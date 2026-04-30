@@ -65,12 +65,12 @@ def test_catalog_response_nested_tree_roundtrip():
         configs={
             "storage": {
                 "routing": {
-                    "CatalogRoutingConfig": {
+                    "catalog_routing_config": {
                         "enabled": True,
                         "operations": {
                             "WRITE": [
-                                {"driver_id": "CatalogCorePostgresqlDriver",
-                                 "config_ref": "CatalogCorePostgresqlDriver",
+                                {"driver_id": "catalog_core_postgresql_driver",
+                                 "config_ref": "catalog_core_postgresql_driver",
                                  "on_failure": "fatal",
                                  "write_mode": "sync"}
                             ],
@@ -78,7 +78,7 @@ def test_catalog_response_nested_tree_roundtrip():
                     },
                 },
                 "drivers": {
-                    "catalog": {"CatalogCorePostgresqlDriver": {"enabled": True}},
+                    "catalog": {"catalog_core_postgresql_driver": {"enabled": True}},
                 },
             },
         },

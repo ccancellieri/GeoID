@@ -10,7 +10,7 @@ account JSON. Three threats we must defend against:
 1. **At-rest leak** — the config_data jsonb column lives in the tenant's
    PostgreSQL schema. A DB snapshot / backup / admin read exposes every
    tenant's credentials.
-2. **Response leak** — GET /configs/catalogs/X/collections/Y/classes/Z
+2. **Response leak** — GET /configs/catalogs/X/collections/Y/plugins/{plugin_id}
    would otherwise return the raw secret in JSON.
 3. **Log leak** — error messages / debug dumps that print the config model
    should not reveal the secret.

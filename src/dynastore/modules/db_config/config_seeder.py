@@ -4,10 +4,13 @@ Reads every ``*.json`` file under ``${DYNASTORE_CONFIG_ROOT}/defaults/`` and
 applies it via ``PlatformConfigsProtocol.set_config``. Each file shape:
 
     {
-      "class_key": "TaskRoutingConfig",
+      "class_key": "task_routing_config",
       "value":     { "enabled": true, "routing": { ... } },
       "override":  false                       // optional, default false
     }
+
+``class_key`` is the snake_case identity (``cls.class_key()``); same wire
+name as ``plugin_id`` on the configs API surface.
 
 Skip policy: a config is applied only if no row exists yet for that class_key,
 unless the file carries ``"override": true``. Files are processed in lexical
@@ -17,8 +20,8 @@ PostgreSQL advisory lock so only one process per cluster runs the seeder at
 a time.
 
 This module owns no domain knowledge — it works for any ``PluginConfig``.
-``TaskRoutingConfig`` is the first user; future ones (e.g.
-``TasksPluginConfig`` overrides) just drop a JSON file alongside it.
+``task_routing_config`` is the first user; future ones (e.g. ``tasks_plugin_config``
+overrides) just drop a JSON file alongside it.
 
 Invoked once during catalog/db_config startup, after ``PlatformConfigsProtocol``
 is registered. Idempotent — safe to re-run on every boot.

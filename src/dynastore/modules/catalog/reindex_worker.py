@@ -65,6 +65,7 @@ from dynastore.models.protocols.metadata_driver import CatalogMetadataStore
 from dynastore.modules.storage.routing_config import (
     CatalogRoutingConfig, Operation, OperationDriverEntry,
 )
+from dynastore.tools.typed_store.base import _to_snake
 
 logger = logging.getLogger(__name__)
 
@@ -511,7 +512,7 @@ async def _resolve_catalog_indexers(
         return []
 
     driver_index = {
-        type(d).__name__: d for d in get_protocols(CatalogMetadataStore)
+        _to_snake(type(d).__name__): d for d in get_protocols(CatalogMetadataStore)
     }
     resolved: List[Tuple[OperationDriverEntry, CatalogMetadataStore]] = []
     for entry in entries:

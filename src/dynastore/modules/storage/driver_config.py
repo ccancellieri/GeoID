@@ -222,7 +222,7 @@ class CollectionWritePolicy(PluginConfig):
 
         configs = get_protocol(ConfigsProtocol)
         policy = await configs.get_config(
-            "collection:write_policy", catalog_id=catalog_id, collection_id=collection_id
+            CollectionWritePolicy, catalog_id=catalog_id, collection_id=collection_id
         )
 
     The ``context`` dict passed to ``write_entities()`` carries runtime values

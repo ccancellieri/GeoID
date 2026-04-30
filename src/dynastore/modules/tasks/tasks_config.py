@@ -43,9 +43,9 @@ class TaskRoutingConfig(PluginConfig):
     ``service_name`` resolved from ``${DYNASTORE_CONFIG_ROOT}/instance.json``
     (see ``modules/db_config/instance.py``).  Per-deployment defaults are
     seeded by dropping a JSON file into ``${DYNASTORE_CONFIG_ROOT}/defaults/``;
-    runtime changes go through the standard ``PUT /configs/classes/
-    TaskRoutingConfig`` admin route and trigger the apply-handler that
-    re-narrows the dispatcher's CapabilityMap.
+    runtime changes go through the standard ``PUT /configs/plugins/task_routing_config``
+    admin route and trigger the apply-handler that re-narrows the dispatcher's
+    CapabilityMap.
     """
     _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "tasks", None)
 

@@ -12,18 +12,18 @@ class TestConfigResolutionError:
         assert isinstance(err, DatabaseError)
 
     def test_message_is_preserved(self):
-        err = ConfigResolutionError("missing default", missing_key="collection:routing")
+        err = ConfigResolutionError("missing default", missing_key="collection_routing_config")
         assert "missing default" in str(err)
 
     def test_structured_fields(self):
         err = ConfigResolutionError(
             "missing default",
-            missing_key="collection:iceberg",
+            missing_key="items_iceberg_driver",
             required_fields=["warehouse", "namespace"],
             scope_tried=["collection", "catalog", "platform", "code_default"],
             hint="set warehouse at platform scope",
         )
-        assert err.missing_key == "collection:iceberg"
+        assert err.missing_key == "items_iceberg_driver"
         assert err.required_fields == ["warehouse", "namespace"]
         assert err.scope_tried == [
             "collection",
@@ -47,20 +47,20 @@ class TestConfigResolutionError:
 
     def test_default_hint_mentions_missing_key(self):
         err = ConfigResolutionError(
-            "no default", missing_key="collection:routing"
+            "no default", missing_key="collection_routing_config"
         )
-        assert "collection:routing" in err.hint
+        assert "collection_routing_config" in err.hint
 
     def test_default_hint_lists_required_fields(self):
         err = ConfigResolutionError(
             "no default",
-            missing_key="collection:iceberg",
+            missing_key="items_iceberg_driver",
             required_fields=["warehouse"],
         )
         assert "warehouse" in err.hint
 
     def test_default_hint_notes_no_required_fields(self):
-        err = ConfigResolutionError("no default", missing_key="collection:routing")
+        err = ConfigResolutionError("no default", missing_key="collection_routing_config")
         assert "none declared" in err.hint
 
 

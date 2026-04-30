@@ -192,9 +192,9 @@ def test_compose_tree_places_classes_by_address():
 
 def test_compose_tree_filters_collection_only_from_catalog():
     # ``_visibility = "collection"`` → hidden at non-collection scopes.
-    by_class = {"CollectionWritePolicy": {"on_conflict": "update"}}
+    by_class = {"collection_write_policy": {"on_conflict": "update"}}
     registry = _stub_registry(
-        CollectionWritePolicy={
+        collection_write_policy={
             "_address": ("storage", "policy", None),
             "_visibility": "collection",
         },
@@ -210,9 +210,9 @@ def test_compose_tree_filters_collection_only_from_catalog():
 
 
 def test_compose_tree_includes_collection_only_at_collection_scope():
-    by_class = {"CollectionWritePolicy": {"on_conflict": "update"}}
+    by_class = {"collection_write_policy": {"on_conflict": "update"}}
     registry = _stub_registry(
-        CollectionWritePolicy={
+        collection_write_policy={
             "_address": ("storage", "policy", None),
             "_visibility": "collection",
         },
@@ -224,7 +224,7 @@ def test_compose_tree_includes_collection_only_at_collection_scope():
         tree, _ = ConfigApiService._compose_tree(
             by_class, sources={}, active_scope="collection", include_meta=False,
         )
-    assert tree["storage"]["policy"]["CollectionWritePolicy"] == {"on_conflict": "update"}
+    assert tree["storage"]["policy"]["collection_write_policy"] == {"on_conflict": "update"}
 
 
 def test_compose_tree_drops_abstract_bases():

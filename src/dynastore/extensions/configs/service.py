@@ -554,18 +554,27 @@ class ConfigsService(ExtensionProtocol):
                 available=available,
             )
 
-        # Group by Protocol qualname (M9 — §7 protocol-based driver grouping)
+        # Group by Protocol qualname (M9 — §7 protocol-based driver grouping).
+        # Inner key is the snake_case driver_id (matches OperationDriverEntry.driver_id).
+        from dynastore.tools.typed_store.base import _to_snake
+
+        def _driver_id(d) -> str:
+            return _to_snake(type(d).__name__)
+
+        def _config_key(d) -> str:
+            return _to_snake(type(d).__name__ + "Config")
+
         drivers: Dict[str, Dict[str, DriverInfo]] = {
             CollectionItemsStore.__qualname__: {
-                type(d).__name__: _routable_info(d, f"{type(d).__name__}Config", d.is_available())
+                _driver_id(d): _routable_info(d, _config_key(d), d.is_available())
                 for d in get_all_protocols(CollectionItemsStore)
             },
             AssetStore.__qualname__: {
-                type(d).__name__: _routable_info(d, f"{type(d).__name__}Config", d.is_available())
+                _driver_id(d): _routable_info(d, _config_key(d), d.is_available())
                 for d in get_all_protocols(AssetStore)
             },
             CollectionMetadataStore.__qualname__: {
-                type(d).__name__: _metadata_info(d, await d.is_available())
+                _driver_id(d): _metadata_info(d, await d.is_available())
                 for d in get_all_protocols(CollectionMetadataStore)
             },
         }

@@ -39,14 +39,15 @@ Seed payloads for any `PluginConfig` subclass. Each file:
 
 ```json
 {
-  "class_key": "TaskRoutingConfig",
+  "class_key": "task_routing_config",
   "value":     { "...": "..." },
   "override":  false
 }
 ```
 
-- `class_key` — the `PluginConfig` subclass name (e.g. `TaskRoutingConfig`,
-  `TasksPluginConfig`).
+- `class_key` — the snake_case identity (`cls.class_key()`) of the
+  `PluginConfig` subclass (e.g. `task_routing_config`, `tasks_plugin_config`).
+  Same wire name as `plugin_id` on the configs API surface.
 - `value` — the config payload (validated against the Pydantic model).
 - `override` — optional. When `false` (default), the seed is skipped if a
   config row already exists for that `class_key`. Set `true` to force apply.

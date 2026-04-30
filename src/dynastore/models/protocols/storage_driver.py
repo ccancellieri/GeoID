@@ -206,7 +206,7 @@ class CollectionItemsStore(Protocol):
 
                 Drivers that declare ``Capability.EXTERNAL_ID_TRACKING`` or
                 ``Capability.TEMPORAL_VALIDITY`` MUST honour these keys and apply
-                the ``CollectionWritePolicy`` (class_key ``"CollectionWritePolicy"``) retrieved
+                the ``CollectionWritePolicy`` (class_key ``"collection_write_policy"``) retrieved
                 from ``ConfigsProtocol``.
 
             db_resource: Optional connection/transaction to reuse (PG only).

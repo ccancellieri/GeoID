@@ -65,7 +65,7 @@ class PluginSchemaInfo(BaseModel):
 class ConfigEntry(BaseModel):
     """A single configuration entry as returned by list/search endpoints."""
 
-    plugin_id: str = Field(..., description="Unique plugin identifier.", examples=["ItemsPostgresqlDriver"])
+    plugin_id: str = Field(..., description="Unique plugin identifier (snake_case).", examples=["items_postgresql_driver"])
     config_data: Dict[str, Any] = Field(..., description="The stored configuration payload.")
     updated_at: Optional[datetime] = Field(None, description="Last modification timestamp (UTC).")
 
@@ -87,7 +87,7 @@ class EffectiveConfigResponse(BaseModel):
     or a fallback default.
     """
 
-    plugin_id: str = Field(..., examples=["ItemsPostgresqlDriver"])
+    plugin_id: str = Field(..., examples=["items_postgresql_driver"])
     config: Dict[str, Any] = Field(..., description="Effective configuration payload.")
     resolved_from: Optional[ConfigLevel] = Field(
         None,
@@ -130,13 +130,13 @@ class DriverListResponse(BaseModel):
 
     Outer key is the domain (``"collections"``, ``"assets"``,
     ``"collection_metadata"``) — matches the slot in routing config.
-    Inner key is the implementation class name (e.g. ``"ItemsPostgresqlDriver"``),
-    used as the ``driver_id`` in ``CollectionRoutingConfig`` / ``AssetRoutingConfig``.
+    Inner key is the snake_case ``driver_id`` (e.g. ``"items_postgresql_driver"``),
+    used in ``CollectionRoutingConfig`` / ``AssetRoutingConfig`` operations.
     """
 
     drivers: Dict[str, Dict[str, DriverInfo]] = Field(
         default_factory=dict,
-        description="domain → {class name → driver info}.",
+        description="domain → {driver_id → driver info}.",
     )
 
 
@@ -149,11 +149,10 @@ class PluginListResponse(BaseModel):
             [
                 "collection",
                 "stac",
-                "CollectionRoutingConfig",
-                "AssetRoutingConfig",
-                "ItemsPostgresqlDriver",
-                "driver:asset:postgresql",
-                "driver:collection:metadata:elasticsearch",
+                "collection_routing_config",
+                "asset_routing_config",
+                "items_postgresql_driver",
+                "items_elasticsearch_driver",
                 "tiles",
                 "tasks",
                 "features",

@@ -69,7 +69,7 @@ class _FakeCatalogs:
         ]
 
 
-def _routing_with_es(driver_id: str = "ItemsElasticsearchDriver"):
+def _routing_with_es(driver_id: str = "items_elasticsearch_driver"):
     """Fake CollectionRoutingConfig listing the regular ES driver."""
     return type("Routing", (), {
         "operations": {"INDEX": [
@@ -81,7 +81,7 @@ def _routing_with_es(driver_id: str = "ItemsElasticsearchDriver"):
 def _routing_without_es():
     return type("Routing", (), {
         "operations": {"INDEX": [
-            type("Entry", (), {"driver_id": "OtherDriver"})()
+            type("Entry", (), {"driver_id": "other_driver"})()
         ]},
     })()
 
@@ -249,3 +249,57 @@ async def test_inputs_drop_mode_field():
     assert "mode" not in inputs.model_dump()
     inputs2 = BulkCollectionReindexInputs(catalog_id="cat1", collection_id="col1")
     assert "mode" not in inputs2.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_is_es_active_for_matches_snake_case_driver_id():
+    """PR-1e regression guard: ``OperationDriverEntry.driver_id`` is always
+    snake_case after the validator coerces it. ``is_es_active_for`` must
+    compare against ``"items_elasticsearch_driver"`` — pre-PR-1e it compared
+    against ``"ItemsElasticsearchDriver"`` and silently returned False for
+    every collection, breaking ES-aware downstream code paths.
+    """
+    from dynastore.modules.elasticsearch.bulk_reindex import is_es_active_for
+    from dynastore.modules.storage.routing_config import (
+        CollectionRoutingConfig,
+        OperationDriverEntry,
+        Operation,
+    )
+    from dynastore.tools import discovery
+
+    routing = CollectionRoutingConfig(
+        operations={Operation.READ: [OperationDriverEntry(driver_id="items_elasticsearch_driver")]},
+    )
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return routing
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch.object(discovery, "get_protocol", side_effect=_get_protocol):
+        assert await is_es_active_for("cat1", "col1") is True
+
+    # And conversely: a routing without ES returns False.
+    routing_pg_only = CollectionRoutingConfig(
+        operations={Operation.READ: [OperationDriverEntry(driver_id="items_postgresql_driver")]},
+    )
+
+    async def _get_config_pg(model, *, catalog_id, collection_id=None):
+        return routing_pg_only
+
+    fake_configs_pg = type("C", (), {"get_config": staticmethod(_get_config_pg)})()
+
+    def _get_protocol_pg(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs_pg
+        return None
+
+    with patch.object(discovery, "get_protocol", side_effect=_get_protocol_pg):
+        assert await is_es_active_for("cat1", "col1") is False
