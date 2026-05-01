@@ -1,6 +1,7 @@
+import fnmatch
 import logging
 import re
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from contextlib import asynccontextmanager
 
 # Hard runtime dep — fail entry-point load on services without ``opensearch-py``
@@ -25,6 +26,74 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _find_overbroad_dynastore_data_stream_templates(
+    es: Any, prefix: str,
+) -> List[Tuple[str, List[str]]]:
+    """Return composable templates that would force dynastore metadata indices into data streams.
+
+    PR #172 fail-fast catches the SYMPTOM (a metadata index already exists as a
+    stream). This helper catches the CAUSE: an over-broad composable template
+    with ``data_stream != null`` whose ``index_patterns`` would intercept the
+    next ``indices.create('{prefix}-collections')`` / ``-catalogs`` call and
+    auto-create it as a stream — which then breaks every subsequent upsert.
+
+    The intended logs template scope is ``{prefix}-logs-*``. Anything broader
+    (e.g. ``{prefix}-*``, ``*``) is over-broad and is reported here.
+
+    Returns a list of ``(template_name, patterns)`` for every offending template.
+    On API errors returns an empty list (the existing fail-fast in lifespan
+    will fall back to the symptom check).
+
+    Observed on review env 2026-05-01: a manually-created template named
+    ``dynastore_logs`` had ``index_patterns=['dynastore-*']`` and
+    ``data_stream={...}``, which converted ``dynastore-collections`` into a
+    stream and produced the "only write ops with op_type=create are allowed
+    in data streams" error on every catalog/collection write.
+    """
+    canonical_metadata_indices = (
+        f"{prefix}-collections",
+        f"{prefix}-catalogs",
+    )
+    try:
+        result = await es.indices.get_index_template(name="*")
+    except Exception as exc:
+        logger.debug(
+            "ElasticsearchModule: get_index_template probe failed (%s) — "
+            "skipping over-broad-template fail-fast (symptom check still active).",
+            exc,
+        )
+        return []
+
+    templates = (result or {}).get("index_templates", []) if isinstance(result, dict) else []
+    offending: List[Tuple[str, List[str]]] = []
+    for entry in templates:
+        if not isinstance(entry, dict):
+            continue
+        body = entry.get("index_template") or {}
+        if not isinstance(body, dict):
+            continue
+        # Only composable templates that emit data streams are dangerous —
+        # a regular template doesn't change the index mode on creation.
+        # Note: ``data_stream`` may be an empty dict (`{}`) when the operator
+        # accepted defaults — still a data-stream template, so we test for
+        # key presence + non-None, NOT truthiness (`{}` is falsy in Python).
+        if body.get("data_stream") is None:
+            continue
+        patterns = body.get("index_patterns") or []
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        # Pattern is over-broad iff it matches a canonical metadata index name
+        # via ES glob semantics (fnmatch covers the "*" / "?" wildcards ES
+        # uses for index_patterns).
+        for p in patterns:
+            if not isinstance(p, str):
+                continue
+            if any(fnmatch.fnmatchcase(name, p) for name in canonical_metadata_indices):
+                offending.append((entry.get("name") or "<unnamed>", list(patterns)))
+                break
+    return offending
+
 
 async def _is_data_stream(es: Any, name: str) -> bool:
     """Return True when ``name`` exists as a data stream in OpenSearch.
@@ -260,6 +329,41 @@ class ElasticsearchModule(ModuleProtocol):
                 CATALOG_MAPPING,
                 COLLECTION_MAPPING,
             )
+
+            # Over-broad-template fail-fast: a composable template with
+            # data_stream=true and index_patterns matching `{prefix}-collections`
+            # or `{prefix}-catalogs` would auto-convert those indices to data
+            # streams on first create, breaking every subsequent metadata
+            # upsert. PR #172 catches the SYMPTOM (existing stream); this
+            # catches the CAUSE so a fresh-cluster deploy doesn't cycle back
+            # into the same broken state after the operator deletes the
+            # stream. Observed on review env 2026-05-01 — template
+            # `dynastore_logs` with patterns=['dynastore-*'].
+            prefix = es_client.get_index_prefix()
+            offending_templates = await _find_overbroad_dynastore_data_stream_templates(
+                es, prefix,
+            )
+            if offending_templates:
+                lines = [
+                    f"  - {name}: index_patterns={patterns}"
+                    for name, patterns in offending_templates
+                ]
+                msg = (
+                    "ElasticsearchModule: cluster has data-stream-emitting "
+                    "composable template(s) whose index_patterns match the "
+                    "platform's metadata indices ('{prefix}-collections' / "
+                    "'{prefix}-catalogs'). Catalog/collection writes will fail "
+                    "with 'only write ops with op_type=create are allowed in "
+                    "data streams' as soon as those indices are auto-created.\n"
+                    "Offending templates:\n"
+                    + "\n".join(lines)
+                    + "\n"
+                    "Tighten each template's index_patterns to exclude the "
+                    f"metadata indices (e.g. ['{prefix}-logs-*'] for the "
+                    "logs backend), then redeploy."
+                ).format(prefix=prefix)
+                logger.error(msg)
+                raise RuntimeError(msg)
 
             for shared_name, mapping in (
                 (f"{es_client.get_index_prefix()}-collections", COLLECTION_MAPPING),

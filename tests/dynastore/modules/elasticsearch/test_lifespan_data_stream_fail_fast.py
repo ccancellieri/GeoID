@@ -18,7 +18,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from dynastore.modules.elasticsearch.module import _is_data_stream
+from dynastore.modules.elasticsearch.module import (
+    _find_overbroad_dynastore_data_stream_templates,
+    _is_data_stream,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -134,3 +137,158 @@ async def test_lifespan_silent_on_missing_index() -> None:
         exists=False, is_data_stream=False,
     )
     assert raised is False
+
+
+# ---------------------------------------------------------------------------
+# Over-broad-template fail-fast — catches the cluster CONFIG that would
+# convert {prefix}-collections / {prefix}-catalogs into data streams on
+# create. Complements the symptom check above.
+# ---------------------------------------------------------------------------
+
+def _mk_es_with_templates(templates: list) -> AsyncMock:
+    es = AsyncMock()
+    es.indices.get_index_template = AsyncMock(return_value={
+        "index_templates": templates,
+    })
+    return es
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_detects_dynastore_star_with_data_stream() -> None:
+    """The exact review-env config: index_patterns=['dynastore-*'] + data_stream."""
+    es = _mk_es_with_templates([
+        {
+            "name": "dynastore_logs",
+            "index_template": {
+                "index_patterns": ["dynastore-*"],
+                "data_stream": {"hidden": False},
+            },
+        },
+    ])
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    assert len(out) == 1
+    assert out[0][0] == "dynastore_logs"
+    assert out[0][1] == ["dynastore-*"]
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_silent_on_safe_logs_only_pattern() -> None:
+    """index_patterns=['dynastore-logs-*'] does NOT match {prefix}-collections."""
+    es = _mk_es_with_templates([
+        {
+            "name": "dynastore_logs",
+            "index_template": {
+                "index_patterns": ["dynastore-logs-*"],
+                "data_stream": {"hidden": False},
+            },
+        },
+    ])
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_silent_on_regular_template_without_data_stream() -> None:
+    """A template without data_stream={...} cannot convert indices to streams."""
+    es = _mk_es_with_templates([
+        {
+            "name": "dynastore_overlay",
+            "index_template": {
+                "index_patterns": ["dynastore-*"],
+                # No data_stream key — regular composable template, harmless.
+            },
+        },
+    ])
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_detects_universal_wildcard() -> None:
+    """index_patterns=['*'] also matches {prefix}-collections / -catalogs."""
+    es = _mk_es_with_templates([
+        {
+            "name": "catch_all",
+            "index_template": {
+                "index_patterns": ["*"],
+                "data_stream": {},
+            },
+        },
+    ])
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    assert len(out) == 1
+    assert out[0][0] == "catch_all"
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_detects_only_offending_one_among_many() -> None:
+    """Mixed cluster: one safe template + one offending template + one regular."""
+    es = _mk_es_with_templates([
+        {
+            "name": "dynastore_logs",
+            "index_template": {
+                "index_patterns": ["dynastore-logs-*"],
+                "data_stream": {"hidden": False},
+            },
+        },
+        {
+            "name": "rogue_overlay",
+            "index_template": {
+                "index_patterns": ["dynastore-collections", "other-*"],
+                "data_stream": {},
+            },
+        },
+        {
+            "name": "regular_template",
+            "index_template": {
+                "index_patterns": ["dynastore-*"],
+                # No data_stream — harmless.
+            },
+        },
+    ])
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    names = [n for n, _ in out]
+    assert names == ["rogue_overlay"]
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_returns_empty_on_api_error() -> None:
+    """Non-fatal: API error means we cannot probe; symptom check still runs."""
+    es = AsyncMock()
+    es.indices.get_index_template = AsyncMock(side_effect=Exception("transport down"))
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_returns_empty_on_no_templates() -> None:
+    """Fresh cluster — no composable templates at all."""
+    es = _mk_es_with_templates([])
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_handles_non_dict_response() -> None:
+    """Defensive — opensearch-py occasionally returns transport objects."""
+    es = AsyncMock()
+    es.indices.get_index_template = AsyncMock(return_value=None)
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_overbroad_template_handles_string_index_patterns() -> None:
+    """Some ES versions return index_patterns as a single string, not a list."""
+    es = _mk_es_with_templates([
+        {
+            "name": "single_pattern",
+            "index_template": {
+                "index_patterns": "dynastore-*",  # str, not list
+                "data_stream": {},
+            },
+        },
+    ])
+    out = await _find_overbroad_dynastore_data_stream_templates(es, "dynastore")
+    assert len(out) == 1
+    assert out[0][0] == "single_pattern"
