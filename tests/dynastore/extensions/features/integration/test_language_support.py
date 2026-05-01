@@ -77,7 +77,7 @@ async def test_create_catalog_with_language_parameter(sysadmin_in_process_client
 
 
 @pytest.mark.asyncio
-async def test_get_catalog_with_language_resolution(in_process_client):
+async def test_get_catalog_with_language_resolution(sysadmin_in_process_client):
     """Test retrieving catalog with language-specific content."""
     # Create multilingual catalog
     catalog_id = f"ogc_lang_{generate_test_id()}"
@@ -91,13 +91,13 @@ async def test_get_catalog_with_language_resolution(in_process_client):
     }
 
     try:
-        create_resp = await in_process_client.post(
+        create_resp = await sysadmin_in_process_client.post(
             "/features/catalogs", json=payload, params={"lang": "*"}
         )
         assert create_resp.status_code == 201
 
         # Get with lang=en
-        resp_en = await in_process_client.get(
+        resp_en = await sysadmin_in_process_client.get(
             f"/features/catalogs/{catalog_id}", params={"lang": "en"}
         )
         assert resp_en.status_code == 200
@@ -105,7 +105,7 @@ async def test_get_catalog_with_language_resolution(in_process_client):
         assert "title" in data_en
 
         # Get with lang=fr
-        resp_fr = await in_process_client.get(
+        resp_fr = await sysadmin_in_process_client.get(
             f"/features/catalogs/{catalog_id}", params={"lang": "fr"}
         )
         assert resp_fr.status_code == 200
@@ -113,18 +113,18 @@ async def test_get_catalog_with_language_resolution(in_process_client):
         assert "title" in data_fr
 
         # Get with lang=* for all
-        resp_all = await in_process_client.get(
+        resp_all = await sysadmin_in_process_client.get(
             f"/features/catalogs/{catalog_id}", params={"lang": "*"}
         )
         assert resp_all.status_code == 200
         data_all = resp_all.json()
         assert "title" in data_all
     finally:
-        await in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
+        await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
 
 
 @pytest.mark.asyncio
-async def test_list_catalogs_with_language(in_process_client):
+async def test_list_catalogs_with_language(sysadmin_in_process_client):
     """Test that catalog listing respects language parameter."""
     # Create some catalogs with multilingual content
     catalogs = [
@@ -141,21 +141,21 @@ async def test_list_catalogs_with_language(in_process_client):
     catalog_ids = [f"{payload['id']}_{i}" for i, payload in enumerate(catalogs)]
     # Pre-cleanup: remove any leftovers from prior runs
     for cid in catalog_ids:
-        await in_process_client.delete(f"/features/catalogs/{cid}", params={"force": "true"})
+        await sysadmin_in_process_client.delete(f"/features/catalogs/{cid}", params={"force": "true"})
 
     created_ids = []
     try:
         for i, payload in enumerate(catalogs):
             cat_id = catalog_ids[i]
             payload["id"] = cat_id
-            resp = await in_process_client.post(
+            resp = await sysadmin_in_process_client.post(
                 "/features/catalogs", json=payload, params={"lang": "en"}
             )
             assert resp.status_code == 201
             created_ids.append(cat_id)
 
         # List with lang=en (must be inside try so catalogs exist)
-        resp_list = await in_process_client.get(
+        resp_list = await sysadmin_in_process_client.get(
             "/features/catalogs", params={"lang": "en", "limit": 50}
         )
         assert resp_list.status_code == 200
@@ -163,18 +163,18 @@ async def test_list_catalogs_with_language(in_process_client):
         assert "catalogs" in data
     finally:
         for cid in created_ids:
-            await in_process_client.delete(f"/features/catalogs/{cid}", params={"force": "true"})
+            await sysadmin_in_process_client.delete(f"/features/catalogs/{cid}", params={"force": "true"})
 
 
 @pytest.mark.asyncio
-async def test_create_collection_with_language(in_process_client):
+async def test_create_collection_with_language(sysadmin_in_process_client):
     """Test creating a collection with language support."""
     catalog_id = f"ogc_coll_{generate_test_id()}"
     collection_id = "ogc_collection_unique_1"
     
     try:
         # First create catalog
-        cat_resp = await in_process_client.post(
+        cat_resp = await sysadmin_in_process_client.post(
             "/features/catalogs",
             json={"id": catalog_id, "description": "Test catalog"},
             params={"lang": "en"},
@@ -195,7 +195,7 @@ async def test_create_collection_with_language(in_process_client):
             },
         }
 
-        coll_resp = await in_process_client.post(
+        coll_resp = await sysadmin_in_process_client.post(
             f"/features/catalogs/{catalog_id}/collections",
             json=coll_payload,
             params={"lang": "en"},
@@ -204,18 +204,18 @@ async def test_create_collection_with_language(in_process_client):
         coll_data = coll_resp.json()
         assert coll_data["id"] == collection_id
     finally:
-        await in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
+        await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
 
 
 @pytest.mark.asyncio
-async def test_get_collection_with_language(in_process_client):
+async def test_get_collection_with_language(sysadmin_in_process_client):
     """Test retrieving collection with language parameter."""
     catalog_id = f"ogc_getcoll_{generate_test_id()}"
     collection_id = "test_get_coll_unique"
     
     try:
         # Setup
-        await in_process_client.post(
+        await sysadmin_in_process_client.post(
             "/features/catalogs",
             json={"id": catalog_id, "description": "Test"},
             params={"lang": "en"},
@@ -230,37 +230,37 @@ async def test_get_collection_with_language(in_process_client):
             },
         }
 
-        await in_process_client.post(
+        await sysadmin_in_process_client.post(
             f"/features/catalogs/{catalog_id}/collections",
             json=coll_payload,
             params={"lang": "en"},
         )
 
         # Retrieve with different languages
-        resp_en = await in_process_client.get(
+        resp_en = await sysadmin_in_process_client.get(
             f"/features/catalogs/{catalog_id}/collections/{collection_id}",
             params={"lang": "en"},
         )
         assert resp_en.status_code == 200
 
-        resp_fr = await in_process_client.get(
+        resp_fr = await sysadmin_in_process_client.get(
             f"/features/catalogs/{catalog_id}/collections/{collection_id}",
             params={"lang": "fr"},
         )
         assert resp_fr.status_code == 200
     finally:
-        await in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
+        await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
 
 
 @pytest.mark.asyncio
-async def test_update_collection_with_language(in_process_client):
+async def test_update_collection_with_language(sysadmin_in_process_client):
     """Test updating collection and merging language data."""
     catalog_id = f"ogc_update_{generate_test_id()}"
     collection_id = "update_coll_unique"
     
     try:
         # Setup
-        await in_process_client.post(
+        await sysadmin_in_process_client.post(
             "/features/catalogs",
             json={"id": catalog_id, "description": "Test"},
             params={"lang": "en"},
@@ -275,7 +275,7 @@ async def test_update_collection_with_language(in_process_client):
             },
         }
 
-        await in_process_client.post(
+        await sysadmin_in_process_client.post(
             f"/features/catalogs/{catalog_id}/collections",
             json=coll_payload,
             params={"lang": "*"},
@@ -284,25 +284,25 @@ async def test_update_collection_with_language(in_process_client):
         # Update with Spanish
         update = {"description": "Descripción en español"}
 
-        resp = await in_process_client.put(
+        resp = await sysadmin_in_process_client.put(
             f"/features/catalogs/{catalog_id}/collections/{collection_id}",
             json=update,
             params={"lang": "es"},
         )
         assert resp.status_code == 200
     finally:
-        await in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
+        await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
 
 
 @pytest.mark.asyncio
-async def test_queryables_respects_language(in_process_client):
+async def test_queryables_respects_language(sysadmin_in_process_client):
     """Test that queryables endpoint respects language parameter."""
     catalog_id = f"ogc_query_{generate_test_id()}"
     collection_id = "query_coll_unique"
     
     try:
         # Setup
-        await in_process_client.post(
+        await sysadmin_in_process_client.post(
             "/features/catalogs",
             json={"id": catalog_id, "description": "Test"},
             params={"lang": "en"},
@@ -317,20 +317,20 @@ async def test_queryables_respects_language(in_process_client):
             },
         }
 
-        await in_process_client.post(
+        await sysadmin_in_process_client.post(
             f"/features/catalogs/{catalog_id}/collections",
             json=coll_payload,
             params={"lang": "en"},
         )
 
         # Get queryables with language
-        resp = await in_process_client.get(
+        resp = await sysadmin_in_process_client.get(
             f"/features/catalogs/{catalog_id}/collections/{collection_id}/queryables",
             params={"lang": "en"},
         )
         assert resp.status_code == 200
     finally:
-        await in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
+        await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}", params={"force": "true"})
 
 
 if __name__ == "__main__":

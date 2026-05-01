@@ -67,13 +67,13 @@ def config_catalog_data():
 
 
 @pytest.fixture
-async def setup_catalog(in_process_client, catalog_data, catalog_id):
+async def setup_catalog(sysadmin_in_process_client, catalog_data, catalog_id):
     """Fixture to ensure a catalog exists and is cleaned up using the API."""
     # Cleanup any existing catalog with hard delete to avoid duplicate key constraints
-    await in_process_client.delete(f"/features/catalogs/{catalog_id}?force=true")
+    await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}?force=true")
 
     # Create catalog
-    r = await in_process_client.post("/features/catalogs", json=catalog_data)
+    r = await sysadmin_in_process_client.post("/features/catalogs", json=catalog_data)
     if r.status_code != 201:
         # Check if it already exists (409 maybe? or just proceed)
         pass
@@ -86,18 +86,18 @@ async def setup_catalog(in_process_client, catalog_data, catalog_id):
 
 @pytest.fixture
 async def setup_collection(
-    in_process_client, setup_catalog, collection_data, collection_id
+    sysadmin_in_process_client, setup_catalog, collection_data, collection_id
 ):
     """Fixture to ensure a collection exists and is cleaned up using the API."""
     catalog_id = setup_catalog
 
     # Cleanup with hard delete to avoid duplicate key constraints
-    await in_process_client.delete(
+    await sysadmin_in_process_client.delete(
         f"/features/catalogs/{catalog_id}/collections/{collection_id}?force=true"
     )
 
     # Create collection
-    r = await in_process_client.post(
+    r = await sysadmin_in_process_client.post(
         f"/features/catalogs/{catalog_id}/collections", json=collection_data
     )
 

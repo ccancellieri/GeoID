@@ -302,8 +302,11 @@ class ItemsElasticsearchDriver(
         Capability.TEMPORAL_VALIDITY,
         Capability.PHYSICAL_ADDRESSING,
     })
-    preferred_for: FrozenSet[str] = frozenset({"search"})
-    supported_hints: FrozenSet[str] = frozenset({"search", "fulltext"})
+    preferred_for: FrozenSet[str] = frozenset({"search", "geometry_simplified"})
+    supported_hints: FrozenSet[str] = frozenset({
+        "search", "fulltext",
+        "geometry_simplified",  # PR #185 default routing: ES serves the fast simplified-geometry read path
+    })
 
     def is_available(self) -> bool:
         return self._sfeos_available()

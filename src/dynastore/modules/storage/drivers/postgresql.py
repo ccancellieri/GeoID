@@ -78,10 +78,11 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         Capability.QUERY_FALLBACK_SOURCE,
         Capability.BULK_COPY,
     })
-    preferred_for: FrozenSet[str] = frozenset({"features", "write"})
+    preferred_for: FrozenSet[str] = frozenset({"features", "write", "geometry_exact"})
     supported_hints: FrozenSet[str] = frozenset({
         "features", "write", "metadata",
         "join",  # primary side of OGC API - Joins (extensions/joins/joins_service.py)
+        "geometry_exact",  # PR #185 default routing: PG returns full-precision geometries
     })
 
     def is_available(self) -> bool:

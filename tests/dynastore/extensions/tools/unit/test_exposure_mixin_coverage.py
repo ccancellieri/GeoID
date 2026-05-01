@@ -22,6 +22,10 @@ import dynastore.extensions.crs  # noqa: F401
 import dynastore.extensions.gdal  # noqa: F401
 import dynastore.extensions.assets  # noqa: F401
 import dynastore.extensions.styles  # noqa: F401
+import dynastore.extensions.dggs  # noqa: F401
+import dynastore.extensions.edr  # noqa: F401
+import dynastore.extensions.joins  # noqa: F401
+import dynastore.extensions.moving_features  # noqa: F401
 
 import pytest
 from dynastore.extensions.tools.exposure_mixin import (

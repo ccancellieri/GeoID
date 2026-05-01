@@ -659,14 +659,20 @@ def _validate_routing_entries(
 
     for operation, entries in config.operations.items():
         for entry in entries:
-            # 1. Unknown driver.
+            # 1. Unknown driver. Warn-and-skip aligns with router.py runtime
+            # behaviour: an entry whose driver isn't registered is silently
+            # skipped at dispatch time. Validation must match — otherwise
+            # config-apply on a subset deployment (test fixture, partial
+            # rollout, deprecated driver) hard-fails despite the runtime
+            # path being safe.
             driver = driver_index.get(entry.driver_id)
             if driver is None:
-                raise ValueError(
-                    f"{label}: driver '{entry.driver_id}' for operation "
-                    f"'{operation}' is not registered. "
-                    f"Available: {sorted(driver_index)}"
+                logger.warning(
+                    "%s: driver '%s' for operation '%s' is not registered. "
+                    "Available: %s. Entry will be skipped at dispatch.",
+                    label, entry.driver_id, operation, sorted(driver_index),
                 )
+                continue
 
             # 2. Hint validation
             driver_hints = getattr(driver, "supported_hints", frozenset())
