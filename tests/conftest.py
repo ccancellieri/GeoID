@@ -729,30 +729,26 @@ async def reset_dynastore_state(engine=None):
     from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
     SidecarRegistry.clear_registry()
 
-    # 10.2 Clear metadata-tier sidecar registries — same problem class:
-    # ``MetadataPgSidecarRegistry`` and ``CatalogMetadataPgSidecarRegistry``
-    # cache ``_defaults_loaded`` + ``_registry`` at class scope. If a prior
-    # test bootstrapped them before the stac extension was instantiated,
-    # the next test's STAC sidecar gets silently omitted from the default
-    # list — collection/catalog metadata writes succeed in-memory but the
-    # STAC slice (title/description/keywords) never reaches the DB,
-    # making PATCH/PUT appear to no-op on the GET-back round trip.
+    # 10.2 Clear metadata-tier sidecar registries via their public test-isolation
+    # hooks. Both classes ship a ``.clear()`` classmethod (with the docstring
+    # ``"""Test-isolation hook."""`` — explicitly designed for this fixture
+    # path). Calling the public API survives any future internal field rename
+    # and matches how the items-tier ``SidecarRegistry.clear_registry()`` is
+    # invoked above.
     try:
         from dynastore.modules.storage.drivers.collection_metadata_postgresql import (
             MetadataPgSidecarRegistry,
         )
-        MetadataPgSidecarRegistry._registry.clear()
-        MetadataPgSidecarRegistry._defaults_loaded = False
+        MetadataPgSidecarRegistry.clear()
     except Exception as e:
-        logger.debug(f"MetadataPgSidecarRegistry reset skipped: {e}")
+        logger.debug(f"MetadataPgSidecarRegistry.clear() skipped: {e}")
     try:
         from dynastore.modules.storage.drivers.catalog_metadata_postgresql import (
             CatalogMetadataPgSidecarRegistry,
         )
-        CatalogMetadataPgSidecarRegistry._registry.clear()
-        CatalogMetadataPgSidecarRegistry._defaults_loaded = False
+        CatalogMetadataPgSidecarRegistry.clear()
     except Exception as e:
-        logger.debug(f"CatalogMetadataPgSidecarRegistry reset skipped: {e}")
+        logger.debug(f"CatalogMetadataPgSidecarRegistry.clear() skipped: {e}")
 
     # 11. Clear Caches safely
     from dynastore.modules.catalog import config_service
