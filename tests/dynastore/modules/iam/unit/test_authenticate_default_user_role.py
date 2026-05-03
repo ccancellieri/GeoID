@@ -138,6 +138,29 @@ async def test_hs256_jwt_without_roles_field_defaults_to_user_role() -> None:
     )
 
 
+def test_normalize_authenticated_roles_helper_defaults() -> None:
+    """Direct test of the extracted ``_normalize_authenticated_roles`` helper.
+
+    The HS256 + OIDC paths now share this method — testing it directly
+    pins the "default to USER" rule independently of the bigger
+    authentication-flow integration tests above. Future refactors can
+    grep for this helper instead of having to reverse-engineer the rule
+    from two separate auth-flow branches.
+    """
+    from dynastore.modules.iam.iam_service import IamService
+
+    norm = IamService._normalize_authenticated_roles
+    # None / empty list → USER default
+    assert norm(None) == [DefaultRole.USER.value]
+    assert norm([]) == [DefaultRole.USER.value]
+    # Single-string role → wrapped, NOT defaulted
+    assert norm("editor") == ["editor"]
+    # Non-empty list → returned verbatim
+    assert norm(["sysadmin", "admin"]) == ["sysadmin", "admin"]
+    # Single role in a list → preserved (NOT defaulted)
+    assert norm(["editor"]) == ["editor"]
+
+
 @pytest.mark.asyncio
 async def test_hs256_jwt_with_explicit_roles_preserves_them() -> None:
     """Negative case: an HS256 JWT that DOES carry roles must keep them

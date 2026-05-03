@@ -679,6 +679,59 @@ class IamService:
 
         return None
 
+    @staticmethod
+    def _normalize_authenticated_roles(raw: Any) -> List[str]:
+        """Normalise the raw ``roles`` field from a JWT payload or Principal
+        into a non-empty ``List[str]`` with the USER default applied.
+
+        Single source of truth for the "an authenticated principal with zero
+        declared roles still gets ``DefaultRole.USER``" rule. Without this
+        default, an HS256 token signed with ``roles=[]`` (or a Principal
+        whose ``.roles`` is ``None``/empty) would surface as ANONYMOUS-
+        equivalent at the policy layer — breaking ``/iam/me/*`` self-service
+        endpoints that any authenticated user should reach.
+
+        Accepts:
+          - ``None``                  → ``["user"]``
+          - missing / empty list      → ``["user"]``
+          - a single role as ``str``  → ``[role]``
+          - a list of role names      → returned verbatim
+
+        Pinned by tests in
+        ``tests/dynastore/modules/iam/unit/test_authenticate_default_user_role.py``.
+        """
+        if isinstance(raw, str):
+            return [raw]
+        roles = list(raw or [])
+        if not roles:
+            roles = [DefaultRole.USER.value]
+        return roles
+
+    async def _expand_role_hierarchy_dual_scope(
+        self, roles: List[str], schema: Optional[str],
+    ) -> List[str]:
+        """Expand a role list against BOTH the platform (``iam``) and the
+        tenant catalog schema's ``role_hierarchy`` tables, returning the
+        union.
+
+        Platform-only roles (e.g. ``sysadmin``) live in ``iam.role_hierarchy``;
+        catalog-scope roles (admin/editor/...) live in
+        ``{catalog_schema}.role_hierarchy``. A principal may carry both at
+        once (D1: scope intrinsic to role, D6: one grants table per scope),
+        so we MUST union the two expansions to avoid silently dropping a
+        parent chain on a catalog request.
+        """
+        platform_expanded = await self.storage.get_role_hierarchy(
+            roles, schema="iam"
+        )
+        if schema and schema != "iam":
+            tenant_expanded = await self.storage.get_role_hierarchy(
+                roles, schema=schema
+            )
+        else:
+            tenant_expanded = []
+        return list(set(platform_expanded) | set(tenant_expanded))
+
     async def authenticate_and_get_role(
         self, request: Any
     ) -> Tuple[List[str], Optional[Principal]]:
@@ -710,30 +763,9 @@ class IamService:
                         auto_register=True,
                     )
                     if principal:
-                        # Translate V2 roles to flattened hierarchy for legacy compatibility
-                        roles = list(principal.roles or [])
-                        if not roles:
-                            roles = ["user"]  # Default role if none assigned
-
-                        # Expand hierarchy in BOTH scopes — platform-only roles
-                        # (e.g. ``sysadmin``) live in ``iam.role_hierarchy``;
-                        # catalog-scope roles (admin/editor/...) live in
-                        # ``{catalog_schema}.role_hierarchy``. The principal
-                        # may carry both at once (D1: scope intrinsic to role,
-                        # D6: one grants table per scope), so we must union
-                        # the two expansions to avoid silently dropping a
-                        # parent chain on a catalog request.
-                        platform_expanded = await self.storage.get_role_hierarchy(
-                            roles, schema="iam"
-                        )
-                        if schema and schema != "iam":
-                            tenant_expanded = await self.storage.get_role_hierarchy(
-                                roles, schema=schema
-                            )
-                        else:
-                            tenant_expanded = []
-                        effective_roles = list(
-                            set(platform_expanded) | set(tenant_expanded)
+                        roles = self._normalize_authenticated_roles(principal.roles)
+                        effective_roles = await self._expand_role_hierarchy_dual_scope(
+                            roles, schema,
                         )
                         return effective_roles, principal
                     else:
@@ -758,34 +790,9 @@ class IamService:
                     continue
             if payload:
                 from dynastore.models.auth import Principal
-                roles = payload.get("roles") or ["user"]
-                if isinstance(roles, str):
-                    roles = [roles]
-                if not roles:
-                    # Same default as the OIDC branch above (line 716): an
-                    # authenticated principal with zero declared roles still
-                    # gets the USER role so /iam/me/* self-service endpoints
-                    # remain reachable. Without this default, an internal
-                    # HS256 token issued for a roles=[] principal would
-                    # surface as ANONYMOUS-equivalent — failing the
-                    # SelfServiceAPI's "any logged-in user can read their
-                    # own roles/catalogs" contract.
-                    roles = ["user"]
-                # Same dual-scope expansion as the OAuth/identity branch — the
-                # internal HS256 fallback can also carry platform + catalog
-                # roles in a single payload (test fixtures sign sysadmin +
-                # editor for cross-scope smoke tests).
-                platform_expanded = await self.storage.get_role_hierarchy(
-                    roles, schema="iam"
-                )
-                if schema and schema != "iam":
-                    tenant_expanded = await self.storage.get_role_hierarchy(
-                        roles, schema=schema
-                    )
-                else:
-                    tenant_expanded = []
-                effective_roles = list(
-                    set(platform_expanded) | set(tenant_expanded)
+                roles = self._normalize_authenticated_roles(payload.get("roles"))
+                effective_roles = await self._expand_role_hierarchy_dual_scope(
+                    roles, schema,
                 )
                 principal = Principal(
                     subject_id=payload.get("sub"),
