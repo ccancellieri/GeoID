@@ -387,16 +387,95 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
         return role
 
     async def flush_pending_registrations(self):
-        """Persist buffered policies and roles. Call after all extension lifespans have registered."""
+        """Persist buffered policies and roles in a single atomic transaction.
+
+        The previous implementation fanned each policy/role out to a
+        separate ``managed_transaction(engine)`` via
+        ``asyncio.gather(*tasks, return_exceptions=True)``. That had two
+        compounding bugs (issue #203):
+
+        1. **Deadlock window**: ~30 simultaneous upserts on the same
+           partitioned table racing against parallel sibling-service
+           seeds (catalog + web + worker + maps + tools + auth all run
+           IAM lifespan at startup, all hitting ``iam.policies_global``
+           concurrently). Postgres picks deadlock victims and rolls
+           them back. Whether a particular row commits depends on
+           timing — repro is intermittent: sometimes ``iam.policies``
+           ends up at 20 rows, sometimes 0.
+        2. **Silent failures**: ``return_exceptions=True`` collected
+           the rolled-back exceptions into the gather result and
+           dropped them on the floor. The per-task ``except Exception``
+           in ``_persist_policy`` would have logged a WARNING, but the
+           "Persisted policy" log line had already fired in the body
+           BEFORE the implicit-commit-at-aexit raised — so the operator
+           sees "Persisted policy: X" lines for rows that never landed.
+
+        Fix: one transaction, sequential upserts, exceptions propagate.
+        ~30 policies + 4 roles is cheap (~30ms); serial vs concurrent
+        is not a perf concern. Sibling services still race against
+        each other via separate transactions, but the upsert ON CONFLICT
+        DO UPDATE is now the only contention point — Postgres serialises
+        these correctly without deadlocking, since the WAIT chain is
+        single-row and a single transaction can't deadlock with itself.
+        """
         policies = list(self._pending_policies.values())
         roles = list(self._pending_roles.values())
         self._pending_policies.clear()
         self._pending_roles.clear()
         if not policies and not roles:
             return
-        tasks = [self._persist_policy(p) for p in policies]
-        tasks.extend(self._persist_role(r) for r in roles)
-        await asyncio.gather(*tasks, return_exceptions=True)
+
+        policy_service = self._policy_service
+        if policy_service is None:
+            return
+        storage = self.storage
+        from dynastore.modules.db_config.query_executor import managed_transaction
+        from dynastore.models.protocols import DatabaseProtocol
+        db = get_protocol(DatabaseProtocol)
+        engine = db.engine if db else None
+        if engine is None:
+            logger.warning("IamModule.flush_pending_registrations: no DB engine available")
+            return
+
+        attempted_p = [p.id for p in policies]
+        attempted_r = [r.name for r in roles]
+        try:
+            async with managed_transaction(engine) as conn:
+                # Policies: one storage call per policy, all in this tx.
+                # `update_policy` opens a nested SAVEPOINT via
+                # `managed_transaction(conn)`. Each per-policy SAVEPOINT
+                # commits or rolls back independently — but a row that
+                # rolls back STILL surfaces as an exception here, instead
+                # of being silently swallowed by `asyncio.gather`.
+                for p in policies:
+                    await policy_service.storage.update_policy(p, schema="iam", conn=conn)
+
+                # Roles: same pattern, with the existing read-modify-write
+                # merge so concurrent extensions registering the same role
+                # name (every OGC extension adds to 'anonymous', etc.) end
+                # up with the union of policy ids.
+                if storage is not None:
+                    async with self._role_lock:
+                        for r in roles:
+                            existing = await storage.get_role(r.name, schema="iam", conn=conn)
+                            if existing:
+                                merged = list(set(existing.policies + r.policies))
+                                merged_role = r.model_copy(update={"policies": merged})
+                                await storage.update_role(merged_role, schema="iam", conn=conn)
+                            else:
+                                await storage.create_role(r, schema="iam", conn=conn)
+            policy_service.invalidate_cache()
+            logger.info(
+                "IamModule: flushed %d policies + %d roles in one transaction",
+                len(policies), len(roles),
+            )
+        except Exception as e:
+            logger.error(
+                "IamModule.flush_pending_registrations: transaction failed; "
+                "policies=%s roles=%s — error: %s",
+                attempted_p, attempted_r, e,
+            )
+            raise
 
 
 
