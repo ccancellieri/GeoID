@@ -110,6 +110,51 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             catalog_id, ctx=DriverContext(db_resource=db_resource)
         )
 
+    async def _enforce_strict_unknown_fields(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        items_list: List[Any],
+    ) -> None:
+        """Reject batches with properties not declared in CollectionSchema.fields.
+
+        Runs at the unified service-layer entry point (item_service.upsert) so
+        every write path — OGC routes via _ingest_items, direct CatalogsProtocol
+        callers, sidecar fan-outs — passes through it once. Driver-agnostic:
+        no JSON-property-storing backend (PG JSONB, ES) can reject unknown
+        keys natively. ``UnknownFieldsError`` is mapped to HTTP 422 by the
+        global ``UnknownFieldsExceptionHandler``.
+        """
+        from dynastore.modules.storage.driver_config import CollectionSchema
+        from dynastore.modules.storage.field_constraints import (
+            check_strict_unknown_fields,
+        )
+
+        configs = get_protocol(ConfigsProtocol)
+        if configs is None:
+            return
+        try:
+            ft = await configs.get_config(
+                CollectionSchema,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+        except Exception:
+            return
+        if not isinstance(ft, CollectionSchema):
+            return
+        if not ft.strict_unknown_fields or not ft.fields:
+            return
+
+        feature_dicts = [
+            it if isinstance(it, dict) else (
+                it.model_dump(by_alias=True, exclude_none=False)
+                if hasattr(it, "model_dump") else dict(it)
+            )
+            for it in items_list
+        ]
+        check_strict_unknown_fields(ft.fields.keys(), feature_dicts)
+
     async def _resolve_physical_table(
         self,
         catalog_id: str,
@@ -331,6 +376,13 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         if not items_list:
             raise ValueError("No features provided. A FeatureCollection must contain at least one feature.")
+
+        # CollectionSchema.strict_unknown_fields enforcement.
+        # Service-layer because no JSON-property-storing driver (PG JSONB,
+        # ES) can natively reject unknown keys, and Branch B (PG primary)
+        # below bypasses driver.write_entities entirely — so this is the
+        # single point all writers cross.
+        await self._enforce_strict_unknown_fields(catalog_id, collection_id, items_list)
 
         # ── Branch A: non-PG primary write driver ─────────────────────────
         # When the primary WRITE driver is not postgresql, delegate the entire

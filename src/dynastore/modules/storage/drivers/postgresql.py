@@ -167,14 +167,9 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         collection_id: str,
         entities: Union[Feature, FeatureCollection, Dict[str, Any], List[Dict[str, Any]]],
         *,
+        context: Optional[Dict[str, Any]] = None,
         db_resource: Optional[Any] = None,
     ) -> List[Feature]:
-        # Strict-mode schema enforcement (CollectionSchema.strict_unknown_fields=True).
-        # Runs BEFORE any DB write so a violating batch is rejected without partial
-        # commit. PG itself can't enforce this — JSON properties accept any key —
-        # so the check must live at service layer.
-        await self._enforce_strict_schema(catalog_id, collection_id, entities)
-
         items_svc = self._get_crud_protocol()
         result = await items_svc.upsert(
             catalog_id, collection_id, entities, ctx=DriverContext(db_resource=db_resource) if db_resource else None
@@ -182,53 +177,6 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         if isinstance(result, list):
             return result
         return [result]
-
-    async def _enforce_strict_schema(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        entities: Any,
-    ) -> None:
-        """Reject batches with unknown fields when strict-mode is on."""
-        from dynastore.models.protocols.configs import ConfigsProtocol
-        from dynastore.modules.storage.driver_config import CollectionSchema
-        from dynastore.modules.storage.field_constraints import (
-            check_strict_unknown_fields,
-        )
-        from dynastore.tools.discovery import get_protocol
-
-        configs = get_protocol(ConfigsProtocol)
-        if not configs:
-            return
-        try:
-            ft = await configs.get_config(
-                CollectionSchema,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-            )
-        except Exception:
-            return
-        if not isinstance(ft, CollectionSchema) or not ft.strict_unknown_fields:
-            return
-        if not ft.fields:
-            return
-
-        # Normalise to a feature-dict list (handles Feature, FeatureCollection,
-        # raw dict, list) — each entry must be Mapping-shaped for the helper.
-        if hasattr(entities, "model_dump"):
-            entities = entities.model_dump(by_alias=True, exclude_none=False)
-        if isinstance(entities, dict) and entities.get("type") == "FeatureCollection":
-            feature_dicts = entities.get("features", []) or []
-        elif isinstance(entities, list):
-            feature_dicts = [
-                e.model_dump(by_alias=True, exclude_none=False)
-                if hasattr(e, "model_dump") else e
-                for e in entities
-            ]
-        else:
-            feature_dicts = [entities]
-
-        check_strict_unknown_fields(ft.fields.keys(), feature_dicts)
 
     async def read_entities(
         self,

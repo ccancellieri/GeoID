@@ -234,6 +234,32 @@ class ValidationExceptionHandler(ExceptionHandler):
         )
 
 
+class UnknownFieldsExceptionHandler(ExceptionHandler):
+    """Maps ``UnknownFieldsError`` to HTTP 422 with structured offender list.
+
+    Raised by ``item_service.upsert`` when a write batch carries properties
+    not declared in ``CollectionSchema.fields`` and ``strict_unknown_fields``
+    is enabled.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.storage.errors import UnknownFieldsError
+
+        return isinstance(exception, UnknownFieldsError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": str(exception),
+                "unknown_fields": list(getattr(exception, "unknown_fields", [])),
+                "allowed_fields": list(getattr(exception, "allowed_fields", [])),
+            },
+        )
+
+
 class ImmutableConfigExceptionHandler(ExceptionHandler):
     """Handles immutable configuration modification attempts."""
 
@@ -339,6 +365,7 @@ class ExceptionHandlerRegistry:
         # first so its 4xx isn't shadowed by a more generic handler downstream.
         self.register(ProblemExceptionHandler())
         self.register(ConflictExceptionHandler())
+        self.register(UnknownFieldsExceptionHandler())
         self.register(ImmutableConfigExceptionHandler())
         self.register(PluginNotFoundExceptionHandler())
         self.register(ConfigResolutionExceptionHandler())  # 500 — ops misconfig
