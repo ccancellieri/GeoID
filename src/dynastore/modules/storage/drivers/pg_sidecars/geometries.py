@@ -252,12 +252,19 @@ class GeometriesSidecar(SidecarProtocol):
             columns.append(f"{col} BIGINT")
             known_columns.add(col)
 
-        # Geohash generated column (ST_GeoHash is IMMUTABLE → safe for STORED)
+        # Geohash generated column (ST_GeoHash is IMMUTABLE → safe for STORED).
+        # ST_GeoHash requires inputs in decimal degrees (EPSG:4326). When the
+        # geometry column is stored in a projected CRS (e.g. target_srid=3857),
+        # PostgreSQL raises "Geohash requires inputs in decimal degrees" on
+        # the generated-column compute. Wrap in ST_Transform to 4326 so the
+        # geohash is always semantically the WGS84 location of the geometry,
+        # regardless of how the source geometry is stored. ST_Transform is a
+        # no-op when geom is already in 4326.
         if self.config.geohash_precision:
             gh_prec = self.config.geohash_precision
             columns.append(
                 f"geohash CHAR({gh_prec}) GENERATED ALWAYS AS "
-                f"(ST_GeoHash({self.config.geom_column}, {gh_prec})) STORED"
+                f"(ST_GeoHash(ST_Transform({self.config.geom_column}, 4326), {gh_prec})) STORED"
             )
             known_columns.add("geohash")
 
