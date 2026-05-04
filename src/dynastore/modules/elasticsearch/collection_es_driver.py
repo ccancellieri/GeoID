@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 """
-Elasticsearch collection driver — implements CollectionMetadataStore.
+Elasticsearch collection driver — implements CollectionStore.
 
 Stores the **full collection object** (not just metadata) in the
 platform-wide singleton index ``{prefix}-collections``. Per-catalog
@@ -38,7 +38,7 @@ import logging
 from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from dynastore.models.driver_context import DriverContext
-from dynastore.models.protocols.metadata_driver import MetadataCapability
+from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.modules.storage.storage_location import StorageLocation
 from dynastore.models.protocols.typed_driver import (
     TypedDriver,
@@ -118,7 +118,7 @@ def _bbox_to_envelope(bbox: List[float]) -> Optional[Dict[str, Any]]:
 
 
 class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverConfig]):
-    """Elasticsearch implementation of :class:`CollectionMetadataStore`.
+    """Elasticsearch implementation of :class:`CollectionStore`.
 
     Uses opensearch-py client (wire-compatible with ES and OpenSearch).
     Indexes ONE tier — collection metadata, keyed by ``(catalog_id,
@@ -130,13 +130,13 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
     is_collection_indexer: ClassVar[bool] = True
 
     capabilities: FrozenSet[str] = frozenset({
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SEARCH,
-        MetadataCapability.CQL_FILTER,
-        MetadataCapability.SPATIAL_FILTER,
-        MetadataCapability.AGGREGATION,
-        MetadataCapability.PHYSICAL_ADDRESSING,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SEARCH,
+        EntityStoreCapability.CQL_FILTER,
+        EntityStoreCapability.SPATIAL_FILTER,
+        EntityStoreCapability.AGGREGATION,
+        EntityStoreCapability.PHYSICAL_ADDRESSING,
     })
 
     def location(self, catalog_id: str, collection_id: Optional[str] = None) -> StorageLocation:

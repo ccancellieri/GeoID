@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import ClassVar, FrozenSet, Optional, Tuple
 
-from dynastore.models.protocols.metadata_driver import MetadataCapability
+from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.modules.storage.driver_config import DriverPluginConfig
 from dynastore.modules.storage.drivers.metadata_postgresql import (
@@ -74,7 +74,7 @@ class CollectionStacPostgresqlDriver(
     because the ``extent`` column carries the STAC bbox the spatial-filter
     endpoints match against.  Composed inside the PG-tier wrapper
     ``CollectionPostgresqlDriver`` via the ``metadata_stac`` sidecar
-    (PR 1e step 3b); not a standalone ``CollectionMetadataStore`` plugin
+    (PR 1e step 3b); not a standalone ``CollectionStore`` plugin
     anymore.  The wrapper forwards the ``stac_metadata_columns()`` marker
     to this class via ``MetadataPgSidecarRegistry`` try-import.
     """
@@ -83,11 +83,11 @@ class CollectionStacPostgresqlDriver(
     _columns: ClassVar[Tuple[str, ...]] = _COLLECTION_STAC_COLUMNS
 
     capabilities: FrozenSet[str] = frozenset({
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SOFT_DELETE,
-        MetadataCapability.SPATIAL_FILTER,
-        MetadataCapability.PHYSICAL_ADDRESSING,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SOFT_DELETE,
+        EntityStoreCapability.SPATIAL_FILTER,
+        EntityStoreCapability.PHYSICAL_ADDRESSING,
     })
 
     def stac_metadata_columns(self) -> Tuple[str, ...]:
@@ -102,7 +102,7 @@ class CatalogStacPostgresqlDriver(
     Backs ``catalog.catalog_metadata_stac``. Scope: ``stac_version``,
     ``stac_extensions``, ``conforms_to``, ``links``, ``assets``.
 
-    Structurally satisfies ``StacCatalogMetadataCapability`` via the
+    Structurally satisfies ``StacCatalogEntityStoreCapability`` via the
     ``stac_metadata_columns()`` marker method.
     """
 
@@ -110,9 +110,9 @@ class CatalogStacPostgresqlDriver(
     _columns: ClassVar[Tuple[str, ...]] = _CATALOG_STAC_COLUMNS
 
     capabilities: FrozenSet[str] = frozenset({
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SOFT_DELETE,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SOFT_DELETE,
     })
 
     def stac_metadata_columns(self) -> Tuple[str, ...]:

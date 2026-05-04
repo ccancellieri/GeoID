@@ -27,7 +27,7 @@ global STAC table is applied once during ``StacModule.lifespan``.
 
 Without the STAC module loaded, neither the global nor the per-tenant
 STAC sidecar table is created — a STAC field write hits the loud
-"StacCollectionMetadataCapability not registered" error from
+"StacCollectionEntityStoreCapability not registered" error from
 ``stac_service._has_stac()``.
 """
 

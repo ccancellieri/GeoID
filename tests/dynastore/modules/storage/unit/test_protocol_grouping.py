@@ -5,7 +5,7 @@ Invariants:
    ``CollectionMetadataDriverProtocol`` names survive anywhere in source or
    tests — they were renamed in M7.
 2. The three new Protocol classes (``CollectionItemsStore``, ``AssetStore``,
-   ``CollectionMetadataStore``) exist and are importable.
+   ``CollectionStore``) exist and are importable.
 3. ``DriverRegistry`` builds correct indices keyed by the new names.
 4. Every driver class that implements a Protocol is discoverable via the
    Protocol's qualname (structural subtype check via ``@runtime_checkable``).
@@ -67,18 +67,18 @@ class TestNewProtocolsImportable:
         assert AssetStore.__name__ == "AssetStore"
 
     def test_collection_metadata_store_importable(self):
-        from dynastore.models.protocols.metadata_driver import CollectionMetadataStore
-        assert CollectionMetadataStore.__name__ == "CollectionMetadataStore"
+        from dynastore.models.protocols.entity_store import CollectionStore
+        assert CollectionStore.__name__ == "CollectionStore"
 
     def test_protocols_re_exported_from_package(self):
         from dynastore.models.protocols import (
             CollectionItemsStore,
             AssetStore,
-            CollectionMetadataStore,
+            CollectionStore,
         )
         assert CollectionItemsStore.__name__ == "CollectionItemsStore"
         assert AssetStore.__name__ == "AssetStore"
-        assert CollectionMetadataStore.__name__ == "CollectionMetadataStore"
+        assert CollectionStore.__name__ == "CollectionStore"
 
     def test_collection_items_store_re_exported_from_storage(self):
         from dynastore.modules.storage import CollectionItemsStore

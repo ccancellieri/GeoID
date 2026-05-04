@@ -9,7 +9,7 @@ Covers:
 - Write fan-out calls every driver in order, sharing the same
   ``db_resource``.
 - Delete fan-out honours ``soft``.
-- Default driver resolution pulls from ``get_protocols(CatalogMetadataStore)``.
+- Default driver resolution pulls from ``get_protocols(CatalogStore)``.
 - Absence of registered drivers → router no-ops everything (no raise).
 - CatalogRoutingConfig defaults (the other half of M2.3b) point at the
   canonical M2.1 driver names under both WRITE and READ.
@@ -248,7 +248,7 @@ async def test_delete_catalog_metadata_forwards_soft_flag():
 
 
 def test_resolve_catalog_metadata_drivers_goes_through_get_protocols():
-    """Default path resolves every registered CatalogMetadataStore."""
+    """Default path resolves every registered CatalogStore."""
     from dynastore.modules.catalog import catalog_metadata_router as mod
 
     fake_driver = MagicMock()
@@ -259,9 +259,9 @@ def test_resolve_catalog_metadata_drivers_goes_through_get_protocols():
         result = mod._resolve_catalog_metadata_drivers()
     assert result == [fake_driver]
     gp.assert_called_once()
-    # Called with the CatalogMetadataStore protocol — the one arg to get_protocols.
-    from dynastore.models.protocols.metadata_driver import CatalogMetadataStore
-    assert gp.call_args.args[0] is CatalogMetadataStore
+    # Called with the CatalogStore protocol — the one arg to get_protocols.
+    from dynastore.models.protocols.entity_store import CatalogStore
+    assert gp.call_args.args[0] is CatalogStore
 
 
 # ---------------------------------------------------------------------------

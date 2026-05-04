@@ -227,14 +227,14 @@ from unittest.mock import AsyncMock, patch
 def test_get_metadata_accepts_context_kwarg():
     params = inspect.signature(CollectionElasticsearchDriver.get_metadata).parameters
     assert "context" in params, (
-        "get_metadata must accept `context` per CollectionMetadataStore protocol"
+        "get_metadata must accept `context` per CollectionStore protocol"
     )
 
 
 def test_search_metadata_accepts_context_kwarg():
     params = inspect.signature(CollectionElasticsearchDriver.search_metadata).parameters
     assert "context" in params, (
-        "search_metadata must accept `context` per CollectionMetadataStore protocol"
+        "search_metadata must accept `context` per CollectionStore protocol"
     )
 
 

@@ -6,8 +6,8 @@ relocated alongside the drivers that moved to ``modules/stac/`` in
 PR 1b of the STAC-decoupling sequence.
 
 Covers: structural typing, declared capabilities, ``stac_metadata_columns()``
-marker method, sub-Protocol satisfaction (``StacCollectionMetadataCapability``
-/ ``StacCatalogMetadataCapability``), STAC column tuples, payload filter
+marker method, sub-Protocol satisfaction (``StacCollectionEntityStoreCapability``
+/ ``StacCatalogEntityStoreCapability``), STAC column tuples, payload filter
 behaviour, SQL builder smoke tests with a mocked engine, DDL alignment,
 and entry-point discovery at the new location.
 """
@@ -19,13 +19,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from dynastore.extensions.stac.protocols import (
-    StacCatalogMetadataCapability,
-    StacCollectionMetadataCapability,
+    StacCatalogEntityStoreCapability,
+    StacCollectionEntityStoreCapability,
 )
-from dynastore.models.protocols.metadata_driver import (
-    CatalogMetadataStore,
-    CollectionMetadataStore,
-    MetadataCapability,
+from dynastore.models.protocols.entity_store import (
+    CatalogStore,
+    CollectionStore,
+    EntityStoreCapability,
 )
 
 
@@ -37,13 +37,13 @@ class TestStructuralInvariants:
 
         d = CollectionStacPostgresqlDriver()
         assert d._table == "collection_metadata_stac"
-        assert MetadataCapability.SPATIAL_FILTER in d.capabilities
+        assert EntityStoreCapability.SPATIAL_FILTER in d.capabilities
         # STAC collection driver does NOT advertise SEARCH — the CORE
         # driver owns title/description; STAC carries structured fields.
-        assert MetadataCapability.SEARCH not in d.capabilities
+        assert EntityStoreCapability.SEARCH not in d.capabilities
         # Structural typing — base Protocol + STAC sub-Protocol.
-        assert isinstance(d, CollectionMetadataStore)
-        assert isinstance(d, StacCollectionMetadataCapability)
+        assert isinstance(d, CollectionStore)
+        assert isinstance(d, StacCollectionEntityStoreCapability)
 
     def test_catalog_stac_driver_identifies_as_stac_catalog(self):
         from dynastore.modules.stac.drivers.metadata_postgresql import (
@@ -52,12 +52,12 @@ class TestStructuralInvariants:
 
         d = CatalogStacPostgresqlDriver()
         assert d._table == "catalog_metadata_stac"
-        assert isinstance(d, CatalogMetadataStore)
-        assert isinstance(d, StacCatalogMetadataCapability)
+        assert isinstance(d, CatalogStore)
+        assert isinstance(d, StacCatalogEntityStoreCapability)
 
     def test_stac_metadata_columns_marker_returns_columns(self):
         """The ``stac_metadata_columns()`` marker method on the sub-Protocol
-        is what makes ``isinstance(d, StacCollectionMetadataCapability)``
+        is what makes ``isinstance(d, StacCollectionEntityStoreCapability)``
         discriminate STAC drivers from CORE drivers at runtime.
         """
         from dynastore.modules.stac.drivers.metadata_postgresql import (
@@ -77,7 +77,7 @@ class TestStructuralInvariants:
         )
 
     def test_core_driver_does_not_satisfy_stac_capability(self):
-        """``isinstance(core_driver, StacCollectionMetadataCapability)`` must
+        """``isinstance(core_driver, StacCollectionEntityStoreCapability)`` must
         be False — the marker method is the discriminator.
         """
         from dynastore.modules.storage.drivers.metadata_postgresql import (
@@ -86,10 +86,10 @@ class TestStructuralInvariants:
         )
 
         assert not isinstance(
-            CollectionCorePostgresqlDriver(), StacCollectionMetadataCapability
+            CollectionCorePostgresqlDriver(), StacCollectionEntityStoreCapability
         )
         assert not isinstance(
-            CatalogCorePostgresqlDriver(), StacCatalogMetadataCapability
+            CatalogCorePostgresqlDriver(), StacCatalogEntityStoreCapability
         )
 
 

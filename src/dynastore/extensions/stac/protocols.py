@@ -19,9 +19,9 @@
 """STAC capability sub-Protocols — owned by the STAC extension.
 
 Two ``@runtime_checkable`` Protocols extend the core
-``CollectionMetadataStore`` / ``CatalogMetadataStore`` surfaces to mark a
+``CollectionStore`` / ``CatalogStore`` surfaces to mark a
 driver as STAC-slice-capable. STAC code dispatches via
-``isinstance(d, StacCollectionMetadataCapability)`` instead of inspecting
+``isinstance(d, StacCollectionEntityStoreCapability)`` instead of inspecting
 a string ``domain`` ClassVar — class identity, not data identity.
 
 Drivers structurally satisfy these by implementing the base Protocols and
@@ -34,15 +34,15 @@ from __future__ import annotations
 
 from typing import Protocol, Tuple, runtime_checkable
 
-from dynastore.models.protocols.metadata_driver import (
-    CatalogMetadataStore,
-    CollectionMetadataStore,
+from dynastore.models.protocols.entity_store import (
+    CatalogStore,
+    CollectionStore,
 )
 
 
 @runtime_checkable
-class StacCollectionMetadataCapability(CollectionMetadataStore, Protocol):
-    """A ``CollectionMetadataStore`` that persists the STAC slice of metadata.
+class StacCollectionEntityStoreCapability(CollectionStore, Protocol):
+    """A ``CollectionStore`` that persists the STAC slice of metadata.
 
     The PG-tier composition wrapper ``CollectionPostgresqlDriver``
     satisfies this structurally by exposing ``stac_metadata_columns()``
@@ -66,10 +66,10 @@ class StacCollectionMetadataCapability(CollectionMetadataStore, Protocol):
 
 
 @runtime_checkable
-class StacCatalogMetadataCapability(CatalogMetadataStore, Protocol):
-    """A ``CatalogMetadataStore`` that persists the STAC slice of metadata.
+class StacCatalogEntityStoreCapability(CatalogStore, Protocol):
+    """A ``CatalogStore`` that persists the STAC slice of metadata.
 
-    Catalog-tier sibling of ``StacCollectionMetadataCapability``. Same
+    Catalog-tier sibling of ``StacCollectionEntityStoreCapability``. Same
     marker-method discriminator pattern.
     """
 

@@ -36,7 +36,7 @@ Intended uses
   ``DEBUG`` in production to trace which catalogs are being touched
   and by which operation, without adding an ES dependency.
 * **Reference implementation**: ~180 lines of the
-  :class:`CatalogMetadataStore` protocol concretely satisfied.
+  :class:`CatalogStore` protocol concretely satisfied.
   Subsequent real indexers (ES, vector-DB, external search service)
   can copy this shape and swap the log calls for backend I/O.
 
@@ -58,7 +58,7 @@ What this driver does NOT do
 Protocol contract
 -----------------
 
-:class:`CatalogMetadataStore` methods:
+:class:`CatalogStore` methods:
 
 * ``capabilities`` — empty frozenset; the indexer reads nothing,
   writes nothing persistently, and serves no queries.  A future

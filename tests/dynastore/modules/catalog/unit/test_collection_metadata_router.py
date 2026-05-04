@@ -174,13 +174,13 @@ async def test_delete_soft_flag_propagates_to_every_driver():
 
 @pytest.mark.asyncio
 async def test_search_picks_driver_with_matching_capability():
-    from dynastore.models.protocols.metadata_driver import MetadataCapability
+    from dynastore.models.protocols.entity_store import EntityStoreCapability
 
     no_search = MagicMock()
     no_search.capabilities = frozenset()
     no_search.search_metadata = AsyncMock(return_value=([], 0))
     yes_search = MagicMock()
-    yes_search.capabilities = frozenset({MetadataCapability.SEARCH})
+    yes_search.capabilities = frozenset({EntityStoreCapability.SEARCH})
     yes_search.search_metadata = AsyncMock(return_value=([{"id": "c1"}], 1))
 
     rows, total = await search_collection_metadata(

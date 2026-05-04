@@ -107,7 +107,7 @@ curl http://localhost:8000/configs/registry/caching_config
 ```bash
 curl http://localhost:8000/configs/storage/drivers
 ```
-Returns `{ProtocolQualname: {ClassName: DriverInfo}}` for `CollectionItemsStore`, `AssetStore`, and `CollectionMetadataStore` — capabilities, supported operations, hints, availability — for the operator's driver picker.
+Returns `{ProtocolQualname: {ClassName: DriverInfo}}` for `CollectionItemsStore`, `AssetStore`, and `CollectionStore` — capabilities, supported operations, hints, availability — for the operator's driver picker.
 
 ## Quick Start — PostgreSQL Defaults
 

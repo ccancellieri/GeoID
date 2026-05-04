@@ -19,7 +19,7 @@ from dynastore.models.protocols.indexer import (
     ItemIndexer,
     PlatformAssetIndexer,
 )
-from dynastore.models.protocols.metadata_driver import MetadataCapability
+from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.modules.elasticsearch.catalog_es_driver import (
     CatalogElasticsearchDriver,
     CatalogElasticsearchDriverConfig,
@@ -37,16 +37,16 @@ def test_capabilities_set_matches_protocol():
     carry no spatial extent).
     """
     expected = frozenset({
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SOFT_DELETE,
-        MetadataCapability.SEARCH,
-        MetadataCapability.AGGREGATION,
-        MetadataCapability.PHYSICAL_ADDRESSING,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SOFT_DELETE,
+        EntityStoreCapability.SEARCH,
+        EntityStoreCapability.AGGREGATION,
+        EntityStoreCapability.PHYSICAL_ADDRESSING,
     })
     assert CatalogElasticsearchDriver.capabilities == expected
     # SPATIAL_FILTER must NOT be advertised — would mislead the router.
-    assert MetadataCapability.SPATIAL_FILTER not in CatalogElasticsearchDriver.capabilities
+    assert EntityStoreCapability.SPATIAL_FILTER not in CatalogElasticsearchDriver.capabilities
 
 
 def test_marker_opt_in_catalog_only():
@@ -80,7 +80,7 @@ def test_get_catalog_metadata_accepts_context_kwarg():
         CatalogElasticsearchDriver.get_catalog_metadata,
     ).parameters
     assert "context" in params, (
-        "get_catalog_metadata must accept `context` per CatalogMetadataStore protocol"
+        "get_catalog_metadata must accept `context` per CatalogStore protocol"
     )
 
 

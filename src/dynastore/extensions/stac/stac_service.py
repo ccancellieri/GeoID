@@ -95,7 +95,7 @@ def _assert_stac_capable_metadata_stack() -> None:
     ``stac_extensions``, ``conforms_to``, ``links``, and ``assets`` of
     the catalog itself must land somewhere, or the STAC catalog is
     meaningless.  Fail with HTTPException(422) if no registered
-    ``CatalogMetadataStore`` satisfies ``StacCatalogMetadataCapability``.
+    ``CatalogStore`` satisfies ``StacCatalogEntityStoreCapability``.
 
     The collection tier is a **soft requirement**: a STAC catalog can
     legitimately exist with zero STAC collections at create time
@@ -113,12 +113,12 @@ def _assert_stac_capable_metadata_stack() -> None:
     ``*MetadataPgSidecarRegistry`` try-import (PR 1e steps 3b+3c).
     """
     from dynastore.extensions.stac.protocols import (
-        StacCatalogMetadataCapability,
-        StacCollectionMetadataCapability,
+        StacCatalogEntityStoreCapability,
+        StacCollectionEntityStoreCapability,
     )
-    from dynastore.models.protocols.metadata_driver import (
-        CatalogMetadataStore,
-        CollectionMetadataStore,
+    from dynastore.models.protocols.entity_store import (
+        CatalogStore,
+        CollectionStore,
     )
 
     def _has_stac(proto_cls: type, capability_cls: type) -> bool:
@@ -144,13 +144,13 @@ def _assert_stac_capable_metadata_stack() -> None:
                 return True
         return False
 
-    if not _has_stac(CatalogMetadataStore, StacCatalogMetadataCapability):
+    if not _has_stac(CatalogStore, StacCatalogEntityStoreCapability):
         raise HTTPException(
             status_code=422,
             detail=(
                 "STAC catalog creation requires a registered "
-                "CatalogMetadataStore driver implementing "
-                "StacCatalogMetadataCapability and exposing non-empty "
+                "CatalogStore driver implementing "
+                "StacCatalogEntityStoreCapability and exposing non-empty "
                 "stac_metadata_columns().  The default PG deployment "
                 "satisfies this via CatalogPostgresqlDriver once the "
                 "stac extra is installed (the wrapper composes the "
@@ -159,15 +159,15 @@ def _assert_stac_capable_metadata_stack() -> None:
                 "check the routing config."
             ),
         )
-    if not _has_stac(CollectionMetadataStore, StacCollectionMetadataCapability):
+    if not _has_stac(CollectionStore, StacCollectionEntityStoreCapability):
         logger.warning(
             "STAC catalog creation proceeding without a STAC-capable "
-            "CollectionMetadataStore driver.  Adding a STAC collection "
+            "CollectionStore driver.  Adding a STAC collection "
             "under this catalog will drop the STAC slice on write.  "
             "Default PG deployment satisfies this via "
             "CollectionPostgresqlDriver once the stac extra is "
             "installed; install ``dynastore[module_stac]`` or register "
-            "an equivalent implementing StacCollectionMetadataCapability "
+            "an equivalent implementing StacCollectionEntityStoreCapability "
             "before creating STAC collections."
         )
 

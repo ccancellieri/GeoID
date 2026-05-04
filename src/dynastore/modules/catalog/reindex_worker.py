@@ -61,7 +61,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dynastore.models.protocols.driver_roles import DriverSla
-from dynastore.models.protocols.metadata_driver import CatalogMetadataStore
+from dynastore.models.protocols.entity_store import CatalogStore
 from dynastore.modules.storage.routing_config import (
     CatalogRoutingConfig, Operation, OperationDriverEntry,
 )
@@ -146,7 +146,7 @@ class ReindexWorker:
         """
         Args:
             resolve_indexers: Callable returning
-                ``List[Tuple[OperationDriverEntry, CatalogMetadataStore]]``.
+                ``List[Tuple[OperationDriverEntry, CatalogStore]]``.
 
                 May be either SYNC (``() -> List[...]``) or ASYNC
                 (``async def resolve(*, catalog_id=None) -> List[...]``).
@@ -239,7 +239,7 @@ class ReindexWorker:
                 errors=["missing catalog_id"],
             )
 
-        indexers: List[Tuple[OperationDriverEntry, CatalogMetadataStore]]
+        indexers: List[Tuple[OperationDriverEntry, CatalogStore]]
         try:
             # ``resolve_indexers`` may be sync (test-injected callable)
             # or async (production — ``_resolve_catalog_indexers`` awaits
@@ -351,7 +351,7 @@ class ReindexWorker:
         self,
         *,
         entry: OperationDriverEntry,
-        driver: CatalogMetadataStore,
+        driver: CatalogStore,
         catalog_id: str,
         envelope: Optional[Dict[str, Any]],
         operation: str,
@@ -418,7 +418,7 @@ class ReindexWorker:
 
 def _resolve_entry_sla(
     entry: OperationDriverEntry,
-    driver: CatalogMetadataStore,
+    driver: CatalogStore,
 ) -> Optional[DriverSla]:
     """Pick the effective SLA: per-entry override, then class default."""
     if entry.sla is not None:
@@ -463,7 +463,7 @@ def _apply_sla_policy(
 async def _resolve_catalog_indexers(
     *,
     catalog_id: Optional[str] = None,
-) -> List[Tuple[OperationDriverEntry, CatalogMetadataStore]]:
+) -> List[Tuple[OperationDriverEntry, CatalogStore]]:
     """Return the (entry, driver) pairs configured under INDEX for catalogs.
 
     Resolution order mirrors the collection-tier router
@@ -480,7 +480,7 @@ async def _resolve_catalog_indexers(
        entries, so the worker becomes a no-op rather than crashing.
 
     Filters to driver_ids that are actually registered via
-    ``get_protocols(CatalogMetadataStore)``; unregistered entries are
+    ``get_protocols(CatalogStore)``; unregistered entries are
     logged and dropped.
     """
     from dynastore.tools.discovery import get_protocol, get_protocols
@@ -512,15 +512,15 @@ async def _resolve_catalog_indexers(
         return []
 
     driver_index = {
-        _to_snake(type(d).__name__): d for d in get_protocols(CatalogMetadataStore)
+        _to_snake(type(d).__name__): d for d in get_protocols(CatalogStore)
     }
-    resolved: List[Tuple[OperationDriverEntry, CatalogMetadataStore]] = []
+    resolved: List[Tuple[OperationDriverEntry, CatalogStore]] = []
     for entry in entries:
         driver = driver_index.get(entry.driver_id)
         if driver is None:
             logger.warning(
                 "CatalogRoutingConfig INDEX entry %r is not a registered "
-                "CatalogMetadataStore — skipping",
+                "CatalogStore — skipping",
                 entry.driver_id,
             )
             continue

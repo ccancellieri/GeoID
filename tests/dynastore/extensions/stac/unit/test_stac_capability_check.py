@@ -1,8 +1,8 @@
 """Unit tests for the STAC catalog-creation capability precheck.
 
 ``_assert_stac_capable_metadata_stack`` refuses a STAC catalog create
-when the ``CatalogMetadataStore`` registry has no driver implementing
-``StacCatalogMetadataCapability`` (the sub-Protocol owned by the STAC
+when the ``CatalogStore`` registry has no driver implementing
+``StacCatalogEntityStoreCapability`` (the sub-Protocol owned by the STAC
 extension at ``extensions/stac/protocols.py``). Default PG deployment
 satisfies the check once the ``modules/stac/`` module is loaded
 (STAC PG drivers register at both tiers via ``StacModule.lifespan``);
@@ -18,8 +18,8 @@ import pytest
 from fastapi import HTTPException
 
 from dynastore.extensions.stac.protocols import (
-    StacCatalogMetadataCapability,
-    StacCollectionMetadataCapability,
+    StacCatalogEntityStoreCapability,
+    StacCollectionEntityStoreCapability,
 )
 from dynastore.extensions.stac.stac_service import (
     _assert_stac_capable_metadata_stack,
@@ -46,13 +46,13 @@ def _core_driver():
 
 
 def test_raises_when_no_catalog_stac_driver_registered():
-    """No CatalogMetadataStore satisfying StacCatalogMetadataCapability → reject."""
+    """No CatalogStore satisfying StacCatalogEntityStoreCapability → reject."""
 
     def _get_protocols(proto_cls):
         # Collection-tier has a STAC driver; catalog-tier does not.
-        if proto_cls.__name__ == "CatalogMetadataStore":
+        if proto_cls.__name__ == "CatalogStore":
             return [_core_driver()]
-        return [_stac_driver(StacCollectionMetadataCapability)]
+        return [_stac_driver(StacCollectionEntityStoreCapability)]
 
     with patch(
         "dynastore.extensions.stac.stac_service.get_protocols",
@@ -62,16 +62,16 @@ def test_raises_when_no_catalog_stac_driver_registered():
             _assert_stac_capable_metadata_stack()
 
     assert exc.value.status_code == 422
-    assert "StacCatalogMetadataCapability" in exc.value.detail
+    assert "StacCatalogEntityStoreCapability" in exc.value.detail
 
 
 def test_warns_but_proceeds_when_no_collection_stac_driver_registered(caplog):
     """Missing collection-tier STAC driver is a WARNING, not a reject."""
 
     def _get_protocols(proto_cls):
-        if proto_cls.__name__ == "CollectionMetadataStore":
+        if proto_cls.__name__ == "CollectionStore":
             return [_core_driver()]
-        return [_stac_driver(StacCatalogMetadataCapability)]
+        return [_stac_driver(StacCatalogEntityStoreCapability)]
 
     with patch(
         "dynastore.extensions.stac.stac_service.get_protocols",
@@ -81,7 +81,7 @@ def test_warns_but_proceeds_when_no_collection_stac_driver_registered(caplog):
             _assert_stac_capable_metadata_stack()  # should not raise
 
     assert any(
-        "StacCollectionMetadataCapability" in r.message
+        "StacCollectionEntityStoreCapability" in r.message
         for r in caplog.records
     )
 
@@ -90,9 +90,9 @@ def test_passes_when_both_tiers_have_stac_driver():
     """Default PG config: STAC drivers at both tiers → no raise."""
 
     def _get_protocols(proto_cls):
-        if proto_cls.__name__ == "CatalogMetadataStore":
-            return [_core_driver(), _stac_driver(StacCatalogMetadataCapability)]
-        return [_core_driver(), _stac_driver(StacCollectionMetadataCapability)]
+        if proto_cls.__name__ == "CatalogStore":
+            return [_core_driver(), _stac_driver(StacCatalogEntityStoreCapability)]
+        return [_core_driver(), _stac_driver(StacCollectionEntityStoreCapability)]
 
     with patch(
         "dynastore.extensions.stac.stac_service.get_protocols",
@@ -112,7 +112,7 @@ def test_raises_when_registry_empty_on_catalog_tier():
             _assert_stac_capable_metadata_stack()
 
     assert exc.value.status_code == 422
-    assert "StacCatalogMetadataCapability" in exc.value.detail
+    assert "StacCatalogEntityStoreCapability" in exc.value.detail
 
 
 def test_warns_when_collection_wrapper_satisfies_capability_but_returns_empty_columns(caplog):
@@ -131,9 +131,9 @@ def test_warns_when_collection_wrapper_satisfies_capability_but_returns_empty_co
             return ()
 
     def _get_protocols(proto_cls):
-        if proto_cls.__name__ == "CollectionMetadataStore":
+        if proto_cls.__name__ == "CollectionStore":
             return [_CapableButEmptyWrapper()]
-        return [_stac_driver(StacCatalogMetadataCapability)]
+        return [_stac_driver(StacCatalogEntityStoreCapability)]
 
     with patch(
         "dynastore.extensions.stac.stac_service.get_protocols",
@@ -143,6 +143,6 @@ def test_warns_when_collection_wrapper_satisfies_capability_but_returns_empty_co
             _assert_stac_capable_metadata_stack()  # should not raise
 
     assert any(
-        "StacCollectionMetadataCapability" in r.message
+        "StacCollectionEntityStoreCapability" in r.message
         for r in caplog.records
     ), "WARNING must fire when the wrapper exposes the marker but returns empty columns"

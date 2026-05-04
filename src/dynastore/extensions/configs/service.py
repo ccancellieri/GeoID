@@ -556,12 +556,12 @@ class ConfigsService(ExtensionProtocol):
 
         Response shape: ``{ProtocolQualname: {class_name: DriverInfo}}``.
         Keys are the ``__qualname__`` of ``CollectionItemsStore``, ``AssetStore``,
-        and ``CollectionMetadataStore``.  Use the inner class names as driver_id
+        and ``CollectionStore``.  Use the inner class names as driver_id
         values in the routing config's operations list.
         """
         from dynastore.extensions.configs.dto import DriverInfo, DriverListResponse
         from dynastore.models.protocols.asset_driver import AssetStore
-        from dynastore.models.protocols.metadata_driver import CollectionMetadataStore
+        from dynastore.models.protocols.entity_store import CollectionStore
         from dynastore.models.protocols.storage_driver import CollectionItemsStore
         from dynastore.modules.storage.routing_config import derive_supported_operations
         from dynastore.tools.discovery import get_all_protocols
@@ -623,9 +623,9 @@ class ConfigsService(ExtensionProtocol):
                 _driver_id(d): _routable_info(d, _config_key(d), d.is_available())
                 for d in get_all_protocols(AssetStore)
             },
-            CollectionMetadataStore.__qualname__: {
+            CollectionStore.__qualname__: {
                 _driver_id(d): _metadata_info(d, await d.is_available())
-                for d in get_all_protocols(CollectionMetadataStore)
+                for d in get_all_protocols(CollectionStore)
             },
         }
 

@@ -12,7 +12,7 @@ Bug observed on review env 2026-04-30:
 These tests pin the contract that ``update_provisioning_status``:
   1. writes the source-of-truth row in ``catalog.catalogs``
   2. fans the change out via ``catalog_metadata_router.upsert_catalog_metadata``
-     so every CatalogMetadataStore driver (PG CORE, PG STAC, ES indexer)
+     so every CatalogStore driver (PG CORE, PG STAC, ES indexer)
      stays in sync with the row
 
 Also pins that ``provisioning_status`` is in the metadata payload built

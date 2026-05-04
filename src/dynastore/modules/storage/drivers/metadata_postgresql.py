@@ -61,10 +61,10 @@ import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from dynastore.models.driver_context import DriverContext
-from dynastore.models.protocols.metadata_driver import (
-    CatalogMetadataStore,
-    CollectionMetadataStore,
-    MetadataCapability,
+from dynastore.models.protocols.entity_store import (
+    CatalogStore,
+    CollectionStore,
+    EntityStoreCapability,
 )
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.modules.db_config.query_executor import (
@@ -163,7 +163,7 @@ def _filter_payload(
     on the next write.  A partial update that only carries ``{"title":
     "T2"}`` must leave existing ``description`` / ``keywords`` / … rows
     untouched.  This is the "PATCH, not PUT" semantic the
-    :class:`CatalogMetadataStore.upsert_catalog_metadata` contract
+    :class:`CatalogStore.upsert_catalog_metadata` contract
     assumes (the protocol doc calls it a "write or update").
     """
     return {k: metadata[k] for k in columns if metadata.get(k) is not None}
@@ -204,7 +204,7 @@ class _PgCollectionMetadataBase:
     ``domain`` ClassVar) live on the concrete subclasses; this base
     handles the CRUD bodies that don't vary by domain.
 
-    The class explicitly does NOT inherit ``CollectionMetadataStore`` —
+    The class explicitly does NOT inherit ``CollectionStore`` —
     that protocol is a structural ``typing.Protocol`` (`runtime_checkable`)
     and instances of the concrete subclasses satisfy it via duck-typing.
     """
@@ -440,13 +440,13 @@ class CollectionCorePostgresqlDriver(
     _columns: ClassVar[Tuple[str, ...]] = _COLLECTION_CORE_COLUMNS
 
     capabilities: FrozenSet[str] = frozenset({
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SEARCH,
-        MetadataCapability.SEARCH_EXACT,
-        MetadataCapability.SOFT_DELETE,
-        MetadataCapability.PHYSICAL_ADDRESSING,
-        MetadataCapability.QUERY_FALLBACK_SOURCE,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SEARCH,
+        EntityStoreCapability.SEARCH_EXACT,
+        EntityStoreCapability.SOFT_DELETE,
+        EntityStoreCapability.PHYSICAL_ADDRESSING,
+        EntityStoreCapability.QUERY_FALLBACK_SOURCE,
     })
 
     async def search_metadata(
@@ -658,10 +658,10 @@ class CatalogCorePostgresqlDriver(
     _columns: ClassVar[Tuple[str, ...]] = _CATALOG_CORE_COLUMNS
 
     capabilities: FrozenSet[str] = frozenset({
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SOFT_DELETE,
-        MetadataCapability.QUERY_FALLBACK_SOURCE,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SOFT_DELETE,
+        EntityStoreCapability.QUERY_FALLBACK_SOURCE,
     })
 
 

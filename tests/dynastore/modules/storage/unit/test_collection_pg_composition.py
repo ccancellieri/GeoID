@@ -15,9 +15,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from dynastore.models.protocols.metadata_driver import (
-    CollectionMetadataStore,
-    MetadataCapability,
+from dynastore.models.protocols.entity_store import (
+    CollectionStore,
+    EntityStoreCapability,
 )
 from dynastore.modules.storage.drivers.collection_metadata_postgresql import (
     CollectionPostgresqlDriver,
@@ -29,7 +29,7 @@ from dynastore.modules.storage.drivers.collection_metadata_postgresql import (
 
 
 # ---------------------------------------------------------------------------
-# Test doubles — minimal CollectionMetadataStore stand-ins
+# Test doubles — minimal CollectionStore stand-ins
 # ---------------------------------------------------------------------------
 
 
@@ -46,9 +46,9 @@ class _FakeInner:
     ):
         self.slice_value = slice_value
         self.capabilities = capabilities or frozenset({
-            MetadataCapability.READ,
-            MetadataCapability.WRITE,
-            MetadataCapability.SOFT_DELETE,
+            EntityStoreCapability.READ,
+            EntityStoreCapability.WRITE,
+            EntityStoreCapability.SOFT_DELETE,
         })
         self.upsert_calls: List[Dict[str, Any]] = []
         self.delete_calls: List[Dict[str, Any]] = []
@@ -115,9 +115,9 @@ class _FakeCoreCls:
             cls._instance = _FakeInner(
                 slice_value={"title": "core-title", "description": "core-desc"},
                 capabilities=frozenset({
-                    MetadataCapability.READ, MetadataCapability.WRITE,
-                    MetadataCapability.SEARCH, MetadataCapability.SOFT_DELETE,
-                    MetadataCapability.PHYSICAL_ADDRESSING,
+                    EntityStoreCapability.READ, EntityStoreCapability.WRITE,
+                    EntityStoreCapability.SEARCH, EntityStoreCapability.SOFT_DELETE,
+                    EntityStoreCapability.PHYSICAL_ADDRESSING,
                 }),
             )
         return cls._instance
@@ -131,8 +131,8 @@ class _FakeStacCls:
             cls._instance = _FakeInner(
                 slice_value={"extent": {"bbox": [[1, 2, 3, 4]]}, "providers": []},
                 capabilities=frozenset({
-                    MetadataCapability.READ, MetadataCapability.WRITE,
-                    MetadataCapability.SPATIAL_FILTER, MetadataCapability.SOFT_DELETE,
+                    EntityStoreCapability.READ, EntityStoreCapability.WRITE,
+                    EntityStoreCapability.SPATIAL_FILTER, EntityStoreCapability.SOFT_DELETE,
                 }),
             )
         return cls._instance
@@ -190,12 +190,12 @@ def test_capabilities_union_covers_inner_capabilities():
     """
     caps = CollectionPostgresqlDriver.capabilities
     for required in (
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SOFT_DELETE,
-        MetadataCapability.SEARCH,         # CORE
-        MetadataCapability.SPATIAL_FILTER, # STAC
-        MetadataCapability.PHYSICAL_ADDRESSING,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SOFT_DELETE,
+        EntityStoreCapability.SEARCH,         # CORE
+        EntityStoreCapability.SPATIAL_FILTER, # STAC
+        EntityStoreCapability.PHYSICAL_ADDRESSING,
     ):
         assert required in caps
 
@@ -283,10 +283,10 @@ async def test_get_metadata_swallows_per_inner_failure_and_returns_other_slices(
     """An inner driver crashing on read must not blank out the whole
     response — mirrors the router's `_safe_get` graceful-degrade shape.
     """
-    failing = AsyncMock(spec=CollectionMetadataStore)
+    failing = AsyncMock(spec=CollectionStore)
     failing.get_metadata.side_effect = RuntimeError("boom")
     failing.is_available.return_value = True
-    failing.capabilities = frozenset({MetadataCapability.READ})
+    failing.capabilities = frozenset({EntityStoreCapability.READ})
 
     class _FailingCls:
         def __new__(cls):  # type: ignore[misc]
@@ -322,10 +322,10 @@ async def test_search_metadata_delegates_to_first_search_capable_inner():
 
 async def test_search_metadata_returns_empty_when_no_inner_has_search():
     _FakeCoreCls._instance = _FakeInner(
-        capabilities=frozenset({MetadataCapability.READ}),
+        capabilities=frozenset({EntityStoreCapability.READ}),
     )
     _FakeStacCls._instance = _FakeInner(
-        capabilities=frozenset({MetadataCapability.READ}),
+        capabilities=frozenset({EntityStoreCapability.READ}),
     )
     driver = CollectionPostgresqlDriver()
     rows, total = await driver.search_metadata("cat-a", q="foo")
@@ -361,10 +361,10 @@ def test_wrapper_config_default_sidecars_is_empty_list():
 
 # ---------------------------------------------------------------------------
 # STAC capability marker — wrapper must structurally satisfy
-# ``StacCollectionMetadataCapability`` IFF a STAC inner is loaded.
+# ``StacCollectionEntityStoreCapability`` IFF a STAC inner is loaded.
 # Regression guard for PR 1e step 3b: before the fix, the wrapper had no
 # ``stac_metadata_columns`` method, so ``isinstance(wrapper,
-# StacCollectionMetadataCapability)`` returned False and
+# StacCollectionEntityStoreCapability)`` returned False and
 # ``stac_service._assert_stac_capable_metadata_stack`` warned
 # "STAC slice will be dropped on write" even though the wrapper's
 # STAC sidecar actually persisted it.
@@ -373,7 +373,7 @@ def test_wrapper_config_default_sidecars_is_empty_list():
 
 def test_wrapper_satisfies_stac_capability_when_stac_inner_loaded():
     from dynastore.extensions.stac.protocols import (
-        StacCollectionMetadataCapability,
+        StacCollectionEntityStoreCapability,
     )
 
     # Make the STAC fake actually expose the marker method so the wrapper
@@ -385,7 +385,7 @@ def test_wrapper_satisfies_stac_capability_when_stac_inner_loaded():
         _FakeStacCls._instance, _FakeInner,
     )
     driver = CollectionPostgresqlDriver()
-    assert isinstance(driver, StacCollectionMetadataCapability)
+    assert isinstance(driver, StacCollectionEntityStoreCapability)
     cols = driver.stac_metadata_columns()
     assert "extent" in cols
     assert "stac_version" in cols
@@ -564,7 +564,7 @@ async def test_registry_default_used_when_no_operator_override():
 
 
 # ---------------------------------------------------------------------------
-# Discovery integration — wrapper IS the discovered CollectionMetadataStore
+# Discovery integration — wrapper IS the discovered CollectionStore
 # plugin after register_plugin().  Closes a real gap: existing router tests
 # inject mocks via ``drivers=`` and don't exercise the production discovery
 # path.  This test catches "I forgot to register the wrapper" or "I forgot
@@ -574,13 +574,13 @@ async def test_registry_default_used_when_no_operator_override():
 
 
 async def test_wrapper_is_discoverable_via_get_protocols():
-    """Verify ``get_protocols(CollectionMetadataStore)`` returns the
+    """Verify ``get_protocols(CollectionStore)`` returns the
     wrapper after ``register_plugin``, NOT a raw inner driver.  Mirrors
     the production discovery path that ``collection_metadata_router._resolve_drivers``
     uses when called without an explicit ``drivers=`` kwarg.
     """
-    from dynastore.models.protocols.metadata_driver import (
-        CollectionMetadataStore,
+    from dynastore.models.protocols.entity_store import (
+        CollectionStore,
     )
     from dynastore.tools.discovery import (
         get_protocols,
@@ -591,11 +591,11 @@ async def test_wrapper_is_discoverable_via_get_protocols():
     wrapper = CollectionPostgresqlDriver()
     register_plugin(wrapper)
     try:
-        discovered = list(get_protocols(CollectionMetadataStore))
+        discovered = list(get_protocols(CollectionStore))
         # Wrapper IS in the discovery results.
         assert wrapper in discovered
         # And every PG-tier discovered instance is a wrapper, not a raw inner.
-        # (Other CollectionMetadataStore implementers — e.g. ES drivers — may
+        # (Other CollectionStore implementers — e.g. ES drivers — may
         # also appear; this test only pins the PG-tier shape.)
         from dynastore.modules.storage.drivers.metadata_postgresql import (
             CollectionCorePostgresqlDriver,

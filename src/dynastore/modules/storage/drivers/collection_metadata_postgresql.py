@@ -22,7 +22,7 @@
 metadata drivers (``CollectionCorePostgresqlDriver`` plus the optional
 ``CollectionStacPostgresqlDriver`` from the stac module) and fans CRUD
 out across them at write/read/delete time.  The two inner drivers
-already implement :class:`CollectionMetadataStore` directly today; this
+already implement :class:`CollectionStore` directly today; this
 class is purely a composition layer so that operators can list ONE
 ``driver_id`` in routing config instead of two and tune the active set
 via a single ``sidecars`` discriminated union on the wrapper config.
@@ -30,7 +30,7 @@ via a single ``sidecars`` discriminated union on the wrapper config.
 As of PR 1e step 3b this driver IS entry-point-registered (group
 ``dynastore.modules``, name ``collection_postgresql``); the two raw
 inner drivers' entry-points were removed in the same change so that
-``get_protocols(CollectionMetadataStore)`` returns only the wrapper.
+``get_protocols(CollectionStore)`` returns only the wrapper.
 The catalog-tier raw drivers stay entry-point-registered until step
 3c lands ``CatalogPostgresqlDriver``.
 
@@ -47,7 +47,7 @@ naming, per-feature DDL evolution) is items-specific and the wrong
 abstraction for tenant-schema-keyed metadata tables whose DDL is
 created out-of-band by ``modules.catalog.db_init.metadata_domain_split``
 at catalog provisioning time.  Each "metadata sidecar" here is an
-ALREADY-EXISTING ``CollectionMetadataStore`` driver whose own column
+ALREADY-EXISTING ``CollectionStore`` driver whose own column
 filter (``_PgCollectionMetadataBase._filter_payload``) handles the
 per-domain slicing.
 """
@@ -72,9 +72,9 @@ from typing import (
 
 from pydantic import BaseModel, Discriminator, Field, model_validator
 
-from dynastore.models.protocols.metadata_driver import (
-    CollectionMetadataStore,
-    MetadataCapability,
+from dynastore.models.protocols.entity_store import (
+    CollectionStore,
+    EntityStoreCapability,
 )
 from dynastore.models.protocols.typed_driver import (
     TypedDriver,
@@ -151,12 +151,12 @@ _PgMetadataSidecarConfig = Annotated[
 
 
 class MetadataPgSidecarRegistry:
-    """Registry mapping ``sidecar_type`` to inner ``CollectionMetadataStore``
+    """Registry mapping ``sidecar_type`` to inner ``CollectionStore``
     classes.  STAC entry uses try-import so the wrapper works in deployments
     without the stac extra installed.
     """
 
-    _registry: Dict[str, Type[CollectionMetadataStore]] = {}
+    _registry: Dict[str, Type[CollectionStore]] = {}
     _defaults_loaded: bool = False
 
     @classmethod
@@ -188,13 +188,13 @@ class MetadataPgSidecarRegistry:
     @classmethod
     def get_driver_cls(
         cls, sidecar_type: str,
-    ) -> Optional[Type[CollectionMetadataStore]]:
+    ) -> Optional[Type[CollectionStore]]:
         cls._ensure_defaults()
         return cls._registry.get(sidecar_type)
 
     @classmethod
     def register(
-        cls, sidecar_type: str, driver_cls: Type[CollectionMetadataStore],
+        cls, sidecar_type: str, driver_cls: Type[CollectionStore],
     ) -> None:
         """Register a new metadata sidecar type — used by extensions that
         contribute a new domain slice (mirrors items-tier
@@ -310,7 +310,7 @@ CollectionPostgresqlDriverConfig.register_apply_handler(
 
 
 class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
-    """Composition driver: fans CollectionMetadataStore CRUD across the
+    """Composition driver: fans CollectionStore CRUD across the
     configured PG metadata sidecars (``metadata_core``, optionally
     ``metadata_stac``, plus any extension-contributed sidecar registered
     via :meth:`MetadataPgSidecarRegistry.register`).
@@ -326,21 +326,21 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
     """
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SOFT_DELETE,
-        MetadataCapability.SEARCH,
-        MetadataCapability.SEARCH_EXACT,
-        MetadataCapability.SPATIAL_FILTER,
-        MetadataCapability.PHYSICAL_ADDRESSING,
-        MetadataCapability.QUERY_FALLBACK_SOURCE,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SOFT_DELETE,
+        EntityStoreCapability.SEARCH,
+        EntityStoreCapability.SEARCH_EXACT,
+        EntityStoreCapability.SPATIAL_FILTER,
+        EntityStoreCapability.PHYSICAL_ADDRESSING,
+        EntityStoreCapability.QUERY_FALLBACK_SOURCE,
     })
 
     def _resolve_inner_drivers(
         self, sidecars: Optional[List[_PgMetadataSidecarConfigBase]] = None,
-    ) -> List[CollectionMetadataStore]:
+    ) -> List[CollectionStore]:
         """Resolve the configured ``sidecars`` list to instantiated inner
-        ``CollectionMetadataStore`` driver instances.
+        ``CollectionStore`` driver instances.
 
         ``sidecars=None`` (or empty) falls back to
         :meth:`MetadataPgSidecarRegistry.default_sidecars`.
@@ -357,7 +357,7 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
         """
         if not sidecars:
             sidecars = MetadataPgSidecarRegistry.default_sidecars()
-        out: List[CollectionMetadataStore] = []
+        out: List[CollectionStore] = []
         for cfg in sidecars:
             sc_type = getattr(cfg, "sidecar_type", None)
             if sc_type is None:
@@ -378,7 +378,7 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
         return out
 
     @cached_property
-    def _default_inner_drivers(self) -> List[CollectionMetadataStore]:
+    def _default_inner_drivers(self) -> List[CollectionStore]:
         """Cached registry-default resolution — used by code paths that
         have NO ``catalog_id`` in scope (``is_available``,
         ``stac_metadata_columns``).  Per-catalog paths go through
@@ -398,7 +398,7 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
         catalog_id: str,
         *,
         db_resource: Optional[Any] = None,
-    ) -> List[CollectionMetadataStore]:
+    ) -> List[CollectionStore]:
         """Resolve the inner driver list for ``catalog_id`` honoring any
         operator-submitted ``sidecars`` override at the catalog or
         platform scope.
@@ -545,7 +545,7 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
         )
         for inner in inners:
             inner_caps = getattr(inner, "capabilities", frozenset())
-            if MetadataCapability.SEARCH in inner_caps:
+            if EntityStoreCapability.SEARCH in inner_caps:
                 return await inner.search_metadata(
                     catalog_id,
                     q=q, bbox=bbox, datetime_range=datetime_range,
@@ -573,7 +573,7 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
         inners = await self._resolve_sidecars_for_catalog(catalog_id)
         for inner in inners:
             inner_caps = getattr(inner, "capabilities", frozenset())
-            if MetadataCapability.PHYSICAL_ADDRESSING in inner_caps:
+            if EntityStoreCapability.PHYSICAL_ADDRESSING in inner_caps:
                 return await inner.location(catalog_id, collection_id)
         return StorageLocation(
             backend="postgresql",
@@ -599,8 +599,8 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
         driver that exposes it.
 
         Defining this method makes the wrapper structurally satisfy
-        :class:`extensions.stac.protocols.StacCollectionMetadataCapability`,
-        so ``get_protocols(CollectionMetadataStore)`` -> isinstance check
+        :class:`extensions.stac.protocols.StacCollectionEntityStoreCapability`,
+        so ``get_protocols(CollectionStore)`` -> isinstance check
         in ``stac_service._assert_stac_capable_metadata_stack`` keeps
         working after the wrapper replaces the raw STAC driver in the
         plugin registry.

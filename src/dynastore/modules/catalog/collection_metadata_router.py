@@ -20,7 +20,7 @@
 Collection-tier metadata router — fan-out across registered drivers.
 
 Mirror of :mod:`catalog_metadata_router` at the collection tier.  Every
-registered :class:`CollectionMetadataStore` driver receives WRITE / DELETE
+registered :class:`CollectionStore` driver receives WRITE / DELETE
 fan-outs and contributes its slice on READ; the router merges per-domain
 dicts into the envelope returned to callers.  Default deployment
 registers :class:`CollectionPostgresqlDriver` (the composition wrapper
@@ -40,9 +40,9 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from dynastore.models.protocols.metadata_driver import (
-    CollectionMetadataStore,
-    MetadataCapability,
+from dynastore.models.protocols.entity_store import (
+    CollectionStore,
+    EntityStoreCapability,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,13 +58,13 @@ _MISSING_DRIVERS_LOGGED: Dict[str, bool] = {
 
 
 def _filter_capable(
-    drivers: List[CollectionMetadataStore],
+    drivers: List[CollectionStore],
     capability: str,
-) -> List[CollectionMetadataStore]:
+) -> List[CollectionStore]:
     """Keep only drivers declaring ``capability`` — TRANSFORM-only drivers
     (e.g. ``BigQueryMetadataTransformDriver``) must never reach the WRITE
-    / DELETE fan-out.  See ``TransformOnlyCollectionMetadataStoreMixin``
-    in ``models/protocols/metadata_driver.py`` — its raising stubs are a
+    / DELETE fan-out.  See ``TransformOnlyCollectionStoreMixin``
+    in ``models/protocols/entity_store.py`` — its raising stubs are a
     bug-catcher; routers MUST honour the capability contract before
     invocation.
     """
@@ -72,13 +72,13 @@ def _filter_capable(
             if capability in getattr(d, "capabilities", frozenset())]
 
 
-def _resolve_drivers() -> List[CollectionMetadataStore]:
+def _resolve_drivers() -> List[CollectionStore]:
     from dynastore.tools.discovery import get_protocols
 
-    drivers = list(get_protocols(CollectionMetadataStore))
+    drivers = list(get_protocols(CollectionStore))
     if not drivers and not _MISSING_DRIVERS_LOGGED["collection"]:
         logger.error(
-            "No CollectionMetadataStore drivers registered; collection-"
+            "No CollectionStore drivers registered; collection-"
             "metadata router will no-op all operations.  Check that "
             "metadata_postgresql imports cleanly and its entry-points "
             "are installed."
@@ -93,7 +93,7 @@ async def get_collection_metadata(
     *,
     context: Optional[Dict[str, Any]] = None,
     db_resource: Optional[Any] = None,
-    drivers: Optional[List[CollectionMetadataStore]] = None,
+    drivers: Optional[List[CollectionStore]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Merge every registered driver's READ slice into a single envelope.
 
@@ -113,7 +113,7 @@ async def get_collection_metadata(
     if not drivers:
         return None
 
-    async def _safe_get(d: CollectionMetadataStore) -> Optional[Dict[str, Any]]:
+    async def _safe_get(d: CollectionStore) -> Optional[Dict[str, Any]]:
         try:
             return await d.get_metadata(
                 catalog_id, collection_id,
@@ -149,7 +149,7 @@ async def upsert_collection_metadata(
     metadata: Dict[str, Any],
     *,
     db_resource: Optional[Any] = None,
-    drivers: Optional[List[CollectionMetadataStore]] = None,
+    drivers: Optional[List[CollectionStore]] = None,
 ) -> None:
     """Fan-out WRITE across every registered driver (sequential, fail-fast).
 
@@ -164,16 +164,16 @@ async def upsert_collection_metadata(
     suppression — callers at the service layer decide whether the write
     is fatal to their request.
 
-    Only drivers declaring ``MetadataCapability.WRITE`` participate in
+    Only drivers declaring ``EntityStoreCapability.WRITE`` participate in
     the fan-out.  TRANSFORM-only drivers never receive ``upsert_metadata``
     — they'd raise ``NotImplementedError`` from the mixin stub.
     """
     if drivers is None:
-        drivers = _filter_capable(_resolve_drivers(), MetadataCapability.WRITE)
+        drivers = _filter_capable(_resolve_drivers(), EntityStoreCapability.WRITE)
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["collection_write"]:
             logger.warning(
-                "No WRITE-capable CollectionMetadataStore drivers "
+                "No WRITE-capable CollectionStore drivers "
                 "registered; upsert_collection_metadata is a no-op."
             )
             _MISSING_DRIVERS_LOGGED["collection_write"] = True
@@ -199,7 +199,7 @@ async def delete_collection_metadata(
     *,
     soft: bool = False,
     db_resource: Optional[Any] = None,
-    drivers: Optional[List[CollectionMetadataStore]] = None,
+    drivers: Optional[List[CollectionStore]] = None,
 ) -> None:
     """Fan-out DELETE across every registered driver (best-effort).
 
@@ -208,16 +208,16 @@ async def delete_collection_metadata(
     wins over fail-fast here.  If any driver raised, re-raises the
     first exception after every driver has been attempted.
 
-    Only drivers declaring ``MetadataCapability.WRITE`` participate in
+    Only drivers declaring ``EntityStoreCapability.WRITE`` participate in
     the fan-out (no separate ``DELETE`` capability exists).  TRANSFORM-
     only drivers never receive ``delete_metadata``.
     """
     if drivers is None:
-        drivers = _filter_capable(_resolve_drivers(), MetadataCapability.WRITE)
+        drivers = _filter_capable(_resolve_drivers(), EntityStoreCapability.WRITE)
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["collection_delete"]:
             logger.warning(
-                "No WRITE-capable CollectionMetadataStore drivers "
+                "No WRITE-capable CollectionStore drivers "
                 "registered; delete_collection_metadata is a no-op."
             )
             _MISSING_DRIVERS_LOGGED["collection_delete"] = True
@@ -251,7 +251,7 @@ async def search_collection_metadata(
     offset: int = 0,
     context: Optional[Dict[str, Any]] = None,
     db_resource: Optional[Any] = None,
-    drivers: Optional[List[CollectionMetadataStore]] = None,
+    drivers: Optional[List[CollectionStore]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Delegate SEARCH to the first driver capable of serving the query shape."""
     drivers = drivers if drivers is not None else _resolve_drivers()
@@ -260,11 +260,11 @@ async def search_collection_metadata(
 
     required: set[str] = set()
     if q is not None:
-        required.add(MetadataCapability.SEARCH)
+        required.add(EntityStoreCapability.SEARCH)
     if bbox is not None:
-        required.add(MetadataCapability.SPATIAL_FILTER)
+        required.add(EntityStoreCapability.SPATIAL_FILTER)
     if filter_cql is not None:
-        required.add(MetadataCapability.CQL_FILTER)
+        required.add(EntityStoreCapability.CQL_FILTER)
 
     chosen = None
     for driver in drivers:

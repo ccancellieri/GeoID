@@ -20,7 +20,7 @@
 Catalog-tier metadata router.
 
 Parallels :mod:`dynastore.modules.catalog.collection_metadata_router`
-but scoped to :class:`CatalogMetadataStore` implementations.
+but scoped to :class:`CatalogStore` implementations.
 Three operations:
 
 - :func:`get_catalog_metadata`      — fan-out READ that merges CORE +
@@ -35,7 +35,7 @@ Resolution policy
 -----------------
 
 Resolves drivers by scanning every registered
-:class:`CatalogMetadataStore` via ``get_protocols()``.  This discovery-
+:class:`CatalogStore` via ``get_protocols()``.  This discovery-
 only path is deliberate for the WRITE / READ / DELETE operations
 exposed here: the M2.3a backfill assumes both CORE and STAC tables
 are always populated for catalogs that need them, and fan-out across
@@ -98,9 +98,9 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from dynastore.models.protocols.metadata_driver import (
-    CatalogMetadataStore,
-    MetadataCapability,
+from dynastore.models.protocols.entity_store import (
+    CatalogStore,
+    EntityStoreCapability,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,13 +117,13 @@ _MISSING_DRIVERS_LOGGED: Dict[str, bool] = {
 
 
 def _filter_capable(
-    drivers: List[CatalogMetadataStore],
+    drivers: List[CatalogStore],
     capability: str,
-) -> List[CatalogMetadataStore]:
+) -> List[CatalogStore]:
     """Keep only drivers declaring ``capability`` — TRANSFORM-only drivers
     (e.g. ``BigQueryMetadataTransformDriver``) must never reach the WRITE
-    / DELETE fan-out.  See ``TransformOnlyCatalogMetadataStoreMixin`` in
-    ``models/protocols/metadata_driver.py`` — its raising stubs are a
+    / DELETE fan-out.  See ``TransformOnlyCatalogStoreMixin`` in
+    ``models/protocols/entity_store.py`` — its raising stubs are a
     bug-catcher; routers MUST honour the capability contract before
     invocation.
     """
@@ -131,8 +131,8 @@ def _filter_capable(
             if capability in getattr(d, "capabilities", frozenset())]
 
 
-def _resolve_catalog_metadata_drivers() -> List[CatalogMetadataStore]:
-    """Return the live :class:`CatalogMetadataStore` drivers registered via entry-points.
+def _resolve_catalog_metadata_drivers() -> List[CatalogStore]:
+    """Return the live :class:`CatalogStore` drivers registered via entry-points.
 
     Delegates to :func:`dynastore.tools.discovery.get_protocols` so the
     router picks up any driver module loaded by the current scope —
@@ -143,7 +143,7 @@ def _resolve_catalog_metadata_drivers() -> List[CatalogMetadataStore]:
     """
     from dynastore.tools.discovery import get_protocols
 
-    drivers = list(get_protocols(CatalogMetadataStore))
+    drivers = list(get_protocols(CatalogStore))
     if not drivers and not _MISSING_DRIVERS_LOGGED["catalog"]:
         # Log once per process rather than per request to avoid spamming
         # when a deployment legitimately starts up without PG metadata
@@ -151,10 +151,10 @@ def _resolve_catalog_metadata_drivers() -> List[CatalogMetadataStore]:
         # caller expected at least one driver, so ERROR is appropriate —
         # but one ERROR is enough.
         logger.error(
-            "No CatalogMetadataStore drivers registered; catalog-metadata "
+            "No CatalogStore drivers registered; catalog-metadata "
             "router will no-op all operations.  Entry-point discovery did "
             "not surface any dynastore.modules entry-point implementing "
-            "CatalogMetadataStore — check installed package metadata and "
+            "CatalogStore — check installed package metadata and "
             "that metadata_postgresql imports cleanly in this env."
         )
         _MISSING_DRIVERS_LOGGED["catalog"] = True
@@ -166,7 +166,7 @@ async def get_catalog_metadata(
     *,
     context: Optional[Dict[str, Any]] = None,
     db_resource: Optional[Any] = None,
-    drivers: Optional[List[CatalogMetadataStore]] = None,
+    drivers: Optional[List[CatalogStore]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Merged catalog metadata across all registered domain drivers.
 
@@ -197,7 +197,7 @@ async def get_catalog_metadata(
     if not drivers:
         return None
 
-    async def _safe_get(d: CatalogMetadataStore) -> Optional[Dict[str, Any]]:
+    async def _safe_get(d: CatalogStore) -> Optional[Dict[str, Any]]:
         try:
             return await d.get_catalog_metadata(
                 catalog_id, context=context, db_resource=db_resource,
@@ -232,7 +232,7 @@ async def upsert_catalog_metadata(
     metadata: Dict[str, Any],
     *,
     db_resource: Optional[Any] = None,
-    drivers: Optional[List[CatalogMetadataStore]] = None,
+    drivers: Optional[List[CatalogStore]] = None,
 ) -> None:
     """Fan-out WRITE across every registered catalog-metadata driver.
 
@@ -266,19 +266,19 @@ async def upsert_catalog_metadata(
     has the update; a missing event just means slower propagation
     until the consumer's backfill catches up).
 
-    Only drivers declaring ``MetadataCapability.WRITE`` participate in
+    Only drivers declaring ``EntityStoreCapability.WRITE`` participate in
     the fan-out.  TRANSFORM-only drivers never receive
     ``upsert_catalog_metadata`` — they'd raise ``NotImplementedError``
     from the mixin stub.
     """
     if drivers is None:
         drivers = _filter_capable(
-            _resolve_catalog_metadata_drivers(), MetadataCapability.WRITE,
+            _resolve_catalog_metadata_drivers(), EntityStoreCapability.WRITE,
         )
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["catalog_write"]:
             logger.warning(
-                "No WRITE-capable CatalogMetadataStore drivers "
+                "No WRITE-capable CatalogStore drivers "
                 "registered; upsert_catalog_metadata is a no-op."
             )
             _MISSING_DRIVERS_LOGGED["catalog_write"] = True
@@ -300,7 +300,7 @@ async def delete_catalog_metadata(
     *,
     soft: bool = False,
     db_resource: Optional[Any] = None,
-    drivers: Optional[List[CatalogMetadataStore]] = None,
+    drivers: Optional[List[CatalogStore]] = None,
 ) -> None:
     """Fan-out DELETE across every registered catalog-metadata driver.
 
@@ -312,18 +312,18 @@ async def delete_catalog_metadata(
     read flip will pull STAC via the same router, and a hard-deleted
     STAC row is indistinguishable from "never had STAC".
 
-    Only drivers declaring ``MetadataCapability.WRITE`` participate in
+    Only drivers declaring ``EntityStoreCapability.WRITE`` participate in
     the fan-out (no separate ``DELETE`` capability exists).  TRANSFORM-
     only drivers never receive ``delete_catalog_metadata``.
     """
     if drivers is None:
         drivers = _filter_capable(
-            _resolve_catalog_metadata_drivers(), MetadataCapability.WRITE,
+            _resolve_catalog_metadata_drivers(), EntityStoreCapability.WRITE,
         )
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["catalog_delete"]:
             logger.warning(
-                "No WRITE-capable CatalogMetadataStore drivers "
+                "No WRITE-capable CatalogStore drivers "
                 "registered; delete_catalog_metadata is a no-op."
             )
             _MISSING_DRIVERS_LOGGED["catalog_delete"] = True
@@ -348,7 +348,7 @@ async def delete_catalog_metadata(
 async def _emit_catalog_metadata_changed(
     *,
     catalog_id: str,
-    drivers: List[CatalogMetadataStore],
+    drivers: List[CatalogStore],
     operation: str,
     db_resource: Optional[Any],
 ) -> None:

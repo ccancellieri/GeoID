@@ -38,9 +38,9 @@ import logging
 from typing import Any, ClassVar, Dict, FrozenSet, Optional
 
 from dynastore.models.protocols.driver_roles import DriverSla
-from dynastore.models.protocols.metadata_driver import (
-    MetadataCapability,
-    TransformOnlyCollectionMetadataStoreMixin,
+from dynastore.models.protocols.entity_store import (
+    EntityStoreCapability,
+    TransformOnlyCollectionStoreMixin,
 )
 from dynastore.tools.discovery import get_protocol
 
@@ -49,11 +49,11 @@ logger = logging.getLogger(__name__)
 BQ_STATS_CONFIG_ID = "bq_stats"
 
 
-class BigQueryMetadataTransformDriver(TransformOnlyCollectionMetadataStoreMixin):
+class BigQueryMetadataTransformDriver(TransformOnlyCollectionStoreMixin):
     """TRANSFORM driver backed by BigQuery, returning ``bq_stats`` partials.
 
-    Structurally satisfies :class:`CollectionMetadataStore` via the
-    :class:`TransformOnlyCollectionMetadataStoreMixin` — which provides
+    Structurally satisfies :class:`CollectionStore` via the
+    :class:`TransformOnlyCollectionStoreMixin` — which provides
     default-raising stubs for the non-TRANSFORM methods — plus this
     class's own ``get_metadata`` / ``is_available`` implementations.
 
@@ -65,7 +65,7 @@ class BigQueryMetadataTransformDriver(TransformOnlyCollectionMetadataStoreMixin)
     """
 
     # --- Role-based driver attributes ---------------------------------------
-    capabilities: FrozenSet[str] = frozenset({MetadataCapability.TRANSFORM})
+    capabilities: FrozenSet[str] = frozenset({EntityStoreCapability.TRANSFORM})
     sla: ClassVar[DriverSla] = DriverSla(
         timeout_ms=2000,
         on_timeout="degrade",

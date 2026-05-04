@@ -28,7 +28,7 @@ propagation timeouts.  Kept separate from ``WriteMode`` /
 Per-driver "which slice of the payload" identification was previously
 done via a ``MetadataDomain`` StrEnum + ``ClassVar`` ClassVar on each
 driver.  That coupling was removed when STAC was promoted to its own
-module — STAC drivers now satisfy ``StacCollectionMetadataCapability``
+module — STAC drivers now satisfy ``StacCollectionEntityStoreCapability``
 (a ``@runtime_checkable Protocol`` owned by ``extensions/stac/protocols.py``)
 and consumers dispatch via ``isinstance``.
 """

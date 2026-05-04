@@ -792,7 +792,7 @@ class CatalogService(CatalogsProtocol):
             # The catalog.catalogs registry row is committed (INSERT above),
             # so the FK into catalog.catalogs(id) from the domain-scoped
             # metadata tables is satisfied.  The router fans out the
-            # payload across every registered CatalogMetadataStore driver
+            # payload across every registered CatalogStore driver
             # (PG Core / PG Stac today; ES indexers, etc. in the future).
             # Each driver filters down to its own domain's columns and
             # skips the write when the filtered payload is empty — so a
@@ -944,7 +944,7 @@ class CatalogService(CatalogsProtocol):
         return Catalog.model_validate(data)
 
     def _list_catalog_metadata_driver_types(self) -> List[type]:
-        """Return the ``CatalogMetadataStore`` classes currently registered.
+        """Return the ``CatalogStore`` classes currently registered.
 
         Used by :meth:`list_catalogs` to compute the expected per-row
         round-trip count for the threshold-warn log.  Kept as a
@@ -956,12 +956,12 @@ class CatalogService(CatalogsProtocol):
         through the happy path.
         """
         try:
-            from dynastore.models.protocols.metadata_driver import (
-                CatalogMetadataStore,
+            from dynastore.models.protocols.entity_store import (
+                CatalogStore,
             )
             from dynastore.tools.discovery import get_protocols
 
-            return [type(d) for d in get_protocols(CatalogMetadataStore)]
+            return [type(d) for d in get_protocols(CatalogStore)]
         except Exception:  # noqa: BLE001 — diagnostic only
             return []
 
@@ -1828,7 +1828,7 @@ class CatalogService(CatalogsProtocol):
         """Updates the provisioning status (provisioning | ready | failed) for a catalog.
 
         After committing the source-of-truth row in ``catalog.catalogs``, fans
-        the change out across every registered ``CatalogMetadataStore`` driver
+        the change out across every registered ``CatalogStore`` driver
         via ``catalog_metadata_router.upsert_catalog_metadata``. Without that
         propagation, search backends (ES indexer) keep the stale
         ``provisioning_status`` value and reads return inconsistent state

@@ -18,9 +18,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from dynastore.models.protocols.metadata_driver import (
-    CatalogMetadataStore,
-    MetadataCapability,
+from dynastore.models.protocols.entity_store import (
+    CatalogStore,
+    EntityStoreCapability,
 )
 from dynastore.modules.storage.drivers.catalog_metadata_postgresql import (
     CatalogMetadataCoreSidecarConfig,
@@ -32,7 +32,7 @@ from dynastore.modules.storage.drivers.catalog_metadata_postgresql import (
 
 
 # ---------------------------------------------------------------------------
-# Test doubles — minimal CatalogMetadataStore stand-ins
+# Test doubles — minimal CatalogStore stand-ins
 # ---------------------------------------------------------------------------
 
 
@@ -49,9 +49,9 @@ class _FakeInner:
     ):
         self.slice_value = slice_value
         self.capabilities = capabilities or frozenset({
-            MetadataCapability.READ,
-            MetadataCapability.WRITE,
-            MetadataCapability.SOFT_DELETE,
+            EntityStoreCapability.READ,
+            EntityStoreCapability.WRITE,
+            EntityStoreCapability.SOFT_DELETE,
         })
         self.upsert_calls = []
         self.delete_calls = []
@@ -86,9 +86,9 @@ class _FakeCoreCls:
             cls._instance = _FakeInner(
                 slice_value={"title": "core-title", "description": "core-desc"},
                 capabilities=frozenset({
-                    MetadataCapability.READ, MetadataCapability.WRITE,
-                    MetadataCapability.SOFT_DELETE,
-                    MetadataCapability.QUERY_FALLBACK_SOURCE,
+                    EntityStoreCapability.READ, EntityStoreCapability.WRITE,
+                    EntityStoreCapability.SOFT_DELETE,
+                    EntityStoreCapability.QUERY_FALLBACK_SOURCE,
                 }),
             )
         return cls._instance
@@ -102,8 +102,8 @@ class _FakeStacCls:
             cls._instance = _FakeInner(
                 slice_value={"stac_version": "1.0.0", "conforms_to": ["x"]},
                 capabilities=frozenset({
-                    MetadataCapability.READ, MetadataCapability.WRITE,
-                    MetadataCapability.SOFT_DELETE,
+                    EntityStoreCapability.READ, EntityStoreCapability.WRITE,
+                    EntityStoreCapability.SOFT_DELETE,
                 }),
             )
         return cls._instance
@@ -156,17 +156,17 @@ def test_capabilities_union_covers_inner_capabilities():
     """
     caps = CatalogPostgresqlDriver.capabilities
     for required in (
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SOFT_DELETE,
-        MetadataCapability.QUERY_FALLBACK_SOURCE,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SOFT_DELETE,
+        EntityStoreCapability.QUERY_FALLBACK_SOURCE,
     ):
         assert required in caps
     # Negative assertions — would surface accidental cap drift from the
     # collection wrapper.
-    assert MetadataCapability.SEARCH not in caps
-    assert MetadataCapability.SPATIAL_FILTER not in caps
-    assert MetadataCapability.PHYSICAL_ADDRESSING not in caps
+    assert EntityStoreCapability.SEARCH not in caps
+    assert EntityStoreCapability.SPATIAL_FILTER not in caps
+    assert EntityStoreCapability.PHYSICAL_ADDRESSING not in caps
 
 
 # ---------------------------------------------------------------------------
@@ -249,10 +249,10 @@ async def test_get_catalog_metadata_returns_none_when_every_inner_returns_none()
 
 
 async def test_get_catalog_metadata_swallows_per_inner_failure_and_returns_other_slices():
-    failing = AsyncMock(spec=CatalogMetadataStore)
+    failing = AsyncMock(spec=CatalogStore)
     failing.get_catalog_metadata.side_effect = RuntimeError("boom")
     failing.is_available.return_value = True
-    failing.capabilities = frozenset({MetadataCapability.READ})
+    failing.capabilities = frozenset({EntityStoreCapability.READ})
 
     class _FailingCls:
         def __new__(cls):  # type: ignore[misc]
@@ -298,12 +298,12 @@ def test_wrapper_config_default_sidecars_is_empty_list():
 
 def test_wrapper_satisfies_stac_capability_when_stac_inner_loaded():
     """Closes the loop on the 3b follow-up `747477d` by ensuring the
-    catalog wrapper structurally satisfies ``StacCatalogMetadataCapability``
+    catalog wrapper structurally satisfies ``StacCatalogEntityStoreCapability``
     when a STAC inner is loaded — without needing a separate
     follow-up commit.
     """
     from dynastore.extensions.stac.protocols import (
-        StacCatalogMetadataCapability,
+        StacCatalogEntityStoreCapability,
     )
 
     def _stac_cols(self):
@@ -313,7 +313,7 @@ def test_wrapper_satisfies_stac_capability_when_stac_inner_loaded():
         _FakeStacCls._instance, _FakeInner,
     )
     driver = CatalogPostgresqlDriver()
-    assert isinstance(driver, StacCatalogMetadataCapability)
+    assert isinstance(driver, StacCatalogEntityStoreCapability)
     cols = driver.stac_metadata_columns()
     assert "stac_version" in cols
     assert "conforms_to" in cols
@@ -458,7 +458,7 @@ async def test_registry_default_used_when_no_operator_override():
 
 async def test_wrapper_is_discoverable_via_get_protocols():
     """Sister test to the collection wrapper's discovery integration
-    test — verify ``get_protocols(CatalogMetadataStore)`` returns the
+    test — verify ``get_protocols(CatalogStore)`` returns the
     catalog wrapper after ``register_plugin``, and that no raw
     ``CatalogCorePostgresqlDriver`` surfaces.
     """
@@ -471,7 +471,7 @@ async def test_wrapper_is_discoverable_via_get_protocols():
     wrapper = CatalogPostgresqlDriver()
     register_plugin(wrapper)
     try:
-        discovered = list(get_protocols(CatalogMetadataStore))
+        discovered = list(get_protocols(CatalogStore))
         assert wrapper in discovered
         from dynastore.modules.storage.drivers.metadata_postgresql import (
             CatalogCorePostgresqlDriver,

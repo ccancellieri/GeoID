@@ -3,7 +3,7 @@
 Covers:
 
 - Protocol satisfaction: ``LogCatalogIndexer`` is structurally
-  compatible with :class:`CatalogMetadataStore`.
+  compatible with :class:`CatalogStore`.
 - ``get_catalog_metadata`` is the deliberate no-op.
 - ``upsert_catalog_metadata`` logs the sorted key list, not values.
 - ``delete_catalog_metadata`` logs ``soft`` flag alongside id.
@@ -24,14 +24,14 @@ import pytest
 @pytest.mark.asyncio
 async def test_satisfies_catalog_metadata_store_protocol():
     """Structural check — isinstance against the runtime-checkable Protocol."""
-    from dynastore.models.protocols.metadata_driver import CatalogMetadataStore
+    from dynastore.models.protocols.entity_store import CatalogStore
     from dynastore.modules.storage.drivers.catalog_log_indexer import (
         LogCatalogIndexer,
     )
 
     indexer = LogCatalogIndexer()
-    assert isinstance(indexer, CatalogMetadataStore), (
-        "LogCatalogIndexer should satisfy CatalogMetadataStore structurally"
+    assert isinstance(indexer, CatalogStore), (
+        "LogCatalogIndexer should satisfy CatalogStore structurally"
     )
 
 
@@ -158,7 +158,7 @@ async def test_reindex_worker_dispatches_upsert_to_log_indexer(caplog):
     naming the catalog.
 
     This pins the wiring contract: LogCatalogIndexer, reindex_worker
-    dispatch, and the CatalogMetadataStore protocol all line up
+    dispatch, and the CatalogStore protocol all line up
     correctly.  A future real Indexer can copy the same test shape
     swapping only the backend assertion.
     """

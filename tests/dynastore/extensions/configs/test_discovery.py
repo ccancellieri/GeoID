@@ -147,12 +147,12 @@ class TestStorageDriversProtocolGrouping:
         """
         from dynastore.models.protocols.storage_driver import CollectionItemsStore
         from dynastore.models.protocols.asset_driver import AssetStore
-        from dynastore.models.protocols.metadata_driver import CollectionMetadataStore
+        from dynastore.models.protocols.entity_store import CollectionStore
 
         expected = {
             CollectionItemsStore.__qualname__,
             AssetStore.__qualname__,
-            CollectionMetadataStore.__qualname__,
+            CollectionStore.__qualname__,
         }
         # Check the service source code directly — the keys are set at call time
         import inspect

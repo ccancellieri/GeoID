@@ -151,7 +151,7 @@ class AssetStore(Protocol):
     # Collection-metadata CRUD is no longer part of the AssetStore
     # protocol.  The M2.5 hard cut moved ownership of collection
     # metadata to :mod:`dynastore.modules.catalog.collection_metadata_router`
-    # which fans out across CollectionMetadataStore implementers.
+    # which fans out across CollectionStore implementers.
     # Asset drivers handle asset-level CRUD only; a TRANSFORM driver
     # that needs to enrich collection metadata should go through the
     # router, not through the asset store.

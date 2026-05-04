@@ -10,14 +10,14 @@ module auto-registers ``BigQueryMetadataTransformDriver`` via
 ``register_plugin`` during ``GCPModule.lifespan()``; the driver
 advertises ``capabilities = frozenset({TRANSFORM})`` and its
 ``upsert_metadata`` stub raises on invocation (see
-``TransformOnlyCollectionMetadataStoreMixin`` in
-``models/protocols/metadata_driver.py``).
+``TransformOnlyCollectionStoreMixin`` in
+``models/protocols/entity_store.py``).
 
 Before the fix, the default fan-out path in both
 ``collection_metadata_router`` and ``catalog_metadata_router`` iterated
 every registered driver, invoking the raising stub and aborting the
 fan-out with no preceding driver writes completed.  The fix is a
-``MetadataCapability.WRITE`` filter applied only on the default-
+``EntityStoreCapability.WRITE`` filter applied only on the default-
 resolution path; callers that pass ``drivers=`` explicitly keep full
 control (dry-run tooling, tests that want to observe the raise).
 """
@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from dynastore.models.protocols.metadata_driver import MetadataCapability
+from dynastore.models.protocols.entity_store import EntityStoreCapability
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ from dynastore.models.protocols.metadata_driver import MetadataCapability
 
 def _write_driver() -> MagicMock:
     d = MagicMock(name="WriteDriver")
-    d.capabilities = frozenset({MetadataCapability.WRITE})
+    d.capabilities = frozenset({EntityStoreCapability.WRITE})
     d.upsert_metadata = AsyncMock()
     d.delete_metadata = AsyncMock()
     d.upsert_catalog_metadata = AsyncMock()
@@ -48,7 +48,7 @@ def _write_driver() -> MagicMock:
 
 def _transform_only_driver() -> MagicMock:
     d = MagicMock(name="TransformOnlyDriver")
-    d.capabilities = frozenset({MetadataCapability.TRANSFORM})
+    d.capabilities = frozenset({EntityStoreCapability.TRANSFORM})
     # Mirrors the raising mixin stub: any accidental invocation blows up.
     d.upsert_metadata = AsyncMock(side_effect=NotImplementedError(
         "TransformOnly is TRANSFORM-only; route writes to a Primary driver."
@@ -119,7 +119,7 @@ async def test_upsert_collection_noops_when_only_transform_drivers(caplog):
 
     transform.upsert_metadata.assert_not_awaited()
     assert any(
-        "No WRITE-capable CollectionMetadataStore drivers" in r.message
+        "No WRITE-capable CollectionStore drivers" in r.message
         for r in caplog.records
     )
 
@@ -197,6 +197,6 @@ async def test_upsert_catalog_noops_when_only_transform_drivers(caplog):
     transform.upsert_catalog_metadata.assert_not_awaited()
     emit.assert_not_awaited()
     assert any(
-        "No WRITE-capable CatalogMetadataStore drivers" in r.message
+        "No WRITE-capable CatalogStore drivers" in r.message
         for r in caplog.records
     )

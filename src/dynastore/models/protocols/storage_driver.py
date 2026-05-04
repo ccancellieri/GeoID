@@ -313,7 +313,7 @@ class CollectionItemsStore(Protocol):
 
     # Collection-metadata CRUD is no longer part of the
     # CollectionItemsStore protocol.  The M2.5 hard cut moved ownership
-    # of collection metadata to the CollectionMetadataStore protocol; the
+    # of collection metadata to the CollectionStore protocol; the
     # PG-tier implementer is now the composition wrapper
     # CollectionPostgresqlDriver (PR 1e step 3b), which fans CRUD across
     # metadata_core + metadata_stac sidecars internally.  Routing happens

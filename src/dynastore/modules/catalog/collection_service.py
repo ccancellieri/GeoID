@@ -264,7 +264,7 @@ class CollectionService:
             return None
 
         # 2. Read metadata via the router — fan-out across every registered
-        # CollectionMetadataStore driver (PG Core + PG Stac by default;
+        # CollectionStore driver (PG Core + PG Stac by default;
         # ES joins in when the elasticsearch scope is installed).  The
         # router merges the per-domain slices into one dict.
         from dynastore.modules.catalog.collection_metadata_router import (
@@ -592,7 +592,7 @@ class CollectionService:
             #    the Immutable guard short-circuits while `current=None`.
 
             # 7. Store collection metadata via the router — fan-out across
-            # every registered CollectionMetadataStore driver.  Each driver
+            # every registered CollectionStore driver.  Each driver
             # filters the unified payload to its own domain's columns and
             # no-ops on an empty filtered slice.
             from dynastore.modules.catalog.collection_metadata_router import (

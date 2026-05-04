@@ -70,9 +70,9 @@ from dynastore.models.protocols.connected_systems import ConnectedSystemsProtoco
 from dynastore.models.protocols.search import SearchProtocol
 from dynastore.models.protocols.indexer import IndexerProtocol
 from dynastore.models.protocols.storage_driver import CollectionItemsStore
-from dynastore.models.protocols.metadata_driver import (
-    CatalogMetadataStore,
-    CollectionMetadataStore,
+from dynastore.models.protocols.entity_store import (
+    CatalogStore,
+    CollectionStore,
 )
 from dynastore.models.protocols.driver_roles import DriverSla
 from dynastore.models.protocols.asset_driver import AssetStore
@@ -172,8 +172,8 @@ __all__ = [
     "SearchProtocol",
     "IndexerProtocol",
     "CollectionItemsStore",
-    "CollectionMetadataStore",
-    "CatalogMetadataStore",
+    "CollectionStore",
+    "CatalogStore",
     "DriverSla",
     "AssetStore",
     "AssetContributor",

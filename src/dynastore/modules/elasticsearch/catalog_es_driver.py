@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 """
-Elasticsearch catalog-metadata driver — implements :class:`CatalogMetadataStore`.
+Elasticsearch catalog-metadata driver — implements :class:`CatalogStore`.
 
 Stores catalog-tier metadata in a SINGLE shared ES index across all
 catalogs (``{prefix}-catalogs`` from ``mappings.get_index_name(prefix,
@@ -40,7 +40,7 @@ import logging
 from typing import Any, ClassVar, Dict, FrozenSet, Optional, Tuple
 
 from dynastore.models.driver_context import DriverContext
-from dynastore.models.protocols.metadata_driver import MetadataCapability
+from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.models.protocols.typed_driver import (
     TypedDriver,
     _PluginDriverConfig,
@@ -121,7 +121,7 @@ CatalogElasticsearchDriverConfig.register_apply_handler(_on_apply_catalog_es_dri
 
 
 class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
-    """Elasticsearch implementation of :class:`CatalogMetadataStore`.
+    """Elasticsearch implementation of :class:`CatalogStore`.
 
     Uses opensearch-py client (wire-compatible with ES and OpenSearch).
     Indexes ONE tier — catalog-tier metadata, keyed by ``catalog_id`` —
@@ -139,12 +139,12 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
     is_catalog_indexer: ClassVar[bool] = True
 
     capabilities: FrozenSet[str] = frozenset({
-        MetadataCapability.READ,
-        MetadataCapability.WRITE,
-        MetadataCapability.SOFT_DELETE,
-        MetadataCapability.SEARCH,
-        MetadataCapability.AGGREGATION,
-        MetadataCapability.PHYSICAL_ADDRESSING,
+        EntityStoreCapability.READ,
+        EntityStoreCapability.WRITE,
+        EntityStoreCapability.SOFT_DELETE,
+        EntityStoreCapability.SEARCH,
+        EntityStoreCapability.AGGREGATION,
+        EntityStoreCapability.PHYSICAL_ADDRESSING,
     })
 
     # ------------------------------------------------------------------
@@ -219,7 +219,7 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
         return index_name
 
     # ------------------------------------------------------------------
-    # CatalogMetadataStore — CRUD
+    # CatalogStore — CRUD
     # ------------------------------------------------------------------
 
     async def get_catalog_metadata(

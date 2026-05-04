@@ -17,10 +17,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from dynastore.models.protocols.metadata_driver import (
-    CatalogMetadataStore,
-    CollectionMetadataStore,
-    MetadataCapability,
+from dynastore.models.protocols.entity_store import (
+    CatalogStore,
+    CollectionStore,
+    EntityStoreCapability,
 )
 
 
@@ -37,12 +37,12 @@ class TestStructuralInvariants:
 
         d = CollectionCorePostgresqlDriver()
         assert d._table == "collection_metadata_core"
-        assert MetadataCapability.READ in d.capabilities
-        assert MetadataCapability.WRITE in d.capabilities
-        assert MetadataCapability.SEARCH in d.capabilities
-        assert MetadataCapability.SOFT_DELETE in d.capabilities
-        # Structural typing — CollectionMetadataStore is @runtime_checkable.
-        assert isinstance(d, CollectionMetadataStore)
+        assert EntityStoreCapability.READ in d.capabilities
+        assert EntityStoreCapability.WRITE in d.capabilities
+        assert EntityStoreCapability.SEARCH in d.capabilities
+        assert EntityStoreCapability.SOFT_DELETE in d.capabilities
+        # Structural typing — CollectionStore is @runtime_checkable.
+        assert isinstance(d, CollectionStore)
 
     def test_catalog_core_driver_identifies_as_core_catalog(self):
         from dynastore.modules.storage.drivers.metadata_postgresql import (
@@ -51,7 +51,7 @@ class TestStructuralInvariants:
 
         d = CatalogCorePostgresqlDriver()
         assert d._table == "catalog_metadata_core"
-        assert isinstance(d, CatalogMetadataStore)
+        assert isinstance(d, CatalogStore)
 
 class TestDomainColumnSets:
     """Column sets must match the M2.0 DDL exactly.

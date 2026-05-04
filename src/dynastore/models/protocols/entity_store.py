@@ -17,18 +17,19 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 """
-CollectionMetadataStore — pluggable storage for collection metadata.
+Entity stores — pluggable storage for collection-row and catalog-row data.
 
-Mirrors the ``CollectionItemsStore`` architecture:
+``CollectionStore`` and ``CatalogStore`` mirror the ``CollectionItemsStore``
+architecture:
   - Capability-gated operations (CQL filter, spatial filter, fulltext, etc.)
-  - Extensible schema (metadata fields are not fixed — enrichers and users
-    can add arbitrary fields)
+  - Extensible schema (fields are not fixed — enrichers and users can add
+    arbitrary fields)
   - Driver config via ``ConfigsProtocol`` waterfall
   - Multiple backends: PostgreSQL (always available), Elasticsearch (default,
     faster for JSON), or any future backend
 
-Metadata drivers are discovered via entry points (``dynastore.metadata_drivers``)
-and routed through ``CollectionRoutingConfig``.
+Drivers are registered through ``register_plugin`` and routed through
+``CollectionRoutingConfig`` / ``CatalogRoutingConfig``.
 """
 
 from typing import (
@@ -52,14 +53,14 @@ if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
 
 
-class MetadataCapability:
-    """Well-known capability constants for metadata drivers.
+class EntityStoreCapability:
+    """Well-known capability constants for entity-store drivers.
 
     Usage::
 
         capabilities: FrozenSet[str] = frozenset({
-            MetadataCapability.READ, MetadataCapability.WRITE,
-            MetadataCapability.SEARCH,
+            EntityStoreCapability.READ, EntityStoreCapability.WRITE,
+            EntityStoreCapability.SEARCH,
         })
     """
 
@@ -91,7 +92,7 @@ class MetadataCapability:
 
 
 @runtime_checkable
-class CollectionMetadataStore(Protocol):
+class CollectionStore(Protocol):
     """Pluggable storage abstraction for collection metadata.
 
     Each driver provides CRUD + search operations for metadata using
@@ -103,12 +104,12 @@ class CollectionMetadataStore(Protocol):
 
     Drivers that own only a slice of the payload (e.g. STAC PG drivers
     persisting STAC-extension columns) declare a sub-Capability Protocol
-    owned by their extension (e.g. ``StacCollectionMetadataCapability``
+    owned by their extension (e.g. ``StacCollectionEntityStoreCapability``
     in ``extensions/stac/protocols.py``); consumers dispatch via
     ``isinstance`` against the sub-Capability, not against a string tag
     or enum value on this base Protocol.
 
-    ``sla`` is a **mandatory** per-class SLA when ``MetadataCapability.TRANSFORM``
+    ``sla`` is a **mandatory** per-class SLA when ``EntityStoreCapability.TRANSFORM``
     is declared — a transform without an SLA can quietly tax the hot path.
     Non-transform drivers may leave it ``None``.  Per-entry SLAs on
     ``OperationDriverEntry`` override this class-level default.
@@ -168,7 +169,7 @@ class CollectionMetadataStore(Protocol):
         """Delete collection metadata.
 
         Args:
-            soft: If True and ``MetadataCapability.SOFT_DELETE`` is supported,
+            soft: If True and ``EntityStoreCapability.SOFT_DELETE`` is supported,
                 mark as deleted but retain for recovery.
         """
         ...
@@ -222,7 +223,7 @@ class CollectionMetadataStore(Protocol):
     ) -> "StorageLocation":
         """Return typed physical storage coordinates for this metadata collection.
 
-        Drivers advertising ``MetadataCapability.PHYSICAL_ADDRESSING`` MUST
+        Drivers advertising ``EntityStoreCapability.PHYSICAL_ADDRESSING`` MUST
         implement this.  Parallel to ``CollectionItemsStore.location()``.
         """
         ...
@@ -241,7 +242,7 @@ class CollectionMetadataStore(Protocol):
         collection-creation flow when this driver is referenced for a catalog.
 
         Drivers with no provisioning work (e.g. transform-only) inherit a no-op
-        from :class:`TransformOnlyCollectionMetadataStoreMixin`.
+        from :class:`TransformOnlyCollectionStoreMixin`.
         """
         ...
 
@@ -251,7 +252,7 @@ class CollectionMetadataStore(Protocol):
 # ---------------------------------------------------------------------------
 
 
-class TransformOnlyCollectionMetadataStoreMixin:
+class TransformOnlyCollectionStoreMixin:
     """Default stubs for drivers that only implement ``TRANSFORM``.
 
     A TRANSFORM-only driver contributes a partial envelope via its
@@ -266,15 +267,15 @@ class TransformOnlyCollectionMetadataStoreMixin:
 
     .. code-block:: python
 
-        class MyTransformDriver(TransformOnlyCollectionMetadataStoreMixin):
-            capabilities: FrozenSet[str] = frozenset({MetadataCapability.TRANSFORM})
+        class MyTransformDriver(TransformOnlyCollectionStoreMixin):
+            capabilities: FrozenSet[str] = frozenset({EntityStoreCapability.TRANSFORM})
             sla: ClassVar[DriverSla] = DriverSla(timeout_ms=2000, on_timeout="degrade")
 
             async def get_metadata(self, catalog_id, collection_id, *, context=None, db_resource=None):
                 return {"my_partial": ...}
 
     Structural-typing note: the driver still satisfies
-    :class:`CollectionMetadataStore` because every method exists
+    :class:`CollectionStore` because every method exists
     (either via the mixin's raising stubs or the subclass's own
     implementation).  Callers check ``capabilities`` before invoking a
     method; if they don't and the method is unimplemented, the raise
@@ -352,12 +353,12 @@ class TransformOnlyCollectionMetadataStoreMixin:
 
 
 # ---------------------------------------------------------------------------
-# Catalog-tier metadata protocol — mirror of CollectionMetadataStore
+# Catalog-tier metadata protocol — mirror of CollectionStore
 # ---------------------------------------------------------------------------
 
 
 @runtime_checkable
-class CatalogMetadataStore(Protocol):
+class CatalogStore(Protocol):
     """Pluggable storage abstraction for catalog-level metadata.
 
     **Status**: vocabulary introduced by M1a, no concrete implementer yet.
@@ -366,7 +367,7 @@ class CatalogMetadataStore(Protocol):
     early so ``CatalogRoutingConfig`` can reference it at its apply
     handler without a forward declaration.
 
-    Mirrors :class:`CollectionMetadataStore` but scoped to the catalog tier.
+    Mirrors :class:`CollectionStore` but scoped to the catalog tier.
     Drivers own a ``domain`` (CORE / STAC / future) and stamp ``updated_at``
     on writes so that INDEX / BACKUP drivers can use it as their freshness
     token (see role-based driver plan §Freshness contract — tentative).
@@ -377,8 +378,8 @@ class CatalogMetadataStore(Protocol):
     etc.).  Per-domain tables: ``catalog.catalog_metadata_core`` (always),
     ``catalog.catalog_metadata_stac`` (STAC extension only).
 
-    ``capabilities`` — same semantics as :class:`CollectionMetadataStore`.
-    ``sla``           — mandatory when ``MetadataCapability.TRANSFORM``.
+    ``capabilities`` — same semantics as :class:`CollectionStore`.
+    ``sla``           — mandatory when ``EntityStoreCapability.TRANSFORM``.
     """
 
     capabilities: FrozenSet[str]
@@ -422,7 +423,7 @@ class CatalogMetadataStore(Protocol):
         """Delete catalog-level metadata for this driver's domain.
 
         Args:
-            soft: If True and ``MetadataCapability.SOFT_DELETE`` is supported,
+            soft: If True and ``EntityStoreCapability.SOFT_DELETE`` is supported,
                 mark as deleted but retain for recovery.  Soft-delete still
                 bumps ``updated_at`` so a tombstone event can be emitted.
         """

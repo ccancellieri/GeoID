@@ -368,7 +368,7 @@ class GCPModule(
 
             # Register BigQueryService and the BQ metadata TRANSFORM driver.
             # Role-based driver refactor: the old CollectionMetadataEnricherProtocol-based
-            # BigQueryCollectionEnricher is now a CollectionMetadataStore with
+            # BigQueryCollectionEnricher is now a CollectionStore with
             # the TRANSFORM capability (plan §Protocols).  The attribute name
             # and plugin registration are preserved for now so downstream
             # lifespan teardown paths don't need changes in this PR.

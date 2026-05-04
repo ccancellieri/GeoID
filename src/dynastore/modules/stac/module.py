@@ -18,12 +18,12 @@
 
 """StacModule — registers the STAC PG metadata drivers + applies global DDL.
 
-The STAC capability sub-Protocols (``StacCollectionMetadataCapability`` /
-``StacCatalogMetadataCapability``) are owned by ``extensions/stac/protocols.py``
+The STAC capability sub-Protocols (``StacCollectionEntityStoreCapability`` /
+``StacCatalogEntityStoreCapability``) are owned by ``extensions/stac/protocols.py``
 and are structurally satisfied by the drivers registered here. Splitting
 the STAC code into its own module means SCOPE/entry-point installation
 controls whether STAC fields can be persisted at all — without this
-module loaded, ``get_protocols(StacCollectionMetadataCapability)``
+module loaded, ``get_protocols(StacCollectionEntityStoreCapability)``
 returns nothing and ``stac_service._has_stac()`` reports False.
 
 Module priority is 60 — runs after ``CatalogModule`` (default 50) so the
@@ -49,7 +49,7 @@ class StacModule(ModuleProtocol):
     - Applies the global ``catalog.catalog_metadata_stac`` DDL.
 
     Neither STAC PG driver is surfaced as a standalone
-    ``CollectionMetadataStore`` / ``CatalogMetadataStore`` plugin
+    ``CollectionStore`` / ``CatalogStore`` plugin
     anymore (PR 1e steps 3b + 3c).  Both slices are composed inside
     the wrapper drivers ``CollectionPostgresqlDriver`` /
     ``CatalogPostgresqlDriver`` via the per-tier sidecar registries'

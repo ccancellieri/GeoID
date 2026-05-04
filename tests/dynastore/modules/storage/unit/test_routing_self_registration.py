@@ -230,7 +230,7 @@ def test_end_to_end_marker_to_INDEX_entry_via_real_apply_handler():
 
     class _DummyCatalogIndexer:
         is_catalog_indexer: ClassVar[bool] = True
-        # Minimal CatalogMetadataStore surface — enough for
+        # Minimal CatalogStore surface — enough for
         # _validate_routing_entries to accept it under operations[INDEX]
         # if it were referenced (it isn't pre-apply; the marker self-
         # registration appends it).  We avoid populating WRITE/READ to
@@ -295,36 +295,36 @@ def test_indexer_marker_skips_already_listed_driver():
 
 
 def test_searcher_helper_picks_up_drivers_with_search_capability():
-    """Any driver declaring a SEARCH-family MetadataCapability lands in
+    """Any driver declaring a SEARCH-family EntityStoreCapability lands in
     operations[SEARCH] (umbrella SEARCH or any of the three specialisations)."""
     from unittest.mock import patch
 
-    from dynastore.models.protocols.metadata_driver import (
-        CatalogMetadataStore,
-        MetadataCapability,
+    from dynastore.models.protocols.entity_store import (
+        CatalogStore,
+        EntityStoreCapability,
     )
     from dynastore.modules.storage.routing_config import (
         _self_register_searchers_into,
     )
 
     class _ESCat:
-        capabilities = frozenset({MetadataCapability.SEARCH})
+        capabilities = frozenset({EntityStoreCapability.SEARCH})
 
     class _VectorBackend:
-        capabilities = frozenset({MetadataCapability.SEARCH_VECTOR})
+        capabilities = frozenset({EntityStoreCapability.SEARCH_VECTOR})
 
     class _NotASearcher:
-        capabilities = frozenset({MetadataCapability.READ})
+        capabilities = frozenset({EntityStoreCapability.READ})
 
     target_ops: dict = {}
     fake_pool = [_ESCat(), _VectorBackend(), _NotASearcher()]
 
     # Bypass the runtime_checkable Protocol membership check — the test
-    # pool intentionally doesn't implement the full CatalogMetadataStore
+    # pool intentionally doesn't implement the full CatalogStore
     # surface; this test pins the SEARCH-capability filter alone.
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: fake_pool):
-        _self_register_searchers_into(target_ops, CatalogMetadataStore)
+        _self_register_searchers_into(target_ops, CatalogStore)
 
     ids = {e.driver_id for e in target_ops.get(Operation.SEARCH, [])}
     assert ids == {"_es_cat", "_vector_backend"}
@@ -334,9 +334,9 @@ def test_searcher_helper_skips_drivers_without_search_capability():
     """Driver with only READ/WRITE capabilities is not added to SEARCH."""
     from unittest.mock import patch
 
-    from dynastore.models.protocols.metadata_driver import (
-        CatalogMetadataStore,
-        MetadataCapability,
+    from dynastore.models.protocols.entity_store import (
+        CatalogStore,
+        EntityStoreCapability,
     )
     from dynastore.modules.storage.routing_config import (
         _self_register_searchers_into,
@@ -344,13 +344,13 @@ def test_searcher_helper_skips_drivers_without_search_capability():
 
     class _PgPrimary:
         capabilities = frozenset({
-            MetadataCapability.READ, MetadataCapability.WRITE,
+            EntityStoreCapability.READ, EntityStoreCapability.WRITE,
         })
 
     target_ops: dict = {}
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_PgPrimary()]):
-        _self_register_searchers_into(target_ops, CatalogMetadataStore)
+        _self_register_searchers_into(target_ops, CatalogStore)
     assert target_ops.get(Operation.SEARCH, []) == []
 
 
@@ -358,24 +358,24 @@ def test_searcher_helper_idempotent():
     """Repeated calls don't add duplicates; operator-supplied entry survives."""
     from unittest.mock import patch
 
-    from dynastore.models.protocols.metadata_driver import (
-        CatalogMetadataStore,
-        MetadataCapability,
+    from dynastore.models.protocols.entity_store import (
+        CatalogStore,
+        EntityStoreCapability,
     )
     from dynastore.modules.storage.routing_config import (
         _self_register_searchers_into,
     )
 
     class _ESCat:
-        capabilities = frozenset({MetadataCapability.SEARCH_FULLTEXT})
+        capabilities = frozenset({EntityStoreCapability.SEARCH_FULLTEXT})
 
     op_entry = OperationDriverEntry(driver_id="_es_cat", hints={"custom"})
     target_ops: dict = {Operation.SEARCH: [op_entry]}
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ESCat()]):
-        _self_register_searchers_into(target_ops, CatalogMetadataStore)
-        _self_register_searchers_into(target_ops, CatalogMetadataStore)
+        _self_register_searchers_into(target_ops, CatalogStore)
+        _self_register_searchers_into(target_ops, CatalogStore)
 
     assert len(target_ops[Operation.SEARCH]) == 1
     assert target_ops[Operation.SEARCH][0].hints == {"custom"}
@@ -392,11 +392,11 @@ def test_catalog_routing_validator_augments_INDEX_and_SEARCH():
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.metadata_driver import MetadataCapability
+    from dynastore.models.protocols.entity_store import EntityStoreCapability
 
     class _CatES:
         is_catalog_indexer: ClassVar[bool] = True
-        capabilities = frozenset({MetadataCapability.SEARCH})
+        capabilities = frozenset({EntityStoreCapability.SEARCH})
 
     instance = _CatES()
 
@@ -404,7 +404,7 @@ def test_catalog_routing_validator_augments_INDEX_and_SEARCH():
         # Marker check + capability check both rely on isinstance —
         # the fake instance has the right ClassVar + duck-typed
         # `capabilities` set so it satisfies both runtime_checkable
-        # Protocols (CatalogIndexer + CatalogMetadataStore via
+        # Protocols (CatalogIndexer + CatalogStore via
         # the SEARCH cap predicate inside _self_register_searchers_into).
         return [instance]
 
@@ -438,11 +438,11 @@ def test_collection_routing_validator_augments_INDEX_and_SEARCH():
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.metadata_driver import MetadataCapability
+    from dynastore.models.protocols.entity_store import EntityStoreCapability
 
     class _ColES:
         is_collection_indexer: ClassVar[bool] = True
-        capabilities = frozenset({MetadataCapability.SEARCH_FULLTEXT})
+        capabilities = frozenset({EntityStoreCapability.SEARCH_FULLTEXT})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ColES()]):
@@ -485,19 +485,19 @@ def test_items_routing_validator_augments_INDEX_and_SEARCH():
 
 def test_items_routing_search_caps_filter():
     """ItemsRoutingConfig SEARCH gate uses storage Capability (FULLTEXT,
-    SPATIAL_FILTER, ATTRIBUTE_FILTER) — NOT MetadataCapability.SEARCH.
+    SPATIAL_FILTER, ATTRIBUTE_FILTER) — NOT EntityStoreCapability.SEARCH.
     A driver with only metadata SEARCH caps must NOT land in items-tier
     ``operations[SEARCH]``."""
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.metadata_driver import MetadataCapability
+    from dynastore.models.protocols.entity_store import EntityStoreCapability
     from dynastore.models.protocols.storage_driver import Capability
 
     class _MetadataOnlySearcher:
         # Has metadata SEARCH caps but NOT storage SEARCH caps.
         is_item_indexer: ClassVar[bool] = False
-        capabilities = frozenset({MetadataCapability.SEARCH})
+        capabilities = frozenset({EntityStoreCapability.SEARCH})
 
     class _StorageSpatialSearcher:
         is_item_indexer: ClassVar[bool] = False
@@ -601,21 +601,21 @@ def test_searcher_helper_marks_entries_as_auto():
     `source="auto"`."""
     from unittest.mock import patch
 
-    from dynastore.models.protocols.metadata_driver import (
-        CatalogMetadataStore,
-        MetadataCapability,
+    from dynastore.models.protocols.entity_store import (
+        CatalogStore,
+        EntityStoreCapability,
     )
     from dynastore.modules.storage.routing_config import (
         _self_register_searchers_into,
     )
 
     class _ESCat:
-        capabilities = frozenset({MetadataCapability.SEARCH})
+        capabilities = frozenset({EntityStoreCapability.SEARCH})
 
     target_ops: dict = {}
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ESCat()]):
-        _self_register_searchers_into(target_ops, CatalogMetadataStore)
+        _self_register_searchers_into(target_ops, CatalogStore)
 
     assert len(target_ops[Operation.SEARCH]) == 1
     assert target_ops[Operation.SEARCH][0].source == "auto"
@@ -755,17 +755,17 @@ def test_apply_handlers_invoke_searcher_self_registration():
             cat, catalog_id=None, collection_id=None, db_resource=None,
         ))
 
-    from dynastore.models.protocols.metadata_driver import (
-        CatalogMetadataStore,
-        CollectionMetadataStore,
+    from dynastore.models.protocols.entity_store import (
+        CatalogStore,
+        CollectionStore,
     )
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
     # Each tier's apply handler invokes searcher registration once with its
     # own marker Protocol. Order matches invocation order above.
     assert calls == [
         CollectionItemsStore,
-        CollectionMetadataStore,
-        CatalogMetadataStore,
+        CollectionStore,
+        CatalogStore,
     ]
 
 
