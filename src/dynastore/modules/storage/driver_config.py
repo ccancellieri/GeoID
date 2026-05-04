@@ -64,6 +64,9 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
 from dynastore.modules.storage.drivers.pg_sidecars.item_metadata_config import (
     ItemMetadataSidecarConfig,
 )
+from dynastore.modules.storage.drivers.pg_sidecars.stac_metadata_config import (
+    StacItemsSidecarConfig,
+)
 
 # Discriminated union of all concrete PG sidecar configs.  The ``sidecar_type``
 # discriminator + the base-class validator that pins ``sidecar_type`` in
@@ -74,6 +77,7 @@ _PgSidecarConfig = Annotated[
         GeometriesSidecarConfig,
         FeatureAttributeSidecarConfig,
         ItemMetadataSidecarConfig,
+        StacItemsSidecarConfig,
     ],
     Discriminator("sidecar_type"),
 ]

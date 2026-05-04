@@ -1,11 +1,23 @@
 """
-STAC Items Sidecar — lightweight overlay for STAC-specific item fields.
+STAC Items Sidecar — first-class sidecar owning STAC-specific physical state.
 
-This sidecar does **not** own a database table.  It reads raw metadata
-published by the core ``ItemMetadataSidecar`` via the pipeline context
-and injects STAC-specific fields (extensions, assets, extra_fields) into
-the Feature.  Generic multilanguage resolution (title, description,
-keywords) is handled entirely by ``ItemMetadataSidecar``.
+Owns a per-items-table ``_stac_metadata`` companion table holding the
+externally-supplied STAC content that is persisted once and returned
+verbatim on read:
+
+- ``external_extensions``: extension URIs supplied by the producer
+- ``external_assets``: assets supplied at ingest (not derived)
+- ``extra_fields``: open content under STAC-spec extension points
+
+Generic multilanguage descriptive metadata (title / description /
+keywords) remains owned by ``ItemMetadataSidecar`` so OGC-only
+deployments that don't mount the STAC extension carry no STAC pollution
+in their items rows.
+
+On read, ``map_row_to_feature`` merges the stored content into the
+Feature.  Generated content (proj/raster/vector blocks, derived asset
+URLs, HATEOAS links) is computed downstream by the STAC generator and
+extension-protocol providers — those are not owned by this sidecar.
 """
 
 import json
@@ -15,18 +27,23 @@ from datetime import datetime
 
 from geojson_pydantic import Feature
 
+from dynastore.modules.db_config.query_executor import (
+    DbResource,
+    DQLQuery,
+    ResultHandler,
+)
 from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarProtocol,
-    SidecarConfig,
-    SidecarConfigRegistry,
     FeaturePipelineContext,
     ConsumerType,
     ValidationResult,
     FieldDefinition,
     FieldCapability,
 )
-from dynastore.modules.db_config.query_executor import DbResource
+from dynastore.modules.storage.drivers.pg_sidecars.stac_metadata_config import (
+    StacItemsSidecarConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,26 +55,24 @@ STAC_FEATURES_STRIP: Set[str] = {
     "assets",
 }
 
-
-class StacItemsSidecarConfig(SidecarConfig):
-    """Configuration for the STAC overlay sidecar."""
-
-    sidecar_type: str = "stac_metadata"
+# Raw column aliases produced by the stac_metadata sidecar's SQL join.
+STAC_METADATA_RAW_COLUMNS: Set[str] = {
+    "external_extensions",
+    "external_assets",
+    "stac_extra_fields",
+}
 
 
 class StacItemsSidecar(SidecarProtocol):
-    """
-    Lightweight STAC overlay sidecar.
+    """First-class STAC items sidecar with its own physical table.
 
-    Reads from ``context.get_sidecar("item_metadata")`` and injects:
-    - ``stac_extensions`` from ``external_extensions``
-    - ``assets`` from ``external_assets`` (with multilang resolution)
-    - Extra fields (``stac_version``, extension-specific properties)
+    Owns ``{schema}.{items_table}_stac_metadata`` with three JSONB
+    columns persisting externally-supplied STAC content
+    (``external_extensions``, ``external_assets``, ``extra_fields``).
 
-    This sidecar has **no DDL, no SELECT, no JOIN** of its own.
-    It only runs during ``map_row_to_feature`` and is gated on
-    ``context.consumer`` to avoid injecting STAC fields into OGC
-    Features responses.
+    On read, ``map_row_to_feature`` merges the stored content into the
+    Feature; gated on ``context.consumer`` to avoid injecting STAC
+    fields into OGC Features responses.
     """
 
     def __init__(self, config: StacItemsSidecarConfig):
@@ -75,13 +90,19 @@ class StacItemsSidecar(SidecarProtocol):
     def get_default_config(
         cls, context: Dict[str, Any]
     ) -> Optional[StacItemsSidecarConfig]:
-        """Auto-inject STAC overlay if explicitly requested via context."""
-        if context.get("stac_context"):
-            return StacItemsSidecarConfig()
-        return None
+        """Auto-inject STAC sidecar by default.
+
+        Mirrors ``ItemMetadataSidecar``'s always-inject pattern (post
+        commit ``6530359``).  Skipped only for RECORDS collections,
+        which have no per-item descriptive layer.  Non-STAC deployments
+        that produce no STAC content pay only the empty-table cost.
+        """
+        if context.get("collection_type") == "RECORDS":
+            return None
+        return StacItemsSidecarConfig()
 
     def is_mandatory(self) -> bool:
-        """Not mandatory — has no table of its own."""
+        """Not mandatory — items can exist without STAC content."""
         return False
 
     @property
@@ -92,8 +113,6 @@ class StacItemsSidecar(SidecarProtocol):
     def feature_id_field_name(self) -> Optional[str]:
         return None
 
-    # ── No table of its own ──────────────────────────────────────────────
-
     def get_ddl(
         self,
         physical_table: str,
@@ -101,8 +120,77 @@ class StacItemsSidecar(SidecarProtocol):
         partition_key_types: Dict[str, str] = {},
         has_validity: bool = False,
     ) -> str:
-        """No DDL — table is owned by ItemMetadataSidecar."""
-        return ""
+        """Generate DDL for the STAC metadata sidecar table."""
+        columns = [
+            "geoid UUID NOT NULL",
+            "external_extensions JSONB",
+            "external_assets JSONB",
+            "extra_fields JSONB",
+        ]
+
+        known_columns = {
+            "geoid",
+            "external_extensions",
+            "external_assets",
+            "extra_fields",
+        }
+
+        if has_validity or "validity" in partition_keys:
+            columns.append('"validity" TSTZRANGE NOT NULL')
+            known_columns.add("validity")
+
+        pk_columns: List[str] = []
+
+        if partition_keys:
+            for key in partition_keys:
+                if key not in known_columns:
+                    col_type = partition_key_types.get(key, "TEXT")
+                    columns.insert(0, f'"{key}" {col_type} NOT NULL')
+                    known_columns.add(key)
+
+            for key in partition_keys:
+                pk_columns.append(f'"{key}"')
+
+            if "geoid" not in set(partition_keys):
+                pk_columns.append('"geoid"')
+
+            partition_clause = (
+                f" PARTITION BY LIST ({', '.join([f'\"{k}\"' for k in partition_keys])})"
+            )
+        else:
+            partition_clause = ""
+            pk_columns = ['"geoid"']
+
+        table_name = f"{physical_table}_{self.sidecar_id}"
+
+        create_sql = (
+            f'CREATE TABLE IF NOT EXISTS {{schema}}."{table_name}" '
+            f"({', '.join(columns)}, PRIMARY KEY ({', '.join(pk_columns)}))"
+            f"{partition_clause};"
+        )
+
+        ref_cols = ["geoid"]
+        if "validity" in partition_keys:
+            ref_cols.append("validity")
+
+        fk_sql = (
+            f'\nALTER TABLE {{schema}}."{table_name}" '
+            f'ADD CONSTRAINT "fk_{table_name}_hub" '
+            f"FOREIGN KEY ({', '.join([f'\"' + c + '\"' for c in ref_cols])}) "
+            f'REFERENCES {{schema}}."{physical_table}" '
+            f"({', '.join([f'\"' + c + '\"' for c in ref_cols])}) "
+            f"ON DELETE CASCADE;"
+        )
+
+        ddl = create_sql + fk_sql
+
+        for col in ["external_extensions", "external_assets", "extra_fields"]:
+            ddl += (
+                f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_{col}" '
+                f'ON {{schema}}."{table_name}" USING GIN({col});'
+            )
+
+        return ddl
 
     def get_select_fields(
         self,
@@ -111,8 +199,13 @@ class StacItemsSidecar(SidecarProtocol):
         sidecar_alias: Optional[str] = None,
         include_all: bool = False,
     ) -> List[str]:
-        """No SELECT — reads from pipeline context."""
-        return []
+        """Return SELECT fields for STAC metadata."""
+        alias = sidecar_alias or f"sc_{self.sidecar_id}"
+        return [
+            f"{alias}.external_extensions",
+            f"{alias}.external_assets",
+            f"{alias}.extra_fields AS stac_extra_fields",
+        ]
 
     def get_join_clause(
         self,
@@ -123,8 +216,15 @@ class StacItemsSidecar(SidecarProtocol):
         join_type: str = "LEFT",
         extra_condition: Optional[str] = None,
     ) -> str:
-        """No JOIN — reads from pipeline context."""
-        return ""
+        """Generate JOIN clause for the STAC metadata sidecar."""
+        alias = sidecar_alias or f"sc_{self.sidecar_id}"
+        table_name = f"{hub_table}_{self.sidecar_id}"
+
+        on_clause = f"{hub_alias}.geoid = {alias}.geoid"
+        if extra_condition:
+            on_clause += f" AND {extra_condition}"
+
+        return f'{join_type} JOIN "{schema}"."{table_name}" AS {alias} ON {on_clause}'
 
     # ── Validation ───────────────────────────────────────────────────────
 
@@ -160,11 +260,6 @@ class StacItemsSidecar(SidecarProtocol):
     ) -> None:
         pass
 
-    # ── Query support (reads from ItemMetadataSidecar context) ───────────
-
-    def resolve_query_path(self, attr_name: str) -> Optional[Tuple[str, str]]:
-        return None
-
     def apply_query_context(
         self,
         request: Any,
@@ -173,7 +268,15 @@ class StacItemsSidecar(SidecarProtocol):
         pass
 
     def get_queryable_fields(self) -> Dict[str, FieldDefinition]:
-        return {}
+        return {
+            "external_extensions": FieldDefinition(
+                name="external_extensions",
+                data_type="jsonb",
+                sql_expression=f"sc_{self.sidecar_id}.external_extensions",
+                capabilities=[FieldCapability.FILTERABLE],
+                description="Externally-supplied STAC extension URIs",
+            ),
+        }
 
     def get_feature_type_schema(self) -> Dict[str, Any]:
         return {
@@ -184,13 +287,67 @@ class StacItemsSidecar(SidecarProtocol):
     def get_identity_columns(self) -> List[str]:
         return ["geoid"]
 
-    # ── Upsert delegates to ItemMetadataSidecar ──────────────────────────
+    def resolve_query_path(self, attr_name: str) -> Optional[Tuple[str, str]]:
+        """Resolves an attribute reference to SQL and JOIN requirements."""
+        alias = f"sc_{self.sidecar_id}"
+        if attr_name == "external_extensions":
+            return (f"{alias}.external_extensions", alias)
+        if attr_name == "external_assets":
+            return (f"{alias}.external_assets", alias)
+        return None
 
     def prepare_upsert_payload(
         self, feature: Any, context: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """No-op — writes are handled by ItemMetadataSidecar."""
-        return None
+        """Extract STAC-specific content for the stac_metadata table.
+
+        Reuses ``prune_managed_content_sync`` (the same helper that
+        ``ItemMetadataSidecar`` uses for title/description/keywords) and
+        cherry-picks the three STAC keys (``external_assets``,
+        ``external_extensions``, ``extra_fields``) for this sidecar's
+        physical row.
+        """
+        geoid = context.get("geoid")
+        if not geoid:
+            raise ValueError(
+                "geoid is required in context for stac_metadata sidecar"
+            )
+
+        if hasattr(feature, "dict"):
+            data = feature.dict(by_alias=True)
+        elif hasattr(feature, "model_dump"):
+            data = feature.model_dump(by_alias=True)
+        else:
+            data = dict(feature)
+
+        from dynastore.tools.discovery import get_protocols
+        from dynastore.extensions.stac.stac_extension_protocol import (
+            StacExtensionProtocol,
+        )
+        from dynastore.extensions.stac.metadata_helpers import (
+            prune_managed_content_sync,
+        )
+
+        providers = get_protocols(StacExtensionProtocol)
+        pruned = prune_managed_content_sync(data, providers)
+
+        payload: Dict[str, Any] = {
+            "geoid": geoid,
+            "external_extensions": pruned["external_extensions"],
+            "external_assets": pruned["external_assets"],
+            "extra_fields": pruned["extra_fields"],
+        }
+
+        if context.get("partition_key_name"):
+            payload[context["partition_key_name"]] = context["partition_key_value"]
+
+        from dynastore.extensions.tools.fast_api import CustomJSONEncoder
+
+        for field in ["external_extensions", "external_assets", "extra_fields"]:
+            if payload[field] is not None:
+                payload[field] = json.dumps(payload[field], cls=CustomJSONEncoder)
+
+        return payload
 
     def finalize_upsert_payload(
         self,
@@ -198,7 +355,15 @@ class StacItemsSidecar(SidecarProtocol):
         hub_row: Dict[str, Any],
         context: Dict[str, Any],
     ) -> Dict[str, Any]:
-        return sc_payload
+        """Finalize payload by injecting validity from Hub or context."""
+        payload = sc_payload.copy()
+
+        if "validity" in context or "validity" in hub_row:
+            validity = hub_row.get("validity") or context.get("validity")
+            if validity:
+                payload["validity"] = validity
+
+        return payload
 
     async def expire_version(
         self,
@@ -208,11 +373,27 @@ class StacItemsSidecar(SidecarProtocol):
         geoid: str,
         expire_at: datetime,
     ) -> int:
-        """No-op — versioning handled by ItemMetadataSidecar."""
-        return 0
+        """Mark the current active version as expired."""
+        sc_table = f"{physical_table}_{self.sidecar_id}"
+
+        sql = (
+            f'UPDATE "{physical_schema}"."{sc_table}" '
+            f"SET validity = tstzrange(lower(validity), :expire_at, '[)') "
+            f"WHERE geoid = :geoid AND upper(validity) IS NULL"
+        )
+
+        try:
+            return await DQLQuery(sql, result_handler=ResultHandler.ROWCOUNT).execute(
+                conn, geoid=geoid, expire_at=expire_at
+            )
+        except Exception as e:
+            if 'column "validity" does not exist' in str(e).lower():
+                return 0
+            raise
 
     def get_internal_columns(self) -> set:
-        return set()
+        """Columns owned by this sidecar that are never part of Feature properties."""
+        return STAC_METADATA_RAW_COLUMNS
 
     # ── The core method: inject STAC fields from context ─────────────────
 
@@ -224,23 +405,16 @@ class StacItemsSidecar(SidecarProtocol):
     ) -> None:
         """Inject STAC-specific fields into the Feature.
 
-        Reads raw metadata from the ``item_metadata`` sidecar's context
-        publication.  Skips injection entirely for OGC Features consumers.
+        Reads stored content directly from the row (columns surfaced by
+        this sidecar's SELECT/JOIN).  Skips injection entirely for OGC
+        Features consumers.
         """
         # For OGC Features consumers, do nothing — generic metadata
         # (title/desc/keywords) was already resolved by ItemMetadataSidecar.
         if context.consumer == ConsumerType.OGC_FEATURES:
             return
 
-        # Read raw data published by ItemMetadataSidecar
-        metadata = context.get_sidecar("item_metadata")
-
-        # Also check the row directly for backward compat (legacy column aliases)
         def _get(key: str):
-            if metadata:
-                v = metadata.get(key)
-                if v is not None:
-                    return v
             return row.get(key)
 
         def _maybe_parse(v):
@@ -319,10 +493,9 @@ class StacItemsSidecar(SidecarProtocol):
                     props["assets"] = {}
                 props["assets"].update(assets)
 
-        # 3. Extra Fields
+        # 3. Extra Fields (column aliased as ``stac_extra_fields`` in SELECT)
         extra = _maybe_parse(
-            _get("item_extra_fields")
-            or _get("stac_extra_fields")
+            _get("stac_extra_fields")
             or _get("extra_fields")
         )
         if isinstance(extra, dict):
@@ -360,5 +533,5 @@ class StacItemsSidecar(SidecarProtocol):
 
 
 # Register for polymorphic resolution
-SidecarConfigRegistry.register("stac_metadata", StacItemsSidecarConfig)
+# (Config is registered in stac_metadata_config.py at import time.)
 SidecarRegistry.register("stac_metadata", StacItemsSidecar)

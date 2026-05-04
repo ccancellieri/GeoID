@@ -463,7 +463,7 @@ async def search_items(
 
     candidate_fragments = []
 
-    # Store table mapping for hydration: collection_id -> (phys_table, sidecar_table, geom_table, stac_meta_table)
+    # Store table mapping for hydration: collection_id -> (phys_table, sidecar_table, geom_table, item_meta_table, stac_meta_table, has_attr, has_geom, has_item_meta, has_stac_meta)
     collection_table_map = {}
 
     for collection_id in target_collections:
@@ -649,11 +649,13 @@ async def search_items(
             # Update mapping for hydration
             sidecar_table = f"{phys_table}_attributes"
             geom_table = f"{phys_table}_geometries"
-            stac_meta_table = f"{phys_table}_item_metadata"
+            item_meta_table = f"{phys_table}_item_metadata"
+            stac_meta_table = f"{phys_table}_stac_metadata"
 
             has_attr_sidecar = False
             has_geom_sidecar = False
-            has_stac_sidecar = False
+            has_item_meta_sidecar = False
+            has_stac_meta_sidecar = False
             # Sidecars are a PG-driver-internal concept; for non-PG
             # driver configs (Elasticsearch, DuckDB, Iceberg, …) the
             # helper returns [] and the sidecar-shaped hydration is
@@ -667,17 +669,21 @@ async def search_items(
                     has_attr_sidecar = True
                 elif stype in ["geometries", "geometry"]:
                     has_geom_sidecar = True
-                elif stype in ["stac_metadata", "item_metadata"]:
-                    has_stac_sidecar = True
+                elif stype == "item_metadata":
+                    has_item_meta_sidecar = True
+                elif stype == "stac_metadata":
+                    has_stac_meta_sidecar = True
 
             collection_table_map[collection_id] = (
                 phys_table,
                 sidecar_table,
                 geom_table,
+                item_meta_table,
                 stac_meta_table,
                 has_attr_sidecar,
                 has_geom_sidecar,
-                has_stac_sidecar,
+                has_item_meta_sidecar,
+                has_stac_meta_sidecar,
             )
 
         except Exception as e:
@@ -737,9 +743,17 @@ async def search_items(
         if coll_id not in collection_table_map:
             continue
 
-        p_tab, s_tab, g_tab, sm_tab, has_attr, has_geom, has_stac = (
-            collection_table_map[coll_id]
-        )
+        (
+            p_tab,
+            s_tab,
+            g_tab,
+            im_tab,
+            sm_tab,
+            has_attr,
+            has_geom,
+            has_item_meta,
+            has_stac_meta,
+        ) = collection_table_map[coll_id]
 
         geoid_param = f"geoids_{coll_idx}"
         hydration_params[geoid_param] = geoids
@@ -787,18 +801,28 @@ async def search_items(
                 ", null as bbox_xmax, null as bbox_ymax"
             )
 
-        if has_stac:
+        if has_item_meta:
             select_parts.append(
-                ", sm.title as stac_title, sm.description as stac_description"
-                ", sm.keywords as stac_keywords, sm.external_extensions"
-                ", sm.external_assets, sm.extra_fields as stac_extra_fields"
+                ", im.title as stac_title, im.description as stac_description"
+                ", im.keywords as stac_keywords"
+            )
+            joins.append(f'LEFT JOIN "{phys_schema}"."{im_tab}" im ON h.geoid = im.geoid')
+        else:
+            select_parts.append(
+                ", null as stac_title, null as stac_description"
+                ", null as stac_keywords"
+            )
+
+        if has_stac_meta:
+            select_parts.append(
+                ", sm.external_extensions, sm.external_assets"
+                ", sm.extra_fields as stac_extra_fields"
             )
             joins.append(f'LEFT JOIN "{phys_schema}"."{sm_tab}" sm ON h.geoid = sm.geoid')
         else:
             select_parts.append(
-                ", null as stac_title, null as stac_description"
-                ", null as stac_keywords, null as external_extensions"
-                ", null as external_assets, null as stac_extra_fields"
+                ", null as external_extensions, null as external_assets"
+                ", null as stac_extra_fields"
             )
 
         fragment = (

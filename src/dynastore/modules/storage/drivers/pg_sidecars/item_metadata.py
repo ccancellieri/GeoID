@@ -19,12 +19,15 @@
 """
 Item Metadata Sidecar - Generic per-item multilanguage metadata.
 
-Stores title, description, keywords (internationalized) plus extension
-columns (external_extensions, external_assets, extra_fields) that downstream
-sidecars like the STAC overlay may consume via the pipeline context.
+Stores per-item title, description, keywords (internationalized) for
+non-STAC consumers (OGC Features, EDR, WFS).  Resolves multilanguage
+fields into the requested language at render time.
 
-This is a **core** sidecar — it runs for all consumers (OGC Features, STAC,
-WFS) and resolves multilanguage fields into the requested language.
+STAC-specific stored content (``external_extensions``,
+``external_assets``, ``extra_fields``) lives in the
+:class:`StacItemsSidecar`'s own physical table — keeping
+``item_metadata`` free of STAC-only columns so OGC-only deployments
+carry no STAC pollution.
 """
 
 import json
@@ -59,9 +62,6 @@ ITEM_METADATA_RAW_COLUMNS: Set[str] = {
     "item_title",
     "item_description",
     "item_keywords",
-    "external_extensions",
-    "external_assets",
-    "item_extra_fields",
 }
 
 
@@ -69,11 +69,8 @@ class ItemMetadataSidecar(SidecarProtocol):
     """
     Core sidecar for per-item multilanguage metadata.
 
-    Stores:
-    - Per-item title, description, keywords (internationalized)
-    - External extension URIs (consumed by STAC overlay)
-    - External assets (consumed by STAC overlay)
-    - Extension-specific extra fields (consumed by STAC overlay)
+    Stores per-item title, description, keywords (internationalized).
+    STAC-specific external content lives in :class:`StacItemsSidecar`.
     """
 
     def __init__(self, config: ItemMetadataSidecarConfig):
@@ -143,9 +140,6 @@ class ItemMetadataSidecar(SidecarProtocol):
             "title JSONB",
             "description JSONB",
             "keywords JSONB",
-            "external_extensions JSONB",
-            "external_assets JSONB",
-            "extra_fields JSONB",
         ]
 
         known_columns = {
@@ -153,9 +147,6 @@ class ItemMetadataSidecar(SidecarProtocol):
             "title",
             "description",
             "keywords",
-            "external_extensions",
-            "external_assets",
-            "extra_fields",
         }
 
         if has_validity or "validity" in partition_keys:
@@ -207,14 +198,7 @@ class ItemMetadataSidecar(SidecarProtocol):
 
         ddl = create_sql + fk_sql
 
-        for col in [
-            "title",
-            "description",
-            "keywords",
-            "external_extensions",
-            "external_assets",
-            "extra_fields",
-        ]:
+        for col in ["title", "description", "keywords"]:
             ddl += (
                 f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_{col}" '
                 f'ON {{schema}}."{table_name}" USING GIN({col});'
@@ -235,9 +219,6 @@ class ItemMetadataSidecar(SidecarProtocol):
             f"{alias}.title AS item_title",
             f"{alias}.description AS item_description",
             f"{alias}.keywords AS item_keywords",
-            f"{alias}.external_extensions",
-            f"{alias}.external_assets",
-            f"{alias}.extra_fields AS item_extra_fields",
         ]
 
     def get_join_clause(
@@ -302,8 +283,6 @@ class ItemMetadataSidecar(SidecarProtocol):
             return (f"{alias}.title", alias)
         if attr_name in ["item_description", "description"]:
             return (f"{alias}.description", alias)
-        if attr_name == "external_extensions":
-            return (f"{alias}.external_extensions", alias)
         return None
 
     def apply_query_context(
@@ -346,13 +325,6 @@ class ItemMetadataSidecar(SidecarProtocol):
                 sql_expression="sc_item_metadata.description",
                 capabilities=[FieldCapability.FILTERABLE],
                 description="Item description (internationalized)",
-            ),
-            "external_extensions": FieldDefinition(
-                name="external_extensions",
-                data_type="jsonb",
-                sql_expression="sc_item_metadata.external_extensions",
-                capabilities=[FieldCapability.FILTERABLE],
-                description="External extension URIs",
             ),
         }
 
@@ -414,9 +386,6 @@ class ItemMetadataSidecar(SidecarProtocol):
             "title": pruned["title"],
             "description": pruned["description"],
             "keywords": pruned["keywords"],
-            "external_extensions": pruned["external_extensions"],
-            "external_assets": pruned["external_assets"],
-            "extra_fields": pruned["extra_fields"],
         }
 
         if context.get("partition_key_name"):
@@ -424,14 +393,7 @@ class ItemMetadataSidecar(SidecarProtocol):
 
         from dynastore.extensions.tools.fast_api import CustomJSONEncoder
 
-        for field in [
-            "title",
-            "description",
-            "keywords",
-            "external_extensions",
-            "external_assets",
-            "extra_fields",
-        ]:
+        for field in ["title", "description", "keywords"]:
             if payload[field] is not None:
                 payload[field] = json.dumps(payload[field], cls=CustomJSONEncoder)
 
@@ -540,47 +502,3 @@ class ItemMetadataSidecar(SidecarProtocol):
 
 
 SidecarRegistry.register("item_metadata", ItemMetadataSidecar)
-
-
-# ── Migration: rename legacy _stac_metadata tables → _item_metadata ──────
-
-from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
-from dynastore.modules.db_config.query_executor import (
-    DQLQuery,
-    ResultHandler,
-)
-
-
-@lifecycle_registry.sync_catalog_initializer(priority=5)
-async def _migrate_stac_tables(
-    conn: DbResource, schema: str, catalog_id: str
-):
-    """Rename legacy ``_stac_metadata`` sidecar tables to ``_item_metadata``.
-
-    Runs once per catalog init; the existence check makes it a safe no-op
-    when the table has already been renamed or never existed.
-    """
-    rows = await DQLQuery(
-        "SELECT tablename FROM pg_tables "
-        "WHERE schemaname = :schema AND tablename LIKE '%\\_stac\\_metadata'",
-        result_handler=ResultHandler.ALL,
-    ).execute(conn, schema=schema)
-
-    for row in rows or []:
-        old_name = row["tablename"] if isinstance(row, dict) else row[0]
-        new_name = old_name.replace("_stac_metadata", "_item_metadata")
-
-        exists = await DQLQuery(
-            "SELECT 1 FROM pg_tables "
-            "WHERE schemaname = :schema AND tablename = :new_name",
-            result_handler=ResultHandler.ONE_OR_NONE,
-        ).execute(conn, schema=schema, new_name=new_name)
-
-        if exists is None:
-            await DQLQuery(
-                f'ALTER TABLE "{schema}"."{old_name}" RENAME TO "{new_name}"',
-                result_handler=ResultHandler.NONE,
-            ).execute(conn)
-            logger.info(
-                f"Migrated sidecar table: {schema}.{old_name} → {new_name}"
-            )
