@@ -245,7 +245,7 @@ async def test_upsert_metadata_fans_out_to_every_configured_sidecar():
     assert len(stac.upsert_calls) == 1
     # Wrapper hands the FULL payload to every inner — each inner is
     # responsible for filtering to its own column set (existing
-    # `_PgCollectionMetadataBase._filter_payload` invariant).
+    # `_PgCollectionCoreBase._filter_payload` invariant).
     assert core.upsert_calls[0]["metadata"] == payload
     assert stac.upsert_calls[0]["metadata"] == payload
 
@@ -597,7 +597,7 @@ async def test_wrapper_is_discoverable_via_get_protocols():
         # And every PG-tier discovered instance is a wrapper, not a raw inner.
         # (Other CollectionStore implementers — e.g. ES drivers — may
         # also appear; this test only pins the PG-tier shape.)
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             CollectionCorePostgresqlDriver,
         )
         for d in discovered:

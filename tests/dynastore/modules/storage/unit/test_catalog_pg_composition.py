@@ -215,7 +215,7 @@ async def test_upsert_catalog_metadata_fans_out_to_every_configured_sidecar():
     assert len(stac.upsert_calls) == 1
     # Wrapper hands the FULL payload to every inner — each inner is
     # responsible for filtering to its own column set
-    # (existing ``_PgCatalogMetadataBase._filter_payload`` invariant).
+    # (existing ``_PgCatalogCoreBase._filter_payload`` invariant).
     assert core.upsert_calls[0]["metadata"] == payload
     assert stac.upsert_calls[0]["metadata"] == payload
 
@@ -473,7 +473,7 @@ async def test_wrapper_is_discoverable_via_get_protocols():
     try:
         discovered = list(get_protocols(CatalogStore))
         assert wrapper in discovered
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             CatalogCorePostgresqlDriver,
         )
         for d in discovered:

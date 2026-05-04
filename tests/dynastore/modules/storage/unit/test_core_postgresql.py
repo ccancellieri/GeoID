@@ -31,7 +31,7 @@ from dynastore.models.protocols.entity_store import (
 
 class TestStructuralInvariants:
     def test_collection_core_driver_identifies_as_core_collection(self):
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             CollectionCorePostgresqlDriver,
         )
 
@@ -45,7 +45,7 @@ class TestStructuralInvariants:
         assert isinstance(d, CollectionStore)
 
     def test_catalog_core_driver_identifies_as_core_catalog(self):
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             CatalogCorePostgresqlDriver,
         )
 
@@ -65,7 +65,7 @@ class TestDomainColumnSets:
     """
 
     def test_collection_core_columns(self):
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             _COLLECTION_CORE_COLUMNS,
         )
 
@@ -74,7 +74,7 @@ class TestDomainColumnSets:
         )
 
     def test_catalog_core_columns(self):
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             _CATALOG_CORE_COLUMNS,
         )
 
@@ -84,7 +84,7 @@ class TestDomainColumnSets:
 
 class TestPayloadFilter:
     def test_filter_payload_drops_unowned_keys(self):
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             _COLLECTION_CORE_COLUMNS, _filter_payload,
         )
 
@@ -114,7 +114,7 @@ class TestPayloadFilter:
         previously had description / keywords would overwrite both to
         NULL (data loss).
         """
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             _COLLECTION_CORE_COLUMNS, _filter_payload,
         )
 
@@ -123,7 +123,7 @@ class TestPayloadFilter:
 
     def test_filter_payload_drops_none_values(self):
         """Explicit None values are dropped — same as absent keys."""
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             _COLLECTION_CORE_COLUMNS, _filter_payload,
         )
 
@@ -147,7 +147,7 @@ def fake_conn_with_dql():
     Lets each test inspect the exact SQL string and bind params the
     driver issued without needing a live DB.
     """
-    import dynastore.modules.storage.drivers.metadata_postgresql as mod
+    import dynastore.modules.storage.drivers.core_postgresql as mod
 
     fake_engine = MagicMock()
     dql_execute = AsyncMock(return_value=None)
@@ -182,7 +182,7 @@ def fake_conn_with_dql():
 @pytest.mark.asyncio
 async def test_collection_core_upsert_uses_core_columns_only(fake_conn_with_dql):
     """Full CORE payload → INSERT column list matches supplied CORE keys."""
-    from dynastore.modules.storage.drivers.metadata_postgresql import (
+    from dynastore.modules.storage.drivers.core_postgresql import (
         CollectionCorePostgresqlDriver,
     )
 
@@ -228,7 +228,7 @@ async def test_collection_core_upsert_partial_update_preserves_other_columns(
     the supplied columns, so the DO UPDATE SET clause leaves the
     other columns untouched.
     """
-    from dynastore.modules.storage.drivers.metadata_postgresql import (
+    from dynastore.modules.storage.drivers.core_postgresql import (
         CollectionCorePostgresqlDriver,
     )
 
@@ -264,7 +264,7 @@ async def test_collection_core_upsert_empty_payload_only_bumps_updated_at(
     INDEX / BACKUP propagation reads ``updated_at`` as the freshness
     token — a silent no-op here would hide the activity.
     """
-    from dynastore.modules.storage.drivers.metadata_postgresql import (
+    from dynastore.modules.storage.drivers.core_postgresql import (
         CollectionCorePostgresqlDriver,
     )
 
@@ -283,7 +283,7 @@ async def test_collection_core_upsert_empty_payload_only_bumps_updated_at(
 
 @pytest.mark.asyncio
 async def test_catalog_core_upsert_targets_global_schema(fake_conn_with_dql):
-    from dynastore.modules.storage.drivers.metadata_postgresql import (
+    from dynastore.modules.storage.drivers.core_postgresql import (
         CatalogCorePostgresqlDriver,
     )
 
@@ -349,7 +349,7 @@ class TestColumnTupleAlignment:
         from dynastore.modules.catalog.db_init.metadata_core_tables import (
             TENANT_METADATA_CORE_DDL,
         )
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             _COLLECTION_CORE_COLUMNS,
         )
 
@@ -361,7 +361,7 @@ class TestColumnTupleAlignment:
         from dynastore.modules.catalog.db_init.metadata_core_tables import (
             CATALOG_METADATA_CORE_DDL,
         )
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             _CATALOG_CORE_COLUMNS,
         )
 

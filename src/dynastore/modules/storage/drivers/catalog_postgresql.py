@@ -152,7 +152,7 @@ class CatalogPgSidecarRegistry:
         cls._defaults_loaded = True
 
         # CORE — same module tree, no try-import needed.
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             CatalogCorePostgresqlDriver,
         )
         cls._registry.setdefault(
@@ -162,7 +162,7 @@ class CatalogPgSidecarRegistry:
         # STAC — different module; deployments without the stac extra
         # silently omit the entry.
         try:
-            from dynastore.modules.stac.drivers.metadata_postgresql import (
+            from dynastore.modules.stac.drivers.postgresql import (
                 CatalogStacPostgresqlDriver,
             )
             cls._registry.setdefault(
@@ -294,7 +294,7 @@ class CatalogPostgresqlDriver(TypedDriver[CatalogPostgresqlDriverConfig]):
 
     The wrapper itself owns no SQL — every method delegates to the
     inner drivers, each of which already filters the payload to its
-    own column set via ``_PgCatalogMetadataBase._upsert_catalog_row``.
+    own column set via ``_PgCatalogCoreBase._upsert_catalog_row``.
     """
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({
@@ -430,7 +430,7 @@ class CatalogPostgresqlDriver(TypedDriver[CatalogPostgresqlDriverConfig]):
     ) -> None:
         """Fan-out: hand the full payload to each inner driver.  Each
         inner filters to its own ``_columns`` and no-ops if the filtered
-        slice is empty (existing ``_PgCatalogMetadataBase`` invariant).
+        slice is empty (existing ``_PgCatalogCoreBase`` invariant).
         """
         inners = await self._resolve_sidecars_for_catalog(
             catalog_id, db_resource=db_resource,

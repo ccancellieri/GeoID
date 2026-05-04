@@ -209,8 +209,8 @@ def _build_catalog_metadata_payload(catalog_model: Catalog) -> Dict[str, Any]:
     """Flatten the Catalog model into a dict keyed by domain-metadata columns.
 
     Keys align with the column tuples in
-    :mod:`dynastore.modules.storage.drivers.metadata_postgresql` (CORE)
-    and :mod:`dynastore.modules.stac.drivers.metadata_postgresql` (STAC)
+    :mod:`dynastore.modules.storage.drivers.core_postgresql` (CORE)
+    and :mod:`dynastore.modules.stac.drivers.postgresql` (STAC)
     so the ``catalog_router`` can fan the payload out to every
     registered driver and let each driver ``_filter_payload`` down to
     its own column slice.  Absent fields are omitted (not set to

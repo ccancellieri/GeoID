@@ -22,8 +22,8 @@ The two collection/catalog-tier STAC drivers persist the STAC subset of
 the metadata envelope into the per-tenant ``{schema}.collection_metadata_stac``
 and global ``catalog.catalog_metadata_stac`` tables respectively.
 
-The shared CRUD bodies live on ``_PgCollectionMetadataBase`` /
-``_PgCatalogMetadataBase`` in the core PG metadata module
+The shared CRUD bodies live on ``_PgCollectionCoreBase`` /
+``_PgCatalogCoreBase`` in the core PG metadata module
 (``modules/storage/drivers/metadata_postgresql.py``) — imported here,
 not duplicated.
 """
@@ -35,9 +35,9 @@ from typing import ClassVar, FrozenSet, Optional, Tuple
 from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.modules.storage.driver_config import DriverPluginConfig
-from dynastore.modules.storage.drivers.metadata_postgresql import (
-    _PgCatalogMetadataBase,
-    _PgCollectionMetadataBase,
+from dynastore.modules.storage.drivers.core_postgresql import (
+    _PgCatalogCoreBase,
+    _PgCollectionCoreBase,
 )
 
 
@@ -65,7 +65,7 @@ class CatalogStacPostgresqlDriverConfig(DriverPluginConfig):
 
 
 class CollectionStacPostgresqlDriver(
-    TypedDriver[CollectionStacPostgresqlDriverConfig], _PgCollectionMetadataBase,
+    TypedDriver[CollectionStacPostgresqlDriverConfig], _PgCollectionCoreBase,
 ):
     """Inner driver for the STAC collection metadata slice (``extent``,
     ``providers``, …).
@@ -95,7 +95,7 @@ class CollectionStacPostgresqlDriver(
 
 
 class CatalogStacPostgresqlDriver(
-    TypedDriver[CatalogStacPostgresqlDriverConfig], _PgCatalogMetadataBase,
+    TypedDriver[CatalogStacPostgresqlDriverConfig], _PgCatalogCoreBase,
 ):
     """Primary driver for STAC catalog metadata.
 

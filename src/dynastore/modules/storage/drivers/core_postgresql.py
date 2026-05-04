@@ -23,9 +23,9 @@ CORE PostgreSQL metadata drivers + shared CRUD base classes.
 - :class:`CatalogCorePostgresqlDriver`     → ``catalog.catalog_metadata_core``
 
 The matching STAC drivers live in
-:mod:`dynastore.modules.stac.drivers.metadata_postgresql` and inherit
-the shared CRUD bases (``_PgCollectionMetadataBase`` /
-``_PgCatalogMetadataBase``) defined in this file — same column-filtered
+:mod:`dynastore.modules.stac.drivers.postgresql` and inherit
+the shared CRUD bases (``_PgCollectionCoreBase`` /
+``_PgCatalogCoreBase``) defined in this file — same column-filtered
 upsert / delete / search shape, different column tuples and table names.
 
 Each driver owns only its declared columns.  Callers that need the full
@@ -197,7 +197,7 @@ class CatalogCorePostgresqlDriverConfig(DriverPluginConfig):
 # ---------------------------------------------------------------------------
 
 
-class _PgCollectionMetadataBase:
+class _PgCollectionCoreBase:
     """Shared implementation for the two collection-tier metadata drivers.
 
     Domain-specific knobs (table name, column tuple, capability set,
@@ -423,7 +423,7 @@ class _PgCollectionMetadataBase:
 
 
 class CollectionCorePostgresqlDriver(
-    TypedDriver[CollectionCorePostgresqlDriverConfig], _PgCollectionMetadataBase,
+    TypedDriver[CollectionCorePostgresqlDriverConfig], _PgCollectionCoreBase,
 ):
     """Primary driver for CORE collection metadata (``title``, ``description``, …).
 
@@ -507,7 +507,7 @@ class CollectionCorePostgresqlDriver(
 # ---------------------------------------------------------------------------
 
 
-class _PgCatalogMetadataBase:
+class _PgCatalogCoreBase:
     """Shared implementation for the two catalog-tier metadata drivers."""
 
     _table: ClassVar[str]              # e.g. "catalog_metadata_core"
@@ -549,7 +549,7 @@ class _PgCatalogMetadataBase:
         """Partial-update UPSERT — only columns the caller set are touched.
 
         Same "PATCH, not PUT" semantics as the collection-tier driver
-        (see :meth:`_PgCollectionMetadataBase.upsert_metadata`).
+        (see :meth:`_PgCollectionCoreBase.upsert_metadata`).
         Absent keys are never stamped as ``NULL``; partial updates
         preserve previously-populated columns.
 
@@ -646,7 +646,7 @@ class _PgCatalogMetadataBase:
 
 
 class CatalogCorePostgresqlDriver(
-    TypedDriver[CatalogCorePostgresqlDriverConfig], _PgCatalogMetadataBase,
+    TypedDriver[CatalogCorePostgresqlDriverConfig], _PgCatalogCoreBase,
 ):
     """Primary driver for CORE catalog metadata.
 

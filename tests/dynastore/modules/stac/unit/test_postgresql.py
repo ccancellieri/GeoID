@@ -31,7 +31,7 @@ from dynastore.models.protocols.entity_store import (
 
 class TestStructuralInvariants:
     def test_collection_stac_driver_identifies_as_stac_collection(self):
-        from dynastore.modules.stac.drivers.metadata_postgresql import (
+        from dynastore.modules.stac.drivers.postgresql import (
             CollectionStacPostgresqlDriver,
         )
 
@@ -46,7 +46,7 @@ class TestStructuralInvariants:
         assert isinstance(d, StacCollectionEntityStoreCapability)
 
     def test_catalog_stac_driver_identifies_as_stac_catalog(self):
-        from dynastore.modules.stac.drivers.metadata_postgresql import (
+        from dynastore.modules.stac.drivers.postgresql import (
             CatalogStacPostgresqlDriver,
         )
 
@@ -60,7 +60,7 @@ class TestStructuralInvariants:
         is what makes ``isinstance(d, StacCollectionEntityStoreCapability)``
         discriminate STAC drivers from CORE drivers at runtime.
         """
-        from dynastore.modules.stac.drivers.metadata_postgresql import (
+        from dynastore.modules.stac.drivers.postgresql import (
             CatalogStacPostgresqlDriver,
             CollectionStacPostgresqlDriver,
             _CATALOG_STAC_COLUMNS,
@@ -80,7 +80,7 @@ class TestStructuralInvariants:
         """``isinstance(core_driver, StacCollectionEntityStoreCapability)`` must
         be False — the marker method is the discriminator.
         """
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             CatalogCorePostgresqlDriver,
             CollectionCorePostgresqlDriver,
         )
@@ -95,7 +95,7 @@ class TestStructuralInvariants:
 
 class TestDomainColumnSets:
     def test_collection_stac_columns(self):
-        from dynastore.modules.stac.drivers.metadata_postgresql import (
+        from dynastore.modules.stac.drivers.postgresql import (
             _COLLECTION_STAC_COLUMNS,
         )
 
@@ -105,7 +105,7 @@ class TestDomainColumnSets:
         )
 
     def test_catalog_stac_columns(self):
-        from dynastore.modules.stac.drivers.metadata_postgresql import (
+        from dynastore.modules.stac.drivers.postgresql import (
             _CATALOG_STAC_COLUMNS,
         )
 
@@ -121,7 +121,7 @@ def fake_conn_with_dql():
     ``_CatalogMetadataDomainBase`` live — STAC drivers inherit the CRUD
     bodies from those bases, so the patches must target their module).
     """
-    import dynastore.modules.storage.drivers.metadata_postgresql as mod
+    import dynastore.modules.storage.drivers.core_postgresql as mod
 
     fake_engine = MagicMock()
     dql_execute = AsyncMock(return_value=None)
@@ -156,7 +156,7 @@ def fake_conn_with_dql():
 @pytest.mark.asyncio
 async def test_collection_stac_upsert_uses_stac_columns_only(fake_conn_with_dql):
     """Full STAC payload → INSERT columns match the supplied STAC keys."""
-    from dynastore.modules.stac.drivers.metadata_postgresql import (
+    from dynastore.modules.stac.drivers.postgresql import (
         CollectionStacPostgresqlDriver,
     )
 
@@ -197,7 +197,7 @@ async def test_catalog_stac_upsert_carries_catalog_stac_columns(fake_conn_with_d
 
     Partial-update semantics: only supplied keys appear in the SQL.
     """
-    from dynastore.modules.stac.drivers.metadata_postgresql import (
+    from dynastore.modules.stac.drivers.postgresql import (
         CatalogStacPostgresqlDriver,
     )
 
@@ -252,7 +252,7 @@ class TestColumnTupleAlignment:
         from dynastore.modules.stac.db_init.metadata_stac_tables import (
             TENANT_METADATA_STAC_DDL,
         )
-        from dynastore.modules.stac.drivers.metadata_postgresql import (
+        from dynastore.modules.stac.drivers.postgresql import (
             _COLLECTION_STAC_COLUMNS,
         )
 
@@ -264,7 +264,7 @@ class TestColumnTupleAlignment:
         from dynastore.modules.stac.db_init.metadata_stac_tables import (
             CATALOG_METADATA_STAC_DDL,
         )
-        from dynastore.modules.stac.drivers.metadata_postgresql import (
+        from dynastore.modules.stac.drivers.postgresql import (
             _CATALOG_STAC_COLUMNS,
         )
 

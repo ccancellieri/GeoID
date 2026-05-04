@@ -10,7 +10,7 @@
 Core PostgreSQL metadata DDL — catalog + tenant ``*_metadata_core`` tables.
 
 Backs the ``CatalogStore`` / ``CollectionStore`` core
-drivers (``modules.storage.drivers.metadata_postgresql``).
+drivers (``modules.storage.drivers.core_postgresql``).
 
 Global (under ``catalog.`` schema):
 

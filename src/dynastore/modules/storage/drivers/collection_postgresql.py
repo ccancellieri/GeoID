@@ -48,7 +48,7 @@ abstraction for tenant-schema-keyed metadata tables whose DDL is
 created out-of-band by ``modules.catalog.db_init.metadata_domain_split``
 at catalog provisioning time.  Each "metadata sidecar" here is an
 ALREADY-EXISTING ``CollectionStore`` driver whose own column
-filter (``_PgCollectionMetadataBase._filter_payload``) handles the
+filter (``_PgCollectionCoreBase._filter_payload``) handles the
 per-domain slicing.
 """
 
@@ -166,7 +166,7 @@ class CollectionPgSidecarRegistry:
         cls._defaults_loaded = True
 
         # CORE — same module tree, no try-import needed.
-        from dynastore.modules.storage.drivers.metadata_postgresql import (
+        from dynastore.modules.storage.drivers.core_postgresql import (
             CollectionCorePostgresqlDriver,
         )
         cls._registry.setdefault("metadata_core", CollectionCorePostgresqlDriver)
@@ -174,7 +174,7 @@ class CollectionPgSidecarRegistry:
         # STAC — different module; deployments without the stac extra
         # silently omit the entry.
         try:
-            from dynastore.modules.stac.drivers.metadata_postgresql import (
+            from dynastore.modules.stac.drivers.postgresql import (
                 CollectionStacPostgresqlDriver,
             )
             cls._registry.setdefault(
