@@ -268,6 +268,21 @@ class GeometriesSidecar(SidecarProtocol):
             )
             known_columns.add("geohash")
 
+        # Geometry hash GENERATED column — SHA256 of the WKB.  Mirrors
+        # ``attributes_hash`` on the attributes sidecar; replaces the
+        # legacy hub ``geometry_hash`` column (issue #220).  Application
+        # code never computes this hash — Postgres maintains it
+        # atomically with the geometry, eliminating the skew window
+        # between ``hub.geometry_hash`` and the actual stored geometry
+        # that the previous design carried.
+        #
+        # Requires pgcrypto extension (already enabled by ensure_init_db).
+        columns.append(
+            f"geometry_hash CHAR(64) GENERATED ALWAYS AS "
+            f"(encode(digest(ST_AsBinary({self.config.geom_column}), 'sha256'), 'hex')) STORED"
+        )
+        known_columns.add("geometry_hash")
+
         # Add Statistics Columns
         if self.config.statistics and self.config.statistics.enabled:
             stats_cfg = self.config.statistics
@@ -375,6 +390,10 @@ class GeometriesSidecar(SidecarProtocol):
 
         if self.config.geohash_precision and "geohash" in known_columns:
             ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_geohash" ON {{schema}}."{table_name}" (geohash);'
+
+        # Index for the GEOMETRY_HASH identity matcher (lookup on equality).
+        if "geometry_hash" in known_columns:
+            ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_geometry_hash" ON {{schema}}."{table_name}" (geometry_hash);'
 
         # Add Statistics Indexes
         if self.config.statistics and self.config.statistics.enabled:
@@ -1096,15 +1115,16 @@ class GeometriesSidecar(SidecarProtocol):
             )
             shapely_geom = geom_data.get("shapely_geom")
 
-        # Propagate the geometry-derived geometry_hash to the orchestrator
-        # so the hub row stores it and the GEOMETRY_HASH identity matcher /
-        # skip_if_unchanged_geometry_hash gate can resolve. process_geometry
-        # populates it on the standard path; the trusted ingestion path
-        # skips it, so derive from the final WKB to keep the invariant
-        # (hash always matches the stored geometry).
+        # Compute geometry_hash on the incoming WKB so the
+        # GEOMETRY_HASH identity matcher can look up an existing row
+        # *before* this write commits.  The PG-generated column on the
+        # sidecar (issue #220) handles the stored value; this Python-
+        # side hash is for matcher lookup only and uses the same input
+        # (final WKB → SHA256) so the two values are guaranteed to
+        # match for the same processed geometry.
         wkb_hex_final = geom_data.get("wkb_hex_processed")
         if wkb_hex_final:
-            context["geometry_hash"] = geom_data.get("geometry_hash") or hashlib.sha256(
+            context["geometry_hash"] = hashlib.sha256(
                 bytes.fromhex(wkb_hex_final)
             ).hexdigest()
 
@@ -1413,8 +1433,10 @@ class GeometriesSidecar(SidecarProtocol):
             return None
 
         sc_table = f"{physical_table}_{self.sidecar_id}"
+        # geometry_hash also lives on this sidecar (issue #220) — same
+        # JOIN, just project the column from ``s`` instead of ``h``.
         sql = f"""
-            SELECT h.geoid, h.geometry_hash
+            SELECT h.geoid, s.geometry_hash
             FROM "{physical_schema}"."{physical_table}" h
             JOIN "{physical_schema}"."{sc_table}" s ON s.geoid = h.geoid
             WHERE h.deleted_at IS NULL

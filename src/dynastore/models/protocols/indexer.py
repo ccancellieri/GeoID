@@ -18,6 +18,19 @@ Indexer protocol definitions.
 Abstracts document indexing lifecycle so that event-driven modules can
 dispatch indexing operations without coupling to a specific search backend.
 
+Two protocol surfaces:
+
+* :class:`Indexer` — slim generic surface (``index`` / ``index_bulk``).
+  Every concrete indexer (public ES tenant index, private geoid-only ES
+  index, vector DB, audit log, …) implements the same shape.  The
+  :class:`IndexDispatcher` walks ``routing.operations[INDEX]`` and calls
+  this surface uniformly; failure policy + outbox + circuit breaker are
+  driver-agnostic.
+
+* :class:`IndexerProtocol` — the historical fat surface (per-entity
+  methods, private-index slots).  Retained for backward compatibility
+  with ``ElasticsearchModule``; new code targets :class:`Indexer`.
+
 Per-tier marker Protocols (``CatalogIndexer``, ``CollectionIndexer``,
 ``AssetIndexer``, ``ItemIndexer``) let drivers opt in to one or more tiers
 they can serve as INDEX-role propagation targets.  Routing-config
@@ -28,7 +41,132 @@ data are indexable — markers are tier-scoped, not metadata-vs-data.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Dict, Literal, Optional, Protocol, runtime_checkable
+from typing import (
+    Any, ClassVar, Dict, List, Literal, Optional, Protocol, Sequence,
+    runtime_checkable,
+)
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Generic Indexer surface (Phase 1 of the indexer-protocol harmonisation)
+# ---------------------------------------------------------------------------
+
+
+EntityType = Literal["catalog", "collection", "item", "asset"]
+IndexOpType = Literal["upsert", "delete"]
+
+
+class IndexOp(BaseModel):
+    """A single index operation — opaque to the dispatcher.
+
+    The dispatcher does not interpret ``payload``; each :class:`Indexer`
+    implementation projects/serialises it as it sees fit.  ``entity_id`` is
+    the stable identity within the ``(catalog, collection)`` scope set on
+    :class:`IndexContext`.
+    """
+
+    op_type: IndexOpType = Field(description="``upsert`` or ``delete``.")
+    entity_type: EntityType = Field(description="Tier of the indexed entity.")
+    entity_id: str = Field(description="Stable identity within the ctx scope.")
+    payload: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Document body for upsert; ``None`` for delete.",
+    )
+
+    model_config = {"frozen": True}
+
+
+class IndexContext(BaseModel):
+    """Per-call context — the scope and the live PG transaction handle.
+
+    ``pg_conn`` is the load-bearing field for the production durability
+    guarantee: when an indexer call needs to enqueue an outbox row (because
+    the synchronous attempt failed and ``on_failure`` is ``OUTBOX``), the
+    INSERT runs on this connection so the outbox row is committed (or
+    rolled back) atomically with the upstream data write.
+    """
+
+    catalog: str
+    collection: Optional[str] = None
+    correlation_id: str = Field(default="")
+    pg_conn: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Live PG connection / transaction handle from the caller. "
+            "Used for in-TX outbox enqueue. ``None`` when called from a "
+            "non-PG context (e.g. operator-triggered bulk reindex)."
+        ),
+    )
+
+    model_config = {"arbitrary_types_allowed": True, "frozen": True}
+
+
+class BulkResult(BaseModel):
+    """Outcome of a bulk index call — per-op pass/fail summary."""
+
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    failures: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@runtime_checkable
+class Indexer(Protocol):
+    """Slim, generic index sink.
+
+    Every concrete indexer — public ES tenant index, private geoid-only
+    ES index, OpenSearch, vector DB, audit log, future search engine —
+    implements this same surface.  Routing config decides which fires
+    per ``(catalog, collection)`` via ``operations[INDEX]``; the
+    :class:`IndexDispatcher` walks the entries and calls this Protocol
+    uniformly.
+
+    Implementations remain free to expose richer per-backend operations
+    (bulk reindex, ensure_index, mapping management) on their concrete
+    classes — those are operator/admin surfaces, not part of the per-item
+    write path.
+    """
+
+    indexer_id: ClassVar[str]
+
+    async def ensure_indexer(self, ctx: IndexContext) -> None:
+        """Ensure this indexer's per-tenant storage is provisioned.
+
+        Each backend has different needs — ES creates a per-catalog
+        index plus alias membership, a vector DB creates a collection
+        with a configured dimension, an audit-log indexer is a no-op.
+        Implementations MUST be idempotent: dispatched repeatedly per
+        process, but only the first call per (indexer, catalog,
+        collection) is uncached on the dispatcher side.
+
+        Called by :class:`IndexDispatcher` before the first
+        :meth:`index` / :meth:`index_bulk` for a given
+        ``(catalog, collection)``.  Failures surface to the dispatcher
+        and are governed by the routing entry's ``FailurePolicy`` —
+        OUTBOX persists the obligation; the drain worker re-attempts
+        ``ensure_indexer`` automatically.
+        """
+        ...
+
+    async def index(self, ctx: IndexContext, op: IndexOp) -> None:
+        """Apply a single index op (upsert or delete) to this sink.
+
+        Must raise on transient/durable failure so the dispatcher can
+        apply the configured ``FailurePolicy`` (FATAL → caller rollback,
+        OUTBOX → enqueue retry row, WARN → log, IGNORE → silent skip).
+        """
+        ...
+
+    async def index_bulk(
+        self, ctx: IndexContext, ops: Sequence[IndexOp],
+    ) -> BulkResult:
+        """Apply a batch of index ops.  Per-op failures are reported in
+        ``BulkResult.failures``; an unhandled exception aborts the batch
+        and the dispatcher applies ``FailurePolicy`` to the whole batch.
+        """
+        ...
 
 
 @runtime_checkable

@@ -61,7 +61,7 @@ from dynastore.tools.db import validate_sql_identifier
 from .stac_models import STACCatalogRequest, stac_localize
 from .stac_validator import validate_stac_item, validate_stac_collection
 from dynastore.models.shared_models import Feature
-from . import stac_generator, stac_db, asset_factory, metadata_mapper
+from . import stac_generator, stac_db, asset_factory
 from .stac_models import (
     STACCollectionUpdate,
     STACItem,

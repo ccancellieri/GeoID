@@ -577,6 +577,40 @@ class ItemQueryMixin:
             if rows > 0:
                 await recalculate_and_update_extents(conn, catalog_id, collection_id)
 
+                # Dispatcher fan-out for delete propagation — single call
+                # site replacing the per-driver ``_on_item_delete`` event
+                # listeners.
+                try:
+                    from dynastore.models.protocols.indexer import (
+                        IndexContext, IndexOp,
+                    )
+                    from dynastore.modules.storage.index_dispatcher import (
+                        get_index_dispatcher,
+                    )
+                    from dynastore.tools.correlation import get_correlation_id
+
+                    dispatcher = get_index_dispatcher()
+                    await dispatcher.fan_out(
+                        IndexContext(
+                            catalog=catalog_id,
+                            collection=collection_id,
+                            correlation_id=get_correlation_id() or "",
+                            pg_conn=None,
+                        ),
+                        IndexOp(
+                            op_type="delete",
+                            entity_type="item",
+                            entity_id=item_id,
+                            payload=None,
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Index dispatcher delete fan-out failed for %s/%s/%s: %s",
+                        catalog_id, collection_id, item_id, e,
+                    )
+
+                # Emit event for non-indexer subscribers (audit, telemetry).
                 try:
                     from dynastore.models.protocols.event_bus import EventBusProtocol
                     from dynastore.modules.catalog.event_service import CatalogEventType

@@ -1570,9 +1570,12 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         # Build query to match external_id and find active record
         sc_table = f"{physical_table}_{self.sidecar_id}"
+        geom_sc_table = f"{physical_table}_geometries"
 
-        # We need geoid and validity (if enabled)
-        select_fields = ["h.geoid", "h.geometry_hash"]
+        # Issue #220: geometry_hash now lives on the geometries sidecar.
+        # JOIN it so the matcher chain has both the geoid and the
+        # current geometry_hash for the skip-if-unchanged gate.
+        select_fields = ["h.geoid", "g.geometry_hash"]
 
         # Check active status:
         # 1. Hub deleted_at IS NULL
@@ -1581,7 +1584,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         where_conditions = [
             """s.external_id = :ext_id""",
             """h.deleted_at IS NULL""",
-            """h.geoid = s.geoid""",  # Join condition
+            """h.geoid = s.geoid""",
+            """g.geoid = h.geoid""",
         ]
 
         if self.config.enable_validity:
@@ -1594,7 +1598,9 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         sql = f"""
             SELECT {", ".join(select_fields)}
-            FROM "{physical_schema}"."{physical_table}" h, "{physical_schema}"."{sc_table}" s
+            FROM "{physical_schema}"."{physical_table}" h,
+                 "{physical_schema}"."{sc_table}" s,
+                 "{physical_schema}"."{geom_sc_table}" g
             WHERE {" AND ".join(where_conditions)}
             ORDER BY h.transaction_time DESC
             LIMIT 1;
@@ -1612,21 +1618,31 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         physical_table: str,
         processing_context: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """Match on the hub's ``geometry_hash`` fingerprint (geometry-derived).
+        """Match on the geometries sidecar's ``geometry_hash`` (PG-generated).
 
-        The fingerprint is computed in ``tools.geospatial.prepare_geometry_for_upsert``
-        and flows through ``processing_context["geometry_hash"]`` when the geometries
-        sidecar's pipeline populates it.  Returns the active hub row with its
-        ``geometry_hash`` so callers can short-circuit no-op writes.
+        Issue #220: ``geometry_hash`` lives on the geometries sidecar as a
+        STORED GENERATED column (``encode(digest(ST_AsBinary(geom),
+        'sha256'), 'hex')``) — same shape as ``attributes_hash`` on the
+        attributes sidecar, same shape as ``geohash``.  Postgres maintains
+        it atomically with the geometry, eliminating the skew window the
+        previous hub-side application-computed hash had.
+
+        The matcher reads the incoming hash from
+        ``processing_context["geometry_hash"]`` (populated by the
+        geometries sidecar's pre-write pipeline) and JOINs the sidecar
+        to find the active geoid carrying the same hash.
         """
         geometry_hash = processing_context.get("geometry_hash")
         if not geometry_hash:
             return None
 
+        geom_sidecar_table = f"{physical_table}_geometries"
         sql = f"""
-            SELECT h.geoid, h.geometry_hash
+            SELECT h.geoid, s.geometry_hash
             FROM "{physical_schema}"."{physical_table}" h
-            WHERE h.geometry_hash = :ch
+            JOIN "{physical_schema}"."{geom_sidecar_table}" s
+              ON s.geoid = h.geoid
+            WHERE s.geometry_hash = :ch
               AND h.deleted_at IS NULL
             ORDER BY h.transaction_time DESC
             LIMIT 1;
@@ -1676,11 +1692,14 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             return None
 
         sc_table = f"{physical_table}_{self.sidecar_id}"
+        geom_sc_table = f"{physical_table}_geometries"
         sql = f"""
-            SELECT h.geoid, h.geometry_hash, s.attributes_hash
+            SELECT h.geoid, g.geometry_hash, s.attributes_hash
             FROM "{physical_schema}"."{physical_table}" h,
-                 "{physical_schema}"."{sc_table}" s
+                 "{physical_schema}"."{sc_table}" s,
+                 "{physical_schema}"."{geom_sc_table}" g
             WHERE h.geoid = s.geoid
+              AND g.geoid = h.geoid
               AND h.deleted_at IS NULL
               AND s.attributes_hash = encode(
                   digest(CAST(:attrs AS jsonb)::text, 'sha256'), 'hex')

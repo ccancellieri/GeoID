@@ -427,7 +427,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     catalog_id, collection_id, results, _primary_already_written=True,
                 )
 
-            # Emit events
+            # Single dispatcher call site for index propagation —
+            # replaces the per-driver ``_on_item_upsert`` event listeners.
+            if results:
+                await self._dispatch_index_upsert(catalog_id, collection_id, results)
+
+            # Emit events for non-indexer subscribers (audit, telemetry).
+            # Index propagation no longer rides this channel — it goes
+            # through the dispatcher above so failures are attributable
+            # per-indexer with proper retry semantics.
             if results:
                 try:
                     from dynastore.models.protocols.event_bus import EventBusProtocol
@@ -608,11 +616,10 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 # Single-level partitioning today — first value is the partition key.
                 unique_partition_values.add(next(iter(partition_values.values())))
 
-            # Lift geometry_hash computed by the geometries sidecar onto the
-            # hub row so it persists in hub.geometry_hash and the matcher
-            # chain / hash gating in insert_or_update_distributed can read it.
-            if "geometry_hash" in item_context and "geometry_hash" not in hub_payload:
-                hub_payload["geometry_hash"] = item_context["geometry_hash"]
+            # geometry_hash is now PG-generated on the geometries sidecar
+            # (issue #220) — STORED column ``encode(digest(ST_AsBinary(geom),
+            # 'sha256'), 'hex')``.  No longer carried on the hub row; the
+            # matcher JOINs the sidecar to read it.
 
             prepared.append({
                 "geoid": geoid,
@@ -705,7 +712,13 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 catalog_id, collection_id, results
             )
 
-        # ── Post-commit: emit events ──────────────────────────────────
+        # ── Post-commit: dispatcher fan-out for index propagation ──────
+        # Single call site replaces the per-driver ``_on_item_upsert``
+        # event listeners.
+        if results:
+            await self._dispatch_index_upsert(catalog_id, collection_id, results)
+
+        # ── Post-commit: emit events for non-indexer subscribers ──────
         if results:
             try:
                 from dynastore.models.protocols.event_bus import EventBusProtocol
@@ -736,6 +749,77 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         if is_single:
             return results[0] if results else None
         return results
+
+    # ------------------------------------------------------------------
+    # Index dispatcher fan-out — replaces ES event-driven listeners
+    # ------------------------------------------------------------------
+
+    async def _dispatch_index_upsert(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        results: List["Feature"],
+    ) -> None:
+        """Fan items out to every configured Indexer for the collection.
+
+        Single dispatcher call site for items, replacing the per-driver
+        ``_on_item_upsert`` event listeners.  Driver-agnostic: ES public,
+        ES private, vector DB, audit log — anything implementing the slim
+        :class:`Indexer` Protocol and registered under
+        ``operations[INDEX]``.
+
+        Failure surfaces are decided by routing-config ``on_failure`` per
+        entry — ``OUTBOX`` enqueues a durable retry row, ``WARN`` logs,
+        ``FATAL`` raises out of this method.
+        """
+        if not results:
+            return
+
+        from dynastore.models.protocols.indexer import (
+            IndexContext, IndexOp,
+        )
+        from dynastore.modules.storage.index_dispatcher import (
+            IndexerFatal, get_index_dispatcher,
+        )
+        from dynastore.tools.correlation import get_correlation_id
+
+        dispatcher = get_index_dispatcher()
+        ctx = IndexContext(
+            catalog=catalog_id,
+            collection=collection_id,
+            correlation_id=get_correlation_id() or "",
+            # No pg_conn: this call site runs post-commit. OUTBOX
+            # policy degrades to non-atomic enqueue — Phase 2f will
+            # move the call inside the write TX so OUTBOX becomes
+            # atomic with the data write.
+            pg_conn=None,
+        )
+        ops = [
+            IndexOp(
+                op_type="upsert",
+                entity_type="item",
+                entity_id=str(r.id) if r.id else "",
+                payload=r.model_dump(by_alias=True, exclude_none=True),
+            )
+            for r in results
+            if r.id is not None
+        ]
+
+        try:
+            if len(ops) == 1:
+                await dispatcher.fan_out(ctx, ops[0])
+            else:
+                await dispatcher.fan_out_bulk(ctx, ops)
+        except IndexerFatal:
+            # FATAL contract: a routing entry with on_failure=FATAL
+            # MUST propagate so the caller's TX rolls back.  Don't
+            # swallow.
+            raise
+        except Exception as e:  # noqa: BLE001 — non-FATAL paths absorb errors
+            logger.warning(
+                "Index dispatcher fan-out failed for %s/%s (%d items): %s",
+                catalog_id, collection_id, len(results), e,
+            )
 
     # ------------------------------------------------------------------
     # Multi-driver write fan-out

@@ -76,9 +76,11 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
 GeometryStorageConfig = GeometriesSidecarConfig
 
 
-def _calculate_geometry_hash(geom: "BaseGeometry") -> str:
-    """Calculates a SHA256 hash of the geometry's WKB representation."""
-    return hashlib.sha256(geom.wkb).hexdigest()
+# Issue #220: ``_calculate_geometry_hash`` was removed.  ``geometry_hash`` is
+# now a STORED GENERATED column on the geometries sidecar (PG-maintained via
+# ``encode(digest(ST_AsBinary(geom), 'sha256'), 'hex')``).  Application code
+# never computes the hash — eliminating the skew window between an
+# application-computed hash and the actual stored geometry.
 
 
 def process_geometry(
@@ -197,8 +199,8 @@ def process_geometry(
             f"Geometry type '{processed_geom.geom_type}' not allowed. Allowed types: {storage_config.allowed_geometry_types}"
         )
 
-    # Calculate content hash based on the final processed geometry
-    geometry_hash = _calculate_geometry_hash(processed_geom)
+    # geometry_hash is now PG-generated on the geometries sidecar (issue #220)
+    # — no application-side computation here.
 
     # Calculate bbox_coords in EPSG:4326 for validation
     bbox_coords = None
@@ -244,7 +246,6 @@ def process_geometry(
     return {
         "geom_type": processed_geom.geom_type,
         "wkb_hex_processed": wkb_hex_processed,
-        "geometry_hash": geometry_hash,
         "bbox_coords": bbox_coords,
         "centroid": (processed_geom.centroid.x, processed_geom.centroid.y),
         "shapely_geom": processed_geom,

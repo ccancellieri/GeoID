@@ -60,11 +60,31 @@ logger = logging.getLogger(__name__)
 
 
 class FailurePolicy(StrEnum):
-    """Per-driver failure behaviour within an operation."""
+    """Per-driver failure behaviour within an operation.
 
-    FATAL = "fatal"    # operation fails if this driver fails
-    WARN = "warn"      # log warning, continue with other drivers
-    IGNORE = "ignore"  # silently skip on failure
+    ``OUTBOX`` is the production-grade durability policy for INDEX entries:
+    on synchronous failure (or when the per-indexer circuit breaker is
+    open) the dispatcher persists an ``_meta.index_outbox`` row in the
+    same PG transaction as the upstream data write.  A background worker
+    drains it with exponential backoff.  PG TX commit guarantees neither
+    the data nor the obligation-to-index can ever be lost.
+
+    Selection guide:
+        ``FATAL``   — caller rolls back if this driver fails.  Use for
+                       indexers whose divergence from the source of truth
+                       is unacceptable (regulated audit, billing).
+        ``OUTBOX``  — eventual consistency, never lost.  Use for the
+                       common case of search-backend propagation.
+        ``WARN``    — best-effort; failures logged.  Use only for
+                       non-critical sinks (telemetry, analytics).
+        ``IGNORE``  — silent skip.  Reserved for opt-in development
+                       experiments.
+    """
+
+    FATAL = "fatal"      # operation fails if this driver fails
+    OUTBOX = "outbox"    # on failure, enqueue _meta.index_outbox row in same TX
+    WARN = "warn"        # log warning, continue with other drivers
+    IGNORE = "ignore"    # silently skip on failure
 
 
 class Operation(StrEnum):

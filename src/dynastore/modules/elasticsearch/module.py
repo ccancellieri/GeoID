@@ -255,6 +255,10 @@ class ElasticsearchModule(ModuleProtocol):
     async def lifespan(self, app_state: object):
         events = get_protocol(EventBusProtocol)
 
+        # ITEM_* propagation moved to the IndexDispatcher (Phase 2d of
+        # the indexer-protocol harmonisation).  Catalog/collection-tier
+        # listeners stay event-driven for now — a follow-up phase will
+        # migrate those to the dispatcher too.
         _registered: list = []
         if events:
             for etype, handler in [
@@ -266,11 +270,6 @@ class ElasticsearchModule(ModuleProtocol):
                 (CatalogEventType.COLLECTION_UPDATE,        self._on_collection_upsert),
                 (CatalogEventType.COLLECTION_DELETION,      self._on_collection_delete),
                 (CatalogEventType.COLLECTION_HARD_DELETION, self._on_collection_delete),
-                (CatalogEventType.ITEM_CREATION,            self._on_item_upsert),
-                (CatalogEventType.ITEM_UPDATE,              self._on_item_upsert),
-                (CatalogEventType.ITEM_DELETION,            self._on_item_delete),
-                (CatalogEventType.ITEM_HARD_DELETION,       self._on_item_delete),
-                (CatalogEventType.BULK_ITEM_CREATION,       self._on_item_bulk_upsert),
             ]:
                 decorator = events.async_event_listener(etype)
                 if decorator:
@@ -280,10 +279,14 @@ class ElasticsearchModule(ModuleProtocol):
                     logger.warning(
                         "ElasticsearchModule: Failed to register listener for %s", etype
                     )
-            logger.info("ElasticsearchModule: Registered async event listeners.")
+            logger.info(
+                "ElasticsearchModule: Registered catalog/collection listeners "
+                "(item propagation now dispatched via IndexDispatcher).",
+            )
         else:
             logger.warning(
-                "ElasticsearchModule: EventsProtocol not found. Indexing events not captured."
+                "ElasticsearchModule: EventsProtocol not found. "
+                "Catalog/collection events not captured.",
             )
 
         # Restore in-memory DENY policies for all catalogs that have private=True.
@@ -814,146 +817,6 @@ class ElasticsearchModule(ModuleProtocol):
             inputs=ElasticsearchDeleteInputs(
                 entity_type="collection",
                 entity_id=entity_id,
-            ).model_dump(),
-        )
-
-    async def _on_item_upsert(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None, item_id: Optional[str] = None,
-        payload=None, **kwargs,
-    ):
-        if not catalog_id or not collection_id or not item_id:
-            return
-
-        # --- Private path: index only {geoid, catalog_id, collection_id} ---
-        # Per-collection resolver consults the collection-tier override first
-        # (ElasticsearchCollectionConfig.private) and falls back to the
-        # catalog-tier flag (ElasticsearchCatalogConfig.private).
-        from dynastore.modules.elasticsearch.es_collection_config import (
-            is_collection_private,
-        )
-        if await is_collection_private(catalog_id, collection_id):
-            from dynastore.modules.storage.drivers.elasticsearch_private.tasks import (
-                PrivateIndexInputs,
-            )
-            await self._dispatch_task(
-                task_type="elasticsearch_private_index",
-                inputs=PrivateIndexInputs(
-                    geoid=item_id,
-                    catalog_id=catalog_id,
-                    collection_id=collection_id,
-                ).model_dump(),
-            )
-            return  # never populate the STAC items index
-
-        # --- Normal catalog path ---
-        if not await _is_es_active(catalog_id, collection_id):
-            return
-
-        doc = await _stac_serialize_item(catalog_id, collection_id, item_id)
-        if doc is None:
-            doc = payload if isinstance(payload, dict) else {}
-            doc.update({"id": item_id, "catalog_id": catalog_id, "collection_id": collection_id})
-
-        entity_id = f"{catalog_id}:{collection_id}:{item_id}"
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchIndexInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_index",
-            inputs=ElasticsearchIndexInputs(
-                entity_type="item",
-                entity_id=entity_id,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-                item_id=item_id,
-                payload=doc,
-            ).model_dump(mode="json"),
-        )
-
-    async def _on_item_bulk_upsert(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None, payload=None, **kwargs,
-    ):
-        if not catalog_id or not collection_id:
-            return
-
-        items_subset = (payload if isinstance(payload, dict) else {}).get("items_subset", [])
-
-        # --- Private path ---
-        # Single resolver call before the loop — every item in this bulk
-        # event shares the same (catalog_id, collection_id) so the
-        # private indexing decision is identical for the whole batch.
-        from dynastore.modules.elasticsearch.es_collection_config import (
-            is_collection_private,
-        )
-        if await is_collection_private(catalog_id, collection_id):
-            from dynastore.modules.storage.drivers.elasticsearch_private.tasks import (
-                PrivateIndexInputs,
-            )
-            for item_doc in items_subset:
-                item_id = item_doc.get("id")
-                if not item_id:
-                    continue
-                await self._dispatch_task(
-                    task_type="elasticsearch_private_index",
-                    inputs=PrivateIndexInputs(
-                        geoid=item_id,
-                        catalog_id=catalog_id,
-                        collection_id=collection_id,
-                    ).model_dump(),
-                )
-            return
-
-        # --- Normal catalog path ---
-        if not await _is_es_active(catalog_id, collection_id):
-            return
-
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchIndexInputs
-        for item_doc in items_subset:
-            item_id = item_doc.get("id")
-            if not item_id:
-                continue
-            doc = {**item_doc, "catalog_id": catalog_id, "collection_id": collection_id}
-            entity_id = f"{catalog_id}:{collection_id}:{item_id}"
-            await self._dispatch_task(
-                task_type="elasticsearch_index",
-                inputs=ElasticsearchIndexInputs(
-                    entity_type="item",
-                    entity_id=entity_id,
-                    catalog_id=catalog_id,
-                    collection_id=collection_id,
-                    item_id=item_id,
-                    payload=doc,
-                ).model_dump(),
-            )
-
-    async def _on_item_delete(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None, item_id: Optional[str] = None,
-        payload=None, **kwargs,
-    ):
-        if not item_id:
-            item_id = (payload if isinstance(payload, dict) else {}).get("geoid")
-        if not catalog_id or not collection_id or not item_id:
-            return
-
-        entity_id = f"{catalog_id}:{collection_id}:{item_id}"
-
-        # Delete from the STAC items index (no-op if not indexed there).
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchDeleteInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_delete",
-            inputs=ElasticsearchDeleteInputs(
-                entity_type="item",
-                entity_id=entity_id,
-            ).model_dump(),
-        )
-
-        # Delete from the private geoid index (no-op if catalog is not private).
-        from dynastore.modules.storage.drivers.elasticsearch_private.tasks import (
-            PrivateDeleteInputs,
-        )
-        await self._dispatch_task(
-            task_type="elasticsearch_private_delete",
-            inputs=PrivateDeleteInputs(
-                geoid=item_id,
-                catalog_id=catalog_id,
             ).model_dump(),
         )
 

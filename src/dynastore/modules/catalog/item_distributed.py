@@ -163,12 +163,16 @@ class ItemDistributedMixin(_Host):
 
         # 1.7 Hash gating: if enabled and an unchanged geometry_hash matches,
         # short-circuit the action to avoid churning identical rows.
+        # Issue #220: geometry_hash lives on the geometries sidecar (PG-
+        # generated STORED column).  ``active_rec`` carries it via the
+        # matcher's JOIN; ``processing_context`` carries the incoming
+        # hash computed by the geometries sidecar's pre-write hook.
         if (
             active_rec
             and write_policy
             and write_policy.skip_if_unchanged_geometry_hash
         ):
-            incoming_ch = processing_context.get("geometry_hash") or hub_payload.get("geometry_hash")
+            incoming_ch = processing_context.get("geometry_hash")
             if incoming_ch and active_rec.get("geometry_hash") == incoming_ch:
                 logger.info(
                     "DISTRIBUTED UPSERT: geometry_hash unchanged — collapsing "

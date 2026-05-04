@@ -216,6 +216,84 @@ def _build_complex_filter_sql(query_filter: QueryFilter, params: dict) -> str:
     return f"({op_sql.join(filter(None, conditions))})"
 
 
+async def _maybe_dispatch_to_es_search(
+    cat_id: str,
+    search_request: "ItemSearchRequest",
+) -> Optional[Tuple[list, int, Optional[Dict[str, Any]]]]:
+    """If the target collections route reads through
+    ``items_elasticsearch_driver``, run the ES path via
+    :class:`SearchService` and return STAC-shaped results.  Returns
+    ``None`` when this dispatch is not applicable (no ES driver, CQL2
+    filter present, multi-collection mixed-driver, …) so the caller
+    falls back to the PG path.
+
+    Closes the user-visible part of issue #222 — basic STAC search on
+    ES-routed collections returns 0 items today because every search
+    unconditionally builds raw PG SQL.
+    """
+    # Only basic structural filters routed through ES today.
+    if search_request.filter is not None:
+        return None
+
+    # Resolve the primary READ driver for each requested collection.
+    # When mixed (some ES, some PG) we don't dispatch — fall back to
+    # PG and let the QueryOptimizer per-collection logic handle it.
+    from dynastore.modules.storage.router import get_driver
+    from dynastore.modules.storage.routing_config import Operation
+
+    cids = search_request.collections or []
+    if not cids:
+        return None
+    es_indexer_id = "items_elasticsearch_driver"
+    for cid in cids:
+        try:
+            driver = await get_driver(Operation.READ, cat_id, cid)
+        except Exception:
+            return None
+        driver_id = type(driver).__name__
+        # Snake-case match — same convention used in routing_config.
+        from dynastore.modules.storage.routing_config import _to_snake
+        if _to_snake(driver_id) != es_indexer_id:
+            return None  # at least one collection isn't ES — bail
+
+    # All target collections route through ES.  Build a SearchBody and
+    # delegate to SearchService.search_items.
+    try:
+        from dynastore.extensions.search.search_models import SearchBody
+        from dynastore.extensions.search.search_service import SearchService
+    except ImportError:
+        return None  # search extension not loaded
+
+    search_svc = get_protocol(SearchService)
+    if search_svc is None:
+        return None
+
+    body = SearchBody(
+        q=None,
+        token=None,
+        sortby=None,
+        catalog_id=cat_id,
+        collections=cids,
+        ids=search_request.ids,
+        bbox=list(search_request.bbox) if search_request.bbox else None,
+        intersects=search_request.intersects,
+        datetime=search_request.datetime,
+        limit=search_request.limit,
+    )
+    try:
+        item_collection = await search_svc.search_items(body)
+    except Exception as exc:
+        logger.warning(
+            "STAC search → ES dispatch failed (catalog=%s, collections=%s): %s",
+            cat_id, cids, exc,
+        )
+        return None  # fall back to PG path on error
+
+    features = item_collection.features
+    total = item_collection.numberMatched or 0
+    return features, total, None
+
+
 async def search_items(
     db_resource: DbResource,
     search_request: ItemSearchRequest,
@@ -229,6 +307,21 @@ async def search_items(
     assert catalogs is not None, "CatalogsProtocol not registered"
     assert search_request.catalog_id is not None, "search_request.catalog_id required"
     cat_id: str = search_request.catalog_id
+
+    # ── ES dispatch fast path (issue #222) ────────────────────────────
+    # When the resolved primary READ driver is ``items_elasticsearch_driver``
+    # and the request is structural-filter only (no CQL2 ``filter``),
+    # delegate to the platform :class:`SearchService` which already
+    # implements the ES query path against ``{prefix}-items-{cat}`` /
+    # the public alias.  CQL2 + ES is intentionally NOT routed here yet
+    # because no CQL2→ES translator exists; those queries fall through
+    # to the PG path (operator's responsibility to ensure their data
+    # is in PG, or pin the collection's READ to PG via routing config).
+    es_dispatch_result = await _maybe_dispatch_to_es_search(
+        cat_id, search_request,
+    )
+    if es_dispatch_result is not None:
+        return es_dispatch_result
 
     # Helper to execute with a connection (reusing if present, connecting if engine)
     _catalogs = catalogs
@@ -651,10 +744,14 @@ async def search_items(
         geoid_param = f"geoids_{coll_idx}"
         hydration_params[geoid_param] = geoids
 
+        # Issue #220: geometry_hash now lives on the geometries sidecar.
+        # Project ``g.geometry_hash`` when the geometries sidecar is
+        # joined below (``has_geom``); otherwise emit NULL to keep the
+        # column shape stable.
         select_parts = [
             f"SELECT '{cat_id}' as catalog_id,"
             f" '{coll_id}' as collection_id,"
-            f" h.geoid, h.transaction_time, h.geometry_hash"
+            f" h.geoid, h.transaction_time"
         ]
         joins = [f'FROM "{phys_schema}"."{p_tab}" h']
 
@@ -676,6 +773,7 @@ async def search_items(
 
         if has_geom:
             select_parts.append(
+                f", g.geometry_hash"
                 f", ST_AsEWKB(ST_SimplifyPreserveTopology(g.geom, {simplification_sql})) AS simplified_geom"
                 f", ST_XMin(g.geom) as bbox_xmin, ST_YMin(g.geom) as bbox_ymin"
                 f", ST_XMax(g.geom) as bbox_xmax, ST_YMax(g.geom) as bbox_ymax"
@@ -683,6 +781,7 @@ async def search_items(
             joins.append(f'LEFT JOIN "{phys_schema}"."{g_tab}" g ON h.geoid = g.geoid')
         else:
             select_parts.append(
+                ", null as geometry_hash"
                 ", null as simplified_geom"
                 ", null as bbox_xmin, null as bbox_ymin"
                 ", null as bbox_xmax, null as bbox_ymax"

@@ -709,20 +709,18 @@ class ItemsPostgresqlDriverConfig(CollectionDriverConfig):
     def get_column_definitions(self) -> Dict[str, str]:
         """Hub table column definitions (sidecar columns are separate).
 
-        ``geometry_hash`` (renamed from ``geometry_hash``): SHA256 of the
-        processed geometry's WKB, populated by the geometries sidecar's
-        write path and lifted onto the hub by the orchestrator. Used by
-        ``IdentityMatcher.GEOMETRY_HASH`` and the
-        ``skip_if_unchanged_geometry_hash`` policy gate.
-
-        Follow-up (#220): relocate to the geometries sidecar as a STORED
-        GENERATED column once readers and writers are migrated together.
+        Issue #220 cutover (no dual-write window): ``geometry_hash`` is
+        now a STORED GENERATED column on the geometries sidecar
+        (``encode(digest(ST_AsBinary(geom), 'sha256'), 'hex')``).
+        Postgres maintains it atomically with the geometry — no
+        application-side write path, no skew between hub-stored hash and
+        actual stored geometry.  The matcher / hash gate JOIN the
+        sidecar to read it.
         """
         return {
             "geoid": "UUID PRIMARY KEY",
             "transaction_time": "TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
             "deleted_at": "TIMESTAMPTZ",
-            "geometry_hash": "VARCHAR(64)",
         }
 
     def get_all_field_definitions(self) -> Dict[str, Any]:

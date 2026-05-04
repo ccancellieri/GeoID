@@ -68,7 +68,13 @@ from dynastore.models.protocols.styles import StylesProtocol
 from dynastore.models.protocols.moving_features import MovingFeaturesProtocol
 from dynastore.models.protocols.connected_systems import ConnectedSystemsProtocol
 from dynastore.models.protocols.search import SearchProtocol
-from dynastore.models.protocols.indexer import IndexerProtocol
+from dynastore.models.protocols.indexer import (
+    BulkResult,
+    Indexer,
+    IndexContext,
+    IndexerProtocol,
+    IndexOp,
+)
 from dynastore.models.protocols.storage_driver import CollectionItemsStore
 from dynastore.models.protocols.entity_store import (
     CatalogStore,
@@ -170,7 +176,11 @@ __all__ = [
     "MovingFeaturesProtocol",
     "ConnectedSystemsProtocol",
     "SearchProtocol",
+    "BulkResult",
+    "Indexer",
+    "IndexContext",
     "IndexerProtocol",
+    "IndexOp",
     "CollectionItemsStore",
     "CollectionStore",
     "CatalogStore",

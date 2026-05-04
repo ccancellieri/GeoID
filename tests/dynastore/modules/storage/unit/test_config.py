@@ -335,7 +335,14 @@ class TestWriteMode:
 class TestMetadataRoutingConfig:
     def test_default_operations_empty(self):
         cfg = CollectionRoutingConfig()
-        assert cfg.operations == {}
+        # After Phase 2c, the Searcher auto-self-registration validator may
+        # seed Operation.SEARCH on construction once a Searcher has registered
+        # itself. The invariant that still holds: no WRITE/READ/TRANSFORM
+        # entries are seeded by default — those remain operator-driven.
+        for op in (Operation.WRITE, Operation.READ, Operation.TRANSFORM):
+            assert op not in cfg.operations, (
+                f"{op} unexpectedly present in default operations: {cfg.operations}"
+            )
 
     def test_read_operation(self):
         cfg = CollectionRoutingConfig(operations={

@@ -287,6 +287,12 @@ class ItemsElasticsearchDriver(
 
     is_item_indexer: ClassVar[bool] = True
 
+    # Generic Indexer Protocol — slim per-item / bulk surface used by the
+    # ``IndexDispatcher``.  The legacy ``_on_item_upsert``/``_on_item_delete``
+    # event listeners remain in place during Phase 2; Phase 2c removes them
+    # once item_service.upsert calls the dispatcher directly.
+    indexer_id: ClassVar[str] = "items_elasticsearch_driver"
+
     priority: int = 50
     preferred_chunk_size: int = 500
     capabilities: FrozenSet[str] = frozenset({
@@ -326,6 +332,14 @@ class ItemsElasticsearchDriver(
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
+        """Register event listeners for catalog/collection-tier propagation only.
+
+        ITEM_* propagation moved to the IndexDispatcher (called directly
+        from item_service.upsert and item_query.delete) — see Phase 2d
+        of the indexer-protocol harmonisation.  Catalog/collection-tier
+        propagation will follow in a separate phase; for now those keep
+        the event-driven path.
+        """
         from dynastore.models.protocols.events import EventsProtocol
         from dynastore.tools.discovery import get_protocol
         from dynastore.modules.catalog.event_service import CatalogEventType
@@ -341,16 +355,14 @@ class ItemsElasticsearchDriver(
                 (CatalogEventType.COLLECTION_UPDATE, self._on_collection_upsert),
                 (CatalogEventType.COLLECTION_DELETION, self._on_collection_delete),
                 (CatalogEventType.COLLECTION_HARD_DELETION, self._on_collection_delete),
-                (CatalogEventType.ITEM_CREATION, self._on_item_upsert),
-                (CatalogEventType.ITEM_UPDATE, self._on_item_upsert),
-                (CatalogEventType.ITEM_DELETION, self._on_item_delete),
-                (CatalogEventType.ITEM_HARD_DELETION, self._on_item_delete),
-                (CatalogEventType.BULK_ITEM_CREATION, self._on_item_bulk_upsert),
             ]:
                 decorator = events.async_event_listener(etype)
                 if decorator:
                     decorator(handler)
-            logger.info("ItemsElasticsearchDriver: event listeners registered.")
+            logger.info(
+                "ItemsElasticsearchDriver: catalog/collection event listeners "
+                "registered (item propagation now dispatched via IndexDispatcher).",
+            )
         yield
 
     # ------------------------------------------------------------------
@@ -988,101 +1000,138 @@ class ItemsElasticsearchDriver(
                 catalog_id, collection_id, e,
             )
 
-    async def _on_item_upsert(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None,
-        item_id: Optional[str] = None, payload=None, **kwargs,
-    ):
-        if not catalog_id or not collection_id or not item_id:
-            return
-        if not await self._is_secondary_for(type(self).__name__, catalog_id, collection_id):
-            return
-        # Skip event-driven indexing when driver is in WRITE routing —
-        # the router fan-out already handled this write.
-        if await self._is_write_driver_for(type(self).__name__, catalog_id, collection_id):
-            return
-        try:
-            doc = await self._serialize_item(catalog_id, collection_id, item_id)
-            if doc is None:
-                doc = payload if isinstance(payload, dict) else {}
-                doc.update({
-                    "id": item_id,
-                    "collection": collection_id,
-                })
-            es = _es_client_required()
-            index_name = _tenant_items_index(catalog_id)
-            await es.index(
-                index=index_name, id=item_id, body=doc,
-                params={"routing": collection_id},
-            )
-        except Exception as e:
-            logger.error(
-                "ES driver: item upsert failed for %s/%s/%s: %s",
-                catalog_id, collection_id, item_id, e,
-            )
+    # ------------------------------------------------------------------
+    # Generic Indexer Protocol — slim, dispatcher-facing surface
+    # ------------------------------------------------------------------
 
-    async def _on_item_bulk_upsert(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None,
-        payload=None, **kwargs,
-    ):
-        if not catalog_id or not collection_id:
-            return
-        if not await self._is_secondary_for(type(self).__name__, catalog_id, collection_id):
-            return
-        # Skip event-driven indexing when driver is in WRITE routing —
-        # the router fan-out already handled this write.
-        if await self._is_write_driver_for(type(self).__name__, catalog_id, collection_id):
-            return
+    async def ensure_indexer(self, ctx) -> None:
+        """Idempotent bootstrap — creates the per-tenant items index
+        ``{prefix}-items-{catalog_id}`` with ``ITEM_MAPPING`` if missing
+        and enrols it in the platform alias ``{prefix}-items-public``.
 
-        items_subset = (payload if isinstance(payload, dict) else {}).get("items_subset", [])
-        if not items_subset:
-            return
+        Delegates to :meth:`ensure_storage` so a single code path
+        handles both per-collection-creation eager bootstrap and the
+        dispatcher's lazy first-write check.
+        """
+        await self.ensure_storage(ctx.catalog, ctx.collection)
 
-        try:
-            es = _es_client_required()
-            index_name = _tenant_items_index(catalog_id)
-            body: list = []
-            for item_doc in items_subset:
-                item_doc.setdefault("collection", collection_id)
-                doc_id = item_doc.get("id")
-                if doc_id is None:
-                    continue
-                body.append({"index": {
-                    "_index": index_name,
-                    "_id": str(doc_id),
-                    "routing": collection_id,
-                }})
-                body.append(item_doc)
-            if body:
-                await es.bulk(body=body, params={"refresh": "false"})
-        except Exception as e:
-            logger.error(
-                "ES driver: bulk upsert failed for %s/%s: %s",
-                catalog_id, collection_id, e,
+    async def index(self, ctx, op) -> None:
+        """Apply a single :class:`IndexOp` to the per-tenant items index.
+
+        Called by :class:`IndexDispatcher` from inside the caller's PG
+        transaction.  Failure raises; the dispatcher applies the
+        configured ``FailurePolicy`` (FATAL → caller rollback, OUTBOX
+        → enqueue retry row in same TX, WARN → log).
+
+        No ``_is_secondary_for`` / ``_is_write_driver_for`` guards: the
+        dispatcher only invokes drivers listed in
+        ``operations[INDEX]`` for this ``(catalog, collection)`` — guard
+        is moved out of the driver into the routing layer.
+        """
+        if op.entity_type != "item":
+            # Items driver only handles item-tier ops.  Non-item routes
+            # land on a different Indexer registered for that tier.
+            return
+        if not ctx.collection:
+            raise ValueError(
+                "ItemsElasticsearchDriver.index: collection is required for item ops",
             )
 
-    async def _on_item_delete(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None,
-        item_id: Optional[str] = None, payload=None, **kwargs,
-    ):
-        if not item_id:
-            _val = (payload if isinstance(payload, dict) else {}).get("geoid")
-            item_id = str(_val) if _val is not None else None
-        if not catalog_id or not collection_id or not item_id:
-            return
-        if not await self._is_secondary_for(type(self).__name__, catalog_id, collection_id):
-            return
-        try:
-            es = _es_client_required()
-            index_name = _tenant_items_index(catalog_id)
+        es = _es_client_required()
+        index_name = _tenant_items_index(ctx.catalog)
+
+        if op.op_type == "delete":
             await es.delete(
-                index=index_name, id=item_id,
-                params={"routing": collection_id, "ignore": "404"},
+                index=index_name, id=op.entity_id,
+                params={"routing": ctx.collection, "ignore": "404"},
             )
-        except Exception as e:
-            logger.error(
-                "ES driver: item delete failed for %s/%s/%s: %s",
-                catalog_id, collection_id, item_id, e,
+            return
+
+        # op_type == "upsert"
+        doc = op.payload or await self._serialize_item(
+            ctx.catalog, ctx.collection, op.entity_id,
+        )
+        if doc is None:
+            # Nothing serialisable — skip without raising; this is the
+            # "row vanished between write and index" race, not a failure.
+            logger.debug(
+                "ItemsElasticsearchDriver.index: %s/%s/%s — no doc to index",
+                ctx.catalog, ctx.collection, op.entity_id,
             )
+            return
+        doc.setdefault("id", op.entity_id)
+        doc.setdefault("collection", ctx.collection)
+        await es.index(
+            index=index_name, id=op.entity_id, body=doc,
+            params={"routing": ctx.collection},
+        )
+
+    async def index_bulk(self, ctx, ops):
+        """Apply a batch of :class:`IndexOp` via the ES ``_bulk`` API.
+
+        Returns a :class:`BulkResult` summarising success / failure
+        per-op.  An unhandled exception (auth, connection) raises; the
+        dispatcher applies the configured ``FailurePolicy`` to the whole
+        batch.
+        """
+        from dynastore.models.protocols.indexer import BulkResult
+
+        if not ops:
+            return BulkResult()
+        if not ctx.collection:
+            raise ValueError(
+                "ItemsElasticsearchDriver.index_bulk: collection is required for item ops",
+            )
+
+        es = _es_client_required()
+        index_name = _tenant_items_index(ctx.catalog)
+
+        body: List[dict] = []
+        for op in ops:
+            if op.entity_type != "item":
+                continue
+            if op.op_type == "delete":
+                body.append({"delete": {
+                    "_index": index_name, "_id": op.entity_id,
+                    "routing": ctx.collection,
+                }})
+                continue
+            doc = op.payload or await self._serialize_item(
+                ctx.catalog, ctx.collection, op.entity_id,
+            )
+            if doc is None:
+                continue
+            doc.setdefault("id", op.entity_id)
+            doc.setdefault("collection", ctx.collection)
+            body.append({"index": {
+                "_index": index_name, "_id": op.entity_id,
+                "routing": ctx.collection,
+            }})
+            body.append(doc)
+
+        if not body:
+            return BulkResult(total=len(ops))
+
+        resp = await es.bulk(body=body, params={"refresh": "false"})
+        items = (resp or {}).get("items", []) if isinstance(resp, dict) else []
+        succeeded = 0
+        failures: List[Dict[str, Any]] = []
+        for it in items:
+            entry = next(iter(it.values())) if isinstance(it, dict) and it else {}
+            err = entry.get("error") if isinstance(entry, dict) else None
+            if err:
+                failures.append({
+                    "id": entry.get("_id"),
+                    "reason": str(err.get("reason", err) if isinstance(err, dict) else err),
+                })
+            else:
+                succeeded += 1
+        return BulkResult(
+            total=len(ops),
+            succeeded=succeeded,
+            failed=len(failures),
+            failures=failures,
+        )
 
     # ------------------------------------------------------------------
     # Serialization helpers (reuse existing DynaStore services)
@@ -1397,6 +1446,11 @@ class AssetElasticsearchDriver(
 
     is_asset_indexer: ClassVar[bool] = True
 
+    # Generic Indexer Protocol — slim per-item / bulk surface used by the
+    # ``IndexDispatcher``.  Asset ops route through the same dispatcher
+    # via ``AssetRoutingConfig.operations[INDEX]``.
+    indexer_id: ClassVar[str] = "asset_elasticsearch_driver"
+
     priority: int = 52
     capabilities: FrozenSet[str] = frozenset({
         Capability.READ,
@@ -1467,6 +1521,64 @@ class AssetElasticsearchDriver(
             await es.delete(index=index_name, id=asset_id)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Generic Indexer Protocol — slim, dispatcher-facing surface
+    # ------------------------------------------------------------------
+
+    async def ensure_indexer(self, ctx) -> None:
+        """Idempotent bootstrap — creates ``{prefix}-assets-{catalog_id}``
+        with ``ASSET_MAPPING`` if missing.  No alias today (assets are
+        per-catalog only; no platform-wide assets alias).
+        """
+        await self.ensure_storage(ctx.catalog, ctx.collection)
+
+    async def index(self, ctx, op) -> None:
+        """Apply a single asset :class:`IndexOp` via the existing
+        :meth:`index_asset` / :meth:`delete_asset` helpers.
+
+        Skips ops whose ``entity_type`` is not ``"asset"`` — different
+        tier; a different Indexer fields it.
+        """
+        if op.entity_type != "asset":
+            return
+        if op.op_type == "delete":
+            await self.delete_asset(ctx.catalog, op.entity_id)
+            return
+        # upsert
+        doc = dict(op.payload or {})
+        doc.setdefault("asset_id", op.entity_id)
+        doc.setdefault("catalog_id", ctx.catalog)
+        if ctx.collection is not None:
+            doc.setdefault("collection_id", ctx.collection)
+        await self.index_asset(ctx.catalog, doc)
+
+    async def index_bulk(self, ctx, ops):
+        """Bulk-apply a batch of asset ops.
+
+        Delegates per-op to :meth:`index` for now — asset writes are
+        rare enough vs item writes that a single ES round-trip per op
+        isn't a hot-path concern.  A native ``_bulk`` implementation
+        can land later if profiling motivates it.
+        """
+        from dynastore.models.protocols.indexer import BulkResult
+
+        succeeded = 0
+        failures: List[Dict[str, Any]] = []
+        for op in ops:
+            if op.entity_type != "asset":
+                continue
+            try:
+                await self.index(ctx, op)
+                succeeded += 1
+            except Exception as exc:  # noqa: BLE001 — surface per-op failures
+                failures.append({"id": op.entity_id, "reason": str(exc)})
+        return BulkResult(
+            total=len(ops),
+            succeeded=succeeded,
+            failed=len(failures),
+            failures=failures,
+        )
 
     # ------------------------------------------------------------------
     # StorageDriverProtocol
