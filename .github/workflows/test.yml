@@ -218,14 +218,15 @@ jobs:
 
   integration-tests:
     runs-on: ubuntu-22.04
-    # 20 min cap. Slim-stack baseline (db only): build test-runner ~5 min
-    # (cache miss on PR branches; warm on main), free-disk ~1 min,
-    # db build+up ~1 min, integration tests ~3-5 min on 4-vCPU GHA xdist
-    # (~183 items, in-process FastAPI clients, no external HTTP).
-    # Total ~10-12 min on warm cache, ~14 min cold. 20 min leaves
-    # comfortable headroom; if a future change pushes us past it that's
-    # a real regression worth investigating, not a budget to extend.
-    timeout-minutes: 20
+    # Temporary bump to 30 min while we triage the 7 stac-integration
+    # failures + chase down which sidecar tables aren't getting created
+    # under the lazy-activation path. Test count grew 53 → 183 (Apr
+    # 26→28); per-test catalog setup ~25 s × N tests overruns the
+    # original 20-min budget post-growth. Permanent fix is shared_catalog
+    # adoption (PR #218 fixture) — once non-lifecycle tests reuse the
+    # module-scoped catalog this job drops back to ~10-12 min and
+    # timeout returns to 20.
+    timeout-minutes: 30
     # inputs.run_integration is only set for workflow_dispatch / workflow_call.
     # For push/pull_request it is undefined (''), so the comparison evaluates
     # != 'false' as true. Skip only when the caller explicitly passes false.
