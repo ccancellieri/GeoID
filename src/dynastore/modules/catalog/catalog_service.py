@@ -773,18 +773,17 @@ class CatalogService(CatalogsProtocol):
             )
             if not inserted_rows:
                 # ON CONFLICT DO NOTHING produced rowcount=0 — the row already
-                # exists. Surface as a conflict the HTTP layer can map to 409.
-                # ensure_catalog_exists() pre-checks existence and only calls
-                # create_catalog when the row is missing, so the only callers
-                # that see this path are explicit POSTs of duplicates.
-                from sqlalchemy.exc import IntegrityError
+                # exists. Surface a typed conflict so the HTTP layer maps it
+                # to 409. Raising raw IntegrityError(orig=Exception(...)) here
+                # produces an exception with pgcode=None, which fails the
+                # tightened is_conflict_error() pgcode-set check (PR #200) and
+                # falls through to a 500.
+                from dynastore.modules.db_config.exceptions import (
+                    UniqueViolationError,
+                )
 
-                raise IntegrityError(
-                    statement=f"INSERT catalog '{catalog_model.id}'",
-                    params=None,
-                    orig=Exception(
-                        f"Catalog '{catalog_model.id}' already exists"
-                    ),
+                raise UniqueViolationError(
+                    f"Catalog '{catalog_model.id}' already exists"
                 )
 
             # Catalog metadata persistence — router-direct.
