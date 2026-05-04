@@ -234,6 +234,44 @@ class ValidationExceptionHandler(ExceptionHandler):
         )
 
 
+class ConstraintViolationExceptionHandler(ExceptionHandler):
+    """Maps PG schema-level constraint violations to HTTP 422.
+
+    Pre-#200, every IntegrityError was greedy-mapped to 409 by
+    ``ConflictExceptionHandler`` regardless of its pgcode — masking
+    NOT NULL / CHECK violations behind a misleading "duplicate" status.
+    With ``is_conflict_error`` now restricted to genuine conflict
+    pgcodes (23505, 23503, 42710), this handler claims the rest of the
+    DB-schema-validation family and emits 422.
+
+    Registered ahead of ``ValidationExceptionHandler`` so its richer
+    detail body (with pgcode hint) takes precedence over the generic
+    ``ValueError`` mapping.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.db_config.exceptions import (
+            CheckViolationError,
+            NotNullViolationError,
+        )
+
+        return isinstance(exception, (NotNullViolationError, CheckViolationError))
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.modules.db_config.exceptions import NotNullViolationError
+
+        kind = "NOT NULL" if isinstance(exception, NotNullViolationError) else "CHECK"
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": f"{kind} constraint violation: {exception}",
+                "constraint_kind": kind,
+            },
+        )
+
+
 class UnknownFieldsExceptionHandler(ExceptionHandler):
     """Maps ``UnknownFieldsError`` to HTTP 422 with structured offender list.
 
@@ -365,6 +403,7 @@ class ExceptionHandlerRegistry:
         # first so its 4xx isn't shadowed by a more generic handler downstream.
         self.register(ProblemExceptionHandler())
         self.register(ConflictExceptionHandler())
+        self.register(ConstraintViolationExceptionHandler())
         self.register(UnknownFieldsExceptionHandler())
         self.register(ImmutableConfigExceptionHandler())
         self.register(PluginNotFoundExceptionHandler())

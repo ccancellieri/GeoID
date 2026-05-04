@@ -132,6 +132,27 @@ class ForeignKeyViolationError(DatabaseError):
     pass
 
 
+class NotNullViolationError(DatabaseError):
+    """Raised on violation of a NOT NULL constraint (pgcode: 23502).
+
+    Maps to HTTP 422 — the request body is missing a column the schema
+    requires. Distinct from a "conflict" (409) which means "your write
+    collides with existing state"; here the request is structurally
+    incomplete.
+    """
+    pass
+
+
+class CheckViolationError(DatabaseError):
+    """Raised on violation of a CHECK constraint (pgcode: 23514).
+
+    Maps to HTTP 422 — a column value violates a domain rule the schema
+    encodes (e.g. range check). Not a conflict; the request is invalid
+    on its own merits.
+    """
+    pass
+
+
 # Mapping from PostgreSQL error codes (pgcode) to our custom exception classes.
 # See: https://www.postgresql.org/docs/current/errcodes-appendix.html
 PGCODE_EXCEPTION_MAP = {
@@ -142,23 +163,53 @@ PGCODE_EXCEPTION_MAP = {
     '42710': DuplicateObjectError,
     '23505': UniqueViolationError,
     '23503': ForeignKeyViolationError,
+    '23502': NotNullViolationError,
+    '23514': CheckViolationError,
     # Codes for connection issues
     '08000': DatabaseConnectionError,
     '08003': DatabaseConnectionError,
     '08006': DatabaseConnectionError,
 }
 
+# pgcodes that genuinely warrant HTTP 409 Conflict.  Others (NOT NULL,
+# CHECK, etc.) are NOT conflicts — they're 422 / 500 / etc. Pre-fix the
+# ConflictExceptionHandler claimed every IntegrityError and downcast it
+# to DuplicateObjectError → bogus 409. Tightening the predicate here
+# unmasks the real exception type so the rest of the handler chain can
+# emit the correct status (closes #200).
+_CONFLICT_PGCODES = frozenset({
+    '23505',  # unique_violation
+    '23503',  # foreign_key_violation (kept as 409 for back-compat)
+    '42710',  # duplicate_object (DDL-level)
+})
+
+
 # --- REST API Conflict Detection Utilities ---
 
 def is_conflict_error(exc: Exception) -> bool:
     """
     Check if an exception represents a data conflict (HTTP 409 Conflict status).
-    
-    Identifies constraint violation and duplicate key errors that should be
-    reported to REST API clients as 409 Conflict responses.
+
+    Returns True only for:
+      * Our own conflict exception classes (UniqueViolationError,
+        ForeignKeyViolationError, DuplicateObjectError) — these have
+        already been classified.
+      * SQLAlchemy IntegrityError carrying a conflict-class pgcode
+        (``23505``, ``23503``, ``42710``).
+
+    Returns False for IntegrityError with non-conflict pgcodes
+    (``23502`` not_null, ``23514`` check, etc.) so the rest of the
+    exception handler chain can map them to richer 4xx/5xx statuses
+    rather than blanket 409 (closes #200).
     """
     from sqlalchemy.exc import IntegrityError as SqlIntegrityError
-    return isinstance(exc, (UniqueViolationError, ForeignKeyViolationError, DuplicateObjectError, SqlIntegrityError))
+
+    if isinstance(exc, (UniqueViolationError, ForeignKeyViolationError, DuplicateObjectError)):
+        return True
+    if isinstance(exc, SqlIntegrityError):
+        pgcode = getattr(exc.orig, 'pgcode', None) if exc.orig else None
+        return pgcode in _CONFLICT_PGCODES
+    return False
 
 
 def get_conflict_context(exc: Exception) -> dict:

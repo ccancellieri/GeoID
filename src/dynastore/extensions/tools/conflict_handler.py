@@ -59,21 +59,43 @@ def conflict_to_409(
         HTTPException with 409 Conflict status code
     
     """
-    # Convert raw IntegrityError if needed
+    # Convert raw IntegrityError if needed.
+    #
+    # Pre-fix: any unmapped pgcode silently downcast to DuplicateObjectError →
+    # bogus 409 (closed #200). Now we only map pgcodes that genuinely warrant
+    # 409. Other IntegrityErrors should never reach this function — they're
+    # filtered out upstream by ``is_conflict_error``. If we somehow do get one
+    # (a caller invoked us directly with a non-conflict IntegrityError), the
+    # raise below makes the misuse loud rather than masquerading as 409.
     if isinstance(error, IntegrityError):
         pgcode = getattr(error.orig, 'pgcode', None) if error.orig else None
         if pgcode and pgcode in PGCODE_EXCEPTION_MAP:
             error = PGCODE_EXCEPTION_MAP[pgcode](str(error.orig), original_exception=error)
         else:
-            error = DuplicateObjectError(str(error.orig), original_exception=error)
-    
-    # Generate message based on exception type
+            raise ValueError(
+                f"conflict_to_409 called with IntegrityError carrying pgcode "
+                f"{pgcode!r} which is not a conflict-class pgcode. The caller "
+                f"should funnel this through the ExceptionHandlerRegistry "
+                f"instead so the right 4xx/5xx mapping can fire. "
+                f"Original: {error.orig}"
+            )
+
+    # Generate message based on exception type. Pre-fix the catch-all `else`
+    # downcast every other DatabaseError subclass to 409 (e.g. NotNull /
+    # Check violations the new typed map produces). Now strict: any
+    # non-conflict-class typed exception raises so the misuse is loud.
     if isinstance(error, (UniqueViolationError, DuplicateObjectError)):
         detail = f"{resource_name} '{resource_id}' already exists." if resource_id else f"{resource_name} already exists."
     elif isinstance(error, ForeignKeyViolationError):
         detail = f"Cannot create {resource_name} '{resource_id}': referenced resource does not exist." if resource_id else "Cannot create resource: referenced resource does not exist."
     else:
-        detail = f"Conflict creating {resource_name}." if resource_name else "Resource conflict."
-    
+        raise ValueError(
+            f"conflict_to_409 called with non-conflict-class exception "
+            f"{type(error).__name__}: {error}. Conflict status (409) is only "
+            f"appropriate for UniqueViolationError, ForeignKeyViolationError, "
+            f"and DuplicateObjectError. Route this through the "
+            f"ExceptionHandlerRegistry for the correct status mapping."
+        )
+
     logger.warning(f"Conflict (409): {detail} [Original: {error}]")
     return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
