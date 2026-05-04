@@ -1196,6 +1196,106 @@ class ItemsElasticsearchDriver(
             display_label=f"{index_name} (routing={collection_id})",
         )
 
+    # ------------------------------------------------------------------
+    # CollectionItemsStore Protocol — capability-gated stubs
+    # ------------------------------------------------------------------
+    # The methods below exist to satisfy the runtime_checkable
+    # CollectionItemsStore protocol so isinstance(driver,
+    # CollectionItemsStore) returns True and the driver registers in
+    # the items slot. They raise NotImplementedError because this
+    # driver's capabilities frozenset does NOT advertise the matching
+    # Capability flag — callers that respect capabilities won't reach
+    # them. Implementations can replace these stubs incrementally as
+    # the corresponding capabilities (COUNT, AGGREGATION, STATISTICS,
+    # INTROSPECTION) are added.
+
+    async def count_entities(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        request: Optional[Any] = None,
+        db_resource: Optional[Any] = None,
+    ) -> int:
+        raise NotImplementedError(
+            "ItemsElasticsearchDriver: count_entities is not implemented "
+            "(no Capability.COUNT). Route counting through a driver that "
+            "advertises the capability."
+        )
+
+    async def compute_extents(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError(
+            "ItemsElasticsearchDriver: compute_extents is not implemented "
+            "(no Capability.STATISTICS). Route extent computation through "
+            "a driver that advertises the capability."
+        )
+
+    async def aggregate(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        aggregation_type: str,
+        field: Optional[str] = None,
+        request: Optional[Any] = None,
+        db_resource: Optional[Any] = None,
+    ) -> Any:
+        raise NotImplementedError(
+            "ItemsElasticsearchDriver: aggregate is not implemented "
+            "(no Capability.AGGREGATION). Route aggregations through "
+            "a driver that advertises the capability."
+        )
+
+    async def introspect_schema(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> List[Any]:
+        raise NotImplementedError(
+            "ItemsElasticsearchDriver: introspect_schema is not implemented "
+            "(no Capability.INTROSPECTION). Route schema discovery through "
+            "a driver that advertises the capability."
+        )
+
+    async def rename_storage(
+        self,
+        catalog_id: str,
+        old_collection_id: str,
+        new_collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> None:
+        raise NotImplementedError(
+            "ItemsElasticsearchDriver: rename_storage is not supported. "
+            "Renaming a collection on this backend would require a full "
+            "reindex; perform the reindex explicitly via the "
+            "elasticsearch_indexer process."
+        )
+
+    async def restore_entities(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        entity_ids: List[str],
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> int:
+        from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
+
+        raise SoftDeleteNotSupportedError(
+            "ItemsElasticsearchDriver: restore_entities is not implemented; "
+            "soft-deleted entities are not tracked separately on this "
+            "backend (deletes are physical removals from the index)."
+        )
+
 
 
 # ---------------------------------------------------------------------------
