@@ -1201,36 +1201,31 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             assert isinstance(_cfg, StacPluginConfig)
             stac_config = _cfg
 
-            # Check if aggregations are enabled
-            if stac_config.aggregations and not stac_config.aggregations.enabled:
+            if not stac_config.aggregations:
                 raise HTTPException(
                     status_code=403,
                     detail="Aggregations are not enabled for this collection.",
                 )
 
-            # Validate aggregation count
-            if stac_config.aggregations:
-                max_aggs = stac_config.aggregations.max_aggregations_per_request
-                if len(aggregation_request.aggregations) > max_aggs:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Too many aggregations requested. Maximum is {max_aggs}.",
-                    )
+            max_aggs = stac_config.aggregations.max_aggregations_per_request
+            if len(aggregation_request.aggregations) > max_aggs:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Too many aggregations requested. Maximum is {max_aggs}.",
+                )
 
-                # Check if custom aggregations are allowed
-                if not stac_config.aggregations.allow_custom:
-                    # Verify all requested aggregations are in default_rules
-                    default_names = {
-                        rule.name for rule in stac_config.aggregations.default_rules
-                    }
-                    requested_names = {
-                        agg.name for agg in aggregation_request.aggregations
-                    }
-                    if not requested_names.issubset(default_names):
-                        raise HTTPException(
-                            status_code=403,
-                            detail="Custom aggregations are not allowed. Use only pre-configured aggregations.",
-                        )
+            if not stac_config.aggregations.allow_custom:
+                default_names = {
+                    rule.name for rule in stac_config.aggregations.default_rules
+                }
+                requested_names = {
+                    agg.name for agg in aggregation_request.aggregations
+                }
+                if not requested_names.issubset(default_names):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Custom aggregations are not allowed. Use only pre-configured aggregations.",
+                    )
 
             # Build WHERE clause from filters
             where_clauses = ["h.deleted_at IS NULL"]

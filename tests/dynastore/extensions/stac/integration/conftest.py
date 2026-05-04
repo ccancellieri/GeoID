@@ -86,7 +86,7 @@ async def setup_aggregation_data(
 
     stac_config = StacPluginConfig(
         aggregations=AggregationConfig(
-            enabled=True, allow_custom=True, max_aggregations_per_request=10
+            allow_custom=True, max_aggregations_per_request=10
         )
     )
 
