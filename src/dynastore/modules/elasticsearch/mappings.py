@@ -175,6 +175,12 @@ COMMON_PROPERTIES: Dict[str, Any] = {
     "id":           {"type": "keyword"},
     "catalog_id":   {"type": "keyword"},
     "collection_id": {"type": "keyword"},
+    # STAC Item documents use the field name `collection` (not
+    # `collection_id`) — and that's the field both /search and the
+    # `items_es_ops` term-filter target. Without an explicit keyword
+    # mapping it falls back to dynamic-detected `text`, against which
+    # `term`/`terms` queries silently miss every exact value.
+    "collection":   {"type": "keyword"},
     "type":         {"type": "keyword"},
     "stac_version": {"type": "keyword"},
     "stac_extensions": {"type": "keyword"},
