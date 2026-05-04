@@ -412,11 +412,17 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
 
         Fix: one transaction, sequential upserts, exceptions propagate.
         ~30 policies + 4 roles is cheap (~30ms); serial vs concurrent
-        is not a perf concern. Sibling services still race against
-        each other via separate transactions, but the upsert ON CONFLICT
-        DO UPDATE is now the only contention point — Postgres serialises
-        these correctly without deadlocking, since the WAIT chain is
-        single-row and a single transaction can't deadlock with itself.
+        is not a perf concern.
+
+        Sibling-service race retry (issue #209.2): sibling services
+        (catalog + web + worker + maps + tools + auth + geoid) still
+        open separate transactions that all upsert the same partition
+        rows. PG ``ON CONFLICT DO UPDATE`` serialises correctly but can
+        still surface SQLSTATE ``40001`` (serialization_failure) or
+        ``40P01`` (deadlock_detected) when the concurrency is tight at
+        cold start. Bounded retry — 3 attempts, exponential backoff —
+        handles the cluster cold-start window without masking real bugs:
+        any other exception propagates immediately.
         """
         policies = list(self._pending_policies.values())
         roles = list(self._pending_roles.values())
@@ -439,7 +445,8 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
 
         attempted_p = [p.id for p in policies]
         attempted_r = [r.name for r in roles]
-        try:
+
+        async def _flush_once() -> None:
             async with managed_transaction(engine) as conn:
                 # Policies: one storage call per policy, all in this tx.
                 # `update_policy` opens a nested SAVEPOINT via
@@ -464,6 +471,28 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                                 await storage.update_role(merged_role, schema="iam", conn=conn)
                             else:
                                 await storage.create_role(r, schema="iam", conn=conn)
+
+        try:
+            from tenacity import (
+                AsyncRetrying,
+                retry_if_exception,
+                stop_after_attempt,
+                wait_exponential,
+            )
+
+            # ``reraise=True`` propagates the underlying exception on
+            # exhaustion (no ``RetryError`` wrapper). Other exceptions
+            # propagate immediately because ``retry_if_exception``
+            # returns False for them — no retry attempted.
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=0.05, max=0.5),
+                retry=retry_if_exception(_is_transient_serialization_failure),
+                reraise=True,
+            ):
+                with attempt:
+                    await _flush_once()
+
             policy_service.invalidate_cache()
             logger.info(
                 "IamModule: flushed %d policies + %d roles in one transaction",
@@ -476,6 +505,18 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                 attempted_p, attempted_r, e,
             )
             raise
+
+
+def _is_transient_serialization_failure(exc: BaseException) -> bool:
+    """True for PG SQLSTATE 40001 (serialization_failure) / 40P01
+    (deadlock_detected). Used to bound the IAM-seeding retry window —
+    these are the only two SQLSTATEs that are safe to retry blindly
+    because Postgres has already rolled back the offending transaction.
+    Any other DB error indicates a real problem and propagates.
+    """
+    orig = getattr(exc, "orig", None)
+    pgcode = getattr(orig, "pgcode", None) or getattr(exc, "pgcode", None)
+    return pgcode in ("40001", "40P01")
 
 
 

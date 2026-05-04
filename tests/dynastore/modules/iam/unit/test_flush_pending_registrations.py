@@ -202,3 +202,188 @@ async def test_flush_clears_pending_buffers_before_attempting_persist() -> None:
 
     assert mod._pending_policies == {}, "pending policies should be drained"
     assert mod._pending_roles == {}, "pending roles should be drained"
+
+
+# ---------------------------------------------------------------------------
+# Sibling-service serialization-failure retry (issue #209.2)
+# ---------------------------------------------------------------------------
+
+class _PgError(Exception):
+    """Stand-in for SQLAlchemy's DBAPIError carrying a pgcode-bearing .orig."""
+
+    def __init__(self, pgcode: str, message: str = "test"):
+        super().__init__(message)
+        self.orig = MagicMock()
+        self.orig.pgcode = pgcode
+
+
+def _patched_flush(mod, mtx_cls):
+    """Common patch context: get_protocol → fake_db, managed_transaction → mtx_cls."""
+    fake_db = MagicMock()
+    fake_db.engine = MagicMock()
+    return (
+        patch("dynastore.modules.iam.module.get_protocol", return_value=fake_db),
+        patch("dynastore.modules.db_config.query_executor.managed_transaction", mtx_cls),
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_on_serialization_failure_eventually_succeeds() -> None:
+    """SQLSTATE 40001 raised twice → 3rd attempt succeeds → no exception."""
+    policies = [_mk_policy("p0")]
+    mod, calls = _make_module_with_pending(policies, [])
+
+    attempts = {"n": 0}
+
+    class _MTx:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def __aenter__(self):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise _PgError("40001", "serialization_failure")
+            return MagicMock()
+
+        async def __aexit__(self, *_):
+            return False
+
+    p_get_protocol, p_mtx = _patched_flush(mod, _MTx)
+    with p_get_protocol, p_mtx:
+        await mod.flush_pending_registrations()
+
+    assert attempts["n"] == 3, f"Expected exactly 3 attempts, got {attempts['n']}"
+
+
+@pytest.mark.asyncio
+async def test_retry_on_deadlock_detected_eventually_succeeds() -> None:
+    """SQLSTATE 40P01 (deadlock_detected) is also retryable."""
+    policies = [_mk_policy("p0")]
+    mod, _ = _make_module_with_pending(policies, [])
+
+    attempts = {"n": 0}
+
+    class _MTx:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def __aenter__(self):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                raise _PgError("40P01", "deadlock_detected")
+            return MagicMock()
+
+        async def __aexit__(self, *_):
+            return False
+
+    p_get_protocol, p_mtx = _patched_flush(mod, _MTx)
+    with p_get_protocol, p_mtx:
+        await mod.flush_pending_registrations()
+
+    assert attempts["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausts_after_three_serialization_failures() -> None:
+    """Three consecutive 40001s → exhausted, original exception propagates
+    (reraise=True; no RetryError wrapper)."""
+    policies = [_mk_policy("p0")]
+    mod, _ = _make_module_with_pending(policies, [])
+
+    attempts = {"n": 0}
+
+    class _MTx:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def __aenter__(self):
+            attempts["n"] += 1
+            raise _PgError("40001", "still failing")
+
+        async def __aexit__(self, *_):
+            return False
+
+    p_get_protocol, p_mtx = _patched_flush(mod, _MTx)
+    with p_get_protocol, p_mtx:
+        with pytest.raises(_PgError) as exc_info:
+            await mod.flush_pending_registrations()
+
+    assert exc_info.value.orig.pgcode == "40001"
+    assert attempts["n"] == 3, f"Expected exactly 3 attempts before exhaustion, got {attempts['n']}"
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_non_serialization_error() -> None:
+    """Any non-SQLSTATE error propagates IMMEDIATELY (single attempt only).
+    The retry must not mask real bugs (FK violations, network errors,
+    programming errors)."""
+    policies = [_mk_policy("p0")]
+    mod, _ = _make_module_with_pending(policies, [])
+
+    attempts = {"n": 0}
+
+    class _MTx:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def __aenter__(self):
+            attempts["n"] += 1
+            raise RuntimeError("some other failure — must not retry")
+
+        async def __aexit__(self, *_):
+            return False
+
+    p_get_protocol, p_mtx = _patched_flush(mod, _MTx)
+    with p_get_protocol, p_mtx:
+        with pytest.raises(RuntimeError, match="must not retry"):
+            await mod.flush_pending_registrations()
+
+    assert attempts["n"] == 1, (
+        f"Non-serialization errors must not retry — expected 1 attempt, got {attempts['n']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_non_pgcode_integrity_error() -> None:
+    """Errors with .orig but a non-retryable pgcode (e.g. 23505 unique
+    violation) must propagate immediately, not be retried."""
+    policies = [_mk_policy("p0")]
+    mod, _ = _make_module_with_pending(policies, [])
+
+    attempts = {"n": 0}
+
+    class _MTx:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def __aenter__(self):
+            attempts["n"] += 1
+            raise _PgError("23505", "unique_violation")
+
+        async def __aexit__(self, *_):
+            return False
+
+    p_get_protocol, p_mtx = _patched_flush(mod, _MTx)
+    with p_get_protocol, p_mtx:
+        with pytest.raises(_PgError) as exc_info:
+            await mod.flush_pending_registrations()
+
+    assert exc_info.value.orig.pgcode == "23505"
+    assert attempts["n"] == 1, (
+        f"Unique-violation must not retry — expected 1 attempt, got {attempts['n']}"
+    )
+
+
+def test_is_transient_serialization_failure_predicate() -> None:
+    """Direct unit on the helper used by tenacity.retry_if_exception."""
+    from dynastore.modules.iam.module import _is_transient_serialization_failure
+
+    assert _is_transient_serialization_failure(_PgError("40001"))
+    assert _is_transient_serialization_failure(_PgError("40P01"))
+    assert not _is_transient_serialization_failure(_PgError("23505"))  # unique_violation
+    assert not _is_transient_serialization_failure(_PgError("23502"))  # not_null_violation
+    assert not _is_transient_serialization_failure(RuntimeError("boom"))
+    # Direct attribute on exception (no .orig wrapping) also works.
+    bare = RuntimeError("boom")
+    bare.pgcode = "40001"  # type: ignore[attr-defined]
+    assert _is_transient_serialization_failure(bare)
