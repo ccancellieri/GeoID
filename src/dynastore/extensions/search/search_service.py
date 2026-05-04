@@ -141,7 +141,7 @@ def _build_item_query(body: SearchBody) -> Dict[str, Any]:
     # 3. Collections filter
     # ------------------------------------------------------------------
     if body.collections:
-        filter_.append({"terms": {"collection_id": body.collections}})
+        filter_.append({"terms": {"collection": body.collections}})
 
     # ------------------------------------------------------------------
     # 4. Spatial filter – bbox or intersects (mutually exclusive)
