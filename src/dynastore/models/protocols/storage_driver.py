@@ -213,7 +213,7 @@ class CollectionItemsStore(Protocol):
         """
         ...
 
-    async def read_entities(
+    def read_entities(
         self,
         catalog_id: str,
         collection_id: str,

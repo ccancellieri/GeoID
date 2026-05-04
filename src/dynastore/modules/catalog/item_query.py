@@ -107,7 +107,7 @@ async def _try_driver_dispatch(
     effective_limit = (request.limit if request and request.limit else limit) or limit
     effective_offset = (request.offset if request and request.offset else offset) or offset
 
-    items: AsyncIterator[Feature] = await resolved.read_entities(
+    items: AsyncIterator[Feature] = resolved.read_entities(
         catalog_id,
         collection_id,
         entity_ids=entity_ids,
