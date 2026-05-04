@@ -196,13 +196,13 @@ jobs:
 
   integration-tests:
     runs-on: ubuntu-22.04
-    # 20 min cap. Post PR #124 the actual numbers are: build ~4 min
-    # (image-reuse), tests ~7 min on 4-vCPU GHA xdist, total ~11 min.
-    # A local 12-vCPU run completes the same 53 integration tests in
-    # ~13.5 min, including the ES + keycloak + GCP test paths the CI
-    # conftest auto-skips. 20 min leaves 9 min headroom for cold-cache
-    # runs; if a future change pushes us past 20 min that's a real
-    # regression worth investigating, not a budget to extend.
+    # 20 min cap. Slim-stack baseline (db only): build test-runner ~5 min
+    # (cache miss on PR branches; warm on main), free-disk ~1 min,
+    # db build+up ~1 min, integration tests ~3-5 min on 4-vCPU GHA xdist
+    # (~183 items, in-process FastAPI clients, no external HTTP).
+    # Total ~10-12 min on warm cache, ~14 min cold. 20 min leaves
+    # comfortable headroom; if a future change pushes us past it that's
+    # a real regression worth investigating, not a budget to extend.
     timeout-minutes: 20
     # inputs.run_integration is only set for workflow_dispatch / workflow_call.
     # For push/pull_request it is undefined (''), so the comparison evaluates
@@ -244,48 +244,35 @@ jobs:
           cache-from: type=gha,scope=tester
           cache-to: type=gha,mode=max,scope=tester
 
-      - name: Build catalog/worker image (cached)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: src/dynastore/docker/Dockerfile
-          target: builder
-          build-args: SCOPE=all
-          tags: geoid-builder:ci
-          load: true
-          cache-from: type=gha,scope=builder
-          cache-to: type=gha,mode=max,scope=builder
-
-      # Bring up the integration stack from the canonical compose. SCOPE=all
-      # for catalog/worker so every conformance path is registered. Db isn't
-      # pre-baked by the build-push-action above, so `--build` ensures it's
-      # built before `up -d` (catalog/worker pick up their `image:` tags
-      # from the buildx load).
-      - name: Start integration stack (db + es + keycloak + catalog + worker)
-        env:
-          CATALOG_SCOPE: all
-          WORKER_SCOPE: all
+      # Bring up the bare-minimum integration stack: db only. Every
+      # integration test uses an in-process FastAPI client
+      # (`ASGITransport(app=app)` via `in_process_client` /
+      # `sysadmin_in_process_client`), so no catalog/worker container is
+      # ever connected to. Elasticsearch and IDP markers auto-skip in CI
+      # (see tests/conftest.py:251-271 — they require explicit
+      # DYNASTORE_RUN_ELASTICSEARCH_TESTS / DYNASTORE_RUN_IDP_TESTS opt-ins).
+      # Starting catalog+worker would add ~3 min of compose-rebuild cost
+      # (the canonical compose has no `image:` directive on those services
+      # so `up` rebuilds them every run) without exercising any code path
+      # tests actually use.
+      - name: Start db
         run: |
           docker compose -f src/dynastore/docker/docker-compose.yml build db
-          docker compose -f src/dynastore/docker/docker-compose.yml up -d --wait \
-            db elasticsearch keycloak catalog worker
+          docker compose -f src/dynastore/docker/docker-compose.yml up -d --wait db
 
-      # Tests run via one-off `docker run` against the canonical compose's
-      # network so they can resolve `db`, `catalog`, `worker`, `elasticsearch`,
-      # `keycloak` by service name. Project name is derived from the compose
-      # file's directory ("docker"), so the network is `docker_dynastore_net`;
-      # we look it up dynamically via `docker network ls`.
+      # Tests run via one-off `docker run` joined to the compose network so
+      # they can resolve `db` by service name. Project name is derived from
+      # the compose file's directory ("docker"), so the network is
+      # `docker_dynastore_net`; we look it up dynamically.
       #
-      # The `find … -print0` + `mapfile` pattern preserves the previous
-      # workflow's behavior: scopes pytest to the 53 integration files,
-      # surfaces zero-find as a non-zero exit, and is safe against shell
-      # metacharacters.
+      # The `find … -print0` + `mapfile` pattern scopes pytest to the
+      # `*/integration/*` files and surfaces zero-find as a non-zero exit.
       #
       # No `-m` marker filter on purpose. `tests/conftest.py` already
       # auto-skips `local_only` (when CI / GITHUB_ACTIONS / REMOTE_TEST_
-      # EXECUTION is set), `gcp` (when ADC creds aren't resolvable), and
-      # `elasticsearch` (when DYNASTORE_RUN_ELASTICSEARCH_TESTS isn't set).
-      # Filtering at the workflow layer would only duplicate that logic.
+      # EXECUTION is set), `gcp` (when ADC creds aren't resolvable),
+      # `elasticsearch` (without DYNASTORE_RUN_ELASTICSEARCH_TESTS), and
+      # `idp` (without DYNASTORE_RUN_IDP_TESTS).
       - name: Run integration tests
         id: integration
         env:
@@ -306,8 +293,6 @@ jobs:
             -v "$WORKSPACE/pytest.ini":/dynastore/pytest.ini \
             --env-file src/dynastore/docker/.env \
             -e DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}" \
-            -e DYNASTORE_API_URL=http://catalog:80 \
-            -e DYNASTORE_WORKER_URL=http://worker:81 \
             -e REMOTE_TEST_EXECUTION=true \
             -e DYNASTORE_DDL_STATEMENT_TIMEOUT=120s \
             -e DYNASTORE_DDL_LOCK_TIMEOUT=120s \
@@ -316,11 +301,9 @@ jobs:
             geoid-test-runner:ci \
             bash -c 'set -euo pipefail; mapfile -d "" -t TESTS < <(find tests -path "*/integration/*" -name "test_*.py" -type f -print0 | sort -z); test "${#TESTS[@]}" -gt 0 || { echo "no integration tests found"; exit 1; }; /opt/venv/bin/pytest "${TESTS[@]}" --durations=20 --junitxml=/dynastore/workspace/test-results.xml'
 
-      - name: Display Docker logs on failure
+      - name: Display db logs on failure
         if: failure()
-        run: |
-          docker compose -f src/dynastore/docker/docker-compose.yml logs catalog
-          docker compose -f src/dynastore/docker/docker-compose.yml logs worker
+        run: docker compose -f src/dynastore/docker/docker-compose.yml logs db
 
       - name: Tear down integration stack
         if: always()
