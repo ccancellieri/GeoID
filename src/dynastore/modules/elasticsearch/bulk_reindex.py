@@ -78,34 +78,6 @@ async def is_es_active_for(catalog_id: str, collection_id: str) -> bool:
     )
 
 
-async def _ensure_public_alias_member(es, index_name: str) -> None:
-    """Idempotently add ``index_name`` to the public ``{prefix}-items`` alias.
-
-    The platform's read endpoints (``/search``, ``/search/catalogs/{cat}/items-search``)
-    target either the per-tenant index or the public alias. Driver-side
-    ``ensure_storage`` is the canonical place for alias enrolment, but it
-    only fires when the items ES driver is loaded on the catalog service
-    (gated on ``stac-fastapi-elasticsearch`` being importable). Until that
-    install path is universal across services, mirror the enrolment from
-    the indexer side after a successful bulk so search works end-to-end
-    out of the box. Best-effort: a failure here does not invalidate the
-    bulk that just succeeded.
-    """
-    from dynastore.modules.elasticsearch.client import get_index_prefix
-    from dynastore.modules.elasticsearch.mappings import get_public_items_alias
-
-    alias = get_public_items_alias(get_index_prefix())
-    try:
-        await es.indices.update_aliases(
-            body={"actions": [{"add": {"index": index_name, "alias": alias}}]}
-        )
-    except Exception as exc:
-        logger.warning(
-            "Failed to enroll %s in alias %s (search may not see it): %s",
-            index_name, alias, exc,
-        )
-
-
 async def reindex_collection_into_index(
     es,
     catalogs_proto,
@@ -133,7 +105,16 @@ async def reindex_collection_into_index(
         )
         return 0
 
-    await _ensure_public_alias_member(es, index_name)
+    # Mirror ItemsElasticsearchDriver.ensure_storage's alias enrolment from
+    # the indexer side. The driver-side path only fires when the items ES
+    # driver is loaded on the catalog service (gated on stac-fastapi-
+    # elasticsearch being importable, which scope-catalog doesn't pull in
+    # today). Without this, /search and /search/catalogs/.../items-search
+    # query the empty public alias and return 0 for every catalog created
+    # via the public API even after a successful bulk reindex. Best-effort
+    # and idempotent (helper handles repeats).
+    from dynastore.modules.elasticsearch.aliases import add_index_to_public_alias
+    await add_index_to_public_alias(index_name)
 
     total = 0
     offset = 0
