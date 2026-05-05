@@ -224,65 +224,21 @@ class IndexerProtocol(Protocol):
         """
         ...
 
-    async def index_private(
-        self,
-        geoid: str,
-        catalog_id: str,
-        collection_id: str,
-        db_resource: Optional[Any] = None,
-    ) -> None:
-        """
-        Index a single geoid-only document in the private index.
-
-        This is the privacy-preserving counterpart of ``index_document``.
-        The indexed document contains only ``{geoid, catalog_id,
-        collection_id}`` — no geometry, no STAC metadata.
-
-        Args:
-            geoid: The private item identifier.
-            catalog_id: Owning catalog.
-            collection_id: Owning collection.
-            db_resource: Database resource for transactional context.
-        """
-        ...
-
-    async def delete_private(
-        self,
-        geoid: str,
-        catalog_id: str,
-        db_resource: Optional[Any] = None,
-    ) -> None:
-        """
-        Remove a single geoid document from the private index.
-
-        Safe to call even if the document does not exist (no-op).
-
-        Args:
-            geoid: The private item identifier.
-            catalog_id: Owning catalog.
-            db_resource: Database resource for transactional context.
-        """
-        ...
-
     async def bulk_reindex(
         self,
         catalog_id: str,
         collection_id: Optional[str] = None,
-        mode: Literal["catalog", "private"] = "catalog",
         db_resource: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """
-        Trigger a bulk reindex of all items in a catalog or collection.
+        """Trigger a bulk reindex of all items in a catalog or collection.
 
-        This is typically dispatched as a durable background task or
-        Cloud Run Job rather than executed inline.
+        Typically dispatched as a durable background task or Cloud Run
+        Job rather than executed inline.
 
         Args:
             catalog_id: The catalog to reindex.
             collection_id: Optional single collection (if ``None``, all
                            collections in the catalog are reindexed).
-            mode: ``"catalog"`` (full catalog documents) or ``"private"``
-                  (geoid-only documents).
             db_resource: Database resource for transactional context.
 
         Returns:
@@ -292,18 +248,15 @@ class IndexerProtocol(Protocol):
 
     async def ensure_index(
         self,
-        entity_type: Literal["catalog", "collection", "item", "asset", "private"],
+        entity_type: Literal["catalog", "collection", "item", "asset"],
         catalog_id: Optional[str] = None,
     ) -> None:
-        """
-        Ensure the index for the given entity type exists, creating it
+        """Ensure the index for the given entity type exists, creating it
         with the correct mapping if necessary.
 
         Args:
-            entity_type: The index to ensure. Use ``"private"`` for
-                         the per-catalog geoid-only index.
-            catalog_id: Required when ``entity_type="private"`` (index
-                        is per-catalog).
+            entity_type: The index to ensure.
+            catalog_id: Optional catalog scope hint.
         """
         ...
 

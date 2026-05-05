@@ -281,11 +281,11 @@ class ConfigApiService:
         At collection scope, catalog-tier configs (``_visibility = "catalog"``)
         are surfaced under a sibling ``inherited_from_catalog`` block instead
         of being dropped — the operator sees which catalog-tier configs
-        influence this collection (e.g. ``ElasticsearchCatalogConfig.private``
-        decides whether items go to the public or private ES index, but is
-        editable only at catalog scope).  The block uses the SAME
-        ``scope/topic/sub`` shape as the main tree so dashboards can render
-        it with the same form-builder.
+        influence this collection (e.g. ``CatalogPolicyConfig.default_collection_privacy``
+        sets the catalog-wide privacy default, but is editable only at
+        catalog scope).  The block uses the SAME ``scope/topic/sub`` shape
+        as the main tree so dashboards can render it with the same
+        form-builder.
 
         ``meta_mode`` controls per-class field documentation in the
         hierarchical ``meta`` tree:

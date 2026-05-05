@@ -131,7 +131,6 @@ class SearchProtocol(Protocol):
     async def reindex_catalog(
         self,
         catalog_id: str,
-        mode: Optional[Literal["catalog", "private"]] = None,
         driver: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -139,11 +138,10 @@ class SearchProtocol(Protocol):
 
         Args:
             catalog_id: The catalog to reindex.
-            mode: ``"catalog"`` or ``"private"``. When ``None``, resolved
                   from the catalog's indexer configuration.
 
         Returns:
-            Dict with ``task_id``, ``catalog_id``, ``mode``, ``status``.
+            Dict with ``task_id``, ``catalog_id``, ``status``.
         """
         ...
 
@@ -151,7 +149,6 @@ class SearchProtocol(Protocol):
         self,
         catalog_id: str,
         collection_id: str,
-        mode: Optional[Literal["catalog", "private"]] = None,
         driver: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -160,10 +157,9 @@ class SearchProtocol(Protocol):
         Args:
             catalog_id: The catalog owning the collection.
             collection_id: The collection to reindex.
-            mode: ``"catalog"`` or ``"private"``.
 
         Returns:
             Dict with ``task_id``, ``catalog_id``, ``collection_id``,
-            ``mode``, ``status``.
+            ``status``.
         """
         ...

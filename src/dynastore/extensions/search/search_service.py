@@ -459,29 +459,26 @@ class SearchService(ExtensionProtocol):
     async def reindex_catalog(
         self,
         catalog_id: str,
-        mode: Optional[Literal["catalog", "private"]] = None,
         driver: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Dispatch a BulkCatalogReindexTask and return 202 + task_id.
+        """Dispatch a BulkCatalogReindexTask and return 202 + task_id.
 
-        If `mode` is omitted, falls back to the catalog's indexer config
-        (private=True → "private", otherwise "catalog").
-        If `driver` is provided, the task targets only that secondary driver.
+        If ``driver`` is provided, the task targets only that secondary driver.
+        Privacy routing is per-collection
+        (``CollectionPluginConfig.is_private``); there is no catalog-wide
+        "private mode" to resolve here.
         """
         from dynastore.models.protocols import DatabaseProtocol
         from dynastore.modules.tasks import tasks_module
         from dynastore.modules.tasks.models import TaskCreate
         from dynastore.tools.discovery import get_protocol
 
-        resolved_mode = mode or await self._resolve_mode(catalog_id)
-
         db = get_protocol(DatabaseProtocol)
         if not db:
             raise RuntimeError("DatabaseProtocol not available.")
         engine = db.engine if isinstance(db, DatabaseProtocol) else db
 
-        inputs: Dict[str, Any] = {"catalog_id": catalog_id, "mode": resolved_mode}
+        inputs: Dict[str, Any] = {"catalog_id": catalog_id}
         if driver:
             inputs["driver"] = driver
 
@@ -496,32 +493,29 @@ class SearchService(ExtensionProtocol):
         )
         if task is None:
             raise RuntimeError("reindex_catalog: create_task returned None (dedup hit on a non-dedup task).")
-        return {"task_id": str(task.task_id), "catalog_id": catalog_id, "mode": resolved_mode, "driver": driver, "status": "queued"}
+        return {"task_id": str(task.task_id), "catalog_id": catalog_id, "driver": driver, "status": "queued"}
 
     async def reindex_collection(
         self,
         catalog_id: str,
         collection_id: str,
-        mode: Optional[Literal["catalog", "private"]] = None,
         driver: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Dispatch a BulkCollectionReindexTask and return 202 + task_id.
-        If `driver` is provided, the task targets only that secondary driver.
+        """Dispatch a BulkCollectionReindexTask and return 202 + task_id.
+
+        If ``driver`` is provided, the task targets only that secondary driver.
         """
         from dynastore.models.protocols import DatabaseProtocol
         from dynastore.modules.tasks import tasks_module
         from dynastore.modules.tasks.models import TaskCreate
         from dynastore.tools.discovery import get_protocol
 
-        resolved_mode = mode or await self._resolve_mode(catalog_id)
-
         db = get_protocol(DatabaseProtocol)
         if not db:
             raise RuntimeError("DatabaseProtocol not available.")
         engine = db.engine if isinstance(db, DatabaseProtocol) else db
 
-        inputs: Dict[str, Any] = {"catalog_id": catalog_id, "collection_id": collection_id, "mode": resolved_mode}
+        inputs: Dict[str, Any] = {"catalog_id": catalog_id, "collection_id": collection_id}
         if driver:
             inputs["driver"] = driver
 
@@ -540,29 +534,9 @@ class SearchService(ExtensionProtocol):
             "task_id": str(task.task_id),
             "catalog_id": catalog_id,
             "collection_id": collection_id,
-            "mode": resolved_mode,
             "driver": driver,
             "status": "queued",
         }
-
-    async def _resolve_mode(self, catalog_id: str) -> Literal["catalog", "private"]:
-        """Resolve the reindex mode from the catalog's indexer config.
-
-        Uses ConfigsProtocol discovery — no direct import from any module.
-        The config key ``"elasticsearch"`` is a plain string, not an imported constant.
-        """
-        try:
-            from dynastore.models.protocols.configs import ConfigsProtocol
-            from dynastore.tools.discovery import get_protocol
-            configs_proto = get_protocol(ConfigsProtocol)
-            if configs_proto:
-                from dynastore.modules.elasticsearch.es_catalog_config import ElasticsearchCatalogConfig
-                cfg = await configs_proto.get_config(ElasticsearchCatalogConfig, catalog_id=catalog_id)
-                if cfg and getattr(cfg, "private", False):
-                    return "private"
-        except Exception:
-            pass
-        return "catalog"
 
     async def search_catalogs(
         self,

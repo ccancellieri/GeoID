@@ -17,8 +17,8 @@ import opensearchpy  # noqa: F401
 from dynastore.modules import ModuleProtocol
 from dynastore.models.protocols.event_bus import EventBusProtocol
 from dynastore.tools.discovery import get_protocol
+from dynastore.modules.catalog.catalog_config import CatalogPolicyConfig
 from dynastore.modules.catalog.event_service import CatalogEventType
-from dynastore.modules.elasticsearch.es_catalog_config import ElasticsearchCatalogConfig
 
 logger = logging.getLogger(__name__)
 
@@ -119,17 +119,6 @@ async def _is_data_stream(es: Any, name: str) -> bool:
     return any((s or {}).get("name") == name for s in streams)
 
 
-async def _get_es_catalog_config(catalog_id: str):
-    """Return ElasticsearchCatalogConfig for catalog_id, or None."""
-    try:
-        from dynastore.models.protocols.configs import ConfigsProtocol
-        configs = get_protocol(ConfigsProtocol)
-        if not configs:
-            return None
-        return await configs.get_config(ElasticsearchCatalogConfig, catalog_id=catalog_id)
-    except Exception as e:
-        logger.debug("Could not resolve ES catalog config for '%s': %s", catalog_id, e)
-        return None
 
 
 async def _is_es_active(catalog_id: str, collection_id: str) -> bool:
@@ -239,14 +228,13 @@ class ElasticsearchModule(ModuleProtocol):
     indexing backend via ``get_protocol(IndexerProtocol)`` without importing
     this module directly.
 
-    Per-catalog private indexing is configured at runtime via:
-        PUT /configs/catalogs/{catalog_id}/elasticsearch  {"private": true}
-
-    When a catalog is private:
-    - Items are indexed only as {geoid, catalog_id, collection_id} in a
-      dedicated geoid index — no geometry, no attributes.
-    - All GET access to the catalog via any protocol is denied to all_users.
-    - The standard STAC items index is never populated for this catalog.
+    Privacy is per-collection (Cycle E) — see
+    ``CollectionPluginConfig.is_private`` and the
+    ``items_elasticsearch_private_driver`` (per-tenant geoid-only index
+    + DENY policy management).  This module no longer carries
+    catalog-wide private-mode toggles; the catalog-tier
+    ``CatalogPolicyConfig.default_collection_privacy`` only seeds the
+    default for newly-created collections.
     """
 
     priority: int = 50
@@ -288,10 +276,6 @@ class ElasticsearchModule(ModuleProtocol):
                 "ElasticsearchModule: EventsProtocol not found. "
                 "Catalog/collection events not captured.",
             )
-
-        # Restore in-memory DENY policies for all catalogs that have private=True.
-        # on_apply is not called automatically on service restart, so we do it here.
-        await self._restore_private_policies()
 
         from dynastore.modules.elasticsearch import client as es_client
         await es_client.init()
@@ -499,253 +483,6 @@ class ElasticsearchModule(ModuleProtocol):
             )
         except Exception as e:
             logger.error("ElasticsearchModule: Failed to dispatch task %s: %s", task_type, e)
-
-    # ------------------------------------------------------------------
-    # Private mode: enable / disable
-    # ------------------------------------------------------------------
-
-    async def enable_private_mode(self, catalog_id: str, db_resource=None) -> None:
-        """
-        Apply the DENY access policy, ensure the geoid index exists, and
-        dispatch a bulk reindex task (private mode).
-
-        Called by on_apply when private=True is written, and by lifespan
-        to restore in-memory policies on service restart.
-        """
-        logger.info("ElasticsearchModule: Enabling private mode for catalog '%s'.", catalog_id)
-        await self._apply_private_policy(catalog_id)
-        await self._ensure_private_index(catalog_id)
-        # Bulk reindex of private data is no longer supported by the
-        # shared task — the private driver requires a fresh-start
-        # cutover instead. Toggling private indexing only flips the DENY
-        # policy + ensures the private index exists; existing items
-        # stay where they are.
-
-    async def disable_private_mode(self, catalog_id: str, db_resource=None) -> None:
-        """
-        Remove the DENY access policy and dispatch a bulk reindex task
-        targeting the per-tenant items index so historical items become
-        discoverable again under the regular driver.
-
-        Called by on_apply when private=False is written.
-        """
-        logger.info("ElasticsearchModule: Disabling private mode for catalog '%s'.", catalog_id)
-        await self._revoke_private_policy(catalog_id)
-        from dynastore.tasks.elasticsearch_indexer.tasks import BulkCatalogReindexInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_bulk_reindex_catalog",
-            inputs=BulkCatalogReindexInputs(
-                catalog_id=catalog_id,
-            ).model_dump(),
-            db_resource=db_resource,
-        )
-
-    # ------------------------------------------------------------------
-    # Access policy management
-    # ------------------------------------------------------------------
-
-    async def _apply_private_policy(self, catalog_id: str) -> None:
-        """Create/update a persisted DENY policy that blocks all_users GET
-        access across every protocol path under the given catalog, and
-        also registers it in-memory for immediate effect in this process."""
-        from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role
-
-        perm = get_protocol(PermissionProtocol)
-        if not perm:
-            logger.warning(
-                "ElasticsearchModule: PermissionProtocol unavailable — "
-                "DENY policy not applied for catalog '%s'.",
-                catalog_id,
-            )
-            return
-
-        policy_id = f"private_deny_{catalog_id}"
-        deny_policy = Policy(
-            id=policy_id,
-            description=f"Blocks public access to private catalog: {catalog_id}",
-            actions=["GET"],
-            resources=[
-                # Covers: /catalog/catalogs/X/*, /stac/catalogs/X/*,
-                #         /features/catalogs/X/*, /tiles/catalogs/X/*,
-                #         /wfs/catalogs/X/*, /maps/catalogs/X/*
-                f"/(catalog|stac|features|tiles|wfs|maps)/catalogs/{re.escape(catalog_id)}(/.*)?",
-            ],
-            effect="DENY",
-        )
-
-        # In-memory: immediate effect in this process.
-        perm.register_policy(deny_policy)
-        perm.register_role(Role(name="all_users", policies=[policy_id]))
-
-        # Persistent: survives restarts and propagates to other processes.
-        try:
-            await perm.create_policy(deny_policy)
-            logger.info(
-                "ElasticsearchModule: DENY policy '%s' persisted for catalog '%s'.",
-                policy_id, catalog_id,
-            )
-        except Exception:
-            try:
-                await perm.update_policy(deny_policy)
-                logger.debug("ElasticsearchModule: DENY policy '%s' updated.", policy_id)
-            except Exception as e:
-                logger.error(
-                    "ElasticsearchModule: Could not persist DENY policy '%s': %s",
-                    policy_id, e,
-                )
-
-    async def _revoke_private_policy(self, catalog_id: str) -> None:
-        """Remove the persisted DENY policy for the catalog.
-        The in-memory copy persists until the next restart — this is
-        acceptable since the policy will not be recreated at startup."""
-        from dynastore.models.protocols.policies import PermissionProtocol
-
-        perm = get_protocol(PermissionProtocol)
-        if not perm:
-            return
-
-        policy_id = f"private_deny_{catalog_id}"
-        try:
-            await perm.delete_policy(policy_id)
-            logger.info(
-                "ElasticsearchModule: DENY policy '%s' removed for catalog '%s'.",
-                policy_id, catalog_id,
-            )
-        except Exception as e:
-            logger.debug(
-                "ElasticsearchModule: Could not remove DENY policy '%s' (may not exist): %s",
-                policy_id, e,
-            )
-
-    # ------------------------------------------------------------------
-    # ES index management
-    # ------------------------------------------------------------------
-
-    async def _ensure_private_index(self, catalog_id: str) -> None:
-        """Ensure the per-tenant feature ES index exists with the current mapping.
-
-        If the index exists with the legacy 3-field mapping, drop it so the
-        next reindex repopulates it with full features under
-        ``TENANT_FEATURE_MAPPING``. The caller (``enable_private_mode``)
-        already dispatches a bulk reindex after this returns.
-        """
-        from dynastore.modules.elasticsearch import client as es_client
-        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            TENANT_FEATURE_MAPPING,
-            get_private_index_name,
-        )
-
-        es = es_client.get_client()
-        if es is None:
-            logger.warning("ElasticsearchModule: ES client not initialized, skipping private index creation.")
-            return
-
-        index_name = get_private_index_name(es_client.get_index_prefix(), catalog_id)
-        try:
-            if await es.indices.exists(index=index_name):
-                # Detect legacy mapping (no `geometry` field) and drop the
-                # index so it can be recreated with the new shape.
-                try:
-                    current = await es.indices.get_mapping(index=index_name)
-                    props = (
-                        current.get(index_name, {})
-                        .get("mappings", {})
-                        .get("properties", {})
-                    )
-                    if "geometry" not in props:
-                        logger.info(
-                            "ElasticsearchModule: legacy private mapping detected on '%s', recreating.",
-                            index_name,
-                        )
-                        await es.indices.delete(index=index_name, ignore_unavailable=True)  # type: ignore[call-arg]
-                    else:
-                        return
-                except Exception as exc:
-                    logger.warning(
-                        "ElasticsearchModule: mapping inspection failed for '%s': %s",
-                        index_name, exc,
-                    )
-                    return
-
-            await es.indices.create(
-                index=index_name,
-                body={"mappings": TENANT_FEATURE_MAPPING},
-            )
-            logger.info(
-                "ElasticsearchModule: Created tenant feature index '%s'.", index_name
-            )
-        except Exception as exc:
-            logger.warning("ElasticsearchModule: Could not create tenant feature index '%s': %s", index_name, exc)
-
-    # ------------------------------------------------------------------
-    # Startup: restore in-memory DENY policies
-    # ------------------------------------------------------------------
-
-    async def _restore_private_policies(self) -> None:
-        """
-        Scan all catalogs and re-register in-memory DENY policies for those
-        with private=True. Called once at lifespan startup.
-
-        The persisted policies are already loaded from DB by PermissionProtocol,
-        but register_policy() is needed for the current process's in-memory fast path.
-        The bulk reindex is NOT dispatched here — items are already indexed.
-        """
-        from dynastore.models.protocols import CatalogsProtocol
-        from dynastore.models.protocols.configs import ConfigsProtocol
-        from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role
-
-        catalogs_proto = get_protocol(CatalogsProtocol)
-        configs = get_protocol(ConfigsProtocol)
-        perm = get_protocol(PermissionProtocol)
-        if not catalogs_proto or not configs or not perm:
-            return
-
-        try:
-            offset, batch = 0, 100
-            while True:
-                catalog_list = await catalogs_proto.list_catalogs(limit=batch, offset=offset)
-                if not catalog_list:
-                    break
-                for catalog in catalog_list:
-                    catalog_id = getattr(catalog, "id", None)
-                    if not catalog_id:
-                        continue
-                    try:
-                        cfg = await configs.get_config(ElasticsearchCatalogConfig, catalog_id=catalog_id)
-                    except Exception as exc:
-                        logger.debug(
-                            "ElasticsearchModule: Skipping catalog '%s' — config lookup failed: %s",
-                            catalog_id, exc,
-                        )
-                        continue
-                    if cfg and getattr(cfg, "private", False):
-                        policy_id = f"private_deny_{catalog_id}"
-                        deny_policy = Policy(
-                            id=policy_id,
-                            description=f"Blocks public access to private catalog: {catalog_id}",
-                            actions=["GET"],
-                            resources=[
-                                f"/(catalog|stac|features|tiles|wfs|maps)/catalogs/{re.escape(catalog_id)}(/.*)?",
-                            ],
-                            effect="DENY",
-                        )
-                        perm.register_policy(deny_policy)
-                        perm.register_role(
-                            Role(name="all_users", policies=[policy_id])
-                        )
-                        logger.info(
-                            "ElasticsearchModule: Restored DENY policy for private catalog '%s'.",
-                            catalog_id,
-                        )
-                if len(catalog_list) < batch:
-                    break
-                offset += batch
-        except Exception as e:
-            logger.warning(
-                "ElasticsearchModule: Could not restore private policies at startup: %s", e
-            )
-
-    # ------------------------------------------------------------------
     # Async event handlers
     # ------------------------------------------------------------------
 
@@ -770,9 +507,6 @@ class ElasticsearchModule(ModuleProtocol):
     async def _on_catalog_delete(self, catalog_id: Optional[str] = None, **kwargs):
         if not catalog_id:
             return
-        # Remove any private DENY policy when the catalog is hard-deleted.
-        await self._revoke_private_policy(catalog_id)
-
         from dynastore.tasks.elasticsearch.tasks import ElasticsearchDeleteInputs
         await self._dispatch_task(
             task_type="elasticsearch_delete",
@@ -863,44 +597,6 @@ class ElasticsearchModule(ModuleProtocol):
             db_resource=db_resource,
         )
 
-    async def index_private(
-        self,
-        geoid: str,
-        catalog_id: str,
-        collection_id: str,
-        db_resource: Optional[Any] = None,
-    ) -> None:
-        from dynastore.modules.storage.drivers.elasticsearch_private.tasks import (
-                PrivateIndexInputs,
-            )
-        await self._dispatch_task(
-            task_type="elasticsearch_private_index",
-            inputs=PrivateIndexInputs(
-                geoid=geoid,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-            ).model_dump(),
-            db_resource=db_resource,
-        )
-
-    async def delete_private(
-        self,
-        geoid: str,
-        catalog_id: str,
-        db_resource: Optional[Any] = None,
-    ) -> None:
-        from dynastore.modules.storage.drivers.elasticsearch_private.tasks import (
-            PrivateDeleteInputs,
-        )
-        await self._dispatch_task(
-            task_type="elasticsearch_private_delete",
-            inputs=PrivateDeleteInputs(
-                geoid=geoid,
-                catalog_id=catalog_id,
-            ).model_dump(),
-            db_resource=db_resource,
-        )
-
     async def bulk_reindex(
         self,
         catalog_id: str,
@@ -930,13 +626,10 @@ class ElasticsearchModule(ModuleProtocol):
 
     async def ensure_index(
         self,
-        entity_type: Literal["catalog", "collection", "item", "asset", "private"],
+        entity_type: Literal["catalog", "collection", "item", "asset"],
         catalog_id: Optional[str] = None,
     ) -> None:
-        if entity_type == "private":
-            if not catalog_id:
-                raise ValueError("catalog_id is required for private index.")
-            await self._ensure_private_index(catalog_id)
-        else:
-            # Standard indices are created on-demand by the index tasks.
-            pass
+        # Standard indices are created on-demand by the index tasks.
+        # Per-tenant private indexes are managed by their own driver's
+        # ``ensure_indexer`` (CollectionItemsStore lifecycle).
+        return None

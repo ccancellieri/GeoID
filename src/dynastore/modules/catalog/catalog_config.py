@@ -25,7 +25,7 @@ from pydantic import (
 from dynastore.modules.db_config.platform_config_service import (
     PluginConfig,
 )
-from typing import ClassVar, List, Optional, Tuple
+from typing import ClassVar, List, Literal, Optional, Tuple
 
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import GeometriesSidecarConfig
@@ -132,3 +132,32 @@ class CollectionPluginConfig(PluginConfig):
 
 
 CollectionPluginConfig.model_rebuild()
+
+
+class CatalogPolicyConfig(PluginConfig):
+    """Catalog-tier policy defaults — visibility, future RBAC hooks.
+
+    Holds knobs that apply uniformly across a catalog's collections unless
+    overridden per-collection.  Today: ``default_collection_privacy``.
+    Future: read/write permission defaults for the ``is_private`` cascade.
+
+    The privacy default is read at collection-create time to seed
+    ``CollectionPluginConfig.is_private`` when the operator does not pass
+    one explicitly.  After creation the collection's own flag is the
+    source of truth — flipping the catalog default does not retroactively
+    re-flag existing collections.
+    """
+    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("catalog", "policy", None)
+    _visibility: ClassVar[Optional[str]] = "catalog"
+
+    default_collection_privacy: Literal["public", "private"] = Field(
+        default="public",
+        description=(
+            "Default privacy for newly-created collections in this catalog. "
+            "When 'private', new collections are seeded with "
+            "is_private=True (auto-resolves the private items + collection ES "
+            "indexers, applies DENY policies). Existing collections are "
+            "unaffected by changes to this default — their own is_private "
+            "field is authoritative."
+        ),
+    )

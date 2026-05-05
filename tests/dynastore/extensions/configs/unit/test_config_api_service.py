@@ -680,21 +680,21 @@ def test_compose_tree_slim_at_platform_scope_is_a_noop():
 # heuristic; explicit `_address` fixes them.
 # ---------------------------------------------------------------------------
 
-def test_es_catalog_config_lands_at_catalog_scope():
-    """``ElasticsearchCatalogConfig`` was leaking to ``platform.misc``."""
-    from dynastore.modules.elasticsearch.es_catalog_config import (
-        ElasticsearchCatalogConfig,
-    )
+def test_catalog_policy_config_lands_at_catalog_scope():
+    """``CatalogPolicyConfig`` (Cycle E.1 — replaces
+    ``ElasticsearchCatalogConfig``) carries the catalog-tier privacy
+    default; address pins it under ``catalog.policy``.
+    """
+    from dynastore.modules.catalog.catalog_config import CatalogPolicyConfig
 
-    assert ElasticsearchCatalogConfig._address == ("catalog", "elasticsearch", None)
-    assert ElasticsearchCatalogConfig._visibility == "catalog"
+    assert CatalogPolicyConfig._address == ("catalog", "policy", None)
+    assert CatalogPolicyConfig._visibility == "catalog"
 
 
-# NOTE: ``ElasticsearchCollectionConfig`` was retired in Cycle C
-# (its only field, ``private``, was redundant with the catalog-tier
-# ``ElasticsearchCatalogConfig.private``).  Privacy moves to a
-# first-class ``is_private: bool`` on ``CollectionPluginConfig`` in
-# Cycle E.
+# NOTE: ``ElasticsearchCollectionConfig`` was retired in Cycle C and
+# ``ElasticsearchCatalogConfig`` was retired in Cycle E.1.  Privacy
+# moves to ``CatalogPolicyConfig.default_collection_privacy`` (catalog
+# tier) and (Cycle E.2) ``is_private: bool`` on ``CollectionPluginConfig``.
 
 
 def test_catalog_es_driver_lands_under_storage_drivers_catalog():

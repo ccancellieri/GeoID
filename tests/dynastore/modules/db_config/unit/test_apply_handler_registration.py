@@ -120,28 +120,23 @@ def test_imperative_register_apply_handler_works():
 
 
 def test_known_consumers_have_handlers_registered():
-    """Sanity-check the four classes migrated in this PR — their apply
-    handlers must end up in ``_APPLY_HANDLERS`` after import.
+    """Sanity-check the classes that ship apply handlers — their handlers
+    must end up in ``_APPLY_HANDLERS`` after import.
+
+    Cycle E retired the catalog-wide private-mode apply handler
+    (``ElasticsearchCatalogConfig`` deleted; ``CatalogPolicyConfig`` is
+    pure data — consulted only at collection-create time as a default
+    seed for the per-collection ``is_private`` flag).
     """
-    from dynastore.modules.elasticsearch.es_catalog_config import (
-        ElasticsearchCatalogConfig,
-    )
     from dynastore.modules.gcp.gcp_config import (
         GcpCatalogBucketConfig,
         GcpEventingConfig,
     )
 
-    # ``ElasticsearchCollectionConfig`` was retired in Cycle C of the
-    # config-API restructure (2026-05-05); privacy moves to a first-class
-    # ``is_private: bool`` on ``CollectionPluginConfig`` in Cycle E.
-    for cls in (
-        GcpCatalogBucketConfig,
-        GcpEventingConfig,
-        ElasticsearchCatalogConfig,
-    ):
+    for cls in (GcpCatalogBucketConfig, GcpEventingConfig):
         handlers = _APPLY_HANDLERS.get(cls, [])
         assert handlers, (
-            f"{cls.__name__} has no apply handler registered — Phase 1.5 "
-            f"migration must call ``{cls.__name__}.register_apply_handler(...)`` "
+            f"{cls.__name__} has no apply handler registered — "
+            f"its module must call ``{cls.__name__}.register_apply_handler(...)`` "
             f"at module-import time."
         )

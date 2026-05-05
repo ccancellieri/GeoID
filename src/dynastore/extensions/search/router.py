@@ -363,10 +363,9 @@ async def post_geoid(request: Request, body: GeoidSearchBody) -> GeoidCollection
 async def post_reindex_catalog_scoped(
     request: Request,
     catalog_id: str,
-    mode: Optional[Literal["catalog", "private"]] = Query(None),
     driver: Optional[str] = Query(None, description="Hint: which secondary driver to reindex (e.g. 'elasticsearch')."),
 ) -> Dict[str, Any]:
-    return await _get_search_service().reindex_catalog(catalog_id, mode=mode, driver=driver)
+    return await _get_search_service().reindex_catalog(catalog_id, driver=driver)
 
 
 @router.post(
@@ -379,10 +378,9 @@ async def post_reindex_collection_scoped(
     request: Request,
     catalog_id: str,
     collection_id: str,
-    mode: Optional[Literal["catalog", "private"]] = Query(None),
     driver: Optional[str] = Query(None, description="Hint: which secondary driver to reindex."),
 ) -> Dict[str, Any]:
-    return await _get_search_service().reindex_collection(catalog_id, collection_id, mode=mode, driver=driver)
+    return await _get_search_service().reindex_collection(catalog_id, collection_id, driver=driver)
 
 
 # ---------------------------------------------------------------------------
@@ -399,9 +397,8 @@ async def post_reindex_collection_scoped(
 async def post_reindex_catalog(
     request: Request,
     catalog_id: str,
-    mode: Optional[Literal["catalog", "private"]] = Query(None),
 ) -> Dict[str, Any]:
-    return await _get_search_service().reindex_catalog(catalog_id, mode=mode)
+    return await _get_search_service().reindex_catalog(catalog_id)
 
 
 @router.post(
@@ -415,6 +412,5 @@ async def post_reindex_collection(
     request: Request,
     catalog_id: str,
     collection_id: str,
-    mode: Optional[Literal["catalog", "private"]] = Query(None),
 ) -> Dict[str, Any]:
-    return await _get_search_service().reindex_collection(catalog_id, collection_id, mode=mode)
+    return await _get_search_service().reindex_collection(catalog_id, collection_id)

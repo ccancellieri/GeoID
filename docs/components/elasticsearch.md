@@ -237,10 +237,10 @@ models/protocols/
   indexer.py               # IndexerProtocol — backend-agnostic indexing contract
 
 modules/elasticsearch/
-  __init__.py              # Exports ElasticsearchModule, ElasticsearchCatalogConfig
-  module.py                # Event listeners, private mode, IndexerProtocol impl
+  __init__.py              # Exports ElasticsearchModule
+  module.py                # Event listeners, private mode, IndexerProtocol impl,
+                           #   CatalogPolicyConfig apply handler (Cycle E.1)
   config.py                # EnvVar-based ES connection config
-  es_catalog_config.py     # Per-catalog PluginConfig (private flag)
   mappings.py              # Index mappings + helpers
 
 extensions/search/
