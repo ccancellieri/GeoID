@@ -24,11 +24,24 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, Si
 
 
 class ItemMetadataSidecarConfig(SidecarConfig):
-    """Configuration for per-item multilanguage metadata sidecar.
+    """PG sidecar table for per-item multilanguage metadata + STAC overlay.
 
-    This sidecar stores generic item-level metadata (title, description,
-    keywords) with internationalization support, plus extension/asset columns
-    that may be consumed by downstream sidecars (e.g. STAC overlay).
+    Owns the ``{schema}.{table}_item_metadata`` table — one row per
+    item (FK to hub on ``geoid``).  Stores:
+
+    * **Multilanguage core** — ``title`` / ``description`` /
+      ``keywords`` as JSONB ``{"en": "...", "fr": "..."}`` resolved at
+      read time per ``?lang=`` query param.
+    * **STAC external content** — ``external_extensions`` (JSONB
+      array) + ``external_assets`` (JSONB dict) + ``extra_fields``
+      (JSONB) for stac_extensions / assets / namespaced fields the
+      caller supplied that aren't owned by a registered STAC provider.
+      Merged back into the rendered STAC Item by the
+      ``StacItemsSidecar`` overlay at read time.
+
+    Auto-injected by the STAC extension via ``SidecarRegistry`` —
+    appears in ``effective_sidecars`` whenever the STAC extension is
+    loaded, regardless of whether ``sidecars`` overrides include it.
     """
 
     # Literal-typed discriminator — required by Pydantic for the

@@ -141,16 +141,28 @@ class AttributeSchemaEntry(BaseModel):
 
 
 class FeatureAttributeSidecarConfig(SidecarConfig):
-    """
-    Configuration for the Feature Attribute Sidecar.
+    """PG sidecar table that stores feature attributes + identity off-hub.
 
-    Supports:
-    - Relational (columnar) or JSONB storage
-    - Per-attribute indexing and partitioning
-    - Identity columns (external_id, asset_id)
-    - Default values for attributes
-    - Storage-only fields (queryable but not in Feature output)
-    - Feature type schema override
+    Owns the ``{schema}.{table}_attributes`` table — one row per item
+    (FK to hub on ``geoid``).  Always-on for every collection_type; the
+    only sidecar that's never optional.
+
+    Two storage modes (auto-resolved by ``storage_mode=AUTOMATIC``
+    based on whether ``attribute_schema`` is supplied):
+
+    * **JSONB (Mode B, default when no schema)** — single ``attributes
+      JSONB`` column + STORED GENERATED ``attributes_hash CHAR(64)``
+      (SHA256 of canonicalised JSONB) powering
+      ``IdentityMatcher.ATTRIBUTES_HASH``.  Schema-flexible; one column
+      per item regardless of property count.
+
+    * **Columnar (Mode A, when schema is supplied)** — one PG column
+      per declared attribute with type/nullability/index controls.
+      Stronger query plans, requires schema declaration up-front.
+
+    Identity columns (``external_id``, ``asset_id``) are gated by
+    ``enable_external_id`` / ``enable_asset_id`` flags — used by
+    ``IdentityMatcher.EXTERNAL_ID`` and the asset-reference cascade.
     """
 
     sidecar_type: Literal["attributes"] = "attributes"

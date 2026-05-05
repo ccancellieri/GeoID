@@ -209,7 +209,19 @@ class PlaceStatisticsConfig(BaseModel):
 # ============================================================================
 
 class GeometriesSidecarConfig(SidecarConfig):
-    """Configuration for GeometriesSidecar."""
+    """PG sidecar table that stores geometry off-hub.
+
+    Owns the ``{schema}.{table}_geometries`` table — one row per item
+    (FK to hub on ``geoid``).  Columns include ``geom`` (and optional
+    ``bbox_geom``), a STORED GENERATED ``geohash CHAR(N)`` driven by
+    ``ST_GeoHash(geom, N)``, and a STORED GENERATED ``geometry_hash
+    CHAR(64)`` (SHA256 of ``ST_AsBinary(geom)``) used by
+    ``IdentityMatcher.GEOMETRY_HASH`` and the
+    ``skip_if_unchanged_geometry_hash`` write-policy gate.
+
+    Attached by default for VECTOR / RASTER collections; not attached
+    for RECORDS (no spatial component).
+    """
     sidecar_type: Literal["geometries"] = "geometries"
     
     # Geometry storage settings
