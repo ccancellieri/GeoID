@@ -187,17 +187,28 @@ class ContextSelector {
         this.loadCatalogs();
     }
 
+    // Resolve absolute API path with optional reverse-proxy prefix.
+    // Page is served at <prefix>/web/pages/<id> in iframes; relative URLs
+    // resolve against /web/pages/, hitting the wrong endpoint (404).
+    // Match the pattern in extensions/stac/static/stac_browser.html.
+    _apiPath(path) {
+        const p = window.location.pathname || '';
+        const idx = p.indexOf('/web/');
+        const prefix = idx !== -1 ? p.substring(0, idx) : '';
+        return prefix + path;
+    }
+
     async loadCatalogs() {
         try {
             let offset = 0;
             const limit = 100;
             let allCatalogs = [];
-            
+
             while (true) {
-                let url = `catalogs?limit=${limit}&offset=${offset}`;
+                let url = this._apiPath(`/catalogs?limit=${limit}&offset=${offset}`);
                 if (this.state.q) url += `&q=${encodeURIComponent(this.state.q)}`;
-                
-                const res = await fetch(url);
+
+                const res = await fetch(url, { credentials: "same-origin" });
                 if (!res.ok) throw new Error("Failed to fetch catalogs");
                 const catalogs = await res.json();
                 
@@ -249,17 +260,17 @@ class ContextSelector {
             let offset = 0;
             const limit = 100;
             let allCollections = [];
-            
+
             while (true) {
-                let url = `catalogs/${catalogId}/collections?limit=${limit}&offset=${offset}`;
+                let url = this._apiPath(`/catalogs/${catalogId}/collections?limit=${limit}&offset=${offset}`);
                 if (this.enableVirtualCollections) {
-                    url += '&include_virtual=true'; 
+                    url += '&include_virtual=true';
                 }
                 if (this.state.q) {
                     url += `&q=${encodeURIComponent(this.state.q)}`;
                 }
-                
-                const res = await fetch(url);
+
+                const res = await fetch(url, { credentials: "same-origin" });
                 if (!res.ok) throw new Error("Failed to fetch collections");
                 const cols = await res.json();
                 
@@ -300,8 +311,10 @@ class ContextSelector {
     
     async loadAssets(catalogId, collectionId) {
         try {
-             // Mock endpoint - Adjust to actual API
-            const res = await fetch(`catalogs/${catalogId}/collections/${collectionId}/assets`);
+            const res = await fetch(
+                this._apiPath(`/catalogs/${catalogId}/collections/${collectionId}/assets`),
+                { credentials: "same-origin" }
+            );
             if (!res.ok) throw new Error("Failed to fetch assets");
             const assets = await res.json();
             
