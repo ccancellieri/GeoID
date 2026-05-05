@@ -21,6 +21,21 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+
+# Top-level tenacity import — load-bearing for SCOPE gating.
+# `tools/discovery.py:159 discover_and_load_plugins` skips entry-points whose
+# top-level imports raise ImportError, so importing tenacity at module load
+# (rather than lazily inside `flush_pending_registrations`) ensures IamModule
+# is *not* registered on services whose SCOPE excludes `module_iam` (which
+# declares the tenacity dep).  Without this, IamModule loaded on every
+# service and crashed at lifespan time when tenacity wasn't installed —
+# see GeoID#252 / PR #249 (the symptom-fix that promoted tenacity to `core`).
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 from dynastore.modules import ModuleProtocol, get_protocol
 from dynastore.models.auth import (
     AuthenticationProtocol,
@@ -473,13 +488,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                                 await storage.create_role(r, schema="iam", conn=conn)
 
         try:
-            from tenacity import (
-                AsyncRetrying,
-                retry_if_exception,
-                stop_after_attempt,
-                wait_exponential,
-            )
-
             # ``reraise=True`` propagates the underlying exception on
             # exhaustion (no ``RetryError`` wrapper). Other exceptions
             # propagate immediately because ``retry_if_exception``

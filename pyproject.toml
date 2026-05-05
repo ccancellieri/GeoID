@@ -210,7 +210,7 @@ db_sync = ["dynastore[db_config,datastore]"]
 #   *  processes    — standalone; on catalog (cloud) or worker (on-prem)
 #
 # ==========================================================================
-core = ["tenacity>=8.0", "dynastore[db_async,web,configs,events,storage,cache]"]
+core = ["dynastore[db_async,web,configs,events,storage,cache]"]
 # catalog_grp split: data layer (needed by maps for collection reads + /features)
 # vs public catalog routers (stac/assets/search/records — not on maps).
 catalog_data_grp = ["dynastore[geospatial_core,catalog,features]"]
