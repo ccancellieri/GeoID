@@ -88,6 +88,15 @@ class ItemsElasticsearchPrivateDriver(
     indexer_id: ClassVar[str] = "items_elasticsearch_private_driver"
     is_item_indexer: ClassVar[bool] = True
 
+    # Opt out of items-tier auto-default routing.  The private variant is
+    # tenant-isolated DENY-policy indexing; it must only run for catalogs
+    # whose routing config explicitly pins it (``source: "operator"``).
+    # Auto-injecting it into every collection's INDEX/SEARCH would silently
+    # bypass the privacy contract.  ``ConfigApiService._build_routing_resolution``
+    # uses ``is_collection_private`` to decide which ES variant is correct
+    # for a given collection — that's the right gate, not auto-augmentation.
+    auto_register_for_routing: ClassVar[bool] = False
+
     priority: int = 51
     preferred_chunk_size: int = 500
     capabilities: FrozenSet[str] = frozenset({

@@ -45,7 +45,7 @@ import queue
 import threading
 import uuid
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, FrozenSet, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Set, Union
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -211,6 +211,14 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
 
     Satisfies ``CollectionItemsStore``.
     """
+
+    # Opt out of items-tier auto-default routing.  The driver declares
+    # SEARCH capabilities (FULLTEXT/SPATIAL_FILTER/ATTRIBUTE_FILTER) so
+    # operators CAN pin it explicitly for analytical reads, but it
+    # shouldn't be the default SEARCH backend for every collection — ES
+    # and PG handle that.  Operators who want DuckDB SEARCH set the
+    # routing config entry by hand (``source: "operator"``).
+    auto_register_for_routing: ClassVar[bool] = False
 
     priority: int = 30
     preferred_chunk_size: int = 1000

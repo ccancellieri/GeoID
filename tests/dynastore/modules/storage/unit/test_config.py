@@ -293,18 +293,15 @@ class TestCollectionMetadataRouting:
     def test_es_primary_in_read_default_with_geometry_hints(self):
         """Default routing puts ES (public) at READ position 0 with the
         ``geometry_simplified`` hint; PG follows with ``geometry_exact``.
-        WRITE keeps PG as authoritative (on_failure=fatal) and adds ES as a
-        best-effort indexer (on_failure=warn).
+        WRITE is PG-only — ES indexing is async via the dispatcher feeding
+        ``operations[INDEX]`` (auto-augmented with ES); see
+        ``feedback_es_indexing_per_item_async_not_bulk.md``.
         """
         cfg = ItemsRoutingConfig()
         write = cfg.operations[Operation.WRITE]
         read = cfg.operations[Operation.READ]
-        assert [e.driver_id for e in write] == [
-            "items_postgresql_driver", "items_elasticsearch_driver",
-        ]
-        assert [e.on_failure for e in write] == [
-            FailurePolicy.FATAL, FailurePolicy.WARN,
-        ]
+        assert [e.driver_id for e in write] == ["items_postgresql_driver"]
+        assert [e.on_failure for e in write] == [FailurePolicy.FATAL]
         assert [e.driver_id for e in read] == [
             "items_elasticsearch_driver", "items_postgresql_driver",
         ]

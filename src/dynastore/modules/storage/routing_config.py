@@ -345,21 +345,26 @@ class ItemsRoutingConfig(PluginConfig):
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
-            # ES (public) primary, PG secondary. PG is authoritative for WRITE
-            # (on_failure=fatal — must succeed); ES is the derived index
-            # (on_failure=warn — transient outage doesn't block writes,
-            # reindex catches up). READ orders ES first for fast simplified-
-            # geometry search; PG carries the `geometry_exact` hint so a
-            # consumer can request exact geometries — actual hint-aware
-            # dispatch is pending PR-1e (today position 0 wins per :660).
+            # PG is authoritative for WRITE (on_failure=fatal — must succeed).
+            # ES is intentionally NOT in WRITE: the per-item event listener
+            # ``ItemsElasticsearchDriver._on_item_upsert`` already mirrors
+            # writes to ES asynchronously (best-effort, fire-and-forget),
+            # and INDEX is auto-augmented with the same driver via
+            # ``_self_register_indexers_into``.  Putting ES in WRITE would
+            # duplicate the path; the listener has a ``_is_write_driver_for``
+            # guard to skip itself when ES is in WRITE precisely because
+            # double-indexing was the historical failure mode.  See
+            # ``feedback_es_indexing_per_item_async_not_bulk.md``: ES item
+            # sync is a per-item async best-effort listener, not a
+            # synchronous fan-out target.
+            #
+            # READ orders ES first for fast simplified-geometry search; PG
+            # carries the ``geometry_exact`` hint so a consumer can request
+            # exact geometries via ``get_driver(..., hint="geometry_exact")``.
             Operation.WRITE: [
                 OperationDriverEntry(
                     driver_id="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
-                ),
-                OperationDriverEntry(
-                    driver_id="items_elasticsearch_driver",
-                    on_failure=FailurePolicy.WARN,
                 ),
             ],
             Operation.READ: [
@@ -789,6 +794,14 @@ def _self_register_indexers_into(
 
     listed = {entry.driver_id for entry in target_ops.get(Operation.INDEX, [])}
     for driver in get_protocols(marker_proto):
+        # Drivers can opt out of auto-default routing by setting
+        # ``auto_register_for_routing = False`` on the class.  Used by
+        # drivers that are real but require explicit operator pinning
+        # (e.g. tenant-isolated DENY-policy variants), so they don't
+        # silently land in every collection's routing config.  Default
+        # True preserves the auto-discovery convention.
+        if not getattr(type(driver), "auto_register_for_routing", True):
+            continue
         driver_id = _to_snake(type(driver).__name__)
         if driver_id in listed:
             continue
@@ -885,6 +898,14 @@ def _self_register_searchers_into(
         })
     listed = {entry.driver_id for entry in target_ops.get(Operation.SEARCH, [])}
     for driver in get_protocols(marker_proto):
+        # Same opt-out semantics as ``_self_register_indexers_into``:
+        # ``auto_register_for_routing = False`` on the class excludes
+        # the driver from auto-default SEARCH routing.  Used by drivers
+        # that declare SEARCH capabilities for explicit-pin use cases
+        # (e.g. DuckDB analytical reads) but shouldn't be the default
+        # items SEARCH backend.
+        if not getattr(type(driver), "auto_register_for_routing", True):
+            continue
         driver_caps = getattr(driver, "capabilities", frozenset())
         if not (driver_caps & search_caps):
             continue
