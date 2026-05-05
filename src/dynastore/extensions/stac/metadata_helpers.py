@@ -8,7 +8,7 @@ Provides utilities to:
 """
 
 import logging
-from typing import Dict, Any, List, Set, Optional, TYPE_CHECKING
+from typing import Dict, Any, List, Sequence, Set, Optional, TYPE_CHECKING
 from dynastore.tools.language_utils import (
     resolve_localized_field,
     inject_localized_field,
@@ -34,7 +34,7 @@ _SHORT_NAME_URI_MARKERS = {
 
 def filter_providers_by_short_names(
     providers: List["StacExtensionProtocol"],
-    allowed_short_names: List[str],
+    allowed_short_names: Sequence[str],
 ) -> List["StacExtensionProtocol"]:
     """Filter ``StacExtensionProtocol`` providers by collection-level
     ``auto_render_extensions``.
