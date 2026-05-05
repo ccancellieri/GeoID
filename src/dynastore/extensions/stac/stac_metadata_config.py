@@ -18,12 +18,14 @@
 
 """Configuration for the STAC items sidecar.
 
-Lives in ``modules/storage/drivers/pg_sidecars/`` so the items driver's
-discriminated union (``ItemsPostgresqlDriverConfig.sidecars``, in
-``modules/storage/driver_config.py``) can reference it without crossing
-the storage→extensions layer boundary.  The sidecar's behaviour
-(``get_ddl``, ``map_row_to_feature``, etc.) lives in
-``extensions/stac/stac_items_sidecar.py``.
+Lives in ``extensions/stac/`` (its conceptual home) and registers itself
+into ``SidecarConfigRegistry`` at import time.
+``ItemsPostgresqlDriverConfig.sidecars`` resolves the discriminated
+union via the registry rather than via direct imports — see
+``modules/storage/driver_config.py``'s ``_PgSidecarUnionSchema``.
+
+The sidecar's behaviour (``get_ddl``, ``map_row_to_feature``, etc.)
+lives alongside in ``extensions/stac/stac_items_sidecar.py``.
 """
 
 from typing import Literal
@@ -42,9 +44,8 @@ class StacItemsSidecarConfig(SidecarConfig):
     (``external_extensions``, ``external_assets``, ``extra_fields``).
     """
 
-    # Literal-typed discriminator — required by Pydantic for the
-    # Annotated[Union[...], Discriminator("sidecar_type")] dispatch on
-    # ItemsPostgresqlDriverConfig.sidecars.
+    # Literal-typed discriminator — required by the registry-resolved
+    # discriminated union on ``ItemsPostgresqlDriverConfig.sidecars``.
     sidecar_type: Literal["stac_metadata"] = "stac_metadata"
 
 

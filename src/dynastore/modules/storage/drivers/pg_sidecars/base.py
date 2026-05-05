@@ -26,6 +26,7 @@ including methods for DDL generation, data transformation, and operation validat
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import (
+    Annotated,
     Dict,
     Any,
     Optional,
@@ -37,7 +38,7 @@ from typing import (
     Protocol,
     runtime_checkable,
 )
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
 from enum import Enum
 from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.query_builder import QueryRequest
@@ -433,6 +434,54 @@ class SidecarConfig(BaseModel):
         return None
 
     model_config = {"extra": "allow"}
+
+
+def _coerce_pg_sidecar(v: Any) -> Any:
+    """Resolve a sidecar config dict → its concrete subclass via
+    :class:`SidecarConfigRegistry`, dispatching on ``sidecar_type``.
+
+    Used as a Pydantic ``BeforeValidator`` on
+    ``ItemsPostgresqlDriverConfig.sidecars``.  Reading the registry at
+    every validation lets extensions register sidecar configs *after*
+    class-definition of the items driver — important since the driver
+    config is shared code while the extension configs (e.g. STAC) live
+    in their own modules.
+
+    Fail-loud on unknown / empty ``sidecar_type`` so configuration typos
+    surface at validation time rather than silently degrading to the
+    base :class:`SidecarConfig`.  Already-typed instances pass through
+    unchanged so model-instance round-tripping
+    (``model_dump(exclude_unset=True)`` → ``model_validate``) stays
+    lossless.
+    """
+    if isinstance(v, SidecarConfig):
+        return v
+    if isinstance(v, dict):
+        sc_type = v.get("sidecar_type")
+        if not sc_type:
+            registered = sorted(SidecarConfigRegistry._registry.keys())
+            raise ValueError(
+                f"sidecar_type is required; registered types: {registered}"
+            )
+        cls = SidecarConfigRegistry.resolve_config_class(sc_type)
+        if cls is SidecarConfig:
+            registered = sorted(SidecarConfigRegistry._registry.keys())
+            raise ValueError(
+                f"sidecar_type {sc_type!r} not registered; "
+                f"registered types: {registered}"
+            )
+        return cls.model_validate(v)
+    # Non-dict, non-SidecarConfig (e.g. a raw string) — let Pydantic
+    # surface its native ``model_type`` error, which the upstream
+    # error-message assertions still match.
+    return v
+
+
+# Field type for ``ItemsPostgresqlDriverConfig.sidecars``.  Keeping this
+# alias inside ``pg_sidecars/`` (not in shared ``storage/driver_config``)
+# means non-PG drivers (DuckDB, Iceberg, Elasticsearch) never see PG
+# sidecar machinery.
+PgSidecarConfig = Annotated[SidecarConfig, BeforeValidator(_coerce_pg_sidecar)]
 
 
 class SidecarProtocol(ABC):

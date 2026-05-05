@@ -37,9 +37,9 @@ etc.), not *what operation* it performs.  Operations are defined in
 import json
 import os
 from enum import StrEnum
-from typing import Annotated, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple, Union
+from typing import Annotated, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
-from pydantic import ConfigDict, Discriminator, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from dynastore.tools.secrets import Secret
 from dynastore.tools.ui_hints import ui
@@ -51,36 +51,20 @@ from dynastore.modules.db_config.platform_config_service import (
     WriteOnce,
 )
 
-# PG sidecar configs — colocated with the PG driver (storage/drivers/pg_sidecars)
-# since M1b.0.  They are imported eagerly here so the discriminated-union field
-# type on ItemsPostgresqlDriverConfig.sidecars can reference them directly
-# without string forward refs.  No cycle: pg_sidecars doesn't import driver_config.
-from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
-    FeatureAttributeSidecarConfig,
+# Sidecar machinery is PG-specific — the field type alias and its
+# registry-based coercion live in ``pg_sidecars/base.py`` so that other
+# storage drivers (DuckDB, Iceberg, Elasticsearch) don't see PG sidecar
+# code at all.  Eager imports of the core sidecar config modules below
+# trigger their ``SidecarConfigRegistry.register(...)`` side effects so
+# extensions (e.g. STAC) can register on top.
+from dynastore.modules.storage.drivers.pg_sidecars import (
+    attributes_config as _attributes_config,  # noqa: F401 — registry side-effect
+    geometries_config as _geometries_config,  # noqa: F401 — registry side-effect
+    item_metadata_config as _item_metadata_config,  # noqa: F401 — registry side-effect
 )
-from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
-    GeometriesSidecarConfig,
-)
-from dynastore.modules.storage.drivers.pg_sidecars.item_metadata_config import (
-    ItemMetadataSidecarConfig,
-)
-from dynastore.modules.storage.drivers.pg_sidecars.stac_metadata_config import (
-    StacItemsSidecarConfig,
-)
+from dynastore.modules.storage.drivers.pg_sidecars.base import PgSidecarConfig
 
-# Discriminated union of all concrete PG sidecar configs.  The ``sidecar_type``
-# discriminator + the base-class validator that pins ``sidecar_type`` in
-# ``__pydantic_fields_set__`` (see pg_sidecars/base.py) makes
-# ``model_dump(exclude_unset=True)`` → ``model_validate`` lossless.
-_PgSidecarConfig = Annotated[
-    Union[
-        GeometriesSidecarConfig,
-        FeatureAttributeSidecarConfig,
-        ItemMetadataSidecarConfig,
-        StacItemsSidecarConfig,
-    ],
-    Discriminator("sidecar_type"),
-]
+_PgSidecarConfig = PgSidecarConfig
 
 
 # ---------------------------------------------------------------------------

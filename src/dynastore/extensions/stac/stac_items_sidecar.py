@@ -41,7 +41,7 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import (
     FieldDefinition,
     FieldCapability,
 )
-from dynastore.modules.storage.drivers.pg_sidecars.stac_metadata_config import (
+from dynastore.extensions.stac.stac_metadata_config import (
     StacItemsSidecarConfig,
 )
 

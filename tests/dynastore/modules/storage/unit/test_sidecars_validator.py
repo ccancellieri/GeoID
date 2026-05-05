@@ -72,11 +72,14 @@ class TestSidecarsValidatorFailsLoud:
             )
 
     def test_non_dict_non_sidecarconfig_raises(self):
-        # Pydantic's native message for a non-object, non-SidecarConfig
-        # input to a discriminated-union field is
-        # ``Input should be a valid dictionary or object to extract
-        # fields from``.  Match the stable substring.
-        with pytest.raises(ValueError, match="valid dictionary or object"):
+        # Pydantic's native ``model_type`` error for a non-dict,
+        # non-SidecarConfig input.  Wording switched to "instance of
+        # SidecarConfig" with the registry-based discriminator (PR-G3)
+        # since the field type is now ``SidecarConfig`` plus a
+        # ``BeforeValidator``, not a discriminated ``Union[...]``.
+        with pytest.raises(
+            ValueError, match="valid dictionary or instance of SidecarConfig"
+        ):
             ItemsPostgresqlDriverConfig(sidecars=["not-a-config"])
 
     def test_error_message_includes_index_for_multi_item_list(self):
