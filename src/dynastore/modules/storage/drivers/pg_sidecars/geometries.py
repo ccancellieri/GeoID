@@ -1458,7 +1458,7 @@ class GeometriesSidecar(SidecarProtocol):
         never part of the public Feature output properties.
 
         ``geohash`` is the Postgres-generated ST_GeoHash column used by
-        the GEOHASH identity matcher (see CollectionWritePolicy); it is
+        the GEOHASH identity matcher (see ItemsWritePolicy); it is
         queryable at the SQL layer for write policies but is hidden from
         API consumers by default to avoid leaking storage plumbing into
         Feature.properties.

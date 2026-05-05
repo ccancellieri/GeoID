@@ -1452,7 +1452,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         table = f"{physical_table}_{self.sidecar_id}"
 
         # 1. Check Asset ID Collision (if behavior requires it)
-        # Note: ItemService handles the check based on CollectionWritePolicy,
+        # Note: ItemService handles the check based on ItemsWritePolicy,
         # but here we provide the implementation for specific fields.
         asset_id = processing_context.get("asset_id")
         if asset_id and self.config.enable_asset_id:

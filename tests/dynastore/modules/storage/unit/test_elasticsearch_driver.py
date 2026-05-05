@@ -539,11 +539,11 @@ class TestWriteEntitiesTenantIndex:
     @pytest.mark.asyncio
     async def test_default_policy_writes_with_routing_and_tracking_fields(self):
         from dynastore.modules.storage.driver_config import (
-            CollectionWritePolicy, WriteConflictPolicy,
+            ItemsWritePolicy, WriteConflictPolicy,
         )
 
         es = _StubEs(exists=True)
-        policy = CollectionWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
         with patch(
             "dynastore.modules.elasticsearch.client.get_client", return_value=es,
         ), patch(
@@ -588,12 +588,12 @@ class TestWriteEntitiesTenantIndex:
     @pytest.mark.asyncio
     async def test_refuse_policy_skips_existing_external_id(self):
         from dynastore.modules.storage.driver_config import (
-            CollectionWritePolicy, WriteConflictPolicy,
+            ItemsWritePolicy, WriteConflictPolicy,
         )
 
         es = _StubEs(exists=True)
         es.count_result = {"count": 1}
-        policy = CollectionWritePolicy(
+        policy = ItemsWritePolicy(
             on_conflict=WriteConflictPolicy.REFUSE,
             external_id_field="properties.ext_id",
         )
@@ -622,11 +622,11 @@ class TestWriteEntitiesTenantIndex:
     @pytest.mark.asyncio
     async def test_new_version_policy_appends_timestamp_to_doc_id(self):
         from dynastore.modules.storage.driver_config import (
-            CollectionWritePolicy, WriteConflictPolicy,
+            ItemsWritePolicy, WriteConflictPolicy,
         )
 
         es = _StubEs(exists=True)
-        policy = CollectionWritePolicy(
+        policy = ItemsWritePolicy(
             on_conflict=WriteConflictPolicy.NEW_VERSION,
             external_id_field="properties.ext_id",
         )

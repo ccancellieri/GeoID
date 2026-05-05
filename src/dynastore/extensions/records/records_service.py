@@ -364,10 +364,10 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             if isinstance(item, dict):
                 item["geometry"] = None
 
-        from dynastore.modules.storage.driver_config import CollectionWritePolicy
+        from dynastore.modules.storage.driver_config import ItemsWritePolicy
         policy_source = (
             f"/configs/catalogs/{catalog_id}/collections/{collection_id}"
-            f"/plugins/{CollectionWritePolicy.class_key()}"
+            f"/plugins/{ItemsWritePolicy.class_key()}"
         )
         # Pass the normalised list so the mixin works with the same payload
         # shape regardless of original body format.

@@ -74,7 +74,7 @@ class ConsumerType(str, Enum):
 # Columns that belong to the Hub table and must never appear in Feature.properties,
 # regardless of which sidecar is currently running. geometry_hash is plumbing for
 # the GEOMETRY_HASH identity matcher and skip_if_unchanged_geometry_hash gate
-# (see CollectionWritePolicy); it is queryable at the SQL layer for write
+# (see ItemsWritePolicy); it is queryable at the SQL layer for write
 # policies but is not surfaced to API consumers by default.
 HUB_INTERNAL_COLUMNS: frozenset = frozenset({
     "geoid",

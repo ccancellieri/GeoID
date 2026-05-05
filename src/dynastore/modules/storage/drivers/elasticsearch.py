@@ -55,7 +55,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
 
 if TYPE_CHECKING:
-    from dynastore.modules.storage.driver_config import CollectionWritePolicy
+    from dynastore.modules.storage.driver_config import ItemsWritePolicy
     from dynastore.modules.storage.storage_location import StorageLocation
 
 from dynastore.models.ogc import Feature, FeatureCollection
@@ -379,7 +379,7 @@ class ItemsElasticsearchDriver(
         context: Optional[Dict[str, Any]] = None,
         db_resource: Optional[Any] = None,
     ) -> List[Feature]:
-        """Write/upsert entities to Elasticsearch respecting CollectionWritePolicy.
+        """Write/upsert entities to Elasticsearch respecting ItemsWritePolicy.
 
         Applies ``WriteConflictPolicy`` per entity when ``external_id`` is present.
         Stores ``asset_id``, ``valid_from``, ``valid_to`` from ``context`` in ES ``_source``.
@@ -574,10 +574,10 @@ class ItemsElasticsearchDriver(
     @staticmethod
     async def _resolve_write_policy(
         catalog_id: str, collection_id: str,
-    ) -> "CollectionWritePolicy":
-        """Resolve CollectionWritePolicy from the config waterfall."""
+    ) -> "ItemsWritePolicy":
+        """Resolve ItemsWritePolicy from the config waterfall."""
         from dynastore.modules.storage.driver_config import (
-            CollectionWritePolicy,
+            ItemsWritePolicy,
         )
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.tools.discovery import get_protocol
@@ -586,15 +586,15 @@ class ItemsElasticsearchDriver(
             configs = get_protocol(ConfigsProtocol)
             if configs:
                 result = await configs.get_config(
-                    CollectionWritePolicy,
+                    ItemsWritePolicy,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
                 )
-                if isinstance(result, CollectionWritePolicy):
+                if isinstance(result, ItemsWritePolicy):
                     return result
         except Exception:
             pass
-        return CollectionWritePolicy()
+        return ItemsWritePolicy()
 
     @staticmethod
     def _extract_external_id_from_doc(doc: dict, field_path: Optional[str]) -> Optional[str]:

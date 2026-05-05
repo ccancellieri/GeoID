@@ -10,7 +10,7 @@ import pytest
 
 from dynastore.modules.storage.driver_config import (
     CollectionSchema,
-    CollectionWritePolicy,
+    ItemsWritePolicy,
     WriteConflictPolicy,
 )
 from dynastore.modules.storage.routing_config import (
@@ -43,13 +43,13 @@ class TestCollectionRoutingConfigDefaults:
         assert "items_postgresql_driver" in ids
 
 
-class TestCollectionWritePolicyDefaults:
+class TestItemsWritePolicyDefaults:
     def test_zero_arg_instantiation(self):
-        cfg = CollectionWritePolicy()
+        cfg = ItemsWritePolicy()
         assert cfg is not None
 
     def test_default_on_conflict_is_update(self):
-        cfg = CollectionWritePolicy()
+        cfg = ItemsWritePolicy()
         assert cfg.on_conflict == WriteConflictPolicy.UPDATE
 
 

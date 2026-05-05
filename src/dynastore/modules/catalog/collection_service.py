@@ -546,17 +546,17 @@ class CollectionService:
 
             if write_policy_input:
                 from dynastore.modules.storage.driver_config import (
-                    CollectionWritePolicy,
+                    ItemsWritePolicy,
                 )
                 policy = (
-                    CollectionWritePolicy.model_validate(write_policy_input)
+                    ItemsWritePolicy.model_validate(write_policy_input)
                     if isinstance(write_policy_input, dict)
                     else write_policy_input
                 )
                 configs = get_protocol(ConfigsProtocol)
                 assert configs is not None, "ConfigsProtocol not registered"
                 await configs.set_config(
-                    CollectionWritePolicy,
+                    ItemsWritePolicy,
                     policy,
                     catalog_id=catalog_id,
                     collection_id=collection_model.id,

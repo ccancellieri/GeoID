@@ -79,7 +79,7 @@ from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.driver_config import (
     ItemsIcebergDriverConfig,
-    CollectionWritePolicy,
+    ItemsWritePolicy,
     IcebergConfig,
 )
 
@@ -434,7 +434,7 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         context: Optional[Dict[str, Any]] = None,
         db_resource: Optional[Any] = None,
     ) -> List[Feature]:
-        """Write entities to an Iceberg table respecting CollectionWritePolicy.
+        """Write entities to an Iceberg table respecting ItemsWritePolicy.
 
         Policy semantics on Iceberg (append-only table format):
 
@@ -463,7 +463,7 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
             dicts_to_features,
         )
         from dynastore.modules.storage.driver_config import (
-            CollectionWritePolicy,
+            ItemsWritePolicy,
             WriteConflictPolicy,
         )
 
@@ -567,9 +567,9 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         return dicts_to_features(rows)
 
     @staticmethod
-    async def _resolve_write_policy(catalog_id: str, collection_id: str) -> "CollectionWritePolicy":
-        """Resolve CollectionWritePolicy from the config waterfall."""
-        from dynastore.modules.storage.driver_config import CollectionWritePolicy
+    async def _resolve_write_policy(catalog_id: str, collection_id: str) -> "ItemsWritePolicy":
+        """Resolve ItemsWritePolicy from the config waterfall."""
+        from dynastore.modules.storage.driver_config import ItemsWritePolicy
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.tools.discovery import get_protocol
 
@@ -577,15 +577,15 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
             configs = get_protocol(ConfigsProtocol)
             if configs:
                 cfg = await configs.get_config(
-                    CollectionWritePolicy,
+                    ItemsWritePolicy,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
                 )
-                if isinstance(cfg, CollectionWritePolicy):
+                if isinstance(cfg, ItemsWritePolicy):
                     return cfg
         except Exception:
             pass
-        return CollectionWritePolicy()
+        return ItemsWritePolicy()
 
     @staticmethod
     def _extract_external_id(row: dict, field_path: Optional[str]) -> Optional[str]:

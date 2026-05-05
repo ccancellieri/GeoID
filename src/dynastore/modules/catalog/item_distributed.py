@@ -21,7 +21,7 @@ from dynastore.modules.db_config.query_executor import (
 )
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,
-    CollectionWritePolicy,
+    ItemsWritePolicy,
     WriteConflictPolicy,
     IdentityMatcher,
 )
@@ -81,12 +81,12 @@ class ItemDistributedMixin(_Host):
 
         # 1. Resolve write policy from the config waterfall (same as all drivers)
         configs = get_protocol(ConfigsProtocol)
-        write_policy: Optional[CollectionWritePolicy] = None
+        write_policy: Optional[ItemsWritePolicy] = None
         if configs is not None:
             wp = await configs.get_config(
-                CollectionWritePolicy, catalog_id, collection_id, ctx=DriverContext(db_resource=conn
+                ItemsWritePolicy, catalog_id, collection_id, ctx=DriverContext(db_resource=conn
             ))
-            if isinstance(wp, CollectionWritePolicy):
+            if isinstance(wp, ItemsWritePolicy):
                 write_policy = wp
         on_conflict = (
             write_policy.on_conflict if write_policy else WriteConflictPolicy.UPDATE

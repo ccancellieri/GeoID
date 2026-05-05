@@ -26,7 +26,7 @@ from dynastore.tools.typed_store.base import _to_snake
         ("ItemsPostgresqlDriver", "items_postgresql_driver"),
         ("AssetPostgresqlDriver", "asset_postgresql_driver"),
         ("CatalogElasticsearchDriver", "catalog_elasticsearch_driver"),
-        ("CollectionWritePolicy", "collection_write_policy"),
+        ("ItemsWritePolicy", "items_write_policy"),
         # Already lowercase: unchanged
         ("foo", "foo"),
         # Numbers stay attached to the preceding lowercase letter
@@ -41,14 +41,14 @@ def test_to_snake(name: str, expected: str) -> None:
 def test_class_key_returns_snake_case():
     """`PersistentModel.class_key()` flows through `_to_snake` end to end."""
     from dynastore.modules.storage.driver_config import (
-        CollectionWritePolicy,
+        ItemsWritePolicy,
         ItemsPostgresqlDriverConfig,
     )
     # Import the bound driver so TypedDriver.__init_subclass__ has populated
     # _DRIVER_REGISTRY[ItemsPostgresqlDriverConfig] before we read class_key().
     from dynastore.modules.storage.drivers.postgresql import ItemsPostgresqlDriver  # noqa: F401
 
-    assert CollectionWritePolicy.class_key() == "collection_write_policy"
+    assert ItemsWritePolicy.class_key() == "items_write_policy"
     # The DriverConfig→Driver class_key rewrite still happens inside the
     # TypedDriver bind, so the wire key here is the bound DRIVER name (in
     # snake_case): the *Config Python suffix is dropped.

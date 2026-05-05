@@ -256,7 +256,7 @@ class GeometriesSidecarConfig(SidecarConfig):
         description=(
             "If set, a STORED generated column `geohash CHAR(N)` (N=precision, 1-12) "
             "is added to the geometry sidecar, populated by ST_GeoHash(geom, N), "
-            "with a B-tree index.  Used by CollectionWritePolicy.IdentityMatcher.GEOHASH "
+            "with a B-tree index.  Used by ItemsWritePolicy.IdentityMatcher.GEOHASH "
             "for spatial-locality-based deduplication on write. Default 8 (≈20 m, ≈38 bits) — "
             "small storage cost, useful out-of-the-box for spatial dedup. Set to None to "
             "opt out for collections where the column would be wasted."

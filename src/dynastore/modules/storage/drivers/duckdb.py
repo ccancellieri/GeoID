@@ -430,12 +430,12 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
         """Synchronous write — runs inside thread pool."""
         from dynastore.modules.storage.drivers._duckdb_helpers import dicts_to_features
         from dynastore.modules.storage.driver_config import (
-            CollectionWritePolicy, WriteConflictPolicy,
+            ItemsWritePolicy, WriteConflictPolicy,
             AssetConflictPolicy,
         )
 
         ctx = context or {}
-        policy = ctx.get("_resolved_policy", CollectionWritePolicy())
+        policy = ctx.get("_resolved_policy", ItemsWritePolicy())
 
         # Enrich rows with context metadata
         asset_id = ctx.get("asset_id")
@@ -677,7 +677,7 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
 
         from dynastore.modules.storage.drivers._duckdb_helpers import normalize_to_dicts
         from dynastore.modules.storage.driver_config import (
-            CollectionWritePolicy,
+            ItemsWritePolicy,
         )
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.tools.discovery import get_protocol
@@ -688,12 +688,12 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
 
         # Resolve write policy (async) before entering thread pool
         ctx = dict(context or {})
-        policy = CollectionWritePolicy()
+        policy = ItemsWritePolicy()
         try:
             _configs = get_protocol(ConfigsProtocol)
             if _configs:
                 _p = await _configs.get_config(
-                    CollectionWritePolicy, catalog_id=catalog_id, collection_id=collection_id
+                    ItemsWritePolicy, catalog_id=catalog_id, collection_id=collection_id
                 )
                 if _p is not None:
                     policy = _p

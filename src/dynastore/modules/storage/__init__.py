@@ -45,7 +45,7 @@ from dynastore.modules.storage.driver_config import (
     AssetConflictPolicy,
     AssetDriverConfig,
     CollectionDriverConfig,
-    CollectionWritePolicy,
+    ItemsWritePolicy,
     CollectionSchema,
     WritePolicyDefaults,
     DriverCapability,
@@ -121,7 +121,7 @@ __all__ = [
     "OgcFeaturesSchemaExtension",
     "ConfigScopeMixin",
     # Write policy
-    "CollectionWritePolicy",
+    "ItemsWritePolicy",
     "WriteConflictPolicy",
     # Entity-transform chain runtime (operates on routing operations[TRANSFORM])
     "apply_transform_chain",

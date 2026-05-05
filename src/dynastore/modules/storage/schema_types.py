@@ -98,8 +98,8 @@ class UniqueConstraint(FieldConstraint):
 class IdentityKeyConstraint(FieldConstraint):
     """This field acts as the deduplication identity key.
 
-    Replaces ``CollectionWritePolicy.external_id_field`` +
-    ``CollectionWritePolicy.geohash_precision``.
+    Replaces ``ItemsWritePolicy.external_id_field`` +
+    ``ItemsWritePolicy.geohash_precision``.
 
     geohash_precision: geohash grid precision when the GEOHASH matcher is used.
         Ignored when ``external_id_field`` mode is active.
@@ -112,7 +112,7 @@ class IdentityKeyConstraint(FieldConstraint):
 class ValidityConstraint(FieldConstraint):
     """This field carries the temporal validity range for a feature.
 
-    Replaces ``CollectionWritePolicy.validity_field``.
+    Replaces ``ItemsWritePolicy.validity_field``.
 
     field: name of the temporal validity field (e.g. ``"valid_time"``).
     """
@@ -124,7 +124,7 @@ class ValidityConstraint(FieldConstraint):
 class GeometryHashConstraint(FieldConstraint):
     """Skip write when the incoming geometry hash equals the stored one.
 
-    Replaces ``CollectionWritePolicy.skip_if_unchanged_geometry_hash``.
+    Replaces ``ItemsWritePolicy.skip_if_unchanged_geometry_hash``.
     NEW_VERSION degrades to no-op; UPDATE degrades to REFUSE_RETURN.
     """
 

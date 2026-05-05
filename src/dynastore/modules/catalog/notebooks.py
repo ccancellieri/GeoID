@@ -1,7 +1,7 @@
 """Platform notebook registrations for the catalog module.
 
 Registers collection configuration notebooks:
-  - collection_write_policy            — write policy configuration
+  - items_write_policy            — write policy configuration
   - collection_feature_type            — feature type definition
   - collection_metadata_enrichment     — metadata enrichment / METADATA storage routing
   - collection_shapefile_strict_schema — end-to-end strict-schema demo (PRs #178/179/180/181)
@@ -16,12 +16,12 @@ _HERE = Path(__file__).parent / "notebooks"
 _REG = "dynastore.modules.catalog"
 
 register_platform_notebook(
-    notebook_id="collection_write_policy",
+    notebook_id="items_write_policy",
     registered_by=_REG,
-    notebook_path=_HERE / "write_policy.ipynb",
-    title={"en": "Collection Write Policy"},
-    description={"en": "Configure write-once semantics, external ID tracking, and temporal validity for a collection."},
-    tags=["collection", "write-policy", "configuration"],
+    notebook_path=_HERE / "items_write_policy.ipynb",
+    title={"en": "Items Write Policy"},
+    description={"en": "Configure write-once semantics, external ID tracking, and temporal validity for items."},
+    tags=["items", "write-policy", "configuration"],
 )
 
 register_platform_notebook(

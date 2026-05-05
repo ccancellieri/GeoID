@@ -148,7 +148,7 @@ class DriverCapability(StrEnum):
 class WriteConflictPolicy(StrEnum):
     """Item-level conflict policy — applied per entity when identity already exists.
 
-    Drivers read this policy from ``CollectionWritePolicy`` via the config
+    Drivers read this policy from ``ItemsWritePolicy`` via the config
     waterfall and apply it during ``write_entities()`` after identity is
     resolved by one of the configured :class:`IdentityMatcher` strategies.
 
@@ -173,7 +173,7 @@ class IdentityMatcher(StrEnum):
     """Strategies for deciding whether an incoming feature matches an existing one.
 
     Matchers are evaluated in the order declared on
-    ``CollectionWritePolicy.identity_matchers``; the first one that resolves a
+    ``ItemsWritePolicy.identity_matchers``; the first one that resolves a
     record wins.  Each sidecar implements the matchers it owns via its
     ``resolve_existing_item(..., matcher=...)`` method.
 
@@ -218,18 +218,19 @@ class AssetConflictPolicy(StrEnum):
     REFUSE = "refuse_asset"     # hard stop — reject the entire asset batch
 
 
-class CollectionWritePolicy(PluginConfig):
-    """Collection-level write behaviour, applied by all capable drivers.
+class ItemsWritePolicy(PluginConfig):
+    """Item-level write behaviour, applied by all capable drivers.
 
-    Registered as ``CollectionWritePolicy`` in the config waterfall
-    (identity: class_key) — collection > catalog > platform > code default.
+    Registered as ``ItemsWritePolicy`` in the config waterfall
+    (identity: class_key, ``items_write_policy``) — collection > catalog >
+    platform > code default.
 
     All drivers (PG, ES, Iceberg, DuckDB) read this single config during
     ``write_entities()`` via::
 
         configs = get_protocol(ConfigsProtocol)
         policy = await configs.get_config(
-            CollectionWritePolicy, catalog_id=catalog_id, collection_id=collection_id
+            ItemsWritePolicy, catalog_id=catalog_id, collection_id=collection_id
         )
 
     The ``context`` dict passed to ``write_entities()`` carries runtime values
@@ -258,7 +259,7 @@ class CollectionWritePolicy(PluginConfig):
       ``REFUSE_RETURN``. Enables "new version only when geometry differs".
 
     Layering vs ``WritePolicyDefaults`` (M8):
-      ``CollectionWritePolicy`` is the collection-INTRINSIC config — carries
+      ``ItemsWritePolicy`` is the collection-INTRINSIC config — carries
       field-name bindings (``external_id_field``, ``validity_field``) needed
       by existing write infrastructure. ``WritePolicyDefaults`` (sibling
       class) is the platform/catalog-tier POSTURE config — carries only
@@ -268,14 +269,14 @@ class CollectionWritePolicy(PluginConfig):
       ``ValidityConstraint``, ``ContentHashConstraint``). Operators
       configuring a NEW collection should set posture in
       ``WritePolicyDefaults`` at the platform tier and field bindings via
-      ``CollectionSchema.constraints``; ``CollectionWritePolicy`` remains
+      ``CollectionSchema.constraints``; ``ItemsWritePolicy`` remains
       for legacy collections that bound fields here directly.
 
     Worked scenarios:
 
     1. **External-id versioning** (track every change as a new version)::
 
-           CollectionWritePolicy(
+           ItemsWritePolicy(
                identity_matchers=[IdentityMatcher.EXTERNAL_ID],
                on_conflict=WriteConflictPolicy.NEW_VERSION,
                external_id_field="properties.code",
@@ -287,7 +288,7 @@ class CollectionWritePolicy(PluginConfig):
 
     2. **Geohash dedup at city precision** (drop duplicate POIs)::
 
-           CollectionWritePolicy(
+           ItemsWritePolicy(
                identity_matchers=[IdentityMatcher.GEOHASH],
                geohash_precision=6,           # ~1.2km
                on_conflict=WriteConflictPolicy.REFUSE_RETURN,
@@ -299,7 +300,7 @@ class CollectionWritePolicy(PluginConfig):
     3. **Batch idempotency via geometry hash** (reject the whole asset on
        any geometry duplicate)::
 
-           CollectionWritePolicy(
+           ItemsWritePolicy(
                identity_matchers=[IdentityMatcher.GEOMETRY_HASH],
                on_conflict=WriteConflictPolicy.UPDATE,
                on_asset_conflict=AssetConflictPolicy.REFUSE,
@@ -452,18 +453,18 @@ class WritePolicyDefaults(PluginConfig):
     ``GeometryHashConstraint`` instances — owned by the schema, not the
     write-policy config.
 
-    Layering vs ``CollectionWritePolicy`` (sibling class):
+    Layering vs ``ItemsWritePolicy`` (sibling class):
       - **At platform / catalog tiers**: set posture defaults via
         ``WritePolicyDefaults``. Operators set "all collections in this
         catalog default to ``on_conflict=REFUSE_FAIL``" once at the catalog
         scope.
       - **At collection tier (legacy / field-name-binding cases)**: use
-        ``CollectionWritePolicy`` for the field-name knobs
+        ``ItemsWritePolicy`` for the field-name knobs
         (``external_id_field``, ``validity_field``) that pre-date the schema
         constraint model. New collections should declare bindings in
-        ``CollectionSchema.constraints`` and leave ``CollectionWritePolicy``
+        ``CollectionSchema.constraints`` and leave ``ItemsWritePolicy``
         at code defaults.
-      - When both are present, ``CollectionWritePolicy`` at collection tier
+      - When both are present, ``ItemsWritePolicy`` at collection tier
         wins for the fields it owns; ``WritePolicyDefaults`` at upstream
         tiers fills in the rest via the standard waterfall.
 
@@ -501,7 +502,7 @@ class WritePolicyDefaults(PluginConfig):
         description=(
             "Item-level default action when identity matches. Cascades down "
             "the waterfall (platform → catalog → collection). Overridden at "
-            "collection scope by ``CollectionWritePolicy.on_conflict`` if set. "
+            "collection scope by ``ItemsWritePolicy.on_conflict`` if set. "
             "Use ``refuse_fail`` for strict-mode catalogs that must surface "
             "every duplicate as a 409."
         ),
@@ -1001,7 +1002,7 @@ class AssetElasticsearchDriverConfig(AssetDriverConfig):
 # Convenience helpers
 # ---------------------------------------------------------------------------
 
-# CollectionWritePolicy / CollectionSchema auto-register via
+# ItemsWritePolicy / CollectionSchema auto-register via
 # PluginConfig.__init_subclass__ — no explicit registration needed.
 
 from dynastore.models.protocols.field_definition import (  # noqa: E402
@@ -1108,7 +1109,7 @@ async def _on_apply_write_policy(
     ``external_id_field = "geoid"`` or ``"id"`` are always accepted (system fields).
     If ``CollectionSchema`` is not yet configured, validation is skipped.
     """
-    if not isinstance(config, CollectionWritePolicy):
+    if not isinstance(config, ItemsWritePolicy):
         return
     ext_id = config.external_id_field
     if not ext_id or ext_id in _ALWAYS_VALID_EXTERNAL_ID_FIELDS:
@@ -1153,7 +1154,7 @@ async def _on_apply_write_policy(
         )
 
 
-CollectionWritePolicy.register_apply_handler(_on_apply_write_policy)
+ItemsWritePolicy.register_apply_handler(_on_apply_write_policy)
 
 
 # ---------------------------------------------------------------------------
