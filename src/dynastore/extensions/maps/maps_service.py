@@ -219,11 +219,12 @@ class MapsService(ExtensionProtocol):
         return await self._serve_page_template("map_viewer.html")
 
     async def _serve_page_template(self, filename: str):
+        from dynastore._version import VERSION
         file_path = os.path.join(os.path.dirname(__file__), "static", filename)
         if not os.path.exists(file_path):
              return Response(content=f"Template {filename} not found", status_code=404)
         with open(file_path, "r", encoding="utf-8") as f:
-             return Response(content=f.read(), media_type="text/html")
+             return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     @router.get("/{dataset}", response_model=DatasetMaps)
     async def get_dataset_maps(dataset: str, request: Request):  # type: ignore[reportGeneralTypeIssues]

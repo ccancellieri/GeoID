@@ -111,6 +111,20 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     # Provision default global policies
                     await self._policy_service.provision_default_policies(conn=conn)
 
+                    # Self-heal guard: if anonymous role is still absent after
+                    # normal provision (e.g. iam_storage was None on first pass,
+                    # or a DB reset happened before a previous restart), force a
+                    # full re-seed so the service is never left in a locked-out state.
+                    anon = await self.storage.get_role("anonymous", schema="iam", conn=conn)
+                    if anon is None:
+                        logger.critical(
+                            "IamModule: 'anonymous' role missing after provision — "
+                            "DB may have been reset. Forcing full re-seed."
+                        )
+                        await self._policy_service.provision_default_policies(
+                            conn=conn, force=True
+                        )
+
             except Exception as e:
                 logger.error(f"Failed to initialize IamModule: {e}", exc_info=True)
 

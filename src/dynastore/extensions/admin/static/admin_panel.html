@@ -114,7 +114,7 @@
   .chip-list { display: flex; flex-wrap: wrap; gap: 4px; }
   .chip-input { width: 100%; margin-top: 6px; }
 </style>
-<script src="../website/context-selector.js"></script>
+<script src="../website/context-selector.js?v={{VERSION}}"></script>
 <script src="https://cdn.jsdelivr.net/npm/@json-editor/json-editor@latest/dist/jsoneditor.min.js"></script>
 </head>
 <body>
@@ -373,7 +373,7 @@ async function assignCatalogRole() {
   const role = document.getElementById('cm-role').value.trim();
   if (!catalog || !role) { toast('Catalog ID and role are required.', false); return; }
   try {
-    await apiFetch(`/principals/${pid}/catalogs/${catalog}/roles`, { method:'POST', body: JSON.stringify({role}) });
+    await apiFetch(`/catalogs/${catalog}/principals/${pid}/roles`, { method:'POST', body: JSON.stringify({role}) });
     toast(`Role '${role}' assigned to catalog '${catalog}'.`); closeCatalogModal();
   } catch(e) { toast(e.message, false); }
 }

@@ -363,7 +363,7 @@ class IamExtension(ExtensionProtocol):
         title="Admin",
         icon="fa-shield-halved",
         description="Administration and platform management.",
-        required_roles=[DefaultRole.SYSADMIN.value, DefaultRole.ADMIN.value],
+        required_roles=[DefaultRole.SYSADMIN.value, DefaultRole.ADMIN.value, DefaultRole.USER.value],
         priority=10,
     )
     async def provide_admin_hub(self, request: Request):
@@ -429,9 +429,10 @@ class IamExtension(ExtensionProtocol):
         priority=20,
     )
     async def provide_admin_panel(self, request: Request):
+        from dynastore._version import VERSION
         file_path = os.path.join(os.path.dirname(__file__), "..", "admin", "static", "admin_panel.html")
         with open(os.path.normpath(file_path), "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
+            return HTMLResponse(content=f.read().replace("{{VERSION}}", VERSION))
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):

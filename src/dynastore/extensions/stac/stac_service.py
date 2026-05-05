@@ -385,11 +385,12 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         return await self._serve_page_template("stac_browser.html")
 
     async def _serve_page_template(self, filename: str):
+        from dynastore._version import VERSION
         file_path = os.path.join(os.path.dirname(__file__), "static", filename)
         if not os.path.exists(file_path):
             return Response(content=f"Template {filename} not found", status_code=404)
         with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read(), media_type="text/html")
+            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     async def get_stac_catalog(
         self, catalog_id: str, request: Request, language: str = Depends(get_language)

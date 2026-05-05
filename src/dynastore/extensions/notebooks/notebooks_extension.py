@@ -149,11 +149,12 @@ class NotebooksExtension(ExtensionProtocol):
     )
     async def provide_notebooks_page(self, request: Optional[Request] = None, language: str = "en"):
         """Serve the notebooks browser HTML page."""
+        from dynastore._version import VERSION
         html_path = os.path.join(self._static_dir, "notebooks.html")
         if not os.path.exists(html_path):
             return Response(content="Notebooks page template not found", status_code=404)
         with open(html_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read(), media_type="text/html")
+            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     # ------------------------------------------------------------------
     # Platform notebook endpoints

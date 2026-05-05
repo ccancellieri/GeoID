@@ -136,9 +136,11 @@ def register_web_policies():
     pm.register_role(Role(name=DefaultRole.USER.value, policies=["web_admin_access"]))
 
     # Platform-tier dashboard endpoints (no `catalogs/` segment) — sysadmin only.
+    # Note: ogc-compliance is also covered by web_dashboard_ogc_compliance_access
+    # (which extends access to admin/user); both policies ALLOW, which is correct.
     web_dashboard_platform_policy = Policy(
         id="web_dashboard_platform_access",
-        description="Sysadmin-only access to platform-tier dashboard endpoints.",
+        description="Sysadmin-only access to platform-tier dashboard endpoints (stats, logs, events, tasks, ogc-compliance).",
         actions=["GET", "OPTIONS"],
         resources=[r"^/web/dashboard/(stats|logs|events|tasks|ogc-compliance)/?$"],
         effect="ALLOW",
@@ -148,6 +150,21 @@ def register_web_policies():
         name=DefaultRole.SYSADMIN.value,
         policies=["web_dashboard_platform_access"],
     ))
+
+    # OGC compliance check is read-only conformance info — accessible to any authenticated user.
+    web_dashboard_ogc_policy = Policy(
+        id="web_dashboard_ogc_compliance_access",
+        description="Read-only OGC conformance check accessible to authenticated users.",
+        actions=["GET", "OPTIONS"],
+        resources=[r"^/web/dashboard/ogc-compliance/?$"],
+        effect="ALLOW",
+    )
+    pm.register_policy(web_dashboard_ogc_policy)
+    for role_name in (DefaultRole.ADMIN.value, DefaultRole.USER.value):
+        pm.register_role(Role(
+            name=role_name,
+            policies=["web_dashboard_ogc_compliance_access"],
+        ))
 
     # Per-catalog dashboard endpoints — anyone with catalog membership for the
     # catalog_id present in the URL. The condition handler does the actual
@@ -874,6 +891,16 @@ async function demoAction(action) {
 </script>
 """
 
+    @staticmethod
+    def _serve_html_template(html_path: str) -> HTMLResponse:
+        """Read an HTML file and replace {{VERSION}} with the running package version."""
+        from dynastore._version import VERSION
+        with open(html_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(f.read().replace("{{VERSION}}", VERSION))
+
+    # Alias kept for the admin-panel callers already using this name.
+    _serve_admin_html = _serve_html_template
+
     @expose_web_page(
         page_id="exposure",
         title="Service Exposure",
@@ -889,8 +916,7 @@ async function demoAction(action) {
         html_path = os.path.join(static_dir, "exposure.html")
         if not os.path.exists(html_path):
             raise HTTPException(status_code=404, detail="Service exposure panel template not found.")
-        with open(html_path, "r") as f:
-            return HTMLResponse(f.read())
+        return self._serve_admin_html(html_path)
 
     @expose_web_page(
         page_id="configuration",
@@ -912,8 +938,7 @@ async function demoAction(action) {
         html_path = os.path.join(static_dir, "configuration.html")
         if not os.path.exists(html_path):
             raise HTTPException(status_code=404, detail="Configuration Hub template not found.")
-        with open(html_path, "r") as f:
-            return HTMLResponse(f.read())
+        return self._serve_admin_html(html_path)
 
     @expose_web_page(
         page_id="governance",
@@ -936,8 +961,7 @@ async function demoAction(action) {
         html_path = os.path.join(static_dir, "governance.html")
         if not os.path.exists(html_path):
             raise HTTPException(status_code=404, detail="Governance page template not found.")
-        with open(html_path, "r") as f:
-            return HTMLResponse(f.read())
+        return self._serve_admin_html(html_path)
 
     @expose_web_page(
         page_id="stac-authoring",
@@ -958,8 +982,7 @@ async function demoAction(action) {
         html_path = os.path.join(static_dir, "stac-authoring.html")
         if not os.path.exists(html_path):
             raise HTTPException(status_code=404, detail="STAC authoring template not found.")
-        with open(html_path, "r") as f:
-            return HTMLResponse(f.read())
+        return self._serve_admin_html(html_path)
 
     @expose_web_page(
         page_id="ingest",
@@ -982,8 +1005,7 @@ async function demoAction(action) {
         html_path = os.path.join(static_dir, "ingest.html")
         if not os.path.exists(html_path):
             raise HTTPException(status_code=404, detail="Ingest page template not found.")
-        with open(html_path, "r") as f:
-            return HTMLResponse(f.read())
+        return self._serve_admin_html(html_path)
 
     @expose_web_page(page_id="docs", title="Documentation", icon="fa-book", priority=-100)
     def docs_page(self, language: str = "en"):
@@ -1197,16 +1219,17 @@ async function demoAction(action) {
                     return await self.serve_file(index_path)
             return HTMLResponse("Not Found", status_code=404)
 
+        _dashboard_index = os.path.join(
+            os.path.dirname(__file__), "static", "dashboard", "index.html"
+        )
+
         @self.router.get("/dashboard/")
         async def read_dashboard_root():
             """Catalog-picker root. Anonymous-allowed: lists catalogs the
             caller can see (filtered downstream by IAM) and lets them pick
             a per-catalog dashboard."""
-            dashboard_index = os.path.join(
-                os.path.dirname(__file__), "static", "dashboard", "index.html"
-            )
-            if os.path.exists(dashboard_index):
-                return await self.serve_file(dashboard_index)
+            if os.path.exists(_dashboard_index):
+                return self._serve_html_template(_dashboard_index)
             return HTMLResponse("Dashboard Not Found", status_code=404)
 
         @self.router.get("/dashboard/catalogs/{catalog_id}/")
@@ -1215,11 +1238,8 @@ async function demoAction(action) {
             JS reads ``catalog_id`` from ``window.location.pathname`` and
             uses relative URLs (``stats``, ``logs``, ``events``) which
             resolve against this base path."""
-            dashboard_index = os.path.join(
-                os.path.dirname(__file__), "static", "dashboard", "index.html"
-            )
-            if os.path.exists(dashboard_index):
-                return await self.serve_file(dashboard_index)
+            if os.path.exists(_dashboard_index):
+                return self._serve_html_template(_dashboard_index)
             return HTMLResponse("Dashboard Not Found", status_code=404)
 
         @self.router.get("/dashboard/catalogs/{catalog_id}/processes/")
