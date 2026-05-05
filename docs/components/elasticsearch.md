@@ -85,38 +85,47 @@ When `private` changes, the `on_apply` callback fires automatically — no resta
 
 ---
 
-## GeoID Private Mode
+## Per-Collection Privacy (Cycle E)
 
-Private mode is designed for privacy-sensitive catalogs where item geometry and full STAC metadata must not be exposed to general users. When enabled:
+Privacy is a per-collection concept, governed by `CollectionPluginConfig.is_private` (Cycle E.2.a). Two specialized drivers — both opt-in only via explicit routing pin (`auto_register_for_routing = frozenset()`) — write privacy-sensitive data into per-tenant indexes:
 
-### What happens on enable (`private: true`)
+| Driver | Tier | Per-tenant index | Provided by |
+|---|---|---|---|
+| `items_elasticsearch_private_driver` | items | `{prefix}-{cat}-private-items` (geoid-only docs) | `modules/storage/drivers/elasticsearch_private/driver.py` |
+| `collection_elasticsearch_private_driver` | collection envelopes | `{prefix}-{cat}-collections-private` (full collection envelope) | `modules/storage/drivers/elasticsearch_private/collection_driver.py` (Cycle E.2.b) |
 
-1. **DENY policy applied** — A `Policy(effect="DENY")` blocks all `GET` requests on every protocol path for the catalog:
-   ```
-   /(catalog|stac|features|tiles|wfs|maps)/catalogs/{catalog_id}(/.*)?
-   ```
-   This prevents `all_users` from reading item details, geometries, tiles, or WFS features.
+### Cascade rule
 
-2. **Geoid-only ES index created** — `{prefix}-geoid-{catalog_id}` with `dynamic: false`. Documents contain only:
-   ```json
-   { "geoid": "abc123", "catalog_id": "my_catalog", "collection_id": "my_collection" }
-   ```
+`CollectionPluginConfig.is_private == True` REQUIRES that `ItemsRoutingConfig` pins `items_elasticsearch_private_driver` in some operation (typically `INDEX`). Reverse direction is allowed (items-private + collection-public is a real shape — public envelope, private item geometry). Items-public + collection-private is rejected: it would leak item geometry through `/search` despite the per-collection DENY.
 
-3. **Bulk reindex dispatched** — A `BulkCatalogReindexTask` (mode=`"private"`) is queued, streaming all items from AlloyDB into the geoid-only index in 500-document batches.
+The cascade is enforced by apply handlers on both `CollectionPluginConfig` and `ItemsRoutingConfig` (`modules/storage/routing_config.py:_enforce_collection_privacy_cascade` / `_enforce_items_routing_privacy_cascade`).
 
-4. **Complementary index cleaned** — Stale STAC items for this catalog are removed from the full items index via `delete_by_query`.
+### DENY policy
 
-5. **Per-item incremental indexing** — Subsequent item creates/updates dispatch `PrivateIndexTask` (one geoid doc per item). The STAC items index is never populated.
+Catalog-wide DENY (`private_deny_{catalog_id}`) is owned by the items-private driver and blocks all `GET` requests under `/(catalog|stac|features|tiles|wfs|maps)/catalogs/{cat}/...`. The cascade rule guarantees the items-private driver is in scope whenever any collection is private, so the catalog-wide DENY covers the collection-envelope index access paths too. The collection-private driver does NOT manage its own DENY policies.
 
-### What happens on disable (`private: false`)
+The items-private driver's `_restore_deny_policies` lifespan hook scans all catalogs at startup and re-registers DENY policies for any catalog with at least one `is_private=True` collection.
 
-1. DENY policy revoked.
-2. Bulk reindex dispatched in `"catalog"` mode — collections with `search_index=True` are re-indexed into the STAC items index.
-3. Stale private documents cleaned from the geoid index.
+### Catalog-level default
 
-### Startup restoration
+`CatalogPolicyConfig.default_collection_privacy: Literal["public","private"]` (Cycle E.1) is consulted at collection-create time as a seed for new collections' `is_private` flag. Pure data — flipping the default does not retroactively re-flag existing collections.
 
-`on_apply` is NOT called at service restart. The module's `lifespan` scans all catalogs, reads their ES config, and re-registers in-memory DENY policies for private ones. No reindex is dispatched (items are already indexed).
+### Operational pinning
+
+To opt a collection into per-tenant privacy:
+
+```
+PUT /configs/catalogs/{cat}/collections/{col}/plugins/items_routing_config
+{ "operations": { "INDEX": [{ "driver_id": "items_elasticsearch_private_driver", ... }] } }
+
+PUT /configs/catalogs/{cat}/collections/{col}/plugins/collection_routing_config
+{ "operations": { "INDEX": [{ "driver_id": "collection_elasticsearch_private_driver", ... }] } }
+
+PUT /configs/catalogs/{cat}/collections/{col}/plugins/collection_plugin_config
+{ "is_private": true }
+```
+
+Order matters: pin the routing first, then set `is_private`. The cascade validator rejects attempts that violate the rule with a clear error message guiding the operator to the missing pin.
 
 ---
 
@@ -238,10 +247,19 @@ models/protocols/
 
 modules/elasticsearch/
   __init__.py              # Exports ElasticsearchModule
-  module.py                # Event listeners, private mode, IndexerProtocol impl,
-                           #   CatalogPolicyConfig apply handler (Cycle E.1)
+  module.py                # Event listeners, IndexerProtocol impl
   config.py                # EnvVar-based ES connection config
-  mappings.py              # Index mappings + helpers
+  mappings.py              # Index mappings + helpers (incl.
+                           #   get_tenant_collections_private_index — Cycle E.2.b)
+  collection_es_driver.py  # Public CollectionStore driver (shared
+                           #   {prefix}-collections singleton)
+
+modules/storage/drivers/elasticsearch_private/
+  driver.py                # ItemsElasticsearchPrivateDriver — per-tenant
+                           #   geoid-only index + DENY policy management
+  collection_driver.py     # CollectionElasticsearchPrivateDriver — per-tenant
+                           #   collection envelope index (Cycle E.2.b)
+  mappings.py              # Tenant-feature mapping for items private index
 
 extensions/search/
   __init__.py              # SearchExtension entry point
