@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, FrozenSet, Iterable, List, Optional, Union
+from typing import Any, AsyncIterator, ClassVar, Dict, FrozenSet, Iterable, List, Optional, Union
 
 from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.protocols import (
@@ -49,6 +49,10 @@ class ItemsBigQueryDriver(TypedDriver[ItemsBigQueryDriverConfig]):
     do NOT raise, so this driver is safe to pin as ``on_failure=warn`` in
     a multi-driver WRITE fan-out (see role-based driver plan §Routing).
     """
+
+    # Explicit-pin only.  Operators who want BQ in items routing set
+    # the entry by hand (``source: "operator"``).
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
     priority: int = 50
     preferred_chunk_size: int = 500

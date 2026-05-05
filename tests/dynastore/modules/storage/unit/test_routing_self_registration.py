@@ -124,6 +124,7 @@ def test_indexer_marker_lands_in_INDEX_with_async_warn_defaults():
 
     class _CollectionES:
         is_collection_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     class _NotAnIndexer:
         pass
@@ -230,6 +231,7 @@ def test_end_to_end_marker_to_INDEX_entry_via_real_apply_handler():
 
     class _DummyCatalogIndexer:
         is_catalog_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
         # Minimal CatalogStore surface — enough for
         # _validate_routing_entries to accept it under operations[INDEX]
         # if it were referenced (it isn't pre-apply; the marker self-
@@ -274,6 +276,7 @@ def test_indexer_marker_skips_already_listed_driver():
 
     class _AssetES:
         is_asset_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     operator_entry = OperationDriverEntry(
         driver_id="_asset_es", on_failure=FailurePolicy.FATAL,
@@ -294,44 +297,54 @@ def test_indexer_marker_skips_already_listed_driver():
 # ---------------------------------------------------------------------------
 
 
-def test_searcher_helper_picks_up_drivers_with_search_capability():
-    """Any driver declaring a SEARCH-family EntityStoreCapability lands in
-    operations[SEARCH] (umbrella SEARCH or any of the three specialisations)."""
+def test_searcher_helper_picks_up_drivers_opting_into_search():
+    """Drivers declaring ``Operation.SEARCH`` in
+    ``auto_register_for_routing`` land in operations[SEARCH].  Drivers
+    that don't opt in stay out.
+
+    The previous cap-based gate (``EntityStoreCapability.SEARCH`` /
+    ``Capability.FULLTEXT`` / …) was retired alongside the migration to
+    the per-Operation auto-default set: capabilities are structural facts
+    only; per-request flavours (fulltext/aggregation/count) live in the
+    ``Hint`` catalogue.  Auto-augmentation gates purely on the Op-set.
+    """
+    from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.entity_store import (
-        CatalogStore,
-        EntityStoreCapability,
-    )
+    from dynastore.models.protocols.entity_store import CatalogStore
     from dynastore.modules.storage.routing_config import (
         _self_register_searchers_into,
     )
 
     class _ESCat:
-        capabilities = frozenset({EntityStoreCapability.SEARCH})
+        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
 
-    class _VectorBackend:
-        capabilities = frozenset({EntityStoreCapability.SEARCH_VECTOR})
+    class _IndexerOnly:
+        # Opts into INDEX but not SEARCH — should NOT land in SEARCH.
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
-    class _NotASearcher:
-        capabilities = frozenset({EntityStoreCapability.READ})
+    class _NotOptedIn:
+        # No declaration → defaults to frozenset() → not auto-augmented.
+        pass
 
     target_ops: dict = {}
-    fake_pool = [_ESCat(), _VectorBackend(), _NotASearcher()]
+    fake_pool = [_ESCat(), _IndexerOnly(), _NotOptedIn()]
 
-    # Bypass the runtime_checkable Protocol membership check — the test
-    # pool intentionally doesn't implement the full CatalogStore
-    # surface; this test pins the SEARCH-capability filter alone.
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: fake_pool):
         _self_register_searchers_into(target_ops, CatalogStore)
 
     ids = {e.driver_id for e in target_ops.get(Operation.SEARCH, [])}
-    assert ids == {"_es_cat", "_vector_backend"}
+    assert ids == {"_es_cat"}
 
 
-def test_searcher_helper_skips_drivers_without_search_capability():
-    """Driver with only READ/WRITE capabilities is not added to SEARCH."""
+def test_searcher_helper_skips_drivers_without_search_optin():
+    """Driver without ``Operation.SEARCH`` in its Op-set is not added
+    to SEARCH, regardless of which capabilities it declares.
+
+    Capabilities are structural facts; they do not gate auto-augmentation
+    under the new model.
+    """
     from unittest.mock import patch
 
     from dynastore.models.protocols.entity_store import (
@@ -343,8 +356,10 @@ def test_searcher_helper_skips_drivers_without_search_capability():
     )
 
     class _PgPrimary:
+        # Has lots of caps but no Op-set → no auto-default into SEARCH.
         capabilities = frozenset({
             EntityStoreCapability.READ, EntityStoreCapability.WRITE,
+            EntityStoreCapability.SEARCH,  # cap is no longer the gate
         })
 
     target_ops: dict = {}
@@ -356,18 +371,16 @@ def test_searcher_helper_skips_drivers_without_search_capability():
 
 def test_searcher_helper_idempotent():
     """Repeated calls don't add duplicates; operator-supplied entry survives."""
+    from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.entity_store import (
-        CatalogStore,
-        EntityStoreCapability,
-    )
+    from dynastore.models.protocols.entity_store import CatalogStore
     from dynastore.modules.storage.routing_config import (
         _self_register_searchers_into,
     )
 
     class _ESCat:
-        capabilities = frozenset({EntityStoreCapability.SEARCH_FULLTEXT})
+        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
 
     from dynastore.modules.storage.hints import Hint
     op_entry = OperationDriverEntry(driver_id="_es_cat", hints={Hint.METADATA})
@@ -397,7 +410,7 @@ def test_catalog_routing_validator_augments_INDEX_and_SEARCH():
 
     class _CatES:
         is_catalog_indexer: ClassVar[bool] = True
-        capabilities = frozenset({EntityStoreCapability.SEARCH})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX, Operation.SEARCH})
 
     instance = _CatES()
 
@@ -443,7 +456,7 @@ def test_collection_routing_validator_augments_INDEX_and_SEARCH():
 
     class _ColES:
         is_collection_indexer: ClassVar[bool] = True
-        capabilities = frozenset({EntityStoreCapability.SEARCH_FULLTEXT})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX, Operation.SEARCH})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ColES()]):
@@ -468,7 +481,7 @@ def test_items_routing_validator_augments_INDEX_and_SEARCH():
 
     class _ItemsES:
         is_item_indexer: ClassVar[bool] = True
-        capabilities = frozenset({Capability.FULLTEXT, Capability.READ})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX, Operation.SEARCH})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ItemsES()]):
@@ -484,33 +497,33 @@ def test_items_routing_validator_augments_INDEX_and_SEARCH():
            "items_postgresql_driver" in write_ids
 
 
-def test_items_routing_search_caps_filter():
-    """ItemsRoutingConfig SEARCH gate uses storage Capability (FULLTEXT,
-    SPATIAL_FILTER, ATTRIBUTE_FILTER) — NOT EntityStoreCapability.SEARCH.
-    A driver with only metadata SEARCH caps must NOT land in items-tier
-    ``operations[SEARCH]``."""
+def test_items_routing_search_optin_gate():
+    """ItemsRoutingConfig SEARCH gate is the per-Operation opt-in set.
+    The cap-based gate (storage ``Capability.{FULLTEXT, SPATIAL_FILTER,
+    ATTRIBUTE_FILTER}`` vs metadata ``EntityStoreCapability.SEARCH``)
+    was retired alongside PR #3a — capabilities are structural facts
+    only.  A driver lands in items SEARCH iff its class declares
+    ``Operation.SEARCH`` in ``auto_register_for_routing``.
+    """
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.entity_store import EntityStoreCapability
-    from dynastore.models.protocols.storage_driver import Capability
-
-    class _MetadataOnlySearcher:
-        # Has metadata SEARCH caps but NOT storage SEARCH caps.
+    class _OptedInSearcher:
         is_item_indexer: ClassVar[bool] = False
-        capabilities = frozenset({EntityStoreCapability.SEARCH})
+        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
 
-    class _StorageSpatialSearcher:
+    class _OptedOutSearcher:
+        # Capabilities are irrelevant under the new model — only the
+        # Op-set decides auto-augmentation.
         is_item_indexer: ClassVar[bool] = False
-        capabilities = frozenset({Capability.SPATIAL_FILTER})
 
     with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_MetadataOnlySearcher(), _StorageSpatialSearcher()]):
+               lambda proto: [_OptedInSearcher(), _OptedOutSearcher()]):
         cfg = ItemsRoutingConfig()
 
     top_search = {e.driver_id for e in cfg.operations.get(Operation.SEARCH, [])}
-    assert "_storage_spatial_searcher" in top_search
-    assert "_metadata_only_searcher" not in top_search
+    assert "_opted_in_searcher" in top_search
+    assert "_opted_out_searcher" not in top_search
 
 
 def test_asset_routing_validator_augments_INDEX_only():
@@ -523,7 +536,7 @@ def test_asset_routing_validator_augments_INDEX_only():
 
     class _AssetES:
         is_asset_indexer: ClassVar[bool] = True
-        capabilities = frozenset()  # no search caps anyway
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_AssetES()]):
@@ -587,6 +600,7 @@ def test_indexer_helper_marks_entries_as_auto():
 
     class _ColES:
         is_collection_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     target_ops: dict = {}
     with patch("dynastore.tools.discovery.get_protocols",
@@ -600,18 +614,16 @@ def test_indexer_helper_marks_entries_as_auto():
 def test_searcher_helper_marks_entries_as_auto():
     """Entries created by `_self_register_searchers_into` also carry
     `source="auto"`."""
+    from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.entity_store import (
-        CatalogStore,
-        EntityStoreCapability,
-    )
+    from dynastore.models.protocols.entity_store import CatalogStore
     from dynastore.modules.storage.routing_config import (
         _self_register_searchers_into,
     )
 
     class _ESCat:
-        capabilities = frozenset({EntityStoreCapability.SEARCH})
+        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
 
     target_ops: dict = {}
     with patch("dynastore.tools.discovery.get_protocols",
@@ -651,9 +663,11 @@ def test_operator_entry_preserved_alongside_auto_entry():
 
     class _AutoDriver:
         is_collection_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     class _OpDriver:
         is_collection_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     operator_entry = OperationDriverEntry(
         driver_id="_op_driver", on_failure=FailurePolicy.FATAL,

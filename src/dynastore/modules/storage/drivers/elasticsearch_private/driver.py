@@ -96,7 +96,7 @@ class ItemsElasticsearchPrivateDriver(
     # bypass the privacy contract.  ``ConfigApiService._build_routing_resolution``
     # uses ``is_collection_private`` to decide which ES variant is correct
     # for a given collection — that's the right gate, not auto-augmentation.
-    auto_register_for_routing: ClassVar[bool] = False
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
     priority: int = 51
     preferred_chunk_size: int = 500

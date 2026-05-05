@@ -63,7 +63,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, FrozenSet, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -136,6 +136,11 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
 
     Satisfies ``CollectionItemsStore``.
     """
+
+    # OTF analytical/file-export driver — explicit-pin only.  Operators
+    # who want Iceberg as a SEARCH/INDEX target set the routing config
+    # entry by hand (``source: "operator"``).
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
     priority: int = 20
     preferred_chunk_size: int = 1000

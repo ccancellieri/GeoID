@@ -49,6 +49,7 @@ from dynastore.modules.db_config.platform_config_service import (
     Immutable,
     PluginConfig,
 )
+from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.storage_location import StorageLocation
 from pydantic import Field
 
@@ -137,6 +138,10 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
     """
 
     is_catalog_indexer: ClassVar[bool] = True
+
+    # Catalog ES is the canonical async indexer + primary SEARCH backend
+    # for catalog metadata routing.  Auto-defaults into both Operations.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.INDEX})
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,

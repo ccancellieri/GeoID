@@ -27,7 +27,7 @@ to the existing PG-based service layer.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, FrozenSet, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -40,6 +40,7 @@ from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.protocols import ModuleProtocol
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
+from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,13 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
     PG-based item services, preserving all sidecar logic, query
     optimization, and streaming.
     """
+
+    # PG is the truth-source for items (WRITE primary in routing
+    # defaults) and the ``geometry_exact`` fallback for SEARCH.  WRITE +
+    # READ are pinned by explicit defaults in ``ItemsRoutingConfig``;
+    # auto-augment opts in only for SEARCH so PG appears in the SEARCH
+    # entry list as the precision-fallback backend.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH})
 
     priority: int = 10
     preferred_chunk_size: int = 0

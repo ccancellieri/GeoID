@@ -213,13 +213,12 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
     Satisfies ``CollectionItemsStore``.
     """
 
-    # Opt out of items-tier auto-default routing.  The driver declares
-    # SEARCH capabilities (FULLTEXT/SPATIAL_FILTER/ATTRIBUTE_FILTER) so
-    # operators CAN pin it explicitly for analytical reads, but it
-    # shouldn't be the default SEARCH backend for every collection — ES
-    # and PG handle that.  Operators who want DuckDB SEARCH set the
-    # routing config entry by hand (``source: "operator"``).
-    auto_register_for_routing: ClassVar[bool] = False
+    # Opt out of items-tier auto-default routing.  ``frozenset()`` =
+    # explicit-pin only.  Operators CAN pin DuckDB for analytical reads
+    # via ``hint=Hint.ANALYTICS`` (declared in ``supported_hints``);
+    # it just shouldn't be the default SEARCH backend for every
+    # collection.  ES and PG handle the canonical SEARCH path.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
     priority: int = 30
     preferred_chunk_size: int = 1000

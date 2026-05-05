@@ -81,6 +81,7 @@ from dynastore.models.protocols.typed_driver import (
     _PluginDriverConfig,
 )
 from dynastore.modules.db_config.platform_config_service import Immutable
+from dynastore.modules.storage.routing_config import Operation
 from dynastore.tools.cache import cached
 
 logger = logging.getLogger(__name__)
@@ -324,6 +325,10 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
     so the routing layer recognises this single entry as covering
     everything the two raw drivers cover today.
     """
+
+    # Collection metadata fallback for SEARCH (PG serves the
+    # query-fallback path when ES is unavailable / not registered).
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH})
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({
         EntityStoreCapability.READ,

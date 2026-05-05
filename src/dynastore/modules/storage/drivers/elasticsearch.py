@@ -70,6 +70,7 @@ from dynastore.modules.storage.driver_config import (
 )
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
+from dynastore.modules.storage.routing_config import Operation
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,10 @@ class ItemsElasticsearchDriver(
     # event listeners remain in place during Phase 2; Phase 2c removes them
     # once item_service.upsert calls the dispatcher directly.
     indexer_id: ClassVar[str] = "items_elasticsearch_driver"
+
+    # ES (public) is the canonical async indexer + primary SEARCH
+    # backend for items routing.  Auto-defaults into both Operations.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.INDEX})
 
     priority: int = 50
     preferred_chunk_size: int = 500
@@ -1451,6 +1456,10 @@ class AssetElasticsearchDriver(
     # ``IndexDispatcher``.  Asset ops route through the same dispatcher
     # via ``AssetRoutingConfig.operations[INDEX]``.
     indexer_id: ClassVar[str] = "asset_elasticsearch_driver"
+
+    # Asset ES is the canonical async indexer + primary SEARCH backend
+    # for asset metadata routing.  Auto-defaults into both Operations.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.INDEX})
 
     priority: int = 52
     capabilities: FrozenSet[str] = frozenset({

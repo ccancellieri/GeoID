@@ -39,6 +39,7 @@ from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.entity_store import EntityStoreCapability
+from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.storage_location import StorageLocation
 from dynastore.models.protocols.typed_driver import (
     TypedDriver,
@@ -128,6 +129,11 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
     """
 
     is_collection_indexer: ClassVar[bool] = True
+
+    # Collection ES is the canonical async indexer + primary SEARCH
+    # backend for collection metadata routing.  Auto-defaults into both
+    # Operations.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.INDEX})
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,

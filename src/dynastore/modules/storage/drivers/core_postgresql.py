@@ -74,6 +74,7 @@ from dynastore.modules.db_config.query_executor import (
     managed_transaction,
 )
 from dynastore.modules.storage.driver_config import DriverPluginConfig
+from dynastore.modules.storage.routing_config import Operation
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -438,6 +439,10 @@ class CollectionCorePostgresqlDriver(
 
     _table: ClassVar[str] = "collection_core"
     _columns: ClassVar[Tuple[str, ...]] = _COLLECTION_CORE_COLUMNS
+
+    # Collection metadata fallback for SEARCH (PG serves the
+    # query-fallback path when ES is unavailable / not registered).
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH})
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,

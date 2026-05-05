@@ -187,9 +187,6 @@ def derive_supported_operations(capabilities: FrozenSet[str]) -> FrozenSet[str]:
     mapping: Dict[str, Set[str]] = {
         Capability.WRITE: {Operation.WRITE, Operation.INDEX, Operation.BACKUP},
         Capability.READ: {Operation.READ},
-        Capability.FULLTEXT: {Operation.SEARCH},
-        Capability.ATTRIBUTE_FILTER: {Operation.SEARCH},
-        Capability.SPATIAL_FILTER: {Operation.SEARCH},
         Capability.EXPORT: {Operation.BACKUP},
     }
     ops: Set[str] = set()
@@ -197,23 +194,6 @@ def derive_supported_operations(capabilities: FrozenSet[str]) -> FrozenSet[str]:
         if cap in mapping:
             ops.update(mapping[cap])
     return frozenset(ops)
-
-
-def _items_search_caps() -> FrozenSet[str]:
-    """Storage-tier capability strings that qualify a driver for the
-    items-tier ``operations[SEARCH]`` operation.
-
-    Lazy: imports the storage ``Capability`` enum on first call so this
-    module stays importable when a stripped-down dependency set is
-    loaded (e.g. tests that don't pull the storage protocols).
-    """
-    from dynastore.models.protocols.storage_driver import Capability
-
-    return frozenset({
-        Capability.FULLTEXT,
-        Capability.SPATIAL_FILTER,
-        Capability.ATTRIBUTE_FILTER,
-    })
 
 
 # ---------------------------------------------------------------------------
@@ -411,10 +391,7 @@ class ItemsRoutingConfig(PluginConfig):
 
         try:
             _self_register_indexers_into(self.operations, ItemIndexer)
-            _self_register_searchers_into(
-                self.operations, CollectionItemsStore,
-                search_caps=_items_search_caps(),
-            )
+            _self_register_searchers_into(self.operations, CollectionItemsStore)
             _self_register_transformers_into(self.operations)
         except Exception as exc:
             logger.debug(
@@ -801,13 +778,13 @@ def _self_register_indexers_into(
 
     listed = {entry.driver_id for entry in target_ops.get(Operation.INDEX, [])}
     for driver in get_protocols(marker_proto):
-        # Drivers can opt out of auto-default routing by setting
-        # ``auto_register_for_routing = False`` on the class.  Used by
-        # drivers that are real but require explicit operator pinning
-        # (e.g. tenant-isolated DENY-policy variants), so they don't
-        # silently land in every collection's routing config.  Default
-        # True preserves the auto-discovery convention.
-        if not getattr(type(driver), "auto_register_for_routing", True):
+        # Single gate on the per-Operation auto-default set.  Drivers
+        # explicitly declare which Operations they auto-default into via
+        # ``auto_register_for_routing: ClassVar[FrozenSet[Operation]]``;
+        # ``Operation.INDEX`` membership opts the driver in here.
+        # Empty (default) = explicit-pin only.
+        opt_in: FrozenSet[str] = getattr(type(driver), "auto_register_for_routing", frozenset())
+        if Operation.INDEX not in opt_in:
             continue
         driver_id = _to_snake(type(driver).__name__)
         if driver_id in listed:
@@ -870,51 +847,34 @@ def _self_register_upload_into(
 def _self_register_searchers_into(
     target_ops: Dict[str, List["OperationDriverEntry"]],
     marker_proto: type,
-    *,
-    search_caps: Optional[FrozenSet[str]] = None,
 ) -> None:
-    """Auto-append every installed driver declaring a SEARCH-family
-    capability to ``target_ops[SEARCH]``.
+    """Auto-append every installed driver opting into SEARCH to
+    ``target_ops[SEARCH]``.
 
-    Tier-scoped via two parameters:
+    Single gate on the per-Operation auto-default set: a driver is
+    auto-augmented into ``operations[SEARCH]`` only if its class
+    declares ``Operation.SEARCH`` in
+    ``auto_register_for_routing: ClassVar[FrozenSet[Operation]]``.
+    Capability-based gating (``FULLTEXT`` / ``SPATIAL_FILTER`` / …)
+    has been retired; capabilities are now structural facts only,
+    while which read-flavours a driver serves is expressed through
+    ``supported_hints``.
 
-    - ``marker_proto`` — the structural Protocol to discover against
-      (e.g. ``CatalogStore`` for catalog routing,
-      ``CollectionStore`` for collection-tier metadata routing,
-      ``CollectionItemsStore`` for items-tier routing).
-    - ``search_caps`` — the set of capability strings that qualify a
-      driver as a SEARCH provider.  When ``None`` (default) the
-      metadata-tier set is used (``EntityStoreCapability.SEARCH``,
-      ``SEARCH_FULLTEXT``, ``SEARCH_VECTOR``, ``SEARCH_EXACT``).
-      Items-tier callers pass the storage ``Capability`` set
-      (``FULLTEXT``, ``SPATIAL_FILTER``, ``ATTRIBUTE_FILTER``) via the
-      module-level :data:`ITEMS_SEARCH_CAPS` constant.
+    Tier-scoped via ``marker_proto`` — the structural Protocol to
+    discover against (``CatalogStore`` for catalog routing,
+    ``CollectionStore`` for collection-tier metadata routing,
+    ``CollectionItemsStore`` for items-tier routing).
 
-    Idempotent — drivers already listed under ``operations[SEARCH]`` are
-    not re-appended (operator-supplied entries with custom hints survive).
+    Idempotent — drivers already listed under ``operations[SEARCH]``
+    are not re-appended (operator-supplied entries with custom hints
+    survive).
     """
     from dynastore.tools.discovery import get_protocols
 
-    if search_caps is None:
-        from dynastore.models.protocols.entity_store import EntityStoreCapability
-        search_caps = frozenset({
-            EntityStoreCapability.SEARCH,
-            EntityStoreCapability.SEARCH_FULLTEXT,
-            EntityStoreCapability.SEARCH_VECTOR,
-            EntityStoreCapability.SEARCH_EXACT,
-        })
     listed = {entry.driver_id for entry in target_ops.get(Operation.SEARCH, [])}
     for driver in get_protocols(marker_proto):
-        # Same opt-out semantics as ``_self_register_indexers_into``:
-        # ``auto_register_for_routing = False`` on the class excludes
-        # the driver from auto-default SEARCH routing.  Used by drivers
-        # that declare SEARCH capabilities for explicit-pin use cases
-        # (e.g. DuckDB analytical reads) but shouldn't be the default
-        # items SEARCH backend.
-        if not getattr(type(driver), "auto_register_for_routing", True):
-            continue
-        driver_caps = getattr(driver, "capabilities", frozenset())
-        if not (driver_caps & search_caps):
+        opt_in: FrozenSet[str] = getattr(type(driver), "auto_register_for_routing", frozenset())
+        if Operation.SEARCH not in opt_in:
             continue
         driver_id = _to_snake(type(driver).__name__)
         if driver_id in listed:
@@ -990,14 +950,13 @@ async def _on_apply_items_routing_config(
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionItemsStore)}
     _validate_routing_entries(config, driver_index, "Items routing config")
 
-    # Items-tier: auto-register ItemIndexer drivers + items-tier SEARCH-capable
-    # CollectionItemsStore drivers — apply-handler parity with the read-time
-    # model_validator so operator PUTs also pick up auto-augmentation.
+    # Items-tier: auto-register ItemIndexer drivers (gated on
+    # ``Operation.INDEX in driver.auto_register_for_routing``) +
+    # ``CollectionItemsStore`` drivers opting into ``Operation.SEARCH``
+    # — apply-handler parity with the read-time model_validator so
+    # operator PUTs also pick up auto-augmentation.
     _self_register_indexers_into(config.operations, ItemIndexer)
-    _self_register_searchers_into(
-        config.operations, CollectionItemsStore,
-        search_caps=_items_search_caps(),
-    )
+    _self_register_searchers_into(config.operations, CollectionItemsStore)
 
     # Invalidate router cache
     try:
