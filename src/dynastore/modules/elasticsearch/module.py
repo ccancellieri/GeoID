@@ -631,9 +631,5 @@ class ElasticsearchModule(ModuleProtocol):
     ) -> None:
         # Standard indices are created on-demand by the index tasks.
         # Per-tenant private indexes are managed by their own driver's
-<<<<<<< Updated upstream
         # ``ensure_indexer`` (CollectionItemsStore lifecycle).
-=======
-        # ``ensure_indexer`` (``CollectionItemsStore`` lifecycle).
->>>>>>> Stashed changes
         return None

@@ -256,12 +256,7 @@ class IndexerProtocol(Protocol):
 
         Args:
             entity_type: The index to ensure.
-<<<<<<< Updated upstream
             catalog_id: Optional catalog scope hint.
-=======
-            catalog_id: Required when ``entity_type="private"`` (index
-                        is per-catalog).
->>>>>>> Stashed changes
         """
         ...
 
