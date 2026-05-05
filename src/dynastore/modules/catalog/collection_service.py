@@ -581,6 +581,41 @@ class CollectionService:
                     ctx=DriverContext(db_resource=conn),
                 )
 
+            # 5c. Cycle E.2.c — seed the collection's privacy state
+            #     from ``CatalogPolicyConfig.default_collection_privacy``
+            #     when no explicit ``is_private`` was passed.  The
+            #     helper writes ``ItemsRoutingConfig`` (private driver
+            #     pinned) BEFORE ``CollectionPluginConfig(is_private=True)``
+            #     so the cascade validator on the second write finds
+            #     the private driver already in scope.  No-op when
+            #     the catalog default is ``"public"``.
+            explicit_is_private: Optional[bool] = None
+            if isinstance(collection_definition, dict):
+                _v = collection_definition.get("is_private")
+                if isinstance(_v, bool):
+                    explicit_is_private = _v
+            elif hasattr(collection_definition, "is_private"):
+                _v = getattr(collection_definition, "is_private")
+                if isinstance(_v, bool):
+                    explicit_is_private = _v
+            if explicit_is_private is None:
+                from dynastore.modules.catalog.catalog_config import (
+                    apply_catalog_default_privacy_seed,
+                )
+                _seed_configs = get_protocol(ConfigsProtocol)
+                try:
+                    await apply_catalog_default_privacy_seed(
+                        catalog_id,
+                        collection_model.id,
+                        configs=_seed_configs,
+                        db_resource=conn,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Could not apply default_collection_privacy seed for %s/%s: %s",
+                        catalog_id, collection_model.id, e,
+                    )
+
             # 6. (Lazy activation) Steps formerly responsible for
             #    `ensure_storage` + routing pin have moved to
             #    `_activate_collection`. A newly-created collection is

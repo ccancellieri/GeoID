@@ -26,7 +26,7 @@ from dynastore.modules.db_config.platform_config_service import (
     Immutable,
     PluginConfig,
 )
-from typing import ClassVar, List, Literal, Optional, Tuple
+from typing import Any, ClassVar, List, Literal, Optional, Tuple
 
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import GeometriesSidecarConfig
@@ -201,3 +201,105 @@ class CatalogPolicyConfig(PluginConfig):
             "field is authoritative."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Cycle E.2.c — collection-create seed flow
+# ---------------------------------------------------------------------------
+
+
+async def apply_catalog_default_privacy_seed(
+    catalog_id: str,
+    collection_id: str,
+    *,
+    configs: Any,
+    db_resource: Any = None,
+) -> bool:
+    """Seed a freshly-created collection's privacy state from the
+    catalog's ``CatalogPolicyConfig.default_collection_privacy``.
+
+    Returns ``True`` iff the seed was applied (catalog default is
+    ``"private"`` AND ConfigsProtocol is reachable).  No-ops when:
+
+    - The catalog has no ``CatalogPolicyConfig`` row yet (default is
+      ``"public"`` per the field default; nothing to seed);
+    - The catalog policy is ``"public"`` (matches the
+      ``CollectionPluginConfig.is_private`` default — no writes
+      needed);
+    - ``configs`` is ``None`` (early-fixture / partial-deployment path
+      — caller's apply handler eventually catches the cascade on
+      a later config write).
+
+    Cycle E.2.c slice 1: the wiring lives in
+    ``CollectionService.create_collection``.  Mid-lifecycle privacy
+    flips on existing collections still go through the cascade
+    validator (operator pins items routing first, then sets
+    ``is_private=True``); this helper covers ONLY the
+    create-time seed path.
+
+    Apply ordering matters: we write ``ItemsRoutingConfig`` BEFORE
+    ``CollectionPluginConfig`` so the cascade validator on the
+    second write finds the private driver already pinned.  The
+    inverse order would trigger an immediate cascade rejection on
+    ``CollectionPluginConfig`` apply (because items routing wouldn't
+    yet have the private driver).
+    """
+    if configs is None:
+        return False
+
+    from dynastore.models.driver_context import DriverContext
+    from dynastore.modules.storage.routing_config import (
+        FailurePolicy,
+        ItemsRoutingConfig,
+        Operation,
+        OperationDriverEntry,
+        WriteMode,
+    )
+
+    ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
+
+    try:
+        policy = await configs.get_config(
+            CatalogPolicyConfig, catalog_id=catalog_id, ctx=ctx,
+        )
+    except Exception:
+        return False
+    if not isinstance(policy, CatalogPolicyConfig):
+        return False
+    if policy.default_collection_privacy != "private":
+        return False
+
+    private_routing = ItemsRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_id="items_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+                OperationDriverEntry(
+                    driver_id="items_elasticsearch_private_driver",
+                    write_mode=WriteMode.ASYNC,
+                    on_failure=FailurePolicy.OUTBOX,
+                    source="auto",
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(driver_id="items_postgresql_driver"),
+            ],
+        },
+    )
+    await configs.set_config(
+        ItemsRoutingConfig,
+        private_routing,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+        ctx=ctx,
+    )
+    await configs.set_config(
+        CollectionPluginConfig,
+        CollectionPluginConfig(is_private=True),
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+        ctx=ctx,
+    )
+    return True
