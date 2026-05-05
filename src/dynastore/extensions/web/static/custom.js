@@ -402,7 +402,7 @@ async function loadDocContent(docId) {
 
 function handleHashChange() {
     const hash = window.location.hash;
-    
+
     if (hash.startsWith('#ext:')) {
         const pageId = hash.substring(5);
         openExtension(pageId);
@@ -416,14 +416,28 @@ function handleHashChange() {
     }
 
     if (!docsLoaded && hash.startsWith('#docs')) return;
-    
+
     if (hash.startsWith('#docs:')) {
         loadDocContent(hash.substring(6));
-    } else if (hash === '#docs' && docsManifest) {
+        return;
+    }
+    if (hash === '#docs' && docsManifest) {
         const firstCat = Object.keys(docsManifest)[0];
         if (firstCat && docsManifest[firstCat].length > 0) {
             loadDocContent(docsManifest[firstCat][0].id);
         }
+        return;
+    }
+
+    // Generic page route: any other `#<page-id>` is fetched as a fragment.
+    // Without this, browser-back / forward / a manual URL edit between page
+    // hashes (e.g. `#admin` -> `#geoid`) updated the hash but left the
+    // content area stuck on the previous page.  switchTab handles fetch
+    // failures (404 / 403) internally.
+    if (hash && hash !== '#' && hash !== '#home') {
+        switchTab(hash.substring(1));
+    } else if (!hash || hash === '#' || hash === '#home') {
+        switchTab('home');
     }
 }
 
@@ -492,12 +506,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadSidebar();
 
     window.addEventListener('hashchange', handleHashChange);
-    
+
+    // Resolve the initial tab from the URL hash.  Previously this routed only
+    // a hard-coded set (docs/dashboard/extensions) and silently dropped every
+    // other hash to `home`, so reloading a deep link like `#admin`, `#geoid`,
+    // or `#stac_browser` always landed on the landing page.  Generalised:
+    //   - `#ext:<id>`       -> openExtension(id)
+    //   - `#docs[:...]`     -> docs tab (preserve docs-specific behaviour)
+    //   - `#<page-id>`      -> switchTab('<page-id>') for any page id (admin,
+    //                          geoid, stac_browser, dashboard, notebooks, …)
+    //                          — switchTab handles fetch failures internally.
+    //   - empty / `#home`   -> switchTab('home')
     const hash = window.location.hash;
-    if (hash.startsWith('#docs')) { await switchTab('docs'); }
-    else if (hash === '#dashboard') await switchTab('dashboard');
-    else if (hash === '#extensions') await switchTab('extensions');
-    else await switchTab('home');
+    if (hash.startsWith('#ext:')) {
+        openExtension(hash.substring(5));
+    } else if (hash.startsWith('#docs')) {
+        await switchTab('docs');
+    } else if (hash && hash !== '#' && hash !== '#home') {
+        await switchTab(hash.substring(1));
+    } else {
+        await switchTab('home');
+    }
 
     // Language Selector Listeners
     document.querySelectorAll('.lang-btn').forEach(btn => {
