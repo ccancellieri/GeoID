@@ -21,6 +21,54 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Mapping from ``StacPluginConfig.auto_render_extensions`` short names
+# to URI substrings that match a provider's ``get_stac_extensions()``.
+# Used by :func:`filter_providers_by_short_names` to gate which
+# auto-renderers contribute at item-render time.
+_SHORT_NAME_URI_MARKERS = {
+    "proj":   ("/projection/",),
+    "raster": ("/raster/",),
+    "vector": ("/vector/", "vector:"),
+}
+
+
+def filter_providers_by_short_names(
+    providers: List["StacExtensionProtocol"],
+    allowed_short_names: List[str],
+) -> List["StacExtensionProtocol"]:
+    """Filter ``StacExtensionProtocol`` providers by collection-level
+    ``auto_render_extensions``.
+
+    A provider passes if at least one URI it advertises (via
+    ``get_stac_extensions()``) matches a short name in
+    ``allowed_short_names``.  Empty allowed list → no providers pass
+    (passthrough mode: only externally-supplied content surfaces).
+
+    Providers that don't match any known short name (e.g. a custom
+    extension plugin) are kept by default — this gate is strictly for
+    the proj / raster / vector auto-renderers documented today.
+    """
+    if not allowed_short_names:
+        return []
+    allowed_markers: Set[str] = set()
+    for short_name in allowed_short_names:
+        allowed_markers.update(_SHORT_NAME_URI_MARKERS.get(short_name, ()))
+
+    kept: List["StacExtensionProtocol"] = []
+    for p in providers:
+        uris = list(p.get_stac_extensions() or [])
+        # Keep if any URI matches an allowed marker, OR if no URIs
+        # match any *known* marker (custom / unknown extension — out of
+        # this gate's scope).
+        known_uris = [u for u in uris if any(any(m in u for m in markers) for markers in _SHORT_NAME_URI_MARKERS.values())]
+        if not known_uris:
+            kept.append(p)
+            continue
+        if any(any(m in u for m in allowed_markers) for u in uris):
+            kept.append(p)
+    return kept
+
+
 def normalize_i18n_field(value: Any, default_lang: str = "en") -> Dict[str, Any]:
     """
     Normalize a field to multi-language format.

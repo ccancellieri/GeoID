@@ -541,7 +541,11 @@ async def create_collection(
             for k, v in stac_config.cube_variables.items()
         }
 
-    if SUPPORTED_STAC_EXTENSIONS[1] in stac_extensions_to_add and storage_config:
+    if (
+        SUPPORTED_STAC_EXTENSIONS[1] in stac_extensions_to_add
+        and storage_config
+        and "proj" in stac_config.auto_render_extensions
+    ):
         collection.extra_fields["proj:epsg"] = storage_config.target_srid
         collection.extra_fields["proj:wkt2"] = None
 
@@ -992,8 +996,15 @@ async def create_item_from_feature(
         lang=lang,
     )
 
-    # 3. Get all STAC extension providers
-    providers = get_protocols(StacExtensionProtocol)
+    # 3. Get all STAC extension providers, filtered by the collection's
+    # ``auto_render_extensions`` flag.  Empty list = passthrough; only
+    # externally-supplied content from the stac_metadata sidecar flows
+    # through, no auto-generation runs.
+    from dynastore.extensions.stac.metadata_helpers import filter_providers_by_short_names
+    providers = filter_providers_by_short_names(
+        get_protocols(StacExtensionProtocol),
+        stac_config.auto_render_extensions,
+    )
 
     # 4. Merge external + managed metadata
     await merge_stac_metadata(item, external_metadata, providers, extension_context)

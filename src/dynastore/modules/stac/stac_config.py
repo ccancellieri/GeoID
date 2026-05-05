@@ -19,7 +19,7 @@
 # dynastore/modules/stac/stac_config.py
 
 from enum import Enum
-from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from dynastore.modules.db_config.platform_config_service import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
@@ -270,8 +270,36 @@ class StacPluginConfig(ExposableConfigMixin, PluginConfig):
     """
     _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "stac", None)
 
-    # Extension schemas
+    # Extension schemas — URIs advertised on the collection's top-level
+    # ``stac_extensions`` array.  Independent of ``auto_render_extensions``
+    # below: this list is *what we say we use*, the next list is *what we
+    # auto-generate at item-render time*.
     enabled_extensions: List[str] = Field(default_factory=list)
+
+    # Item-render gate.  Controls which auto-generators contribute content
+    # at render time (proj/raster/vector blocks from ``StacExtensionProtocol``
+    # providers, plus the collection-level ``proj:epsg``/``proj:wkt2``
+    # injection driven by ``storage_config.target_srid``).
+    #
+    # Default keeps current behavior — all three auto-renderers run.
+    # Empty list = passthrough mode: stored content (``external_extensions``
+    # / ``external_assets`` / ``extra_fields`` from the ``stac_metadata``
+    # sidecar) flows verbatim, no auto-generation; navigation / hierarchy
+    # links still get added.
+    auto_render_extensions: List[Literal["proj", "raster", "vector"]] = Field(
+        default_factory=lambda: ["proj", "raster", "vector"],
+        description=(
+            "Which extension auto-renderers run at item-render time.  Empty "
+            "list = passthrough mode: only externally-supplied content (from "
+            "the stac_metadata sidecar) is surfaced; HATEOAS navigation and "
+            "hierarchy links still get added.  Default enables all three."
+        ),
+        examples=[
+            ["proj", "raster", "vector"],
+            ["proj"],
+            [],
+        ],
+    )
     
     # Metadata summaries (Range Object, enum array, or JSON Schema dict)
     summaries: Dict[str, StacSummaryValue] = Field(default_factory=dict)
