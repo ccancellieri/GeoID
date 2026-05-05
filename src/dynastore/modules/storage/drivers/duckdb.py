@@ -227,13 +227,9 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
         Capability.READ,
         Capability.WRITE,
         Capability.STREAMING,
-        Capability.SPATIAL_FILTER,
-        Capability.SORT,
-        Capability.GROUP_BY,
         Capability.EXPORT,
         Capability.GEOSPATIAL,
         Capability.SOURCE_REFERENCE,
-        Capability.ATTRIBUTE_FILTER,
         Capability.EXTERNAL_ID_TRACKING,
         Capability.TEMPORAL_VALIDITY,
         Capability.PHYSICAL_ADDRESSING,
@@ -243,7 +239,10 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
         # Opt into app-level fallback via CollectionSchema.allow_app_level_enforcement.
     })
     preferred_for: FrozenSet[Hint] = frozenset({Hint.ANALYTICS})
-    supported_hints: FrozenSet[Hint] = frozenset({Hint.ANALYTICS})
+    supported_hints: FrozenSet[Hint] = frozenset({
+        Hint.ANALYTICS,
+        Hint.SPATIAL_FILTER, Hint.ATTRIBUTE_FILTER, Hint.SORT, Hint.GROUP_BY,
+    })
 
     def is_available(self) -> bool:
         return _duckdb_available()

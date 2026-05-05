@@ -58,12 +58,13 @@ class ItemsBigQueryDriver(TypedDriver[ItemsBigQueryDriverConfig]):
     preferred_chunk_size: int = 500
 
     capabilities: FrozenSet[str] = frozenset({
-        "READ", "WRITE", "STREAMING", "INTROSPECTION", "COUNT", "AGGREGATION",
+        "READ", "WRITE", "STREAMING", "INTROSPECTION",
     })
     preferred_for: FrozenSet[Hint] = frozenset({Hint.FEATURES})
     supported_hints: FrozenSet[Hint] = frozenset({
         Hint.FEATURES, Hint.BIGQUERY,
         Hint.JOIN,  # BQ can serve as either side of an OGC API - Joins request
+        Hint.COUNT, Hint.AGGREGATION,
     })
 
     def is_available(self) -> bool:

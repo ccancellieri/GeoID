@@ -21,10 +21,17 @@ class TestItemsPostgresqlDriverMeta:
     def test_capabilities(self):
         driver = ItemsPostgresqlDriver()
         assert Capability.STREAMING in driver.capabilities
-        assert Capability.SPATIAL_FILTER in driver.capabilities
         assert Capability.SOFT_DELETE in driver.capabilities
         assert Capability.EXPORT in driver.capabilities
         assert Capability.READ_ONLY not in driver.capabilities
+
+    def test_read_flavour_hints(self):
+        """Read-flavour capabilities moved to ``Hint`` in PR #3b."""
+        from dynastore.modules.storage.hints import Hint
+        driver = ItemsPostgresqlDriver()
+        assert Hint.SPATIAL_FILTER in driver.supported_hints
+        assert Hint.AGGREGATION in driver.supported_hints
+        assert Hint.GEOMETRY_EXACT in driver.supported_hints
 
     def test_is_available_with_items_protocol(self):
         with patch("dynastore.tools.discovery.get_protocol") as mock_gp:

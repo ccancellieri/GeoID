@@ -148,9 +148,6 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         Capability.READ,
         Capability.WRITE,
         Capability.STREAMING,
-        Capability.SPATIAL_FILTER,
-        Capability.SORT,
-        Capability.GROUP_BY,
         Capability.EXPORT,
         Capability.TIME_TRAVEL,
         Capability.VERSIONING,
@@ -158,9 +155,7 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         Capability.SCHEMA_EVOLUTION,
         Capability.SOFT_DELETE,
         Capability.GEOSPATIAL,
-        Capability.STATISTICS,
         Capability.ASSET_TRACKING,
-        Capability.ATTRIBUTE_FILTER,
         Capability.SOURCE_REFERENCE,
         Capability.EXTERNAL_ID_TRACKING,
         Capability.TEMPORAL_VALIDITY,
@@ -173,7 +168,11 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         # Opt into app-level fallback via IntrospectedSchema.allow_app_level_enforcement.
     })
     preferred_for: FrozenSet[Hint] = frozenset({Hint.ANALYTICS, Hint.FEATURES, Hint.WRITE})
-    supported_hints: FrozenSet[Hint] = frozenset({Hint.ANALYTICS, Hint.FEATURES, Hint.WRITE})
+    supported_hints: FrozenSet[Hint] = frozenset({
+        Hint.ANALYTICS, Hint.FEATURES, Hint.WRITE,
+        Hint.SPATIAL_FILTER, Hint.ATTRIBUTE_FILTER, Hint.SORT, Hint.GROUP_BY,
+        Hint.STATISTICS,
+    })
 
     # Thread-safe catalog cache: loc_key → catalog instance, protected by asyncio.Lock.
     _catalog_cache: Dict[str, Any] = {}

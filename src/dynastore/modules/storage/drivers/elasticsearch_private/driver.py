@@ -105,13 +105,12 @@ class ItemsElasticsearchPrivateDriver(
         Capability.WRITE,
         Capability.STREAMING,
         Capability.PHYSICAL_ADDRESSING,
-        Capability.COUNT,
-        Capability.STATISTICS,
-        Capability.AGGREGATION,
         Capability.INTROSPECTION,
     })
     preferred_for: FrozenSet[Hint] = frozenset()
-    supported_hints: FrozenSet[Hint] = frozenset()
+    supported_hints: FrozenSet[Hint] = frozenset({
+        Hint.AGGREGATION, Hint.COUNT, Hint.STATISTICS,
+    })
 
     def is_available(self) -> bool:
         # See ItemsElasticsearchDriver.is_available — the driver is

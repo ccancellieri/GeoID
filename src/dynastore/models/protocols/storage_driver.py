@@ -86,11 +86,15 @@ class Capability:
     STREAMING = "streaming"
     EXPORT = "export"
 
-    # --- Query ---
-    SPATIAL_FILTER = "spatial_filter"
-    FULLTEXT = "fulltext"
-    SORT = "sort"        # can sort results by arbitrary fields
-    GROUP_BY = "group_by"  # can group/aggregate results
+    # NB. Read-flavour members (``FULLTEXT``, ``SPATIAL_FILTER``,
+    # ``ATTRIBUTE_FILTER``, ``AGGREGATION``, ``COUNT``, ``STATISTICS``,
+    # ``SORT``, ``GROUP_BY``) were retired in PR #3b of the routing
+    # cleanup.  They were not structural facts about the driver — they
+    # were per-request flavours of READ/SEARCH that callers asked for,
+    # and they've moved to the canonical ``Hint`` catalogue
+    # (``modules/storage/hints.py``).  Drivers express which flavours
+    # they serve via ``supported_hints``; routing dispatches via
+    # ``get_driver(Operation.SEARCH, hint=Hint.AGGREGATION)``.
 
     # --- Data management ---
     SOFT_DELETE = "soft_delete"
@@ -101,12 +105,10 @@ class Capability:
 
     # --- Per-feature processing ---
     GEOSPATIAL = "geospatial"      # bbox, centroid, geometry validation/fix per row
-    STATISTICS = "statistics"      # area, volume, length, morphological indices per row
     SPATIAL_INDEX = "spatial_index"  # H3/S2 indexing per row
 
-    # --- Per-feature tracking & filtering ---
+    # --- Per-feature tracking ---
     ASSET_TRACKING = "asset_tracking"      # tracks asset_id per feature (source provenance)
-    ATTRIBUTE_FILTER = "attribute_filter"  # can filter by feature attributes
     SOURCE_REFERENCE = "source_reference"  # provides source reference per feature
 
     # --- Cross-driver composition ---
@@ -122,8 +124,6 @@ class Capability:
 
     # --- Analytics & introspection ---
     INTROSPECTION = "introspection"  # schema discovery (field names, types)
-    COUNT = "count"                  # efficient entity counting
-    AGGREGATION = "aggregation"      # aggregation queries (terms, stats, histogram)
 
     # --- Storage location & addressing ---
     PHYSICAL_ADDRESSING = "physical_addressing"
@@ -331,7 +331,8 @@ class CollectionItemsStore(Protocol):
     ) -> int:
         """Count entities matching the optional query request.
 
-        Requires ``Capability.COUNT``. Returns 0 if collection has no data.
+        Drivers self-declare COUNT support via ``Hint.COUNT`` in
+        ``supported_hints``.  Returns 0 if collection has no data.
         """
         ...
 
@@ -366,7 +367,8 @@ class CollectionItemsStore(Protocol):
     ) -> Optional[Dict[str, Any]]:
         """Compute spatial and temporal extents for a collection.
 
-        Requires ``Capability.STATISTICS``.
+        Drivers self-declare STATISTICS support via ``Hint.STATISTICS``
+        in ``supported_hints``.
 
         Returns::
 
@@ -391,7 +393,8 @@ class CollectionItemsStore(Protocol):
     ) -> Any:
         """Run an aggregation query on the collection.
 
-        Requires ``Capability.AGGREGATION``.
+        Drivers self-declare AGGREGATION support via ``Hint.AGGREGATION``
+        in ``supported_hints``.
 
         Common ``aggregation_type`` values:
           - ``"terms"``: unique values + counts for ``field``

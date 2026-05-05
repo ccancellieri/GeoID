@@ -25,8 +25,16 @@ class TestDuckDBDriverMeta:
         driver = ItemsDuckdbDriver()
         assert Capability.READ in driver.capabilities
         assert Capability.STREAMING in driver.capabilities
-        assert Capability.SPATIAL_FILTER in driver.capabilities
         assert Capability.EXPORT in driver.capabilities
+
+    def test_read_flavour_hints(self):
+        """Read-flavour capabilities moved to ``Hint`` in PR #3b."""
+        from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
+        from dynastore.modules.storage.hints import Hint
+        driver = ItemsDuckdbDriver()
+        assert Hint.SPATIAL_FILTER in driver.supported_hints
+        assert Hint.SORT in driver.supported_hints
+        assert Hint.GROUP_BY in driver.supported_hints
 
     def test_is_available_without_duckdb(self):
         from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver

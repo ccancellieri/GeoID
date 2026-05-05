@@ -305,23 +305,18 @@ class ItemsElasticsearchDriver(
         Capability.READ,
         Capability.WRITE,
         Capability.STREAMING,
-        Capability.SPATIAL_FILTER,
-        Capability.SORT,
-        Capability.FULLTEXT,
         Capability.SOFT_DELETE,
-        Capability.ATTRIBUTE_FILTER,
         Capability.EXTERNAL_ID_TRACKING,
         Capability.TEMPORAL_VALIDITY,
         Capability.PHYSICAL_ADDRESSING,
-        Capability.COUNT,
-        Capability.STATISTICS,
-        Capability.AGGREGATION,
         Capability.INTROSPECTION,
     })
     preferred_for: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.GEOMETRY_SIMPLIFIED})
     supported_hints: FrozenSet[Hint] = frozenset({
         Hint.SEARCH, Hint.FULLTEXT,
         Hint.GEOMETRY_SIMPLIFIED,  # PR #185 default routing: ES serves the fast simplified-geometry read path
+        Hint.SPATIAL_FILTER, Hint.ATTRIBUTE_FILTER, Hint.SORT,
+        Hint.AGGREGATION, Hint.COUNT, Hint.STATISTICS,
     })
 
     def is_available(self) -> bool:
@@ -1466,11 +1461,10 @@ class AssetElasticsearchDriver(
         Capability.READ,
         Capability.WRITE,
         Capability.STREAMING,
-        Capability.FULLTEXT,
         Capability.PHYSICAL_ADDRESSING,
     })
     preferred_for: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.ASSETS})
-    supported_hints: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.ASSETS})
+    supported_hints: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.ASSETS, Hint.FULLTEXT})
 
     def is_available(self) -> bool:
         return self._sfeos_available()

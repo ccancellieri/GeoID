@@ -40,7 +40,7 @@ async def recalculate_and_update_extents(
     """
     from dynastore.modules.storage.router import get_driver
     from dynastore.modules.storage.routing_config import Operation
-    from dynastore.models.protocols.storage_driver import Capability
+    from dynastore.modules.storage.hints import Hint
 
     catalogs = get_protocol(CatalogsProtocol)
     if not catalogs:
@@ -56,7 +56,13 @@ async def recalculate_and_update_extents(
             )
             return
 
-        if not (hasattr(driver, "capabilities") and Capability.AGGREGATION in driver.capabilities):
+        # Drivers self-declare aggregation/extents support via the Hint
+        # catalogue (post PR #3b — the read-flavour Capabilities moved to
+        # ``Hint``).  Falling back to ``True`` when neither is present
+        # treats the driver optimistically; ``compute_extents`` handles
+        # NotImplementedError downstream.
+        supported = getattr(driver, "supported_hints", None)
+        if supported is not None and Hint.AGGREGATION not in supported:
             logger.warning(
                 f"Driver for '{catalog_id}:{collection_id}' does not support compute_extents."
             )

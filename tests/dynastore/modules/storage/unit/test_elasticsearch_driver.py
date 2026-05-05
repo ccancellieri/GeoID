@@ -142,9 +142,17 @@ class TestItemsElasticsearchDriverMeta:
     def test_capabilities(self):
         driver = ItemsElasticsearchDriver()
         assert Capability.STREAMING in driver.capabilities
-        assert Capability.SPATIAL_FILTER in driver.capabilities
-        assert Capability.FULLTEXT in driver.capabilities
         assert Capability.SOFT_DELETE in driver.capabilities
+
+    def test_read_flavour_hints(self):
+        """Read-flavour capabilities moved from ``Capability`` to
+        ``Hint`` in PR #3b — the driver self-declares them via
+        ``supported_hints``."""
+        from dynastore.modules.storage.hints import Hint
+        driver = ItemsElasticsearchDriver()
+        assert Hint.FULLTEXT in driver.supported_hints
+        assert Hint.SPATIAL_FILTER in driver.supported_hints
+        assert Hint.AGGREGATION in driver.supported_hints
 
     @pytest.mark.asyncio
     async def test_export_entities_not_implemented(self):
@@ -165,7 +173,6 @@ class TestItemsElasticsearchPrivateDriverMeta:
     def test_capabilities(self):
         driver = ItemsElasticsearchPrivateDriver()
         assert Capability.STREAMING in driver.capabilities
-        assert Capability.FULLTEXT not in driver.capabilities
         assert Capability.SOFT_DELETE not in driver.capabilities
 
     @pytest.mark.asyncio

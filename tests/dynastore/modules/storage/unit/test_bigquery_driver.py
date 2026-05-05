@@ -9,13 +9,16 @@ class TestDriverMeta:
     def test_capabilities_set(self):
         """Phase 3 adds WRITE (reporter-mode, opt-in via reporter_mode config)."""
         from dynastore.modules.storage.drivers.bigquery import ItemsBigQueryDriver
+        from dynastore.modules.storage.hints import Hint
         d = ItemsBigQueryDriver()
         caps = d.capabilities
         assert "READ" in caps
         assert "STREAMING" in caps
         assert "INTROSPECTION" in caps
-        assert "COUNT" in caps
-        assert "AGGREGATION" in caps
+        # PR #3b: COUNT and AGGREGATION moved from ``Capability`` to
+        # ``Hint`` — drivers self-declare them via ``supported_hints``.
+        assert Hint.COUNT in d.supported_hints
+        assert Hint.AGGREGATION in d.supported_hints
         # Phase 3: WRITE capability is declared at the class level so the
         # driver can participate in routing-config WRITE fan-outs.  Actual
         # write behaviour is gated by reporter_mode on the per-collection

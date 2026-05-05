@@ -67,19 +67,12 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         Capability.READ,
         Capability.WRITE,
         Capability.STREAMING,
-        Capability.SPATIAL_FILTER,
-        Capability.SORT,
-        Capability.GROUP_BY,
         Capability.SOFT_DELETE,
         Capability.EXPORT,
         Capability.GEOSPATIAL,
-        Capability.STATISTICS,
         Capability.SPATIAL_INDEX,
         Capability.ASSET_TRACKING,
-        Capability.ATTRIBUTE_FILTER,
         Capability.INTROSPECTION,
-        Capability.COUNT,
-        Capability.AGGREGATION,
         Capability.REQUIRED_ENFORCEMENT,
         Capability.UNIQUE_ENFORCEMENT,
         Capability.PHYSICAL_ADDRESSING,
@@ -92,6 +85,8 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         Hint.FEATURES, Hint.WRITE, Hint.METADATA,
         Hint.JOIN,  # primary side of OGC API - Joins (extensions/joins/joins_service.py)
         Hint.GEOMETRY_EXACT,  # PR #185 default routing: PG returns full-precision geometries
+        Hint.SPATIAL_FILTER, Hint.ATTRIBUTE_FILTER, Hint.SORT, Hint.GROUP_BY,
+        Hint.AGGREGATION, Hint.COUNT, Hint.STATISTICS,
     })
 
     def is_available(self) -> bool:

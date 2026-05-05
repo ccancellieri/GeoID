@@ -182,7 +182,6 @@ class TestIcebergDriverMeta:
     def test_capabilities(self):
         caps = ItemsIcebergDriver().capabilities
         assert Capability.STREAMING in caps
-        assert Capability.SPATIAL_FILTER in caps
         assert Capability.EXPORT in caps
         assert Capability.TIME_TRAVEL in caps
         assert Capability.VERSIONING in caps
@@ -190,6 +189,14 @@ class TestIcebergDriverMeta:
         assert Capability.SCHEMA_EVOLUTION in caps
         assert Capability.SOFT_DELETE in caps
         assert Capability.READ_ONLY not in caps
+
+    def test_read_flavour_hints(self):
+        """Read-flavour capabilities moved to ``Hint`` in PR #3b."""
+        from dynastore.modules.storage.hints import Hint
+        hints = ItemsIcebergDriver().supported_hints
+        assert Hint.SPATIAL_FILTER in hints
+        assert Hint.STATISTICS in hints
+        assert Hint.SORT in hints
 
     def test_is_available_true(self):
         assert ItemsIcebergDriver().is_available() is True
