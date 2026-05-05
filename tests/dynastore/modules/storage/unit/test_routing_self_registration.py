@@ -108,10 +108,12 @@ def test_self_registration_skips_zero_drivers():
 # ---------------------------------------------------------------------------
 
 
-def test_indexer_marker_lands_in_INDEX_with_async_warn_defaults():
+def test_indexer_marker_lands_in_INDEX_with_async_outbox_defaults():
     """A driver opting in to a tier indexer marker auto-registers under
-    operations[INDEX] with write_mode=async, on_failure=warn — sourced
+    operations[INDEX] with write_mode=async, on_failure=outbox — sourced
     from the per-tier marker, not from generic capability discovery.
+    OUTBOX (not WARN) is the default so transient indexer failures
+    enqueue a durable retry row instead of dropping silently.
     """
     from typing import ClassVar
     from unittest.mock import patch
@@ -141,7 +143,7 @@ def test_indexer_marker_lands_in_INDEX_with_async_warn_defaults():
     entries = target_ops.get(Operation.INDEX, [])
     assert len(entries) == 1
     assert entries[0].driver_id == "_collection_es"
-    assert entries[0].on_failure == FailurePolicy.WARN
+    assert entries[0].on_failure == FailurePolicy.OUTBOX
     assert entries[0].write_mode == WriteMode.ASYNC
 
 
@@ -214,10 +216,11 @@ def test_end_to_end_marker_to_INDEX_entry_via_real_apply_handler():
     """End-to-end: register a real driver opting in to ``CatalogIndexer``,
     invoke ``_on_apply_catalog_routing_config`` against a fresh
     ``CatalogRoutingConfig``, assert the driver lands in
-    ``operations[INDEX]`` with the marker's defaults (async + warn).
+    ``operations[INDEX]`` with the marker's defaults (async + outbox).
 
-    Validates the full chain shipped in d1aa321 + dbe505f + 98d0801:
-    marker discovery → helper invocation → entry with correct policy.
+    Validates the full chain shipped in d1aa321 + dbe505f + 98d0801
+    (and the WARN→OUTBOX flip): marker discovery → helper invocation →
+    entry with correct durable-retry policy.
     """
     import asyncio
     from typing import ClassVar
@@ -252,7 +255,7 @@ def test_end_to_end_marker_to_INDEX_entry_via_real_apply_handler():
         index_entries = cfg.operations.get(Operation.INDEX, [])
         assert any(
             e.driver_id == "_dummy_catalog_indexer"
-            and e.on_failure == FailurePolicy.WARN
+            and e.on_failure == FailurePolicy.OUTBOX
             and e.write_mode == WriteMode.ASYNC
             for e in index_entries
         ), f"_DummyCatalogIndexer not auto-registered: {index_entries!r}"

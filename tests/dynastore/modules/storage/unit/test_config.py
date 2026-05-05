@@ -293,15 +293,26 @@ class TestCollectionMetadataRouting:
     def test_es_primary_in_read_default_with_geometry_hints(self):
         """Default routing puts ES (public) at READ position 0 with the
         ``geometry_simplified`` hint; PG follows with ``geometry_exact``.
-        WRITE is PG-only — ES indexing is async via the dispatcher feeding
-        ``operations[INDEX]`` (auto-augmented with ES); see
-        ``feedback_es_indexing_per_item_async_not_bulk.md``.
+
+        WRITE fans out to PG (sync, fatal — authoritative) and ES
+        (async, outbox — durable propagation): the dispatcher's sync
+        phase commits the PG write, in the same TX it enqueues an
+        outbox row for the ES sink, and a background drain task pumps
+        the row through with retry.  Replaces the legacy per-item
+        listener pattern (``feedback_es_indexing_per_item_async_not_bulk.md``)
+        which lacked durability under restart.
         """
         cfg = ItemsRoutingConfig()
         write = cfg.operations[Operation.WRITE]
         read = cfg.operations[Operation.READ]
-        assert [e.driver_id for e in write] == ["items_postgresql_driver"]
-        assert [e.on_failure for e in write] == [FailurePolicy.FATAL]
+        from dynastore.modules.storage.routing_config import WriteMode
+        assert [e.driver_id for e in write] == [
+            "items_postgresql_driver", "items_elasticsearch_driver",
+        ]
+        assert write[0].on_failure == FailurePolicy.FATAL
+        assert write[0].write_mode == WriteMode.SYNC
+        assert write[1].on_failure == FailurePolicy.OUTBOX
+        assert write[1].write_mode == WriteMode.ASYNC
         assert [e.driver_id for e in read] == [
             "items_elasticsearch_driver", "items_postgresql_driver",
         ]

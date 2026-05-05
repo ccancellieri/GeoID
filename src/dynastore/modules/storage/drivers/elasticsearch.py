@@ -328,7 +328,10 @@ class ItemsElasticsearchDriver(
         # methods raise a RuntimeError at call time if SFEOS is missing,
         # which is the right granularity to fail at — not a top-level
         # discovery skip that would also hide the read path.
-        from dynastore.modules.elasticsearch.client import get_client
+        try:
+            from dynastore.modules.elasticsearch.client import get_client
+        except (ImportError, ModuleNotFoundError):
+            return False
         return get_client() is not None
 
     @asynccontextmanager

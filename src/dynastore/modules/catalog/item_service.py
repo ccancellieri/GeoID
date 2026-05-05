@@ -887,6 +887,202 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             )
 
     # ------------------------------------------------------------------
+    # Atomic bulk upsert — Phase 9 outbox-aware path
+    # ------------------------------------------------------------------
+
+    async def upsert_bulk(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        items: List[Dict[str, Any]],
+        *,
+        db_resource: Optional[DbResource] = None,
+    ) -> List[Dict[str, Any]]:
+        """Atomic bulk upsert with same-item coalescing + outbox enqueue.
+
+        Opens ONE wrapping TX and performs three actions inside it:
+
+        1. **Coalesce** input items by ``id`` (latest wins). Three ops on
+           the same id collapse to a single PG row + a single outbox row,
+           halving outbox volume on hot-update collections without losing
+           fidelity (a consumer applying the original ops in order would
+           converge on the same final state).
+        2. **Run FATAL routing entries inline** — every entry under
+           ``ItemsRoutingConfig.operations[WRITE]`` with
+           ``on_failure=FATAL`` and ``write_mode=SYNC`` writes through
+           ``CollectionItemsStore.write_entities`` on the wrapping conn.
+           Any driver failure raises out of the TX, rolling everything
+           back.
+        3. **Enqueue outbox rows for ASYNC OUTBOX entries** — every entry
+           under ``operations[INDEX]`` with ``write_mode=ASYNC`` and
+           ``on_failure=OUTBOX`` gets one outbox row per coalesced item,
+           via ``OutboxStore.enqueue_bulk(conn, ...)`` on the SAME conn.
+           A failed enqueue rolls back the PG write — the central
+           guarantee that closes the PG/secondary-index drift hole.
+
+        Bypasses :class:`IndexDispatcher` for the OUTBOX-enqueue case
+        (we already have the routing in hand and want to share the conn);
+        the dispatcher's missing-indexer path remains the entry point for
+        per-call ops without explicit routing knowledge. ``WARN`` /
+        ``IGNORE`` INDEX entries are not enqueued here — they're tolerant
+        by design and are still handled by the post-commit dispatcher
+        path on the legacy :meth:`upsert` flow.
+
+        Test injection seams (set on the instance, not the constructor):
+        ``_test_routing_resolver``, ``_test_driver_registry``,
+        ``_test_outbox_store``, ``_test_managed_transaction``. When None,
+        the method resolves through the production helpers.
+        """
+        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.modules.storage.driver_instance_id import (
+            compute_driver_instance_id,
+        )
+        from dynastore.modules.storage.routing_config import (
+            FailurePolicy, Operation, WriteMode,
+        )
+        from dynastore.tools.identifiers import generate_uuidv7
+
+        if not items:
+            return []
+
+        # ── Coalesce same-item ops (latest wins) ──────────────────────
+        coalesced: Dict[str, Dict[str, Any]] = {}
+        no_id: List[Dict[str, Any]] = []
+        for it in items:
+            iid = it.get("id") if isinstance(it, dict) else None
+            if iid is None:
+                no_id.append(it)
+            else:
+                coalesced[str(iid)] = it
+        deduped: List[Dict[str, Any]] = list(coalesced.values()) + no_id
+
+        # ── Resolve routing (test seam first, prod helper fallback) ───
+        routing_resolver = getattr(self, "_test_routing_resolver", None)
+        if routing_resolver is not None:
+            routing = await routing_resolver(catalog_id, collection_id)
+        else:
+            from dynastore.models.protocols import ConfigsProtocol
+            from dynastore.modules.storage.routing_config import (
+                ItemsRoutingConfig,
+            )
+            configs = get_protocol(ConfigsProtocol)
+            assert configs is not None, "ConfigsProtocol not registered"
+            routing = await configs.get_config(
+                ItemsRoutingConfig,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+
+        ops_map = getattr(routing, "operations", {}) or {}
+        write_entries = list(ops_map.get(Operation.WRITE, []))
+        index_entries = list(ops_map.get(Operation.INDEX, []))
+
+        fatal_entries = [
+            e for e in write_entries
+            if e.on_failure == FailurePolicy.FATAL
+            and e.write_mode == WriteMode.SYNC
+        ]
+        async_outbox_entries = [
+            e for e in index_entries
+            if e.write_mode == WriteMode.ASYNC
+            and e.on_failure == FailurePolicy.OUTBOX
+        ]
+
+        # ── Resolve driver registry (test seam first) ─────────────────
+        registry = getattr(self, "_test_driver_registry", None)
+
+        async def _resolve_driver(driver_id: str):
+            if registry is not None:
+                return await registry(driver_id)
+            # Production: look up CollectionItemsStore impls by snake_case
+            # driver_id from the central DriverRegistry — the same store
+            # the routing resolver pins WRITE entries against.
+            from dynastore.modules.storage.driver_registry import (
+                DriverRegistry,
+            )
+            return DriverRegistry.get_collection(driver_id)
+
+        # ── Resolve outbox (test seam first) ──────────────────────────
+        outbox = getattr(self, "_test_outbox_store", None)
+        if outbox is None and async_outbox_entries:
+            from dynastore.modules.storage.index_dispatcher import (
+                get_index_dispatcher,
+            )
+            outbox = get_index_dispatcher()._outbox
+
+        # ── Resolve TX manager (test seam first) ──────────────────────
+        tx_manager = getattr(
+            self, "_test_managed_transaction", managed_transaction,
+        )
+        engine = db_resource or self.engine
+        if engine is None:
+            raise RuntimeError(
+                "upsert_bulk requires a DbResource (constructor engine or "
+                "explicit db_resource kwarg)."
+            )
+
+        # ── Wrapping TX: PG writes + outbox enqueue commit together ──
+        async with tx_manager(engine) as conn:
+            # FATAL entries: bulk-write inline through each driver.
+            for entry in fatal_entries:
+                driver = await _resolve_driver(entry.driver_id)
+                if driver is None:
+                    from dynastore.modules.db_config.exceptions import (
+                        ConfigResolutionError,
+                    )
+                    raise ConfigResolutionError(
+                        (
+                            f"FATAL routing entry '{entry.driver_id}' has no "
+                            f"registered driver — upsert_bulk cannot proceed."
+                        ),
+                        missing_key=entry.driver_id,
+                        required_fields=[],
+                        scope_tried=["driver_registry"],
+                        hint=(
+                            "Either register the driver in the SCOPE or "
+                            "downgrade the routing entry to WARN/OUTBOX."
+                        ),
+                    )
+                await driver.write_entities(
+                    catalog_id, collection_id, deduped,
+                    db_resource=conn,
+                )
+
+            # ASYNC OUTBOX entries: build OutboxRecords + enqueue on the
+            # SAME conn. Failure here rolls back the PG write above — the
+            # atomicity guarantee that closes the drift hole.
+            if async_outbox_entries:
+                if outbox is None:
+                    raise RuntimeError(
+                        "upsert_bulk has ASYNC OUTBOX routing entries but "
+                        "no OutboxStore is wired."
+                    )
+                records: List[OutboxRecord] = []
+                for entry in async_outbox_entries:
+                    inst = compute_driver_instance_id(
+                        entry.driver_id, catalog_id, collection_id,
+                    )
+                    for it in deduped:
+                        item_id = it.get("id") if isinstance(it, dict) else None
+                        item_id_str = str(item_id) if item_id is not None else None
+                        records.append(OutboxRecord(
+                            op_id=generate_uuidv7(),
+                            driver_id=entry.driver_id,
+                            driver_instance_id=inst,
+                            collection_id=collection_id,
+                            op="upsert",
+                            item_id=item_id_str,
+                            payload=it if isinstance(it, dict) else dict(it),
+                            idempotency_key=item_id_str or str(generate_uuidv7()),
+                        ))
+                if records:
+                    await outbox.enqueue_bulk(
+                        conn, catalog_id=catalog_id, rows=records,
+                    )
+
+        return deduped
+
+    # ------------------------------------------------------------------
     # Multi-driver write fan-out
     # ------------------------------------------------------------------
 

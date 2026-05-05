@@ -409,13 +409,14 @@ async def test_outbox_dedup_key_is_stable_across_calls():
 # ---------------------------------------------------------------------------
 
 
-def test_get_index_dispatcher_returns_singleton():
+@pytest.mark.asyncio
+async def test_get_index_dispatcher_returns_singleton():
     """Repeated calls return the same instance; reset clears the cache."""
-    reset_index_dispatcher()
+    await reset_index_dispatcher()
     a = get_index_dispatcher()
     b = get_index_dispatcher()
     assert a is b
-    reset_index_dispatcher()
+    await reset_index_dispatcher()
     c = get_index_dispatcher()
     assert c is not a
 
@@ -426,7 +427,7 @@ async def test_default_dispatcher_describe_with_no_routing_returns_empty_indexer
     resolver yields an empty CollectionRoutingConfig — describe returns
     an empty indexer list rather than blowing up.
     """
-    reset_index_dispatcher()
+    await reset_index_dispatcher()
     d = get_index_dispatcher()
     info = await d.describe(IndexContext(catalog="cat", collection="col"))
     assert info["indexers"] == [] or all(

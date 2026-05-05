@@ -56,12 +56,18 @@ def _get_protocols_cached(protocol: type) -> List[Any]:
 
     def _accept(obj: Any) -> bool:
         obj_id = id(obj)
-        if obj_id in seen:
+        if obj_id in seen or not isinstance(obj, protocol):
             return False
-        if not isinstance(obj, protocol):
-            return False
-        if hasattr(obj, "is_available") and not inspect.iscoroutinefunction(obj.is_available) and not obj.is_available():
-            return False
+        if hasattr(obj, "is_available") and not inspect.iscoroutinefunction(obj.is_available):
+            try:
+                if not obj.is_available():
+                    return False
+            except Exception as exc:
+                logger.warning(
+                    "Driver %s.is_available() raised %s; treating as unavailable",
+                    type(obj).__name__, exc,
+                )
+                return False
         seen.add(obj_id)
         return True
 

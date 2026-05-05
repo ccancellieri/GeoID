@@ -54,10 +54,11 @@ Phases
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Union, cast
 
 from dynastore.models.protocols.indexer import (
     BulkResult,
@@ -65,12 +66,22 @@ from dynastore.models.protocols.indexer import (
     IndexContext,
     IndexOp,
 )
+from dynastore.models.protocols.indexing import IndexableOp, OutboxStore
 from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     Operation,
     OperationDriverEntry,
     WriteMode,
 )
+
+
+# Public surface of the dispatcher accepts either the legacy
+# ``IndexOp`` (Pydantic, in-process indexers still consume this shape)
+# or the new ``IndexableOp`` (frozen dataclass, durable contract for
+# outbox + bulk reindex).  Internals branch on the runtime type for the
+# few code paths that need the richer ``IndexableOp`` fields
+# (``op_id`` / ``driver_instance_id`` / ``idempotency_key``).
+DispatchableOp = Union[IndexOp, IndexableOp]
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +97,21 @@ class IndexerFatal(Exception):
     rolls back, taking the upstream data write with it.
     """
 
-    def __init__(self, indexer_id: str, op: IndexOp, original: BaseException) -> None:
+    def __init__(
+        self,
+        indexer_id: str,
+        op: "DispatchableOp",
+        original: BaseException,
+    ) -> None:
+        # Format depending on which op shape was passed — both fan_out
+        # callers (legacy IndexOp and new IndexableOp) use this same
+        # exception type.
+        if isinstance(op, IndexableOp):
+            descriptor = f"{op.op}/{op.collection_id}/{op.item_id}"
+        else:
+            descriptor = f"{op.op_type}/{op.entity_type}/{op.entity_id}"
         super().__init__(
-            f"Fatal indexer failure: '{indexer_id}' on "
-            f"{op.op_type}/{op.entity_type}/{op.entity_id}: {original}"
+            f"Fatal indexer failure: '{indexer_id}' on {descriptor}: {original}"
         )
         self.indexer_id = indexer_id
         self.op = op
@@ -279,7 +301,153 @@ class TaskTableOutboxWriter:
 # ---------------------------------------------------------------------------
 
 
-_DEFAULT_DISPATCHER: Optional[IndexDispatcher] = None
+_DEFAULT_DISPATCHER: Optional["IndexDispatcher"] = None
+
+# Process-wide lazy asyncpg pool for the bulk OutboxStore. Created on
+# first dispatch that needs it; reused across calls. Sized small by
+# default — the pool is only used by the dispatcher's missing-indexer
+# OUTBOX path, so production traffic is bounded by the dispatch rate
+# rather than the request rate.
+_OUTBOX_POOL: Any = None
+_OUTBOX_POOL_LOCK = asyncio.Lock()
+
+
+async def _get_outbox_pool() -> Any:
+    """Return (lazily creating) the process-wide asyncpg pool used by
+    :class:`PgOutboxStore`.
+
+    Acquires the DSN from :class:`DBConfig` (the same env-driven source
+    SQLAlchemy uses) and strips the ``+asyncpg`` dialect suffix so the
+    libpq URL is acceptable to ``asyncpg.create_pool``.
+    """
+    global _OUTBOX_POOL
+    if _OUTBOX_POOL is not None:
+        return _OUTBOX_POOL
+    async with _OUTBOX_POOL_LOCK:
+        if _OUTBOX_POOL is not None:
+            return _OUTBOX_POOL
+        import asyncpg  # local import: keep module import-light
+
+        from dynastore.modules.db_config.db_config import DBConfig
+
+        dsn = DBConfig.database_url.replace("postgresql+asyncpg://", "postgresql://")
+        _OUTBOX_POOL = await asyncpg.create_pool(
+            dsn=dsn, min_size=1, max_size=10,
+        )
+        return _OUTBOX_POOL
+
+
+async def _close_outbox_pool() -> None:
+    """Test/shutdown hook — closes the lazy outbox pool if it was opened.
+
+    Production processes typically rely on Cloud Run reaping the worker
+    rather than explicit teardown, but tests that exercise the
+    production-mode wiring need to release pool sockets cleanly.
+    """
+    global _OUTBOX_POOL
+    if _OUTBOX_POOL is None:
+        return
+    pool = _OUTBOX_POOL
+    _OUTBOX_POOL = None
+    try:
+        await pool.close()
+    except Exception:
+        # Best-effort shutdown; don't mask the original test failure.
+        logger.exception("IndexDispatcher: outbox pool close failed")
+
+
+class _LazyPoolProxy:
+    """Pool-shaped object that resolves the real asyncpg pool on demand.
+
+    ``PgOutboxStore`` only ever calls ``await pool.acquire()`` and
+    ``await pool.release(conn)`` against the object passed to its
+    ``pool=`` kw, so the proxy implements just those two methods.
+    Connections are released back to the underlying pool — same
+    contract as a direct asyncpg.Pool reference.
+    """
+
+    async def acquire(self) -> Any:
+        pool = await _get_outbox_pool()
+        return await pool.acquire()
+
+    async def release(self, conn: Any) -> None:
+        pool = await _get_outbox_pool()
+        await pool.release(conn)
+
+
+class _DualOutbox:
+    """Bridge that satisfies both the bulk :class:`OutboxStore` Protocol
+    (``enqueue_bulk`` / ``claim_batch`` / ``mark_*`` / ``listen``) and
+    the legacy :class:`OutboxWriterProtocol` singular ``enqueue``
+    surface.
+
+    The dispatcher's ``_handle_missing`` path (Phase 6, ``IndexableOp``
+    callers) goes through ``enqueue_bulk`` → :class:`PgOutboxStore`
+    (the per-tenant ``storage_outbox`` table). The legacy
+    ``_handle_failure`` path (resolved-but-failing indexer with the
+    older :class:`IndexOp` shape) goes through ``enqueue`` →
+    :class:`TaskTableOutboxWriter` (the existing ``tasks.tasks`` row
+    with ``task_type='index_propagation'``).
+
+    Keeping both lets the dispatcher honour OUTBOX policy for both call
+    sites while the codebase finishes migrating off the legacy IndexOp
+    shape.
+    """
+
+    def __init__(
+        self, *, bulk: OutboxStore, legacy: "OutboxWriterProtocol",
+    ) -> None:
+        self._bulk = bulk
+        self._legacy = legacy
+
+    # OutboxStore surface — delegate to the bulk implementation.
+    async def enqueue_bulk(
+        self, conn: Any = None, *, catalog_id: str, rows: Sequence[Any],
+    ) -> None:
+        await self._bulk.enqueue_bulk(conn, catalog_id=catalog_id, rows=rows)
+
+    async def claim_batch(
+        self, *, driver_id: str, catalog_id: str,
+        batch_size: int, claimed_by: str,
+    ) -> List[Any]:
+        return await self._bulk.claim_batch(
+            driver_id=driver_id, catalog_id=catalog_id,
+            batch_size=batch_size, claimed_by=claimed_by,
+        )
+
+    async def mark_done(
+        self, *, catalog_id: str, op_ids: Sequence[Any],
+    ) -> None:
+        await self._bulk.mark_done(catalog_id=catalog_id, op_ids=op_ids)
+
+    async def mark_retry(
+        self, *, catalog_id: str, op_ids: Sequence[Any],
+        error: str, attempts_seen: int,
+    ) -> None:
+        await self._bulk.mark_retry(
+            catalog_id=catalog_id, op_ids=op_ids,
+            error=error, attempts_seen=attempts_seen,
+        )
+
+    async def mark_failed(
+        self, *, catalog_id: str, op_ids: Sequence[Any], error: str,
+    ) -> None:
+        await self._bulk.mark_failed(
+            catalog_id=catalog_id, op_ids=op_ids, error=error,
+        )
+
+    def listen(self, *, driver_id: str, catalog_id: str) -> Any:
+        return self._bulk.listen(driver_id=driver_id, catalog_id=catalog_id)
+
+    # OutboxWriterProtocol surface — delegate to the legacy task-table
+    # writer so the older IndexOp callers keep their durable retry path.
+    async def enqueue(
+        self, *, indexer_id: str, ctx: IndexContext, op: IndexOp,
+        last_error: Optional[str] = None,
+    ) -> None:
+        await self._legacy.enqueue(
+            indexer_id=indexer_id, ctx=ctx, op=op, last_error=last_error,
+        )
 
 
 def _make_default_routing_resolver():
@@ -334,28 +502,48 @@ def _make_default_indexer_registry():
 
 
 def get_index_dispatcher() -> IndexDispatcher:
-    """Process-wide singleton dispatcher — reuses live resolvers + the
-    default :class:`TaskTableOutboxWriter` + a per-indexer
-    :class:`CircuitBreaker` (Phase 3).
+    """Process-wide singleton dispatcher — reuses live resolvers + a
+    composite outbox (:class:`PgOutboxStore` for the bulk
+    :class:`OutboxStore` Protocol path used by ``_handle_missing`` and
+    :class:`TaskTableOutboxWriter` for the legacy singular ``enqueue``
+    path used by ``_handle_failure``) + a per-indexer
+    :class:`CircuitBreaker`.
+
+    The asyncpg pool backing :class:`PgOutboxStore` is created lazily at
+    first call to ``enqueue_bulk`` (see :func:`_get_outbox_pool`) so
+    importing this module doesn't open DB sockets and tests that never
+    exercise the missing-indexer OUTBOX path don't pay the pool cost.
+    Pool size is small by default (1..10) since dispatch failures are
+    expected to be rare relative to request volume.
     """
     global _DEFAULT_DISPATCHER
     if _DEFAULT_DISPATCHER is None:
         from dynastore.modules.storage.circuit_breaker import CircuitBreaker
+        from dynastore.modules.storage.pg_outbox import PgOutboxStore
+
+        bulk_outbox = PgOutboxStore(pool=_LazyPoolProxy())
+        legacy_outbox = TaskTableOutboxWriter()
         _DEFAULT_DISPATCHER = IndexDispatcher(
             routing_resolver=_make_default_routing_resolver(),
             indexer_registry=_make_default_indexer_registry(),
-            outbox=TaskTableOutboxWriter(),
+            outbox=_DualOutbox(bulk=bulk_outbox, legacy=legacy_outbox),
             breaker=CircuitBreaker(),
         )
     return _DEFAULT_DISPATCHER
 
 
-def reset_index_dispatcher() -> None:
+async def reset_index_dispatcher() -> None:
     """Test hook — drops the cached singleton so the next
     :func:`get_index_dispatcher` rebuilds with current discovery state.
+
+    Also closes the lazy asyncpg outbox pool (see :func:`_close_outbox_pool`)
+    so subsequent tests that exercise production-mode wiring don't leak
+    sockets across resets. Must be awaited; tests that previously called
+    this synchronously need to be async or wrap with ``asyncio.run``.
     """
     global _DEFAULT_DISPATCHER
     _DEFAULT_DISPATCHER = None
+    await _close_outbox_pool()
 
 
 def _bind_named_to_positional(sql: str, params: Dict[str, Any]):
@@ -435,6 +623,12 @@ class IndexDispatcher:
         self._outbox = outbox
         self._breaker = breaker
         self._outbox_warning_emitted: set = set()
+        # Dedupe key for ``_handle_missing`` WARN-policy log output:
+        # ``(driver_id, catalog, collection)``. A single deployment can
+        # legitimately omit a driver from a SCOPE; we don't want one
+        # missing driver to flood logs at every item write for the
+        # lifetime of the process.
+        self._missing_warning_emitted: set = set()
         # ``ensure_indexer`` is idempotent on the driver side, but we
         # cache success here to avoid the per-call ES ``indices.exists``
         # round-trip.  Keyed by ``(indexer_id, catalog, collection)``;
@@ -445,20 +639,27 @@ class IndexDispatcher:
     # Public surface — single-op and bulk
     # ------------------------------------------------------------------
 
-    async def fan_out(self, ctx: IndexContext, op: IndexOp) -> None:
+    async def fan_out(
+        self, ctx: IndexContext, op: DispatchableOp,
+    ) -> None:
         """Dispatch a single index op across every configured indexer
         for ``(ctx.catalog, ctx.collection)``.
 
         Each indexer's outcome is governed by its routing entry's
         :attr:`OperationDriverEntry.on_failure` policy — the dispatcher
         does not stop on a single non-FATAL failure.
+
+        Accepts either the legacy :class:`IndexOp` or the durable
+        :class:`IndexableOp` shape; missing-indexer outbox enqueue uses
+        the bulk ``OutboxStore`` interface and therefore requires
+        :class:`IndexableOp`.
         """
         entries = await self._index_entries(ctx)
         for entry in entries:
             await self._dispatch_one(entry, ctx, op)
 
     async def fan_out_bulk(
-        self, ctx: IndexContext, ops: Sequence[IndexOp],
+        self, ctx: IndexContext, ops: Sequence[DispatchableOp],
     ) -> Dict[str, BulkResult]:
         """Dispatch a bulk of index ops across every configured indexer.
 
@@ -472,6 +673,11 @@ class IndexDispatcher:
         for entry in entries:
             indexer = await self._resolve_indexer(entry.driver_id)
             if indexer is None:
+                # Driver not registered locally — apply the routing
+                # entry's FailurePolicy per-op so observable behaviour
+                # matches the in-process "indexer raised" path.
+                for op in ops:
+                    await self._handle_missing(entry, ctx, op)
                 continue
             results[entry.driver_id] = await self._dispatch_bulk(
                 entry, indexer, ctx, ops,
@@ -500,14 +706,11 @@ class IndexDispatcher:
         self,
         entry: OperationDriverEntry,
         ctx: IndexContext,
-        op: IndexOp,
+        op: DispatchableOp,
     ) -> None:
         indexer = await self._resolve_indexer(entry.driver_id)
         if indexer is None:
-            logger.debug(
-                "IndexDispatcher: no runtime instance for indexer '%s' — skipping.",
-                entry.driver_id,
-            )
+            await self._handle_missing(entry, ctx, op)
             return
 
         # OUTBOX_ONLY shortcut: never attempt sync, always enqueue.
@@ -537,7 +740,11 @@ class IndexDispatcher:
 
         # Synchronous in-process attempt.
         try:
-            await indexer.index(ctx, op)
+            # See note in ``_dispatch_bulk``: in-process indexers still
+            # consume the legacy ``IndexOp`` shape; cast at the boundary
+            # so the Union-typed dispatcher surface stays compatible
+            # without forcing every indexer migration in this phase.
+            await indexer.index(ctx, cast(IndexOp, op))
             if self._breaker is not None:
                 self._breaker.record_success(entry.driver_id)
         except Exception as exc:
@@ -545,12 +752,119 @@ class IndexDispatcher:
                 self._breaker.record_failure(entry.driver_id)
             await self._handle_failure(entry, ctx, op, exc)
 
+    async def _handle_missing(
+        self,
+        entry: OperationDriverEntry,
+        ctx: IndexContext,
+        op: DispatchableOp,
+    ) -> None:
+        """Apply ``entry.on_failure`` when the indexer is not locally
+        registered.  Mirrors the policy semantics already used for
+        resolved-but-failing indexers, so deployments don't see two
+        different behaviours for "ES is down" vs "ES isn't installed
+        in this SCOPE".
+
+        WARN dedupes per ``(driver_id, catalog, collection)`` so a
+        deliberately-omitted driver doesn't flood the log on every op.
+        OUTBOX path requires the new :class:`IndexableOp` shape; legacy
+        :class:`IndexOp` callers fall back to the existing
+        :meth:`_enqueue_or_warn` path so the singular-``enqueue`` outbox
+        writer still receives them.
+        """
+        policy = entry.on_failure
+        if policy == FailurePolicy.FATAL:
+            raise IndexerFatal(
+                entry.driver_id, op,
+                RuntimeError(
+                    f"indexer '{entry.driver_id}' not registered locally and "
+                    f"routing entry is FATAL"
+                ),
+            )
+        if policy == FailurePolicy.OUTBOX:
+            if isinstance(op, IndexableOp):
+                await self._enqueue_outbox_record(entry, ctx, op)
+            else:
+                # Legacy IndexOp path — degrade through the existing
+                # enqueue-or-warn helper so behaviour is unchanged for
+                # callers still on the older value type.
+                await self._enqueue_or_warn(entry, ctx, op)
+            return
+        if policy == FailurePolicy.WARN:
+            key = (entry.driver_id, ctx.catalog, ctx.collection)
+            if key not in self._missing_warning_emitted:
+                self._missing_warning_emitted.add(key)
+                logger.warning(
+                    "IndexDispatcher: indexer '%s' not registered locally "
+                    "(catalog=%s, collection=%s) — skipping per WARN policy. "
+                    "Future occurrences for this triple are suppressed.",
+                    entry.driver_id, ctx.catalog, ctx.collection,
+                )
+            return
+        # IGNORE — silent.
+
+    async def _enqueue_outbox_record(
+        self,
+        entry: OperationDriverEntry,
+        ctx: IndexContext,
+        op: IndexableOp,
+    ) -> None:
+        """Translate an :class:`IndexableOp` into an :class:`OutboxRecord`
+        and enqueue via the bulk :class:`OutboxStore` interface.
+
+        Used by :meth:`_handle_missing` when a driver is absent and the
+        routing entry says ``OUTBOX``.  When no outbox is wired, degrade
+        to a one-time WARN keyed identically to the missing-warning
+        dedupe so operators see exactly one signal per
+        ``(driver_id, catalog, collection)``.
+        """
+        if self._outbox is None:
+            key = ("__no_outbox__", entry.driver_id, ctx.catalog, ctx.collection)
+            if key not in self._missing_warning_emitted:
+                self._missing_warning_emitted.add(key)
+                logger.warning(
+                    "IndexDispatcher: indexer '%s' missing AND no outbox "
+                    "wired (catalog=%s, collection=%s); op dropped per "
+                    "fallback.",
+                    entry.driver_id, ctx.catalog, ctx.collection,
+                )
+            return
+        from dynastore.models.protocols.indexing import OutboxRecord
+        record = OutboxRecord(
+            op_id=op.op_id,
+            driver_id=entry.driver_id,
+            driver_instance_id=op.driver_instance_id,
+            collection_id=op.collection_id,
+            op=op.op,
+            item_id=op.item_id,
+            payload=op.payload,
+            idempotency_key=op.idempotency_key,
+        )
+        # Outbox may implement the bulk OutboxStore Protocol
+        # (``enqueue_bulk``) or only the legacy singular
+        # ``OutboxWriterProtocol.enqueue`` — pick whichever the wired
+        # instance offers so the dispatcher stays compatible with both
+        # during the migration window.  ``OutboxStore`` is
+        # ``@runtime_checkable`` so we narrow via ``isinstance`` rather
+        # than ``getattr`` probing (project rule: Protocols over hasattr).
+        if isinstance(self._outbox, OutboxStore):
+            await self._outbox.enqueue_bulk(
+                None,
+                catalog_id=op.catalog_id,
+                rows=[record],
+            )
+            return
+        # Fall through to the legacy singular-enqueue path, which uses
+        # the IndexOp shape internally.  This shouldn't fire in practice
+        # for IndexableOp callers (they wire OutboxStore), but keeps the
+        # dispatcher resilient mid-migration.
+        await self._enqueue_or_warn(entry, ctx, op)
+
     async def _ensure_or_handle(
         self,
         entry: OperationDriverEntry,
         indexer: Indexer,
         ctx: IndexContext,
-        op: IndexOp,
+        op: DispatchableOp,
     ) -> bool:
         """Run ``ensure_indexer`` once per (indexer_id, catalog, collection).
 
@@ -581,7 +895,7 @@ class IndexDispatcher:
         entry: OperationDriverEntry,
         indexer: Indexer,
         ctx: IndexContext,
-        ops: Sequence[IndexOp],
+        ops: Sequence[DispatchableOp],
     ) -> BulkResult:
         if self._breaker is not None and self._breaker.is_open(entry.driver_id):
             return BulkResult(total=len(ops), failed=len(ops), failures=[
@@ -594,7 +908,14 @@ class IndexDispatcher:
                 {"reason": "ensure_indexer_failed", "indexer": entry.driver_id},
             ])
         try:
-            result = await indexer.index_bulk(ctx, ops)
+            # ``Indexer.index_bulk`` is still typed against the legacy
+            # ``IndexOp``; concrete implementations duck-type the op
+            # fields they need.  The dispatcher's Union accepts both
+            # shapes — cast at the boundary, the migration to a unified
+            # shape happens in a later phase.
+            result = await indexer.index_bulk(
+                ctx, cast(Sequence[IndexOp], ops),
+            )
             if self._breaker is not None:
                 self._breaker.record_success(entry.driver_id)
             return result
@@ -614,7 +935,7 @@ class IndexDispatcher:
         self,
         entry: OperationDriverEntry,
         ctx: IndexContext,
-        op: IndexOp,
+        op: DispatchableOp,
         exc: BaseException,
         *,
         bulk: bool = False,
@@ -626,10 +947,11 @@ class IndexDispatcher:
             await self._enqueue_or_warn(entry, ctx, op, original=exc)
             return
         if policy == FailurePolicy.WARN:
+            descriptor = _describe_op(op)
             logger.warning(
-                "IndexDispatcher: indexer '%s' failed for %s/%s/%s "
+                "IndexDispatcher: indexer '%s' failed for %s "
                 "(policy=warn%s): %s",
-                entry.driver_id, op.op_type, op.entity_type, op.entity_id,
+                entry.driver_id, descriptor,
                 ", bulk" if bulk else "", exc,
             )
             return
@@ -663,7 +985,7 @@ class IndexDispatcher:
         self,
         entry: OperationDriverEntry,
         ctx: IndexContext,
-        op: IndexOp,
+        op: DispatchableOp,
         *,
         original: Optional[BaseException] = None,
     ) -> None:
@@ -684,15 +1006,33 @@ class IndexDispatcher:
                 )
             if original is not None:
                 logger.warning(
-                    "IndexDispatcher: indexer '%s' failed for %s/%s/%s "
+                    "IndexDispatcher: indexer '%s' failed for %s "
                     "(policy=outbox, degraded): %s",
-                    entry.driver_id, op.op_type, op.entity_type,
-                    op.entity_id, original,
+                    entry.driver_id, _describe_op(op), original,
                 )
             return
 
+        # The legacy singular-``enqueue`` writer expects an IndexOp; if
+        # this code path is entered with an IndexableOp the writer would
+        # see attribute errors.  Skip with a single warning rather than
+        # hard-failing — the caller's failure policy already chose
+        # tolerance.
+        # NOTE: ``OutboxWriterProtocol`` (defined above) pre-dates the
+        # project's runtime_checkable typing baseline and is *not*
+        # decorated with ``@runtime_checkable``; ``isinstance`` against
+        # it would raise ``TypeError``.  The bulk path above already
+        # narrowed via ``OutboxStore``; here we fall back to a ``getattr``
+        # probe for the legacy singular surface only.
+        enqueue = getattr(self._outbox, "enqueue", None)
+        if enqueue is None:
+            logger.warning(
+                "IndexDispatcher: outbox writer for indexer '%s' has no "
+                "singular ``enqueue`` method; cannot enqueue %s.",
+                entry.driver_id, _describe_op(op),
+            )
+            return
         try:
-            await self._outbox.enqueue(
+            await enqueue(
                 indexer_id=entry.driver_id,
                 ctx=ctx,
                 op=op,
@@ -705,7 +1045,20 @@ class IndexDispatcher:
             # surprise them.
             logger.error(
                 "IndexDispatcher: outbox enqueue failed for indexer '%s' "
-                "on %s/%s/%s — original error: %s, enqueue error: %s",
-                entry.driver_id, op.op_type, op.entity_type, op.entity_id,
-                original, enqueue_exc,
+                "on %s — original error: %s, enqueue error: %s",
+                entry.driver_id, _describe_op(op), original, enqueue_exc,
             )
+
+
+def _describe_op(op: "DispatchableOp") -> str:
+    """Format an op for log/exception output regardless of value type.
+
+    The dispatcher accepts both the legacy :class:`IndexOp` and the new
+    :class:`IndexableOp`; both shapes carry equivalent identity info
+    under different field names.  This helper keeps log strings
+    consistent without leaking value-type branching into every
+    formatter.
+    """
+    if isinstance(op, IndexableOp):
+        return f"{op.op}/{op.collection_id}/{op.item_id}"
+    return f"{op.op_type}/{op.entity_type}/{op.entity_id}"

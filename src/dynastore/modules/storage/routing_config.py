@@ -332,18 +332,24 @@ class ItemsRoutingConfig(PluginConfig):
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
-            # PG is authoritative for WRITE (on_failure=fatal — must succeed).
-            # ES is intentionally NOT in WRITE: the per-item event listener
-            # ``ItemsElasticsearchDriver._on_item_upsert`` already mirrors
-            # writes to ES asynchronously (best-effort, fire-and-forget),
-            # and INDEX is auto-augmented with the same driver via
-            # ``_self_register_indexers_into``.  Putting ES in WRITE would
-            # duplicate the path; the listener has a ``_is_write_driver_for``
-            # guard to skip itself when ES is in WRITE precisely because
-            # double-indexing was the historical failure mode.  See
-            # ``feedback_es_indexing_per_item_async_not_bulk.md``: ES item
-            # sync is a per-item async best-effort listener, not a
-            # synchronous fan-out target.
+            # PG is authoritative for WRITE (on_failure=fatal — must succeed,
+            # write_mode=sync — caller awaits the result).
+            #
+            # ES is a secondary WRITE sink with ASYNC + OUTBOX semantics:
+            # the dispatcher's sync phase enqueues an outbox row in the same
+            # PG transaction as the data write, then a background drain
+            # task pumps the row through the ES driver with retry +
+            # exponential backoff.  PG TX commit guarantees neither the
+            # data nor the obligation-to-index can be lost.  Putting ES
+            # in WRITE with OUTBOX policy is the production-grade
+            # replacement for the legacy per-item listener
+            # (``_on_item_upsert``); the listener's ``_is_write_driver_for``
+            # guard now hits and the listener self-skips when ES is
+            # listed here, so there is no double-indexing.
+            #
+            # See ``feedback_es_indexing_per_item_async_not_bulk.md`` for
+            # the historical rationale that produced the listener; the
+            # outbox drain task supersedes it.
             #
             # READ orders ES first for fast simplified-geometry search; PG
             # carries the ``geometry_exact`` hint so a consumer can request
@@ -352,6 +358,11 @@ class ItemsRoutingConfig(PluginConfig):
                 OperationDriverEntry(
                     driver_id="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
+                ),
+                OperationDriverEntry(
+                    driver_id="items_elasticsearch_driver",
+                    write_mode=WriteMode.ASYNC,
+                    on_failure=FailurePolicy.OUTBOX,
                 ),
             ],
             Operation.READ: [
@@ -761,14 +772,21 @@ def _self_register_indexers_into(
     marker_proto: type,
 ) -> None:
     """Auto-append every installed driver satisfying ``marker_proto`` to
-    ``target_ops[INDEX]`` with sensible async defaults
-    (``write_mode=async``, ``on_failure=warn``).
+    ``target_ops[INDEX]`` with durable async defaults
+    (``write_mode=async``, ``on_failure=outbox``).
 
     Tier-scoped: caller passes the right marker (``CatalogIndexer`` →
     catalog routing, ``CollectionIndexer`` → collection routing,
     ``AssetIndexer`` → asset routing).  Drivers indexing multiple tiers
     opt in to multiple markers and self-register into each tier's
     ``operations[INDEX]`` independently.
+
+    The ``OUTBOX`` default mirrors the WRITE-side ES default: a transient
+    indexer failure enqueues a row in ``_meta.index_outbox`` (same PG
+    transaction as the upstream write) for the drain task to retry,
+    instead of dropping the obligation with a log line.  Operators who
+    want a non-durable best-effort sink can override per-entry to
+    ``WARN``.
 
     Idempotent: drivers already listed under ``operations[INDEX]`` are
     not re-appended (operator-supplied entries with custom ``on_failure``
@@ -792,7 +810,7 @@ def _self_register_indexers_into(
         target_ops.setdefault(Operation.INDEX, []).append(
             OperationDriverEntry(
                 driver_id=driver_id,
-                on_failure=FailurePolicy.WARN,
+                on_failure=FailurePolicy.OUTBOX,
                 write_mode=WriteMode.ASYNC,
                 source="auto",
             )
@@ -800,7 +818,7 @@ def _self_register_indexers_into(
         listed.add(driver_id)
         logger.debug(
             "Routing config self-registration: appended %s indexer '%s' "
-            "to operations[INDEX] (write_mode=async, on_failure=warn, source=auto)",
+            "to operations[INDEX] (write_mode=async, on_failure=outbox, source=auto)",
             marker_proto.__name__, driver_id,
         )
 

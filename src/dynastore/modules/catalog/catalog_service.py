@@ -753,6 +753,18 @@ class CatalogService(CatalogsProtocol):
             )
             await ensure_tenant_core_tables(conn, physical_schema)
 
+            # 3b. Per-tenant indexing outbox + failure log. Tables live in
+            # the catalog's physical schema so atomicity is local and
+            # tenants stay isolated.  The outbox AFTER INSERT trigger emits
+            # pg_notify('outbox_<driver_id>_<schema>') so per-driver-per-
+            # tenant drain workers wake on commit instead of polling.
+            from dynastore.modules.storage.outbox_ddl import (
+                ensure_storage_outbox,
+                ensure_index_failure_log,
+            )
+            await ensure_storage_outbox(conn, schema=physical_schema)
+            await ensure_index_failure_log(conn, schema=physical_schema)
+
             # 4. Module-specific lifecycle hooks (stats, tiles, …) all run AFTER
             #    the schema and core tables exist, inside their own SAVEPOINTs.
             await lifecycle_registry.init_catalog(

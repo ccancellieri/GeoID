@@ -236,6 +236,11 @@ drivers_grp = ["dynastore[module_storage_postgresql,module_storage_duckdb,module
 # ==========================================================================
 task_base = ["dynastore[db_sync,module_tasks,module_events,extension_processes]"]
 ingestion = ["dynastore[task_base,module_gcp,task_ingestion_deps]"]
+# outbox_drain — generic per-driver outbox consumer used by indexer worker
+# Cloud Run Jobs. Only depends on task_base; the concrete BulkIndexer
+# adapter is supplied by the worker's own driver extras (e.g. the ES
+# worker also pulls in module_elasticsearch).
+outbox_drain = ["dynastore[task_base]"]
 
 # ---- Worker / Cloud Run Job task extras (heavy; sync-db via task_base).
 # One extras per task. Each Cloud Run Job is deployed with
@@ -265,18 +270,24 @@ ingestion = ["dynastore[task_base,module_gcp,task_ingestion_deps]"]
 # DefinitionOnlyTask placeholder — main_task.py then raises a misleading
 # "run method without payload annotation" error. Confirmed by
 # dynastore-dwh-join-export-job-snq2n container log on 2026-04-29.
-worker_task_dwh_join = ["dynastore[task_base,module_catalog,module_crs,dwh]"]
-worker_task_ingestion = ["dynastore[ingestion,catalog_grp,google_grp,gdal]"]
+# `module_storage_postgresql` (empty marker) is added on every worker_task_*
+# SCOPE so the SCOPE × routing invariant test passes: items routing keeps
+# `items_postgresql_driver` at FATAL for WRITE (it is the source of truth);
+# every worker scope must therefore declare it can host the PG items driver
+# class even when the task itself does not exercise items WRITE — module
+# imports still resolve through ItemsRoutingConfig instantiation.
+worker_task_dwh_join = ["dynastore[task_base,module_catalog,module_crs,dwh,module_storage_postgresql]"]
+worker_task_ingestion = ["dynastore[ingestion,catalog_grp,google_grp,gdal,drivers_grp]"]
 # export_features: writes feature output to GCS (`gs://...` destination_uri)
 # via dynastore.modules.gcp clients. Without module_gcp the worker raises
 # at task run time: "GCPModule has not been initialized or failed to
 # create a storage client." Confirmed by 019dda8e-a239-7bd8-...
 # OGC poll on 2026-04-29.
-worker_task_export_features = ["dynastore[task_base,module_gcp,stac,geospatial_core]"]
-worker_task_tiles_preseed = ["dynastore[task_base,module_catalog,tiles,crs]", "morecantile>=7.0.3,<8"]
-worker_task_gdal = ["dynastore[task_base,module_catalog,gdal]"]
-worker_task_dimensions_materialize = ["dynastore[task_base,module_catalog,extension_dimensions]"]
-worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps]"]
+worker_task_export_features = ["dynastore[task_base,module_gcp,stac,geospatial_core,module_storage_postgresql]"]
+worker_task_tiles_preseed = ["dynastore[task_base,module_catalog,tiles,crs,module_storage_postgresql]", "morecantile>=7.0.3,<8"]
+worker_task_gdal = ["dynastore[task_base,module_catalog,gdal,module_storage_postgresql]"]
+worker_task_dimensions_materialize = ["dynastore[task_base,module_catalog,extension_dimensions,module_storage_postgresql]"]
+worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
 
 # ==========================================================================
 # SERVICE COMPOSITIONS (async-db)
@@ -477,6 +488,7 @@ styles = "dynastore.extensions.styles.styles_service:StylesService"
 connected_systems = "dynastore.extensions.connected_systems.consys_service:ConnectedSystemsService"
 httpx = "dynastore.extensions.httpx.httpx_service:HttpxExtension"
 iam = "dynastore.extensions.iam.service:IamExtension"
+index_failures = "dynastore.extensions.index_failures.service:IndexFailureService"
 logs = "dynastore.extensions.logs.log_extension:LogExtension"
 configs = "dynastore.extensions.configs.service:ConfigsService"
 crs = "dynastore.extensions.crs.crs_extension:CRSExtension"
@@ -504,6 +516,7 @@ dwh_join = "dynastore.tasks.dwh_join.dwh_join_export_task:DwhJoinExportTask"
 export_features = "dynastore.tasks.export_features.export_features_task:ExportFeaturesTask"
 tiles_preseed = "dynastore.tasks.tiles_preseed.task:TilePreseedTask"
 dimensions_materialize = "dynastore.tasks.dimensions_materialize.task:DimensionsMaterializeTask"
+outbox_drain = "dynastore.tasks.outbox_drain.drain_task:OutboxDrainTask"
 gcs_storage_event = "dynastore.tasks.gcp.gcs_storage_event_task:GcsStorageEventTask"
 gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
 
