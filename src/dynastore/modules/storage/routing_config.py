@@ -1161,6 +1161,148 @@ CatalogRoutingConfig.register_apply_handler(cast(_HandlerSig, _on_apply_catalog_
 
 
 # ---------------------------------------------------------------------------
+# Privacy cascade (Cycle E.2)
+# ---------------------------------------------------------------------------
+#
+# Cascade rule (resolved with user 2026-05-05):
+#   collection-private REQUIRES items-private.  Reverse direction allowed
+#   (items-private + collection-public is a real deployment shape — public
+#   collection list with private item geometry).  Items-public + collection-
+#   private is rejected: it leaks the items index unauthenticated while
+#   denying access to the collection envelope, which would surface item
+#   geometry on /search bypassing the per-collection DENY policy.
+#
+# Detection:
+#   - Collection privacy: ``CollectionPluginConfig.is_private == True``.
+#   - Items privacy: presence of ``items_elasticsearch_private_driver`` in
+#     any operation of ``ItemsRoutingConfig.operations``.
+#
+# Enforcement points:
+#   1. Apply-time on ``CollectionPluginConfig``: if the new ``is_private``
+#      is True, fetch the sibling ``ItemsRoutingConfig`` and require the
+#      private items driver be pinned somewhere.
+#   2. Apply-time on ``ItemsRoutingConfig``: if the new routing drops the
+#      private items driver, fetch the sibling ``CollectionPluginConfig``
+#      and reject if the collection still claims ``is_private``.
+
+
+_PRIVATE_ITEMS_DRIVER_ID = "items_elasticsearch_private_driver"
+
+
+def _items_routing_has_private_driver(routing: "ItemsRoutingConfig") -> bool:
+    """Return True iff ``items_elasticsearch_private_driver`` is pinned in
+    any operation of the given items routing config."""
+    for entries in routing.operations.values():
+        for entry in entries:
+            if entry.driver_id == _PRIVATE_ITEMS_DRIVER_ID:
+                return True
+    return False
+
+
+async def _enforce_collection_privacy_cascade(
+    config: PluginConfig,
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    db_resource: Optional[Any],
+) -> None:
+    """Apply handler on ``CollectionPluginConfig`` — enforce the cascade
+    rule that ``is_private=True`` requires an items routing pinning the
+    private items driver.
+
+    No-op when ``is_private=False`` (public collections impose no cascade
+    on items routing) and at platform/catalog scope (cascade is per-pair).
+    """
+    from dynastore.modules.catalog.catalog_config import CollectionPluginConfig
+
+    if not isinstance(config, CollectionPluginConfig):
+        return
+    if not config.is_private:
+        return
+    if not catalog_id or not collection_id:
+        return  # platform / catalog scope — N/A
+
+    from dynastore.models.protocols.configs import ConfigsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    configs = get_protocol(ConfigsProtocol)
+    if configs is None:
+        # Discovery not ready (early test fixture, partial deployment) —
+        # the apply handler on ItemsRoutingConfig will catch the cascade
+        # next time routing is written.
+        return
+    routing = await configs.get_config(
+        ItemsRoutingConfig,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+    if not isinstance(routing, ItemsRoutingConfig):
+        return
+    if not _items_routing_has_private_driver(routing):
+        raise ValueError(
+            f"Privacy cascade violation: CollectionPluginConfig.is_private=True "
+            f"for {catalog_id!r}/{collection_id!r}, but the items routing "
+            f"does not pin {_PRIVATE_ITEMS_DRIVER_ID!r} in any operation. "
+            f"Add the private items driver to ItemsRoutingConfig (e.g. "
+            f"operations[INDEX]) or set is_private=False."
+        )
+
+
+async def _enforce_items_routing_privacy_cascade(
+    config: PluginConfig,
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    db_resource: Optional[Any],
+) -> None:
+    """Apply handler on ``ItemsRoutingConfig`` — enforce the cascade rule
+    that an items routing without the private driver is incompatible with
+    a collection that claims ``is_private=True``.
+    """
+    if not isinstance(config, ItemsRoutingConfig):
+        return
+    if not catalog_id or not collection_id:
+        return
+    if _items_routing_has_private_driver(config):
+        return  # routing keeps the private driver — cascade satisfied
+
+    from dynastore.modules.catalog.catalog_config import CollectionPluginConfig
+    from dynastore.models.protocols.configs import ConfigsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    configs = get_protocol(ConfigsProtocol)
+    if configs is None:
+        return
+    coll = await configs.get_config(
+        CollectionPluginConfig,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+    if not isinstance(coll, CollectionPluginConfig):
+        return
+    if coll.is_private:
+        raise ValueError(
+            f"Privacy cascade violation: collection {catalog_id!r}/{collection_id!r} "
+            f"has CollectionPluginConfig.is_private=True, but the items "
+            f"routing being applied does not pin "
+            f"{_PRIVATE_ITEMS_DRIVER_ID!r}.  Re-add the private driver to "
+            f"operations[INDEX] (and SEARCH/READ as appropriate) or set "
+            f"the collection's is_private=False first."
+        )
+
+
+# Items-side cascade registration — safe at module-load time because the
+# handler body lazy-imports ``CollectionPluginConfig`` (avoids the
+# storage→catalog→storage cycle that triggers when a top-level import
+# pulls catalog/catalog_config.py via the pg_sidecars path).
+#
+# The collection-side cascade handler is registered from
+# ``modules/catalog/catalog_config.py`` after ``CollectionPluginConfig``
+# is fully defined — see the bottom of that module.
+ItemsRoutingConfig.register_apply_handler(
+    cast(_HandlerSig, _enforce_items_routing_privacy_cascade),
+)
+
+
+# ---------------------------------------------------------------------------
 # Generic routing-active query helpers — entity-agnostic discovery layer
 # ---------------------------------------------------------------------------
 #

@@ -90,12 +90,12 @@ class ItemsElasticsearchPrivateDriver(
     is_item_indexer: ClassVar[bool] = True
 
     # Opt out of items-tier auto-default routing.  The private variant is
-    # tenant-isolated DENY-policy indexing; it must only run for catalogs
-    # whose routing config explicitly pins it (``source: "operator"``).
-    # Auto-injecting it into every collection's INDEX/SEARCH would silently
-    # bypass the privacy contract.  ``ConfigApiService._build_routing_resolution``
-    # uses ``is_collection_private`` to decide which ES variant is correct
-    # for a given collection — that's the right gate, not auto-augmentation.
+    # tenant-isolated DENY-policy indexing; it must only run for collections
+    # whose ``CollectionPluginConfig.is_private == True`` (Cycle E.2) — the
+    # privacy-cascade validator on ``ItemsRoutingConfig`` enforces that the
+    # routing pins this driver in some operation whenever the collection
+    # claims is_private.  Auto-injecting into every collection's INDEX/SEARCH
+    # would silently bypass that gate.
     auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
     priority: int = 51
@@ -536,12 +536,25 @@ class ItemsElasticsearchPrivateDriver(
             pass
 
     async def _restore_deny_policies(self) -> None:
-        """Restore DENY policies at startup for catalogs using this driver."""
+        """Restore catalog-wide DENY policies at startup for any catalog
+        that has at least one private collection.
+
+        Cycle E.2 cutover: privacy is per-collection now
+        (``CollectionPluginConfig.is_private``).  We scan all catalogs,
+        list each catalog's collections, and re-apply the DENY policy
+        idempotently for any catalog with at least one private collection.
+
+        The DENY pattern stays catalog-wide
+        (``private_deny_{catalog_id}`` blocking
+        ``/.../catalogs/{cat}/...``) — the cascade validator guarantees
+        that any private collection's items go through this driver, so
+        the catalog-wide block covers every privacy-sensitive path.
+        """
         try:
             from dynastore.models.protocols import CatalogsProtocol
             from dynastore.models.protocols.configs import ConfigsProtocol
-            from dynastore.tools.discovery import get_protocol
             from dynastore.modules.catalog.catalog_config import CollectionPluginConfig
+            from dynastore.tools.discovery import get_protocol
 
             catalogs_proto = get_protocol(CatalogsProtocol)
             configs = get_protocol(ConfigsProtocol)
@@ -559,18 +572,14 @@ class ItemsElasticsearchPrivateDriver(
                     catalog_id = getattr(catalog, "id", None)
                     if not catalog_id:
                         continue
-                    try:
-                        routing = await configs.get_config(
-                            CollectionPluginConfig, catalog_id=catalog_id,
+                    if await self._catalog_has_private_collection(
+                        catalogs_proto, configs, catalog_id, CollectionPluginConfig,
+                    ):
+                        await self._apply_deny_policy(catalog_id)
+                        logger.info(
+                            "PrivateDriver: restored DENY for '%s' (cycle E.2 — at least one private collection).",
+                            catalog_id,
                         )
-                        if type(self).__name__ in routing.secondary_driver_ids:  # type: ignore[attr-defined]
-                            await self._apply_deny_policy(catalog_id)
-                            logger.info(
-                                "PrivateDriver: restored DENY for '%s'.",
-                                catalog_id,
-                            )
-                    except Exception:
-                        continue
                 if len(catalog_list) < batch:
                     break
                 offset += batch
@@ -578,6 +587,41 @@ class ItemsElasticsearchPrivateDriver(
             logger.warning(
                 "PrivateDriver: could not restore DENY policies: %s", e,
             )
+
+    @staticmethod
+    async def _catalog_has_private_collection(
+        catalogs_proto: Any,
+        configs: Any,
+        catalog_id: str,
+        collection_cls: type,
+    ) -> bool:
+        """Return True iff any collection of the catalog has
+        ``is_private == True``.  Iterates collections in batches."""
+        offset, batch = 0, 100
+        while True:
+            try:
+                collections = await catalogs_proto.list_collections(
+                    catalog_id, limit=batch, offset=offset,
+                )
+            except Exception:
+                return False
+            if not collections:
+                return False
+            for col in collections:
+                col_id = getattr(col, "id", None)
+                if not col_id:
+                    continue
+                try:
+                    cfg = await configs.get_config(
+                        collection_cls, catalog_id=catalog_id, collection_id=col_id,
+                    )
+                except Exception:
+                    continue
+                if isinstance(cfg, collection_cls) and getattr(cfg, "is_private", False):
+                    return True
+            if len(collections) < batch:
+                return False
+            offset += batch
 
     async def location(
         self,

@@ -23,6 +23,7 @@ from pydantic import (
     model_validator,
 )
 from dynastore.modules.db_config.platform_config_service import (
+    Immutable,
     PluginConfig,
 )
 from typing import ClassVar, List, Literal, Optional, Tuple
@@ -130,8 +131,47 @@ class CollectionPluginConfig(PluginConfig):
         ),
     )
 
+    is_private: Immutable[bool] = Field(
+        default=False,
+        description=(
+            "Privacy flag for this collection (Cycle E.2). When True, the "
+            "routing-resolution layer auto-substitutes the private variants "
+            "of the items + collection ES drivers in INDEX/SEARCH "
+            "operations, and the per-tenant private indexes "
+            "({prefix}-geoid-{catalog} for items + "
+            "{prefix}-{catalog}-collections-private for collection "
+            "envelopes) carry DENY policies blocking GET access to "
+            "all_users.  Immutable: flipping privacy on an existing "
+            "collection requires moving its docs across indexes "
+            "(schema-level operation, not a runtime PATCH).  Cascade "
+            "rule: collection-private REQUIRES items-private (reverse "
+            "direction allowed); the cascade is enforced by the apply "
+            "handlers on this class and ItemsRoutingConfig."
+        ),
+    )
+
 
 CollectionPluginConfig.model_rebuild()
+
+
+# Cycle E.2 — register the collection-side privacy-cascade handler.  The
+# helper itself lives in ``modules/storage/routing_config`` because it
+# inspects ``ItemsRoutingConfig``; we do the registration HERE so it
+# fires only after ``CollectionPluginConfig`` is fully defined (avoids
+# the storage→catalog→storage import cycle that would trigger if the
+# storage module attempted ``from modules.catalog.catalog_config import
+# CollectionPluginConfig`` at its own module-load time).
+def _register_collection_privacy_cascade_handler() -> None:
+    from dynastore.modules.storage.routing_config import (
+        _enforce_collection_privacy_cascade,
+    )
+
+    CollectionPluginConfig.register_apply_handler(
+        _enforce_collection_privacy_cascade,
+    )
+
+
+_register_collection_privacy_cascade_handler()
 
 
 class CatalogPolicyConfig(PluginConfig):
