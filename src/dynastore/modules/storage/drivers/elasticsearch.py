@@ -69,6 +69,7 @@ from dynastore.modules.storage.driver_config import (
     ItemsElasticsearchDriverConfig,
 )
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
+from dynastore.modules.storage.hints import Hint
 
 logger = logging.getLogger(__name__)
 
@@ -312,10 +313,10 @@ class ItemsElasticsearchDriver(
         Capability.AGGREGATION,
         Capability.INTROSPECTION,
     })
-    preferred_for: FrozenSet[str] = frozenset({"search", "geometry_simplified"})
-    supported_hints: FrozenSet[str] = frozenset({
-        "search", "fulltext",
-        "geometry_simplified",  # PR #185 default routing: ES serves the fast simplified-geometry read path
+    preferred_for: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.GEOMETRY_SIMPLIFIED})
+    supported_hints: FrozenSet[Hint] = frozenset({
+        Hint.SEARCH, Hint.FULLTEXT,
+        Hint.GEOMETRY_SIMPLIFIED,  # PR #185 default routing: ES serves the fast simplified-geometry read path
     })
 
     def is_available(self) -> bool:
@@ -1459,8 +1460,8 @@ class AssetElasticsearchDriver(
         Capability.FULLTEXT,
         Capability.PHYSICAL_ADDRESSING,
     })
-    preferred_for: FrozenSet[str] = frozenset({"search", "assets"})
-    supported_hints: FrozenSet[str] = frozenset({"search", "assets"})
+    preferred_for: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.ASSETS})
+    supported_hints: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.ASSETS})
 
     def is_available(self) -> bool:
         return self._sfeos_available()

@@ -40,6 +40,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.storage_location import StorageLocation
 
 
@@ -52,8 +53,8 @@ class AssetStore(Protocol):
     """
 
     capabilities: FrozenSet[str]
-    preferred_for: FrozenSet[str]
-    supported_hints: FrozenSet[str]
+    preferred_for: "FrozenSet[Hint]"
+    supported_hints: "FrozenSet[Hint]"
 
     def is_available(self) -> bool:
         """Health check — returning False hides the driver from discovery."""

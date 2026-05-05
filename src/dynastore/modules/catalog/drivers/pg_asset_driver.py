@@ -55,6 +55,7 @@ from dynastore.models.protocols.asset_driver import AssetStore
 from dynastore.models.protocols.storage_driver import Capability
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.modules.storage.driver_config import AssetPostgresqlDriverConfig
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
     DQLQuery,
@@ -85,8 +86,8 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         Capability.QUERY_FALLBACK_SOURCE,
         Capability.BULK_COPY,
     })
-    preferred_for: FrozenSet[str] = frozenset({"default", "metadata"})
-    supported_hints: FrozenSet[str] = frozenset({"metadata"})
+    preferred_for: FrozenSet[Hint] = frozenset({Hint.DEFAULT, Hint.METADATA})
+    supported_hints: FrozenSet[Hint] = frozenset({Hint.METADATA})
 
     def __init__(self, engine: Optional[DbResource] = None) -> None:
         self.engine = engine

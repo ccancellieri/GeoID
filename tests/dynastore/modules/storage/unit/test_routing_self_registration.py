@@ -369,7 +369,8 @@ def test_searcher_helper_idempotent():
     class _ESCat:
         capabilities = frozenset({EntityStoreCapability.SEARCH_FULLTEXT})
 
-    op_entry = OperationDriverEntry(driver_id="_es_cat", hints={"custom"})
+    from dynastore.modules.storage.hints import Hint
+    op_entry = OperationDriverEntry(driver_id="_es_cat", hints={Hint.METADATA})
     target_ops: dict = {Operation.SEARCH: [op_entry]}
 
     with patch("dynastore.tools.discovery.get_protocols",
@@ -378,7 +379,7 @@ def test_searcher_helper_idempotent():
         _self_register_searchers_into(target_ops, CatalogStore)
 
     assert len(target_ops[Operation.SEARCH]) == 1
-    assert target_ops[Operation.SEARCH][0].hints == {"custom"}
+    assert target_ops[Operation.SEARCH][0].hints == {Hint.METADATA}
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +815,8 @@ def test_transformer_helper_idempotent_and_preserves_operator_entry():
         async def transform_for_index(self, entity, **_): return entity
         async def restore_from_index(self, doc, **_): return doc
 
-    op_entry = OperationDriverEntry(driver_id="custom_transformer", hints={"operator"})
+    from dynastore.modules.storage.hints import Hint
+    op_entry = OperationDriverEntry(driver_id="custom_transformer", hints={Hint.METADATA})
     target_ops: dict = {Operation.TRANSFORM: [op_entry]}
 
     with patch("dynastore.tools.discovery.get_protocols",
@@ -823,7 +825,7 @@ def test_transformer_helper_idempotent_and_preserves_operator_entry():
         _self_register_transformers_into(target_ops)
 
     assert len(target_ops[Operation.TRANSFORM]) == 1
-    assert target_ops[Operation.TRANSFORM][0].hints == {"operator"}
+    assert target_ops[Operation.TRANSFORM][0].hints == {Hint.METADATA}
 
 
 def test_transformer_helper_no_op_when_no_implementers():

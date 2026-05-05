@@ -53,6 +53,7 @@ from dynastore.modules.db_config.platform_config_service import (
     Immutable,
     PluginConfig,
 )
+from dynastore.modules.storage.hints import Hint
 from dynastore.tools.typed_store.base import _to_snake
 from dynastore.tools.ui_hints import ui
 
@@ -264,9 +265,15 @@ class OperationDriverEntry(BaseModel):
             return _to_snake(v)
         return v
 
-    hints: Set[str] = Field(
+    hints: Set[Hint] = Field(
         default_factory=set,
-        description="Hints this driver responds to for this operation.",
+        description=(
+            "Hints this driver responds to for this operation.  Members are "
+            "from the canonical ``Hint`` catalogue "
+            "(``modules/storage/hints.py``); raw strings still validate via "
+            "``StrEnum`` coercion, but unknown strings are rejected at "
+            "config-write time so typos surface early."
+        ),
     )
     on_failure: FailurePolicy = Field(
         default=FailurePolicy.FATAL,
@@ -370,12 +377,12 @@ class ItemsRoutingConfig(PluginConfig):
             Operation.READ: [
                 OperationDriverEntry(
                     driver_id="items_elasticsearch_driver",
-                    hints={"geometry_simplified"},
+                    hints={Hint.GEOMETRY_SIMPLIFIED},
                     on_failure=FailurePolicy.WARN,
                 ),
                 OperationDriverEntry(
                     driver_id="items_postgresql_driver",
-                    hints={"geometry_exact"},
+                    hints={Hint.GEOMETRY_EXACT},
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
@@ -535,12 +542,12 @@ class AssetRoutingConfig(PluginConfig):
             Operation.READ: [
                 OperationDriverEntry(
                     driver_id="asset_elasticsearch_driver",
-                    hints={"geometry_simplified"},
+                    hints={Hint.GEOMETRY_SIMPLIFIED},
                     on_failure=FailurePolicy.WARN,
                 ),
                 OperationDriverEntry(
                     driver_id="asset_postgresql_driver",
-                    hints={"geometry_exact"},
+                    hints={Hint.GEOMETRY_EXACT},
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],

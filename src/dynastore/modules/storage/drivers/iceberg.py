@@ -76,6 +76,7 @@ from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.modules.protocols import ModuleProtocol
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.driver_config import (
     ItemsIcebergDriverConfig,
     CollectionWritePolicy,
@@ -166,8 +167,8 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         # (Iceberg also has no UNIQUE primitive at all.)
         # Opt into app-level fallback via IntrospectedSchema.allow_app_level_enforcement.
     })
-    preferred_for: FrozenSet[str] = frozenset({"analytics", "features", "write"})
-    supported_hints: FrozenSet[str] = frozenset({"analytics", "features", "write"})
+    preferred_for: FrozenSet[Hint] = frozenset({Hint.ANALYTICS, Hint.FEATURES, Hint.WRITE})
+    supported_hints: FrozenSet[Hint] = frozenset({Hint.ANALYTICS, Hint.FEATURES, Hint.WRITE})
 
     # Thread-safe catalog cache: loc_key → catalog instance, protected by asyncio.Lock.
     _catalog_cache: Dict[str, Any] = {}

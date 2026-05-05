@@ -58,6 +58,7 @@ from dynastore.modules.concurrency import run_in_thread
 from dynastore.modules.protocols import ModuleProtocol
 from dynastore.modules.storage.errors import ReadOnlyDriverError, SoftDeleteNotSupportedError
 from dynastore.modules.storage.driver_config import ItemsDuckdbDriverConfig, DuckDBConfig
+from dynastore.modules.storage.hints import Hint
 
 logger = logging.getLogger(__name__)
 
@@ -242,8 +243,8 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
         # so field-level NOT NULL / UNIQUE cannot be enforced natively.
         # Opt into app-level fallback via CollectionSchema.allow_app_level_enforcement.
     })
-    preferred_for: FrozenSet[str] = frozenset({"analytics"})
-    supported_hints: FrozenSet[str] = frozenset({"analytics"})
+    preferred_for: FrozenSet[Hint] = frozenset({Hint.ANALYTICS})
+    supported_hints: FrozenSet[Hint] = frozenset({Hint.ANALYTICS})
 
     def is_available(self) -> bool:
         return _duckdb_available()

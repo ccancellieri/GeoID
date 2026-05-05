@@ -47,6 +47,7 @@ from dynastore.modules.storage.driver_config import (
 )
 from dynastore.modules.storage.drivers.elasticsearch import _ElasticsearchBase
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
+from dynastore.modules.storage.hints import Hint
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +110,8 @@ class ItemsElasticsearchPrivateDriver(
         Capability.AGGREGATION,
         Capability.INTROSPECTION,
     })
-    preferred_for: FrozenSet[str] = frozenset()
-    supported_hints: FrozenSet[str] = frozenset()
+    preferred_for: FrozenSet[Hint] = frozenset()
+    supported_hints: FrozenSet[Hint] = frozenset()
 
     def is_available(self) -> bool:
         # See ItemsElasticsearchDriver.is_available — the driver is

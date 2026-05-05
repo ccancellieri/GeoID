@@ -14,6 +14,7 @@ from dynastore.models.protocols import (
 )
 from dynastore.models.protocols.field_definition import FieldDefinition
 from dynastore.models.protocols.typed_driver import TypedDriver
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.drivers.bigquery_models import (
     BigQueryCredentials,
     BigQueryTarget,
@@ -55,10 +56,10 @@ class ItemsBigQueryDriver(TypedDriver[ItemsBigQueryDriverConfig]):
     capabilities: FrozenSet[str] = frozenset({
         "READ", "WRITE", "STREAMING", "INTROSPECTION", "COUNT", "AGGREGATION",
     })
-    preferred_for: FrozenSet[str] = frozenset({"features"})
-    supported_hints: FrozenSet[str] = frozenset({
-        "features", "bigquery",
-        "join",  # BQ can serve as either side of an OGC API - Joins request
+    preferred_for: FrozenSet[Hint] = frozenset({Hint.FEATURES})
+    supported_hints: FrozenSet[Hint] = frozenset({
+        Hint.FEATURES, Hint.BIGQUERY,
+        Hint.JOIN,  # BQ can serve as either side of an OGC API - Joins request
     })
 
     def is_available(self) -> bool:

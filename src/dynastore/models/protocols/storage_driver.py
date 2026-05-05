@@ -60,6 +60,7 @@ from dynastore.models.query_builder import QueryRequest, QueryResponse
 
 if TYPE_CHECKING:
     from dynastore.models.protocols.field_definition import FieldDefinition
+    from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.storage_location import StorageLocation
 
 
@@ -174,8 +175,8 @@ class CollectionItemsStore(Protocol):
     """
 
     capabilities: FrozenSet[str]
-    preferred_for: FrozenSet[str]
-    supported_hints: FrozenSet[str]
+    preferred_for: "FrozenSet[Hint]"
+    supported_hints: "FrozenSet[Hint]"
     preferred_chunk_size: int  # 0 = no preference; >0 = max items per write_entities call
     # description: ClassVar[LocalizedText]  — declared in each concrete driver class
 
