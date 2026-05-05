@@ -17,7 +17,7 @@ ItemsElasticsearchPrivateDriver — tenant-scoped ES storage driver.
 
 Writes the full feature (geometry + properties + external_id) into a
 per-tenant index whose name is owned by this subpackage
-(``{prefix}-geoid-{catalog_id}``). Driver-private mapping
+(``{prefix}-{catalog_id}-private-items``). Driver-private mapping
 (``TENANT_FEATURE_MAPPING``) lives in :mod:`.mappings`.
 
 Manages DENY access policies in its own lifecycle. Reuses the shared
@@ -60,7 +60,7 @@ class ItemsElasticsearchPrivateDriver(
     """Tenant-scoped Elasticsearch storage driver (a.k.a. "private").
 
     Writes the full feature (geometry + properties + external_id) into a
-    per-tenant index ``{prefix}-geoid-{catalog_id}`` shared across all
+    per-tenant index ``{prefix}-{catalog_id}-private-items`` shared across all
     collections of the catalog. The mapping is `TENANT_FEATURE_MAPPING`
     (root ``dynamic: false`` to reject smuggled fields; ``properties.*``
     is dynamic so tenant attributes index without mapping churn).
@@ -337,7 +337,7 @@ class ItemsElasticsearchPrivateDriver(
     async def ensure_indexer(self, ctx) -> None:
         """Idempotent bootstrap for the private per-tenant index.
 
-        Creates ``{prefix}-geoid-{catalog_id}`` with
+        Creates ``{prefix}-{catalog_id}-private-items`` with
         ``TENANT_FEATURE_MAPPING`` if missing, then re-applies the
         catalog's DENY policies (recovers in-memory IAM state on cold
         boot — same recovery path as :meth:`ensure_storage`).
@@ -350,7 +350,7 @@ class ItemsElasticsearchPrivateDriver(
 
     async def index(self, ctx, op) -> None:
         """Apply a single item :class:`IndexOp` to the per-tenant private
-        index ``{prefix}-geoid-{catalog_id}``.
+        index ``{prefix}-{catalog_id}-private-items``.
 
         The "private" index stores the full feature with reduced search
         surface (geoid + tenant attrs).  When called from the
@@ -648,7 +648,7 @@ class ItemsElasticsearchPrivateDriver(
     # CollectionItemsStore Protocol — data-side ops (parity with public)
     # ------------------------------------------------------------------
     # Mirror the public driver's implementation against the per-tenant
-    # private index ``{prefix}-geoid-{catalog_id}``. The private index
+    # private index ``{prefix}-{catalog_id}-private-items``. The private index
     # holds every collection of the catalog in one place, scoped at
     # query time by the ``collection`` field — same shape as public.
 

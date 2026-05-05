@@ -18,7 +18,7 @@ Per-item incremental private indexing tasks.
 Two task types:
   - ``elasticsearch_private_index``  — index one item as a full
     tenant-feature doc into the per-tenant index
-    ``{prefix}-geoid-{catalog_id}``.
+    ``{prefix}-{catalog_id}-private-items``.
   - ``elasticsearch_private_delete`` — remove one geoid doc from the
     private index.
 
@@ -91,11 +91,14 @@ def _build_es_client():
 class PrivateIndexTask(TaskProtocol):
     """Index a single item as a full tenant-feature doc.
 
-    Dispatched per-item by ElasticsearchModule event handlers when the
-    catalog has private=True. The full feature is fetched via
-    ``ItemCrudProtocol`` so the dispatcher only needs to send identifiers.
-    Geometry simplification is applied via ``simplify_to_fit`` to honour
-    the ES 10MB per-doc limit.
+    Dispatched per-item via the ``IndexDispatcher`` (PR #261) when the
+    collection's ``ItemsRoutingConfig`` pins
+    ``items_elasticsearch_private_driver`` in any operation, which is
+    required by the privacy cascade (Cycle E.2.a) when
+    ``CollectionPluginConfig.is_private == True``.  The full feature
+    is fetched via ``ItemCrudProtocol`` so the dispatcher only needs
+    to send identifiers.  Geometry simplification is applied via
+    ``simplify_to_fit`` to honour the ES 10MB per-doc limit.
     """
 
     task_type = "elasticsearch_private_index"
@@ -159,7 +162,7 @@ class PrivateIndexTask(TaskProtocol):
 class PrivateDeleteTask(TaskProtocol):
     """Remove a single geoid document from the private index.
 
-    Safe to run even if the catalog is not private (no-op via NotFoundError).
+    Safe to run even if the collection is not private / the index does not exist (no-op via NotFoundError).
     """
 
     task_type = "elasticsearch_private_delete"
