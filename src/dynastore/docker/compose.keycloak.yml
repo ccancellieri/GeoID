@@ -21,16 +21,23 @@ services:
       KC_DB_POOL_ACQUIRE_TIMEOUT_MILLIS: "30000"
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
-      # Pin the issuer URL so every issued token carries the same `iss`
-      # regardless of whether the caller hit Keycloak via the host-mapped
-      # port (`localhost:8180`) or via docker DNS (`keycloak:8080`).
-      # Without this, `iss` defaults to the request URL and the catalog
-      # rejects tokens whose iss doesn't match `IDP_ISSUER_URL`. See
-      # `src/dynastore/modules/iam/identity_providers/KEYCLOAK_SETUP.md`.
-      # KC_HOSTNAME accepts a full URL in Keycloak 26 (renamed from the
-      # pre-26 `KC_HOSTNAME_URL`). STRICT=true is required to actually
-      # honor the override (otherwise iss falls back to request URL).
-      KC_HOSTNAME: http://keycloak:8080
+      # Frontchannel/backchannel split:
+      #   - KC_HOSTNAME pins the FRONTCHANNEL URL (browser-visible: login form
+      #     `action`, authorization endpoint, redirects, `iss` claim).
+      #   - KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true tells Keycloak to derive
+      #     backchannel URLs (token, jwks_uri, userinfo, introspect) from the
+      #     incoming request's Host header. So the API container can keep
+      #     reaching Keycloak via docker DNS (`http://keycloak:8080`) for
+      #     discovery / token exchange, while the BROWSER sees `localhost:8180`
+      #     URLs in the rendered login page and never tries to resolve the
+      #     internal docker hostname.
+      #   - KC_HOSTNAME_STRICT=true is required for KC_HOSTNAME to actually
+      #     take effect (otherwise iss falls back to the request URL).
+      # The geoid OIDC client (oidc_identity.py:200) already accepts iss
+      # matching either IDP_ISSUER_URL or IDP_PUBLIC_URL, so .env stays as is.
+      # Pre-26 the variable was `KC_HOSTNAME_URL`; 26+ accepts a full URL.
+      KC_HOSTNAME: http://localhost:8180
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
       KC_HOSTNAME_STRICT: "true"
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded

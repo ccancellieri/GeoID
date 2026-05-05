@@ -118,9 +118,22 @@ GeoID validates every incoming `Authorization: Bearer <jwt>` header against the 
 
 - **Signature** — verified against the JWKS resolved from `<IDP_ISSUER_URL>/.well-known/openid-configuration`. RS256 is the default Keycloak signing algorithm; HS256 is **not** supported.
 - **`exp`** (expiry) — must be in the future.
-- **`iss`** (issuer) — must equal `IDP_ISSUER_URL`.
+- **`iss`** (issuer) — must equal `IDP_ISSUER_URL` **or** `IDP_PUBLIC_URL` (`oidc_identity.py:200` accepts both). This matters whenever the browser and the backend reach Keycloak via different hostnames.
 - **`aud`** (audience) — must include `IDP_AUDIENCE` (defaults to `IDP_CLIENT_ID`). If your Keycloak emits tokens with `aud=account` by default, configure an **Audience protocol mapper** on the `geoid-api` client to add the client_id to `aud` (Keycloak admin console → Client Scopes → `roles` → Add mapper → Audience → "Included Client Audience" = `geoid-api`). This is one of the most common gotchas.
-- **`iss` (issuer) URL stability** — Keycloak by default emits `iss` matching the **request URL** (browser-visible vs container-internal differ). If your callers reach Keycloak via different hostnames (browser via `https://login.example.org`; backend services via `http://keycloak:8080` on a private network), tokens carry different `iss` values and fail the catalog's `iss == IDP_ISSUER_URL` check from one path or the other. **Fix in Keycloak 26**: set `KC_HOSTNAME=<the-canonical-issuer-url>` AND `KC_HOSTNAME_STRICT=true` on the Keycloak server. Pre-26 the variable was `KC_HOSTNAME_URL`. The local docker-compose fragment at `src/dynastore/docker/compose.keycloak.yml` already does this. Symptom when missing: every authenticated request 403s with "Deny by Default — No matching ALLOW policy found".
+- **Frontchannel / backchannel hostname split** — Keycloak by default emits every URL it generates (login form `action`, `iss`, redirects, `token_endpoint`, `jwks_uri`) using the **request URL**. When the browser reaches Keycloak via one hostname (e.g. `https://login.example.org` or `http://localhost:8180`) and backend services reach it via another (e.g. `http://keycloak:8080` on a private docker / k8s network), this default produces broken login pages: the browser submits the login form to the internal hostname, which it cannot resolve.
+
+  **Recommended Keycloak 26+ configuration**:
+  ```
+  KC_HOSTNAME=<browser-facing-url>          # e.g. http://localhost:8180  or https://login.example.org
+  KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true       # backend URLs derived from request Host
+  KC_HOSTNAME_STRICT=true                    # required for KC_HOSTNAME to take effect
+  ```
+  Pre-26 the variable was `KC_HOSTNAME_URL`; `KC_HOSTNAME_BACKCHANNEL_DYNAMIC` is 24+.
+
+  Result: front-channel URLs (login form action, authorization endpoint, `iss`) use the public URL; back-channel URLs (token, userinfo, jwks) use the Host header — so the API container keeps using its private hostname to reach Keycloak. The local docker-compose fragment at `src/dynastore/docker/compose.keycloak.yml` follows this pattern.
+
+  Symptom when **front/back channels are not split**: after entering credentials at `http://localhost:8180/...`, the browser is redirected to `http://keycloak:8080/realms/<realm>/login-actions/authenticate?...` and DNS resolution fails on the host machine.
+  Symptom when **HOSTNAME pins are missing entirely**: every authenticated request 403s with "Deny by Default — No matching ALLOW policy found" because tokens issued via different paths carry different `iss` values.
 - **`sub` claim missing** — Keycloak 26 does NOT add a `sub` claim to access tokens by default; the standard `profile` client scope only populates id-token claims, not access-token claims. Without an explicit `oidc-sub-mapper` on each client, the access token carries `sub: null` and geoid falls back to `preferred_username` for principal identity (`oidc_identity.py:238`). The local `realm-export.json` includes the mapper on `geoid-api` and `geoid-web`. To add manually via the Keycloak admin console: select the client → Client scopes → Dedicated mappers → Add mapper → "Subject (sub)" → enable "Add to access token". Or via API: `POST /admin/realms/{realm}/clients/{client_uuid}/protocol-mappers/models` with `{"name":"subject","protocolMapper":"oidc-sub-mapper","protocol":"openid-connect","config":{"access.token.claim":"true","id.token.claim":"true","userinfo.token.claim":"true","introspection.token.claim":"true"}}`.
 
 Then GeoID extracts (from `oidc_identity.py:262-266`):
