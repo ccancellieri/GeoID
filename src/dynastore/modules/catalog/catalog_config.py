@@ -341,3 +341,102 @@ async def apply_catalog_default_privacy_seed(
         ctx=ctx,
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Cycle E.2.c slice 2 — catalog-tier lifecycle hook
+# ---------------------------------------------------------------------------
+
+
+async def _on_apply_catalog_policy_config(
+    config: "CatalogPolicyConfig",
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    db_resource: Any,
+) -> None:
+    """Eagerly create per-tenant private indexes when the catalog default
+    privacy is ``"private"`` (Cycle E.2.c slice 2).
+
+    Fires whenever an operator writes a ``CatalogPolicyConfig`` row.
+    When the new value is ``"private"``, we proactively call
+    ``ensure_storage(catalog_id)`` on both per-tenant private drivers so
+    the indexes exist before any collection-create lands.  Without this
+    hook the drivers' lazy-create fallback covers the first-write race,
+    but eager creation:
+
+    - Removes the first-write latency spike;
+    - Lets operators verify ``GET _cat/indices`` shows the per-tenant
+      private indexes immediately after flipping the policy;
+    - Aligns with the verification step in
+      ``~/.claude/plans/binary-leaping-lightning.md`` item #11.
+
+    Idempotent — both drivers' ``ensure_storage`` swallow
+    ``resource_already_exists`` so re-applying the same policy is a
+    no-op at the ES layer.
+
+    No-op when:
+
+    - ``default_collection_privacy != "private"`` — public is the
+      default; flipping back to public does NOT drop the existing
+      per-tenant indexes (the catalog policy applies to NEW
+      collections; existing ``CollectionPluginConfig.is_private``
+      flags remain authoritative for already-created collections).
+    - ``catalog_id`` is ``None`` (platform-tier write — there's no
+      tenant to bootstrap indexes for).
+    - The relevant private driver isn't installed (deployment SCOPE
+      excludes ``elasticsearch_private``).
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if config.default_collection_privacy != "private":
+        return
+    if not catalog_id:
+        return
+
+    from dynastore.tools.discovery import get_protocols
+    from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
+        ItemsElasticsearchPrivateDriver,
+    )
+    from dynastore.modules.storage.drivers.elasticsearch_private.collection_driver import (
+        CollectionElasticsearchPrivateDriver,
+    )
+    from dynastore.models.protocols.entity_store import CollectionStore
+    from dynastore.models.protocols.storage_driver import CollectionItemsStore
+
+    items_private: Optional[ItemsElasticsearchPrivateDriver] = next(
+        (
+            d
+            for d in get_protocols(CollectionItemsStore)
+            if isinstance(d, ItemsElasticsearchPrivateDriver)
+        ),
+        None,
+    )
+    if items_private is not None:
+        try:
+            await items_private.ensure_storage(catalog_id)
+        except Exception as exc:
+            logger.warning(
+                "CatalogPolicyConfig apply: items-private ensure_storage(%r) failed: %s",
+                catalog_id, exc,
+            )
+
+    coll_private: Optional[CollectionElasticsearchPrivateDriver] = next(
+        (
+            d
+            for d in get_protocols(CollectionStore)
+            if isinstance(d, CollectionElasticsearchPrivateDriver)
+        ),
+        None,
+    )
+    if coll_private is not None:
+        try:
+            await coll_private.ensure_storage(catalog_id)
+        except Exception as exc:
+            logger.warning(
+                "CatalogPolicyConfig apply: collection-private ensure_storage(%r) failed: %s",
+                catalog_id, exc,
+            )
+
+
+CatalogPolicyConfig.register_apply_handler(_on_apply_catalog_policy_config)
