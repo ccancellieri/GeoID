@@ -1,0 +1,20 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {"type": "Polygon", "coordinates": [[[12.40, 41.85], [12.55, 41.85], [12.55, 41.95], [12.40, 41.95], [12.40, 41.85]]]},
+      "properties": {"asset_id": "rome-01", "name": "Rome A", "datetime": "2024-01-10T00:00:00Z"}
+    },
+    {
+      "type": "Feature",
+      "geometry": {"type": "Polygon", "coordinates": [[[2.20, 48.80], [2.45, 48.80], [2.45, 48.95], [2.20, 48.95], [2.20, 48.80]]]},
+      "properties": {"asset_id": "paris-01", "name": "Paris A", "datetime": "2024-02-14T00:00:00Z"}
+    },
+    {
+      "type": "Feature",
+      "geometry": {"type": "Polygon", "coordinates": [[[-0.20, 51.45], [0.05, 51.45], [0.05, 51.60], [-0.20, 51.60], [-0.20, 51.45]]]},
+      "properties": {"asset_id": "london-01", "name": "London A", "datetime": "2024-03-20T00:00:00Z"}
+    }
+  ]
+}
