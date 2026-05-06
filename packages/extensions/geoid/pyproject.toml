@@ -1,0 +1,27 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-geoid"
+version = "0.0.0"
+description = "DynaStore Geoid extension — landing-page + browser-targeted helpers."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "user-agents>=2.2.0",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+geoid = "dynastore.extensions.geoid.geoid:Geoid"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dynastore.extensions.geoid" = ["*.md", "static/**/*"]

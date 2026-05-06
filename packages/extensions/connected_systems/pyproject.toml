@@ -1,0 +1,26 @@
+#    Copyright 2025 FAO
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    See the LICENSE file at the repository root.
+
+[project]
+name = "dynastore-ext-connected-systems"
+version = "0.0.0"
+description = "DynaStore OGC API - Connected Systems extension."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+connected_systems = "dynastore.extensions.connected_systems.consys_service:ConnectedSystemsService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

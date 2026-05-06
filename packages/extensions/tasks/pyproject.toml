@@ -1,0 +1,39 @@
+#    Copyright 2025 FAO
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+# dynastore-ext-tasks — pilot wheel for the per-extension wheel migration.
+# See ../../README.md for the migration plan.
+
+[project]
+name = "dynastore-ext-tasks"
+version = "0.0.0"  # placeholder; managed by setuptools-scm post-merge
+description = "DynaStore Tasks extension — REST surface over the tasks module."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "uvicorn",
+    # dynastore-core providing the tasks module + ExtensionProtocol + tools.
+    # Pinning is handled at the workspace / consumer level.
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+tasks = "dynastore.extensions.tasks.tasks_service:TasksService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dynastore.extensions.tasks" = ["*.html"]

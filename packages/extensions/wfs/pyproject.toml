@@ -1,0 +1,29 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-wfs"
+version = "0.0.0"
+description = "DynaStore OGC WFS 2.0 extension."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "shapely>=2.1.1",
+    "geojson-pydantic>=1.0.0",
+    "pyproj>=3.0.0",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+wfs = "dynastore.extensions.wfs.wfs_service:WFSService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dynastore.extensions.wfs" = ["*.md"]

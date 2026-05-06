@@ -1,0 +1,26 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-coverages"
+version = "0.0.0"
+description = "DynaStore OGC API - Coverages extension."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "shapely>=2.1.1",
+    "geojson-pydantic>=1.0.0",
+    "rasterio>=1.4.3",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+coverages = "dynastore.extensions.coverages.coverages_service:CoveragesService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

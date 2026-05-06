@@ -1,0 +1,24 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-styles"
+version = "0.0.0"
+description = "DynaStore OGC API - Styles extension."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "lxml>=4.9",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+styles = "dynastore.extensions.styles.styles_service:StylesService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

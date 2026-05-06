@@ -1,0 +1,28 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+# Source dir is `extensions/gcp/` but the entry-point name is `gcp_bucket`.
+name = "dynastore-ext-gcp-bucket"
+version = "0.0.0"
+description = "DynaStore GCP Bucket extension — provisions and validates GCS catalog buckets."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "google-cloud-storage>=3.1.0",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+gcp_bucket = "dynastore.extensions.gcp.bucket_service:BucketService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dynastore.extensions.gcp" = ["*.md"]

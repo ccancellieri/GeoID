@@ -1,0 +1,26 @@
+#    Copyright 2025 FAO
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    See the LICENSE file at the repository root.
+
+[project]
+name = "dynastore-ext-moving-features"
+version = "0.0.0"
+description = "DynaStore OGC API - Moving Features extension."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+moving_features = "dynastore.extensions.moving_features.mf_service:MovingFeaturesService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

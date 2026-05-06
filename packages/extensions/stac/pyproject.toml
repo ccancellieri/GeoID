@@ -1,0 +1,28 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-stac"
+version = "0.0.0"
+description = "DynaStore STAC API extension — items + collections + search."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "pystac[validation]>=1.13.0",
+    "stac-pydantic[validation]>=3.1.0",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+stac = "dynastore.extensions.stac.stac_service:STACService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dynastore.extensions.stac" = ["*.md", "hierarchy/**/*", "notebooks/**/*", "static/**/*"]

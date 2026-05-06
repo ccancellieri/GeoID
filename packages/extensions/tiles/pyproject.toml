@@ -1,0 +1,30 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-tiles"
+version = "0.0.0"
+description = "DynaStore OGC Tiles extension — vector tile + WMTS surface."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "shapely>=2.1.1",
+    "geojson-pydantic>=1.0.0",
+    "pmtiles>=3.2.0",
+    "morecantile>=7.0.3,<8",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+tiles = "dynastore.extensions.tiles.tiles_service:TilesService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dynastore.extensions.tiles" = ["*.md", "static/**/*"]

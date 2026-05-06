@@ -1,0 +1,24 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-httpx"
+version = "0.0.0"
+description = "DynaStore HTTPX extension — shared async HTTPX client lifecycle."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "httpx",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+httpx = "dynastore.extensions.httpx.httpx_service:HttpxExtension"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

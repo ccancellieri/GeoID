@@ -1,0 +1,25 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-dggs"
+version = "0.0.0"
+description = "DynaStore DGGS extension — discrete global grid system endpoints."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "h3>=4.1.0",
+    "s2sphere>=0.2.5",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+dggs = "dynastore.extensions.dggs.dggs_service:DGGSService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

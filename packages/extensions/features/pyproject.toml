@@ -1,0 +1,29 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+
+[project]
+name = "dynastore-ext-features"
+version = "0.0.0"
+description = "DynaStore OGC API - Features extension."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+dependencies = [
+    "fastapi>=0.100",
+    "shapely>=2.1.1",
+    "geojson-pydantic>=1.0.0",
+    "pygeofilter[backend-sqlalchemy]",
+    "DynaStore",
+]
+
+[project.entry-points."dynastore.extensions"]
+features = "dynastore.extensions.features.features_service:OGCFeaturesService"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dynastore.extensions.features" = ["*.md", "notebooks/*"]
