@@ -239,7 +239,7 @@ COLLECTION_MAPPING: Dict[str, Any] = {
                 },
                 "temporal": {
                     "properties": {
-                        "interval": {"type": "date_range"},
+                        "interval": {"type": "object"},
                     }
                 },
             }
