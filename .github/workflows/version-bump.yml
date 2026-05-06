@@ -1,48 +1,73 @@
-name: Version Bump
+name: Tag Version
 
+# Tag the merge commit on main with the next semver. The repo's version
+# is derived from the latest reachable tag by setuptools-scm at build time —
+# no VERSION file, no bump commit, no merge conflicts on feature branches.
+#
+# Triggers:
+#   - push to main (PR merges + direct commits)
+#   - workflow_dispatch (manual major/minor bump)
 on:
-  pull_request:
-    types: [closed]
+  push:
     branches: [main]
   workflow_dispatch:
     inputs:
       level:
-        description: 'Bump level (leave empty for patch, or "major")'
+        description: 'Bump level'
         required: false
-        default: ''
+        default: 'patch'
+        type: choice
+        options: [patch, minor, major]
+
+concurrency:
+  group: tag-version
+  cancel-in-progress: false
 
 jobs:
-  bump:
-    # Only run when a PR was actually merged (not just closed), or via manual dispatch
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.merged == true
+  tag:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+          fetch-tags: true
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: main
 
-      - name: Bump version
+      - name: Compute next tag
+        id: tag
         env:
-          BUMP_LEVEL: ${{ github.event.inputs.level }}
+          LEVEL: ${{ github.event.inputs.level || 'patch' }}
         run: |
-          chmod +x scripts/bump-version.sh
-          if [ -n "$BUMP_LEVEL" ]; then
-            scripts/bump-version.sh "$BUMP_LEVEL"
-          else
-            scripts/bump-version.sh
-          fi
+          set -euo pipefail
+          LATEST=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -n1)
+          LATEST="${LATEST#v}"
+          LATEST="${LATEST:-0.0.0}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST"
+          case "$LEVEL" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch|"")
+              PATCH=$((PATCH + 1))
+              if [ "$PATCH" -gt 99 ]; then
+                MINOR=$((MINOR + 1))
+                PATCH=0
+              fi
+              ;;
+            *) echo "Unknown level: $LEVEL" >&2; exit 1 ;;
+          esac
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=${NEW}" >> "$GITHUB_OUTPUT"
+          echo "Tagging v${NEW} (was v${LATEST}, level=${LEVEL})"
 
-      - name: Commit and push
+      - name: Push tag
+        env:
+          NEW: ${{ steps.tag.outputs.version }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          NEW_VERSION=$(cat VERSION)
-          git add VERSION
-          git diff --cached --quiet && echo "No version change" && exit 0
-          git commit -m "chore: bump version to ${NEW_VERSION} [skip ci]"
-          git push
+          git tag -a "v${NEW}" -m "Release v${NEW}"
+          git push origin "v${NEW}"

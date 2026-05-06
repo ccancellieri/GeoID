@@ -1,3 +1,6 @@
+# setuptools-scm generates this at build time from the latest git tag
+src/dynastore/_scm_version.py
+
 Byte-compiled / optimized / DLL files
 __pycache__/
 pycache/

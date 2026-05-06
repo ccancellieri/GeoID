@@ -5,7 +5,6 @@ import logging
 import os
 import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -14,29 +13,27 @@ _VERSION_UNKNOWN = "0.0.0-unknown"
 
 
 def get_version() -> str:
-    """Return the package version using a three-tier fallback."""
-    # Tier 1: installed package metadata (pip install, Docker runtime)
+    """Return the package version using a two-tier fallback.
+
+    Tier 1: installed package metadata (pip install / wheel / Docker runtime).
+            Populated by setuptools-scm at build time from the latest git tag.
+    Tier 2: setuptools-scm-generated module (editable install / source layout).
+    """
     try:
         return importlib.metadata.version(_PACKAGE_NAME)
     except importlib.metadata.PackageNotFoundError:
         pass
-    # Tier 2: VERSION file at repository root (editable install, PYTHONPATH dev)
-    for candidate in (
-        Path(__file__).resolve().parents[3] / "VERSION",  # src/dynastore/_version.py -> repo root
-        Path(__file__).resolve().parents[2] / "VERSION",  # fallback
-    ):
-        if candidate.is_file():
-            try:
-                return candidate.read_text().strip()
-            except OSError:
-                pass
+    try:
+        from dynastore._scm_version import __version__  # type: ignore[import-not-found]
+        return __version__
+    except ImportError:
+        pass
     logger.warning("Could not determine DynaStore version; using fallback.")
     return _VERSION_UNKNOWN
 
 
 def get_git_commit() -> str:
     """Return the short git commit hash, or 'unknown' in non-git environments."""
-    # Prefer build-time injection (Docker images have no .git)
     build_commit = os.environ.get("BUILD_COMMIT", "").strip()
     if build_commit and build_commit != "unknown":
         return build_commit

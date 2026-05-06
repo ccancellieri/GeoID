@@ -21,7 +21,7 @@ readme = "README.md"
 # and aggregates them into 'api', 'worker', and 'all' variants for deployment.
 
 [build-system]
-requires = ["setuptools>=80.9.0"]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
@@ -518,8 +518,13 @@ dimensions_materialize = "dynastore.tasks.dimensions_materialize.task:Dimensions
 outbox_drain = "dynastore.tasks.outbox_drain.drain_task:OutboxDrainTask"
 gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
 
-[tool.setuptools.dynamic]
-version = {file = "VERSION"}
+[tool.setuptools_scm]
+# Derive version from git tags. Writes the resolved version to a runtime-importable
+# file at build time; downstream pip installs (dynastore-deploy, fao-aip-catalog)
+# inherit it via importlib.metadata. See src/dynastore/_version.py for the lookup.
+version_file = "src/dynastore/_scm_version.py"
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"
 
 [tool.setuptools]
 # Include files specified in MANIFEST.in

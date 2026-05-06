@@ -63,14 +63,19 @@ ENV PYTHONPATH=${APP_DIR}/src
 ARG BUILD_COMMIT=unknown
 ENV BUILD_COMMIT=${BUILD_COMMIT}
 
+# Build-time version (resolved by CI from `git describe --tags` or by the
+# downstream wrapper from a pinned tag). setuptools-scm has no .git/ here,
+# so we hand it the version explicitly via SETUPTOOLS_SCM_PRETEND_VERSION.
+# Empty / unset → setuptools-scm falls back to "0.0.0+unknown" (configured
+# in pyproject.toml), which is fine for ad-hoc local builds.
+ARG APP_VERSION=
+
 # Install Production Dependencies — split into two layers so source-only
 # commits don't bust the (~3 min) deps-install cache.
 #
-# Layer 1: project metadata. NOTE: VERSION is intentionally EXCLUDED here.
-# The version-bump bot commits a fresh VERSION on every successful main
-# push (see version-bump.yml); including it in this COPY would mean every
-# downstream PR rebase brings a new VERSION → cache miss on the pip
-# install layer. We stub VERSION below and ship the real one in Layer 3.
+# Layer 1: project metadata. The pip-install layer below caches on
+# pyproject.toml + the stubbed src tree alone; source-only commits hit
+# the cache and skip the heavy GDAL / pyiceberg / etc. install.
 COPY pyproject.toml LICENSE README.md requirements*.txt pytest.ini* setup.cfg* .coveragerc* ./
 
 # Copy .env file if it exists (CI creates it in root, local has it in env/)
@@ -81,14 +86,10 @@ COPY pyproject.toml .en[v]* ./env/
 COPY pyproject.toml .en[v]* ./
 COPY pyproject.toml .en[v]* ./src/
 
-# Layer 2: stub the dynastore package + a stable VERSION so setuptools can
-# build a wheel without bundling real source/version. The pip-install layer
-# below caches on pyproject.toml + this RUN's text alone — source-only AND
-# version-bump-only commits hit the cache and skip the heavy GDAL /
-# pyiceberg / etc. install. Layer 3 replaces both stubs with real files
-# and rebuilds the wheel --no-deps, picking up the real VERSION.
+# Layer 2: stub the dynastore package so setuptools can build a wheel
+# without bundling real source. Layer 3 replaces the stub with real files
+# and rebuilds the wheel --no-deps, picking up the real APP_VERSION.
 RUN mkdir -p src/dynastore/scripts && \
-    echo "0.0.0" > VERSION && \
     : > src/dynastore/__init__.py && \
     : > src/dynastore/scripts/__init__.py && \
     : > src/dynastore/scripts/start.sh && \
@@ -110,23 +111,26 @@ ARG BUILD_JUPYTERLITE=false
 # → driverShortName='Parquet').  Force fiona to rebuild from sdist against
 # the system libgdal so it inherits every driver the base image ships.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    ${VENV_PATH}/bin/pip install --upgrade pip setuptools wheel && \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DYNASTORE=0.0.0 \
+    ${VENV_PATH}/bin/pip install --upgrade pip setuptools setuptools-scm wheel && \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DYNASTORE=0.0.0 \
     ${VENV_PATH}/bin/pip install --no-binary fiona ".[${SCOPE}]" uvicorn gunicorn
 
-# Layer 3: real source overlay + real VERSION. Fast layer — busts only
-# when src/, tests/, or VERSION change.
-COPY VERSION ./
+# Layer 3: real source overlay. Fast layer — busts when src/, tests/, or
+# APP_VERSION change. Re-installs dynastore --no-deps so the wheel metadata
+# (and therefore importlib.metadata.version("DynaStore")) reflects the real
+# version baked in via SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DYNASTORE.
 COPY src ./src
 COPY tests ./tests
+RUN --mount=type=cache,target=/root/.cache/pip \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DYNASTORE="${APP_VERSION:-0.0.0+unknown}" \
+    ${VENV_PATH}/bin/pip install --no-deps --force-reinstall --no-build-isolation .
 
 # Startup scripts ship as package data under dynastore/scripts/ (SSOT).
-# This Dockerfile reads them from the local source tree because Layer 2's
-# pip install used a stub package (the wheel built from those stubs put
-# zero-byte scripts into site-packages, and pip refuses to overwrite them
-# on a `--force-reinstall` overlay). The deployment-wrapper Dockerfile
-# (`pip install dynastore @ git+...`) has no local source and reads the
-# same scripts from ${VENV_PATH}/lib/.../site-packages/dynastore/scripts/.
-# Both reach identical canonical content; only the dispatch path differs.
+# Read them from the local source tree (Layer 3 has overlaid the real files);
+# the deployment-wrapper Dockerfile reads the equivalent files out of
+# ${VENV_PATH}/lib/.../site-packages/dynastore/scripts/. Both reach identical
+# canonical content; only the dispatch path differs.
 RUN install -m 755 /dynastore/src/dynastore/scripts/start.sh /usr/local/bin/start.sh && \
     install -m 755 /dynastore/src/dynastore/scripts/start-task.sh /usr/local/bin/start-task.sh
 
