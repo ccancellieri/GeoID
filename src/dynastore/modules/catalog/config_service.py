@@ -789,6 +789,310 @@ class ConfigService(ConfigsProtocol):
             ctx=DriverContext(db_resource=db_resource) if db_resource else None,
         )
 
+    # -----------------------------------------------------------------
+    # F.4c.4 — ref-keyed write API
+    # -----------------------------------------------------------------
+
+    async def set_config_by_ref(
+        self,
+        ref_key: str,
+        config: PluginConfig,
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        check_immutability: bool = True,
+        ctx: Optional[DriverContext] = None,
+    ) -> None:
+        """Tier-local write at ``(ref_key, scope)`` — see ConfigsProtocol."""
+        if collection_id is not None and catalog_id is None:
+            raise ValueError("catalog_id is required when collection_id is provided")
+
+        db_resource = ctx.db_resource if ctx else None
+        cls = type(config)
+        class_key = cls.class_key()
+
+        if collection_id is not None:
+            if catalog_id is None:
+                raise ValueError("catalog_id is required when collection_id is provided")
+            await self._set_collection_config_by_ref(
+                ref_key, catalog_id, collection_id, cls, config,
+                check_immutability=check_immutability, db_resource=db_resource,
+            )
+            return
+
+        if catalog_id is not None:
+            await self._set_catalog_config_by_ref(
+                ref_key, catalog_id, cls, config,
+                check_immutability=check_immutability, db_resource=db_resource,
+            )
+            return
+
+        # Platform scope — delegate.
+        platform_svc = self._get_platform_config_service()
+        setter = getattr(platform_svc, "set_config_by_ref", None)
+        if setter is None:
+            raise RuntimeError(
+                "set_config_by_ref: platform service does not implement the "
+                "ref-keyed write API"
+            )
+        await setter(
+            ref_key, config,
+            check_immutability=check_immutability,
+            ctx=DriverContext(db_resource=db_resource) if db_resource else None,
+        )
+        # Class-keyed cache lives on the platform service; nothing to bust here.
+        _maybe_bust_router(cls, None, None)
+
+    async def _set_catalog_config_by_ref(
+        self,
+        ref_key: str,
+        catalog_id: str,
+        cls: Type[PluginConfig],
+        config: PluginConfig,
+        check_immutability: bool = True,
+        db_resource: Optional[DbResource] = None,
+    ) -> None:
+        validate_sql_identifier(catalog_id)
+        class_key = cls.class_key()
+
+        async with managed_transaction(db_resource or self.engine) as conn:
+            await self._get_catalog_manager().ensure_catalog_exists(
+                catalog_id, ctx=DriverContext(db_resource=conn)
+            )
+            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+            )
+            if not phys_schema:
+                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                    catalog_id, ctx=DriverContext(db_resource=conn)
+                )
+            if not phys_schema:
+                raise ValueError(
+                    f"Could not resolve physical schema for catalog '{catalog_id}'."
+                )
+
+            existing = await _cq.select_catalog_config_by_ref(phys_schema).execute(
+                conn, ref_key=ref_key
+            )
+            if existing:
+                stored_class_key = existing["class_key"]
+                if stored_class_key != class_key:
+                    raise ValueError(
+                        f"set_config_by_ref({ref_key!r}) at catalog "
+                        f"{catalog_id!r}: row stored as class_key="
+                        f"{stored_class_key!r}, refusing to overwrite with "
+                        f"class_key={class_key!r}.  Delete the ref first or "
+                        f"pick a different name."
+                    )
+                if check_immutability:
+                    enforce_config_immutability(
+                        cls.model_validate(existing["config_data"]), config,
+                    )
+
+            await _register_schema(conn, config)
+
+            config_data = (
+                config.model_dump(
+                    mode="json",
+                    context={"secret_mode": "db"},
+                    exclude_unset=True,
+                )
+                if hasattr(config, "model_dump")
+                else config
+            )
+            await _cq.upsert_catalog_config(phys_schema).execute(
+                conn,
+                ref_key=ref_key,
+                class_key=class_key,
+                schema_id=type(config).schema_id(),
+                config_data=json.dumps(config_data, cls=CustomJSONEncoder),
+            )
+
+            for apply_handler in cls.get_apply_handlers():
+                try:
+                    res = apply_handler(config, catalog_id, None, conn)
+                    if inspect.isawaitable(res):
+                        await res
+                except Exception as e:
+                    logger.error(
+                        f"Failed to apply catalog config for ref={ref_key!r} "
+                        f"class={class_key!r} on catalog '{catalog_id}': {e}",
+                        exc_info=True,
+                    )
+
+        _catalog_config_cache.cache_invalidate(
+            self.engine, self._get_catalog_manager(), catalog_id, class_key
+        )
+        _maybe_bust_router(cls, catalog_id, None)
+
+    async def _set_collection_config_by_ref(
+        self,
+        ref_key: str,
+        catalog_id: str,
+        collection_id: str,
+        cls: Type[PluginConfig],
+        config: PluginConfig,
+        check_immutability: bool = True,
+        db_resource: Optional[DbResource] = None,
+    ) -> None:
+        validate_sql_identifier(catalog_id)
+        validate_sql_identifier(collection_id)
+        class_key = cls.class_key()
+
+        async with managed_transaction(db_resource or self.engine) as conn:
+            await self._get_catalog_manager().ensure_catalog_exists(
+                catalog_id, ctx=DriverContext(db_resource=conn)
+            )
+            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+            )
+            if not phys_schema:
+                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                    catalog_id, ctx=DriverContext(db_resource=conn)
+                )
+            if not phys_schema:
+                raise ValueError(
+                    f"Could not resolve physical schema for catalog '{catalog_id}'."
+                )
+            await self._get_catalog_manager().ensure_collection_exists(
+                catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
+            )
+
+            existing = await _cq.select_collection_config_by_ref(phys_schema).execute(
+                conn, collection_id=collection_id, ref_key=ref_key
+            )
+            if existing:
+                stored_class_key = existing["class_key"]
+                if stored_class_key != class_key:
+                    raise ValueError(
+                        f"set_config_by_ref({ref_key!r}) at "
+                        f"{catalog_id}/{collection_id}: row stored as "
+                        f"class_key={stored_class_key!r}, refusing to "
+                        f"overwrite with class_key={class_key!r}."
+                    )
+                if check_immutability:
+                    enforce_config_immutability(
+                        cls.model_validate(existing["config_data"]), config,
+                    )
+
+            await _register_schema(conn, config)
+
+            config_data = (
+                config.model_dump(
+                    mode="json",
+                    context={"secret_mode": "db"},
+                    exclude_unset=True,
+                )
+                if hasattr(config, "model_dump")
+                else config
+            )
+            await _cq.upsert_collection_config(phys_schema).execute(
+                conn,
+                collection_id=collection_id,
+                ref_key=ref_key,
+                class_key=class_key,
+                schema_id=type(config).schema_id(),
+                config_data=json.dumps(config_data, cls=CustomJSONEncoder),
+            )
+
+            for apply_handler in cls.get_apply_handlers():
+                try:
+                    res = apply_handler(config, catalog_id, collection_id, conn)
+                    if inspect.isawaitable(res):
+                        await res
+                except Exception as e:
+                    logger.error(
+                        f"Failed to apply collection config for ref={ref_key!r} "
+                        f"class={class_key!r} on {catalog_id}/{collection_id}: "
+                        f"{e}",
+                        exc_info=True,
+                    )
+
+        _collection_config_cache.cache_invalidate(
+            self.engine,
+            self._get_catalog_manager(),
+            catalog_id,
+            collection_id,
+            class_key,
+        )
+        _maybe_bust_router(cls, catalog_id, collection_id)
+
+    async def delete_config_by_ref(
+        self,
+        ref_key: str,
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        ctx: Optional[DriverContext] = None,
+    ) -> bool:
+        """Tier-local delete at ``(ref_key, scope)`` — see ConfigsProtocol."""
+        db_resource = ctx.db_resource if ctx else None
+
+        if collection_id is not None:
+            if catalog_id is None:
+                raise ValueError("catalog_id is required when collection_id is provided")
+            validate_sql_identifier(catalog_id)
+            validate_sql_identifier(collection_id)
+            async with managed_transaction(db_resource or self.engine) as conn:
+                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                    catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+                )
+                if not phys_schema:
+                    return False
+                if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
+                    return False
+                existing = await _cq.select_collection_config_by_ref(phys_schema).execute(
+                    conn, collection_id=collection_id, ref_key=ref_key
+                )
+                if not existing:
+                    return False
+                stored_class_key = existing["class_key"]
+                await _cq.delete_collection_config(phys_schema).execute(
+                    conn, collection_id=collection_id, ref_key=ref_key,
+                )
+            _collection_config_cache.cache_invalidate(
+                self.engine, self._get_catalog_manager(),
+                catalog_id, collection_id, stored_class_key,
+            )
+            cls = resolve_config_class(stored_class_key)
+            if cls is not None:
+                _maybe_bust_router(cls, catalog_id, collection_id)
+            return True
+
+        if catalog_id is not None:
+            validate_sql_identifier(catalog_id)
+            async with managed_transaction(db_resource or self.engine) as conn:
+                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                    catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+                )
+                if not phys_schema:
+                    return False
+                if not await check_table_exists(conn, CATALOG_CONFIGS_TABLE, phys_schema):
+                    return False
+                existing = await _cq.select_catalog_config_by_ref(phys_schema).execute(
+                    conn, ref_key=ref_key
+                )
+                if not existing:
+                    return False
+                stored_class_key = existing["class_key"]
+                await _cq.delete_catalog_config(phys_schema).execute(
+                    conn, ref_key=ref_key,
+                )
+            _catalog_config_cache.cache_invalidate(
+                self.engine, self._get_catalog_manager(), catalog_id, stored_class_key,
+            )
+            cls = resolve_config_class(stored_class_key)
+            if cls is not None:
+                _maybe_bust_router(cls, catalog_id, None)
+            return True
+
+        platform_svc = self._get_platform_config_service()
+        deleter = getattr(platform_svc, "delete_config_by_ref", None)
+        if deleter is None:
+            return False
+        return await deleter(
+            ref_key,
+            ctx=DriverContext(db_resource=db_resource) if db_resource else None,
+        )
+
     async def search(
         self,
         query: Optional[str] = None,

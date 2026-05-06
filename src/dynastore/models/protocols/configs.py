@@ -183,3 +183,48 @@ class ConfigsProtocol(Protocol):
         logged at the call site).
         """
         ...
+
+    # -----------------------------------------------------------------
+    # F.4c.4 — ref-keyed write API
+    # -----------------------------------------------------------------
+
+    async def set_config_by_ref(
+        self,
+        ref_key: str,
+        config: "PluginConfig",
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        check_immutability: bool = True,
+        ctx: Optional["DriverContext"] = None,
+    ) -> None:
+        """Store ``config`` at ``(ref_key, scope)``.
+
+        ``config`` carries its own dispatch class — implementations persist
+        the row with ``class_key`` derived from ``type(config).class_key()``
+        as the discriminator and ``ref_key`` as the primary key.  When
+        ``ref_key == class_key`` the row is observable via the class-keyed
+        ``set_config`` (single-instance compatibility); when they diverge
+        the row is only reachable via :meth:`get_config_by_ref` /
+        :meth:`list_refs_at_scope`.
+
+        Immutability is enforced on the row at the same ref_key (an
+        operator can't repurpose a ref to a different class) when
+        ``check_immutability=True``.
+        """
+        ...
+
+    async def delete_config_by_ref(
+        self,
+        ref_key: str,
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        ctx: Optional["DriverContext"] = None,
+    ) -> bool:
+        """Delete the stored row at ``(ref_key, scope)`` and return whether
+        a row was actually removed (so callers can distinguish a no-op from
+        a successful delete without an extra read).
+
+        Symmetrical with :meth:`get_config_by_ref` — deletes are
+        tier-local; the waterfall is not consulted.
+        """
+        ...

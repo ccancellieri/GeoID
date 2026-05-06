@@ -708,3 +708,108 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 _post_commit_router_bust(cls)
                 return True
         return False
+
+    # F.4c.4 — ref-keyed write API (platform scope)
+
+    async def set_config_by_ref(
+        self,
+        ref_key: str,
+        config: PluginConfig,
+        check_immutability: bool = True,
+        ctx: Optional[DriverContext] = None,
+    ) -> None:
+        """F.4c.4 — store ``config`` at ``platform.{ref_key}``.
+
+        ``ref_key == class_key`` collapses to the single-instance path that
+        :meth:`set_config` already covers.  Different ref_keys allow multiple
+        rows per class (multi-instance).
+
+        Immutability check, if enabled, runs against the row stored at the
+        same ref_key (so an operator can't repurpose ``pg_main`` to a
+        different class) — uses :func:`enforce_config_immutability` against
+        the existing row when present.  Apply-handlers fire post-write.
+        """
+        cls = type(config)
+        class_key = cls.class_key()
+        db_resource = ctx.db_resource if ctx else None
+        async with managed_transaction(db_resource or self.engine) as conn:
+            existing_row = await get_platform_config_by_ref_query.execute(
+                conn, ref_key=ref_key
+            )
+            if existing_row:
+                stored_class_key = existing_row["class_key"]
+                if stored_class_key != class_key:
+                    raise ValueError(
+                        f"set_config_by_ref({ref_key!r}): row stored as "
+                        f"class_key={stored_class_key!r}, refusing to "
+                        f"overwrite with class_key={class_key!r}.  Delete "
+                        f"the ref first or pick a different name."
+                    )
+                if check_immutability:
+                    old_config = cls.model_validate(existing_row["config_data"])
+                    enforce_config_immutability(old_config, config)
+
+            await _register_schema(conn, config)
+
+            await upsert_platform_config_query.execute(
+                conn,
+                ref_key=ref_key,
+                class_key=class_key,
+                schema_id=type(config).schema_id(),
+                config_data=json.dumps(
+                    config.model_dump(
+                        mode="json",
+                        context={"secret_mode": "db"},
+                        exclude_unset=True,
+                    ),
+                    cls=CustomJSONEncoder,
+                ),
+            )
+
+            for apply_handler in cls.get_apply_handlers():
+                try:
+                    res = apply_handler(config, None, None, conn)
+                    if inspect.isawaitable(res):
+                        await res
+                except Exception as e:
+                    logger.error(
+                        f"Failed to apply platform configuration for "
+                        f"ref={ref_key!r} class={class_key!r}: {e}",
+                        exc_info=True,
+                    )
+
+        # Invalidate the class-keyed cache for the dispatch class so any
+        # waterfall reads pick up the change.  Multi-instance rows still
+        # share their class with the single-instance default.
+        self.get_platform_config_internal_cached.cache_invalidate(class_key)
+        _post_commit_router_bust(cls)
+
+    async def delete_config_by_ref(
+        self,
+        ref_key: str,
+        ctx: Optional[DriverContext] = None,
+    ) -> bool:
+        """F.4c.4 — delete the platform-stored row at ``ref_key``.
+
+        Returns ``True`` when a row was removed, ``False`` for a no-op.
+        Tier-local: does NOT cascade to catalog / collection rows that
+        share the ref name (per-tier isolation matches single-instance
+        ``delete_config``).
+        """
+        db_resource = ctx.db_resource if ctx else None
+        async with managed_transaction(db_resource or self.engine) as conn:
+            existing_row = await get_platform_config_by_ref_query.execute(
+                conn, ref_key=ref_key
+            )
+            if not existing_row:
+                return False
+            stored_class_key = existing_row["class_key"]
+            await delete_platform_config_query.execute(conn, ref_key=ref_key)
+        # Best-effort cache + router invalidation.  resolve_config_class
+        # returns None when the class has been unregistered (warning
+        # logged); skip the router bust in that case.
+        self.get_platform_config_internal_cached.cache_invalidate(stored_class_key)
+        cls = resolve_config_class(stored_class_key)
+        if cls is not None:
+            _post_commit_router_bust(cls)
+        return True
