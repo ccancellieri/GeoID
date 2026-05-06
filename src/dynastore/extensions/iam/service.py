@@ -461,6 +461,16 @@ class IamExtension(ExtensionProtocol):
         # Register IAM service policies via protocol
         register_iam_service_policies()
 
+        # Register the IAM-side PageVisibilityFilter implementation so
+        # web routes can delegate nav-list filtering without naming any
+        # role themselves.
+        try:
+            from dynastore.extensions.iam.page_filter import IamPageVisibilityFilter
+            from dynastore.tools.discovery import register_plugin
+            register_plugin(IamPageVisibilityFilter())
+        except Exception as e:
+            logger.error("IamExtension: failed to register PageVisibilityFilter: %s", e)
+
         # Discover plugin-declared policies via PolicyContributor. Plugins
         # never touch PermissionProtocol directly — they declare here and
         # IAM forwards centrally. Keeps IAM/auth concepts isolated from

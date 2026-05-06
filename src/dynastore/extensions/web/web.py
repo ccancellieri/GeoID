@@ -1266,49 +1266,34 @@ async function demoAction(action) {
         async def get_web_pages_config(
             request: Request,
             language: str = Query("en"),
-            authorization: Optional[str] = Header(None)
         ):
-            """Returns the list of registered web pages for the frontend navigation, filtered by role."""
-            if not self.web_module:
-                 return []
-            
-            # IamMiddleware has already authenticated and attached the
-            # resolved principal_role to request.state. Read that first; the
-            # OIDC re-decode path below covers test harnesses / direct calls
-            # that bypass the middleware.
-            user_roles: List[str] = []
-            state_roles = getattr(request.state, "principal_role", None)
-            if state_roles:
-                user_roles = list(state_roles) if isinstance(state_roles, list) else [state_roles]
+            """Return the navigation page list visible to the caller.
 
-            if not user_roles and authorization and authorization.startswith("Bearer "):
-                token = authorization.removeprefix("Bearer ")
-                try:
-                    from dynastore.modules.iam.interfaces import IdentityProviderProtocol
-                    for provider in get_protocols(IdentityProviderProtocol):
-                        try:
-                            user_info = await provider.get_user_info(token)
-                            if user_info:
-                                # Keycloak nests roles under realm_access.roles;
-                                # local providers may flatten them at "roles".
-                                raw = user_info.get("roles") or user_info.get("realm_access", {}).get("roles", [])
-                                user_roles = [str(r) for r in raw]
-                                break
-                        except Exception:
-                            continue
-                except Exception as e:
-                    logger.debug(f"Failed to extract roles from token: {e}")
+            Auth-blind by design: the route fetches the raw page list and
+            delegates filtering to ``PageVisibilityFilter`` (registered
+            by IAM). When IAM is unloaded, only pages without
+            ``required_roles`` (or explicitly tagged anonymous) are
+            returned — so the route can render a usable nav even in
+            slim deployments.
+            """
+            if not self.web_module:
+                return []
+
+            from dynastore.models.protocols.page_visibility_filter import (
+                PageVisibilityFilter,
+            )
+            anonymous = DefaultRole.ANONYMOUS.value
 
             pages = await self.web_module.get_web_pages_config(language)
-            results = []
-            for page in pages:
-                roles = page.get("required_roles")
-                if not roles or DefaultRole.ANONYMOUS.value in roles:
-                    results.append(page)
-                elif user_roles and DefaultRole.SYSADMIN.value in user_roles:
-                    results.append(page)
-                elif user_roles and any(r in user_roles for r in roles):
-                    results.append(page)
+            page_filter = get_protocol(PageVisibilityFilter)
+            if page_filter is not None:
+                results = list(page_filter.filter_visible(pages, request))
+            else:
+                # No IAM provider — show only the anonymous-visible subset.
+                results = [
+                    p for p in pages
+                    if not p.get("required_roles") or anonymous in p.get("required_roles", [])
+                ]
 
             results.sort(key=lambda x: x.get("priority", 0))
             return results
