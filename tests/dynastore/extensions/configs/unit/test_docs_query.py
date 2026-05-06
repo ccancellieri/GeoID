@@ -107,9 +107,10 @@ def test_compose_tree_meta_schema_attaches_full_json_schema():
     assert "field_docs" not in meta["platform"]["web"]["web_config"]
 
 
-def test_compose_tree_meta_field_skips_inherited_summary():
-    """Slim mode: configs in the ``inherited`` summary do NOT get meta
-    entries — they're one-line pointers, not a docs surface."""
+def test_compose_tree_meta_field_skips_inherited_classes():
+    """Slim mode: configs deferred to the hierarchical ``inherited`` tree
+    do NOT get meta entries — they're breadcrumbs, not a docs surface.
+    """
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry_with_schema(
         web_config={"_address": ("platform", "web", None)},
@@ -123,17 +124,20 @@ def test_compose_tree_meta_field_skips_inherited_summary():
             active_scope="collection", meta_mode="field",
             include_mode="scope",
         )
-    # The class moved to inherited (not in scope at collection)
-    assert inherited == {"web_config": "platform"}
+    # The class moved to the hierarchical inherited tree (not in scope at collection).
+    assert inherited is not None
+    assert inherited["platform"]["web"]["web_config"] == {"source": "platform"}
     # ... and meta should NOT have an entry for it.
     assert meta is not None
     assert "platform" not in meta or "web" not in meta.get("platform", {})
 
 
-def test_compose_tree_meta_field_attached_for_inherited_from_catalog():
-    """Catalog-tier configs surfacing under ``inherited_from_catalog`` at
-    collection scope DO get meta entries — they're rendered with full
-    payload, so dashboards need their docs alongside."""
+def test_compose_tree_catalog_tier_under_upstream_mode_gets_meta():
+    """Cycle D.3: catalog-tier configs at collection scope surface in
+    ``inherited`` under slim mode (no meta), but render inlined in the
+    main tree under ``include=upstream`` — and THEN they get meta
+    entries at the same address.
+    """
     schema = {"properties": {"private": {"description": "Private mode."}}}
     by_class = {"elasticsearch_catalog_config": {"private": True}}
     registry = _stub_registry_with_schema(
@@ -148,12 +152,17 @@ def test_compose_tree_meta_field_attached_for_inherited_from_catalog():
         return_value=registry,
     ):
         ConfigApiService._extract_field_docs.cache_clear()
-        tree, meta, _ = ConfigApiService._compose_tree(
+        tree, meta, inherited = ConfigApiService._compose_tree(
             by_class, sources={"elasticsearch_catalog_config": "catalog"},
             active_scope="collection", meta_mode="field",
+            include_mode="upstream",
         )
-    assert "inherited_from_catalog" in tree
+    # Upstream mode: rendered inlined at its natural address.
+    assert tree["catalog"]["elasticsearch"]["elasticsearch_catalog_config"] == {"private": True}
+    # No inherited tree under upstream mode.
+    assert inherited is None
+    # Meta mirrors the configs path.
     assert meta is not None
-    assert meta["inherited_from_catalog"]["catalog"]["elasticsearch"]["elasticsearch_catalog_config"]["field_docs"] == {
+    assert meta["catalog"]["elasticsearch"]["elasticsearch_catalog_config"]["field_docs"] == {
         "private": "Private mode.",
     }

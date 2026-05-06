@@ -14,17 +14,19 @@
 
 """DTOs for the centralised composed-config API.
 
-The response is a two-level (``scope -> topic`` — three-level under
-``storage/drivers``) tree where the leaves are raw PluginConfig
-payloads keyed by class name.  No wrapper envelopes, no duplicated
+The response is a tier-first tree (platform/catalog/collection/items
+with assets forks at each tier) where the leaves are raw PluginConfig
+payloads keyed by class_key.  No wrapper envelopes, no duplicated
 driver configs inline under routing entries, no ``class_key`` field
-(the map key IS the class name).
+(the map key IS the class_key).
 
-Tier-of-origin information lives in the top-level ``inherited`` map
-(class_key → tier).  The ``meta`` field carries field-level docs or
-full JSON Schema per class, hierarchical and mirroring the ``configs``
-tree shape; mode is selected via ``?meta=none|field|schema`` (default
-``field``).
+Tier-of-origin information lives in the top-level ``inherited`` tree,
+which mirrors the ``configs`` shape — each leaf carries
+``{"source": <tier>}`` at the same address the resolved value would
+land at if rendered.  The ``meta`` field carries field-level docs or
+full JSON Schema per class, also hierarchical and mirroring the
+``configs`` tree shape; mode is selected via ``?meta=none|field|schema``
+(default ``field``).
 """
 
 from typing import Any, Dict, List, Optional
@@ -155,27 +157,29 @@ class CollectionConfigResponse(BaseModel):
     )
     collection_id: str
     catalog_id: str
-    inherited: Optional[Dict[str, str]] = Field(
+    inherited: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Class-key → source map for configs that resolved at this scope "
-            "but are NOT rendered in ``configs`` (default ``?include=scope`` "
-            "mode). Populated when an upstream-tier config (``platform`` "
-            "or ``default``) would otherwise have flooded the body. "
-            "Operators see WHAT exists upstream and HOW to reach it without "
-            "the full payloads. Set ``?include=upstream`` to render the "
-            "bodies inline (today's verbose mode). ``inherited_from_catalog`` "
-            "(under ``configs``) is distinct: it carries catalog-only-visible "
-            "configs that influence this collection — those keep their tree "
-            "shape since the operator may still need to PATCH them at "
-            "catalog scope."
+            "Hierarchical breadcrumb tree mirroring the ``configs`` shape "
+            "for configs that resolved at this scope but are NOT rendered "
+            "in ``configs`` (default ``?include=scope`` mode). Each leaf "
+            "carries ``{\"source\": <tier>}`` — ``platform`` / ``catalog`` / "
+            "``default`` — at the same path the resolved value would land "
+            "at if it were inlined. Operators see WHICH upstream-tier "
+            "configs influence this collection AND at which natural "
+            "address, without the full payloads flooding the body. Set "
+            "``?include=upstream`` to render the resolved bodies inline "
+            "in ``configs`` (today's verbose mode); ``inherited`` is "
+            "``null`` in that mode."
         ),
     )
     configs: Dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Effective configs at this collection scope, nested as "
-            "scope -> topic -> [sub ->] ClassName -> payload."
+            "Effective configs at this collection scope, nested as a "
+            "tier-first tree (platform/catalog/collection/items + assets "
+            "forks at each tier).  Each leaf is "
+            "``{class_key: payload}``."
         ),
     )
     meta: Optional[Dict[str, Any]] = Field(
@@ -205,20 +209,20 @@ class CatalogConfigResponse(BaseModel):
         ),
     )
     catalog_id: str
-    inherited: Optional[Dict[str, str]] = Field(
+    inherited: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Class-key → source map for configs that resolved at this scope "
-            "but are NOT rendered in ``configs`` (default ``?include=scope`` "
-            "mode). See ``CollectionConfigResponse.inherited`` for full "
-            "semantics."
+            "Hierarchical breadcrumb tree mirroring the ``configs`` shape "
+            "for configs that resolved at this scope but are NOT rendered "
+            "in ``configs`` (default ``?include=scope`` mode). See "
+            "``CollectionConfigResponse.inherited`` for full semantics."
         ),
     )
     configs: Dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Effective configs at this catalog scope, nested as "
-            "scope -> topic -> [sub ->] ClassName -> payload."
+            "Effective configs at this catalog scope, nested as a "
+            "tier-first tree (platform/catalog + assets fork)."
         ),
     )
     meta: Optional[Dict[str, Any]] = Field(
@@ -251,8 +255,9 @@ class PlatformConfigResponse(BaseModel):
     configs: Dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Effective platform-level configs, nested as "
-            "scope -> topic -> [sub ->] ClassName -> payload."
+            "Effective platform-level configs, nested as a tier-first "
+            "tree (platform tier with the catalog/collection/items "
+            "scaffold rendered when waterfall-resolved)."
         ),
     )
     meta: Optional[Dict[str, Any]] = Field(

@@ -396,8 +396,9 @@ class ConfigsService(ExtensionProtocol):
                 "Body-rendering mode. ``scope`` (default): body shows configs "
                 "owned by this scope (``_visibility`` matches OR an explicit "
                 "row exists here). Upstream-tier configs are summarised in "
-                "``inherited`` (class_key → source) — operators see what exists "
-                "without the verbose payloads. ``upstream``: every visible "
+                "the hierarchical ``inherited`` tree — leaves carry "
+                "``{source: <tier>}`` at the same address the resolved value "
+                "would land at if inlined. ``upstream``: every visible "
                 "class is rendered with its waterfall-resolved value (today's "
                 "verbose mode). At platform scope this flag is a no-op since "
                 "platform IS the top tier."
@@ -441,8 +442,9 @@ class ConfigsService(ExtensionProtocol):
             description=(
                 "Body-rendering mode. See platform endpoint for full notes. "
                 "At catalog scope, ``scope`` filters out platform-tier "
-                "configs that have no catalog override; they appear in "
-                "``inherited`` instead."
+                "configs that have no catalog override; they appear in the "
+                "hierarchical ``inherited`` tree instead, with "
+                "``{source: 'platform'}`` leaves at their natural addresses."
             ),
         ),
     ) -> Any:
@@ -487,10 +489,12 @@ class ConfigsService(ExtensionProtocol):
                 "configs owned by this collection — collection-visibility "
                 "configs (routing, items-driver with sidecars) and any "
                 "explicit collection-level overrides. Upstream-tier configs "
-                "(platform/default) appear in ``inherited`` as class_key → "
-                "source pairs. ``upstream``: every visible class is rendered "
-                "with its waterfall-resolved value (today's verbose mode, "
-                "useful for callers expecting the full payload)."
+                "(catalog and platform) appear in the hierarchical "
+                "``inherited`` tree as ``{source: <tier>}`` leaves at their "
+                "natural addresses (mirrors ``configs`` tree shape). "
+                "``upstream``: every visible class is rendered with its "
+                "waterfall-resolved value (today's verbose mode, useful for "
+                "callers expecting the full payload)."
             ),
         ),
     ) -> Any:

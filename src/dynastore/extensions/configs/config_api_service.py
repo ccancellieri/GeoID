@@ -92,8 +92,6 @@ def _place(
     visibility = getattr(cls, "_visibility", None)
     if visibility == "collection" and active_scope != "collection":
         return None
-    if visibility == "catalog" and active_scope == "collection":
-        return None
     address = getattr(cls, "_address", None)
     if not address:
         # Defensive — concrete subclasses must declare _address (enforced in
@@ -286,18 +284,9 @@ class ConfigApiService:
     ) -> Tuple[
         Dict[str, Any],
         Optional[Dict[str, Any]],
-        Optional[Dict[str, str]],
+        Optional[Dict[str, Any]],
     ]:
-        """Bucket visible classes into scope/topic tree and optionally build hierarchical meta.
-
-        At collection scope, catalog-tier configs (``_visibility = "catalog"``)
-        are surfaced under a sibling ``inherited_from_catalog`` block instead
-        of being dropped — the operator sees which catalog-tier configs
-        influence this collection (e.g. ``CatalogPolicyConfig.default_collection_privacy``
-        sets the catalog-wide privacy default, but is editable only at
-        catalog scope).  The block uses the SAME ``scope/topic/sub`` shape
-        as the main tree so dashboards can render it with the same
-        form-builder.
+        """Bucket visible classes into a tier-first tree and optionally build hierarchical meta.
 
         ``meta_mode`` controls per-class field documentation in the
         hierarchical ``meta`` tree:
@@ -317,10 +306,20 @@ class ConfigApiService:
 
         - ``"scope"`` (default) — body shows configs whose ``_visibility``
           declares the active scope as their owner OR whose stored row
-          lives at the active scope.  Upstream-tier configs go into the
-          ``inherited`` summary, NOT inlined.
+          lives at the active scope.  Upstream-tier configs (catalog and
+          platform from collection's POV; platform from catalog's POV) go
+          into the hierarchical ``inherited`` tree, NOT inlined.
         - ``"upstream"`` — every visible class is rendered with its
           waterfall-resolved value.  Returned ``inherited`` is None.
+
+        Cycle D.3: ``inherited`` is a hierarchical tree mirroring the
+        ``configs`` tree shape.  Each leaf carries ``{"source": <tier>}``
+        where ``<tier>`` is ``"platform"`` / ``"catalog"`` / ``"default"``
+        — telling operators WHERE the resolved value comes from at the
+        same path the value would land at if rendered.  The previous
+        ``inherited_from_catalog`` sibling block is gone; catalog-tier
+        configs at collection scope flow through the same ``inherited``
+        tree as platform-tier ones — single uniform mechanism.
 
         Returns ``(tree, meta, inherited)``.  ``meta`` is None unless
         ``meta_mode != "none"``.  ``inherited`` is None unless
@@ -332,7 +331,8 @@ class ConfigApiService:
         all_classes = list_registered_configs()
         tree: Dict[str, Any] = {}
         meta_tree: Dict[str, Any] = {}
-        inherited: Dict[str, str] = {}
+        inherited_tree: Dict[str, Any] = {}
+        inherited_has_entries = False
 
         def _is_in_scope(cls: Type[PluginConfig], class_key: str) -> bool:
             """Slim-mode filter: keep only configs owned by ``active_scope``."""
@@ -380,35 +380,22 @@ class ConfigApiService:
             if cls is None:
                 continue
 
-            # At collection scope, intercept catalog-visibility configs and
-            # bucket them under ``inherited_from_catalog`` instead of dropping
-            # them via _place().  Same scope/topic/sub address as in the main
-            # tree so the rendering is symmetric.
-            if (
-                active_scope == "collection"
-                and getattr(cls, "_visibility", None) == "catalog"
-                and not cls.__dict__.get("is_abstract_base", False)
-            ):
-                address = getattr(cls, "_address", None)
-                if address:
-                    inh_catalog = tree.setdefault("inherited_from_catalog", {})
-                    _place_at(inh_catalog, address, class_key, payload)
-                    if wants_docs:
-                        meta_inh = meta_tree.setdefault("inherited_from_catalog", {})
-                        _place_at(meta_inh, address, class_key, _doc_leaf(cls))
-                continue
-
             placed = _place(cls, active_scope)
             if placed is None:
                 continue
 
-            # Slim mode: defer upstream-tier configs to the ``inherited``
-            # summary instead of inlining their bodies.
+            # Slim mode: defer upstream-tier configs (platform OR catalog
+            # from collection's POV) to the hierarchical ``inherited``
+            # tree instead of inlining their bodies.  Catalog-tier configs
+            # flow through here too — no separate sibling block (Cycle D.3
+            # dropped ``inherited_from_catalog``).
             if slim and not _is_in_scope(cls, class_key):
-                inherited[class_key] = sources.get(class_key, "default")
+                source = sources.get(class_key, "default")
+                _place_at(inherited_tree, placed, class_key, {"source": source})
+                inherited_has_entries = True
                 # NB: meta entries for inherited (slim-suppressed) classes
-                # are intentionally absent — the inherited summary is a
-                # one-line pointer, not a documentation surface.
+                # are intentionally absent — the inherited tree is a
+                # breadcrumb, not a documentation surface.
                 continue
 
             _place_at(tree, placed, class_key, payload)
@@ -417,7 +404,7 @@ class ConfigApiService:
         return (
             tree,
             (meta_tree if wants_docs else None),
-            (inherited if (slim and inherited) else None),
+            (inherited_tree if (slim and inherited_has_entries) else None),
         )
 
     # --- Routing-ref rewrite. ---
@@ -485,7 +472,8 @@ class ConfigApiService:
                 "description": (
                     "When true (default): all registered configs with "
                     "waterfall-resolved values; the top-level ``inherited`` "
-                    "map tells you which tier provided each upstream value. "
+                    "tree (hierarchical, mirrors ``configs`` shape) tells "
+                    "you which tier provided each upstream value. "
                     "When false: only configs explicitly stored at this "
                     "scope (delta-only, safe for read-modify-write flows)."
                 ),
@@ -511,10 +499,12 @@ class ConfigApiService:
                 "description": (
                     "Body-rendering mode. ``scope`` (default) — body lists "
                     "only configs owned by the active scope; upstream-tier "
-                    "configs are summarised in ``inherited`` (class_key → "
-                    "source). ``upstream`` — every visible class rendered "
-                    "with its waterfall-resolved value (today's verbose "
-                    "default; useful when you want the full payload)."
+                    "configs are summarised in the hierarchical "
+                    "``inherited`` tree (mirrors ``configs`` shape; leaves "
+                    "carry ``{source: <tier>}``). ``upstream`` — every "
+                    "visible class rendered with its waterfall-resolved "
+                    "value (today's verbose default; useful when you want "
+                    "the full payload)."
                 ),
                 "examples": ["scope", "upstream"],
             },
