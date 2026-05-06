@@ -277,21 +277,6 @@ class AssetService(ExtensionProtocol):
             methods=["POST"],
             summary="Advanced Asset Search (scoped to catalog)",
         )
-        # Deprecated aliases (backward compat)
-        self.router.add_api_route(
-            "/search",
-            self.advanced_search_global,
-            methods=["POST"],
-            summary="Advanced Search. Deprecated: use /assets-search.",
-            deprecated=True,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/search",
-            self.advanced_search,
-            methods=["POST"],
-            summary="Advanced Search. Deprecated: use /catalogs/{catalog_id}/assets-search.",
-            deprecated=True,
-        )
         # -----------------------------------------------------------------
         # Upload endpoints (backend-agnostic)
         # -----------------------------------------------------------------
@@ -482,26 +467,6 @@ class AssetService(ExtensionProtocol):
                 detail="AssetsProtocol implementation not available.",
             )
         return svc
-
-    @property
-    def upload_provider(self) -> Optional[AssetUploadProtocol]:
-        """Deprecated. Returns the first-registered ``AssetUploadProtocol`` impl.
-
-        Prefer :meth:`resolve_upload_driver` which honours per-catalog
-        ``AssetRoutingConfig.operations[UPLOAD]`` and supports a hint for
-        backend selection. Kept only for external callers that don't have
-        catalog scope at hand and accept the legacy first-match semantics.
-        """
-        import warnings
-        warnings.warn(
-            "AssetService.upload_provider is deprecated; use "
-            "resolve_upload_driver(catalog_id, collection_id) for per-catalog "
-            "upload-backend routing.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        from dynastore.modules import get_protocol as _gp
-        return _gp(AssetUploadProtocol)
 
     async def resolve_upload_driver(
         self,

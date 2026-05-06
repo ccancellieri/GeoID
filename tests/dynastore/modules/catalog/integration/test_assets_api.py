@@ -92,7 +92,7 @@ async def test_assets_api_crud(
             "collection_id": collection_id,
             "limit": 10
         }
-        resp = await client.post(f"/assets/catalogs/{catalog_id}/search", json=search_payload)
+        resp = await client.post(f"/assets/catalogs/{catalog_id}/assets-search", json=search_payload)
         assert resp.status_code == 200
         results = resp.json()
         assert len(results) == 1
@@ -105,7 +105,7 @@ async def test_assets_api_crud(
             ],
             "limit": 10
         }
-        resp = await client.post(f"/assets/catalogs/{catalog_id}/search", json=search_payload_err)
+        resp = await client.post(f"/assets/catalogs/{catalog_id}/assets-search", json=search_payload_err)
         # Depending on implementation, might 400 or 500. SQL injection protection throws value error?
         # Basic validation passes, but SQL execution might fail if column doesn't exist?
         # actually validate_sql_identifier catches it if it has weird chars, but "non_existent_field" is valid identifier.
