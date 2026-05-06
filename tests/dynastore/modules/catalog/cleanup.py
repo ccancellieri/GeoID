@@ -1,6 +1,14 @@
 from tests.dynastore.test_utils.cleanup_registry import CleanupRegistry
 from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler, managed_nested_transaction
 from dynastore.modules.db_config.locking_tools import check_table_exists, force_truncate_table, force_drop_schema
+from dynastore.tools.db_cleanup import (
+    CATALOG_METADATA_TABLES,
+    DELETE_ORPHAN_GCP_BUCKET_RECORDS_SQL,
+    SCHEMA_DROP_BATCH_SIZE,
+    TENANT_SCHEMA_DISCOVERY_SQL,
+    TENANT_SCHEMA_PATTERN,
+    drop_schemas_batch_sql,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,18 +30,20 @@ async def cleanup_catalog(engine):
 
     try:
         # Target schemas matching the generated physical name format: s_ + 8 base36 chars
-        # (see generate_physical_name in catalog_service.py)
-        # NOTE: Use :pattern bind parameter instead of literal regex in the query
-        # string, because TemplateQueryBuilder treats {8} as an identifier placeholder
-        # and silently strips it.
+        # (see generate_physical_name in catalog_service.py).
+        # The pattern + discovery SQL are the SSOT in dynastore.tools.db_cleanup
+        # so this routine and dynastore.scripts.db_reset stay aligned.
+        # NOTE: append the trailing `;` here — TemplateQueryBuilder treats `{8}`
+        # as an identifier placeholder and silently strips it, so the pattern
+        # MUST be passed as a bind parameter (which TENANT_SCHEMA_PATTERN is
+        # designed for).
         query = DQLQuery(
-            "SELECT nspname FROM pg_namespace "
-            "WHERE nspname ~ :pattern;",
+            f"{TENANT_SCHEMA_DISCOVERY_SQL};",
             result_handler=ResultHandler.ALL_SCALARS
         )
         # Use a fresh connection to get the list of schemas
         async with managed_nested_transaction(engine) as conn:
-            schemas = await query.execute(conn, pattern=r'^s_[0-9a-z]{8}$')
+            schemas = await query.execute(conn, pattern=TENANT_SCHEMA_PATTERN)
         
         schemas: list[str] = list(schemas)
         if not schemas:
@@ -55,13 +65,13 @@ async def cleanup_catalog(engine):
                 logger.debug(f"Failed to terminate backends for {schema} (ignored): {e}")
 
         # Step 2: Drop schemas in batches to avoid exceeding max_locks_per_transaction
-        BATCH_SIZE = 20
+        # (default 64; SCHEMA_DROP_BATCH_SIZE is the canonical safe value).
         failed: list[str] = []
         batch: list[str] = []
         for schema in schemas:
             batch.append(schema)
-            if len(batch) >= BATCH_SIZE:
-                drop_sql = "\n".join(f'DROP SCHEMA IF EXISTS "{s}" CASCADE;' for s in batch)
+            if len(batch) >= SCHEMA_DROP_BATCH_SIZE:
+                drop_sql = drop_schemas_batch_sql(batch)
                 try:
                     async with managed_nested_transaction(engine) as conn:
                         await DDLQuery(drop_sql).execute(conn)
@@ -71,7 +81,7 @@ async def cleanup_catalog(engine):
                     failed.extend(batch)
                 batch = []
         if batch:
-            drop_sql = "\n".join(f'DROP SCHEMA IF EXISTS "{s}" CASCADE;' for s in batch)
+            drop_sql = drop_schemas_batch_sql(batch)
             try:
                 async with managed_nested_transaction(engine) as conn:
                     await DDLQuery(drop_sql).execute(conn)
@@ -105,9 +115,9 @@ async def cleanup_catalog(engine):
             except Exception as e:
                 logger.debug(f"Failed to remove orphaned cron jobs (ignored): {e}")
 
-        # Step 4: Truncate catalog metadata tables (always runs, even if no tenant schemas were found)
-        metadata_tables = ["catalogs", "collections"]
-        for table in metadata_tables:
+        # Step 4: Truncate catalog metadata tables (always runs, even if no tenant schemas were found).
+        # Table list is canonical in dynastore.tools.db_cleanup.
+        for table in CATALOG_METADATA_TABLES:
             try:
                 async with managed_nested_transaction(engine) as conn:
                     if await check_table_exists(conn, table, "catalog"):
@@ -116,12 +126,14 @@ async def cleanup_catalog(engine):
             except Exception as e:
                 logger.debug(f"Failed to truncate catalog.{table} (ignored): {e}")
 
-        # Step 5: Clean up GCP bucket records for dropped catalogs
+        # Step 5: Clean up GCP bucket records for dropped catalogs.
+        # SQL is canonical in dynastore.tools.db_cleanup; the trailing `;` is
+        # appended here because TemplateQueryBuilder is comfortable either way.
         try:
             async with managed_nested_transaction(engine) as conn:
                 if await check_table_exists(conn, "catalog_buckets", "gcp"):
                     deleted = await DQLQuery(
-                        "DELETE FROM gcp.catalog_buckets WHERE catalog_id NOT IN (SELECT id FROM catalog.catalogs);",
+                        f"{DELETE_ORPHAN_GCP_BUCKET_RECORDS_SQL};",
                         result_handler=ResultHandler.ROWCOUNT,
                     ).execute(conn)
                     if deleted:

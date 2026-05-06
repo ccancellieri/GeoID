@@ -23,49 +23,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import shlex
 import sys
 from pathlib import Path
 
+# Canonical preserved-schemas + system-cron-jobs lists are SSOT in
+# dynastore.tools.db_cleanup so the test-suite cleanup and this reset
+# script can never drift apart on what counts as system state.
+from dynastore.tools.db_cleanup import load_reset_policy_overrides
 
-# ── Policy (read from sibling reset_policy.env) ────────────────────────────────
 
-_DEFAULT_PRESERVED = {
-    "pg_catalog", "information_schema", "pg_toast", "cron", "public", "keycloak",
-    # Cloud SQL / CloudSQL ML extension schemas owned by the cloud SA, not the app user
-    "ai", "google_ml",
-    # PostGIS topology extension
-    "topology",
-}
-_DEFAULT_SYSTEM_CRON = (
-    "system_cleanup_orphaned_cron_jobs",
-    "monthly_cleanup_system_logs",
+PRESERVED_SCHEMAS, SYSTEM_CRON_JOBS = load_reset_policy_overrides(
+    Path(__file__).parent / "reset_policy.env"
 )
-
-
-def _load_reset_policy() -> tuple[set[str], tuple[str, ...]]:
-    preserved: set[str] = set(_DEFAULT_PRESERVED)
-    system_cron: tuple[str, ...] = _DEFAULT_SYSTEM_CRON
-    policy_file = Path(__file__).parent / "reset_policy.env"
-    if not policy_file.exists():
-        return preserved, system_cron
-    for raw in policy_file.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip().strip('"').strip("'")
-        if key == "PRESERVED_SCHEMAS":
-            preserved = set(shlex.split(val))
-        elif key == "SYSTEM_CRON_JOBS":
-            system_cron = tuple(shlex.split(val))
-    return preserved, system_cron
-
-
-PRESERVED_SCHEMAS, SYSTEM_CRON_JOBS = _load_reset_policy()
 
 
 # ── DDL ────────────────────────────────────────────────────────────────────────
@@ -205,7 +174,7 @@ async def _reset_full(conn, dry_run: bool) -> None:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 async def _run(url: str, mode: str, dry_run: bool) -> None:
-    import asyncpg  # type: ignore[import]
+    import asyncpg
     kwargs = _parse_url(url)
     conn: asyncpg.Connection = await asyncpg.connect(**kwargs)
     try:
