@@ -19,7 +19,7 @@ from typing import ClassVar, Optional, Tuple
 
 class DGGSConfig(ExposableConfigMixin, PluginConfig):
     """Runtime configuration for the OGC API - DGGS extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "dggs", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "dggs")
 
 
     # `enabled` inherited from ExposableConfigMixin.

@@ -28,7 +28,7 @@ from dynastore.models.protocols.typed_driver import (
 
 def test_concrete_pair_registers_and_class_key_resolves():
     class _DemoConfigA(_PluginDriverConfig):
-        _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+        _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "catalog", "collection", "items", "drivers")
         nickname: str = "a"
 
     class _DemoDriverA(TypedDriver[_DemoConfigA]):
@@ -50,7 +50,7 @@ def test_orphan_config_raises_on_assert_bound():
     """
     class _OrphanConfig(_PluginDriverConfig):
         # NO `class XDriver(TypedDriver[_OrphanConfig])` declaration.
-        _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+        _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "catalog", "collection", "items", "drivers")
         nickname: str = "orphan"
 
     # class_key() falls back to qualname (non-fatal) — snake-cased.
@@ -62,7 +62,7 @@ def test_orphan_config_raises_on_assert_bound():
 
 def test_double_bind_raises_on_second_driver():
     class _DemoConfigB(_PluginDriverConfig):
-        _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+        _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "catalog", "collection", "items", "drivers")
         nickname: str = "b"
 
     class _DemoDriverB1(TypedDriver[_DemoConfigB]):
@@ -91,7 +91,7 @@ def test_class_key_byte_matches_driver_name():
     Python class name itself.
     """
     class _CollectionPostgresqlDriverConfig(_PluginDriverConfig):
-        _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "collection", "drivers")
+        _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "catalog", "collection", "drivers")
         schema: str = "public"
 
     class _CollectionPostgresqlDriver(TypedDriver[_CollectionPostgresqlDriverConfig]):

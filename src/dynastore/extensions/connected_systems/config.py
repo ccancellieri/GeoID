@@ -24,6 +24,6 @@ from dynastore.modules.db_config.platform_config_service import PluginConfig
 
 class ConnectedSystemsPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the OGC API - Connected Systems extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "connected_systems", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "connected_systems")
 
     # `enabled` inherited from ExposableConfigMixin — no further fields.

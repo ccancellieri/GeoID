@@ -89,5 +89,5 @@ def test_default_collection_privacy_rejects_unknown_values():
 def test_catalog_policy_address_and_visibility():
     """Pin the address tuple — surfaces the config under
     ``catalog.policy`` in the configs API tree."""
-    assert CatalogPolicyConfig._address == ("catalog", "policy", None)
+    assert CatalogPolicyConfig._address == ("platform", "catalog", "policy")
     assert CatalogPolicyConfig._visibility == "catalog"

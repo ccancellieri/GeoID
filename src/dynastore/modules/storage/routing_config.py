@@ -324,7 +324,7 @@ class ItemsRoutingConfig(PluginConfig):
 
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
-    _address: ClassVar[Tuple[str, str, str]] = ("storage", "items", "routing")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "routing")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -456,7 +456,7 @@ class CollectionRoutingConfig(PluginConfig):
     # CollectionStore drivers are structurally distinct from items-tier drivers,
     # so this routing config lands at ``storage.routing.{class_key}`` rather
     # than under an items/assets sibling.
-    _address: ClassVar[Tuple[str, str]] = ("storage", "routing")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "routing")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -510,7 +510,7 @@ class AssetRoutingConfig(PluginConfig):
 
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
-    _address: ClassVar[Tuple[str, str, str]] = ("storage", "assets", "routing")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "assets", "routing")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -590,7 +590,7 @@ class CatalogRoutingConfig(PluginConfig):
 
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
-    _address: ClassVar[Tuple[str, str, str]] = ("storage", "catalog", "routing")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "routing")
     _visibility: ClassVar[Optional[str]] = "catalog"
 
 

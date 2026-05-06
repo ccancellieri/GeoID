@@ -60,7 +60,7 @@ class CollectionElasticsearchDriverConfig(_PluginDriverConfig):
     (``{index_prefix}-collections``). ``Immutable`` — once set it cannot
     change, because altering the prefix would orphan existing collections.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "collection", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "drivers")
     _visibility: ClassVar[Optional[str]] = "catalog"
 
 

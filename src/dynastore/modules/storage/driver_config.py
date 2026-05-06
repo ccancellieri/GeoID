@@ -309,7 +309,7 @@ class ItemsWritePolicy(PluginConfig):
        A re-uploaded asset (same geometries) is rejected entirely; partial
        overlap fails the whole batch with a 409.
     """
-    _address: ClassVar[Tuple[str, str, str]] = ("storage", "items", "policy")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "policy")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -492,7 +492,7 @@ class WritePolicyDefaults(PluginConfig):
                require_identity_key=True,
            )
     """
-    _address: ClassVar[Tuple[str, str, str]] = ("storage", "items", "policy")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "policy")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -598,7 +598,7 @@ class ItemsPostgresqlDriverConfig(CollectionDriverConfig):
     CRITICAL: ``sidecars`` and ``partitioning`` are **Immutable** — they
     cannot be changed once the physical table exists.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -761,7 +761,7 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
     indexes like ``items_{collection_id}`` that are natively readable by
     an external SFEOS app running in read-only mode.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -805,7 +805,7 @@ class ItemsElasticsearchPrivateDriverConfig(CollectionDriverConfig):
     routes — fixing the visibility gap that previously hid this driver
     from the operator's deep view.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
     model_config = ConfigDict(extra="allow")
@@ -816,7 +816,7 @@ class ItemsDuckdbDriverConfig(CollectionDriverConfig):
 
     Absorbs fields previously in ``FileStorageLocationConfig``.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -844,7 +844,7 @@ class ItemsIcebergDriverConfig(CollectionDriverConfig):
     via ``IcebergConfig`` environment variables. Use the ``resolve_*`` helpers
     to obtain the effective values at runtime.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -975,7 +975,7 @@ class ItemsIcebergDriverConfig(CollectionDriverConfig):
 
 class AssetPostgresqlDriverConfig(AssetDriverConfig):
     """PostgreSQL asset driver config."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "assets", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "assets", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -986,7 +986,7 @@ class AssetPostgresqlDriverConfig(AssetDriverConfig):
 
 class AssetElasticsearchDriverConfig(AssetDriverConfig):
     """Elasticsearch asset driver config."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "assets", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "assets", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -1032,7 +1032,7 @@ class ItemsSchema(PluginConfig):
             ],
         )
     """
-    _address: ClassVar[Tuple[str, str, str]] = ("storage", "items", "schema")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "schema")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 

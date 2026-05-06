@@ -26,7 +26,7 @@ from dynastore.modules.db_config.platform_config_service import PluginConfig
 
 class SecurityPluginConfig(PluginConfig):
     """Platform-level security configuration — changeable at runtime."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "security", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "security", None)
 
 
     # -- CORS --

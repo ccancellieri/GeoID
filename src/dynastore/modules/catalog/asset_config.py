@@ -34,7 +34,7 @@ class AssetPluginConfig(PluginConfig):
     Routing is now managed by ``AssetRoutingConfig``
     (identity: ``AssetRoutingConfig.class_key()``).
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("catalog", "asset", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "asset")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 

@@ -19,6 +19,6 @@ from typing import ClassVar, Optional, Tuple
 
 class LogsPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the logs extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "logs", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "logs")
 
     # `enabled` inherited from ExposableConfigMixin — no further fields.

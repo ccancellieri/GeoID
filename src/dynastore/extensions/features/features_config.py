@@ -22,7 +22,7 @@ class FeaturesPluginConfig(ExposableConfigMixin, PluginConfig):
     Runtime configuration for the OGC Features extension.
     Controls caching and visibility.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "features", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "features")
 
     # Caching
     cache_on_demand: bool = Field(

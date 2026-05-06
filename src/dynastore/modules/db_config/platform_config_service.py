@@ -372,7 +372,7 @@ class PluginConfig(PersistentModel):
                 raise TypeError(
                     f"{cls.__module__}.{cls.__qualname__} is a concrete PluginConfig "
                     f"but does not declare ``_address``.  Declare e.g. "
-                    f"``_address: ClassVar[Tuple[str, str, Optional[str]]] = (\"platform\", \"<topic>\", None)`` "
+                    f"``_address: ClassVar[Tuple[str, ...]] = (\"platform\", \"<topic>\", None)`` "
                     f"or mark it abstract via ``is_abstract_base = True``."
                 )
             # Phase 1.5: catch developers who still declare the retired

@@ -94,7 +94,7 @@ class ItemsBigQueryDriverConfig(CollectionDriverConfig):
     Phase 4e adds registered-per-collection Secret-wrapped credentials on the
     config itself; per-request overrides remain deferred.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "items", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 

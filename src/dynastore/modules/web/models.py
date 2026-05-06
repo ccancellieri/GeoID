@@ -58,7 +58,7 @@ class WebPageConfig(BaseModel):
 
 class WebPageSettingsConfig(PluginConfig):
     """Persistent configuration for web pages (overrides)."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "web", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "web")
 
     pages: Dict[str, WebPageConfig] = Field(default_factory=dict)
 

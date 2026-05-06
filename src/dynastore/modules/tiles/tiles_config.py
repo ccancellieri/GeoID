@@ -23,7 +23,7 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
     Runtime configuration for the Tiles extension.
     Controls visibility, bounds, and on-the-fly generation settings.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "tiles", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "tiles", None)
 
 
     # Global mask/bounds
@@ -62,7 +62,7 @@ class TilesPreseedConfig(PluginConfig):
     Configuration for the Tiles Pre-seeding Process.
     This configures the background task that generates and stores tiles.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "tiles", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "tiles", None)
 
     # Implicitly enabled if this config is present and defaults are acceptable, 
     # but explicit flag allows disabling without deleting config.

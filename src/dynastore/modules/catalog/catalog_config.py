@@ -51,7 +51,7 @@ class CollectionType(PluginConfig):
     driver's apply handler refuses payloads containing the lifted key
     (it's removed from the model entirely so Pydantic rejects on parse).
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("collection", "type", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "type")
     _visibility: ClassVar[Optional[str]] = "collection"
 
     kind: CollectionTypeEnum = Field(
@@ -107,7 +107,7 @@ class CollectionPluginConfig(PluginConfig):
     Storage routing is handled by ``ItemsRoutingConfig``
     (``plugin_id = "items_routing_config"``).
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("catalog", "collection", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "envelope")
     _visibility: ClassVar[Optional[str]] = "collection"
 
 
@@ -187,7 +187,7 @@ class CatalogPolicyConfig(PluginConfig):
     source of truth — flipping the catalog default does not retroactively
     re-flag existing collections.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("catalog", "policy", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "policy")
     _visibility: ClassVar[Optional[str]] = "catalog"
 
     default_collection_privacy: Literal["public", "private"] = Field(

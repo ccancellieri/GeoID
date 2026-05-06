@@ -39,7 +39,7 @@ def test_collection_type_is_a_plugin_config():
 
 
 def test_collection_type_address_and_visibility():
-    assert CollectionType._address == ("collection", "type", None)
+    assert CollectionType._address == ("platform", "catalog", "collection", "type")
     assert CollectionType._visibility == "collection"
 
 

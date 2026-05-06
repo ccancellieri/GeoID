@@ -142,7 +142,7 @@ class GcpCatalogBucketConfig(PluginConfig):
     Defines bucket-level configurations for a catalog. These settings are applied
     when the bucket is first created.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "gcp", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "gcp")
     _visibility: ClassVar[Optional[str]] = "catalog"
 
     # Apply handler is registered imperatively at module-import time
@@ -175,7 +175,7 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
     """
     Defines global configurations for the GCP module.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "gcp", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "gcp")
 
     project_id: str = Field(default=os.getenv("PROJECT_ID", "local-project"), description="The GCP Project ID.")
     region: str = Field(default=os.getenv("REGION", "europe-west1"), description="The default GCP region.")
@@ -201,7 +201,7 @@ class GcpCollectionBucketConfig(PluginConfig):
     Defines object-level configurations for a specific collection within a bucket.
     These settings can override catalog-level defaults for objects belonging to this collection.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "gcp", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "gcp")
     _visibility: ClassVar[Optional[str]] = "collection"
 
     custom_metadata_defaults: Optional[Dict[str, str]] = Field(default=None, description="Default metadata to apply to all objects uploaded to this collection.")
@@ -253,7 +253,7 @@ class GcpEventingConfig(PluginConfig):
     Defines the complete, mutable eventing configuration for a catalog. This is
     stored independently from the bucket configuration.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "gcp", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "gcp")
     _visibility: ClassVar[Optional[str]] = "catalog"
 
     # Apply handler is registered imperatively at module-import time

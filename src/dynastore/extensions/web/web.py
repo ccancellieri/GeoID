@@ -329,7 +329,7 @@ class RelativeSlashRedirectMiddleware:
 
 class WebConfig(PluginConfig):
     """Configuration for the Web Platform interface."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "web", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "web")
 
     brand_name: str = "Agro-Informatics Platform"
     brand_subtitle: str = "Catalog Services"

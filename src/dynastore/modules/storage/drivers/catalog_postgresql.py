@@ -224,7 +224,7 @@ class CatalogPostgresqlDriverConfig(_PluginDriverConfig):
     Marked ``Immutable`` because changing the active sidecar set after
     rows exist would orphan domain slices in ``catalog.catalog_metadata_*``.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("storage", "catalog", "drivers")
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "drivers")
     _visibility: ClassVar[Optional[str]] = "catalog"
 
 

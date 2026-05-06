@@ -6,7 +6,7 @@ from dynastore.modules.db_config.platform_config_service import PluginConfig
 
 class TasksPluginConfig(PluginConfig):
     """Configuration for the Background Tasks module."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "tasks", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "tasks")
 
 
     queue_poll_interval: float = Field(
@@ -47,7 +47,7 @@ class TaskRoutingConfig(PluginConfig):
     admin route and trigger the apply-handler that re-narrows the dispatcher's
     CapabilityMap.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "tasks", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "tasks")
 
 
     routing: Dict[str, List[str]] = Field(

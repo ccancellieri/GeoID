@@ -43,7 +43,7 @@ def test_compose_tree_meta_none_suppresses_meta():
     """``meta_mode="none"`` returns ``meta=None`` regardless of payload."""
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry_with_schema(
-        web_config={"_address": ("platform", "web", None)},
+        web_config={"_address": ("platform", "web")},
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -66,7 +66,7 @@ def test_compose_tree_meta_field_attaches_field_docs():
     }
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry_with_schema(
-        web_config={"_address": ("platform", "web", None), "schema": schema},
+        web_config={"_address": ("platform", "web"), "schema": schema},
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -92,7 +92,7 @@ def test_compose_tree_meta_schema_attaches_full_json_schema():
     schema = {"title": "WebConfig", "type": "object", "properties": {}}
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry_with_schema(
-        web_config={"_address": ("platform", "web", None), "schema": schema},
+        web_config={"_address": ("platform", "web"), "schema": schema},
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -113,7 +113,7 @@ def test_compose_tree_meta_field_skips_inherited_classes():
     """
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry_with_schema(
-        web_config={"_address": ("platform", "web", None)},
+        web_config={"_address": ("platform", "web")},
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -142,7 +142,7 @@ def test_compose_tree_catalog_tier_under_upstream_mode_gets_meta():
     by_class = {"elasticsearch_catalog_config": {"private": True}}
     registry = _stub_registry_with_schema(
         elasticsearch_catalog_config={
-            "_address": ("catalog", "elasticsearch", None),
+            "_address": ("platform", "catalog", "elasticsearch"),
             "_visibility": "catalog",
             "schema": schema,
         },
@@ -158,11 +158,11 @@ def test_compose_tree_catalog_tier_under_upstream_mode_gets_meta():
             include_mode="upstream",
         )
     # Upstream mode: rendered inlined at its natural address.
-    assert tree["catalog"]["elasticsearch"]["elasticsearch_catalog_config"] == {"private": True}
+    assert tree["platform"]["catalog"]["elasticsearch"]["elasticsearch_catalog_config"] == {"private": True}
     # No inherited tree under upstream mode.
     assert inherited is None
     # Meta mirrors the configs path.
     assert meta is not None
-    assert meta["catalog"]["elasticsearch"]["elasticsearch_catalog_config"]["field_docs"] == {
+    assert meta["platform"]["catalog"]["elasticsearch"]["elasticsearch_catalog_config"]["field_docs"] == {
         "private": "Private mode.",
     }

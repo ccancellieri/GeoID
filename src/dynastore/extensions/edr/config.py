@@ -19,7 +19,7 @@ from typing import ClassVar, Optional, Tuple
 
 class EDRConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure and runtime guardrail config for the EDR extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "edr", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "edr")
 
 
     # `enabled` inherited from ExposableConfigMixin.

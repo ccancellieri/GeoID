@@ -22,7 +22,7 @@ class WFSPluginConfig(ExposableConfigMixin, PluginConfig):
     Runtime configuration for the WFS extension.
     Controls caching and visibility.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "wfs", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "wfs")
 
     # Caching
     cache_on_demand: bool = Field(

@@ -19,6 +19,6 @@ from typing import ClassVar, Optional, Tuple
 
 class MovingFeaturesPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the moving_features extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "moving_features", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "moving_features")
 
     # `enabled` inherited from ExposableConfigMixin — no further fields.

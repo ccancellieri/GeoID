@@ -15,7 +15,7 @@ from dynastore.modules.db_config.platform_config_service import PluginConfig
 
 
 class VolumesConfig(PluginConfig):
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "volumes", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "volumes")
 
     max_features_per_tile: int = Field(default=10_000, ge=1)
     max_tree_depth: int = Field(default=20, ge=0, le=32)

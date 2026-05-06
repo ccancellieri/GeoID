@@ -5,6 +5,6 @@ from typing import ClassVar, Optional, Tuple
 
 class JoinsPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the OGC API - Joins extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "joins", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "joins")
 
     # `enabled` inherited from ExposableConfigMixin — no further fields.

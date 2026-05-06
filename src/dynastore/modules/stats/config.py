@@ -19,5 +19,5 @@ from typing import ClassVar, Optional, Tuple
 
 class StatsConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the stats extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "stats", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "stats", None)
 

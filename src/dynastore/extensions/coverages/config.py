@@ -20,7 +20,7 @@ from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 
 class CoveragesConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure and runtime guardrail config for the coverages extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "coverages", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "coverages")
 
     # `enabled` inherited from ExposableConfigMixin.
     max_bands_per_request: int = 16

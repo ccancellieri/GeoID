@@ -268,7 +268,7 @@ class StacPluginConfig(ExposableConfigMixin, PluginConfig):
     """
     Mutable STAC metadata and behavior configuration.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "stac", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "stac")
 
     # Extension schemas — URIs advertised on the collection's top-level
     # ``stac_extensions`` array.  Independent of ``auto_render_extensions``

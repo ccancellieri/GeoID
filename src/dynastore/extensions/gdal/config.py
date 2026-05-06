@@ -19,6 +19,6 @@ from typing import ClassVar, Optional, Tuple
 
 class GdalPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the gdal extension."""
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("extensions", "gdal", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "gdal")
 
     # `enabled` inherited from ExposableConfigMixin — no further fields.

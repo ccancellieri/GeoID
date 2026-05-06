@@ -28,7 +28,7 @@ class IngestionPluginConfig(PluginConfig):
     Configuration for the Ingestion Module.
     This can be updated at any time via API.
     """
-    _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "ingestion", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "ingestion")
 
     # 1. Behavior Rules
     on_conflict: WriteConflictPolicy = Field(

@@ -172,9 +172,9 @@ def test_compose_tree_places_classes_by_address():
         "catalog_core_postgresql_driver": {"enabled": True},
     }
     registry = _stub_registry(
-        WebConfig={"_address": ("platform", "web", None)},
+        WebConfig={"_address": ("platform", "web")},
         catalog_core_postgresql_driver={
-            "_address": ("storage", "catalog", "drivers"),
+            "_address": ("platform", "catalog", "drivers"),
             "_visibility": "catalog",
         },
     )
@@ -190,7 +190,7 @@ def test_compose_tree_places_classes_by_address():
             include_mode="upstream",
         )
     assert tree["platform"]["web"]["WebConfig"] == {"brand_name": "x"}
-    assert "catalog_core_postgresql_driver" in tree["storage"]["catalog"]["drivers"]
+    assert "catalog_core_postgresql_driver" in tree["platform"]["catalog"]["drivers"]
     assert meta is None
 
 
@@ -199,7 +199,7 @@ def test_compose_tree_filters_collection_only_from_catalog():
     by_class = {"items_write_policy": {"on_conflict": "update"}}
     registry = _stub_registry(
         items_write_policy={
-            "_address": ("storage", "items", "policy"),
+            "_address": ("platform", "catalog", "collection", "items", "policy"),
             "_visibility": "collection",
         },
     )
@@ -217,7 +217,7 @@ def test_compose_tree_includes_collection_only_at_collection_scope():
     by_class = {"items_write_policy": {"on_conflict": "update"}}
     registry = _stub_registry(
         items_write_policy={
-            "_address": ("storage", "items", "policy"),
+            "_address": ("platform", "catalog", "collection", "items", "policy"),
             "_visibility": "collection",
         },
     )
@@ -228,7 +228,7 @@ def test_compose_tree_includes_collection_only_at_collection_scope():
         tree, _, _ = ConfigApiService._compose_tree(
             by_class, sources={}, active_scope="collection",
         )
-    assert tree["storage"]["items"]["policy"]["items_write_policy"] == {"on_conflict": "update"}
+    assert tree["platform"]["catalog"]["collection"]["items"]["policy"]["items_write_policy"] == {"on_conflict": "update"}
 
 
 def test_compose_tree_drops_abstract_bases():
@@ -380,7 +380,7 @@ async def test_compose_catalog_meta_field_populates_hierarchical_meta(mock_confi
     svc = ConfigApiService(config_service=mock_config_service)
 
     class FakeWebConfig:
-        _address = ("platform", "web", None)
+        _address = ("platform", "web")
         _visibility = None
 
         @classmethod
@@ -427,7 +427,7 @@ def test_compose_tree_address_visibility_filters_correctly():
     by_class = {"CatalogOnly": {"x": 1}}
     registry = _stub_registry(
         CatalogOnly={
-            "_address": ("storage", "catalog", "drivers"),
+            "_address": ("platform", "catalog", "drivers"),
             "_visibility": "catalog",
         },
     )
@@ -441,7 +441,7 @@ def test_compose_tree_address_visibility_filters_correctly():
             tree, _, inherited = ConfigApiService._compose_tree(
                 by_class, sources={"CatalogOnly": scope}, active_scope=scope,
             )
-            assert "CatalogOnly" in tree["storage"]["catalog"]["drivers"]
+            assert "CatalogOnly" in tree["platform"]["catalog"]["drivers"]
             assert inherited is None
         # At collection scope: NOT inlined in body; surfaces in the hierarchical
         # inherited tree at the same natural address with {source} leaf.
@@ -450,7 +450,7 @@ def test_compose_tree_address_visibility_filters_correctly():
         )
         assert "storage" not in tree
         assert inherited is not None
-        assert inherited["storage"]["catalog"]["drivers"]["CatalogOnly"] == {"source": "catalog"}
+        assert inherited["platform"]["catalog"]["drivers"]["CatalogOnly"] == {"source": "catalog"}
 
 
 def test_compose_tree_surfaces_catalog_configs_in_inherited_at_collection_scope():
@@ -475,23 +475,23 @@ def test_compose_tree_surfaces_catalog_configs_in_inherited_at_collection_scope(
     }
     registry = _stub_registry(
         items_postgresql_driver={
-            "_address": ("storage", "items", "drivers"),
+            "_address": ("platform", "catalog", "collection", "items", "drivers"),
             "_visibility": "collection",
         },
         elasticsearch_catalog_config={
-            "_address": ("catalog", "elasticsearch", None),
+            "_address": ("platform", "catalog", "elasticsearch"),
             "_visibility": "catalog",
         },
         catalog_routing_config={
-            "_address": ("storage", "catalog", "routing"),
+            "_address": ("platform", "catalog", "routing"),
             "_visibility": "catalog",
         },
         catalog_postgresql_driver={
-            "_address": ("storage", "catalog", "drivers"),
+            "_address": ("platform", "catalog", "drivers"),
             "_visibility": "catalog",
         },
         web_config={
-            "_address": ("platform", "web", None),
+            "_address": ("platform", "web"),
         },
     )
     with patch(
@@ -503,18 +503,22 @@ def test_compose_tree_surfaces_catalog_configs_in_inherited_at_collection_scope(
         )
 
     # Collection-vis stays in main tree.
-    assert tree["storage"]["items"]["drivers"]["items_postgresql_driver"] == {"sidecars": []}
+    assert tree["platform"]["catalog"]["collection"]["items"]["drivers"]["items_postgresql_driver"] == {"sidecars": []}
     # No sibling ``inherited_from_catalog`` block (Cycle D.3 dropped it).
     assert "inherited_from_catalog" not in tree
-    # Upstream-tier configs are NOT inlined.
-    assert "platform" not in tree
-    assert "catalog" not in tree
+    # Upstream-tier configs are NOT inlined: collection-only configs live at
+    # platform.catalog.collection (and below); web/elasticsearch/catalog-direct
+    # subtrees should be absent.
+    assert "web" not in tree.get("platform", {})
+    assert "elasticsearch" not in tree.get("platform", {}).get("catalog", {})
+    assert "routing" not in tree.get("platform", {}).get("catalog", {})
+    assert "drivers" not in tree.get("platform", {}).get("catalog", {})
     # All upstream-tier configs land in the hierarchical inherited tree
     # at their natural address with {source: <tier>} leaves.
     assert inherited is not None
-    assert inherited["catalog"]["elasticsearch"]["elasticsearch_catalog_config"] == {"source": "catalog"}
-    assert inherited["storage"]["catalog"]["routing"]["catalog_routing_config"] == {"source": "catalog"}
-    assert inherited["storage"]["catalog"]["drivers"]["catalog_postgresql_driver"] == {"source": "catalog"}
+    assert inherited["platform"]["catalog"]["elasticsearch"]["elasticsearch_catalog_config"] == {"source": "catalog"}
+    assert inherited["platform"]["catalog"]["routing"]["catalog_routing_config"] == {"source": "catalog"}
+    assert inherited["platform"]["catalog"]["drivers"]["catalog_postgresql_driver"] == {"source": "catalog"}
     assert inherited["platform"]["web"]["web_config"] == {"source": "platform"}
 
 
@@ -533,10 +537,10 @@ def test_compose_tree_inherited_at_catalog_scope_carries_platform_breadcrumbs():
     }
     registry = _stub_registry(
         catalog_routing_config={
-            "_address": ("storage", "catalog", "routing"),
+            "_address": ("platform", "catalog", "routing"),
             "_visibility": "catalog",
         },
-        web_config={"_address": ("platform", "web", None)},
+        web_config={"_address": ("platform", "web")},
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -546,9 +550,9 @@ def test_compose_tree_inherited_at_catalog_scope_carries_platform_breadcrumbs():
             by_class, sources=sources, active_scope="catalog",
         )
     # Catalog-tier configs stay inlined.
-    assert tree["storage"]["catalog"]["routing"]["catalog_routing_config"] == {"enabled": True}
-    # Platform-tier configs surface in the hierarchical inherited tree.
-    assert "platform" not in tree
+    assert tree["platform"]["catalog"]["routing"]["catalog_routing_config"] == {"enabled": True}
+    # Platform-tier configs surface in the hierarchical inherited tree (NOT in body).
+    assert "web" not in tree.get("platform", {})
     assert inherited is not None
     assert inherited["platform"]["web"]["web_config"] == {"source": "platform"}
 
@@ -559,7 +563,7 @@ def test_compose_tree_inherited_meta_skips_inherited_classes():
     so they do NOT receive ``meta`` entries.
     """
     class FakeESCatConfig:
-        _address = ("catalog", "elasticsearch", None)
+        _address = ("platform", "catalog", "elasticsearch")
         _visibility = "catalog"
 
         @classmethod
@@ -577,11 +581,12 @@ def test_compose_tree_inherited_meta_skips_inherited_classes():
         tree, meta, inherited = ConfigApiService._compose_tree(
             by_class, sources=sources, active_scope="collection", meta_mode="field",
         )
-    # Catalog-tier config NOT in main tree at collection scope (slim).
-    assert "catalog" not in tree
+    # Catalog-tier config NOT in main tree at collection scope (slim) — the
+    # elasticsearch subtree shouldn't appear under platform.catalog.
+    assert "elasticsearch" not in tree.get("platform", {}).get("catalog", {})
     # Surfaces in the hierarchical inherited tree.
     assert inherited is not None
-    assert inherited["catalog"]["elasticsearch"]["elasticsearch_catalog_config"] == {"source": "catalog"}
+    assert inherited["platform"]["catalog"]["elasticsearch"]["elasticsearch_catalog_config"] == {"source": "catalog"}
     # Meta is empty for inherited classes (breadcrumb only, not a docs surface).
     assert meta is not None
     assert "catalog" not in meta
@@ -604,10 +609,10 @@ def test_compose_tree_slim_default_diverts_universal_visibility_to_inherited():
     }
     registry = _stub_registry(
         items_postgresql_driver={
-            "_address": ("storage", "items", "drivers"),
+            "_address": ("platform", "catalog", "collection", "items", "drivers"),
             "_visibility": "collection",
         },
-        web_config={"_address": ("platform", "web", None)},
+        web_config={"_address": ("platform", "web")},
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -619,9 +624,9 @@ def test_compose_tree_slim_default_diverts_universal_visibility_to_inherited():
             # default include_mode="scope"
         )
     # Collection-owned config stays in the body
-    assert tree["storage"]["items"]["drivers"]["items_postgresql_driver"] == {"sidecars": []}
+    assert tree["platform"]["catalog"]["collection"]["items"]["drivers"]["items_postgresql_driver"] == {"sidecars": []}
     # Universal-vis config is diverted to the hierarchical inherited tree, NOT inlined
-    assert "platform" not in tree
+    assert "web" not in tree.get("platform", {})
     assert inherited is not None
     assert inherited["platform"]["web"]["web_config"] == {"source": "platform"}
 
@@ -631,7 +636,7 @@ def test_compose_tree_slim_keeps_collection_overrides_in_body():
     row IS in-scope — it stays in the body."""
     by_class = {"web_config": {"brand_name": "Tenant Override"}}
     registry = _stub_registry(
-        web_config={"_address": ("platform", "web", None)},
+        web_config={"_address": ("platform", "web")},
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -655,9 +660,9 @@ def test_compose_tree_upstream_mode_renders_everything_in_body():
         "items_postgresql_driver": {"sidecars": []},
     }
     registry = _stub_registry(
-        web_config={"_address": ("platform", "web", None)},
+        web_config={"_address": ("platform", "web")},
         items_postgresql_driver={
-            "_address": ("storage", "items", "drivers"),
+            "_address": ("platform", "catalog", "collection", "items", "drivers"),
             "_visibility": "collection",
         },
     )
@@ -671,7 +676,7 @@ def test_compose_tree_upstream_mode_renders_everything_in_body():
         )
     # Both rendered in body, no inherited summary
     assert tree["platform"]["web"]["web_config"] == {"brand_name": "X"}
-    assert tree["storage"]["items"]["drivers"]["items_postgresql_driver"] == {"sidecars": []}
+    assert tree["platform"]["catalog"]["collection"]["items"]["drivers"]["items_postgresql_driver"] == {"sidecars": []}
     assert inherited is None
 
 
@@ -688,7 +693,7 @@ def test_compose_tree_slim_at_platform_scope_is_a_noop():
     tier, nothing is upstream."""
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry(
-        web_config={"_address": ("platform", "web", None)},
+        web_config={"_address": ("platform", "web")},
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -713,7 +718,7 @@ def test_catalog_policy_config_lands_at_catalog_scope():
     """
     from dynastore.modules.catalog.catalog_config import CatalogPolicyConfig
 
-    assert CatalogPolicyConfig._address == ("catalog", "policy", None)
+    assert CatalogPolicyConfig._address == ("platform", "catalog", "policy")
     assert CatalogPolicyConfig._visibility == "catalog"
 
 
@@ -729,7 +734,7 @@ def test_catalog_es_driver_lands_under_storage_drivers_catalog():
         CatalogElasticsearchDriverConfig,
     )
 
-    assert CatalogElasticsearchDriverConfig._address == ("storage", "catalog", "drivers")
+    assert CatalogElasticsearchDriverConfig._address == ("platform", "catalog", "drivers")
     assert CatalogElasticsearchDriverConfig._visibility == "catalog"
 
 
@@ -739,7 +744,7 @@ def test_collection_es_driver_lands_under_storage_drivers_collection():
         CollectionElasticsearchDriverConfig,
     )
 
-    assert CollectionElasticsearchDriverConfig._address == ("storage", "collection", "drivers")
+    assert CollectionElasticsearchDriverConfig._address == ("platform", "catalog", "collection", "drivers")
     assert CollectionElasticsearchDriverConfig._visibility == "catalog"
 
 
@@ -747,7 +752,7 @@ def test_assets_plugin_config_visible_at_all_scopes():
     """Extension config was incorrectly gated to collection by ``Asset*`` name."""
     from dynastore.extensions.assets.config import AssetsPluginConfig
 
-    assert AssetsPluginConfig._address == ("extensions", "assets", None)
+    assert AssetsPluginConfig._address == ("platform", "extensions", "assets")
     assert AssetsPluginConfig._visibility is None  # visible everywhere
 
 
