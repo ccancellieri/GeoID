@@ -39,8 +39,15 @@ logger = logging.getLogger(__name__)
 from dynastore.models.protocols.stats import StatsProtocol
 
 
-def _register_stats_policies() -> None:
-    """Register sysadmin-only access policy for the /stats/* surface."""
+def _register_stats_policies(sysadmin_role_name: Optional[str] = None) -> None:
+    """Register the access policy for the /stats/* surface.
+
+    Args:
+        sysadmin_role_name: Role name bound to ``stats_endpoint_access``.
+            Defaults to ``DefaultRole.SYSADMIN.value`` for back-compat;
+            operators wiring a custom role landscape pass an explicit
+            name (the role name is a foreign key into ``iam.roles``).
+    """
     from dynastore.models.protocols.policies import Policy, Role
 
     pm = get_protocol(PermissionProtocol)
@@ -49,6 +56,8 @@ def _register_stats_policies() -> None:
             "StatsExtension: PermissionProtocol unavailable — stats policies not registered."
         )
         return
+
+    sysadmin_role_name = sysadmin_role_name or DefaultRole.SYSADMIN.value
 
     # /stats/system + /stats/catalogs/{cid}{/collections/{colid}} are operator-
     # facing observability data. Sysadmin-only until per-catalog admin UI is
@@ -62,7 +71,7 @@ def _register_stats_policies() -> None:
     )
     pm.register_policy(policy)
     pm.register_role(
-        Role(name=DefaultRole.SYSADMIN.value, policies=["stats_endpoint_access"])
+        Role(name=sysadmin_role_name, policies=["stats_endpoint_access"])
     )
     logger.info("StatsExtension: stats policy registered.")
 

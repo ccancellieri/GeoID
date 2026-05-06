@@ -49,12 +49,43 @@ from dynastore.tools.discovery import get_protocol, get_protocols, register_plug
 # Register public access policy for web extension
 logger = logging.getLogger(__name__)
 
-def register_web_policies():
-    """Register web extension policies and anonymous role via PermissionProtocol."""
+def register_web_policies(
+    sysadmin_role_name: Optional[str] = None,
+    admin_role_name: Optional[str] = None,
+    user_role_name: Optional[str] = None,
+    anonymous_role_name: Optional[str] = None,
+):
+    """Register web extension policies and anonymous role via PermissionProtocol.
+
+    Role names are foreign keys into ``iam.roles``. Defaults preserve
+    back-compat with seeded ``DefaultRole`` rows; operators wiring a
+    custom role landscape pass explicit names. The condition on the
+    per-catalog dashboard policy uses the same ``sysadmin_role_name``
+    so a single source of truth covers seed-time bindings and runtime
+    bypass checks.
+
+    Args:
+        sysadmin_role_name: Role bound to the platform-tier
+            (``web_sysadmin_access``, ``web_dashboard_platform_access``)
+            policies. Defaults to ``DefaultRole.SYSADMIN.value``.
+        admin_role_name: One of the catalog-tier roles bound to
+            ``web_admin_access``, ``web_dashboard_ogc_compliance_access``,
+            and ``web_dashboard_per_catalog_access``. Defaults to
+            ``DefaultRole.ADMIN.value``.
+        user_role_name: The other catalog-tier role bound to the same
+            three policies. Defaults to ``DefaultRole.USER.value``.
+        anonymous_role_name: Role bound to ``web_public_access``.
+            Defaults to ``DefaultRole.ANONYMOUS.value``.
+    """
     pm = get_protocol(PermissionProtocol)
     if not pm:
         logger.warning("PermissionProtocol not available; web policies not registered.")
         return
+
+    sysadmin_role_name = sysadmin_role_name or DefaultRole.SYSADMIN.value
+    admin_role_name = admin_role_name or DefaultRole.ADMIN.value
+    user_role_name = user_role_name or DefaultRole.USER.value
+    anonymous_role_name = anonymous_role_name or DefaultRole.ANONYMOUS.value
 
     # Anonymous-allowed web paths. Resource patterns are anchored where
     # ambiguity matters because PolicyService uses ``re.match`` (matches at
@@ -92,7 +123,7 @@ def register_web_policies():
         effect="ALLOW",
     )
     pm.register_policy(web_policy)
-    pm.register_role(Role(name=DefaultRole.ANONYMOUS.value, policies=["web_public_access"]))
+    pm.register_role(Role(name=anonymous_role_name, policies=["web_public_access"]))
 
     # Sysadmin-only: POST/DELETE actions on /web/admin/* (demo populate/cleanup, etc.)
     web_sysadmin_policy = Policy(
@@ -113,7 +144,7 @@ def register_web_policies():
         effect="ALLOW",
     )
     pm.register_policy(web_sysadmin_policy)
-    pm.register_role(Role(name=DefaultRole.SYSADMIN.value, policies=["web_sysadmin_access"]))
+    pm.register_role(Role(name=sysadmin_role_name, policies=["web_sysadmin_access"]))
 
     # Admin/authenticated users can reach the catalog-scoped admin pages.
     # The pages themselves rely on server-side API authorization for every
@@ -132,8 +163,8 @@ def register_web_policies():
         effect="ALLOW",
     )
     pm.register_policy(web_admin_policy)
-    pm.register_role(Role(name=DefaultRole.ADMIN.value, policies=["web_admin_access"]))
-    pm.register_role(Role(name=DefaultRole.USER.value, policies=["web_admin_access"]))
+    pm.register_role(Role(name=admin_role_name, policies=["web_admin_access"]))
+    pm.register_role(Role(name=user_role_name, policies=["web_admin_access"]))
 
     # Platform-tier dashboard endpoints (no `catalogs/` segment) — sysadmin only.
     # `ogc-compliance` is intentionally excluded here and granted separately to
@@ -147,7 +178,7 @@ def register_web_policies():
     )
     pm.register_policy(web_dashboard_platform_policy)
     pm.register_role(Role(
-        name=DefaultRole.SYSADMIN.value,
+        name=sysadmin_role_name,
         policies=["web_dashboard_platform_access"],
     ))
 
@@ -160,7 +191,7 @@ def register_web_policies():
         effect="ALLOW",
     )
     pm.register_policy(web_dashboard_ogc_policy)
-    for role_name in (DefaultRole.ADMIN.value, DefaultRole.USER.value):
+    for role_name in (admin_role_name, user_role_name):
         pm.register_role(Role(
             name=role_name,
             policies=["web_dashboard_ogc_compliance_access"],
@@ -175,10 +206,15 @@ def register_web_policies():
         actions=["GET", "OPTIONS"],
         resources=[r"^/web/dashboard/catalogs/[^/]+(/.*)?$"],
         effect="ALLOW",
-        conditions=[Condition(type="catalog_membership_required", config={})],
+        conditions=[
+            Condition(
+                type="catalog_membership_required",
+                config={"sysadmin_role": sysadmin_role_name},
+            )
+        ],
     )
     pm.register_policy(web_dashboard_per_catalog_policy)
-    for role_name in (DefaultRole.ADMIN.value, DefaultRole.USER.value):
+    for role_name in (admin_role_name, user_role_name):
         pm.register_role(Role(
             name=role_name,
             policies=["web_dashboard_per_catalog_access"],

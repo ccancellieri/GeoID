@@ -136,8 +136,16 @@ async def _probe_dashboards_health() -> Dict[str, bool]:
     return result
 
 
-def _register_logs_dashboard_policy() -> None:
-    """Register the sysadmin-only policy guarding the proxy + the page."""
+def _register_logs_dashboard_policy(sysadmin_role_name: Optional[str] = None) -> None:
+    """Register the policy guarding the embedded dashboard proxy + page.
+
+    Args:
+        sysadmin_role_name: Role name bound to
+            ``logs_dashboard_sysadmin_access``. Defaults to
+            ``DefaultRole.SYSADMIN.value`` for back-compat. Operators
+            wiring a custom role landscape pass an explicit name (the
+            role name is a foreign key into ``iam.roles``).
+    """
     from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role
 
     pm = get_protocol(PermissionProtocol)
@@ -146,6 +154,8 @@ def _register_logs_dashboard_policy() -> None:
             "LogExtension: PermissionProtocol unavailable — dashboard policies not registered."
         )
         return
+
+    sysadmin_role_name = sysadmin_role_name or DefaultRole.SYSADMIN.value
 
     public_path = _public_path()
     # Escape regex meta-chars; the framework treats resources as regexes.
@@ -170,7 +180,7 @@ def _register_logs_dashboard_policy() -> None:
     )
     pm.register_policy(policy)
     pm.register_role(
-        Role(name=DefaultRole.SYSADMIN.value, policies=["logs_dashboard_sysadmin_access"])
+        Role(name=sysadmin_role_name, policies=["logs_dashboard_sysadmin_access"])
     )
     logger.info("LogExtension: dashboard policy registered (path=%s).", public_path)
 
