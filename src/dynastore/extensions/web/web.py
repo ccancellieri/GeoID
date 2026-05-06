@@ -1211,17 +1211,11 @@ async function demoAction(action) {
 
         @self.router.get("/", include_in_schema=False)
         async def read_extension_root():
-            # Redirect root to website
             website_index = os.path.join(
                 os.path.dirname(__file__), "static", "website", "index.html"
             )
             if os.path.exists(website_index):
                 return await self.serve_file(website_index)
-            # Fallback to default index if website not present
-            if self.static_dir:
-                index_path = os.path.join(self.static_dir, "index.html")
-                if os.path.exists(index_path):
-                    return await self.serve_file(index_path)
             return HTMLResponse("Not Found", status_code=404)
 
         _dashboard_index = os.path.join(
