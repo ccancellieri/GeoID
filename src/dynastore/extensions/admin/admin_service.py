@@ -34,7 +34,7 @@ from .models import (
     PolicyCreate, PolicyUpdate, PolicyResponse,
     PrincipalResponse, AssignRoleRequest,
 )
-from .policies import register_admin_policies
+from .policies import admin_policies, admin_role_bindings
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +79,19 @@ class AdminService(ExtensionProtocol):
 
     router: APIRouter = APIRouter(tags=["Admin"], prefix="/admin")
 
+    # PolicyContributor: declare authz needs; IAM forwards centrally.
+    # No direct call to PermissionProtocol — keeps the plugin agnostic
+    # of the enforcement implementation.
+    def get_policies(self):
+        return admin_policies()
+
+    def get_role_bindings(self):
+        return admin_role_bindings()
+
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        register_admin_policies()
-        logger.info("AdminService: Policies registered.")
+        # Policies declared via PolicyContributor (get_policies +
+        # get_role_bindings); IAM picks them up centrally.
         yield
 
     # -------------------------------------------------------------------------

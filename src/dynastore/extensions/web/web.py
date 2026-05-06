@@ -49,181 +49,141 @@ from dynastore.tools.discovery import get_protocol, get_protocols, register_plug
 # Register public access policy for web extension
 logger = logging.getLogger(__name__)
 
-def register_web_policies(
+def _web_policies(sysadmin_role_name: Optional[str] = None) -> List[Policy]:
+    """Pure declaration of the web extension's authorization policies.
+
+    Returned to IAM via ``Web.get_policies``; never registers anything.
+    The per-catalog dashboard policy carries ``sysadmin_role`` through
+    its ``catalog_membership_required`` condition so seed-time bindings
+    and runtime bypass checks share a single source of truth.
+    """
+    sysadmin_role_name = sysadmin_role_name or DefaultRole.SYSADMIN.value
+    return [
+        # Anonymous-allowed web paths. Resource patterns are anchored where
+        # ambiguity matters because PolicyService uses ``re.match`` (matches
+        # at start of string, no implicit end anchor) — an unanchored
+        # ``/web`` pattern would also match
+        # ``/web/dashboard/catalogs/X/stats`` and accidentally allow
+        # anonymous access to gated dashboard endpoints.
+        Policy(
+            id="web_public_access",
+            description="Allows anonymous access to web UI, pages, and static assets. "
+                        "Resources are enumerated explicitly + anchored so dashboard "
+                        "data endpoints stay gated by web_dashboard_*_access policies.",
+            actions=["GET", "OPTIONS"],
+            resources=[
+                "/$",
+                "/docs.*",
+                "/openapi.json",
+                "/favicon.ico.*",
+                "/web/?$",
+                "/web/pages/.*",
+                "/web/extension-static/.*",
+                "/web/static/.*",
+                "/web/website/.*",
+                "/web/docs-content/.*",
+                "/web/docs-manifest$",
+                "/web/config/.*",
+                "/web/health$",
+                "/web/dashboard/?$",
+                "/web/lite/.*",
+                "/.well-known/.*",
+                "/processes.*",
+                "/configs/registry$",
+                "/configs/registry/.*",
+                f"/configs/plugins/{WebConfig.class_key()}$",
+            ],
+            effect="ALLOW",
+        ),
+        Policy(
+            id="web_sysadmin_access",
+            description="Grants sysadmin write access to web admin management endpoints.",
+            actions=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            resources=[
+                "/web/admin",
+                "/web/admin/",
+                "/web/admin/.*",
+                "/web/pages/demo_manager",
+                "/web/pages/exposure",
+                "/web/pages/configuration",
+                "/web/pages/governance",
+                "/web/pages/stac-authoring",
+                "/web/pages/ingest",
+            ],
+            effect="ALLOW",
+        ),
+        Policy(
+            id="web_admin_access",
+            description="Allows admins and authenticated users to load the catalog-scoped admin pages.",
+            actions=["GET", "OPTIONS"],
+            resources=[
+                "/web/pages/governance",
+                "/web/pages/stac-authoring",
+                "/web/pages/ingest",
+            ],
+            effect="ALLOW",
+        ),
+        Policy(
+            id="web_dashboard_platform_access",
+            description="Sysadmin-only access to platform-tier dashboard endpoints (stats, logs, events, tasks).",
+            actions=["GET", "OPTIONS"],
+            resources=[r"^/web/dashboard/(stats|logs|events|tasks)/?$"],
+            effect="ALLOW",
+        ),
+        Policy(
+            id="web_dashboard_ogc_compliance_access",
+            description="Read-only OGC conformance check accessible to authenticated users.",
+            actions=["GET", "OPTIONS"],
+            resources=[r"^/web/dashboard/ogc-compliance/?$"],
+            effect="ALLOW",
+        ),
+        Policy(
+            id="web_dashboard_per_catalog_access",
+            description="Per-catalog dashboard access; requires catalog membership.",
+            actions=["GET", "OPTIONS"],
+            resources=[r"^/web/dashboard/catalogs/[^/]+(/.*)?$"],
+            effect="ALLOW",
+            conditions=[
+                Condition(
+                    type="catalog_membership_required",
+                    config={"sysadmin_role": sysadmin_role_name},
+                )
+            ],
+        ),
+    ]
+
+
+def _web_role_bindings(
     sysadmin_role_name: Optional[str] = None,
     admin_role_name: Optional[str] = None,
     user_role_name: Optional[str] = None,
     anonymous_role_name: Optional[str] = None,
-):
-    """Register web extension policies and anonymous role via PermissionProtocol.
-
-    Role names are foreign keys into ``iam.roles``. Defaults preserve
-    back-compat with seeded ``DefaultRole`` rows; operators wiring a
-    custom role landscape pass explicit names. The condition on the
-    per-catalog dashboard policy uses the same ``sysadmin_role_name``
-    so a single source of truth covers seed-time bindings and runtime
-    bypass checks.
-
-    Args:
-        sysadmin_role_name: Role bound to the platform-tier
-            (``web_sysadmin_access``, ``web_dashboard_platform_access``)
-            policies. Defaults to ``DefaultRole.SYSADMIN.value``.
-        admin_role_name: One of the catalog-tier roles bound to
-            ``web_admin_access``, ``web_dashboard_ogc_compliance_access``,
-            and ``web_dashboard_per_catalog_access``. Defaults to
-            ``DefaultRole.ADMIN.value``.
-        user_role_name: The other catalog-tier role bound to the same
-            three policies. Defaults to ``DefaultRole.USER.value``.
-        anonymous_role_name: Role bound to ``web_public_access``.
-            Defaults to ``DefaultRole.ANONYMOUS.value``.
-    """
-    pm = get_protocol(PermissionProtocol)
-    if not pm:
-        logger.warning("PermissionProtocol not available; web policies not registered.")
-        return
-
+) -> List[Role]:
+    """Pure declaration of the web extension's role-to-policy bindings."""
     sysadmin_role_name = sysadmin_role_name or DefaultRole.SYSADMIN.value
     admin_role_name = admin_role_name or DefaultRole.ADMIN.value
     user_role_name = user_role_name or DefaultRole.USER.value
     anonymous_role_name = anonymous_role_name or DefaultRole.ANONYMOUS.value
-
-    # Anonymous-allowed web paths. Resource patterns are anchored where
-    # ambiguity matters because PolicyService uses ``re.match`` (matches at
-    # start of string, no implicit end anchor) — an unanchored ``/web``
-    # pattern would also match ``/web/dashboard/catalogs/X/stats`` and
-    # accidentally allow anonymous access to gated dashboard endpoints.
-    web_policy = Policy(
-        id="web_public_access",
-        description="Allows anonymous access to web UI, pages, and static assets. "
-                    "Resources are enumerated explicitly + anchored so dashboard "
-                    "data endpoints stay gated by web_dashboard_*_access policies.",
-        actions=["GET", "OPTIONS"],
-        resources=[
-            "/$",
-            "/docs.*",
-            "/openapi.json",
-            "/favicon.ico.*",
-            "/web/?$",                 # /web or /web/ exactly (anchored)
-            "/web/pages/.*",           # expose_web_page routes
-            "/web/extension-static/.*", # expose_static routes
-            "/web/static/.*",
-            "/web/website/.*",
-            "/web/docs-content/.*",
-            "/web/docs-manifest$",
-            "/web/config/.*",
-            "/web/health$",
-            "/web/dashboard/?$",       # catalog-picker root only (anonymous-OK)
-            "/web/lite/.*",            # JupyterLite WASM kernel (anonymous-OK)
-            "/.well-known/.*",
-            "/processes.*",
-            "/configs/registry$",
-            "/configs/registry/.*",
-            f"/configs/plugins/{WebConfig.class_key()}$",
-        ],
-        effect="ALLOW",
-    )
-    pm.register_policy(web_policy)
-    pm.register_role(Role(name=anonymous_role_name, policies=["web_public_access"]))
-
-    # Sysadmin-only: POST/DELETE actions on /web/admin/* (demo populate/cleanup, etc.)
-    web_sysadmin_policy = Policy(
-        id="web_sysadmin_access",
-        description="Grants sysadmin write access to web admin management endpoints.",
-        actions=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        resources=[
-            "/web/admin",
-            "/web/admin/",
-            "/web/admin/.*",
-            "/web/pages/demo_manager",     # expose_web_page route
-            "/web/pages/exposure",         # Service Exposure admin page
-            "/web/pages/configuration",    # Configuration Hub admin page
-            "/web/pages/governance",       # Governance admin page (sysadmin + catalog-admin)
-            "/web/pages/stac-authoring",   # STAC catalog/collection authoring
-            "/web/pages/ingest",           # Feature ingest (authenticated write)
-        ],
-        effect="ALLOW",
-    )
-    pm.register_policy(web_sysadmin_policy)
-    pm.register_role(Role(name=sysadmin_role_name, policies=["web_sysadmin_access"]))
-
-    # Admin/authenticated users can reach the catalog-scoped admin pages.
-    # The pages themselves rely on server-side API authorization for every
-    # mutation; they simply render HTML here. Catalog admins need
-    # governance + stac-authoring; any authenticated user can open ingest
-    # (their actual POST calls still go through WritePolicy).
-    web_admin_policy = Policy(
-        id="web_admin_access",
-        description="Allows admins and authenticated users to load the catalog-scoped admin pages.",
-        actions=["GET", "OPTIONS"],
-        resources=[
-            "/web/pages/governance",
-            "/web/pages/stac-authoring",
-            "/web/pages/ingest",
-        ],
-        effect="ALLOW",
-    )
-    pm.register_policy(web_admin_policy)
-    pm.register_role(Role(name=admin_role_name, policies=["web_admin_access"]))
-    pm.register_role(Role(name=user_role_name, policies=["web_admin_access"]))
-
-    # Platform-tier dashboard endpoints (no `catalogs/` segment) — sysadmin only.
-    # `ogc-compliance` is intentionally excluded here and granted separately to
-    # admin+user via `web_dashboard_ogc_compliance_access` below.
-    web_dashboard_platform_policy = Policy(
-        id="web_dashboard_platform_access",
-        description="Sysadmin-only access to platform-tier dashboard endpoints (stats, logs, events, tasks).",
-        actions=["GET", "OPTIONS"],
-        resources=[r"^/web/dashboard/(stats|logs|events|tasks)/?$"],
-        effect="ALLOW",
-    )
-    pm.register_policy(web_dashboard_platform_policy)
-    pm.register_role(Role(
-        name=sysadmin_role_name,
-        policies=["web_dashboard_platform_access"],
-    ))
-
-    # OGC compliance check is read-only conformance info — accessible to any authenticated user.
-    web_dashboard_ogc_policy = Policy(
-        id="web_dashboard_ogc_compliance_access",
-        description="Read-only OGC conformance check accessible to authenticated users.",
-        actions=["GET", "OPTIONS"],
-        resources=[r"^/web/dashboard/ogc-compliance/?$"],
-        effect="ALLOW",
-    )
-    pm.register_policy(web_dashboard_ogc_policy)
-    for role_name in (admin_role_name, user_role_name):
-        pm.register_role(Role(
-            name=role_name,
-            policies=["web_dashboard_ogc_compliance_access"],
-        ))
-
-    # Per-catalog dashboard endpoints — anyone with catalog membership for the
-    # catalog_id present in the URL. The condition handler does the actual
-    # membership check using catalog_id pre-extracted by IamMiddleware.
-    web_dashboard_per_catalog_policy = Policy(
-        id="web_dashboard_per_catalog_access",
-        description="Per-catalog dashboard access; requires catalog membership.",
-        actions=["GET", "OPTIONS"],
-        resources=[r"^/web/dashboard/catalogs/[^/]+(/.*)?$"],
-        effect="ALLOW",
-        conditions=[
-            Condition(
-                type="catalog_membership_required",
-                config={"sysadmin_role": sysadmin_role_name},
-            )
-        ],
-    )
-    pm.register_policy(web_dashboard_per_catalog_policy)
-    for role_name in (admin_role_name, user_role_name):
-        pm.register_role(Role(
-            name=role_name,
-            policies=["web_dashboard_per_catalog_access"],
-        ))
+    return [
+        Role(name=anonymous_role_name, policies=["web_public_access"]),
+        Role(name=sysadmin_role_name, policies=["web_sysadmin_access"]),
+        Role(name=admin_role_name, policies=["web_admin_access"]),
+        Role(name=user_role_name, policies=["web_admin_access"]),
+        Role(name=sysadmin_role_name, policies=["web_dashboard_platform_access"]),
+        Role(name=admin_role_name, policies=["web_dashboard_ogc_compliance_access"]),
+        Role(name=user_role_name, policies=["web_dashboard_ogc_compliance_access"]),
+        Role(name=admin_role_name, policies=["web_dashboard_per_catalog_access"]),
+        Role(name=user_role_name, policies=["web_dashboard_per_catalog_access"]),
+    ]
 
 
-    logger.debug("Web policies registered via PermissionProtocol.")
+def _register_anonymous_principal() -> None:
+    """Register the platform's anonymous Principal so discovery returns it.
 
-    # Register Anonymous Principal as a plugin for discovery
+    Distinct from policy registration: this is identity scaffolding, not
+    authz wiring. Kept as an explicit side-effecting call that runs once
+    at extension init.
+    """
     register_plugin(
         Principal(
             provider="system",
@@ -461,10 +421,20 @@ class Web(ExtensionProtocol):
         #     app.router.routes.insert(0, app.router.routes.pop())
         #     logger.info("WebService: No root ('/') endpoint found. Added redirect to '/web'.")
 
+    # PolicyContributor: declare authz needs; IAM forwards centrally.
+    # No direct call to PermissionProtocol — keeps the plugin agnostic
+    # of the enforcement implementation.
+    def get_policies(self):
+        return _web_policies()
+
+    def get_role_bindings(self):
+        return _web_role_bindings()
+
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        register_web_policies()
-        logger.info("WebService: Policies registered.")
+        # Policies declared via PolicyContributor (get_policies +
+        # get_role_bindings); IAM picks them up centrally.
+        _register_anonymous_principal()
 
         # Register push-based CORS config handler
         from dynastore.modules.iam.security_config import SecurityPluginConfig
@@ -1628,7 +1598,8 @@ async function demoAction(action) {
 
         # ------------------------------------------------------------------ #
         # Dashboard data endpoints — TWO TIERS, both gated declaratively by  #
-        # PermissionProtocol policies registered in register_web_policies():  #
+        # PermissionProtocol policies declared by Web.get_policies() +     #
+        # forwarded by IAM via PolicyContributor:                          #
         #                                                                     #
         #   Platform tier  : /web/dashboard/{stats|logs|events|tasks}        #
         #     Sysadmin-only via web_dashboard_platform_access policy.         #
