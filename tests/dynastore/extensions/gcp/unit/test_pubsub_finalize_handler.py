@@ -142,6 +142,45 @@ async def test_finalize_returns_204_on_activation(client: TestClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_message_attribute_catalog_id_wins_over_subscription_naming(
+    client: TestClient,
+) -> None:
+    """F5 hardening: catalog_id from ``message.attributes`` is the
+    authoritative source — even when the subscription name encodes a
+    different value, the message-attribute wins.
+
+    This pins the contract that GCS notification ``custom_attributes``
+    (set up in ``modules/gcp/gcp_eventing_ops.py``) flow through to the
+    consumer regardless of subscription-naming drift.
+    """
+    # Subscription name encodes "ds-WRONG-default-sub" — if the handler
+    # falls back to name-parsing, catalog_id would resolve to "WRONG".
+    envelope = make_pubsub_envelope(catalog_id="real_catalog")
+    envelope["subscription"] = "projects/p/subscriptions/ds-WRONG-default-sub"
+
+    seen_catalog_ids: list[str] = []
+
+    async def _spy(catalog_id: str, *args, **kwargs):
+        seen_catalog_ids.append(catalog_id)
+        return ActivationOutcome(asset_id="a", action="activated")
+
+    with patch(
+        "dynastore.extensions.gcp.gcp_events.handle_asset_events",
+        new=_spy,
+    ):
+        from dynastore.extensions.gcp import gcp_events as ge
+        ge._gcp_event_listeners.clear()
+        ge.register_gcp_event_listener("*", ge.handle_gcs_notification)
+        resp = client.post("/gcp/events/pubsub-push", json=envelope)
+
+    assert resp.status_code == 204
+    assert seen_catalog_ids == ["real_catalog"], (
+        f"Expected catalog_id from message.attributes, got "
+        f"{seen_catalog_ids!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_finalize_returns_204_on_idempotent_redelivery(
     client: TestClient,
 ) -> None:

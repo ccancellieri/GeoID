@@ -54,6 +54,7 @@ from dynastore.modules.gcp.models import (
     PushSubscriptionConfig,
     PUBSUB_JWT_AUDIENCE,
 )
+from dynastore.modules.gcp.tools import bucket as bucket_tool
 from dynastore.modules.catalog.lifecycle_manager import LifecycleContext
 
 logger = logging.getLogger(__name__)
@@ -370,15 +371,41 @@ class GcpEventingOpsMixin:
             None
         ]  # None means entire bucket
 
+        # Stamp catalog_id (and where applicable, collection_id) on every
+        # message GCS publishes for this notification. The Pub/Sub HTTP
+        # push handler reads message.attributes via the get_attr() helper
+        # in bucket_service, so this gives the consumer a third independent
+        # source for catalog_id (after pushConfig HTTP headers + manually
+        # injected attributes), robust against subscription-config drift
+        # / orphaned notifications inherited from a previous deployment.
+        notification_attributes: Dict[str, str] = {
+            "catalog_id": catalog_id,
+            "subscription_type": "managed",
+        }
+
         for prefix in prefixes_to_setup:
+            # Per-prefix attributes: the catalog_id is constant; the
+            # collection_id is derivable from the prefix when it points at
+            # collections/<collection_id>/. Stamping it pre-empts the
+            # path-parse fallback in handle_gcs_notification for the common
+            # collection-tier case.
+            prefix_attributes = dict(notification_attributes)
+            if prefix and prefix.startswith(f"{bucket_tool.COLLECTIONS_FOLDER}/"):
+                # prefix shape: "collections/<collection_id>/" (trailing slash optional)
+                tail = prefix[len(bucket_tool.COLLECTIONS_FOLDER) + 1 :].rstrip("/")
+                if tail and "/" not in tail:
+                    prefix_attributes["collection_id"] = tail
+
             match_found = False
             for notif in (existing_notifications or []):
                 # topic_name in GCS notification is the short ID, not full path
                 if notif.topic_name == topic_id and notif.topic_project == project_id:
+                    existing_attrs = dict(notif.custom_attributes or {})
                     if (
                         notif.blob_name_prefix == prefix
                         and set(notif.event_types or []) == set(event_types)
                         and notif.payload_format == managed_config.payload_format
+                        and existing_attrs == prefix_attributes
                     ):
                         managed_config.gcs_notification_ids.append(
                             notif.notification_id
@@ -396,12 +423,16 @@ class GcpEventingOpsMixin:
                     payload_format=managed_config.payload_format,
                     event_types=event_types,
                     blob_name_prefix=prefix,
+                    custom_attributes=prefix_attributes,
                 )
 
                 await run_in_thread(notification.create)
                 managed_config.gcs_notification_ids.append(notification.notification_id or "")
                 logger.info(
-                    f"Successfully created GCS notification '{notification.notification_id}' for prefix '{prefix}' on bucket '{bucket_name}'."
+                    f"Successfully created GCS notification "
+                    f"'{notification.notification_id}' for prefix '{prefix}' on "
+                    f"bucket '{bucket_name}' with attributes "
+                    f"{list(prefix_attributes.keys())}."
                 )
 
         managed_config.bucket_id = bucket_name
