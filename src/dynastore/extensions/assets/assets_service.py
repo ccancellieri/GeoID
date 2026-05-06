@@ -47,12 +47,13 @@ from fastapi import Depends
 from dynastore.modules.catalog.catalog_module import CatalogModule
 from dynastore.modules.catalog.asset_service import (
     Asset,
-    AssetBase,
+    AssetCreate,
     AssetFilter,
     AssetUpdate,
     AssetUploadDefinition,
     AssetReference,
     AssetReferencedError,
+    VirtualAssetCreate,
 )
 from dynastore.modules.catalog.asset_tasks_spi import AssetTasksSPI
 from dynastore.modules.processes.models import (
@@ -157,6 +158,25 @@ class AssetService(ExtensionProtocol):
             status_code=status.HTTP_204_NO_CONTENT,
             summary="Delete All Catalog Assets",
         )
+        # Virtual asset register routes (catalog + collection scoped).
+        # External-href registrations land here so they don't collide with the
+        # physical-asset upload-create surface.
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/virtual-assets",
+            self.create_catalog_virtual_asset,
+            methods=["POST"],
+            response_model=Asset,
+            status_code=status.HTTP_201_CREATED,
+            summary="Register Virtual Catalog Asset",
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/virtual-assets",
+            self.create_collection_virtual_asset,
+            methods=["POST"],
+            response_model=Asset,
+            status_code=status.HTTP_201_CREATED,
+            summary="Register Virtual Collection Asset",
+        )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/collections/{collection_id}",
             self.list_collection_assets,
@@ -193,7 +213,7 @@ class AssetService(ExtensionProtocol):
             summary="Delete Asset",
             description=(
                 "Deletes an asset by ID. "
-                "Soft-delete (default) sets `deleted_at`; hard-delete (`force=true`) removes "
+                "Soft-delete (default) sets `status='deleted'`; hard-delete (`force=true`) removes "
                 "the row entirely. Hard-deletion is **blocked** (HTTP 409) when the asset is "
                 "owned by a storage backend (`owned_by` is set) and one or more non-cascading "
                 "references remain. Use `GET .../references` to diagnose blocking references."
@@ -505,9 +525,9 @@ class AssetService(ExtensionProtocol):
 
     async def create_catalog_asset(
         self,
-        asset_in: AssetBase, catalog_id: str = Path(..., description="The catalog ID")
+        asset_in: AssetCreate, catalog_id: str = Path(..., description="The catalog ID")
     ):
-        """Creates a new asset at the catalog level."""
+        """Creates a new physical asset at the catalog level."""
         await require_catalog_ready(catalog_id)
         try:
             return await self.assets.create_asset(
@@ -519,6 +539,24 @@ class AssetService(ExtensionProtocol):
                 resource_name="Asset",
                 resource_id=f"{catalog_id}:{asset_in.asset_id}",
                 operation="Catalog asset creation",
+            )
+
+    async def create_catalog_virtual_asset(
+        self,
+        asset_in: VirtualAssetCreate, catalog_id: str = Path(..., description="The catalog ID")
+    ):
+        """Registers a virtual (external-href) asset at the catalog level."""
+        await require_catalog_ready(catalog_id)
+        try:
+            return await self.assets.create_asset(
+                catalog_id=catalog_id, asset=asset_in, collection_id=None
+            )
+        except Exception as e:
+            raise handle_exception(
+                e,
+                resource_name="Asset",
+                resource_id=f"{catalog_id}:{asset_in.asset_id}",
+                operation="Catalog virtual-asset registration",
             )
 
 
@@ -625,15 +663,15 @@ class AssetService(ExtensionProtocol):
 
     async def create_collection_asset(
         self,
-        asset_in: AssetBase,
+        asset_in: AssetCreate,
         catalog_id: str = Path(..., description="The catalog ID"),
         collection_id: str = Path(..., description="The collection ID"),
     ):
-        """Creates a new asset associated with a specific collection."""
+        """Creates a new physical asset associated with a specific collection."""
         await require_catalog_ready(catalog_id)
-        # Ensure the asset object has the correct collection linkage if passed, or override
-        # We rely on arguments passed to create_asset, but asset_in might have conflicting info?
-        # AssetBase doesn't have collection_id, so it's fine.
+        # The body carries asset identity (asset_id, filename); collection
+        # scope comes from the path. AssetCreate has no collection_id field
+        # so there is no conflict to reconcile.
         try:
             return await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=collection_id
@@ -644,6 +682,26 @@ class AssetService(ExtensionProtocol):
                 resource_name="Asset",
                 resource_id=f"{catalog_id}:{collection_id}:{asset_in.asset_id}",
                 operation="Collection asset creation",
+            )
+
+    async def create_collection_virtual_asset(
+        self,
+        asset_in: VirtualAssetCreate,
+        catalog_id: str = Path(..., description="The catalog ID"),
+        collection_id: str = Path(..., description="The collection ID"),
+    ):
+        """Registers a virtual (external-href) asset under a specific collection."""
+        await require_catalog_ready(catalog_id)
+        try:
+            return await self.assets.create_asset(
+                catalog_id=catalog_id, asset=asset_in, collection_id=collection_id
+            )
+        except Exception as e:
+            raise handle_exception(
+                e,
+                resource_name="Asset",
+                resource_id=f"{catalog_id}:{collection_id}:{asset_in.asset_id}",
+                operation="Collection virtual-asset registration",
             )
 
 
@@ -1487,13 +1545,14 @@ class AssetService(ExtensionProtocol):
     ):
         asset = await self._load_asset(catalog_id, asset_id, collection_id)
 
-        # Fallback for external-URL assets with no registered process: redirect to the URI.
+        # Fallback for external-URL assets with no registered process: redirect to the URI/href.
         process = self._find_process(process_id)
         if process is None:
-            if process_id == "download" and asset.uri.startswith(("http://", "https://")):
+            target = asset.href or asset.uri
+            if process_id == "download" and target and target.startswith(("http://", "https://")):
                 from fastapi.responses import RedirectResponse
 
-                return RedirectResponse(asset.uri, status_code=status.HTTP_302_FOUND)
+                return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
             raise HTTPException(
                 status_code=404,
                 detail=f"Asset process {process_id!r} is not registered.",

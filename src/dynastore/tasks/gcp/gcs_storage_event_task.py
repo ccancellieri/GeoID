@@ -85,14 +85,19 @@ class GcsStorageEventTask(TaskProtocol):
                 f"GcsStorageEventTask: Creating asset '{asset_id}' "
                 f"in {catalog_id}:{collection_id or ''} from GCS OBJECT_FINALIZE."
             )
-            from dynastore.modules.catalog.asset_service import AssetBase, AssetTypeEnum
+            from dynastore.modules.catalog.asset_service import AssetCreate, AssetTypeEnum
+            import os as _os
             asset_type = AssetTypeEnum(inputs.asset_type)
+            # Storage-event finalize: the bytes already exist in GCS, so we
+            # land an ACTIVE physical row with the resolved URI in one shot.
+            filename_val = _os.path.basename(inputs.uri.rstrip('/')) or asset_id
             await assets.create_asset(
                 catalog_id=catalog_id,
                 collection_id=collection_id,
-                asset=AssetBase(
-                    uri=inputs.uri,
+                asset=AssetCreate(
                     asset_id=asset_id,
+                    filename=filename_val,
+                    uri=inputs.uri,
                     asset_type=asset_type,
                     metadata=inputs.metadata,
                     owned_by="gcs",

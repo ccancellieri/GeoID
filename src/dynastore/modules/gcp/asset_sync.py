@@ -77,7 +77,7 @@ class BucketAnnotationPatcher:
         if parsed is None:
             return
         bucket_name, blob_path = parsed
-        ctx = f"{catalog_id}/{collection_id or '_catalog_'}/{asset_id}"
+        ctx = f"{catalog_id}/{collection_id or '<catalog-tier>'}/{asset_id}"
 
         try:
             from dynastore.modules.gcp.gcp_module import GCPModule

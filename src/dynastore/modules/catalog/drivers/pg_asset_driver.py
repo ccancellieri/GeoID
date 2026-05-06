@@ -68,8 +68,6 @@ from dynastore.tools.json import CustomJSONEncoder
 
 logger = logging.getLogger(__name__)
 
-_CATALOG_LEVEL_COLLECTION_ID = "_catalog_"
-
 
 class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
     """PostgreSQL implementation of ``AssetStore``.
@@ -156,20 +154,61 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
             )
             return
 
+        # New asset shape: discriminated by ``kind`` (physical/virtual) with
+        # ``status`` lifecycle; identity columns split into ``filename`` (set
+        # for physical) and ``href`` (set for virtual). NULL ``collection_id``
+        # represents catalog-tier rows; we provision a DEFAULT partition to
+        # land them. Partial unique indexes guard filename per collection scope
+        # and href per catalog scope, both ignoring soft-deleted rows.
+        #
+        # We can't use a classic PRIMARY KEY here because ``collection_id`` is
+        # nullable for the catalog tier and PG requires NOT NULL on PK columns.
+        # Instead we declare a UNIQUE NULLS NOT DISTINCT index over the same
+        # tuple (PG 15+) — semantically a primary identity, while permitting
+        # NULL collection_id rows to coexist.
+        schema_tag = schema.replace('.', '_')
         assets_ddl = f"""
         CREATE TABLE IF NOT EXISTS "{schema}".assets (
             asset_id      VARCHAR      NOT NULL,
             catalog_id    VARCHAR      NOT NULL,
-            collection_id VARCHAR      NOT NULL DEFAULT '_catalog_',
+            collection_id VARCHAR,
             asset_type    VARCHAR      NOT NULL,
-            uri           TEXT         NOT NULL,
-            created_at    TIMESTAMPTZ  DEFAULT NOW(),
-            deleted_at    TIMESTAMPTZ  DEFAULT NULL,
+            kind          VARCHAR      NOT NULL,
+            status        VARCHAR      NOT NULL DEFAULT 'pending',
+            filename      VARCHAR,
+            href          TEXT,
+            uri           TEXT,
+            content_hash  VARCHAR(64),
+            size_bytes    BIGINT,
             metadata      JSONB        DEFAULT '{{}}'::jsonb,
-            owned_by      VARCHAR      DEFAULT NULL,
-            PRIMARY KEY (collection_id, asset_id)
+            owned_by      VARCHAR,
+            created_at    TIMESTAMPTZ  DEFAULT NOW(),
+            updated_at    TIMESTAMPTZ,
+            CONSTRAINT assets_kind_check
+                CHECK (kind IN ('physical','virtual')),
+            CONSTRAINT assets_status_check
+                CHECK (status IN ('pending','active','failed','deleted')),
+            CONSTRAINT assets_kind_identity_check
+                CHECK ((kind = 'physical' AND filename IS NOT NULL)
+                    OR (kind = 'virtual'  AND href     IS NOT NULL)),
+            CONSTRAINT assets_identity_uq
+                UNIQUE NULLS NOT DISTINCT (catalog_id, collection_id, asset_id)
         ) PARTITION BY LIST (collection_id);
-        CREATE INDEX IF NOT EXISTS idx_assets_created_at_{schema.replace('.', '_')}
+        CREATE TABLE IF NOT EXISTS "{schema}".assets_catalog_tier
+            PARTITION OF "{schema}".assets
+            FOR VALUES IN (NULL);
+        CREATE UNIQUE INDEX IF NOT EXISTS assets_uq_filename_{schema_tag}
+            ON "{schema}".assets (catalog_id, collection_id, filename)
+            WHERE kind = 'physical' AND status <> 'deleted';
+        CREATE UNIQUE INDEX IF NOT EXISTS assets_uq_href_{schema_tag}
+            ON "{schema}".assets (catalog_id, collection_id, href)
+            WHERE kind = 'virtual' AND status <> 'deleted';
+        CREATE INDEX IF NOT EXISTS assets_status_idx_{schema_tag}
+            ON "{schema}".assets (status);
+        CREATE INDEX IF NOT EXISTS assets_pending_idx_{schema_tag}
+            ON "{schema}".assets (catalog_id, collection_id, filename)
+            WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS idx_assets_created_at_{schema_tag}
             ON "{schema}".assets (created_at);
         """
 
@@ -206,7 +245,7 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         catalog but does NOT drop the parent ``assets`` table — that lives
         with the schema itself.
 
-        ``soft=True`` is a no-op (assets have soft-delete via ``deleted_at``).
+        ``soft=True`` is a no-op (assets carry soft-delete via ``status='deleted'``).
         """
         if soft:
             return
@@ -247,12 +286,17 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         *,
         db_resource: Optional[DbResource] = None,
     ) -> None:
-        """Upsert a single asset document (dict representation of ``AssetBase``)."""
+        """Upsert a single asset document.
+
+        Existing call sites (Stage 2) pass ``kind="physical"`` /
+        ``status="active"`` defaults so ingestion paths keep working until
+        Stage 4 wires the policy-gated PENDING insert.
+        """
         from dynastore.modules.db_config.partition_tools import (
             ensure_partition_exists as ensure_partition_tool,
         )
 
-        collection_id = asset_doc.get("collection_id") or _CATALOG_LEVEL_COLLECTION_ID
+        collection_id = asset_doc.get("collection_id")
         schema = await self._resolve_schema(catalog_id, db_resource)
         if not schema:
             raise ValueError(
@@ -260,29 +304,47 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
             )
 
         async with managed_transaction(db_resource or self.engine) as conn:
-            await ensure_partition_tool(
-                conn,
-                table_name="assets",
-                strategy="LIST",
-                partition_value=collection_id,
-                schema=schema,
-                parent_table_name="assets",
-                parent_table_schema=schema,
-            )
+            # NULL collection_id rows land in the default partition created in
+            # ensure_storage; only non-NULL values need a per-value partition.
+            if collection_id is not None:
+                await ensure_partition_tool(
+                    conn,
+                    table_name="assets",
+                    strategy="LIST",
+                    partition_value=collection_id,
+                    schema=schema,
+                    parent_table_name="assets",
+                    parent_table_schema=schema,
+                )
 
             now = datetime.now(timezone.utc)
+            kind_val = asset_doc.get("kind") or "physical"
+            status_val = asset_doc.get("status") or "active"
+            # ``ON CONFLICT ON CONSTRAINT assets_identity_uq`` resolves the
+            # upsert against the NULLS-NOT-DISTINCT unique constraint, so
+            # catalog-tier rows (collection_id IS NULL) participate in the
+            # upsert just like collection-scoped rows.
             sql = text(f"""
                 INSERT INTO "{schema}".assets
-                    (asset_id, catalog_id, collection_id, asset_type, uri,
-                     created_at, metadata, owned_by)
+                    (asset_id, catalog_id, collection_id, asset_type, kind, status,
+                     filename, href, uri, content_hash, size_bytes,
+                     created_at, updated_at, metadata, owned_by)
                 VALUES
-                    (:asset_id, :catalog_id, :collection_id, :asset_type, :uri,
-                     :created_at, :metadata, :owned_by)
-                ON CONFLICT (collection_id, asset_id) DO UPDATE SET
-                    uri        = EXCLUDED.uri,
-                    metadata   = EXCLUDED.metadata,
-                    owned_by   = EXCLUDED.owned_by,
-                    deleted_at = NULL
+                    (:asset_id, :catalog_id, :collection_id, :asset_type, :kind, :status,
+                     :filename, :href, :uri, :content_hash, :size_bytes,
+                     :created_at, :updated_at, :metadata, :owned_by)
+                ON CONFLICT ON CONSTRAINT assets_identity_uq DO UPDATE SET
+                    asset_type   = EXCLUDED.asset_type,
+                    kind         = EXCLUDED.kind,
+                    status       = EXCLUDED.status,
+                    filename     = EXCLUDED.filename,
+                    href         = EXCLUDED.href,
+                    uri          = EXCLUDED.uri,
+                    content_hash = EXCLUDED.content_hash,
+                    size_bytes   = EXCLUDED.size_bytes,
+                    metadata     = EXCLUDED.metadata,
+                    owned_by     = EXCLUDED.owned_by,
+                    updated_at   = EXCLUDED.updated_at
             """)
             await DQLQuery(sql, result_handler=ResultHandler.ROWCOUNT).execute(
                 conn,
@@ -290,8 +352,15 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 asset_type=asset_doc.get("asset_type", "ASSET"),
-                uri=asset_doc["uri"],
+                kind=kind_val,
+                status=status_val,
+                filename=asset_doc.get("filename"),
+                href=asset_doc.get("href"),
+                uri=asset_doc.get("uri"),
+                content_hash=asset_doc.get("content_hash"),
+                size_bytes=asset_doc.get("size_bytes"),
                 created_at=asset_doc.get("created_at") or now,
+                updated_at=asset_doc.get("updated_at") or now,
                 metadata=json.dumps(
                     asset_doc.get("metadata", {}), cls=CustomJSONEncoder
                 ),
@@ -311,19 +380,18 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         if not schema:
             return
 
-        target_col = collection_id or _CATALOG_LEVEL_COLLECTION_ID
         sql = text(f"""
             DELETE FROM "{schema}".assets
             WHERE asset_id = :asset_id
               AND catalog_id = :catalog_id
-              AND collection_id = :collection_id
+              AND collection_id IS NOT DISTINCT FROM :collection_id
         """)
         async with managed_transaction(db_resource or self.engine) as conn:
             await DQLQuery(sql, result_handler=ResultHandler.ROWCOUNT).execute(
                 conn,
                 asset_id=asset_id,
                 catalog_id=catalog_id,
-                collection_id=target_col,
+                collection_id=collection_id,
             )
 
     async def get_asset(
@@ -339,34 +407,27 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         if not schema:
             return None
 
-        # Without collection_id, search across all partitions via the parent table.
-        if collection_id:
-            sql = f"""
-                SELECT asset_id, catalog_id, collection_id, asset_type, uri,
-                       created_at, deleted_at, metadata, owned_by
-                FROM "{schema}".assets
-                WHERE asset_id = :asset_id
-                  AND catalog_id = :catalog_id
-                  AND collection_id = :collection_id
-                  AND deleted_at IS NULL
-                LIMIT 1
-            """
-            params: Dict[str, Any] = {
-                "asset_id": asset_id,
-                "catalog_id": catalog_id,
-                "collection_id": collection_id,
-            }
-        else:
-            sql = f"""
-                SELECT asset_id, catalog_id, collection_id, asset_type, uri,
-                       created_at, deleted_at, metadata, owned_by
-                FROM "{schema}".assets
-                WHERE asset_id = :asset_id
-                  AND catalog_id = :catalog_id
-                  AND deleted_at IS NULL
-                LIMIT 1
-            """
-            params = {"asset_id": asset_id, "catalog_id": catalog_id}
+        # ``collection_id`` is None means: caller wants the catalog-tier row
+        # (NULL collection_id). Use IS NOT DISTINCT FROM so a NULL parameter
+        # matches a NULL column. Without scoping at all, the search route is
+        # used; this method is the single-row lookup so the parameter value
+        # (None or a string) drives the scope.
+        sql = f"""
+            SELECT asset_id, catalog_id, collection_id, asset_type, kind, status,
+                   filename, href, uri, content_hash, size_bytes,
+                   created_at, updated_at, metadata, owned_by
+            FROM "{schema}".assets
+            WHERE asset_id = :asset_id
+              AND catalog_id = :catalog_id
+              AND collection_id IS NOT DISTINCT FROM :collection_id
+              AND status <> 'deleted'
+            LIMIT 1
+        """
+        params: Dict[str, Any] = {
+            "asset_id": asset_id,
+            "catalog_id": catalog_id,
+            "collection_id": collection_id,
+        }
 
         async with managed_transaction(db_resource or self.engine) as conn:
             return await DQLQuery(
@@ -392,15 +453,14 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         if not schema:
             return []
 
-        target_col = collection_id or _CATALOG_LEVEL_COLLECTION_ID
         where_parts = [
             "catalog_id = :catalog_id",
-            "collection_id = :collection_id",
-            "deleted_at IS NULL",
+            "collection_id IS NOT DISTINCT FROM :collection_id",
+            "status <> 'deleted'",
         ]
         params: Dict[str, Any] = {
             "catalog_id": catalog_id,
-            "collection_id": target_col,
+            "collection_id": collection_id,
             "limit": limit,
             "offset": offset,
         }
@@ -421,8 +481,9 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
                 params[key] = value
 
         sql = (
-            f'SELECT asset_id, catalog_id, collection_id, asset_type, uri, '
-            f'created_at, deleted_at, metadata, owned_by '
+            f'SELECT asset_id, catalog_id, collection_id, asset_type, kind, status, '
+            f'filename, href, uri, content_hash, size_bytes, '
+            f'created_at, updated_at, metadata, owned_by '
             f'FROM "{schema}".assets '
             f'WHERE {" AND ".join(where_parts)} '
             f'ORDER BY created_at DESC LIMIT :limit OFFSET :offset'
@@ -504,17 +565,23 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
 
         now = datetime.now(timezone.utc)
 
+        # Build WHERE.
+        # - Always filter by catalog_id.
+        # - When asset_id is given, also pin to a single (collection_id) scope
+        #   using IS NOT DISTINCT FROM so NULL (catalog-tier) matches NULL.
+        # - When asset_id is absent and collection_id is provided, filter by
+        #   that collection only; if both are absent, the operation spans the
+        #   whole catalog.
         where_clauses = ["catalog_id = :cat"]
         params: Dict[str, Any] = {"cat": catalog_id, "now": now}
         if asset_id:
             where_clauses.append("asset_id = :aid")
             params["aid"] = asset_id
-        if collection_id:
-            where_clauses.append("collection_id = :coll")
+            where_clauses.append("collection_id IS NOT DISTINCT FROM :coll")
             params["coll"] = collection_id
-        elif asset_id:
-            where_clauses.append("collection_id = :coll")
-            params["coll"] = _CATALOG_LEVEL_COLLECTION_ID
+        elif collection_id is not None:
+            where_clauses.append("collection_id IS NOT DISTINCT FROM :coll")
+            params["coll"] = collection_id
 
         where_stmt = " AND ".join(where_clauses)
 
@@ -544,7 +611,7 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
             prefix = (
                 f'DELETE FROM "{schema}".assets'
                 if hard
-                else f'UPDATE "{schema}".assets SET deleted_at = :now'
+                else f"UPDATE \"{schema}\".assets SET status = 'deleted', updated_at = :now"
             )
             final_sql = text(f"{prefix} WHERE {where_stmt}")
             rowcount = await DQLQuery(

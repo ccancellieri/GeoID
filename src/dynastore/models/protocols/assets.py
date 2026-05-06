@@ -46,7 +46,7 @@ Quick reference
     # Create
     asset = await assets.create_asset(
         catalog_id="my_catalog",
-        asset=AssetBase(asset_id="scene_001", uri="gs://bucket/scene.tif"),
+        asset=AssetCreate(asset_id="scene_001", filename="scene.tif"),
     )
 
     # Read
@@ -208,8 +208,9 @@ class AssetsProtocol(Protocol):
         """
         Deletes assets matching criteria.
 
-        Soft deletes (``hard=False``) set ``deleted_at``; hard deletes remove the
-        row entirely.  For assets with ``owned_by`` set, hard deletion is blocked
+        Soft deletes (``hard=False``) set ``status='deleted'``; hard deletes
+        remove the row entirely.  For assets with ``owned_by`` set, hard
+        deletion is blocked
         (``AssetReferencedError``) when non-cascading references remain.
 
         Args:

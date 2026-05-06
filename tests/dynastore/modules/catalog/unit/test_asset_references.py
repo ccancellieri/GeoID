@@ -187,23 +187,23 @@ class TestAssetReferencedError:
 
 class TestAssetBase:
     def test_owned_by_defaults_none(self):
-        asset = AssetBase(asset_id="a", uri="gs://b/a.tif")
+        asset = AssetBase(asset_id="a")
         assert asset.owned_by is None
 
     def test_owned_by_gcs(self):
-        asset = AssetBase(asset_id="a", uri="gs://b/a.tif", owned_by="gcs")
+        asset = AssetBase(asset_id="a", owned_by="gcs")
         assert asset.owned_by == "gcs"
 
     def test_owned_by_local(self):
-        asset = AssetBase(asset_id="a", uri="/data/a.tif", owned_by="local")
+        asset = AssetBase(asset_id="a", owned_by="local")
         assert asset.owned_by == "local"
 
     def test_asset_type_default(self):
-        asset = AssetBase(asset_id="a", uri="gs://b/a.tif")
+        asset = AssetBase(asset_id="a")
         assert asset.asset_type == AssetTypeEnum.ASSET
 
     def test_metadata_default_empty(self):
-        asset = AssetBase(asset_id="a", uri="gs://b/a.tif")
+        asset = AssetBase(asset_id="a")
         assert asset.metadata == {}
 
 

@@ -273,7 +273,7 @@ class LocalUploadModule(ModuleProtocol):
                     status_code=http_status.HTTP_404_NOT_FOUND,
                     detail=f"Asset '{asset_id}' not found in catalog '{catalog_id}'.",
                 )
-            if asset.owned_by != "local" or not asset.uri.startswith("file://"):
+            if asset.owned_by != "local" or not (asset.uri and asset.uri.startswith("file://")):
                 raise HTTPException(
                     status_code=http_status.HTTP_409_CONFLICT,
                     detail="Asset is not locally owned.",
@@ -454,15 +454,18 @@ class LocalUploadModule(ModuleProtocol):
         """
         from dynastore.tools.discovery import get_protocol
         from dynastore.models.protocols import AssetsProtocol, UploadStatus
-        from dynastore.modules.catalog.asset_service import AssetBase, AssetTypeEnum
+        from dynastore.modules.catalog.asset_service import AssetCreate, AssetTypeEnum
 
         catalog_id: str = ticket["catalog_id"]
         collection_id: Optional[str] = ticket.get("collection_id")
         filename: str = ticket["filename"]
         asset_def = ticket["asset_def"]
 
-        # Determine permanent path: {asset_root}/{catalog_id}/{collection or '_catalog_'}/{filename}
-        scope = collection_id or "_catalog_"
+        # Determine permanent path: {asset_root}/{catalog_id}/{collection or _catalog_tier}/{filename}
+        # The on-disk segment for catalog-tier assets uses a stable internal
+        # marker so two catalog-tier filenames don't collide; the marker
+        # never reaches DTOs or the DB (which use NULL collection_id).
+        scope = collection_id or "_catalog_tier"
         permanent_dir = self._asset_root / catalog_id / scope
         permanent_dir.mkdir(parents=True, exist_ok=True)
         permanent_path = permanent_dir / filename
@@ -485,8 +488,9 @@ class LocalUploadModule(ModuleProtocol):
         asset_type = asset_def.asset_type if hasattr(asset_def, "asset_type") else AssetTypeEnum.ASSET
         metadata = dict(asset_def.metadata) if hasattr(asset_def, "metadata") and asset_def.metadata else {}
 
-        asset_base = AssetBase(
+        asset_base = AssetCreate(
             asset_id=asset_def.asset_id,
+            filename=filename,
             uri=uri,
             asset_type=asset_type,
             metadata=metadata,
