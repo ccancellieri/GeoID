@@ -28,8 +28,6 @@ from fastapi import (
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.models.protocols import CloudStorageClientProtocol
 from dynastore.modules import get_protocol
-from dynastore.modules.gcp.tools import bucket as bucket_tool
-from dynastore.modules.gcp.tools.bucket import FileSystem
 from dynastore.extensions.httpx.httpx_service import get_client
 from dynastore.modules.gdal.models import RasterInfo, VectorInfo
 from dynastore.modules.gdal.gdal_module import GdalModule
@@ -58,6 +56,10 @@ class GdalService(ExtensionProtocol):
                 return ftype
 
         # Priority 2: Fetch MIME type from the source.
+        # Lazy import: keeps the gdal extension entry-point load-clean when SCOPE
+        # excludes module_gcp (the discovery contract — see tools/discovery.py).
+        from dynastore.modules.gcp.tools import bucket as bucket_tool
+        from dynastore.modules.gcp.tools.bucket import FileSystem
         parsed_url = bucket_tool.parse_url(file_url)
         fetched_mime_type: Optional[str] = None
         if parsed_url.scheme == FileSystem.gs and parsed_url.bucket:
@@ -98,7 +100,8 @@ class GdalService(ExtensionProtocol):
         file_type = await GdalService._get_file_type(file_url, mimetype)
         if gdal_uri:
             return gdal_uri, file_type
-        
+
+        from dynastore.modules.gcp.tools import bucket as bucket_tool
         gdal_path = bucket_tool.get_gdal_path(file_url)
         return gdal_path, file_type
 
