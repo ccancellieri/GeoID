@@ -18,13 +18,15 @@ Engines are platform-only connection-and-pool resources, sysadmin-locked
 by default.  They are referenced from driver configs via ``engine_ref``
 (Cycle F.2) so multiple drivers of the same class can share a connection
 pool, and so a single driver class can run against multiple physical
-engines (e.g. ``pg_main`` + ``pg_secondary`` for sharding — full multi-
-instance support lands in F.4).
+engines (e.g. ``pg_main`` + ``pg_secondary`` for sharding).
 
-Cycle F.1 ships **single-instance-per-kind**: one default engine of each
-``engine_class`` (``postgresql_engine``, ``elasticsearch_engine``,
+Cycle F.1 shipped **single-instance-per-kind**: one default engine of
+each ``engine_class`` (``postgresql_engine``, ``elasticsearch_engine``,
 ``duckdb_engine``, ``iceberg_engine``) keyed by the snake_case class
-name.  F.4 enables ref-keyed storage with multiple instances per kind.
+name.  Cycle F.4c then added the ref-keyed storage layer
+(``platform_configs.ref_key`` column, ``get_config_by_ref`` /
+``set_config_by_ref`` API) that lets operators register multiple
+instances per kind alongside the canonical class-keyed default.
 
 Driver-tier lifecycle is forbidden (decision #15 / #18 in
 ``binary-leaping-lightning.md``): tenants cannot influence platform

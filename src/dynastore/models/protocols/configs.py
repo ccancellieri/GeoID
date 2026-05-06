@@ -161,8 +161,9 @@ class ConfigsProtocol(Protocol):
 
         Tier-local: does NOT walk the waterfall.  Empty dict when nothing is
         stored at the scope.  For single-instance configs ``ref_key`` equals
-        the row's ``class_key`` — multi-instance writes (F.4c.4) introduce
-        refs that diverge.
+        the row's ``class_key``; multi-instance writes via
+        :meth:`set_config_by_ref` produce rows whose ref_key diverges from
+        the class_key (the dispatch class) — both surface here.
         """
         ...
 

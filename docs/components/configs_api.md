@@ -344,6 +344,87 @@ curl -X PATCH https://api/configs/catalogs/demo/collections/sample/plugins/items
   -d 'null'
 ```
 
+## Multi-instance refs (Cycle F.4c–F.4d)
+
+Operators can register multiple instances of the same driver/engine class
+side-by-side at any scope.  Each instance is keyed by an operator-chosen
+`ref_key` (snake_case `^[a-z][a-z0-9_]{0,62}$`); the canonical
+single-instance row is `ref_key == class_key`.
+
+### GET tree shape
+
+Multi-instance ref leaves surface under the parent class's `_address`
+alongside the canonical class-keyed leaf.  Example platform-scope
+response with `tiles_secondary` registered next to the canonical
+`tiles_config`:
+
+```jsonc
+{
+  "configs": {
+    "platform": {
+      "modules": {
+        "tiles": {
+          "tiles_config":    { "min_zoom": 0,  "max_zoom": 12, "..." : "..." },
+          "tiles_secondary": { "min_zoom": 5,  "max_zoom": 15, "cache_on_demand": false }
+        }
+      }
+    }
+  }
+}
+```
+
+The `meta` tree mirrors the same shape — `meta.platform.modules.tiles.tiles_secondary.field_docs`
+matches the canonical leaf so dashboards render the same form for the variant.
+
+`list_refs_at_scope()` on `ConfigsProtocol` enumerates `{ref_key: class_key}`
+without paying the JSON-deserialise cost — useful for quick "what
+multi-instance refs exist at this scope" checks.
+
+### PATCH body discriminator
+
+PATCH dispatches by body-key shape:
+
+| Body key | Treatment |
+|---|---|
+| Matches a registered `class_key` | Class-keyed path: existing single-instance `set_config` / `delete_config` |
+| Anything else | Multi-instance ref: requires `class_key` (or `driver_class` alias) inside the body to resolve the dispatch class; routes to `set_config_by_ref` / `delete_config_by_ref` |
+
+```http
+PATCH /configs/catalogs/{cat}/collections/{coll}/configs HTTP/1.1
+Content-Type: application/merge-patch+json
+
+{
+  "tiles_secondary": {
+    "class_key": "tiles_config",
+    "min_zoom": 5,
+    "max_zoom": 15
+  },
+  "tiles_legacy": null
+}
+```
+
+The `class_key` (or `driver_class`) discriminator is stripped from the
+merged payload before Pydantic validation — it does NOT need to be
+declared on the model.  Existing rows at the same `ref_key` get
+merge-patched (RFC 7396 — dict values merge, `null` deletes).  Fresh
+refs without a discriminator raise a 400 with an actionable message
+pointing operators at the discriminator field.
+
+### Idempotency + class-mismatch guards
+
+* `delete_config_by_ref` returns `True` when a row was removed, `False`
+  for an idempotent retry — operators can distinguish 204 vs 404
+  semantically.
+* `set_config_by_ref` rejects an attempt to overwrite an existing row
+  with a different class (the row's stored `class_key` differs from the
+  body discriminator) — operators must `delete` the ref first or pick a
+  different name.
+* Engine-class compatibility is enforced at the driver-config validator
+  (Cycle F.4c.3): a driver's `engine_ref` resolving via the engine
+  registry to an incompatible `engine_class` is rejected with a clear
+  ValueError; refs unknown to the registry are accepted (deferred to
+  PATCH-handler / runtime existence check via `EngineInstanceCache.get`).
+
 ## See also
 
 - `docs/components/storage_drivers.md` — driver classes, routing, hint

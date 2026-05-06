@@ -211,8 +211,10 @@ class OperationDriverEntry(BaseModel):
     Cycle F.3 renamed the field from ``driver_id`` to ``driver_ref`` to
     align with the F.0-F.2 ``engine_ref`` naming.  Single-instance-per-
     kind: the ref equals the snake_case driver class name (e.g.
-    ``"items_postgresql_driver"``).  F.4 will enable operator-chosen
-    ref names when ref-keyed driver-config storage lands.
+    ``"items_postgresql_driver"``).  Multi-instance refs (Cycle F.4c)
+    let operators name driver instances explicitly (e.g. ``pg_lean``
+    vs ``pg_full``); the routing entry's ref is what the F.4c.2
+    ``get_config_by_ref`` lookup keys on at dispatch time.
 
     Role-based driver plan additions (optional, default-inert):
 

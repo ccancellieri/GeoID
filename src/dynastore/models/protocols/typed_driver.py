@@ -176,8 +176,10 @@ class _PluginDriverConfig(PluginConfig):
       ``engine_ref`` values pointing at engines of incompatible class.
     * ``engine_ref: Optional[str]`` field — name of the platform engine
       this driver instance binds to.  Defaults to
-      ``required_engine_class`` (single-instance deployments); F.4
-      enables operator-chosen ref names for multi-instance.
+      ``required_engine_class`` for single-instance deployments;
+      operators set explicit snake_case ref names (e.g. ``pg_main``)
+      for multi-instance, validated against the engine registry by
+      :meth:`_default_and_validate_engine_ref` (Cycle F.4c.3).
     """
 
     # Marker for abstract intermediate base — hidden from the deep view and
