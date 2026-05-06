@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-05-06",
+  "standards": [
+    { "id": "stac",            "label": "STAC API 1.0.0",            "url": "/stac/conformance",            "service": "catalog", "spec": "https://github.com/radiantearth/stac-api-spec",                 "classes": ["https://api.stacspec.org/v1.0.0/core","https://api.stacspec.org/v1.0.0/collections","https://api.stacspec.org/v1.0.0/item-search"] },
+    { "id": "features",        "label": "OGC API – Features",        "url": "/features/conformance",        "service": "catalog", "spec": "https://docs.ogc.org/is/17-069r4/17-069r4.html",                 "classes": ["http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core","http://www.opengis.net/spec/ogcapi-features-2/1.0/conf/crs"] },
+    { "id": "processes",       "label": "OGC API – Processes",       "url": "/processes/conformance",       "service": "catalog", "spec": "https://docs.ogc.org/is/18-062r2/18-062r2.html",                 "classes": ["http://www.opengis.net/spec/ogcapi-processes-1/1.0/conf/core"] },
+    { "id": "records",         "label": "OGC API – Records",         "url": "/records/conformance",         "service": "catalog", "spec": "https://docs.ogc.org/DRAFTS/20-004.html",                        "classes": ["http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/core"] },
+    { "id": "coverages",       "label": "OGC API – Coverages",       "url": "/coverages/conformance",       "service": "catalog", "spec": "https://docs.ogc.org/DRAFTS/19-087.html",                        "classes": ["http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/core"] },
+    { "id": "dggs",            "label": "OGC API – DGGS",            "url": "/dggs/conformance",            "service": "catalog", "spec": "https://docs.ogc.org/DRAFTS/21-038.html",                        "classes": ["http://www.opengis.net/spec/ogcapi-dggs-1/1.0/conf/core"] },
+    { "id": "consys",          "label": "OGC API – Connected Systems","url": "/consys/conformance",         "service": "catalog", "spec": "https://docs.ogc.org/DRAFTS/23-001r0.html",                      "classes": ["http://www.opengis.net/spec/ogcapi-connectedsystems-1/0.0/conf/core"] },
+    { "id": "movingfeatures",  "label": "OGC API – Moving Features", "url": "/movingfeatures/conformance",  "service": "catalog", "spec": "https://docs.ogc.org/is/19-045r3/19-045r3.html",                 "classes": ["http://www.opengis.net/spec/ogcapi-movingfeatures-1/1.0/conf/core"] },
+    { "id": "tiles",           "label": "OGC API – Tiles",           "url": "/tiles/conformance",           "service": "maps",    "spec": "https://docs.ogc.org/is/20-057/20-057.html",                     "classes": ["http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core"] },
+    { "id": "maps",            "label": "OGC API – Maps",            "url": "/maps/conformance",            "service": "maps",    "spec": "https://docs.ogc.org/DRAFTS/20-058.html",                        "classes": ["http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core"] },
+    { "id": "styles",          "label": "OGC API – Styles",          "url": "/styles/conformance",          "service": "maps",    "spec": "https://docs.ogc.org/is/20-009/20-009.html",                     "classes": ["http://www.opengis.net/spec/ogcapi-styles-1/1.0/conf/core"] }
+  ]
+}

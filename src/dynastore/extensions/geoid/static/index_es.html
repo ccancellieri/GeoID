@@ -1,88 +1,103 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GeoID | Servicio Global de Lugares Federados</title>
-    <link rel="icon" type="image/svg+xml" href="../geoid/geoid_icon.svg">
-    <link rel="stylesheet" href="../geoid/index.css">
-    <!-- Shared Components -->
-    <link rel="stylesheet" href="../static/components/language_selector.css">
-    <script src="../static/components/language_selector.js" defer></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <base href="/web/geoid/">
+  <meta name="description" content="OGC-native multi-tenant geospatial catalog platform. STAC, OGC API Features, Coverages, Tiles, Maps, Processes, Records, DGGS, EDR.">
+  <title>GeoID — Catálogo geoespacial nativo OGC</title>
+  <link rel="icon" type="image/svg+xml" href="geoid_icon.svg">
+  <link rel="stylesheet" href="index.css">
+  <link rel="stylesheet" href="../static/components/language_selector.css">
+  <script src="../static/components/language_selector.js" defer></script>
+  <script src="conformance-matrix.js" defer></script>
 </head>
 <body>
+  <div class="bg-gradients">
+    <div class="bg-grid"></div>
+    <div class="blob blob-top-right"></div>
+    <div class="blob blob-bottom-left"></div>
+  </div>
 
-    <!-- Background Gradients -->
-    <div class="bg-gradients">
-        <div class="bg-grid"></div>
-        <div class="blob blob-top-right"></div>
-        <div class="blob blob-bottom-left"></div>
+  <nav>
+    <div class="nav-container">
+      <div class="logo-group">
+        <img src="geoid_logo.svg" alt="GeoID Logo">
+        <span class="logo-text">GeoID</span>
+      </div>
+      <div class="nav-actions">
+        <a class="cta-secondary" href="/web/pages/docs">Leer la documentación</a>
+        <a class="cta-primary" href="/web/">Abrir catálogo</a>
+        <ds-language-selector></ds-language-selector>
+      </div>
     </div>
+  </nav>
 
-    <!-- Navigation -->
-    <nav>
-        <div class="nav-container">
-            <div class="logo-group">
-                <img src="../geoid/geoid_logo.svg" alt="GeoID Logo">
-                <span class="logo-text">GeoID</span>
-            </div>
-            <ds-language-selector></ds-language-selector>
+  <main>
+    <section class="hero fade-in">
+      <h1>Catálogo geoespacial nativo OGC<br><span class="gradient-text">a escala planetaria</span></h1>
+      <p class="lead">Una plataforma de servicios de catálogo multitenant y compatible con OGC. Gestione billones de entidades en tenants aislados y expóngalas a través de todos los estándares OGC API principales.</p>
+      <div class="hero-ctas">
+        <a class="cta-primary" href="/web/">Abrir catálogo</a>
+        <a class="cta-secondary" href="/web/pages/docs">Leer la documentación</a>
+      </div>
+    </section>
+
+    <section class="pillars fade-in">
+      <h2>Arquitectura de los Tres Pilares</h2>
+      <p class="section-sub">La separación estricta de responsabilidades evita el "big ball of mud".</p>
+      <div class="pillars-grid">
+        <div class="glass-panel pillar-card">
+          <h4>Módulos</h4>
+          <p>Bibliotecas independientes del backend. Fuente única de verdad por dominio. Un módulo es dueño de una tabla.</p>
         </div>
-    </nav>
-
-    <!-- Main Content -->
-    <main>
-        
-        <!-- Left Column: Information -->
-        <section class="info-section fade-in">
-            <h1>
-                Servicio Global de <br>
-                <span class="gradient-text">Lugares Federados</span>
-            </h1>
-            <p class="lead">
-                Una infraestructura segura y compatible con OGC para gestionar y compartir miles de millones de ubicaciones geoespaciales. 
-                Emita identificadores inmutables (DIDs) y rastree la procedencia de los datos con herramientas de consulta de alto rendimiento.
-            </p>
-
-            <div class="glass-panel">
-                <h3 style="color: white; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem;">
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg> 
-                    Abierto e Interoperable
-                </h3>
-                <p style="color: var(--color-text-dim); font-size: 0.9375rem;">
-                    GeoID funciona como un Bien Público Digital, utilizando servicios principales de código abierto y estándares de datos abiertos. 
-                    Construido sobre OGC API Features, garantiza una integración perfecta con las herramientas SIG modernas.
-                </p>
-            </div>
-
-            <div class="features-grid">
-                <div class="glass-panel feature-card">
-                    <h4>IDs Inmutables</h4>
-                    <p>Identificadores Descentralizados (DIDs) para un seguimiento de recursos único, seguro y persistente.</p>
-                </div>
-                <div class="glass-panel feature-card emerald">
-                    <h4>Procedencia</h4>
-                    <p>Seguimiento robusto de metadatos, pasos de procesamiento y gestión de autoridad.</p>
-                </div>
-                <div class="glass-panel feature-card purple">
-                    <h4>Descubrimiento</h4>
-                    <p>Integración con STAC (SpatioTemporal Asset Catalog) para búsquedas a escala planetaria.</p>
-                </div>
-                <div class="glass-panel feature-card">
-                    <h4>Sincronización</h4>
-                    <p>Arquitectura distribuida que soporta la replicación y consistencia entre nodos.</p>
-                </div>
-            </div>
-        </section>
-
-    </main>
-
-    <!-- Footer -->
-    <footer>
-        <div class="footer-text">
-            &copy; 2026 Servicio GeoID. Infraestructura abierta para inteligencia geoespacial.
+        <div class="glass-panel pillar-card">
+          <h4>Extensiones</h4>
+          <p>Adaptadores HTTP sin estado. Traducen solicitudes en llamadas a módulos. Conecte nuevos estándares OGC sin tocar el núcleo.</p>
         </div>
-    </footer>
+        <div class="glass-panel pillar-card">
+          <h4>Tareas</h4>
+          <p>Workers en segundo plano aislados expuestos a través de OGC API – Processes. La ingesta, la indexación y el análisis corren en sus propios contenedores.</p>
+        </div>
+      </div>
+    </section>
 
+    <section class="matrix fade-in">
+      <h2>Cobertura de estándares</h2>
+      <p class="section-sub">Datos en vivo — cada insignia consulta su endpoint OGC API conformance.</p>
+      <div id="ogc-matrix" data-snapshot="conformance-snapshot.json" class="matrix-grid"></div>
+      <p id="ogc-matrix-footer" class="matrix-footer"></p>
+    </section>
+
+    <section class="capabilities fade-in">
+      <h2>Capacidades</h2>
+      <div class="capabilities-grid">
+        <div class="glass-panel feature-card"><h4>Multitenancy</h4><p>Cada catálogo se asigna a un esquema PostgreSQL distinto. Cero filtración de datos, renombrado sin movimiento de datos.</p></div>
+        <div class="glass-panel feature-card emerald"><h4>OGC nativo</h4><p>Features (Partes 1-4), STAC 1.0.0, Coverages, Tiles, Maps, Processes, Records, DGGS, Connected Systems, Moving Features, Styles.</p></div>
+        <div class="glass-panel feature-card purple"><h4>Escala de billones de filas</h4><p>Particionado JIT mediante triggers. Esquemas físicos en base62. Sin planificación de capacidad anticipada.</p></div>
+        <div class="glass-panel feature-card"><h4>ABAC / RBAC</h4><p>Autorización declarativa de grano fino. Identity matchers + content-hash gating para las rutas de escritura.</p></div>
+        <div class="glass-panel feature-card emerald"><h4>Registro de assets</h4><p>URIs estables para cada asset. Deduplicación por content-hash. Une los items STAC con los archivos físicos.</p></div>
+        <div class="glass-panel feature-card purple"><h4>Dimensiones OLAP</h4><p>Dimensiones de datacube paginadas (research). Conecta OGC API con patrones de consulta OLAP.</p></div>
+      </div>
+    </section>
+
+    <section class="quickstart fade-in">
+      <h2>Empezar</h2>
+      <ol class="quickstart-list">
+        <li><span>1. Descubrir catálogos</span><pre><code>curl https://example.org/stac/catalogs</code></pre></li>
+        <li><span>2. Abrir un notebook</span><a href="/notebooks">Explorar los notebooks JupyterLite →</a></li>
+        <li><span>3. Leer la documentación</span><a href="/web/pages/docs">Arquitectura, referencia de API, contribuir →</a></li>
+      </ol>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footer-text">Infraestructura abierta para inteligencia geoespacial.</div>
+    <div class="footer-links">
+      <a href="https://github.com/un-fao/GeoID">GitHub</a>
+      <a href="https://ogcapi.ogc.org/">OGC API specs</a>
+      <a href="https://www.fao.org/">FAO</a>
+    </div>
+  </footer>
 </body>
 </html>

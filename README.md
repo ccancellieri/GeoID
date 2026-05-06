@@ -1,49 +1,59 @@
-# Agro-Informatics Platform - Catalog Services
+# Agro-Informatics Platform — Catalog Services
 
-Agro-Informatics Platform (AIP) - Catalog Services is an enterprise-grade, cloud-native platform for the management, processing, and dissemination of geospatial data. 
+OGC-native, multi-tenant geospatial catalog platform. Manage trillions of features across isolated tenants and expose them through every major OGC API standard.
 
-The system (powered by the internal dynastore engine) is designed as a modular, microservices-based framework engineered for extreme scalability, maintainability, and interoperability, strictly adhering to modern software engineering principles and **Open Geospatial Consortium (OGC)** standards.
+## Why it exists
 
-## Architecture
+Traditional catalog systems trade interoperability for tenancy or scale for flexibility. AIP collapses the trade-off: each catalog you create maps to a physically isolated PostgreSQL schema (zero data leakage, rename without data movement), and every catalog is exposed through STAC, OGC API – Features, Coverages, Tiles, Maps, Processes, Records, EDR, and DGGS without writing extension code per format.
 
-Our core philosophy rests on a strict separation of concerns, a principle that permeates every layer of the system. We utilize "Three Pillars" (Modules, Extensions, Tasks) mitigating technical debt and ensuring system resilience. 
+## Try it
 
-A key innovation is the database architecture, which leverages advanced features of **PostgreSQL** and **PostGIS**, including a "lazy" on-demand partitioning strategy orchestrated by database triggers. This provides true multi-tenancy and performance isolation scaling to trillions of features without degradation.
+```bash
+docker compose -f src/dynastore/docker/dev.compose.yml up -d
+curl http://localhost/stac/catalogs
+open http://localhost/web/
+```
 
-### Table of Contents
+The running service declares OGC conformance live at `/stac/conformance`, `/features/conformance`, `/processes/conformance`, `/records/conformance`, `/coverages/conformance`, `/dggs/conformance`, `/consys/conformance`, `/movingfeatures/conformance`, and the maps service at `/{tiles,maps,styles}/conformance`.
 
-**Part 1: Foundational Concepts & Architecture**
+## Architecture in one paragraph
+
+Three pillars. **Modules** are backend-agnostic libraries — one module owns one table, no HTTP. **Extensions** are stateless HTTP adapters that translate requests into module calls — adding a new OGC API standard is adding an extension, not refactoring the core. **Tasks** are isolated background workers exposed through OGC API – Processes — ingestion, indexing, and analysis run in their own containers.
+
+The catalog → schema → partition mapping is lazy: a `code` like `"agriculture"` resolves to an immutable schema like `"s_a1b2c3"`, partitions are created just-in-time by database triggers on first insert, and renaming a logical code never moves a byte of data.
+
+## Documentation
+
+**Foundations**
+- [Getting Started](docs/getting-started.md)
 - [Architecture Overview](docs/architecture/overview.md)
 - [The Database Layer](docs/architecture/database.md)
 - [The Query Executor Pattern](docs/architecture/query_executor.md)
 - [Distributed Tasks](docs/architecture/distributed-tasks.md)
 
-**Part 2: Deep Dive into Modules and Extensions**
-- [The Catalog Module](docs/components/catalog.md)
-- [The Asynchronous Task Ecosystem](docs/components/tasks.md)
-- [The GCP Extension](docs/components/gcp.md)
-- [The OGC Features Extension](docs/components/features.md)
-- [The STAC Extension](docs/components/stac.md)
-- [The Legacy WFS Extension](docs/components/wfs.md)
+**Extensions**
+- [Catalog Module](docs/components/catalog.md)
+- [Asynchronous Task Ecosystem](docs/components/tasks.md)
+- [OGC API – Features](docs/components/features.md)
+- [STAC API](docs/components/stac.md)
+- [OGC API – Coverages](docs/components/coverages.md)
+- [OGC API – Tiles](docs/components/tiles.md)
+- [OGC API – Maps](docs/components/maps.md)
+- [OGC API – Records](docs/components/records.md)
+- [OGC API – EDR](docs/components/edr.md)
+- [OGC API – DGGS](docs/components/dggs.md)
+- [OGC API – Styles](docs/components/styles.md)
+- [3D GeoVolumes](docs/components/volumes.md)
+- [OGC API – Joins](docs/components/joins.md)
+- [Moving Features](docs/components/moving_features.md)
 - [Elasticsearch Integration](docs/components/elasticsearch.md)
-- [The Maps Extension](docs/components/maps.md)
-- [The Tiles Extension](docs/components/tiles.md)
-- [The DGGS Extension](docs/components/dggs.md)
-- [The EDR Extension](docs/components/edr.md)
-- [The Moving Features Extension](docs/components/moving_features.md)
-- [The Coverages Extension](docs/components/coverages.md)
-- [The Records Extension](docs/components/records.md)
-- [The Styles Extension](docs/components/styles.md)
-- [The 3D GeoVolumes Extension](docs/components/volumes.md)
-- [The Joins Extension](docs/components/joins.md)
+- [Legacy WFS](docs/components/wfs.md)
+- [GCP Extension](docs/components/gcp.md)
 
-**Part 3: Extending & Contributing**
+**Extending & contributing**
 - [Contributing & Plugin Naming Convention](docs/contributing.md)
-- [Example Project Template](examples/my-project/) — starter kit for downstream projects
+- [Example Project Template](examples/my-project/)
 - [Roadmap](docs/roadmap.md)
 
 **Testing**
-- [Coverage Report](docs/testing/coverage-report.md) — per-module coverage, priorities, duplication analysis
-
----
-*For AI guidelines and constraints, see `.ai_context.md` files localized within specific source directories.*
+- [Coverage Report](docs/testing/coverage-report.md)

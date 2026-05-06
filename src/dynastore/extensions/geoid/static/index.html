@@ -1,88 +1,19 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GeoID | Global Federated Places Service</title>
-    <link rel="icon" type="image/svg+xml" href="../geoid/geoid_icon.svg">
-    <link rel="stylesheet" href="../geoid/index.css">
-    <!-- Shared Components -->
-    <link rel="stylesheet" href="../static/components/language_selector.css">
-    <script src="../static/components/language_selector.js" defer></script>
+  <meta charset="UTF-8">
+  <title>GeoID</title>
+  <script>
+    (function () {
+      const supported = ["en", "es", "fr"];
+      const stored = localStorage.getItem("ds_lang");
+      const navLang = (navigator.language || "en").slice(0, 2).toLowerCase();
+      const lang = supported.includes(stored) ? stored
+                  : supported.includes(navLang) ? navLang
+                  : "en";
+      window.location.replace("index_" + lang + ".html");
+    })();
+  </script>
 </head>
-<body>
-
-    <!-- Background Gradients -->
-    <div class="bg-gradients">
-        <div class="bg-grid"></div>
-        <div class="blob blob-top-right"></div>
-        <div class="blob blob-bottom-left"></div>
-    </div>
-
-    <!-- Navigation -->
-    <nav>
-        <div class="nav-container">
-            <div class="logo-group">
-                <img src="../geoid/geoid_logo.svg" alt="GeoID Logo">
-                <span class="logo-text">GeoID</span>
-            </div>
-            <ds-language-selector></ds-language-selector>
-        </div>
-    </nav>
-
-    <!-- Main Content -->
-    <main>
-        
-        <!-- Left Column: Information -->
-        <section class="info-section fade-in">
-            <h1>
-                Global Federated <br>
-                <span class="gradient-text">Places Service</span>
-            </h1>
-            <p class="lead">
-                A secure, OGC-compliant infrastructure to manage and share billions of geospatial locations. 
-                Issue immutable identifiers (DIDs) and track data provenance with high-performance query tools.
-            </p>
-
-            <div class="glass-panel">
-                <h3 style="color: white; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem;">
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg> 
-                    Open & Interoperable
-                </h3>
-                <p style="color: var(--color-text-dim); font-size: 0.9375rem;">
-                    GeoID serves as a Digital Public Good, utilizing open-source core services and open-data standards. 
-                    Built on OGC API Features, it ensures seamless integration with modern GIS tools and agro-informatics platforms.
-                </p>
-            </div>
-
-            <div class="features-grid">
-                <div class="glass-panel feature-card">
-                    <h4>Immutable IDs</h4>
-                    <p>Decentralized Identifiers (DIDs) for unique, secure, and persistent resource tracking.</p>
-                </div>
-                <div class="glass-panel feature-card emerald">
-                    <h4>Data Provenance</h4>
-                    <p>Robust tracking of metadata, processing steps, and authority management.</p>
-                </div>
-                <div class="glass-panel feature-card purple">
-                    <h4>Fast Discovery</h4>
-                    <p>SpatioTemporal Asset Catalog (STAC) integration for planetary-scale search.</p>
-                </div>
-                <div class="glass-panel feature-card">
-                    <h4>Federated Sync</h4>
-                    <p>Distributed architecture supporting cross-node replication and consistency.</p>
-                </div>
-            </div>
-        </section>
-
-    </main>
-
-    <!-- Footer -->
-    <footer>
-        <div class="footer-text">
-            &copy; 2026 GeoID Service. Open Infrastructure for Geospatial Intelligence.
-        </div>
-    </footer>
-
-</body>
+<body></body>
 </html>

@@ -372,3 +372,52 @@ footer {
     height: 1.25rem;
     fill: currentColor;
 }
+
+/* === Landing redesign 2026-05-06 === */
+.nav-actions { display: flex; gap: 1rem; align-items: center; }
+
+.hero { text-align: center; padding: 4rem 0 2rem; }
+.hero h1 { font-size: clamp(2.25rem, 4.5vw, 3.5rem); }
+.hero .lead { max-width: 720px; margin: 1.5rem auto 2rem; }
+
+.hero-ctas { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+.cta-primary, .cta-secondary {
+  display: inline-block; padding: 0.875rem 1.5rem; border-radius: 0.75rem;
+  text-decoration: none; font-weight: 600; transition: var(--transition-standard);
+}
+.cta-primary { background: var(--color-primary); color: white; }
+.cta-primary:hover { background: #2563eb; transform: translateY(-1px); }
+.cta-secondary { background: transparent; color: var(--color-text-main); border: 1px solid rgba(255,255,255,0.16); }
+.cta-secondary:hover { background: rgba(255,255,255,0.05); }
+
+section { padding: 3rem 0; }
+section h2 { font-size: clamp(1.5rem, 3vw, 2rem); margin-bottom: 0.5rem; color: white; }
+section .section-sub { color: var(--color-text-dim); margin-bottom: 2rem; }
+
+.pillars-grid, .capabilities-grid {
+  display: grid; gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.pillar-card { padding: 1.5rem; }
+.pillar-card h4 { color: white; margin-bottom: 0.5rem; }
+.pillar-card p { color: var(--color-text-dim); font-size: 0.9375rem; }
+
+.matrix-grid {
+  display: grid; gap: 0.75rem; margin-top: 1.5rem;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}
+.matrix-footer { margin-top: 1.5rem; color: var(--color-text-dim); font-size: 0.875rem; text-align: center; }
+
+.quickstart-list { display: grid; gap: 1.25rem; padding-left: 0; list-style: none; }
+.quickstart-list li { display: flex; flex-direction: column; gap: 0.5rem; }
+.quickstart-list pre { background: var(--color-bg-darker); padding: 0.875rem; border-radius: 0.5rem; overflow: auto; }
+.quickstart-list code { font-family: ui-monospace, monospace; color: var(--color-text-main); }
+
+.footer-links { display: flex; gap: 1.5rem; justify-content: center; margin-top: 0.75rem; flex-wrap: wrap; }
+.footer-links a { color: var(--color-text-dim); text-decoration: none; font-size: 0.875rem; }
+.footer-links a:hover { color: var(--color-text-main); }
+
+@media (max-width: 640px) {
+  .hero { padding: 2rem 0 1rem; }
+  section { padding: 2rem 0; }
+}
