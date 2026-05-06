@@ -36,7 +36,10 @@ from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
 from dynastore.extensions.dggs.config import DGGSConfig
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.tools.ogc_policies import register_ogc_public_access_policy
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.shared_models import Link
 from dynastore.modules.dggs import h3_indexer, s2_indexer
@@ -140,12 +143,14 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        self.register_policies()
         logger.info("DGGSService: policies registered.")
         yield
 
-    def register_policies(self):
-        register_ogc_public_access_policy("dggs")
+    def get_policies(self):
+        return [ogc_public_access_policy("dggs")]
+
+    def get_role_bindings(self):
+        return [ogc_anonymous_role_binding("dggs")]
 
     # ------------------------------------------------------------------
     # Route registration

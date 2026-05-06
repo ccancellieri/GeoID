@@ -41,7 +41,7 @@ import dynastore.modules.db_config.shared_queries as shared_queries
 from dynastore.extensions import get_extension_instance
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.web.decorators import expose_static
-from .policies import register_stac_policies
+from .policies import stac_policies, stac_role_bindings
 from dynastore.extensions.tools.db import get_async_engine
 from dynastore.extensions.tools.exception_handlers import handle_exception
 from dynastore.modules.db_config.query_executor import (
@@ -218,12 +218,14 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        self.register_policies()
-        logger.info("STACService: Policies registered.")
+        # Policies declared via PolicyContributor; IAM forwards centrally.
         yield
 
-    def register_policies(self):
-        register_stac_policies()
+    def get_policies(self):
+        return stac_policies()
+
+    def get_role_bindings(self):
+        return stac_role_bindings()
 
     def get_static_prefix(self) -> str:
         """Returns the static prefix for STAC."""

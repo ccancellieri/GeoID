@@ -1,51 +1,41 @@
 #    Copyright 2025 FAO
 #
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
-#
-#    Author: Carlo Cancellieri (ccancellieri@gmail.com)
-#    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
-#    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
+#    Licensed under the Apache License, Version 2.0 (the "License").
 
-import logging
+"""Pure declarations of the STAC extension's authz policies.
+
+Consumed by IAM via ``STACService.get_policies`` / ``get_role_bindings``
+through the ``PolicyContributor`` Protocol — see PR #308.
+"""
+
+from typing import List, Optional
+
+from dynastore.models.auth import Policy
+from dynastore.models.auth_models import Role
 from dynastore.models.protocols.authorization import DefaultRole
-from dynastore.models.protocols.policies import Policy, Role
-from dynastore.tools.discovery import get_protocol
-
-logger = logging.getLogger(__name__)
 
 
-def register_stac_policies():
-    """Register STAC public-access policy and anonymous role via PermissionProtocol."""
-    from dynastore.models.protocols.policies import PermissionProtocol
+def stac_policies() -> List[Policy]:
+    return [
+        Policy(
+            id="stac_public_access",
+            description="Allows anonymous GET access to STAC API and browser.",
+            actions=["GET", "OPTIONS"],
+            resources=[
+                "/stac",
+                "/stac/",
+                "/stac/.*",
+                "/web/pages/stac_browser",
+            ],
+            effect="ALLOW",
+        ),
+    ]
 
-    pm = get_protocol(PermissionProtocol)
-    if not pm:
-        logger.warning("PermissionProtocol not available; STAC policies not registered.")
-        return
 
-    stac_policy = Policy(
-        id="stac_public_access",
-        description="Allows anonymous GET access to STAC API and browser.",
-        actions=["GET", "OPTIONS"],
-        resources=[
-            "/stac",
-            "/stac/",
-            "/stac/.*",
-            "/web/pages/stac_browser",  # expose_web_page route
-        ],
-        effect="ALLOW",
-    )
-    pm.register_policy(stac_policy)
-    pm.register_role(Role(name=DefaultRole.ANONYMOUS.value, policies=["stac_public_access"]))
-
-    logger.debug("STAC policies registered via PermissionProtocol.")
+def stac_role_bindings(anonymous_role_name: Optional[str] = None) -> List[Role]:
+    return [
+        Role(
+            name=anonymous_role_name or DefaultRole.ANONYMOUS.value,
+            policies=["stac_public_access"],
+        ),
+    ]

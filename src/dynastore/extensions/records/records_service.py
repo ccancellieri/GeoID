@@ -42,7 +42,7 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
 
 from . import records_generator as gen
 from . import records_models as rm
-from .policies import register_records_policies
+from .policies import records_policies, records_role_bindings
 from dynastore.models.driver_context import DriverContext
 
 logger = logging.getLogger(__name__)
@@ -95,12 +95,14 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        self.register_policies()
-        logger.info("RecordsService: policies registered.")
+        # Policies declared via PolicyContributor; IAM forwards centrally.
         yield
 
-    def register_policies(self):
-        register_records_policies()
+    def get_policies(self):
+        return records_policies()
+
+    def get_role_bindings(self):
+        return records_role_bindings()
 
     # ------------------------------------------------------------------
     # Route registration

@@ -144,7 +144,7 @@ def _return_empty_tile(width, height):
     # return Response(content=buffer.getvalue(), media_type="image/png")
     return Response(content=empty_png, media_type="image/png")
 
-from .policies import register_maps_policies
+from .policies import maps_policies, maps_role_bindings
 class MapsService(ExtensionProtocol):
     priority: int = 100
     """Provides OGC API - Maps (WMS-like) functionality with filtering and Tiling."""
@@ -160,6 +160,13 @@ class MapsService(ExtensionProtocol):
         from dynastore.extensions.tools.web_collect import collect_static_assets
         return collect_static_assets(self)
 
+    # PolicyContributor: declare authz needs; IAM forwards centrally.
+    def get_policies(self):
+        return maps_policies()
+
+    def get_role_bindings(self):
+        return maps_role_bindings()
+
     def configure_app(self, app: FastAPI):
         """Early configuration for the Maps extension."""
         # Web pages / static assets are discovered by WebModule via the
@@ -168,8 +175,8 @@ class MapsService(ExtensionProtocol):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        register_maps_policies()
-        logger.info("Maps Service startup: policies and process pool starting...")
+        # Policies declared via PolicyContributor; IAM forwards centrally.
+        logger.info("Maps Service startup: process pool starting...")
         MapsService.process_pool = ProcessPoolExecutor()
         app.state.maps_config = MapsConfig()
         yield
