@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 class GcpStorageOpsMixin:
     """Mixin providing StorageProtocol delegations and AssetUploadProtocol for GCPModule."""
 
+    # AssetUploadProtocol surface
+    driver_id: str = "gcs"
+    supports_versioning: bool = False
+
     # --- Host interface stubs (provided by GCPModule) ---
     _upload_tickets: Dict[str, Dict[str, Any]]
 
@@ -137,8 +141,10 @@ class GcpStorageOpsMixin:
         Prepares a GCS resumable upload session and returns a backend-agnostic
         ``UploadTicket``.  The client PUTs the file directly to ``upload_url``
         (a GCS signed resumable-session URI).  After the upload completes the
-        GCS Pub/Sub OBJECT_FINALIZE event triggers ``GcsStorageEventTask`` which
-        calls ``AssetsProtocol.create_asset`` with ``owned_by='gcs'``.
+        GCS Pub/Sub OBJECT_FINALIZE event hits the inline finalize activator
+        (``modules/gcp/gcp_finalize_activator.activate``) which transitions
+        the PENDING ``assets`` row (born during ``initiate_upload``) to
+        ACTIVE in a single transaction — no task hop.
 
         The ticket is stored in ``_upload_tickets`` so ``get_upload_status`` can
         later check whether the asset was registered.
@@ -262,8 +268,9 @@ class GcpStorageOpsMixin:
         """
         Polls the status of an upload session.
 
-        Status is determined by checking whether the asset has been registered
-        in the catalog (set by ``GcsStorageEventTask`` after OBJECT_FINALIZE).
+        Status is determined by checking whether the asset row has been
+        promoted to ACTIVE (the inline finalize activator does this when the
+        Pub/Sub OBJECT_FINALIZE notification arrives).
         The ticket is removed from the in-memory store once the upload is
         confirmed complete or the session has expired.
         """

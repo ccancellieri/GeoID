@@ -23,7 +23,7 @@ import asyncio
 import itertools
 from typing import Optional
 
-from dynastore.modules.catalog.asset_service import Asset, AssetBase
+from dynastore.modules.catalog.asset_service import Asset, AssetCreate, VirtualAssetCreate
 from dynastore.modules.catalog.models import CoreAssetReferenceType
 
 from dynastore.modules.catalog.tools import recalculate_and_update_extents
@@ -107,12 +107,13 @@ def _resolve_source_content_type(asset: Asset) -> Optional[str]:
     ct = md.get("content_type") or md.get("contentType")
     if ct:
         return ct
-    if not asset.uri.startswith("gs://"):
+    source = asset.uri or asset.href
+    if not source or not source.startswith("gs://"):
         return None
     try:
         from google.cloud import storage
 
-        bucket_name, _, object_name = asset.uri[len("gs://"):].partition("/")
+        bucket_name, _, object_name = source[len("gs://"):].partition("/")
         if not bucket_name or not object_name:
             return None
         client = storage.Client()
@@ -247,9 +248,14 @@ async def run_ingestion_task(
                 r"[^a-zA-Z0-9_\-]", "_", os.path.basename(req_asset.uri)
             )
 
-            asset_payload = AssetBase(
+            # External-source ingestion: register as a virtual asset since we
+            # don't manage the source bytes (the file lives in the caller's
+            # storage). Stage 4 will replace this with the policy-driven
+            # variant; today we keep the `Asset.uri` field populated by
+            # storing the raw URI as the virtual `href`.
+            asset_payload = VirtualAssetCreate(
                 asset_id=asset_id_for_creation,
-                uri=req_asset.uri,
+                href=req_asset.uri,
                 metadata=req_asset.metadata or {},
             )
             asset = await asset_manager.create_asset(
@@ -269,7 +275,11 @@ async def run_ingestion_task(
             if asset is None:
                 raise RuntimeError("Pre-operations returned no asset.")
 
-        source_file_path = asset.uri
+        source_file_path = asset.uri or asset.href
+        if source_file_path is None:
+            raise RuntimeError(
+                f"Asset {asset.asset_id} has no source URI: kind={asset.kind} status={asset.status}"
+            )
         asset_id = asset.asset_id
         # MIME hint used by reader resolution when the URI itself carries
         # no recognisable suffix (legacy bare-filename uploads).  Source

@@ -2,7 +2,6 @@
   "class_key": "task_routing_config",
   "value": {
     "routing": {
-      "gcs_storage_event":                     ["catalog"],
       "gcp_provision_catalog":                 ["catalog"],
       "gcp_destroy_catalog":                   ["catalog"],
       "gcp_catalog_cleanup":                   ["catalog"],

@@ -762,11 +762,28 @@ class BucketService(ExtensionProtocol):
         fastapi_request: Request,
         _=Depends(verify_pubsub_jwt),
     ):
+        """Receive a Pub/Sub HTTP push notification and process it inline.
+
+        OBJECT_FINALIZE events drive the inline activator (no task hop):
+        the matching PENDING ``assets`` row is UPDATEd to ACTIVE in the
+        same request, in a single ``managed_transaction``. Pub/Sub
+        at-least-once redelivery is the retry mechanism.
+
+        HTTP status mapping (Pub/Sub treats 2xx as ack, 5xx as nack):
+
+        * 204 — successful activation, idempotent re-delivery, orphan
+          finalize (logged via ``log_event(event_type='orphan_finalize')``),
+          or non-FINALIZE / unrecognised events. None of these benefit
+          from redelivery.
+        * 503 — transient infrastructure failure (DB unreachable, lock
+          timeout, asyncpg pool exhaustion, unexpected exception).
+          Pub/Sub redelivers per its backoff policy.
         """
-        This endpoint receives push notifications from Google Pub/Sub.
-        It decodes the message, extracts context (subscription ID, catalog ID),
-        and dispatches it to the internal event handler.
-        """
+        # Lazy-import the OrphanFinalizeEvent class so this route module
+        # does not pull the activator chain at import time.
+        from dynastore.modules.gcp.gcp_finalize_activator import (
+            OrphanFinalizeEvent,
+        )
 
         try:
             # The actual data is base64 encoded within the 'data' field.
@@ -864,11 +881,31 @@ class BucketService(ExtensionProtocol):
             }
             await gcp_events.dispatch_gcp_event(dispatch_payload)
 
+        except OrphanFinalizeEvent as exc:
+            # Activator already logged the orphan via log_event. Ack so
+            # Pub/Sub stops redelivering — Stage 6 reconciliation owns
+            # the recovery path.
+            logger.info(f"Orphan finalize acked (no PENDING row): {exc}")
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        except HTTPException:
+            # Auth / validation failure — re-raise so FastAPI's normal
+            # handler builds the response. JWT verify already did this
+            # before us, but defence-in-depth.
+            raise
         except Exception as e:
-            # Acknowledge the message to prevent Pub/Sub retries on poison messages,
-            # but log the error for investigation.
+            # Transient infrastructure failure (DB unreachable, lock
+            # timeout, asyncpg pool exhaustion, etc). Surface as 5xx so
+            # Pub/Sub redelivers per its backoff policy. The push
+            # subscription's dead-letter policy is the last line of
+            # defence for genuinely poison messages — letting them
+            # redeliver here is the right default for at-least-once.
             logger.error(
-                f"Error processing Pub/Sub push notification: {e}", exc_info=True
+                f"Transient failure processing Pub/Sub push notification: {e}",
+                exc_info=True,
+            )
+            return Response(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content=f"Transient failure: {e!s}".encode(),
             )
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)

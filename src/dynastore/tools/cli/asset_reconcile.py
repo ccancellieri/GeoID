@@ -188,7 +188,7 @@ async def cmd_reconcile(args: argparse.Namespace) -> int:
                     continue
             drifted += 1
             print(
-                f"DRIFT  {catalog_id}/{asset.collection_id or '_catalog_'}/"
+                f"DRIFT  {catalog_id}/{asset.collection_id or '<catalog-tier>'}/"
                 f"{asset.asset_id}  (index={'missing' if idx_doc is None else 'stale'})"
             )
             if not args.apply:

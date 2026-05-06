@@ -19,7 +19,19 @@
 #    dynastore/modules/gcp/gcp_events.py
 from dynastore.modules.concurrency import run_in_thread
 import logging
-from typing import Optional, cast, Dict, Any, List, Callable, Coroutine
+from typing import (
+    Optional,
+    cast,
+    Dict,
+    Any,
+    List,
+    Callable,
+    Coroutine,
+    TYPE_CHECKING,
+)
+
+if TYPE_CHECKING:
+    from dynastore.modules.gcp.gcp_finalize_activator import ActivationOutcome
 from collections import defaultdict
 import fnmatch
 import asyncio
@@ -615,78 +627,77 @@ async def handle_asset_events(
     collection_id: Optional[str],
     event_payload: Dict[str, Any],
     event_type_str: Optional[str] = None,
-):
-    """
-    Enqueues a GcsStorageEventTask for the received GCS object event.
+) -> Optional["ActivationOutcome"]:
+    """Process a GCS object lifecycle notification inline.
 
-    Returns immediately — the task executor handles the actual asset operation
-    with retry/heartbeat guarantees.
+    OBJECT_FINALIZE goes through :func:`gcp_finalize_activator.activate`
+    in a single transaction (no task hop): the matching PENDING ``assets``
+    row is UPDATEd to ACTIVE. Pub/Sub at-least-once redelivery is the
+    retry mechanism — concurrent deliveries serialise on ``FOR UPDATE``.
+
+    The function returns:
+
+    * an :class:`ActivationOutcome` for OBJECT_FINALIZE when the inline
+      path executed (success or idempotent re-delivery). The HTTP push
+      handler maps this to a 200 ack.
+    * ``None`` for non-FINALIZE events, missing/unsupported events, or
+      missing dependencies (DatabaseProtocol / catalog schema). These
+      paths are intentionally non-fatal — operators see them via logs.
+
+    Exceptions propagate (they are NOT swallowed here): the HTTP push
+    route maps :class:`OrphanFinalizeEvent` to a 200 ack and any other
+    exception to 5xx so Pub/Sub redelivers.
     """
     event_type = event_type_str or event_payload.get("eventType")
-    if event_type not in ["OBJECT_FINALIZE", "OBJECT_DELETE", "OBJECT_ARCHIVE"]:
-        logger.debug(f"handle_asset_events: ignoring event_type '{event_type}'.")
-        return
-
-    object_name = event_payload.get("name")
-    metadata = event_payload.get("metadata") or {}
-    asset_id = metadata.get("asset_id") or metadata.get("asset_code")
-
-    if not asset_id:
-        logger.warning(
-            f"GCS event for '{object_name}' is missing 'asset_id' in metadata. "
-            "Cannot enqueue asset task."
+    # OBJECT_DELETE / OBJECT_ARCHIVE handling: deferred. The legacy
+    # GcsStorageEventTask covered both via AssetsProtocol.delete_assets
+    # but Stage 4.2 is scoped to OBJECT_FINALIZE; Stage 6 reconciliation
+    # owns the deletion-cleanup surface. Until then we only act on
+    # OBJECT_FINALIZE — other events are ignored after a debug log.
+    if event_type != "OBJECT_FINALIZE":
+        logger.debug(
+            f"handle_asset_events: ignoring event_type '{event_type}' "
+            f"(only OBJECT_FINALIZE is handled inline in Stage 4.2)."
         )
-        return
-
-    bucket = event_payload.get("bucket")
-    uri = f"gs://{bucket}/{object_name}"
-    asset_type = metadata.get("asset_type", "ASSET")
-    # GCS guarantees (bucket, objectId, generation) uniquely identifies a
-    # versioned object. Combined with eventType this is a stable idempotency
-    # key across Pub/Sub redeliveries. Re-uploads bump `generation` → new key.
-    generation = event_payload.get("generation")
-    dedup_key = f"gcs:{bucket}:{object_name}:{generation}:{event_type}"
+        return None
 
     from dynastore.models.protocols import DatabaseProtocol
-    from dynastore.models.tasks import TaskCreate
-    from dynastore.modules.tasks.tasks_module import create_task_for_catalog
+    from dynastore.modules.gcp.gcp_finalize_activator import (
+        activate,
+        finalize_event_from_pubsub,
+    )
 
     db = get_protocol(DatabaseProtocol)
     if not db:
         logger.warning("handle_asset_events: DatabaseProtocol not available.")
-        return
+        return None
 
-    try:
-        task_data = TaskCreate(
-            task_type="gcs_storage_event",
-            caller_id=f"gcp_events:{event_type}",
-            inputs={
-                "catalog_id": catalog_id,
-                "collection_id": collection_id,
-                "event_type": event_type,
-                "asset_id": asset_id,
-                "asset_type": asset_type,
-                "uri": uri,
-                "metadata": metadata,
-            },
-            dedup_key=dedup_key,
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if catalogs_svc is None:
+        logger.warning("handle_asset_events: CatalogsProtocol not available.")
+        return None
+    schema = await catalogs_svc.resolve_physical_schema(catalog_id)
+    if not schema:
+        logger.warning(
+            f"handle_asset_events: no physical schema for catalog '{catalog_id}'."
         )
-        task = await create_task_for_catalog(db.engine, task_data, catalog_id)
-        if task is None:
-            logger.info(
-                f"Dedup: GcsStorageEventTask({event_type}) for asset '{asset_id}' "
-                f"in {catalog_id}:{collection_id or ''} already in flight; skipping."
-            )
-        else:
-            logger.info(
-                f"Enqueued GcsStorageEventTask({event_type}) for asset '{asset_id}' "
-                f"in {catalog_id}:{collection_id or ''} [dedup_key={dedup_key}]."
-            )
-    except Exception as e:
-        logger.error(
-            f"Failed to enqueue GcsStorageEventTask for asset '{asset_id}': {e}",
-            exc_info=True,
-        )
+        return None
+
+    finalize_event = finalize_event_from_pubsub(
+        event_payload,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+
+    async with managed_transaction(db.engine) as conn:
+        outcome = await activate(conn, schema, finalize_event)
+
+    logger.info(
+        f"GCS finalize processed for {catalog_id}:{collection_id or ''} "
+        f"asset_id={outcome.asset_id} action={outcome.action} "
+        f"uri={finalize_event.uri}"
+    )
+    return outcome
 
 
 # --- Registration Functions ---

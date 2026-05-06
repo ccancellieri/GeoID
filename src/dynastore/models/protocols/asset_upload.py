@@ -59,7 +59,8 @@ Upload flows
     #   headers: ticket.headers
     #   body: <file bytes>
 
-    # GCS fires OBJECT_FINALIZE → GcsStorageEventTask → create_asset(owned_by="gcs")
+    # GCS fires OBJECT_FINALIZE → Pub/Sub HTTP push → inline finalize activator
+    # transitions the PENDING assets row to ACTIVE in a single transaction.
 
     # Poll until status == "completed":
     from dynastore.models.protocols import UploadStatus
@@ -225,10 +226,49 @@ class AssetUploadProtocol(Protocol):
     Implementations handle the backend-specific details (signed URLs, staging
     paths, quota checks) while exposing a uniform interface to the API layer.
 
-    Implementing classes must also provide a *driver-internal* ``complete_upload``
-    method (not part of this protocol) that is called when the file delivery
-    is confirmed (cloud event, upload endpoint completion, etc.) and registers
-    the asset via ``AssetsProtocol.create_asset``.
+    Two implementations ship in-tree:
+
+    * ``GcpStorageOpsMixin`` (``modules/gcp/gcp_storage_ops.py``) —
+      ``driver_id="gcs"``, GCS resumable signed URLs, asynchronous activation
+      via the ``OBJECT_FINALIZE`` Pub/Sub event handled inline by
+      ``extensions/gcp/gcp_events.py``.
+    * ``LocalUploadModule`` (``modules/local/local_upload.py``) —
+      ``driver_id="local"``, server-side staging directory, synchronous
+      activation when the client POSTs to the staging endpoint.
+
+    Driver selection: ``modules/storage/router.get_asset_upload_driver()``
+    consults ``AssetRoutingConfig.operations[UPLOAD]`` (auto-augmented with
+    every discoverable ``AssetUploadProtocol`` impl) and returns the first
+    matching backend. With no per-catalog routing configured, GCP wins when
+    the GCP module is installed (registration order, GCP module lifespan
+    runs before ``LocalUploadModule``); otherwise Local. ``None`` only when
+    no backend is registered at all — the REST layer surfaces this as 503.
+
+    Asset registration is **not** owned by this protocol. Drivers mint upload
+    URLs and accept bytes; the assets table is owned by the catalog layer
+    (``upsert_asset`` for the policy-gated PENDING insert at upload-create
+    time, and the inline Pub/Sub finalize handler for the PENDING→ACTIVE
+    transition). ``complete_upload`` is intentionally not part of this
+    protocol.
+    """
+
+    driver_id: str
+    """Stable, lowercase, snake-case identifier for this backend.
+
+    Used by ``AssetRoutingConfig.operations[UPLOAD]`` for explicit per-catalog
+    routing and by REST clients for diagnostic purposes. Examples: ``"gcs"``,
+    ``"local"``.
+    """
+
+    supports_versioning: bool
+    """Whether this backend can preserve a previous version of an asset's
+    bytes when a new upload completes for the same logical asset.
+
+    Read by ``AssetsWritePolicy`` when ``on_conflict=NEW_VERSION``: the
+    chain runner refuses with ``reason="versioning_unsupported"`` if a
+    matching policy is configured but the resolved driver returns False
+    here. Defaults to ``False`` for both shipped impls — Stage 6's
+    reconcile path is the recovery surface for restoring an older blob.
     """
 
     async def initiate_upload(

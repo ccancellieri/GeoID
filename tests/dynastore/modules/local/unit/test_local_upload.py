@@ -288,7 +288,7 @@ class TestCompleteUpload:
             asset = await m._complete_upload("t1", staging_file, ticket)
 
         # File was moved
-        permanent = m._asset_root / "cat1" / "_catalog_" / "scene.tif"
+        permanent = m._asset_root / "cat1" / "_catalog_tier" / "scene.tif"
         assert permanent.exists()
         assert not staging_file.exists()
         assert asset.asset_id == "scene_001"

@@ -16,7 +16,20 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from .gcs_storage_event_task import GcsStorageEventTask
 from .gcp_catalog_cleanup_task import GcpCatalogCleanupTask
+from .bucket_reconcile_task import (
+    BucketReconcileInputs,
+    BucketReconcileReport,
+    BucketReconcileTask,
+    DriftEntry,
+    DriftKind,
+)
 
-__all__ = ["GcsStorageEventTask", "GcpCatalogCleanupTask"]
+__all__ = [
+    "GcpCatalogCleanupTask",
+    "BucketReconcileTask",
+    "BucketReconcileInputs",
+    "BucketReconcileReport",
+    "DriftEntry",
+    "DriftKind",
+]

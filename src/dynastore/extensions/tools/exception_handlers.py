@@ -298,6 +298,57 @@ class UnknownFieldsExceptionHandler(ExceptionHandler):
         )
 
 
+class AssetSidecarRejectedExceptionHandler(ExceptionHandler):
+    """Maps ``AssetSidecarRejectedError`` to HTTP 409 with structured body.
+
+    Raised by the asset write-policy chain in
+    :mod:`dynastore.modules.catalog.asset_distributed` when an incoming asset
+    matches an existing one and the resolved :class:`AssetsWritePolicy` says
+    ``REFUSE_FAIL`` (or when ``NEW_VERSION`` is requested without driver
+    versioning). The body shape follows the structured-error convention used
+    by other 409 paths so REST clients can react uniformly:
+
+    * ``asset_id`` — the incoming payload's id
+    * ``matcher`` — which matcher hit (``asset_id`` / ``filename`` /
+      ``metadata_field`` / ``url`` / ``content_hash``)
+    * ``reason`` — short machine code (``conflict`` /
+      ``versioning_unsupported``)
+    * ``detail`` — the human-readable message
+    * ``existing_id`` — the id of the existing row that triggered the
+      rejection (``None`` when no probe matched and the rejection comes from
+      a defensive branch).
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.catalog.asset_distributed import (
+            AssetSidecarRejectedError,
+        )
+
+        return isinstance(exception, AssetSidecarRejectedError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.modules.catalog.asset_distributed import (
+            AssetSidecarRejectedError,
+        )
+
+        assert isinstance(exception, AssetSidecarRejectedError)
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "type": "https://docs.dynastore.io/errors/asset-conflict",
+                "title": "Asset write rejected",
+                "status": status.HTTP_409_CONFLICT,
+                "asset_id": exception.asset_id,
+                "matcher": exception.matcher,
+                "reason": exception.reason,
+                "detail": exception.message,
+                "existing_id": exception.existing_id,
+            },
+        )
+
+
 class ImmutableConfigExceptionHandler(ExceptionHandler):
     """Handles immutable configuration modification attempts."""
 
@@ -405,6 +456,7 @@ class ExceptionHandlerRegistry:
         self.register(ConflictExceptionHandler())
         self.register(ConstraintViolationExceptionHandler())
         self.register(UnknownFieldsExceptionHandler())
+        self.register(AssetSidecarRejectedExceptionHandler())
         self.register(ImmutableConfigExceptionHandler())
         self.register(PluginNotFoundExceptionHandler())
         self.register(ConfigResolutionExceptionHandler())  # 500 — ops misconfig

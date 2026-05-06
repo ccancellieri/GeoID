@@ -26,8 +26,10 @@ registered in the catalog database.  Assets are the central linking mechanism:
 
 - **Ingestion tasks** create an asset from a source-file URI, then write
   feature rows into the collection's physical table keyed by ``asset_id``.
-- **GCS/S3 uploads** create assets automatically when the storage event fires
-  (``GcsStorageEventTask`` / future ``S3EventTask``).
+- **GCS/S3 uploads** mint a PENDING row up front (``initiate_upload``); the
+  storage backend's finalize event then activates that row inline (the GCS
+  Pub/Sub HTTP push handler runs the finalize activator in a single
+  transaction; future S3 backends will follow the same shape).
 - **Direct API calls** create assets immediately via
   ``POST /assets/catalogs/{id}`` or the collection-scoped variant.
 
@@ -121,7 +123,8 @@ Upload flow (GCS)
     )
     # → ticket.upload_url is a GCS signed resumable PUT URL
     # → PUT file to ticket.upload_url with ticket.headers
-    # → GCS fires OBJECT_FINALIZE → GcsStorageEventTask → create_asset(owned_by="gcs")
+    # → GCS fires OBJECT_FINALIZE → Pub/Sub push → inline finalize activator
+    #   transitions the PENDING row to ACTIVE in one transaction
     # → poll GET /assets/catalogs/{id}/upload/{ticket.ticket_id}/status
 
 Deletion guard
@@ -143,13 +146,13 @@ Hard-deletion of an ``owned_by`` asset with blocking references raises
 import json
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List, Optional, Dict, Any, Union, Callable, Annotated
+from typing import TYPE_CHECKING, List, Literal, Optional, Dict, Any, Union, Callable, Annotated
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.router import ResolvedDriver
 from sqlalchemy import text
 from dynastore.tools.cache import cached
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, StringConstraints
 
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
@@ -162,6 +165,7 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.tools.json import CustomJSONEncoder
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.modules.catalog.models import AssetReferenceType, CoreAssetReferenceType, EventType
+from dynastore.models.shared_models import Link
 from dynastore.models.protocols.assets import AssetsProtocol
 from dynastore.models.protocols.asset_driver import AssetStore
 from dynastore.models.driver_context import DriverContext
@@ -173,13 +177,27 @@ logger = logging.getLogger(__name__)
 
 # --- Asset-Specific Enums ---
 
-CATALOG_LEVEL_COLLECTION_ID = "_catalog_"
-
 
 class AssetTypeEnum(str, Enum):
     VECTORIAL = "VECTORIAL"
     RASTER = "RASTER"
     ASSET = "ASSET"
+
+
+class AssetKind(str, Enum):
+    """Discriminates between assets we manage and external references."""
+
+    PHYSICAL = "physical"  # blob in our managed bucket / disk
+    VIRTUAL = "virtual"    # external href; we don't manage the bytes
+
+
+class AssetStatus(str, Enum):
+    """Lifecycle states a row passes through."""
+
+    PENDING = "pending"  # row born at upload-create; awaiting OBJECT_FINALIZE
+    ACTIVE = "active"    # blob present (physical) or href registered (virtual)
+    FAILED = "failed"    # finalize never came / hash mismatch / external 404
+    DELETED = "deleted"  # logical delete
 
 
 class AssetEventType(EventType):
@@ -192,48 +210,23 @@ class AssetEventType(EventType):
 
 # --- Asset Models ---
 
+# Filename validator: no slashes, no NUL, max 255 chars.
+Filename = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=255, pattern=r"^[^\x00/\\]+$"),
+]
+
 
 class AssetBase(BaseModel):
     """
-    Core fields required to create or represent an asset.
+    Identity and metadata fields shared across creates and reads.
 
-    ``owned_by`` semantics
-    ~~~~~~~~~~~~~~~~~~~~~~
-    When set, ``owned_by`` declares that a storage backend (``"gcs"``,
-    ``"local"``, ``"http"``, …) manages the underlying file.  This activates
-    the deletion guard: if any ``AssetReference`` with ``cascade_delete=False``
-    is active, ``delete_assets(hard=True)`` raises ``AssetReferencedError``
-    (HTTP 409) instead of removing the row.
-
-    Assets created by ingestion tasks (not file-owned) should leave
-    ``owned_by=None`` so the existing PostgreSQL trigger cascade works without
-    interference from the reference guard.
-
-    Examples::
-
-        # File uploaded to GCS — owned by the GCS backend
-        AssetBase(
-            asset_id="scene_20251225",
-            uri="gs://my-bucket/landsat/scene_20251225.tif",
-            asset_type=AssetTypeEnum.RASTER,
-            metadata={"sensor": "OLI-2"},
-            owned_by="gcs",
-        )
-
-        # Ingestion source file on local disk — NOT file-owned
-        AssetBase(
-            asset_id="stations_2025",
-            uri="/data/uploads/stations_2025.csv",
-            asset_type=AssetTypeEnum.ASSET,
-            metadata={"year": 2025},
-        )
+    Identity (``asset_id``, ``filename``, ``href``) is immutable once a row
+    becomes ``ACTIVE``; only ``metadata`` can be mutated through ``AssetUpdate``.
     """
 
-    asset_id: str = Field(..., description="Unique logical identifier for the asset.")
-    uri: str = Field(
-        ...,
-        description="URI pointing to the asset location (e.g., gs://bucket/path/to/asset.tif).",
-    )
+    asset_id: str = Field(..., min_length=1, max_length=255,
+                          description="Unique logical identifier for the asset.")
     asset_type: AssetTypeEnum = Field(
         default=AssetTypeEnum.ASSET,
         description="Type of the asset. Could be VECTORIAL, RASTER, or generic ASSET.",
@@ -258,8 +251,47 @@ class AssetBase(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class AssetCreate(AssetBase):
+    """
+    Physical asset create payload — blob lives in a managed bucket / disk.
+
+    Used by upload-create REST routes.  ``filename`` is mandatory and must
+    not contain slashes or NUL bytes.
+
+    ``uri`` is for internal storage-event callers (GCS / local finalize)
+    that already know the storage URI and need to create the row as ACTIVE
+    in one shot. REST-facing flows leave it ``None`` and let Stage 4's
+    finalize event populate it.
+    """
+
+    kind: Literal[AssetKind.PHYSICAL] = AssetKind.PHYSICAL
+    filename: Filename
+    uri: Optional[str] = Field(
+        default=None,
+        description="Internal-use: pre-resolved storage URI for storage-event creates.",
+    )
+
+
+class VirtualAssetCreate(AssetBase):
+    """
+    Virtual asset create payload — registers an external href without
+    bucket presence on our side.
+    """
+
+    kind: Literal[AssetKind.VIRTUAL] = AssetKind.VIRTUAL
+    href: str = Field(..., min_length=1, description="External URL the asset points at.")
+    filename: Optional[Filename] = Field(
+        default=None,
+        description="Optional display filename; derived from href tail if absent.",
+    )
+
+
 class AssetUpdate(BaseModel):
-    """Mutable fields for an Asset."""
+    """Mutable surface — metadata only.
+
+    Identity (``asset_id``, ``filename``, ``href``) is immutable once a row
+    becomes ``ACTIVE``; use a NEW_VERSION write policy to replace.
+    """
 
     metadata: Dict[str, Any] = Field(
         default_factory=dict, description="Arbitrary metadata for the asset."
@@ -268,18 +300,12 @@ class AssetUpdate(BaseModel):
 
 class AssetUploadDefinition(BaseModel):
     """
-    Asset metadata supplied at upload-initiation time when the URI is not yet known.
+    Internal-use only: asset metadata embedded inside upload tickets.
 
-    The backend fills in the ``uri`` after receiving the file and then calls
-    ``AssetsProtocol.create_asset`` with a fully formed ``AssetBase``.
-
-    Example::
-
-        AssetUploadDefinition(
-            asset_id="gadm_adm2_italy",
-            asset_type=AssetTypeEnum.VECTORIAL,
-            metadata={"source": "GADM", "version": "4.1", "country": "ITA"},
-        )
+    NOT a public REST request model.  Public callers use ``AssetCreate`` /
+    ``VirtualAssetCreate``; this shape is reserved for ticket-bearing
+    upload-driver internals where the URI is filled in by the backend after
+    delivery.
     """
 
     asset_id: str = Field(..., description="Unique logical identifier for the asset.")
@@ -393,16 +419,49 @@ class AssetReferencedError(ValueError):
 
 
 class Asset(AssetBase):
-    """Fully formed Asset retrieved from DB."""
+    """Fully persisted asset retrieved from the catalog backend.
 
-    # asset_id inherited from AssetBase (str)
+    ``filename`` is required for ``PHYSICAL`` rows; ``href`` is required for
+    ``VIRTUAL`` rows (enforced as a CHECK constraint at the DB layer).
+    Soft-delete is represented by ``status = AssetStatus.DELETED``; there is
+    no separate ``deleted_at`` column.
+    """
+
+    kind: AssetKind
+    status: AssetStatus
     catalog_id: Annotated[str, Field(description="The catalog ID.")]
-    collection_id: Annotated[
-        Optional[str], Field(None, description="The collection ID.")
-    ]
+    collection_id: Optional[str] = Field(
+        default=None,
+        description="Collection scope; NULL for catalog-tier assets.",
+    )
+    filename: Optional[str] = Field(
+        default=None,
+        description="Storage filename (PHYSICAL only); NOT NULL when kind=physical.",
+    )
+    href: Optional[str] = Field(
+        default=None,
+        description="External URL (VIRTUAL only); NOT NULL when kind=virtual.",
+    )
+    uri: Optional[str] = Field(
+        default=None,
+        description="Resolved storage URI (gs://, file://, ...) set by finalize for PHYSICAL once ACTIVE.",
+    )
+    content_hash: Optional[str] = Field(
+        default=None,
+        description="SHA-256 hex (or md5) set by finalize event.",
+    )
+    size_bytes: Optional[int] = Field(default=None, description="Object size in bytes.")
     created_at: datetime
-    deleted_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    links: Optional[List[Link]] = Field(
+        default=None,
+        description=(
+            "OGC API HATEOAS navigation links (``self``, ``collection``, "
+            "``alternate`` to download). Populated by the asset REST surface "
+            "on single-asset GET responses; ``None`` on rows returned by "
+            "lower layers (DB / driver) so list responses stay terse."
+        ),
+    )
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -442,17 +501,23 @@ class AssetService(AssetsProtocol):
     ~~~~~~~~~~~~~
     ::
 
-        {catalog_schema}.assets
-          asset_id       VARCHAR  PK
+        {catalog_schema}.assets   (PARTITION BY LIST (collection_id))
+          asset_id       VARCHAR
           catalog_id     VARCHAR
-          collection_id  VARCHAR  (NULL for catalog-level assets)
-          uri            TEXT
+          collection_id  VARCHAR  (NULL = catalog-tier; default partition)
           asset_type     VARCHAR
+          kind           VARCHAR  ('physical' | 'virtual')
+          status         VARCHAR  ('pending' | 'active' | 'failed' | 'deleted')
+          filename       VARCHAR  (NOT NULL for kind=physical, CHECK)
+          href           TEXT     (NOT NULL for kind=virtual,  CHECK)
+          uri            TEXT     (resolved storage URI for PHYSICAL, set by finalize)
+          content_hash   VARCHAR(64)
+          size_bytes     BIGINT
           metadata       JSONB
           owned_by       VARCHAR  (NULL = not file-owned; set = deletion guard active)
           created_at     TIMESTAMPTZ
           updated_at     TIMESTAMPTZ
-          deleted_at     TIMESTAMPTZ  (soft-delete sentinel)
+          PRIMARY KEY (catalog_id, collection_id, asset_id)
 
         {catalog_schema}.asset_references
           asset_id       VARCHAR  FK → assets
@@ -509,7 +574,7 @@ class AssetService(AssetsProtocol):
     # --- Retrieval & Advanced Search ---
 
     async def _get_asset_db(
-        self, catalog_id: str, asset_id: str, collection_id: str
+        self, catalog_id: str, asset_id: str, collection_id: Optional[str]
     ) -> Optional[Dict[str, Any]]:
         """Fetch asset dict from the configured read driver (cached path)."""
         from dynastore.modules.storage.router import get_asset_driver
@@ -631,25 +696,21 @@ class AssetService(AssetsProtocol):
     ) -> Optional[Asset]:
         """Get asset by ID, routing through the configured read driver."""
         from dynastore.modules.storage.router import get_asset_driver
-        target_col_id = collection_id if collection_id else CATALOG_LEVEL_COLLECTION_ID
 
         if db_resource:
             driver = await get_asset_driver("READ", catalog_id, collection_id)
             asset_doc = await driver.get_asset(
                 catalog_id, asset_id,
-                collection_id=target_col_id,
+                collection_id=collection_id,
                 db_resource=db_resource,
             )
         else:
-            asset_doc = await self.get_asset_cached(catalog_id, asset_id, target_col_id)
+            asset_doc = await self.get_asset_cached(catalog_id, asset_id, collection_id)
 
         if not asset_doc:
             return None
 
-        asset = Asset.model_validate(dict(asset_doc))
-        if asset.collection_id == CATALOG_LEVEL_COLLECTION_ID:
-            asset.collection_id = None
-        return asset
+        return Asset.model_validate(dict(asset_doc))
 
     # Deprecated alias methods for backward compatibility if needed, but we should switch to get_asset using internal logic
     async def get_asset_by_code(
@@ -673,22 +734,15 @@ class AssetService(AssetsProtocol):
         db_resource: Optional[DbResource] = None,
     ) -> List[Asset]:
         from dynastore.modules.storage.router import get_asset_driver
-        target_col_id = collection_id if collection_id else CATALOG_LEVEL_COLLECTION_ID
         driver = await get_asset_driver("READ", catalog_id, collection_id)
         docs = await driver.search_assets(
             catalog_id,
-            collection_id=target_col_id,
+            collection_id=collection_id,
             limit=limit,
             offset=offset,
             db_resource=db_resource or self.engine,
         )
-        assets = []
-        for doc in docs:
-            asset = Asset.model_validate(dict(doc))
-            if asset.collection_id == CATALOG_LEVEL_COLLECTION_ID:
-                asset.collection_id = None
-            assets.append(asset)
-        return assets
+        return [Asset.model_validate(dict(doc)) for doc in docs]
 
     async def search_assets(
         self,
@@ -707,7 +761,6 @@ class AssetService(AssetsProtocol):
         driver (PG) which supports full operator coverage via SQL.
         """
         from dynastore.modules.storage.router import get_asset_driver
-        target_col_id = collection_id if collection_id else CATALOG_LEVEL_COLLECTION_ID
 
         # Build simple field=value dict for EQ-only filters (ES-compatible)
         eq_query: Dict[str, Any] = {}
@@ -727,19 +780,13 @@ class AssetService(AssetsProtocol):
                 driver = await get_asset_driver("READ", catalog_id, collection_id)
             docs = await driver.search_assets(
                 catalog_id,
-                collection_id=target_col_id,
+                collection_id=collection_id,
                 query=eq_query or None,
                 limit=limit,
                 offset=offset,
                 db_resource=db_resource or self.engine,
             )
-            assets = []
-            for doc in docs:
-                asset = Asset.model_validate(dict(doc))
-                if asset.collection_id == CATALOG_LEVEL_COLLECTION_ID:
-                    asset.collection_id = None
-                assets.append(asset)
-            return assets
+            return [Asset.model_validate(dict(doc)) for doc in docs]
 
         # Complex filters: fall back to default driver (PG SQL with full operators)
         driver = await get_asset_driver("READ", catalog_id, collection_id)
@@ -769,19 +816,13 @@ class AssetService(AssetsProtocol):
 
         docs = await driver.search_assets(
             catalog_id,
-            collection_id=target_col_id,
+            collection_id=collection_id,
             query=pg_query,
             limit=limit,
             offset=offset,
             db_resource=db_resource or self.engine,
         )
-        assets = []
-        for doc in docs:
-            asset = Asset.model_validate(dict(doc))
-            if asset.collection_id == CATALOG_LEVEL_COLLECTION_ID:
-                asset.collection_id = None
-            assets.append(asset)
-        return assets
+        return [Asset.model_validate(dict(doc)) for doc in docs]
 
     # --- Lifecycle ---
 
@@ -794,17 +835,35 @@ class AssetService(AssetsProtocol):
     ) -> Asset:
         from dynastore.modules.storage.router import get_asset_driver
         db_resource = ctx.db_resource if ctx else None
-        target_col_id = collection_id if collection_id else CATALOG_LEVEL_COLLECTION_ID
         now = datetime.now(timezone.utc)
+
+        # Resolve discriminated fields based on which create-shape was passed.
+        # Stage 4 will replace this with policy-driven PENDING inserts; for now
+        # we default to PHYSICAL/ACTIVE (so existing call sites that pass a
+        # plain ``AssetBase`` still produce a valid row), and propagate
+        # ``filename`` / ``href`` / ``kind`` from the typed subclasses.
+        kind_val = getattr(asset, "kind", AssetKind.PHYSICAL)
+        if hasattr(kind_val, "value"):
+            kind_str = kind_val.value
+        else:
+            kind_str = str(kind_val)
+        filename_val: Optional[str] = getattr(asset, "filename", None)
+        href_val: Optional[str] = getattr(asset, "href", None)
+        uri_val: Optional[str] = getattr(asset, "uri", None)
 
         asset_doc: Dict[str, Any] = {
             "asset_id": asset.asset_id,
             "catalog_id": catalog_id,
-            "collection_id": target_col_id,
+            "collection_id": collection_id,
             "asset_type": asset.asset_type.value,
-            "uri": asset.uri,
+            "kind": kind_str,
+            "status": AssetStatus.ACTIVE.value,
+            "filename": filename_val,
+            "href": href_val,
+            "uri": uri_val,
+            "content_hash": None,
+            "size_bytes": None,
             "created_at": now,
-            "deleted_at": None,
             "metadata": asset.metadata,
             "owned_by": asset.owned_by,
         }
@@ -820,14 +879,12 @@ class AssetService(AssetsProtocol):
         # Fetch canonical state from the write driver (captures DB-set timestamps)
         fetched_doc = await write_driver.get_asset(
             catalog_id, asset.asset_id,
-            collection_id=target_col_id,
+            collection_id=collection_id,
             db_resource=db_resource,
         )
         created = Asset.model_validate(fetched_doc or asset_doc)
-        if created.collection_id == CATALOG_LEVEL_COLLECTION_ID:
-            created.collection_id = None
 
-        self._invalidate_cache(created.asset_id, catalog_id, target_col_id)
+        self._invalidate_cache(created.asset_id, catalog_id, collection_id)
 
         if self._event_emitter:
             await self._event_emitter(
@@ -846,7 +903,6 @@ class AssetService(AssetsProtocol):
     ) -> Asset:
         """Updates an existing asset's metadata via the configured write driver."""
         from dynastore.modules.storage.router import get_asset_driver
-        target_col_id = collection_id if collection_id else CATALOG_LEVEL_COLLECTION_ID
 
         # Fetch current asset
         current = await self.get_asset(
@@ -863,7 +919,7 @@ class AssetService(AssetsProtocol):
         # Build updated doc
         updated_doc: Dict[str, Any] = current.model_dump()
         updated_doc["metadata"] = update.metadata
-        updated_doc["collection_id"] = target_col_id
+        updated_doc["collection_id"] = collection_id
 
         write_driver = await get_asset_driver("WRITE", catalog_id, collection_id)
         await write_driver.index_asset(catalog_id, updated_doc, db_resource=db_resource)
@@ -876,14 +932,12 @@ class AssetService(AssetsProtocol):
         # Fetch canonical state
         fetched_doc = await write_driver.get_asset(
             catalog_id, asset_id,
-            collection_id=target_col_id,
+            collection_id=collection_id,
             db_resource=db_resource,
         )
         updated = Asset.model_validate(fetched_doc or updated_doc)
-        if updated.collection_id == CATALOG_LEVEL_COLLECTION_ID:
-            updated.collection_id = None
 
-        self._invalidate_cache(updated.asset_id, catalog_id, target_col_id)
+        self._invalidate_cache(updated.asset_id, catalog_id, collection_id)
 
         if self._event_emitter:
             await self._event_emitter(
@@ -892,7 +946,7 @@ class AssetService(AssetsProtocol):
             )
         return updated
 
-    def _invalidate_cache(self, asset_id: str, catalog_id: str, collection_id: str):
+    def _invalidate_cache(self, asset_id: str, catalog_id: str, collection_id: Optional[str]):
         """Invalidates related cache entries."""
         # Signature of _get_asset_db is (catalog_id, asset_id, collection_id)
         self.get_asset_cached.cache_invalidate(catalog_id, asset_id, collection_id)

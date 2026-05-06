@@ -14,7 +14,7 @@ from tests.dynastore.test_utils import generate_test_id
 
 from dynastore.modules.catalog.asset_service import (
     AssetService,
-    AssetBase,
+    AssetCreate,
     AssetUpdate,
     AssetTypeEnum,
 )
@@ -40,15 +40,17 @@ async def test_asset_cache_targeted_invalidation(
     asset_service: AssetService = get_protocol(AssetsProtocol)
 
     # Create two assets
-    asset1 = AssetBase(
+    asset1 = AssetCreate(
         asset_id=f"cache_test_1_{generate_test_id()}",
+        filename="asset1.tif",
         uri="gs://test/asset1.tif",
         asset_type=AssetTypeEnum.RASTER,
         metadata={"version": 1},
     )
 
-    asset2 = AssetBase(
+    asset2 = AssetCreate(
         asset_id=f"cache_test_2_{generate_test_id()}",
+        filename="asset2.tif",
         uri="gs://test/asset2.tif",
         asset_type=AssetTypeEnum.RASTER,
         metadata={"version": 1},
@@ -138,8 +140,9 @@ async def test_asset_cache_bypassed_with_db_resource(
     asset_service: AssetService = get_protocol(AssetsProtocol)
 
     # Create an asset
-    asset = AssetBase(
+    asset = AssetCreate(
         asset_id=f"txn_test_{generate_test_id()}",
+        filename="txn.tif",
         uri="gs://test/txn.tif",
         asset_type=AssetTypeEnum.RASTER,
         metadata={"value": 1},
@@ -202,8 +205,9 @@ async def test_asset_cache_invalidation_on_delete(
     asset_service: AssetService = get_protocol(AssetsProtocol)
 
     # Create and cache an asset
-    asset = AssetBase(
+    asset = AssetCreate(
         asset_id=f"delete_test_{generate_test_id()}",
+        filename="delete.tif",
         uri="gs://test/delete.tif",
         asset_type=AssetTypeEnum.RASTER,
         metadata={"temp": True},
@@ -248,13 +252,14 @@ async def test_asset_cache_performance_improvement(
     await catalogs.create_catalog(catalog_obj)
     await catalogs.create_collection(catalog_id, collection_obj)
 
-    asset_service: AssetManager = get_protocol(AssetsProtocol)
+    asset_service: AssetService = get_protocol(AssetsProtocol)
 
     # Create 10 assets
     assets = []
     for i in range(10):
-        asset = AssetBase(
+        asset = AssetCreate(
             asset_id=f"perf_test_{i}_{generate_test_id()}",
+            filename=f"perf_{i}.tif",
             uri=f"gs://test/perf_{i}.tif",
             asset_type=AssetTypeEnum.RASTER,
             metadata={"index": i},

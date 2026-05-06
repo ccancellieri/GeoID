@@ -15,10 +15,6 @@ from dynastore.tasks.elasticsearch.tasks import (
     ElasticsearchDeleteTask,
     ElasticsearchDeleteInputs,
 )
-from dynastore.tasks.gcp.gcs_storage_event_task import (
-    GcsStorageEventTask,
-    GcsStorageEventInputs,
-)
 from dynastore.tasks.gcp.gcp_catalog_cleanup_task import (
     GcpCatalogCleanupTask,
     GcpCatalogCleanupInputs,
@@ -85,19 +81,6 @@ class TestHydrateTaskPayload:
         payload = hydrate_task_payload(task, raw)
         assert isinstance(payload.inputs, ElasticsearchDeleteInputs)
         assert payload.inputs.entity_id == "del-id"
-
-    def test_gcs_storage_event_hydrated(self):
-        task = GcsStorageEventTask.__new__(GcsStorageEventTask)
-        raw = _make_raw_payload({
-            "catalog_id": "cat_test",
-            "collection_id": "col_test",
-            "event_type": "OBJECT_FINALIZE",
-            "asset_id": "asset_1",
-            "uri": "gs://test-bucket/test-obj",
-        })
-        payload = hydrate_task_payload(task, raw)
-        assert isinstance(payload.inputs, GcsStorageEventInputs)
-        assert payload.inputs.event_type == "OBJECT_FINALIZE"
 
     def test_gcp_catalog_cleanup_hydrated(self):
         task = GcpCatalogCleanupTask.__new__(GcpCatalogCleanupTask)

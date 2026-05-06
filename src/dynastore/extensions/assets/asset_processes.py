@@ -97,7 +97,7 @@ class UploadAssetProcess:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=(
                     "No upload backend registered for "
-                    f"{asset.catalog_id}/{asset.collection_id or '_catalog_'}."
+                    f"{asset.catalog_id}/{asset.collection_id or '<catalog-tier>'}."
                 ),
             )
 

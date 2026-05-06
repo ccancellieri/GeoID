@@ -242,8 +242,10 @@ def test_every_catalog_task_scope_has_matching_entry_point() -> None:
     `dynastore.tasks.<name>` entry-point. Catalog tasks are dispatched
     in-process by the catalog service (not as separate Cloud Run Jobs);
     a SCOPE/entry-point mismatch surfaces the same way — `Task '<name>'
-    not found` at first dispatch. Three entries today: gcp_provision,
-    gcs_storage_event, gcp_catalog_cleanup."""
+    not found` at first dispatch. Two entries today: gcp_provision,
+    gcp_catalog_cleanup. (gcs_storage_event was retired in Stage 4.2 in
+    favour of an inline Pub/Sub activator — no task hop, no SCOPE
+    entry.)"""
     _assert_scope_family_maps_to_entry_points("catalog_task_")
 
 

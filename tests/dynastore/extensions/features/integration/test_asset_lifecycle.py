@@ -2,7 +2,7 @@ import pytest
 from uuid import uuid4
 from sqlalchemy import text
 from dynastore.models.protocols import AssetsProtocol, CatalogsProtocol
-from dynastore.modules.catalog.asset_service import AssetBase, AssetTypeEnum
+from dynastore.modules.catalog.asset_service import AssetCreate, AssetTypeEnum
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
@@ -152,8 +152,9 @@ async def test_sidecar_delete_cascades_to_assets_row(app_lifespan, catalog_id, c
 
         await assets.create_asset(
             catalog_id,
-            asset=AssetBase(
+            asset=AssetCreate(
                 asset_id=asset_id,
+                filename="cascade_test.bin",
                 uri="file:///tmp/cascade_test.bin",
                 asset_type=AssetTypeEnum.ASSET,
                 metadata={"test": "cascade"},

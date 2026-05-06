@@ -136,7 +136,6 @@ task_dimensions_materialize_deps = ["dynastore[extension_dimensions]"]
 
 # ---- Catalog-hosted lightweight tasks (async-db, in-process).
 catalog_task_gcp_provision = ["dynastore[module_gcp]"]
-catalog_task_gcs_storage_event = ["dynastore[module_gcp,module_catalog]"]
 catalog_task_gcp_catalog_cleanup = ["dynastore[module_gcp,module_catalog]"]
 
 # ==========================================================================
@@ -350,7 +349,7 @@ worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elastic
 #
 # ==========================================================================
 # api_open: full catalog WITHOUT auth — open for testing (no tools_grp: proxy/template served by the dedicated tools service)
-api_open = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcs_storage_event,catalog_task_gcp_catalog_cleanup]"]
+api_open = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # api_catalog: api_open + auth (most common production deployment)
 api_catalog = ["dynastore[api_open,auth_grp]"]
 # api_maps_open: vector producer + raster renderer, no auth.
@@ -368,7 +367,7 @@ api_full = ["dynastore[api_catalog,maps_grp,geospatial_io]"]
 # geoid_service: api_catalog + geoid extension — the ONLY service with auth
 geoid_service = ["dynastore[api_catalog,extension_geoid]"]
 # worker_service: background task processor (sync-db tasks + async-db catalog reads), no auth
-worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,catalog_task_gcp_provision,catalog_task_gcs_storage_event,catalog_task_gcp_catalog_cleanup]"]
+worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # catalog_local: local dev catalog — api_open without google_grp/gcp_cloud_runner (no tools_grp: use the dedicated tools service)
 catalog_local = ["dynastore[core,catalog_grp,monitor_grp,index_grp,processes]"]
 # worker_local: local HTTP simulation of Cloud Run Jobs — all tasks + processes/stats UI
@@ -379,11 +378,11 @@ worker_local = ["dynastore[worker_service,monitor_grp]"]
 # Prefixed with scope_ to avoid collision with module-level extras above.
 # ==========================================================================
 # scope_catalog: catalog API without auth — open for local testing
-scope_catalog = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcs_storage_event,catalog_task_gcp_catalog_cleanup,module_cache,notebooks,dimensions,drivers_grp]"]
+scope_catalog = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup,module_cache,notebooks,dimensions,drivers_grp]"]
 # scope_geoid: catalog + geoid UI + auth/iam — maps to geospatial-auth in cloud
 scope_geoid = ["dynastore[scope_catalog,extension_geoid,auth_grp]"]
 # scope_worker: background task processor — headless Cloud Run job runner
-scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,catalog_task_gcp_provision,catalog_task_gcs_storage_event,catalog_task_gcp_catalog_cleanup]"]
+scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # scope_tools: proxy + template tools service — no auth
 scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,proxy]"]
 # scope_maps: vector producer + raster renderer (local docker), no auth.
@@ -517,7 +516,6 @@ export_features = "dynastore.tasks.export_features.export_features_task:ExportFe
 tiles_preseed = "dynastore.tasks.tiles_preseed.task:TilePreseedTask"
 dimensions_materialize = "dynastore.tasks.dimensions_materialize.task:DimensionsMaterializeTask"
 outbox_drain = "dynastore.tasks.outbox_drain.drain_task:OutboxDrainTask"
-gcs_storage_event = "dynastore.tasks.gcp.gcs_storage_event_task:GcsStorageEventTask"
 gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
 
 [tool.setuptools.dynamic]

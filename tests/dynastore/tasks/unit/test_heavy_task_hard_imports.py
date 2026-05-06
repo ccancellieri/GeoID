@@ -24,7 +24,6 @@ HEAVY_TASK_GATES = {
     "dynastore/tasks/elasticsearch/tasks.py": ["opensearchpy"],
     "dynastore/tasks/elasticsearch_indexer/tasks.py": ["opensearchpy"],
     "dynastore/tasks/gcp_provision/task.py": ["google.cloud.storage"],
-    "dynastore/tasks/gcp/gcs_storage_event_task.py": ["google.cloud.storage"],
     "dynastore/tasks/gcp/gcp_catalog_cleanup_task.py": ["google.cloud.storage"],
     "dynastore/tasks/dwh_join/dwh_join_export_task.py": ["google.cloud.bigquery"],
     "dynastore/tasks/export_features/export_features_task.py": ["shapely"],
