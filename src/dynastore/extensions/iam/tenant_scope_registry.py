@@ -81,6 +81,14 @@ _DASHBOARD_PER_CATALOG_PATTERN = re.compile(
     r"^/web/dashboard/catalogs/(?P<catalog_id>[^/]+)(?:/.*)?$"
 )
 
+# /admin/catalogs/{catalog_id}[/...]  — catalog-scoped admin endpoints
+# (principal-role binding GET/POST/DELETE, catalog users list). Extracting
+# catalog_id makes ``catalog_admin_required`` evaluable for the
+# ``admin_catalog_access`` policy.
+_ADMIN_PER_CATALOG_PATTERN = re.compile(
+    r"^/admin/catalogs/(?P<catalog_id>[^/]+)(?:/.*)?$"
+)
+
 
 TENANT_SCOPED_ROUTES: List[TenantScopeRule] = [
     TenantScopeRule(
@@ -103,6 +111,13 @@ TENANT_SCOPED_ROUTES: List[TenantScopeRule] = [
     TenantScopeRule(
         id="dashboard_per_catalog",
         pattern=_DASHBOARD_PER_CATALOG_PATTERN,
+        catalog_source="regex_group:catalog_id",
+        default="_system_",
+        allow_anonymous=False,
+    ),
+    TenantScopeRule(
+        id="admin_per_catalog",
+        pattern=_ADMIN_PER_CATALOG_PATTERN,
         catalog_source="regex_group:catalog_id",
         default="_system_",
         allow_anonymous=False,
