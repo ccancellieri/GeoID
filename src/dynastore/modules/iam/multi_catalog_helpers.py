@@ -190,20 +190,29 @@ async def list_catalogs_for_identity(
 ) -> Dict[str, Any]:
     """List catalogs where the identity has at least one grant.
 
-    Delegates to the storage primitive (`get_catalogs_for_identity`) so
-    a single, indexed lookup over each tenant's `grants` table replaces
-    the legacy "principal exists in tenant schema" probe. The platform
-    flag reflects whether the identity carries any platform-scope grant.
+    Delegates to ``get_catalog_roles_for_identity`` so a single, indexed
+    lookup over each tenant's ``grants`` table populates both the catalog
+    membership flag and the per-catalog role list. The platform flag
+    reflects whether the identity carries any platform-scope grant.
+
+    Returns a mapping with:
+      - ``platform``       bool — identity carries a platform-scope grant
+      - ``catalogs``       list[str] — catalog ids with at least one grant
+      - ``catalog_roles``  Dict[str, list[str]] — per-catalog role names;
+                           used by catalog-scoped condition handlers
+                           (e.g. ``catalog_admin_required``) that need to
+                           know *which* roles the principal holds, not
+                           just whether they have any
+      - ``total``          int — convenience for ``len(catalogs)``
     """
     from dynastore.modules import get_protocol
     from dynastore.models.protocols import CatalogsProtocol, DatabaseProtocol
 
-    # Catalog list, scoped via the storage primitive.
-    catalog_list = await iam_manager.storage.get_catalogs_for_identity(
+    catalog_roles = await iam_manager.storage.get_catalog_roles_for_identity(
         provider=provider, subject_id=subject_id
     )
+    catalog_list = list(catalog_roles.keys())
 
-    # Platform-scope check: does the identity carry any platform role grant?
     has_platform_grant = False
     principal = await iam_manager.storage.get_principal_by_identity(
         provider=provider, subject_id=subject_id
@@ -214,8 +223,6 @@ async def list_catalogs_for_identity(
         )
         has_platform_grant = bool(platform_roles)
 
-    # Side-effect-free use of catalog/db protocols was the only reason
-    # the old implementation needed them. They're no longer required.
     _ = get_protocol  # pragma: no cover — kept for callers that imported these symbols
     _ = CatalogsProtocol
     _ = DatabaseProtocol
@@ -224,6 +231,7 @@ async def list_catalogs_for_identity(
     return {
         "platform": has_platform_grant,
         "catalogs": catalog_list,
+        "catalog_roles": catalog_roles,
         "total": len(catalog_list),
     }
 

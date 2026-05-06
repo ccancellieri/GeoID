@@ -1106,10 +1106,21 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
     ) -> List[str]:
         """Get catalog IDs where the identity has at least one grant.
 
-        Resolves the principal through `iam.identity_links` and then
-        iterates active catalogs, querying each tenant's `grants` for
-        at least one row. Catalogs that aren't fully provisioned (no
-        `grants` table) are skipped via TableNotFoundError.
+        Thin wrapper around ``get_catalog_roles_for_identity`` for callers
+        that only need the membership flag, not the role list.
+        """
+        roles_map = await self.get_catalog_roles_for_identity(provider, subject_id)
+        return list(roles_map.keys())
+
+    async def get_catalog_roles_for_identity(
+        self, provider: str, subject_id: str,
+    ) -> Dict[str, List[str]]:
+        """Get ``{catalog_id: [role_name, ...]}`` for an identity.
+
+        Resolves the principal through ``iam.identity_links`` and then
+        iterates active catalogs, querying each tenant's ``grants`` for
+        the principal's roles. Catalogs that aren't fully provisioned
+        (no ``grants`` table) are skipped via TableNotFoundError.
 
         For deployments with very many catalogs this remains O(N), but
         the per-catalog query is O(1) on the (subject_kind, subject_ref)
@@ -1118,7 +1129,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         """
         principal = await self._resolve_principal_by_identity(provider, subject_id)
         if not principal or principal.id is None:
-            return []
+            return {}
         principal_uuid = principal.id if isinstance(principal.id, UUID) else UUID(str(principal.id))
 
         async with managed_transaction(self.engine) as db:
@@ -1128,7 +1139,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 result_handler=ResultHandler.ALL_DICTS,
             ).execute(conn=db)
 
-        result: List[str] = []
+        result: Dict[str, List[str]] = {}
         for row in rows or []:
             cid = row.get("id")
             schema = row.get("physical_schema") or row.get("schema")
@@ -1141,7 +1152,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             except TableNotFoundError:
                 continue
             if grants:
-                result.append(cid)
+                result[cid] = list(grants)
         return result
 
     async def get_catalog_users(self, catalog_schema: str) -> List[Dict[str, Any]]:

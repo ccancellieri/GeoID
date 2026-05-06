@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import abc
-from typing import List, Any, Optional
+from typing import Dict, List, Any, Optional
 from uuid import UUID
 from .models import Principal, Role, RefreshToken
 
@@ -122,7 +122,24 @@ class AbstractIamStorage(abc.ABC):
 
     @abc.abstractmethod
     async def get_catalogs_for_identity(self, provider: str, subject_id: str) -> List[str]:
-        """Get list of catalog IDs where an identity has at least one grant."""
+        """Get list of catalog IDs where an identity has at least one grant.
+
+        Equivalent to ``list((await get_catalog_roles_for_identity(...)).keys())``;
+        kept as a separate primitive for callers that don't need role data.
+        """
+        ...
+
+    @abc.abstractmethod
+    async def get_catalog_roles_for_identity(
+        self, provider: str, subject_id: str,
+    ) -> Dict[str, List[str]]:
+        """Get a ``{catalog_id: [role_name, ...]}`` map for an identity.
+
+        Used by catalog-scoped authorization (e.g. ``catalog_admin_required``)
+        that needs to know *which* roles the principal holds in each catalog,
+        not just whether they have any grant. Empty dict for unknown
+        identities or identities with no catalog grants.
+        """
         ...
 
     @abc.abstractmethod

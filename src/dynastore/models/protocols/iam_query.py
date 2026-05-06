@@ -36,9 +36,14 @@ class IamQueryProtocol(Protocol):
         """Return the set of catalogs the identity has at least one grant in.
 
         Returns a mapping with keys:
-            ``platform``  bool — identity carries a platform-scope grant
-            ``catalogs``  list[str] — catalog ids where the identity has
-                          at least one role grant
-            ``total``     int — convenience for ``len(catalogs)``
+            ``platform``       bool — identity carries a platform-scope grant
+            ``catalogs``       list[str] — catalog ids with at least one grant
+            ``catalog_roles``  Dict[str, list[str]] — per-catalog role names;
+                               consumers that need to know *which* roles
+                               the principal holds (not just membership) —
+                               e.g. the ``catalog_admin_required``
+                               condition handler — read this field. Keys
+                               are exactly ``catalogs``.
+            ``total``          int — convenience for ``len(catalogs)``
         """
         ...
