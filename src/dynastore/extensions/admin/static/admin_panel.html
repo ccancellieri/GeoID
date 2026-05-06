@@ -127,6 +127,7 @@
       <button class="tab-btn" onclick="switchTab('principals')"><i class="fa-solid fa-fingerprint"></i> Principals</button>
       <button class="tab-btn" onclick="switchTab('roles')"><i class="fa-solid fa-user-tag"></i> Roles</button>
       <button class="tab-btn" onclick="switchTab('policies')"><i class="fa-solid fa-file-shield"></i> Policies</button>
+      <button class="tab-btn" onclick="switchTab('catalog-permissions')"><i class="fa-solid fa-database"></i> Catalog Permissions</button>
     </div>
 
   <!-- ── USERS TAB ── -->
@@ -187,6 +188,22 @@
     </div>
   </div>
 
+  <!-- ── CATALOG PERMISSIONS TAB ── -->
+  <div id="tab-catalog-permissions" class="tab-pane">
+    <div class="toolbar">
+      <label style="color:var(--text-dim);font-size:13px">Catalog</label>
+      <select id="cp-catalog-select" onchange="loadCatalogUsers()" style="min-width:240px"></select>
+      <button class="btn btn-primary" onclick="openCatalogGrantModal()" id="cp-grant-btn" disabled><i class="fa-solid fa-user-plus"></i> Grant Access</button>
+      <button class="btn btn-primary" onclick="loadCatalogUsers()"><i class="fa-solid fa-rotate"></i></button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Display Name</th><th>Provider</th><th>Subject ID</th><th>Roles in catalog</th><th>Actions</th></tr></thead>
+        <tbody id="cp-tbody"><tr><td colspan="5" class="empty">Pick a catalog above.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
 
 </div>
 
@@ -207,7 +224,7 @@
   </div>
 </div>
 
-<!-- Assign Catalog Role Modal -->
+<!-- Assign Catalog Role Modal (user-centric, opened from Users tab) -->
 <div id="catalog-modal" class="modal-bg hidden">
   <div class="modal">
     <h2><i class="fa-solid fa-database" style="color:var(--primary);margin-right:8px"></i>Assign Catalog Role</h2>
@@ -217,6 +234,20 @@
     <div class="form-actions">
       <button class="btn" onclick="closeCatalogModal()" style="color:var(--text-dim)">Cancel</button>
       <button class="btn btn-primary" onclick="assignCatalogRole()"><i class="fa-solid fa-check"></i> Assign</button>
+    </div>
+  </div>
+</div>
+
+<!-- Grant Catalog Access Modal (catalog-centric, opened from Catalog Permissions tab) -->
+<div id="catalog-grant-modal" class="modal-bg hidden">
+  <div class="modal">
+    <h2><i class="fa-solid fa-user-plus" style="color:var(--primary);margin-right:8px"></i>Grant Catalog Access</h2>
+    <div class="form-row"><label>Catalog</label><input id="cg-catalog" disabled style="opacity:.7"/></div>
+    <div class="form-row"><label>Principal subject_id *</label><input id="cg-principal" placeholder="UUID or provider:subject"/></div>
+    <div class="form-row"><label>Role *</label><select id="cg-role"></select></div>
+    <div class="form-actions">
+      <button class="btn" onclick="closeCatalogGrantModal()" style="color:var(--text-dim)">Cancel</button>
+      <button class="btn btn-primary" onclick="submitCatalogGrant()"><i class="fa-solid fa-check"></i> Grant</button>
     </div>
   </div>
 </div>
@@ -297,6 +328,13 @@ function toast(msg, ok = true) {
 
 function csvToList(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
 
+// Escape HTML so user-controlled strings (display names, subject ids, role names)
+// can't break out of innerHTML templates into <script> or attribute injection.
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 // ── Tab switching ──
 function switchTab(name) {
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
@@ -307,6 +345,7 @@ function switchTab(name) {
   if (name === 'principals') loadPrincipals();
   if (name === 'roles') loadRoles();
   if (name === 'policies') loadPolicies();
+  if (name === 'catalog-permissions') loadCatalogPermissionsCatalogs();
 }
 
 // ── USERS ──
@@ -361,7 +400,132 @@ async function deactivateUser(id) {
   } catch(e) { toast(e.message, false); }
 }
 
-// ── CATALOG ROLE ──
+// ── CATALOG PERMISSIONS (catalog-centric tab) ──
+async function loadCatalogPermissionsCatalogs() {
+  const sel = document.getElementById('cp-catalog-select');
+  const grantBtn = document.getElementById('cp-grant-btn');
+  sel.innerHTML = '<option>Loading…</option>';
+  grantBtn.disabled = true;
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${_ADMIN_ROOT}/catalogs?limit=200`, { headers });
+    if (!res.ok) throw new Error(res.statusText);
+    const cats = await res.json();
+    if (!cats.length) {
+      sel.innerHTML = '<option>No catalogs available</option>';
+      document.getElementById('cp-tbody').innerHTML = '<tr><td colspan="5" class="empty">No catalogs to manage.</td></tr>';
+      return;
+    }
+    sel.innerHTML = cats.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.title || c.id)}</option>`).join('');
+    grantBtn.disabled = false;
+    loadCatalogUsers();
+  } catch(e) {
+    sel.innerHTML = '<option>Error loading</option>';
+    toast('Failed to load catalogs: ' + e.message, false);
+  }
+}
+
+async function loadCatalogUsers() {
+  const cat = document.getElementById('cp-catalog-select').value;
+  const tb = document.getElementById('cp-tbody');
+  if (!cat || cat === 'Loading…' || cat === 'No catalogs available') {
+    tb.innerHTML = '<tr><td colspan="5" class="empty">Pick a catalog above.</td></tr>';
+    return;
+  }
+  tb.innerHTML = '<tr><td colspan="5" class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading…</td></tr>';
+  try {
+    const users = await apiFetch(`/catalogs/${encodeURIComponent(cat)}/users`);
+    if (!users || !users.length) {
+      tb.innerHTML = `<tr><td colspan="5" class="empty">No principals have access to <strong>${escapeHtml(cat)}</strong>. Click <em>Grant Access</em> to add one.</td></tr>`;
+      return;
+    }
+    tb.innerHTML = users.map(u => {
+      const roles = (u.roles || []).map(r => `
+        <span class="badge badge-role" style="display:inline-flex;align-items:center;gap:4px">
+          ${escapeHtml(r)}
+          <button title="Revoke" data-action="revoke" data-pid="${escapeHtml(u.id)}" data-role="${escapeHtml(r)}"
+            style="background:none;border:0;color:var(--danger);cursor:pointer;padding:0;font-size:11px">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </span>`).join('');
+      return `
+        <tr>
+          <td><strong>${escapeHtml(u.display_name || u.subject_id)}</strong></td>
+          <td><span style="color:var(--text-dim)">${escapeHtml(u.provider || 'local')}</span></td>
+          <td><code style="font-size:11px;color:var(--text-dim)">${escapeHtml(u.subject_id)}</code></td>
+          <td><div class="chip-list">${roles}</div></td>
+          <td><div class="action-btns">
+            <button class="btn btn-sm btn-primary" title="Add another role for this principal"
+              data-action="add" data-subject="${escapeHtml(u.subject_id)}">
+              <i class="fa-solid fa-plus"></i>
+            </button>
+          </div></td>
+        </tr>`;
+    }).join('');
+    tb.querySelectorAll('[data-action="revoke"]').forEach(btn => {
+      btn.addEventListener('click', () => revokeCatalogRoleFor(cat, btn.dataset.pid, btn.dataset.role));
+    });
+    tb.querySelectorAll('[data-action="add"]').forEach(btn => {
+      btn.addEventListener('click', () => openCatalogGrantModal(btn.dataset.subject));
+    });
+  } catch(e) {
+    tb.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+async function revokeCatalogRoleFor(catalog, principalId, role) {
+  if (!confirm(`Revoke role '${role}' from this principal in catalog '${catalog}'?`)) return;
+  try {
+    await apiFetch(`/catalogs/${encodeURIComponent(catalog)}/principals/${encodeURIComponent(principalId)}/roles/${encodeURIComponent(role)}`, { method:'DELETE' });
+    toast(`Role '${role}' revoked.`);
+    loadCatalogUsers();
+  } catch(e) { toast(e.message, false); }
+}
+
+async function openCatalogGrantModal(prefilledSubjectId) {
+  const cat = document.getElementById('cp-catalog-select').value;
+  if (!cat) { toast('Pick a catalog first.', false); return; }
+  document.getElementById('cg-catalog').value = cat;
+  document.getElementById('cg-principal').value = prefilledSubjectId || '';
+  const sel = document.getElementById('cg-role');
+  sel.innerHTML = '<option>Loading…</option>';
+  try {
+    const roles = await apiFetch(`/roles?catalog_id=${encodeURIComponent(cat)}`);
+    const names = (roles || []).map(r => r.name).filter(Boolean);
+    const merged = Array.from(new Set([...names, 'admin', 'user', 'viewer']));
+    sel.innerHTML = merged.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
+  } catch(_) {
+    sel.innerHTML = ['admin', 'user', 'viewer'].map(n => `<option value="${n}">${n}</option>`).join('');
+  }
+  document.getElementById('catalog-grant-modal').classList.remove('hidden');
+}
+
+function closeCatalogGrantModal() {
+  document.getElementById('catalog-grant-modal').classList.add('hidden');
+}
+
+async function submitCatalogGrant() {
+  const cat = document.getElementById('cg-catalog').value;
+  const subject = document.getElementById('cg-principal').value.trim();
+  const role = document.getElementById('cg-role').value;
+  if (!cat || !subject || !role) { toast('Catalog, principal and role are required.', false); return; }
+  try {
+    let pid = subject;
+    if (!/^[0-9a-fA-F-]{36}$/.test(subject)) {
+      const matches = await apiFetch(`/principals?identifier=${encodeURIComponent(subject)}&limit=1`);
+      if (!matches || !matches.length) {
+        throw new Error(`No principal matched '${subject}'.`);
+      }
+      pid = matches[0].id;
+    }
+    await apiFetch(`/catalogs/${encodeURIComponent(cat)}/principals/${encodeURIComponent(pid)}/roles`, { method:'POST', body: JSON.stringify({role}) });
+    toast(`Granted '${role}' on '${cat}'.`);
+    closeCatalogGrantModal();
+    loadCatalogUsers();
+  } catch(e) { toast(e.message, false); }
+}
+
+// ── CATALOG ROLE (user-centric, from Users tab) ──
 function openCatalogModal(principalId) {
   document.getElementById('cm-principal-id').value = principalId;
   document.getElementById('catalog-modal').classList.remove('hidden');
