@@ -530,6 +530,33 @@ def test_compose_tree_strict_at_platform_routes_catalog_visibility_to_inherited(
         }
 
 
+def test_compose_tree_strict_keeps_platform_visibility_in_body():
+    """Cycle F.7d.2-fixup — ``_visibility="platform"`` configs (engines,
+    security, etc.) stay in body at platform scope under strict.  The
+    F.7d.2 cut only allowed ``_visibility=None`` and silently routed
+    engine configs to ``inherited``, which was a bug — engines ARE
+    platform-tier resources by definition.
+    """
+    by_class = {"engine_a": {"value": 1}}
+    registry = _stub_registry(
+        engine_a={
+            "_address": ("platform", "engines"),
+            "_visibility": "platform",
+        },
+    )
+    sources = {"engine_a": "platform"}
+    with patch(
+        "dynastore.extensions.configs.config_api_service.list_registered_configs",
+        return_value=registry,
+    ):
+        tree, _, inherited = ConfigApiService._compose_tree(
+            by_class, sources=sources, active_scope="platform",
+        )
+        # Engine stays in body under strict=True default.
+        assert "engine_a" in tree["platform"]["engines"]
+        assert inherited is None
+
+
 def test_compose_tree_strict_false_restores_inclusive_platform_behavior():
     """Cycle F.7d.2 — ``strict=False`` brings back the previous always-true
     platform-scope inclusion: catalog-tier templates inline in the body,

@@ -355,15 +355,26 @@ class ConfigApiService:
             visible only on demand via ``inherited`` or ``strict=False``).
             ``strict=False`` restores the previous always-true platform
             short-circuit.
+
+            Cycle F.7d.2-fixup: ``_visibility="platform"`` (engine configs,
+            etc.) is treated as platform-intrinsic — kept in body at
+            platform scope strict mode.  The original F.7d.2 cut only
+            allowed ``_visibility=None`` and silently routed engines to
+            ``inherited``, which is a bug — engines ARE platform-tier
+            resources by definition.
             """
             visibility = getattr(cls, "_visibility", None)
             if active_scope == "platform":
                 if not strict:
                     return True
-                # Strict: only platform-intrinsic configs (visibility=None)
-                # appear in the body.  Catalog-/collection-tier templates
+                # Strict: platform-intrinsic configs stay in body.  Both
+                # ``_visibility=None`` (default; visible everywhere —
+                # owned at platform when stored there) AND
+                # ``_visibility="platform"`` (engines + other platform-
+                # exclusive configs) qualify.  Catalog-/collection-tier
+                # templates (``_visibility="catalog"`` / ``"collection"``)
                 # route to ``inherited``.
-                return visibility is None
+                return visibility is None or visibility == "platform"
             if visibility == active_scope:
                 return True
             if sources.get(class_key) == active_scope:
