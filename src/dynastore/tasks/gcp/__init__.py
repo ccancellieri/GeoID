@@ -17,5 +17,19 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from .gcp_catalog_cleanup_task import GcpCatalogCleanupTask
+from .bucket_reconcile_task import (
+    BucketReconcileInputs,
+    BucketReconcileReport,
+    BucketReconcileTask,
+    DriftEntry,
+    DriftKind,
+)
 
-__all__ = ["GcpCatalogCleanupTask"]
+__all__ = [
+    "GcpCatalogCleanupTask",
+    "BucketReconcileTask",
+    "BucketReconcileInputs",
+    "BucketReconcileReport",
+    "DriftEntry",
+    "DriftKind",
+]

@@ -48,6 +48,21 @@ Designed for professional workflows, the service supports rapid access to metada
 
 The Asset Service is built to excel in cloud-native environments. It monitors your storage buckets and automatically creates the necessary infrastructure whenever a new project begins. This "zero-touch" approach means that as soon as a file is uploaded to the cloud, it becomes part of the searchable geospatial catalog, complete with its technical properties and geographical context.
 
+## Bucket↔DB Invariant and Reconciliation
+
+The Asset Service enforces a 1:1 invariant between objects in the storage backend (e.g. a GCS bucket) and rows in the `assets` table:
+
+- Every blob in the bucket should have a corresponding `assets` row.
+- Every `assets` row with `kind='physical' AND status='active'` should have a corresponding blob.
+- Every `status='pending'` row older than a configurable TTL (default 60 minutes) is treated as a stalled upload.
+
+When the upload finalize event arrives without a matching PENDING row (a rare event drop or out-of-band write), the blob remains in the bucket and the activator records an `orphan_finalize` entry. Reconciliation is the recovery surface that resolves it.
+
+Two endpoints surface the invariant:
+
+- `GET /assets/catalogs/{catalog_id}/assets:drift` (and the collection-scoped variant) — read-only diff. Returns a `BucketReconcileReport` with counts and a per-row `drift_details` list. Inspect this before running reconcile.
+- `POST /assets/catalogs/{catalog_id}/tasks/bucket-reconcile/execute` (and the collection-scoped variant) — apply mode. Imports orphan blobs as ACTIVE rows (`owned_by='gcs:reconcile_orphan'`), marks ghost rows as `status='failed'` (reason `missing_blob`), and fails stuck PENDING rows (reason `upload_abandoned`).
+
 ## Reliability and Data Safety
 
 To prevent accidental data loss, the service employs a "Safety First" approach to deletions:

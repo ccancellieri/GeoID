@@ -587,6 +587,57 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             response_model=AssetProcessOutput,
             summary="Invoke Collection Asset Process",
         )
+        # ---------------------------------------------------------------
+        # Bucket↔DB drift endpoints (Stage 6 reconcile surface).
+        # The literal ``:drift`` action segment cannot collide with the
+        # ``{asset_id}`` parametric routes. Read-only dry-run path; the
+        # apply path is exposed via ``tasks/bucket-reconcile/execute``.
+        # ---------------------------------------------------------------
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/assets:drift",
+            self.get_catalog_assets_drift,
+            methods=["GET"],
+            summary="Inspect Bucket↔DB Drift (Catalog)",
+            description=(
+                "Read-only diff between bucket blobs and the assets table "
+                "for the catalog. Returns a ``BucketReconcileReport`` with "
+                "orphan_blob / ghost_row / stuck_pending counts plus a "
+                "per-row ``drift_details`` list. Does not mutate state. "
+                "Apply the diff via "
+                "``POST /catalogs/{catalog_id}/tasks/bucket-reconcile/execute``."
+            ),
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/assets:drift",
+            self.get_collection_assets_drift,
+            methods=["GET"],
+            summary="Inspect Bucket↔DB Drift (Collection)",
+            description=(
+                "Same as the catalog-level drift endpoint, scoped to a "
+                "single collection's prefix."
+            ),
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/tasks/bucket-reconcile/execute",
+            self.execute_catalog_bucket_reconcile,
+            methods=["POST"],
+            status_code=status.HTTP_200_OK,
+            summary="Execute Bucket Reconcile (Catalog)",
+            description=(
+                "Apply-mode bucket↔DB reconciliation: imports orphan blobs "
+                "as ACTIVE rows, marks ghost rows as failed (reason="
+                "``missing_blob``), and fails stuck PENDING rows older "
+                "than the TTL (reason=``upload_abandoned``). Executes "
+                "synchronously and returns the ``BucketReconcileReport``."
+            ),
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/tasks/bucket-reconcile/execute",
+            self.execute_collection_bucket_reconcile,
+            methods=["POST"],
+            status_code=status.HTTP_200_OK,
+            summary="Execute Bucket Reconcile (Collection)",
+        )
 
     @property
     def assets(self) -> AssetsProtocol:
@@ -2171,4 +2222,118 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Dispatches to the registered ``AssetProcessProtocol`` implementor."""
         return await self._invoke_process(
             request, catalog_id, asset_id, process_id, collection_id=collection_id
+        )
+
+    # =============================================================================
+    #  BUCKET↔DB DRIFT (Stage 6)
+    # =============================================================================
+
+    async def _run_reconcile(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str],
+        *,
+        apply: bool,
+        pending_ttl_minutes: int,
+    ):
+        """Resolve schema/bucket/client and dispatch to ``reconcile_bucket``.
+
+        Centralised so the four drift routes (catalog/collection × dry/apply)
+        share one error-mapping path.
+        """
+        from dynastore.tasks.gcp.bucket_reconcile_task import (
+            BucketReconcileInputs,
+            reconcile_bucket,
+            resolve_reconcile_context,
+        )
+
+        try:
+            schema, bucket_name, storage_client, engine = (
+                await resolve_reconcile_context(catalog_id)
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            )
+
+        inputs = BucketReconcileInputs(
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            apply=apply,
+            pending_ttl_minutes=pending_ttl_minutes,
+        )
+        report = await reconcile_bucket(
+            inputs,
+            schema=schema,
+            bucket_name=bucket_name,
+            storage_client=storage_client,
+            engine=engine,
+        )
+        return report.model_dump(mode="json")
+
+    async def get_catalog_assets_drift(
+        self,
+        catalog_id: str = Path(..., description="The catalog ID"),
+        pending_ttl_minutes: int = Query(
+            60,
+            ge=1,
+            le=1440,
+            description=(
+                "PENDING rows older than this threshold are reported as "
+                "``stuck_pending`` drift entries."
+            ),
+        ),
+    ):
+        """Read-only bucket↔DB diff for a catalog (no mutations)."""
+        await require_catalog_ready(catalog_id)
+        return await self._run_reconcile(
+            catalog_id,
+            None,
+            apply=False,
+            pending_ttl_minutes=pending_ttl_minutes,
+        )
+
+    async def get_collection_assets_drift(
+        self,
+        catalog_id: str = Path(..., description="The catalog ID"),
+        collection_id: str = Path(..., description="The collection ID"),
+        pending_ttl_minutes: int = Query(60, ge=1, le=1440),
+    ):
+        """Read-only bucket↔DB diff scoped to a collection."""
+        await require_catalog_ready(catalog_id)
+        return await self._run_reconcile(
+            catalog_id,
+            collection_id,
+            apply=False,
+            pending_ttl_minutes=pending_ttl_minutes,
+        )
+
+    async def execute_catalog_bucket_reconcile(
+        self,
+        catalog_id: str = Path(..., description="The catalog ID"),
+        pending_ttl_minutes: int = Query(60, ge=1, le=1440),
+    ):
+        """Apply the bucket↔DB diff for a catalog (synchronous)."""
+        await require_catalog_ready(catalog_id)
+        return await self._run_reconcile(
+            catalog_id,
+            None,
+            apply=True,
+            pending_ttl_minutes=pending_ttl_minutes,
+        )
+
+    async def execute_collection_bucket_reconcile(
+        self,
+        catalog_id: str = Path(..., description="The catalog ID"),
+        collection_id: str = Path(..., description="The collection ID"),
+        pending_ttl_minutes: int = Query(60, ge=1, le=1440),
+    ):
+        """Apply the bucket↔DB diff for a collection (synchronous)."""
+        await require_catalog_ready(catalog_id)
+        return await self._run_reconcile(
+            catalog_id,
+            collection_id,
+            apply=True,
+            pending_ttl_minutes=pending_ttl_minutes,
         )
