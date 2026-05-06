@@ -6,36 +6,31 @@
 
 Consumed by IAM via ``STACService.get_policies`` / ``get_role_bindings``
 through the ``PolicyContributor`` Protocol — see PR #308.
+
+Implementation delegates to the shared OGC helpers in
+``extensions/tools/ogc_policies.py`` since the STAC shape (anonymous
+GET on ``/stac/...`` plus the ``stac_browser`` page) is the standard
+OGC public-access pattern with one extra resource.
 """
 
 from typing import List, Optional
 
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.models.auth import Policy
 from dynastore.models.auth_models import Role
-from dynastore.models.protocols.authorization import DefaultRole
 
 
 def stac_policies() -> List[Policy]:
     return [
-        Policy(
-            id="stac_public_access",
-            description="Allows anonymous GET access to STAC API and browser.",
-            actions=["GET", "OPTIONS"],
-            resources=[
-                "/stac",
-                "/stac/",
-                "/stac/.*",
-                "/web/pages/stac_browser",
-            ],
-            effect="ALLOW",
+        ogc_public_access_policy(
+            "stac",
+            extra_resources=["/web/pages/stac_browser"],
         ),
     ]
 
 
 def stac_role_bindings(anonymous_role_name: Optional[str] = None) -> List[Role]:
-    return [
-        Role(
-            name=anonymous_role_name or DefaultRole.ANONYMOUS.value,
-            policies=["stac_public_access"],
-        ),
-    ]
+    return [ogc_anonymous_role_binding("stac", anonymous_role_name)]

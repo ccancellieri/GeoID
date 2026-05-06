@@ -80,17 +80,17 @@ from dynastore.extensions.iam.authorization_api import (
 logger = logging.getLogger(__name__)
 
 
-def register_iam_service_policies():
-    """Register policies for authorization API endpoints via PermissionProtocol."""
-    from dynastore.models.protocols.policies import PermissionProtocol
-    from dynastore.tools.discovery import get_protocol as _get_protocol
+def iam_service_policies():
+    """Pure declaration of IAM service policies (admin + self-service auth API).
 
-    pm = _get_protocol(PermissionProtocol)
-    if not pm:
-        logger.warning("PermissionProtocol not available; IAM service policies not registered.")
-        return
-
-    pm.register_policy(
+    Returned to IAM via ``IamExtension.get_policies``. Same pattern as
+    every other plugin in the SCOPE matrix — no direct
+    ``register_policy`` call. IAM consuming its own contribution is the
+    canonical case for this Protocol; treating it the same way as
+    other plugins keeps the registration site singular and the seeding
+    logic uniform.
+    """
+    return [
         Policy(
             id="admin_authorization_api",
             description="Allows admin users to manage user roles and permissions",
@@ -98,10 +98,7 @@ def register_iam_service_policies():
             resources=["/admin/users/.*", "/admin/roles/.*", "/admin/policies/.*"],
             effect="ALLOW",
             partition_key="global",
-        )
-    )
-
-    pm.register_policy(
+        ),
         Policy(
             id="self_service_authorization_api",
             description="Allows authenticated users to view their own roles and catalog access",
@@ -109,14 +106,21 @@ def register_iam_service_policies():
             resources=["/me", "/me/available-roles", "/me/roles/.*", "/me/catalogs.*"],
             effect="ALLOW",
             partition_key="global",
-        )
-    )
+        ),
+    ]
 
-    pm.register_role(Role(name=DefaultRole.ADMIN.value, policies=["admin_authorization_api"]))
-    pm.register_role(Role(name=DefaultRole.SYSADMIN.value, policies=["admin_authorization_api"]))
-    pm.register_role(Role(name=DefaultRole.USER.value, policies=["self_service_authorization_api"]))
 
-    logger.debug("IAM service policies registered via PermissionProtocol.")
+def iam_service_role_bindings(
+    sysadmin_role_name=None,
+    admin_role_name=None,
+    user_role_name=None,
+):
+    """Pure declaration of role bindings for IAM service policies."""
+    return [
+        Role(name=admin_role_name or DefaultRole.ADMIN.value, policies=["admin_authorization_api"]),
+        Role(name=sysadmin_role_name or DefaultRole.SYSADMIN.value, policies=["admin_authorization_api"]),
+        Role(name=user_role_name or DefaultRole.USER.value, policies=["self_service_authorization_api"]),
+    ]
 
 
 from dynastore.extensions.iam.guards import ensure_privileged_role_assignment
@@ -206,6 +210,15 @@ class IamExtension(ExtensionProtocol):
     def get_web_pages(self):
         from dynastore.extensions.tools.web_collect import collect_web_pages
         return collect_web_pages(self)
+
+    # PolicyContributor: declare IAM's own service policies; the lifespan
+    # contributor loop forwards them to PermissionProtocol — same path as
+    # every other plugin in the SCOPE matrix.
+    def get_policies(self):
+        return iam_service_policies()
+
+    def get_role_bindings(self):
+        return iam_service_role_bindings()
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -458,8 +471,10 @@ class IamExtension(ExtensionProtocol):
         except Exception as e:
             logger.error(f"Failed to seed default policies: {e}")
 
-        # Register IAM service policies via protocol
-        register_iam_service_policies()
+        # IAM's own service policies are declared via PolicyContributor
+        # (IamExtension.get_policies / get_role_bindings) and picked up by
+        # the contributor loop below alongside every other plugin's
+        # declarations — same single registration site.
 
         # Register the IAM-side PageVisibilityFilter implementation so
         # web routes can delegate nav-list filtering without naming any

@@ -252,8 +252,9 @@ class PolicyService:
                 description="Allows anonymous access to public endpoints. "
                             "Resources are enumerated explicitly (no /web/.* "
                             "catch-all) so dashboard data endpoints stay gated "
-                            "by web_dashboard_*_access policies registered in "
-                            "extensions/web/web.py::register_web_policies.",
+                            "by web_dashboard_*_access policies declared in "
+                            "extensions/web/web.py via the PolicyContributor "
+                            "Protocol (Web.get_policies / get_role_bindings).",
                 actions=["GET", "POST", "OPTIONS", "HEAD"],
                 resources=[
                     "/$",

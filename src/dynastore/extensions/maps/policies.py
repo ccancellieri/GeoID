@@ -6,36 +6,31 @@
 
 Consumed by IAM via ``MapsService.get_policies`` / ``get_role_bindings``
 through the ``PolicyContributor`` Protocol — see PR #308.
+
+Implementation delegates to the shared OGC helpers in
+``extensions/tools/ogc_policies.py`` since the Maps shape (anonymous
+GET on ``/maps/...`` plus the ``map_viewer`` page) is the standard
+OGC public-access pattern with one extra resource.
 """
 
 from typing import List, Optional
 
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.models.auth import Policy
 from dynastore.models.auth_models import Role
-from dynastore.models.protocols.authorization import DefaultRole
 
 
 def maps_policies() -> List[Policy]:
     return [
-        Policy(
-            id="maps_public_access",
-            description="Allows anonymous GET access to Maps tile and viewer endpoints.",
-            actions=["GET", "OPTIONS"],
-            resources=[
-                "/maps",
-                "/maps/",
-                "/maps/.*",
-                "/web/pages/map_viewer",
-            ],
-            effect="ALLOW",
+        ogc_public_access_policy(
+            "maps",
+            extra_resources=["/web/pages/map_viewer"],
         ),
     ]
 
 
 def maps_role_bindings(anonymous_role_name: Optional[str] = None) -> List[Role]:
-    return [
-        Role(
-            name=anonymous_role_name or DefaultRole.ANONYMOUS.value,
-            policies=["maps_public_access"],
-        ),
-    ]
+    return [ogc_anonymous_role_binding("maps", anonymous_role_name)]

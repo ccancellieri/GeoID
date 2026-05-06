@@ -7,35 +7,25 @@
 Consumed by IAM via ``RecordsService.get_policies`` /
 ``get_role_bindings`` through the ``PolicyContributor`` Protocol —
 see PR #308.
+
+Implementation delegates to the shared OGC helpers in
+``extensions/tools/ogc_policies.py`` since the Records shape is
+identical to the standard OGC public-access pattern.
 """
 
 from typing import List, Optional
 
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.models.auth import Policy
 from dynastore.models.auth_models import Role
-from dynastore.models.protocols.authorization import DefaultRole
 
 
 def records_policies() -> List[Policy]:
-    return [
-        Policy(
-            id="records_public_access",
-            description="Allows anonymous access to OGC API Records endpoints.",
-            actions=["GET", "OPTIONS"],
-            resources=[
-                "/records.*",
-                "/records/.*",
-            ],
-            effect="ALLOW",
-        ),
-    ]
+    return [ogc_public_access_policy("records")]
 
 
 def records_role_bindings(anonymous_role_name: Optional[str] = None) -> List[Role]:
-    return [
-        Role(
-            name=anonymous_role_name or DefaultRole.ANONYMOUS.value,
-            description="Anonymous user with limited access.",
-            policies=["records_public_access"],
-        ),
-    ]
+    return [ogc_anonymous_role_binding("records", anonymous_role_name)]

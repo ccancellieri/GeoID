@@ -20,14 +20,20 @@ All `/admin/*` routes and the admin dashboard page require the `admin_access` po
 
 Endpoint authorization is enforced dynamically by `IamMiddleware`, which evaluates `PermissionProtocol.evaluate_access(principals, path, method)` against the policy registry for every request. When the IAM module is not loaded the fail-closed `DefaultAuthorizer` protects privileged paths.
 
-Register admin policies at application startup:
+Admin policies are declared (not registered directly) via the `PolicyContributor` Protocol:
 
 ```python
-from dynastore.extensions.admin.policies import register_admin_policies
-register_admin_policies()
+from dynastore.extensions.admin.policies import admin_policies, admin_role_bindings
+
+# AdminService implements PolicyContributor:
+def get_policies(self):
+    return admin_policies()
+
+def get_role_bindings(self):
+    return admin_role_bindings()
 ```
 
-This is called automatically by `AdminService.lifespan`.
+The IAM extension iterates `get_protocols(PolicyContributor)` at lifespan and forwards declarations to `PermissionProtocol` centrally — `AdminService` itself never touches the enforcement implementation. See PR #308 for the architectural rule.
 
 ---
 
@@ -80,8 +86,8 @@ This is called automatically by `AdminService.lifespan`.
 
 | Path | Purpose |
 |------|---------|
-| `admin_service.py` | `AdminService` class; route handlers; registers policies |
-| `policies.py` | `register_admin_policies()` — policy + role registration |
+| `admin_service.py` | `AdminService` class; route handlers; declares policies via `PolicyContributor` (`get_policies` / `get_role_bindings`) |
+| `policies.py` | `admin_policies()` / `admin_role_bindings()` — pure declaration helpers |
 | `static/admin_panel.html` | General admin panel (user management, etc.) |
 
 ---
