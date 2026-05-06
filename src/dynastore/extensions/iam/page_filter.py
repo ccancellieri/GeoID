@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from starlette.requests import Request
 
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRoleConfig
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,8 @@ class IamPageVisibilityFilter:
     """
 
     def __init__(self, sysadmin_role_name: Optional[str] = None) -> None:
-        self._sysadmin_role = sysadmin_role_name or DefaultRole.SYSADMIN.value
+        self._sysadmin_role = sysadmin_role_name or IamRoleConfig().sysadmin
+        self._anonymous_role = IamRoleConfig().anonymous
 
     async def filter_visible(
         self,
@@ -56,7 +57,7 @@ class IamPageVisibilityFilter:
     ) -> List[Dict[str, Any]]:
         user_roles = self._caller_roles(request)
         is_sysadmin = self._sysadmin_role in user_roles
-        anonymous = DefaultRole.ANONYMOUS.value
+        anonymous = self._anonymous_role
 
         # Build a lazy policy_id → {role_names} map. Single ``list_roles``
         # call covers every page that declares an audience_policy_id.

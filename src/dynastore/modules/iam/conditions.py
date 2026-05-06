@@ -30,7 +30,7 @@ from starlette.requests import Request
 from .models import Condition
 from .exceptions import IamError
 from dynastore.modules.iam.iam_storage import AbstractIamStorage
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRoleConfig
 
 logger = logging.getLogger(__name__)
 
@@ -317,10 +317,11 @@ class CatalogAdminConditionConfig(BaseModel):
         ),
     )
     sysadmin_role: str = Field(
-        default=DefaultRole.SYSADMIN.value,
+        default_factory=lambda: IamRoleConfig().sysadmin,
         description=(
             "Name of the platform super-user role used by the "
-            "sysadmin-bypass. Defaults to the seeded DefaultRole."
+            "sysadmin-bypass. Defaults to the active ``IamRoleConfig`` "
+            "(env-driven via ``IAM_ROLE_SYSADMIN``)."
         ),
     )
     allow_platform: bool = Field(
@@ -446,7 +447,6 @@ class CatalogMembershipHandler(ConditionHandler):
 
     async def evaluate(self, config: Dict[str, Any], ctx: EvaluationContext) -> bool:
         from dynastore.models.protocols.iam_query import IamQueryProtocol
-        from dynastore.models.protocols.authorization import DefaultRole
         from dynastore.tools.discovery import get_protocol
         from dynastore.extensions.iam.membership_cache import get_membership_cached
 
@@ -459,7 +459,7 @@ class CatalogMembershipHandler(ConditionHandler):
             # anonymous on a per-catalog policy — fail closed
             return False
         roles = getattr(principal, "roles", None) or []
-        sysadmin_role = str(config.get("sysadmin_role", DefaultRole.SYSADMIN.value))
+        sysadmin_role = str(config.get("sysadmin_role", IamRoleConfig().sysadmin))
         if config.get("allow_sysadmin", True) and sysadmin_role in roles:
             return True
         provider = getattr(principal, "provider", None)

@@ -24,14 +24,20 @@ from typing import Optional
 from fastapi import HTTPException, Request, status
 
 from dynastore.models.auth import Principal
-from dynastore.models.protocols.authorization import DefaultRole, Permission
+from dynastore.models.protocols.authorization import IamRoleConfig, Permission
 from dynastore.models.protocols.authorization_context import SecurityContext
 from dynastore.modules.iam.authorization import require_permission
 
 
-_PRIVILEGED_DEFAULT_ROLES: frozenset[str] = frozenset(
-    {DefaultRole.ADMIN.value, DefaultRole.SYSADMIN.value}
-)
+def _privileged_default_roles() -> frozenset[str]:
+    """Snapshot of platform-tier privileged role names at call time.
+
+    Reads from the active ``IamRoleConfig`` so deployments that rename
+    ``admin`` / ``sysadmin`` (via ``IAM_ROLE_*`` env vars) reflect the
+    rename here without code changes.
+    """
+    cfg = IamRoleConfig()
+    return frozenset({cfg.admin, cfg.sysadmin})
 
 
 def security_context_from_request(request: Request) -> SecurityContext:
@@ -75,13 +81,15 @@ async def ensure_privileged_role_assignment(
     request: Request,
     target_role: str,
     *,
-    protected_roles: frozenset[str] = _PRIVILEGED_DEFAULT_ROLES,
+    protected_roles: Optional[frozenset[str]] = None,
 ) -> None:
     """Business rule: only sysadmins may assign/manage principals with a
-    privileged role. Defaults to protecting the built-in `admin`/`sysadmin`
-    role names, which exist as seed data; callers can override `protected_roles`
+    privileged role. Defaults to protecting the active ``IamRoleConfig``'s
+    ``admin``/``sysadmin`` role names; callers can override ``protected_roles``
     when a deployment has added further privileged roles.
     """
+    if protected_roles is None:
+        protected_roles = _privileged_default_roles()
     if target_role not in protected_roles:
         return
     ctx = security_context_from_request(request)

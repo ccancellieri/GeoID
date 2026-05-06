@@ -1,14 +1,6 @@
 #    Copyright 2026 FAO
 #
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    Licensed under the Apache License, Version 2.0 (the "License").
 
 """
 `DefaultAuthorizer` — fail-closed sentinel used when no `IamAuthorizer`
@@ -25,29 +17,40 @@ but not sufficient for role-gated endpoints — otherwise any principal
 carrying a broad ALLOW policy (e.g. a baseline `user` role with
 `resource=".*"`) would bypass the role-level checks for sysadmin and admin.
 Role enforcement must be independent of path-level policy decisions.
+
+Role *names* (sysadmin/admin/etc.) are read from a constructor-supplied
+``IamRoleConfig`` so deployments that rename the platform super-user
+role wire it through without code changes. Defaults reproduce the
+seeded ``DefaultRole`` names.
 """
 
-from dynastore.models.protocols.authorization import DefaultRole, Permission
+from typing import Optional
+
+from dynastore.models.protocols.authorization import (
+    IamRoleConfig,
+    Permission,
+)
 from dynastore.models.protocols.authorization_context import SecurityContext
-
-
-_ADMIN_ROLES = frozenset({DefaultRole.ADMIN.value, DefaultRole.SYSADMIN.value})
 
 
 class DefaultAuthorizer:
     """Minimal role-based authorizer. Reads only `SecurityContext.roles`."""
 
+    def __init__(self, role_config: Optional[IamRoleConfig] = None) -> None:
+        self._role_config = role_config or IamRoleConfig()
+
     async def check(self, ctx: SecurityContext, permission: Permission) -> None:
+        cfg = self._role_config
         if permission is Permission.AUTHENTICATED:
             if ctx.principal_id or ctx.roles:
                 return
             raise PermissionError("Authentication required.")
         if permission is Permission.ADMIN:
-            if ctx.roles & _ADMIN_ROLES:
+            if ctx.roles & cfg.admin_role_set:
                 return
             raise PermissionError("Administrative privileges required.")
         if permission is Permission.SYSADMIN:
-            if DefaultRole.SYSADMIN.value in ctx.roles:
+            if cfg.sysadmin in ctx.roles:
                 return
             raise PermissionError("System administrator privileges required.")
         raise PermissionError(f"Unknown permission: {permission!r}")

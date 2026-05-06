@@ -31,7 +31,7 @@ from dynastore.modules.iam.conditions import condition_manager, EvaluationContex
 from dynastore.models.protocols.stats import StatsProtocol
 from dynastore.models.protocols.policies import PermissionProtocol
 from dynastore.models.protocols.authentication import AuthenticatorProtocol
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRoleConfig
 from dynastore.modules.iam.models import PolicyBundle
 
 logger = logging.getLogger(__name__)
@@ -54,14 +54,24 @@ class IamMiddleware(BaseHTTPMiddleware):
     # platform-tier authority through identically-named bindings.
     #
     # Both are class attributes so subclasses (or test harnesses) can
-    # rename them without touching the dispatch logic.
-    catalog_admin_role: str = DefaultRole.ADMIN.value
+    # rename them without touching the dispatch logic. ``catalog_admin_role``
+    # defaults to the active IamRoleConfig's admin name so env-renamed
+    # deployments derive the catalog sentinel from their own role names.
+    @staticmethod
+    def _default_catalog_admin_role() -> str:
+        return IamRoleConfig().admin
+
+    catalog_admin_role: str = ""
     catalog_admin_sentinel: str = "catalog_admin"
 
     def __init__(self, app, **kwargs):
         super().__init__(app)
         self._iam_manager: Optional[AuthenticatorProtocol] = None
         self._policy_service: Optional[PermissionProtocol] = None
+
+    @property
+    def _effective_catalog_admin_role(self) -> str:
+        return self.catalog_admin_role or self._default_catalog_admin_role()
 
     async def _augment_with_catalog_sentinels(
         self,
@@ -92,7 +102,7 @@ class IamMiddleware(BaseHTTPMiddleware):
             membership = await get_membership_cached(iam_query, provider, subject_id)
             catalog_roles = membership.get("catalog_roles") or {}
             holds_catalog_admin = any(
-                self.catalog_admin_role in (roles or [])
+                self._effective_catalog_admin_role in (roles or [])
                 for roles in catalog_roles.values()
             )
             if not holds_catalog_admin:
@@ -246,13 +256,14 @@ class IamMiddleware(BaseHTTPMiddleware):
             except jwt.InvalidTokenError:
                 pass
 
-        if principal_role and DefaultRole.SYSADMIN.value in principal_role:
-            source = DefaultRole.SYSADMIN.value
+        cfg = IamRoleConfig()
+        if principal_role and cfg.sysadmin in principal_role:
+            source = cfg.sysadmin
 
         effective_principal_id = (
             (principal_obj.display_name or principal_obj.subject_id)
             if principal_obj
-            else (principal_role[0] if principal_role else DefaultRole.ANONYMOUS.value)
+            else (principal_role[0] if principal_role else cfg.anonymous)
         )
         request.state.principal_id = effective_principal_id
 

@@ -66,7 +66,7 @@ from dynastore.modules.stats.storage import (
     StatsSummary,
 )
 from dynastore.modules import get_protocol
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRoleConfig
 from dynastore.models.protocols.policies import PermissionProtocol
 from dynastore.modules.iam.exceptions import (
     ConflictingResourceError,
@@ -115,11 +115,18 @@ def iam_service_role_bindings(
     admin_role_name=None,
     user_role_name=None,
 ):
-    """Pure declaration of role bindings for IAM service policies."""
+    """Pure declaration of role bindings for IAM service policies.
+
+    Role names default from the active ``IamRoleConfig`` (env-driven via
+    ``IAM_ROLE_*`` vars) so seed-time bindings track operator-renamed
+    deployments without explicit args.
+    """
+    from dynastore.models.protocols.authorization import IamRoleConfig
+    cfg = IamRoleConfig()
     return [
-        Role(name=admin_role_name or DefaultRole.ADMIN.value, policies=["admin_authorization_api"]),
-        Role(name=sysadmin_role_name or DefaultRole.SYSADMIN.value, policies=["admin_authorization_api"]),
-        Role(name=user_role_name or DefaultRole.USER.value, policies=["self_service_authorization_api"]),
+        Role(name=admin_role_name or cfg.admin, policies=["admin_authorization_api"]),
+        Role(name=sysadmin_role_name or cfg.sysadmin, policies=["admin_authorization_api"]),
+        Role(name=user_role_name or cfg.user, policies=["self_service_authorization_api"]),
     ]
 
 

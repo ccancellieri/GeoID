@@ -19,8 +19,11 @@ When it is not loaded, the `DefaultAuthorizer` sentinel takes over and
 fails closed on privileged checks.
 """
 
+import os
 from enum import Enum
 from typing import Protocol, runtime_checkable
+
+from pydantic import BaseModel, Field
 
 from dynastore.models.protocols.authorization_context import SecurityContext
 
@@ -32,18 +35,73 @@ class Permission(str, Enum):
 
 
 class DefaultRole(str, Enum):
-    """Canonical identifiers for the platform-seeded default roles.
+    """Default role-name *constants* used as the IamRoleConfig fallback.
 
-    These are the names used when seeding the `roles` table on first boot.
-    Consumers MUST reference these constants instead of hard-coding the
-    strings, so the seed set can evolve centrally. Operators can still
-    add/rename/remove roles at runtime through the admin API.
+    These are not "concepts" baked into code — they're just the strings
+    the platform seeds when an operator hasn't supplied an alternative
+    via ``IamRoleConfig``. Consumers MUST NOT reference these
+    constants directly for runtime decisions: they should read role
+    names from the active ``IamRoleConfig`` (typically attached to
+    ``IamService`` / ``IamPolicyService`` / ``DefaultAuthorizer``).
+    The enum exists so the defaults are spelled in one place.
     """
 
     SYSADMIN = "sysadmin"
     ADMIN = "admin"
     USER = "user"
     ANONYMOUS = "anonymous"
+
+
+class IamRoleConfig(BaseModel):
+    """Operator-overridable role-name configuration consumed by IAM.
+
+    Every field is a **role name** — a foreign key into the
+    ``iam.roles`` table that the seed flow creates and runtime checks
+    reference. Defaults reproduce the seeded ``DefaultRole`` names so
+    existing deployments need do nothing; operators wiring a custom
+    landscape construct an instance with their chosen names (or set
+    ``IAM_ROLE_*`` env vars) and pass it to ``IamService`` /
+    ``IamPolicyService`` / ``DefaultAuthorizer``.
+
+    The seeding flow in
+    ``IamPolicyService.provision_default_policies`` reads this config
+    when creating the default ``Role`` rows; the same config flows
+    through the runtime authorization decisions so seed and runtime
+    can never disagree on role names. Idempotent: re-running the seed
+    with the same config produces the same DB state (PostgreSQL
+    upserts).
+    """
+
+    sysadmin: str = Field(
+        default_factory=lambda: os.environ.get(
+            "IAM_ROLE_SYSADMIN", DefaultRole.SYSADMIN.value
+        ),
+        description="Role name granting unrestricted platform access.",
+    )
+    admin: str = Field(
+        default_factory=lambda: os.environ.get(
+            "IAM_ROLE_ADMIN", DefaultRole.ADMIN.value
+        ),
+        description="Platform-tier admin role name.",
+    )
+    user: str = Field(
+        default_factory=lambda: os.environ.get(
+            "IAM_ROLE_USER", DefaultRole.USER.value
+        ),
+        description="Default role for any signed-in principal.",
+    )
+    anonymous: str = Field(
+        default_factory=lambda: os.environ.get(
+            "IAM_ROLE_ANONYMOUS", DefaultRole.ANONYMOUS.value
+        ),
+        description="Role name representing unauthenticated callers.",
+    )
+
+    @property
+    def admin_role_set(self) -> frozenset:
+        """Frozen set of role names that count as 'platform admin' for
+        ``DefaultAuthorizer.Permission.ADMIN`` checks."""
+        return frozenset({self.admin, self.sysadmin})
 
 
 @runtime_checkable

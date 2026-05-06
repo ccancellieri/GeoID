@@ -27,7 +27,7 @@ from typing import List, Optional, Tuple, Any, Dict, Union, AsyncGenerator
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRoleConfig
 
 from .models import (
     Principal,
@@ -74,6 +74,7 @@ class IamService:
         storage: Optional[AbstractIamStorage] = None,
         policy_service: Optional[object] = None,
         app_state: Optional[object] = None,
+        role_config: Optional[IamRoleConfig] = None,
     ):
         # In V2, we prefer PostgresIamStorage which implements both interfaces.
         # Typed as Any because PostgresIamStorage has methods not declared in either
@@ -82,6 +83,11 @@ class IamService:
         self.policy_service = policy_service
         self.app_state = app_state
         self._jwt_secret: Optional[str] = None
+        # Same role-name configuration used by the seeding flow. Defaults
+        # read from IAM_ROLE_* env vars (with seeded ``DefaultRole`` values
+        # as the fallback) so seed-time naming stays consistent with
+        # runtime checks throughout the request lifecycle.
+        self._role_config = role_config or IamRoleConfig()
 
     async def get_jwt_secret(self) -> str:
         """Retrieves or generates the active JWT secret."""
@@ -349,13 +355,18 @@ class IamService:
             if identity.get("azp"):
                 attributes["azp"] = identity["azp"]
 
-        # Use realm_roles from OIDC token if present, otherwise default to DefaultRole.USER
-        known_roles = {r.value for r in DefaultRole}
+        # Use realm_roles from OIDC token if present, otherwise default to
+        # the configured "user" role name. Known-role filtering is over the
+        # active IamRoleConfig values rather than the DefaultRole enum so
+        # operator-renamed deployments still recognise their own seeded
+        # role names from incoming JWT claims.
+        cfg = self._role_config
+        known_roles = {cfg.sysadmin, cfg.admin, cfg.user, cfg.anonymous}
         realm_roles = [
             r for r in identity.get("realm_roles", [])
             if r in known_roles
         ]
-        assigned_roles = realm_roles if realm_roles else [DefaultRole.USER.value]
+        assigned_roles = realm_roles if realm_roles else [cfg.user]
 
         # Allocate the principal UUID up-front so we can pass it to
         # downstream calls without re-narrowing the model's
@@ -679,21 +690,21 @@ class IamService:
 
         return None
 
-    @staticmethod
-    def _normalize_authenticated_roles(raw: Any) -> List[str]:
+    def _normalize_authenticated_roles(self, raw: Any) -> List[str]:
         """Normalise the raw ``roles`` field from a JWT payload or Principal
-        into a non-empty ``List[str]`` with the USER default applied.
+        into a non-empty ``List[str]`` with the configured USER default applied.
 
         Single source of truth for the "an authenticated principal with zero
-        declared roles still gets ``DefaultRole.USER``" rule. Without this
+        declared roles still gets the configured user role" rule. Without this
         default, an HS256 token signed with ``roles=[]`` (or a Principal
         whose ``.roles`` is ``None``/empty) would surface as ANONYMOUS-
         equivalent at the policy layer — breaking ``/iam/me/*`` self-service
-        endpoints that any authenticated user should reach.
+        endpoints that any authenticated user should reach. The default
+        role name is read from ``self._role_config.user``.
 
         Accepts:
-          - ``None``                  → ``["user"]``
-          - missing / empty list      → ``["user"]``
+          - ``None``                  → ``[self._role_config.user]``
+          - missing / empty list      → ``[self._role_config.user]``
           - a single role as ``str``  → ``[role]``
           - a list of role names      → returned verbatim
 
@@ -704,7 +715,7 @@ class IamService:
             return [raw]
         roles = list(raw or [])
         if not roles:
-            roles = [DefaultRole.USER.value]
+            roles = [self._role_config.user]
         return roles
 
     async def _expand_role_hierarchy_dual_scope(
@@ -741,7 +752,7 @@ class IamService:
         """
         token = self.extract_token_from_request(request)
         if not token:
-            return [DefaultRole.ANONYMOUS.value], None
+            return [self._role_config.anonymous], None
 
         catalog_id = getattr(getattr(request, "state", {}), "catalog_id", None)
         schema = await self._resolve_schema(catalog_id)
@@ -804,4 +815,4 @@ class IamService:
             logger.debug("Internal HS256 fallback failed: %s", e)
 
         # No valid identity found
-        return [DefaultRole.ANONYMOUS.value], None
+        return [self._role_config.anonymous], None

@@ -34,7 +34,7 @@ def _validate_schema_name(schema: str) -> str:
         raise ValueError(f"Invalid schema name: {schema!r}")
     return schema
 
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRoleConfig
 
 from .models import PolicyBundle, Policy, Condition, Role, Principal
 from .policy_storage import AbstractPolicyStorage
@@ -61,12 +61,18 @@ class PolicyService:
         app_state: object,
         storage: Optional[AbstractPolicyStorage] = None,
         iam_storage: Optional[AbstractIamStorage] = None,
+        role_config: Optional[IamRoleConfig] = None,
     ):
         self._state = app_state
         db = get_protocol(DatabaseProtocol)
         self._engine = db.engine if db else None
         self.storage = storage or PostgresPolicyStorage(app_state=app_state)
         self.iam_storage = iam_storage
+        # Role names used by the seed + runtime checks. Defaults read from
+        # IAM_ROLE_* env vars (with seeded ``DefaultRole`` values as the
+        # ultimate fallback), so deployments configure custom names without
+        # subclassing.
+        self._role_config = role_config or IamRoleConfig()
 
     async def _resolve_schema(
         self, catalog_id: Optional[str], conn: Optional[Any] = None
@@ -294,25 +300,30 @@ class PolicyService:
         ]
 
     def _get_default_roles(self) -> List[Role]:
-        """Returns the core default roles for the platform."""
+        """Return the core default roles, named via ``self._role_config``.
+
+        Operators wiring custom role names (env or constructor arg) seed
+        their chosen names through this method without any code change.
+        """
+        cfg = self._role_config
         return [
             Role(
-                name=DefaultRole.SYSADMIN.value,
+                name=cfg.sysadmin,
                 description="System Administrator with full access.",
                 policies=["sysadmin_full_access"],
             ),
             Role(
-                name=DefaultRole.ADMIN.value,
+                name=cfg.admin,
                 description="Administrator with full access.",
                 policies=["sysadmin_full_access"],
             ),
             Role(
-                name=DefaultRole.ANONYMOUS.value,
+                name=cfg.anonymous,
                 description="Anonymous user with limited access.",
                 policies=["public_access"],
             ),
             Role(
-                name=DefaultRole.USER.value,
+                name=cfg.user,
                 description="Default role for any authenticated user.",
                 policies=["self_service_access"],
             ),
@@ -391,10 +402,11 @@ class PolicyService:
                 # Idempotent: ON CONFLICT DO NOTHING in `add_role_hierarchy`,
                 # so reprovision on every cold start is safe and self-heals
                 # databases that pre-date this seed.
+                cfg = self._role_config
                 _DEFAULT_HIERARCHY = [
-                    (DefaultRole.SYSADMIN.value, DefaultRole.ADMIN.value),
-                    (DefaultRole.ADMIN.value,    DefaultRole.USER.value),
-                    (DefaultRole.USER.value,     DefaultRole.ANONYMOUS.value),
+                    (cfg.sysadmin, cfg.admin),
+                    (cfg.admin,    cfg.user),
+                    (cfg.user,     cfg.anonymous),
                 ]
                 for parent, child in _DEFAULT_HIERARCHY:
                     try:
