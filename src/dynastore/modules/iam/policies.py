@@ -305,6 +305,7 @@ class PolicyService:
                     "/web/?$",
                     "/web/pages/.*",
                     "/web/extension-static/.*",
+                    "/web/geoid/.*",  # GeoID-branded static assets — CSS, JS, snapshot, logo
                     "/web/static/.*",
                     "/web/website/.*",
                     "/web/docs-content/.*",
