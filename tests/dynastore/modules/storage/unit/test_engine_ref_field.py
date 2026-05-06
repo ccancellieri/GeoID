@@ -125,19 +125,33 @@ def test_engine_ref_explicit_match_accepted(cls, expected_engine_class):
 
 
 @pytest.mark.parametrize("cls,expected_engine_class", ENGINE_COMPATIBILITY)
-def test_engine_ref_incompatible_value_rejected(cls, expected_engine_class):
-    """An ``engine_ref`` that doesn't match ``required_engine_class``
-    is rejected with a clear error.  In F.2 (single-instance-per-kind)
-    the static check is identity; F.4 will rewrite it to a registry
-    lookup."""
-    bogus_ref = "nonsense_engine"
-    if expected_engine_class == bogus_ref:
-        bogus_ref = "another_engine"  # extremely defensive
+def test_engine_ref_unknown_string_accepted(cls, expected_engine_class):
+    """Cycle F.4c.3 widens the validator: an ``engine_ref`` that is NOT
+    in the engine registry (operator-chosen multi-instance name like
+    ``pg_main``) is accepted at validate-time after a snake_case format
+    check.  Runtime / PATCH-handler enforces existence at platform.engines.{ref}.
+
+    Pre-F.4c.3 this exact case raised ``ValueError(... incompatible with
+    required_engine_class)`` even when the ref simply hadn't been
+    declared yet — that broke the multi-instance use case.
+    """
+    operator_ref = "pg_main"  # snake_case, not in registry
+    if expected_engine_class == operator_ref:
+        operator_ref = "main_instance"  # extremely defensive
+    cfg = cls(engine_ref=operator_ref)
+    assert cfg.engine_ref == operator_ref
+
+
+@pytest.mark.parametrize("cls,expected_engine_class", ENGINE_COMPATIBILITY)
+def test_engine_ref_invalid_format_rejected(cls, expected_engine_class):
+    """Operator-chosen refs that don't match the snake_case format are
+    rejected at validate-time so PATCH bodies surface the typo clearly
+    rather than leaking through to a 503-on-runtime."""
     with pytest.raises(
         ValidationError,
-        match=r"incompatible with required_engine_class",
+        match=r"snake_case format",
     ):
-        cls(engine_ref=bogus_ref)
+        cls(engine_ref="BadRef-with-Caps!")
 
 
 # ---------------------------------------------------------------------------
@@ -147,22 +161,35 @@ def test_engine_ref_incompatible_value_rejected(cls, expected_engine_class):
 
 
 def test_pg_driver_rejects_es_engine_ref():
-    """Sanity: a PG driver config rejects an ES engine_ref even if the
-    ES engine is a real registered engine_class."""
+    """A PG driver config rejects ``engine_ref="elasticsearch_engine"``
+    because the registry resolves the ref to the ES engine_class."""
     with pytest.raises(
         ValidationError,
-        match=r"incompatible with required_engine_class='postgresql_engine'",
+        match=r"engine_class='elasticsearch_engine', incompatible with "
+              r"required_engine_class='postgresql_engine'",
     ):
         ItemsPostgresqlDriverConfig(engine_ref="elasticsearch_engine")
 
 
 def test_es_driver_rejects_duckdb_engine_ref():
-    """Sanity: an ES driver config rejects a DuckDB engine_ref."""
+    """An ES driver config rejects ``engine_ref="duckdb_engine"`` because
+    the registry resolves the ref to the DuckDB engine_class."""
     with pytest.raises(
         ValidationError,
-        match=r"incompatible with required_engine_class='elasticsearch_engine'",
+        match=r"engine_class='duckdb_engine', incompatible with "
+              r"required_engine_class='elasticsearch_engine'",
     ):
         ItemsElasticsearchDriverConfig(engine_ref="duckdb_engine")
+
+
+def test_pg_driver_rejects_pg_engine_config_class_key_for_other_kind():
+    """Registry's path-1 lookup also catches engine class_key-shaped refs
+    pointing at the wrong kind."""
+    with pytest.raises(
+        ValidationError,
+        match=r"engine_class='elasticsearch_engine', incompatible",
+    ):
+        ItemsPostgresqlDriverConfig(engine_ref="elasticsearch_engine_config")
 
 
 # ---------------------------------------------------------------------------

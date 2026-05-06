@@ -58,6 +58,7 @@ lookup — single name, two places.
 
 from __future__ import annotations
 
+import re
 from functools import cache
 from typing import Any, ClassVar, Dict, Generic, Optional, Type, TypeVar, get_args, get_origin
 
@@ -66,6 +67,14 @@ from pydantic import Field, model_validator
 from dynastore.modules.db_config.platform_config_service import PluginConfig
 
 ConfigT = TypeVar("ConfigT", bound="_PluginDriverConfig")
+
+# F.4c.3 — operator-chosen engine_ref format: snake_case, 1-63 chars,
+# leading lowercase letter.  Aligns with PG identifier conventions and
+# matches the F.4c plan's recommended naming regex (Q1 in the planning
+# notes).  Used only when the registry can't statically resolve the ref —
+# refs that are known engine class_keys / engine_class discriminators
+# bypass the format check.
+_ENGINE_REF_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 # Reverse map: config class → driver class.  Populated by
@@ -191,38 +200,65 @@ class _PluginDriverConfig(PluginConfig):
         description=(
             "Name of the platform engine this driver instance binds to. "
             "Single-instance deployments leave this None (defaults to "
-            "the driver's ``required_engine_class``); F.4 enables "
-            "operator-chosen ref names for multi-instance.  The "
-            "validator rejects refs that point at engines of an "
-            "incompatible ``engine_class``."
+            "the driver's ``required_engine_class``).  Multi-instance "
+            "operators name engines explicitly (e.g. ``pg_main`` / "
+            "``pg_secondary``); the validator accepts any snake_case "
+            "ref but rejects refs that resolve through the engine "
+            "registry to an incompatible ``engine_class``.  Refs "
+            "unknown to the registry are deferred to runtime "
+            "(EngineInstanceCache.get + PATCH-handler ref-existence "
+            "check at platform.engines.{ref})."
         ),
     )
 
     @model_validator(mode="after")
     def _default_and_validate_engine_ref(self) -> "_PluginDriverConfig":
         """Default ``engine_ref`` to ``required_engine_class`` and validate
-        compatibility (F.2 single-instance check; F.4 will rewrite for
-        multi-instance lookup against the engines registry).
+        compatibility against the engine registry (Cycle F.4c.3).
+
+        Three branches by ref shape:
+
+        1. ``None`` / empty → default to ``cls.required_engine_class``.
+        2. Resolves via :func:`resolve_engine_class` (the ref names a
+           registered engine class_key OR engine_class discriminator) —
+           statically enforce ``engine_class == required_engine_class``;
+           reject incompatible kinds with a clear ValueError.
+        3. Operator-chosen multi-instance ref (resolver returns ``None``)
+           — accept after a snake_case format check (1-63 chars).  The
+           DB-side ref-existence check fires at PATCH-handler / runtime
+           (``EngineInstanceCache.get`` raises for unknown refs).
+
+        Bypasses: when ``required_engine_class`` is empty (abstract base
+        or unmigrated subclass) the check is skipped so existing
+        instantiation paths keep working.
         """
         cls = type(self)
         required = cls.required_engine_class
         if not required:
-            # Abstract base or driver class that hasn't migrated yet —
-            # skip the check so existing instantiation paths keep working.
             return self
         if self.engine_ref is None or self.engine_ref == "":
             object.__setattr__(self, "engine_ref", required)
-        # F.2 static check: with single-instance-per-kind (F.1), the
-        # engine_ref must match the driver's required engine_class.
-        # F.4 will rewrite this to a registry lookup that resolves the
-        # ref to its engine_class and compares against required.
-        if self.engine_ref != required:
+            return self
+
+        from dynastore.modules.db_config.engine_registry import resolve_engine_class
+        resolved_class = resolve_engine_class(self.engine_ref)
+        if resolved_class is not None:
+            if resolved_class != required:
+                raise ValueError(
+                    f"{cls.__name__}.engine_ref={self.engine_ref!r} resolves to "
+                    f"engine_class={resolved_class!r}, incompatible with "
+                    f"required_engine_class={required!r}."
+                )
+            return self
+
+        # Operator-chosen multi-instance ref — format-check only; defer
+        # ref-existence to PATCH handler / runtime cache lookup.
+        if not _ENGINE_REF_RE.match(self.engine_ref):
             raise ValueError(
-                f"{cls.__name__}.engine_ref={self.engine_ref!r} is "
-                f"incompatible with required_engine_class={required!r}.  "
-                f"In F.2 (single-instance-per-kind) the ref must equal "
-                f"the engine's class_key.  Operator-chosen ref names "
-                f"land in F.4."
+                f"{cls.__name__}.engine_ref={self.engine_ref!r} is not a "
+                f"registered engine and does not match the snake_case "
+                f"format ^[a-z][a-z0-9_]{{0,62}}$ required for "
+                f"operator-chosen ref names."
             )
         return self
 
