@@ -546,7 +546,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         async with managed_transaction(self.engine) as conn:
             if not await _platform_table_exists(conn):
                 return None
-            return await get_platform_config_query.execute(conn, class_key=class_key)
+            return await get_platform_config_query.execute(conn, ref_key=class_key)
 
     async def _get_platform_config_internal(
         self,
@@ -558,7 +558,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             if not await _platform_table_exists(db_resource):
                 return None
             data = await get_platform_config_query.execute(
-                db_resource, class_key=class_key
+                db_resource, ref_key=class_key
             )
         else:
             data = await self.get_platform_config_internal_cached(class_key)
@@ -581,7 +581,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         async with managed_transaction(db_resource or self.engine) as conn:
             old_config: Optional[PluginConfig] = None
             current_data = await get_platform_config_query.execute(
-                conn, class_key=class_key
+                conn, ref_key=class_key
             )
             if current_data:
                 old_config = cls.model_validate(current_data) if not isinstance(
@@ -597,6 +597,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             # bumping a class default propagates without rewriting this row.
             await upsert_platform_config_query.execute(
                 conn,
+                ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
                 config_data=json.dumps(
@@ -654,7 +655,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         db_resource = ctx.db_resource if ctx else None
         async with managed_transaction(db_resource or self.engine) as conn:
             rows_affected = await delete_platform_config_query.execute(
-                conn, class_key=class_key
+                conn, ref_key=class_key
             )
             if rows_affected > 0:
                 self.get_platform_config_internal_cached.cache_invalidate(class_key)

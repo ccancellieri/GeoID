@@ -118,7 +118,7 @@ async def _catalog_config_cache(
         if not await check_table_exists(conn, CATALOG_CONFIGS_TABLE, phys_schema):
             return None
 
-        return await _cq.select_catalog_config(phys_schema).execute(conn, class_key=class_key)
+        return await _cq.select_catalog_config(phys_schema).execute(conn, ref_key=class_key)
 
 
 @cached(maxsize=16384, ttl=300, namespace="collection_config", ignore=["engine", "catalog_manager"])
@@ -145,7 +145,7 @@ async def _collection_config_cache(
         return await _cq.select_collection_config(phys_schema).execute(
             conn,
             collection_id=collection_id,
-            class_key=class_key,
+            ref_key=class_key,
         )
 
 
@@ -262,7 +262,7 @@ class ConfigService(ConfigsProtocol):
                     conn, CATALOG_CONFIGS_TABLE, phys_schema
                 ):
                     catalog_delta = await _cq.select_catalog_config(phys_schema).execute(
-                        conn, class_key=class_key
+                        conn, ref_key=class_key
                     )
                 else:
                     catalog_delta = None
@@ -284,7 +284,7 @@ class ConfigService(ConfigsProtocol):
                         conn, COLLECTION_CONFIGS_TABLE, phys_schema
                     ):
                         collection_delta = await _cq.select_collection_config(phys_schema).execute(
-                            conn, collection_id=collection_id, class_key=class_key
+                            conn, collection_id=collection_id, ref_key=class_key
                         )
                     else:
                         collection_delta = None
@@ -406,7 +406,7 @@ class ConfigService(ConfigsProtocol):
 
             if check_immutability:
                 current_data = await _cq.select_catalog_config_for_update(phys_schema).execute(
-                    conn, class_key=class_key
+                    conn, ref_key=class_key
                 )
                 if current_data:
                     current_config = cls.model_validate(current_data)
@@ -430,6 +430,7 @@ class ConfigService(ConfigsProtocol):
             )
             await _cq.upsert_catalog_config(phys_schema).execute(
                 conn,
+                ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
                 config_data=json.dumps(config_data, cls=CustomJSONEncoder),
@@ -498,7 +499,7 @@ class ConfigService(ConfigsProtocol):
                 current_data = await _cq.select_collection_config_for_update(phys_schema).execute(
                     conn,
                     collection_id=collection_id,
-                    class_key=class_key,
+                    ref_key=class_key,
                 )
                 if current_data:
                     current_config = cls.model_validate(current_data)
@@ -523,6 +524,7 @@ class ConfigService(ConfigsProtocol):
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
                 collection_id=collection_id,
+                ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
                 config_data=json.dumps(config_data, cls=CustomJSONEncoder),
@@ -796,7 +798,7 @@ class ConfigService(ConfigsProtocol):
                 return False
 
             rows_affected = await _cq.delete_catalog_config(phys_schema).execute(
-                conn, class_key=class_key
+                conn, ref_key=class_key
             )
 
             if rows_affected > 0:
@@ -830,7 +832,7 @@ class ConfigService(ConfigsProtocol):
             rows_affected = await _cq.delete_collection_config(phys_schema).execute(
                 conn,
                 collection_id=collection_id,
-                class_key=class_key,
+                ref_key=class_key,
             )
 
             if rows_affected > 0:

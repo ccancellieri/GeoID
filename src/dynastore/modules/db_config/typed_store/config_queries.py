@@ -33,15 +33,21 @@ a :class:`~dynastore.modules.db_config.query_executor.DQLQuery`.  The schema nam
 validated via :func:`~dynastore.tools.db.validate_sql_identifier` before interpolation,
 matching the same injection-prevention strategy used in :func:`~.ddl.tenant_configs_ddl`.
 
+Cycle F.4c.1 keys all driver/engine/plugin rows by ``ref_key`` (PK).
+``class_key`` remains a NOT NULL discriminator column so the dispatch class is
+recoverable from any row.  Single-instance configs always have
+``ref_key == class_key``; multi-instance support arrives with the F.4c.2 API
+extension.
+
 Usage example::
 
     from dynastore.modules.db_config.typed_store import config_queries as q
 
-    # Platform
-    cfg = await q.get_platform_config.execute(conn, class_key=cls.class_key())
+    # Platform — single-instance: ref_key equals class_key
+    cfg = await q.get_platform_config.execute(conn, ref_key=cls.class_key())
 
     # Tenant
-    data = await q.select_catalog_config(phys_schema).execute(conn, class_key=key)
+    data = await q.select_catalog_config(phys_schema).execute(conn, ref_key=key)
     await q.upsert_catalog_config(phys_schema).execute(conn, **params)
 """
 
@@ -60,15 +66,16 @@ from dynastore.modules.db_config.typed_store.ddl import (
 # ===========================================================================
 
 get_platform_config = DQLQuery(
-    f"SELECT config_data FROM {CONFIGS_SCHEMA}.platform_configs WHERE class_key = :class_key;",
+    f"SELECT config_data FROM {CONFIGS_SCHEMA}.platform_configs WHERE ref_key = :ref_key;",
     result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
 )
 
 upsert_platform_config = DQLQuery(
     f"""
-    INSERT INTO {CONFIGS_SCHEMA}.platform_configs (class_key, schema_id, config_data, updated_at)
-    VALUES (:class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-    ON CONFLICT (class_key) DO UPDATE SET
+    INSERT INTO {CONFIGS_SCHEMA}.platform_configs (ref_key, class_key, schema_id, config_data, updated_at)
+    VALUES (:ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
+    ON CONFLICT (ref_key) DO UPDATE SET
+        class_key   = EXCLUDED.class_key,
         schema_id   = EXCLUDED.schema_id,
         config_data = EXCLUDED.config_data,
         updated_at  = NOW();
@@ -77,12 +84,12 @@ upsert_platform_config = DQLQuery(
 )
 
 list_platform_configs = DQLQuery(
-    f"SELECT class_key, config_data FROM {CONFIGS_SCHEMA}.platform_configs;",
+    f"SELECT ref_key, class_key, config_data FROM {CONFIGS_SCHEMA}.platform_configs;",
     result_handler=ResultHandler.ALL_DICTS,
 )
 
 delete_platform_config = DQLQuery(
-    f"DELETE FROM {CONFIGS_SCHEMA}.platform_configs WHERE class_key = :class_key;",
+    f"DELETE FROM {CONFIGS_SCHEMA}.platform_configs WHERE ref_key = :ref_key;",
     result_handler=ResultHandler.ROWCOUNT,
 )
 
@@ -125,10 +132,10 @@ get_schemas_by_ids = DQLQuery(
 # --- catalog_configs ---------------------------------------------------------
 
 def select_catalog_config(phys_schema: str) -> DQLQuery:
-    """SELECT config_data for a single class_key (read path, no lock)."""
+    """SELECT config_data for a single ref_key (read path, no lock)."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT config_data FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE class_key = :class_key;',
+        f'SELECT config_data FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE ref_key = :ref_key;',
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
     )
 
@@ -137,7 +144,7 @@ def select_catalog_config_for_update(phys_schema: str) -> DQLQuery:
     """SELECT config_data FOR UPDATE — used during immutability check before write."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT config_data FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE class_key = :class_key FOR UPDATE;',
+        f'SELECT config_data FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE ref_key = :ref_key FOR UPDATE;',
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
     )
 
@@ -147,9 +154,10 @@ def upsert_catalog_config(phys_schema: str) -> DQLQuery:
     validate_sql_identifier(phys_schema)
     return DQLQuery(
         f"""
-        INSERT INTO "{phys_schema}".{CATALOG_CONFIGS_TABLE} (class_key, schema_id, config_data, updated_at)
-        VALUES (:class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-        ON CONFLICT (class_key) DO UPDATE SET
+        INSERT INTO "{phys_schema}".{CATALOG_CONFIGS_TABLE} (ref_key, class_key, schema_id, config_data, updated_at)
+        VALUES (:ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
+        ON CONFLICT (ref_key) DO UPDATE SET
+            class_key   = EXCLUDED.class_key,
             schema_id   = EXCLUDED.schema_id,
             config_data = EXCLUDED.config_data,
             updated_at  = NOW();
@@ -162,28 +170,28 @@ def delete_catalog_config(phys_schema: str) -> DQLQuery:
     """DELETE a single catalog-level config row."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'DELETE FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE class_key = :class_key;',
+        f'DELETE FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE ref_key = :ref_key;',
         result_handler=ResultHandler.ROWCOUNT,
     )
 
 
 def list_catalog_configs(phys_schema: str) -> DQLQuery:
-    """SELECT all class_key / config_data rows (used for snapshots)."""
+    """SELECT all ref_key / class_key / config_data rows (used for snapshots)."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT class_key, config_data FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE};',
+        f'SELECT ref_key, class_key, config_data FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE};',
         result_handler=ResultHandler.ALL_DICTS,
     )
 
 
 def list_catalog_configs_paginated(phys_schema: str) -> DQLQuery:
-    """SELECT with window COUNT + ORDER BY class_key, LIMIT/OFFSET pagination."""
+    """SELECT with window COUNT + ORDER BY ref_key, LIMIT/OFFSET pagination."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
         f"""
-        SELECT COUNT(*) OVER() AS total_count, class_key, config_data
+        SELECT COUNT(*) OVER() AS total_count, ref_key, class_key, config_data
         FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE}
-        ORDER BY class_key
+        ORDER BY ref_key
         LIMIT :limit OFFSET :offset;
         """,
         result_handler=ResultHandler.ALL_DICTS,
@@ -193,10 +201,10 @@ def list_catalog_configs_paginated(phys_schema: str) -> DQLQuery:
 # --- collection_configs -------------------------------------------------------
 
 def select_collection_config(phys_schema: str) -> DQLQuery:
-    """SELECT config_data for a single (collection_id, class_key) pair (no lock)."""
+    """SELECT config_data for a single (collection_id, ref_key) pair (no lock)."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND class_key = :class_key;',
+        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND ref_key = :ref_key;',
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
     )
 
@@ -205,7 +213,7 @@ def select_collection_config_for_update(phys_schema: str) -> DQLQuery:
     """SELECT config_data FOR UPDATE — used during immutability check before write."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND class_key = :class_key FOR UPDATE;',
+        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND ref_key = :ref_key FOR UPDATE;',
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
     )
 
@@ -215,9 +223,10 @@ def upsert_collection_config(phys_schema: str) -> DQLQuery:
     validate_sql_identifier(phys_schema)
     return DQLQuery(
         f"""
-        INSERT INTO "{phys_schema}".{COLLECTION_CONFIGS_TABLE} (collection_id, class_key, schema_id, config_data, updated_at)
-        VALUES (:collection_id, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-        ON CONFLICT (collection_id, class_key) DO UPDATE SET
+        INSERT INTO "{phys_schema}".{COLLECTION_CONFIGS_TABLE} (collection_id, ref_key, class_key, schema_id, config_data, updated_at)
+        VALUES (:collection_id, :ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
+        ON CONFLICT (collection_id, ref_key) DO UPDATE SET
+            class_key   = EXCLUDED.class_key,
             schema_id   = EXCLUDED.schema_id,
             config_data = EXCLUDED.config_data,
             updated_at  = NOW();
@@ -230,20 +239,20 @@ def delete_collection_config(phys_schema: str) -> DQLQuery:
     """DELETE a single collection-level config row."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'DELETE FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND class_key = :class_key;',
+        f'DELETE FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND ref_key = :ref_key;',
         result_handler=ResultHandler.ROWCOUNT,
     )
 
 
 def list_collection_configs_paginated(phys_schema: str) -> DQLQuery:
-    """SELECT with window COUNT + ORDER BY class_key for a given collection_id."""
+    """SELECT with window COUNT + ORDER BY ref_key for a given collection_id."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
         f"""
-        SELECT COUNT(*) OVER() AS total_count, class_key, config_data
+        SELECT COUNT(*) OVER() AS total_count, ref_key, class_key, config_data
         FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE}
         WHERE collection_id = :collection_id
-        ORDER BY class_key
+        ORDER BY ref_key
         LIMIT :limit OFFSET :offset;
         """,
         result_handler=ResultHandler.ALL_DICTS,

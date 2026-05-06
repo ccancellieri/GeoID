@@ -31,6 +31,11 @@ Read resolution (:meth:`get`) returns the row whose ``class_key`` is either
 ``base.class_key()`` exactly or a subclass thereof — exact match wins,
 ties broken by ``updated_at DESC``. Implemented as one indexed query per
 call thanks to the real ``class_key`` column.
+
+Cycle F.4c.1 introduced ``ref_key`` as the operator-chosen instance name
+and the new primary key.  This store writes ``ref_key = class_key`` for
+single-instance configs (every config today); the multi-instance API
+extension lands in F.4c.2.
 """
 
 from __future__ import annotations
@@ -227,9 +232,10 @@ class PostgresTypedStore:
             if isinstance(scope, CollectionScope):
                 sql = f'''
                     INSERT INTO "{loc["schema"]}".{loc["table"]}
-                        (collection_id, class_key, schema_id, config_data, updated_at)
-                    VALUES (:collection_id, :class_key, :schema_id, :config_data::jsonb, NOW())
-                    ON CONFLICT (collection_id, class_key) DO UPDATE SET
+                        (collection_id, ref_key, class_key, schema_id, config_data, updated_at)
+                    VALUES (:collection_id, :ref_key, :class_key, :schema_id, :config_data::jsonb, NOW())
+                    ON CONFLICT (collection_id, ref_key) DO UPDATE SET
+                        class_key   = EXCLUDED.class_key,
                         schema_id   = EXCLUDED.schema_id,
                         config_data = EXCLUDED.config_data,
                         updated_at  = NOW();
@@ -237,15 +243,17 @@ class PostgresTypedStore:
             else:
                 sql = f'''
                     INSERT INTO "{loc["schema"]}".{loc["table"]}
-                        (class_key, schema_id, config_data, updated_at)
-                    VALUES (:class_key, :schema_id, :config_data::jsonb, NOW())
-                    ON CONFLICT (class_key) DO UPDATE SET
+                        (ref_key, class_key, schema_id, config_data, updated_at)
+                    VALUES (:ref_key, :class_key, :schema_id, :config_data::jsonb, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        class_key   = EXCLUDED.class_key,
                         schema_id   = EXCLUDED.schema_id,
                         config_data = EXCLUDED.config_data,
                         updated_at  = NOW();
                 '''
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
                 conn,
+                ref_key=class_key,
                 class_key=class_key,
                 schema_id=schema_id,
                 config_data=payload,
@@ -260,10 +268,10 @@ class PostgresTypedStore:
                 return
             sql = (
                 f'DELETE FROM "{loc["schema"]}".{loc["table"]} '
-                f'WHERE {loc["pk_filter"]}class_key = :class_key;'
+                f'WHERE {loc["pk_filter"]}ref_key = :ref_key;'
             )
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-                conn, class_key=cls.class_key(), **loc["pk_values"]
+                conn, ref_key=cls.class_key(), **loc["pk_values"]
             )
 
     async def list(

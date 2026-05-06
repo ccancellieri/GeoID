@@ -21,15 +21,17 @@
 Three scope-specific tables + one content-addressed schema registry:
 
 * ``configs.schemas`` — global schema registry (content-addressed by sha256).
-* ``configs.platform_configs`` — global, one row per ``class_key``.
-* ``"<tenant_schema>".catalog_configs`` — per-tenant, one row per ``class_key``.
+* ``configs.platform_configs`` — global, keyed by ``ref_key`` (Cycle F.4c.1).
+* ``"<tenant_schema>".catalog_configs`` — per-tenant, keyed by ``ref_key``.
 * ``"<tenant_schema>".collection_configs`` — per-tenant, keyed by
-  ``(collection_id, class_key)``.
+  ``(collection_id, ref_key)``.
 
-The ``typed_`` prefix keeps these tables distinct from the legacy
-``configs.platform_configs`` (which is plugin_id-keyed, string-based).  The
-two schemes coexist during migration; once all call sites are moved the
-legacy table can be dropped and the ``typed_`` prefix removed.
+Cycle F.4c.1 introduces ``ref_key`` as the operator-chosen instance name and
+makes it part of the primary key.  ``class_key`` remains a NOT NULL
+discriminator column so the dispatch class is recoverable from any row.
+For single-instance configs (every config today) ``ref_key`` equals the
+``class_key``; the multi-instance API extension that lets two rows share a
+``class_key`` lands in F.4c.2.
 
 Per-tenant tables live inside the tenant's own PG schema, matching
 dynastore's physical tenant isolation — no ``catalog_id`` column needed.
@@ -62,11 +64,15 @@ CREATE INDEX IF NOT EXISTS ix_schemas_class_key
     ON {CONFIGS_SCHEMA}.schemas (class_key);
 
 CREATE TABLE IF NOT EXISTS {CONFIGS_SCHEMA}.platform_configs (
-    class_key   TEXT        PRIMARY KEY,
+    ref_key     TEXT        PRIMARY KEY,
+    class_key   TEXT        NOT NULL,
     schema_id   TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
     config_data JSONB       NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS ix_platform_configs_class_key
+    ON {CONFIGS_SCHEMA}.platform_configs (class_key);
 """
 
 
@@ -79,19 +85,24 @@ def tenant_configs_ddl(tenant_schema: str) -> str:
     validate_sql_identifier(tenant_schema)
     return f"""
     CREATE TABLE IF NOT EXISTS "{tenant_schema}".catalog_configs (
-        class_key   TEXT        PRIMARY KEY,
+        ref_key     TEXT        PRIMARY KEY,
+        class_key   TEXT        NOT NULL,
         schema_id   TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
         config_data JSONB       NOT NULL,
         updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE INDEX IF NOT EXISTS ix_catalog_configs_class_key
+        ON "{tenant_schema}".catalog_configs (class_key);
+
     CREATE TABLE IF NOT EXISTS "{tenant_schema}".collection_configs (
         collection_id TEXT        NOT NULL,
+        ref_key       TEXT        NOT NULL,
         class_key     TEXT        NOT NULL,
         schema_id     TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
         config_data   JSONB       NOT NULL,
         updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (collection_id, class_key)
+        PRIMARY KEY (collection_id, ref_key)
     );
 
     CREATE INDEX IF NOT EXISTS ix_collection_configs_class_key
