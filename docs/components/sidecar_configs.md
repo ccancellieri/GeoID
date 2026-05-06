@@ -273,3 +273,7 @@ collection uses the one driver instance and its declared sidecars.
   core)
 - `docs/components/stac.md` — STAC overlay rendering + the
   `auto_render_extensions` allowlist
+- `docs/components/configs_api.md` — configs API surface (GET/PATCH
+  endpoints, query params, HATEOAS link catalog, scope strictness
+  rules); shows how sidecar overrides land via PATCH at the right
+  scope

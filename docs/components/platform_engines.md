@@ -224,3 +224,6 @@ and admin tooling but does not gate production dispatch.
 - `docs/components/sidecar_configs.md` — sidecar configurations
   composed onto PG-backed items drivers (geometries, attributes,
   item_metadata, stac_metadata)
+- `docs/components/configs_api.md` — runtime configs API surface;
+  GET/PATCH endpoints, query params, HATEOAS link catalog, scope
+  strictness rules

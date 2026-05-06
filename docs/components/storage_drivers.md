@@ -803,3 +803,8 @@ src/dynastore/
 - `docs/components/sidecar_configs.md` — sidecars composed onto
   PG-backed items drivers; full default field surface for every
   shipped sidecar.
+- `docs/components/configs_api.md` — operator surface for runtime
+  configuration: GET/PATCH endpoints, query params (`resolved`,
+  `meta`, `include`, `strict`), HATEOAS link catalog, scope
+  strictness rules, live-shape examples at platform / catalog /
+  collection scope.
