@@ -10,6 +10,9 @@ Secret-wrapped credentials) on top of this surface.
 
 from __future__ import annotations
 
+from google.cloud import bigquery as _bigquery_scope_gate  # noqa: F401  # SCOPE gate: joins extra requires google-cloud-bigquery
+_ = _bigquery_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
+
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional

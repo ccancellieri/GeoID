@@ -56,7 +56,8 @@ from .wfs_config import WFSPluginConfig
 # Import the centralized formatting tools.
 from dynastore.extensions.tools.formatters import OutputFormatEnum, format_response
 from dynastore.extensions.tools.fast_api import _parse_srid_from_srs_name
-from pyproj import CRS, Transformer
+import pyproj as _pyproj_scope_gate  # noqa: F401  # SCOPE gate: extension_wfs requires pyproj
+_ = _pyproj_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.extensions.tools.language_utils import get_language
 

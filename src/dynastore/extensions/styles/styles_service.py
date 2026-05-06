@@ -27,6 +27,9 @@ so that the service participates in the global /conformance aggregator and
 exposes a standard OGC landing page at GET /styles/.
 """
 
+import lxml as _lxml_scope_gate  # noqa: F401  # SCOPE gate: extension_styles requires module_styles (lxml)
+_ = _lxml_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
+
 import json as _json
 import logging
 import uuid

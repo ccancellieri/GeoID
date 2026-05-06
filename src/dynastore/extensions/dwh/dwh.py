@@ -16,6 +16,9 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import pyproj as _pyproj_scope_gate  # noqa: F401  # SCOPE gate: extension_dwh requires pyproj (via tms_definitions)
+_ = _pyproj_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
+
 from dynastore.tools.discovery import get_protocol
 import logging
 from typing import Any, Dict, List, Optional
