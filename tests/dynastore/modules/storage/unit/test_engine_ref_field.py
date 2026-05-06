@@ -25,6 +25,10 @@ from dynastore.modules.elasticsearch.catalog_es_driver import (
 from dynastore.modules.elasticsearch.collection_es_driver import (
     CollectionElasticsearchDriverConfig,
 )
+from dynastore.modules.stac.drivers.postgresql import (
+    CatalogStacPostgresqlDriverConfig,
+    CollectionStacPostgresqlDriverConfig,
+)
 from dynastore.modules.storage.driver_config import (
     AssetElasticsearchDriverConfig,
     AssetPostgresqlDriverConfig,
@@ -40,9 +44,16 @@ from dynastore.modules.storage.drivers.catalog_postgresql import (
 from dynastore.modules.storage.drivers.collection_postgresql import (
     CollectionPostgresqlDriverConfig,
 )
+from dynastore.modules.storage.drivers.core_postgresql import (
+    CatalogCorePostgresqlDriverConfig,
+    CollectionCorePostgresqlDriverConfig,
+)
 
 
 # F.1 compatibility table — verbatim from binary-leaping-lightning.md.
+# Plus the 4 PG sub-driver configs swept in by F.2-fixup (composition
+# wrapper inner drivers — they surface in the configs API tree as their
+# own PluginConfig classes, so they need the same engine binding).
 ENGINE_COMPATIBILITY = [
     (ItemsPostgresqlDriverConfig, "postgresql_engine"),
     (CatalogPostgresqlDriverConfig, "postgresql_engine"),
@@ -55,6 +66,12 @@ ENGINE_COMPATIBILITY = [
     (AssetElasticsearchDriverConfig, "elasticsearch_engine"),
     (ItemsDuckdbDriverConfig, "duckdb_engine"),
     (ItemsIcebergDriverConfig, "iceberg_engine"),
+    # PG sub-drivers (F.2-fixup): inner composition drivers feeding the
+    # PG-tier wrapper.  Same engine kind as their wrapper.
+    (CollectionStacPostgresqlDriverConfig, "postgresql_engine"),
+    (CatalogStacPostgresqlDriverConfig, "postgresql_engine"),
+    (CollectionCorePostgresqlDriverConfig, "postgresql_engine"),
+    (CatalogCorePostgresqlDriverConfig, "postgresql_engine"),
 ]
 
 

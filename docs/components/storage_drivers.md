@@ -463,6 +463,27 @@ config = await configs.get_config(
 | `items_elasticsearch_driver` | `ItemsElasticsearchDriverConfig` | `items_elasticsearch_driver_config` | `index_prefix` (resolved at runtime via `get_index_prefix()`) |
 | `asset_elasticsearch_driver` | `AssetElasticsearchDriverConfig` | `asset_elasticsearch_driver_config` | `index_prefix` |
 
+### Engine Binding (Cycle F.1 / F.2)
+
+Every driver config inherits two engine-binding attributes from
+`_PluginDriverConfig`:
+
+- `required_engine_class: ClassVar[str]` — the platform engine kind this
+  driver class consumes (e.g. `"postgresql_engine"`,
+  `"elasticsearch_engine"`, `"duckdb_engine"`, `"iceberg_engine"`).
+  Concrete subclasses declare it; the validator skips compatibility
+  checks when empty (graceful for un-migrated drivers + non-pooled
+  drivers like BigQuery).
+- `engine_ref: Optional[str]` field — name of the platform engine this
+  driver instance binds to.  Defaults to `required_engine_class` for
+  single-instance-per-kind deployments (F.1).  F.4 enables operator-
+  chosen ref names for multi-instance.
+
+Engines themselves live at `configs.platform.engines.*` and are
+sysadmin-only via the existing `configs_access` policy — see
+`src/dynastore/modules/db_config/engine_config.py` for the four
+concrete engine classes.
+
 ---
 
 ## Creating a New Driver

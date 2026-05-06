@@ -185,12 +185,16 @@ class CollectionCorePostgresqlDriverConfig(DriverPluginConfig):
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
+    required_engine_class: ClassVar[str] = "postgresql_engine"
+
 
 class CatalogCorePostgresqlDriverConfig(DriverPluginConfig):
     """Identity marker for CatalogCorePostgresqlDriver."""
 
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "drivers")
     _visibility: ClassVar[Optional[str]] = "catalog"
+
+    required_engine_class: ClassVar[str] = "postgresql_engine"
 
 
 # ---------------------------------------------------------------------------
