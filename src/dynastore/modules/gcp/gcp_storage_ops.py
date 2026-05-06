@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 class GcpStorageOpsMixin:
     """Mixin providing StorageProtocol delegations and AssetUploadProtocol for GCPModule."""
 
+    # AssetUploadProtocol surface
+    driver_id: str = "gcs"
+    supports_versioning: bool = False
+
     # --- Host interface stubs (provided by GCPModule) ---
     _upload_tickets: Dict[str, Dict[str, Any]]
 

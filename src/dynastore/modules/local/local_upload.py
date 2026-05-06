@@ -79,6 +79,10 @@ class LocalUploadModule(ModuleProtocol):
     lifespan phase.
     """
 
+    # AssetUploadProtocol surface
+    driver_id: str = "local"
+    supports_versioning: bool = False
+
     # Non-foundational: a missing python-multipart or path-write failure
     # should disable local upload but never abort the catalog.
     priority: int = 50
