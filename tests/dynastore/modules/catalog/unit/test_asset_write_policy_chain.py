@@ -461,3 +461,150 @@ async def test_hash_gating_collapses_update_to_refuse_return(
 
     assert result.action == "returned_existing"
     assert not any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
+
+
+# ---------------------------------------------------------------------------
+# F1 — Concurrent-INSERT race surfaces as AssetSidecarRejectedError (409),
+#       not an unhandled DB exception (500).
+# ---------------------------------------------------------------------------
+
+
+def _make_unique_violation(constraint: str) -> Exception:
+    """Build a dynastore ``UniqueViolationError`` whose ``original_exception``
+    carries the violated constraint name on a synthetic asyncpg-style stub."""
+    from dynastore.modules.db_config.exceptions import UniqueViolationError
+
+    class _AsyncpgStub(Exception):
+        pass
+
+    inner = _AsyncpgStub(f'duplicate key value violates unique constraint "{constraint}"')
+    setattr(inner, "constraint_name", constraint)
+    return UniqueViolationError(
+        f"unique violation on {constraint}", original_exception=inner
+    )
+
+
+@pytest.mark.asyncio
+async def test_race_filename_constraint_maps_to_filename_matcher(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Probes return None — the chain ran without finding a match, then a
+    # concurrent writer landed first and the partial unique index fires.
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("assets_uq_filename_ds_test")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()  # defaults
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    err = exc_info.value
+    assert err.matcher == AssetIdentityMatcher.FILENAME.value
+    assert err.reason == "conflict"
+    assert err.asset_id == "alpha"
+    assert err.existing_id is None  # we don't query the winning row
+
+
+@pytest.mark.asyncio
+async def test_race_href_constraint_maps_to_url_matcher(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("assets_uq_href_ds_test")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=virtual(), policy=policy)
+
+    assert exc_info.value.matcher == AssetIdentityMatcher.URL.value
+    assert exc_info.value.reason == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_race_identity_constraint_maps_to_asset_id_matcher(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("assets_identity_uq")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    assert exc_info.value.matcher == AssetIdentityMatcher.ASSET_ID.value
+    assert exc_info.value.reason == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_race_unknown_constraint_maps_to_unknown_matcher(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("some_other_unique_constraint")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    assert exc_info.value.matcher == "unknown"
+    assert exc_info.value.reason == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_race_via_message_scrape_when_constraint_attr_missing(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the underlying driver doesn't expose ``constraint_name``, the
+    message-scrape fallback recovers the constraint from the error text."""
+    from dynastore.modules.db_config.exceptions import UniqueViolationError
+
+    class _StringInner(Exception):
+        pass
+
+    inner = _StringInner(
+        'duplicate key value violates unique constraint "assets_uq_filename_ds_test"'
+    )
+    # Note: NO constraint_name attr — only the message.
+    err = UniqueViolationError("scraped", original_exception=inner)
+
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise err
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    assert exc_info.value.matcher == AssetIdentityMatcher.FILENAME.value
+
+
+@pytest.mark.asyncio
+async def test_race_in_new_version_path_preserves_existing_id(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW_VERSION races: the existing row was found and archived, then the
+    re-INSERT lost the race. The rejection must include the original
+    ``existing_id`` so the client can correlate."""
+    fake_dql.when(is_select_by("asset_id"), EXISTING_ROW)
+
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("assets_uq_filename_ds_test")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.NEW_VERSION)
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    err = exc_info.value
+    assert err.matcher == AssetIdentityMatcher.FILENAME.value
+    assert err.existing_id == "alpha"  # the archived row's id is preserved
+    assert err.reason == "conflict"

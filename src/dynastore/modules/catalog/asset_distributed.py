@@ -53,6 +53,7 @@ from dynastore.modules.catalog.write_policy_assets import (
     AssetsWritePolicy,
     AssetWriteConflictPolicy,
 )
+from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import (
     DbResource,
     DQLQuery,
@@ -360,6 +361,61 @@ PROBES: Dict[AssetIdentityMatcher, ProbeFn] = {
 
 
 # ---------------------------------------------------------------------------
+# Constraint → matcher mapping for concurrent-INSERT race handling
+# ---------------------------------------------------------------------------
+
+
+def _constraint_name_from_exc(exc: BaseException) -> Optional[str]:
+    """Extract the violated constraint name from a :class:`UniqueViolationError`.
+
+    The dynastore ``UniqueViolationError`` wraps either an ``asyncpg`` exception
+    (``constraint_name`` attr) or a SQLAlchemy ``IntegrityError`` (``orig`` attr
+    pointing at the asyncpg exception). Returns ``None`` when the constraint
+    name can't be recovered — caller falls back to a generic conflict matcher.
+    """
+    original = getattr(exc, "original_exception", None)
+    if original is None:
+        return None
+    name = getattr(original, "constraint_name", None)
+    if name:
+        return name
+    # SQLAlchemy IntegrityError nesting
+    orig = getattr(original, "orig", None)
+    if orig is not None:
+        name = getattr(orig, "constraint_name", None)
+        if name:
+            return name
+    # Fall back to message scraping — pgcode 23505 messages typically contain
+    # `unique constraint "<name>"`.
+    msg = str(original)
+    import re
+    m = re.search(r'unique constraint "([^"]+)"', msg)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _matcher_for_constraint(constraint_name: Optional[str]) -> str:
+    """Map a violated constraint name to the matcher value reported in
+    :class:`AssetSidecarRejectedError`.
+
+    Constraint names are namespaced by schema (e.g.
+    ``assets_uq_filename_<schema_tag>``); this matches by prefix.
+    """
+    if not constraint_name:
+        return "unknown"
+    if constraint_name.startswith("assets_uq_filename"):
+        return AssetIdentityMatcher.FILENAME.value
+    if constraint_name.startswith("assets_uq_href"):
+        return AssetIdentityMatcher.URL.value
+    if constraint_name == "assets_identity_uq" or constraint_name.startswith(
+        "assets_identity_uq"
+    ):
+        return AssetIdentityMatcher.ASSET_ID.value
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Chain runner & action dispatcher
 # ---------------------------------------------------------------------------
 
@@ -434,9 +490,33 @@ async def upsert_asset(
         if existing:
             matcher_hit = AssetIdentityMatcher.ASSET_ID
 
-    # 4. No match → fresh INSERT.
+    # 4. No match → fresh INSERT. The chain probe ran without a transaction
+    #    barrier, so a concurrent caller can win the race and INSERT the same
+    #    identity between our probe and our INSERT. The partial unique indexes
+    #    catch that at the DB level; we re-raise as a typed rejection so the
+    #    REST surface returns 409 (matching the application-level policy
+    #    rejection) instead of bubbling a 500.
     if existing is None:
-        inserted = await _insert_new_row(conn, scope, payload, initial_status)
+        try:
+            inserted = await _insert_new_row(conn, scope, payload, initial_status)
+        except UniqueViolationError as exc:
+            constraint = _constraint_name_from_exc(exc)
+            matcher_value = _matcher_for_constraint(constraint)
+            logger.info(
+                "AssetsWritePolicy concurrent-INSERT race lost: "
+                "constraint=%s matcher=%s asset_id=%s",
+                constraint,
+                matcher_value,
+                payload.asset_id,
+            )
+            raise AssetSidecarRejectedError(
+                f"Asset write refused: concurrent INSERT lost the race "
+                f"(unique constraint {constraint or 'unknown'}); policy=race",
+                asset_id=payload.asset_id,
+                matcher=matcher_value,
+                reason="conflict",
+                existing_id=None,
+            ) from exc
         action: UpsertAction = (
             "inserted_pending"
             if initial_status == AssetStatus.PENDING
@@ -500,7 +580,28 @@ async def upsert_asset(
                 existing_id=existing_id,
             )
         await _archive_row(conn, scope, existing)
-        inserted = await _insert_new_row(conn, scope, payload, initial_status)
+        try:
+            inserted = await _insert_new_row(conn, scope, payload, initial_status)
+        except UniqueViolationError as exc:
+            # NEW_VERSION raced with another writer that won the same archive +
+            # re-INSERT cycle. Surface as a conflict rejection rather than 500.
+            constraint = _constraint_name_from_exc(exc)
+            matcher_value = _matcher_for_constraint(constraint)
+            logger.info(
+                "NEW_VERSION concurrent-INSERT race lost: "
+                "constraint=%s matcher=%s asset_id=%s",
+                constraint,
+                matcher_value,
+                payload.asset_id,
+            )
+            raise AssetSidecarRejectedError(
+                f"NEW_VERSION write refused: concurrent INSERT lost the race "
+                f"(unique constraint {constraint or 'unknown'})",
+                asset_id=payload.asset_id,
+                matcher=matcher_value,
+                reason="conflict",
+                existing_id=existing_id,
+            ) from exc
         return UpsertResult(
             action="new_version", row=inserted, matcher_hit=matcher_hit
         )
