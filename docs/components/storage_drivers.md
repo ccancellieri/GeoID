@@ -35,8 +35,8 @@ Drivers (instances discovered via `dynastore.modules` entry points)
     ├── CatalogElasticsearchDriver              driver_id="catalog_elasticsearch_driver"
     ├── AssetPostgresqlDriver                   driver_id="asset_postgresql_driver"
     ├── AssetElasticsearchDriver                driver_id="asset_elasticsearch_driver"
-    ├── CollectionIcebergDriver                 driver_id="collection_iceberg_driver"              (OTF: snapshots, time-travel)
-    └── CollectionDuckdbDriver                  driver_id="collection_duckdb_driver"               (analytical reads)
+    ├── ItemsIcebergDriver                 driver_id="items_iceberg_driver"              (OTF: snapshots, time-travel)
+    └── ItemsDuckdbDriver                  driver_id="items_duckdb_driver"               (analytical reads)
 ```
 
 `driver_id` is always `_to_snake(cls.__name__)` — the snake_case class key (post-PR-1e).
@@ -254,10 +254,10 @@ via the catalog tenant schema (no explicit location config required).
 
 | Property | Value |
 |----------|-------|
-| **class** | `CollectionIcebergDriver` |
-| **driver_id** | `collection_iceberg_driver` |
+| **class** | `ItemsIcebergDriver` |
+| **driver_id** | `items_iceberg_driver` |
 | **capabilities** | `STREAMING`, `SPATIAL_FILTER`, `EXPORT`, `TIME_TRAVEL`, `VERSIONING`, `SNAPSHOTS`, `SCHEMA_EVOLUTION`, `SOFT_DELETE` |
-| **driver config** | `CollectionIcebergDriverConfig` |
+| **driver config** | `ItemsIcebergDriverConfig` |
 | **dependencies** | `pyiceberg[sql-postgres]>=0.9.0`, `pyarrow>=14.0.0` |
 
 Full Open Table Format support via PyIceberg: ACID transactions, snapshots, time-travel reads,
@@ -271,7 +271,7 @@ and schema evolution — all backed by a real Iceberg catalog.
 
 **Warehouse auto-resolution** (via `_resolve_warehouse()` → `_ensure_catalog()`):
 
-1. **Explicit** — `warehouse_uri` field in `CollectionIcebergDriverConfig` (manual override)
+1. **Explicit** — `warehouse_uri` field in `ItemsIcebergDriverConfig` (manual override)
 2. **Auto-detected** — from platform `StorageProtocol` (e.g., GCS bucket). When a collection already has a GCP bucket, the driver derives `gs://bucket/.../iceberg/` automatically
 3. **Fallback** — local temp dir (`file:///tmp/iceberg_warehouse`)
 
@@ -338,10 +338,10 @@ pip install dynastore[module_storage_iceberg]
 
 | Property | Value |
 |----------|-------|
-| **class** | `CollectionDuckdbDriver` |
-| **driver_id** | `collection_duckdb_driver` |
+| **class** | `ItemsDuckdbDriver` |
+| **driver_id** | `items_duckdb_driver` |
 | **capabilities** | `READ_ONLY`, `STREAMING`, `SPATIAL_FILTER`, `EXPORT` |
-| **driver config** | `CollectionDuckdbDriverConfig` |
+| **driver config** | `ItemsDuckdbDriverConfig` |
 | **dependencies** | `duckdb>=1.0.0` |
 
 File-based analytical reads via DuckDB's built-in readers. Reads from parquet, CSV, JSON, etc.
@@ -439,15 +439,15 @@ no `_plugin_id` strings). Fetch via the standard `ConfigsProtocol` waterfall:
 ```python
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,
-    CollectionDuckdbDriverConfig,
-    CollectionIcebergDriverConfig,
+    ItemsDuckdbDriverConfig,
+    ItemsIcebergDriverConfig,
 )
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols.configs import ConfigsProtocol
 
 configs = get_protocol(ConfigsProtocol)
 config = await configs.get_config(
-    CollectionIcebergDriverConfig,
+    ItemsIcebergDriverConfig,
     catalog_id=catalog_id,
     collection_id=collection_id,
 )
@@ -458,8 +458,8 @@ config = await configs.get_config(
 | Driver | Config Class | class_key | Key Fields |
 |--------|-------------|-----------|------------|
 | `items_postgresql_driver` | `ItemsPostgresqlDriverConfig` | `items_postgresql_driver_config` | `collection_type`, `sidecars`, `partitioning` |
-| `collection_duckdb_driver` | `CollectionDuckdbDriverConfig` | `collection_duckdb_driver_config` | `path`, `format`, `write_path`, `write_format` |
-| `collection_iceberg_driver` | `CollectionIcebergDriverConfig` | `collection_iceberg_driver_config` | `catalog_name`, `catalog_type`, `catalog_uri`, `catalog_properties`, `warehouse_uri`, `warehouse_scheme`, `namespace`, `table_name` |
+| `items_duckdb_driver` | `ItemsDuckdbDriverConfig` | `items_duckdb_driver_config` | `path`, `format`, `write_path`, `write_format` |
+| `items_iceberg_driver` | `ItemsIcebergDriverConfig` | `items_iceberg_driver_config` | `catalog_name`, `catalog_type`, `catalog_uri`, `catalog_properties`, `warehouse_uri`, `warehouse_scheme`, `namespace`, `table_name` |
 | `items_elasticsearch_driver` | `ItemsElasticsearchDriverConfig` | `items_elasticsearch_driver_config` | `index_prefix` (resolved at runtime via `get_index_prefix()`) |
 | `asset_elasticsearch_driver` | `AssetElasticsearchDriverConfig` | `asset_elasticsearch_driver_config` | `index_prefix` |
 
@@ -760,8 +760,8 @@ src/dynastore/
 │       ├── core_postgresql.py           # CollectionPostgresqlDriver / CatalogPostgresqlDriver
 │       ├── collection_postgresql.py     # collection-envelope PG driver
 │       ├── catalog_postgresql.py        # catalog-tier PG driver
-│       ├── iceberg.py                   # CollectionIcebergDriver
-│       ├── duckdb.py                    # CollectionDuckdbDriver
+│       ├── iceberg.py                   # ItemsIcebergDriver
+│       ├── duckdb.py                    # ItemsDuckdbDriver
 │       ├── elasticsearch.py             # ItemsElasticsearchDriver + AssetElasticsearchDriver
 │       └── elasticsearch_private/       # ItemsElasticsearchPrivateDriver +
 │                                        # CollectionElasticsearchPrivateDriver (DENY-policied)

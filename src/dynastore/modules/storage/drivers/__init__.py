@@ -19,8 +19,10 @@
 """
 Storage driver implementations.
 
-Each driver is a ``ModuleProtocol`` subclass that also satisfies
-``StorageDriverProtocol``.  Drivers are discovered via the
-``dynastore.modules`` entry-point group and activated by
-``StorageRoutingConfig``.
+Each driver is a ``ModuleProtocol`` subclass that also satisfies the
+appropriate tier protocol (``CollectionItemsStore`` / ``CollectionStore``
+/ ``AssetStore`` / ``CatalogStore``).  Drivers are discovered via the
+``dynastore.modules`` entry-point group and dispatched per-operation
+through the per-tier routing configs (``ItemsRoutingConfig``,
+``CollectionRoutingConfig``, ``AssetRoutingConfig``, ``CatalogRoutingConfig``).
 """
