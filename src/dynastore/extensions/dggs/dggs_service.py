@@ -31,6 +31,10 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional, Set
 
+import h3 as _h3_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires h3
+import s2sphere as _s2sphere_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires s2sphere
+_ = (_h3_scope_gate, _s2sphere_scope_gate)  # silence pyright "unused" — load-bearing for SCOPE filtering
+
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
 
 from dynastore.extensions.dggs.config import DGGSConfig

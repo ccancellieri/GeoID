@@ -20,6 +20,10 @@ import logging
 import json
 import uuid
 from typing import List, Union, Any, Optional, cast
+
+import jsonschema as _jsonschema_scope_gate  # noqa: F401  # SCOPE gate: extension_processes requires jsonschema
+_ = _jsonschema_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
+
 from pydantic import ValidationError
 from fastapi import (
     APIRouter,

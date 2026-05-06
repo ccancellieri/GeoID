@@ -18,6 +18,8 @@
 
 import logging
 from typing import List, Union
+import pyproj as _pyproj_scope_gate  # noqa: F401  # SCOPE gate: extension_crs requires module_crs (pyproj)
+_ = _pyproj_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Request, FastAPI
 from sqlalchemy.ext.asyncio import AsyncConnection
 

@@ -21,6 +21,10 @@
 from typing import Optional, List, Dict, Any, Tuple, Union, cast
 
 import logging
+
+import pygeofilter as _pygeofilter_scope_gate  # noqa: F401  # SCOPE gate: extension_features requires pygeofilter
+_ = _pygeofilter_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
+
 from dynastore.modules.db_config.exceptions import ImmutableConfigError
 from dynastore.models.driver_context import DriverContext
 from fastapi import (
