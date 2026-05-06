@@ -18,7 +18,7 @@
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Query, status, Request, FastAPI
 from fastapi.responses import Response
@@ -114,6 +114,15 @@ class ConfigsService(ExtensionProtocol):
             self.list_storage_drivers,
             methods=["GET"],
             summary="List all registered storage drivers grouped by Protocol qualname",
+        )
+        self.router.add_api_route(
+            "/engines",
+            self.list_engines,
+            methods=["GET"],
+            summary=(
+                "List registered platform engines + their driver-class "
+                "compatibility (Cycle F.4c.0)"
+            ),
         )
         # ---- Composed (waterfall-resolved) tree views ----
         self.router.add_api_route(
@@ -670,6 +679,57 @@ class ConfigsService(ExtensionProtocol):
         }
 
         return DriverListResponse(drivers=drivers)
+
+    async def list_engines(self) -> Any:
+        """List registered platform engines + their driver-class compatibility.
+
+        Cycle F.4c.0 — additive REST surface that exposes the F.4a
+        engine registry to operators.  Returns one entry per concrete
+        :class:`EngineConfig` subclass with:
+
+        * ``engine_class`` — the discriminator (``postgresql_engine``,
+          ``elasticsearch_engine``, etc.).
+        * ``class_key`` — the snake_case wire key (``postgresql_engine_config``).
+        * ``compatible_driver_classes`` — every concrete driver config
+          whose ``required_engine_class`` matches this engine's
+          ``engine_class``.
+
+        F.4c.1+ will widen this to include operator-chosen ref names
+        when ref-keyed driver-config storage lands.  Today, the F.1
+        single-instance-per-kind contract is in force, so each engine
+        kind has exactly one default ref equal to its ``class_key``.
+        """
+        from dynastore.modules.db_config.engine_registry import (
+            list_registered_engines,
+        )
+        from dynastore.models.protocols.typed_driver import (
+            _PluginDriverConfig,
+            _registered_pairs,
+        )
+
+        engines = list_registered_engines()
+
+        # Build reverse index: engine_class → [driver class_key, ...]
+        bound_pairs = _registered_pairs()
+        compat: Dict[str, List[str]] = {}
+        for cfg_cls in bound_pairs:
+            if not issubclass(cfg_cls, _PluginDriverConfig):
+                continue
+            required = cfg_cls.required_engine_class
+            if not required:
+                continue
+            compat.setdefault(required, []).append(cfg_cls.class_key())
+        for k in compat:
+            compat[k].sort()
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for class_key, eng_cls in sorted(engines.items()):
+            out[class_key] = {
+                "class_key": class_key,
+                "engine_class": eng_cls.engine_class,
+                "compatible_driver_classes": compat.get(eng_cls.engine_class, []),
+            }
+        return {"engines": out}
 
     # --- Specific Plugin Configuration (GET/PUT) ---
 
