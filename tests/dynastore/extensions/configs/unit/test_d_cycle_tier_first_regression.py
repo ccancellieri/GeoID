@@ -90,12 +90,50 @@ def test_items_postgresql_driver_address_is_tier_first():
     assert ItemsPostgresqlDriverConfig._address == ("storage", "items", "drivers")
 
 
+def test_items_elasticsearch_driver_address_is_tier_first():
+    """Items-tier ES driver lives at ``storage.items.drivers``."""
+    from dynastore.modules.storage.driver_config import (
+        ItemsElasticsearchDriverConfig,
+    )
+    assert ItemsElasticsearchDriverConfig._address == ("storage", "items", "drivers")
+
+
+def test_items_elasticsearch_private_driver_address_is_tier_first():
+    """Items-tier ES private driver (Cycle E.2.b) lives at ``storage.items.drivers``."""
+    from dynastore.modules.storage.driver_config import (
+        ItemsElasticsearchPrivateDriverConfig,
+    )
+    assert ItemsElasticsearchPrivateDriverConfig._address == (
+        "storage", "items", "drivers",
+    )
+
+
+def test_items_duckdb_driver_address_is_tier_first():
+    """Items-tier DuckDB driver lives at ``storage.items.drivers``."""
+    from dynastore.modules.storage.driver_config import ItemsDuckdbDriverConfig
+    assert ItemsDuckdbDriverConfig._address == ("storage", "items", "drivers")
+
+
+def test_items_iceberg_driver_address_is_tier_first():
+    """Items-tier Iceberg driver lives at ``storage.items.drivers``."""
+    from dynastore.modules.storage.driver_config import ItemsIcebergDriverConfig
+    assert ItemsIcebergDriverConfig._address == ("storage", "items", "drivers")
+
+
 def test_asset_postgresql_driver_address_is_tier_first():
     """Asset-tier PG driver lives at ``storage.assets.drivers``."""
     from dynastore.modules.storage.driver_config import (
         AssetPostgresqlDriverConfig,
     )
     assert AssetPostgresqlDriverConfig._address == ("storage", "assets", "drivers")
+
+
+def test_asset_elasticsearch_driver_address_is_tier_first():
+    """Asset-tier ES driver lives at ``storage.assets.drivers``."""
+    from dynastore.modules.storage.driver_config import (
+        AssetElasticsearchDriverConfig,
+    )
+    assert AssetElasticsearchDriverConfig._address == ("storage", "assets", "drivers")
 
 
 def test_catalog_es_driver_address_is_tier_first():

@@ -454,7 +454,7 @@ class ConfigApiService:
     # the routing tree under ``configs.platform.catalog.collection.
     # storage.routing`` directly.
 
-    # --- JSON Hyper-Schema link assembly (Change 5). ---
+    # --- JSON Hyper-Schema link assembly. ---
 
     @staticmethod
     def _query_param_schema(scope: str) -> Dict[str, Any]:
