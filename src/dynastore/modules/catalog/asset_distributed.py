@@ -53,6 +53,7 @@ from dynastore.modules.catalog.write_policy_assets import (
     AssetsWritePolicy,
     AssetWriteConflictPolicy,
 )
+from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import (
     DbResource,
     DQLQuery,
@@ -311,6 +312,35 @@ async def _probe_by_metadata_field(
     return _row_to_dict(row)
 
 
+def _normalize_content_hash(value: Optional[str]) -> Optional[str]:
+    """Strip the ``algo:`` prefix from a tagged content_hash for raw
+    comparison. Untagged values pass through unchanged so legacy rows
+    continue to match.
+
+    Tagged form: ``"md5:abc=="`` / ``"sha256:0a1b2c..."``. Cross-algo
+    comparisons return the same prefix-stripped value, but the matcher
+    SQL also enforces ``algo``-equality so a "sha256:X" payload never
+    matches an "md5:Y" row even if the bare bytes happen to coincide.
+    """
+    if not value:
+        return None
+    if ":" in value:
+        # Take only the value half; the algo half is enforced separately.
+        return value.split(":", 1)[1]
+    return value
+
+
+def _split_content_hash(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(algo, raw_value)`` from a tagged content_hash. Untagged
+    values yield ``(None, value)``."""
+    if not value:
+        return (None, None)
+    if ":" in value:
+        algo, raw = value.split(":", 1)
+        return (algo, raw)
+    return (None, value)
+
+
 async def _probe_by_content_hash(
     conn: DbResource,
     scope: Scope,
@@ -323,24 +353,36 @@ async def _probe_by_content_hash(
     the hash is set by the finalize event in Stage 4.2, so until then the
     incoming payload has nothing to compare. The probe is still wired so
     Stage 4.2's finalize-event path benefits from it directly.
+
+    Tagged-hash semantics: the column stores values as ``"<algo>:<raw>"``
+    (e.g. ``"md5:abc=="``). The probe matches both the tagged form
+    (via direct equality) and the legacy untagged form (via raw-value
+    comparison) so rows written before Stage F2 keep working. A
+    ``"sha256:X"`` payload will never match an ``"md5:Y"`` row even if
+    raw bytes happen to coincide — the algo prefix is honored as part of
+    the match.
     """
     incoming_hash = getattr(payload, "content_hash", None)
     if not incoming_hash:
         return None
+    algo, raw_value = _split_content_hash(incoming_hash)
+    # Match either the exact tagged value (algo-aware), or, for backwards
+    # compatibility, an untagged row with a raw-equal hash.
     sql = (
         f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
         "WHERE catalog_id = :catalog_id "
         "AND collection_id IS NOT DISTINCT FROM :collection_id "
         "AND kind = 'physical' "
-        "AND content_hash = :content_hash "
         "AND status <> 'deleted' "
+        "AND (content_hash = :tagged OR content_hash = :raw) "
         "LIMIT 1"
     )
     row = await DQLQuery(sql, result_handler=ResultHandler.ONE_OR_NONE).execute(
         conn,
         catalog_id=scope.catalog_id,
         collection_id=scope.collection_id,
-        content_hash=incoming_hash,
+        tagged=incoming_hash,  # already-tagged equality for new rows
+        raw=raw_value,         # legacy untagged rows
     )
     return _row_to_dict(row)
 
@@ -357,6 +399,61 @@ PROBES: Dict[AssetIdentityMatcher, ProbeFn] = {
     AssetIdentityMatcher.METADATA_FIELD: _probe_by_metadata_field,
     AssetIdentityMatcher.CONTENT_HASH: _probe_by_content_hash,
 }
+
+
+# ---------------------------------------------------------------------------
+# Constraint → matcher mapping for concurrent-INSERT race handling
+# ---------------------------------------------------------------------------
+
+
+def _constraint_name_from_exc(exc: BaseException) -> Optional[str]:
+    """Extract the violated constraint name from a :class:`UniqueViolationError`.
+
+    The dynastore ``UniqueViolationError`` wraps either an ``asyncpg`` exception
+    (``constraint_name`` attr) or a SQLAlchemy ``IntegrityError`` (``orig`` attr
+    pointing at the asyncpg exception). Returns ``None`` when the constraint
+    name can't be recovered — caller falls back to a generic conflict matcher.
+    """
+    original = getattr(exc, "original_exception", None)
+    if original is None:
+        return None
+    name = getattr(original, "constraint_name", None)
+    if name:
+        return name
+    # SQLAlchemy IntegrityError nesting
+    orig = getattr(original, "orig", None)
+    if orig is not None:
+        name = getattr(orig, "constraint_name", None)
+        if name:
+            return name
+    # Fall back to message scraping — pgcode 23505 messages typically contain
+    # `unique constraint "<name>"`.
+    msg = str(original)
+    import re
+    m = re.search(r'unique constraint "([^"]+)"', msg)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _matcher_for_constraint(constraint_name: Optional[str]) -> str:
+    """Map a violated constraint name to the matcher value reported in
+    :class:`AssetSidecarRejectedError`.
+
+    Constraint names are namespaced by schema (e.g.
+    ``assets_uq_filename_<schema_tag>``); this matches by prefix.
+    """
+    if not constraint_name:
+        return "unknown"
+    if constraint_name.startswith("assets_uq_filename"):
+        return AssetIdentityMatcher.FILENAME.value
+    if constraint_name.startswith("assets_uq_href"):
+        return AssetIdentityMatcher.URL.value
+    if constraint_name == "assets_identity_uq" or constraint_name.startswith(
+        "assets_identity_uq"
+    ):
+        return AssetIdentityMatcher.ASSET_ID.value
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -415,11 +512,17 @@ async def upsert_asset(
     #    re-finalising the same blob is a no-op.
     on_conflict = policy.on_conflict
     incoming_hash = getattr(payload, "content_hash", None)
+    # Normalise both sides for the gating compare — a Stage 4.2 finalize
+    # event writes "md5:abc==" while an in-flight upload-create payload
+    # may carry the raw form. A pre-Stage-F2 row may still hold an
+    # untagged value. All three should be considered equal when the bare
+    # bytes match.
     if (
         existing
         and policy.skip_if_unchanged_content_hash
         and incoming_hash
-        and existing.get("content_hash") == incoming_hash
+        and _normalize_content_hash(existing.get("content_hash"))
+        == _normalize_content_hash(incoming_hash)
     ):
         if on_conflict == AssetWriteConflictPolicy.NEW_VERSION:
             on_conflict = AssetWriteConflictPolicy.REFUSE_RETURN
@@ -434,9 +537,33 @@ async def upsert_asset(
         if existing:
             matcher_hit = AssetIdentityMatcher.ASSET_ID
 
-    # 4. No match → fresh INSERT.
+    # 4. No match → fresh INSERT. The chain probe ran without a transaction
+    #    barrier, so a concurrent caller can win the race and INSERT the same
+    #    identity between our probe and our INSERT. The partial unique indexes
+    #    catch that at the DB level; we re-raise as a typed rejection so the
+    #    REST surface returns 409 (matching the application-level policy
+    #    rejection) instead of bubbling a 500.
     if existing is None:
-        inserted = await _insert_new_row(conn, scope, payload, initial_status)
+        try:
+            inserted = await _insert_new_row(conn, scope, payload, initial_status)
+        except UniqueViolationError as exc:
+            constraint = _constraint_name_from_exc(exc)
+            matcher_value = _matcher_for_constraint(constraint)
+            logger.info(
+                "AssetsWritePolicy concurrent-INSERT race lost: "
+                "constraint=%s matcher=%s asset_id=%s",
+                constraint,
+                matcher_value,
+                payload.asset_id,
+            )
+            raise AssetSidecarRejectedError(
+                f"Asset write refused: concurrent INSERT lost the race "
+                f"(unique constraint {constraint or 'unknown'}); policy=race",
+                asset_id=payload.asset_id,
+                matcher=matcher_value,
+                reason="conflict",
+                existing_id=None,
+            ) from exc
         action: UpsertAction = (
             "inserted_pending"
             if initial_status == AssetStatus.PENDING
@@ -500,7 +627,28 @@ async def upsert_asset(
                 existing_id=existing_id,
             )
         await _archive_row(conn, scope, existing)
-        inserted = await _insert_new_row(conn, scope, payload, initial_status)
+        try:
+            inserted = await _insert_new_row(conn, scope, payload, initial_status)
+        except UniqueViolationError as exc:
+            # NEW_VERSION raced with another writer that won the same archive +
+            # re-INSERT cycle. Surface as a conflict rejection rather than 500.
+            constraint = _constraint_name_from_exc(exc)
+            matcher_value = _matcher_for_constraint(constraint)
+            logger.info(
+                "NEW_VERSION concurrent-INSERT race lost: "
+                "constraint=%s matcher=%s asset_id=%s",
+                constraint,
+                matcher_value,
+                payload.asset_id,
+            )
+            raise AssetSidecarRejectedError(
+                f"NEW_VERSION write refused: concurrent INSERT lost the race "
+                f"(unique constraint {constraint or 'unknown'})",
+                asset_id=payload.asset_id,
+                matcher=matcher_value,
+                reason="conflict",
+                existing_id=existing_id,
+            ) from exc
         return UpsertResult(
             action="new_version", row=inserted, matcher_hit=matcher_hit
         )
@@ -615,7 +763,13 @@ async def _archive_row(
     so flipping the row to ``status='deleted'`` is sufficient for the new
     INSERT to land — no need to rewrite ``asset_id`` or stash an extra
     "archived" suffix.
+
+    Also stamps any active ``asset_references`` for the archived asset_id
+    so a future hard-delete of the successor row (re-using the same id)
+    isn't blocked by a stale reference pointing at the version we just
+    archived.
     """
+    now = datetime.now(timezone.utc)
     sql = (
         f'UPDATE "{scope.schema}".assets '
         "SET status = 'deleted', updated_at = :updated_at "
@@ -626,9 +780,23 @@ async def _archive_row(
     )
     await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
         conn,
-        updated_at=datetime.now(timezone.utc),
+        updated_at=now,
         catalog_id=scope.catalog_id,
         collection_id=scope.collection_id,
+        asset_id=existing["asset_id"],
+    )
+
+    refs_sql = (
+        f'UPDATE "{scope.schema}".asset_references '
+        "SET valid_until = :now "
+        "WHERE catalog_id = :catalog_id "
+        "AND asset_id = :asset_id "
+        "AND valid_until IS NULL"
+    )
+    await DQLQuery(refs_sql, result_handler=ResultHandler.NONE).execute(
+        conn,
+        now=now,
+        catalog_id=scope.catalog_id,
         asset_id=existing["asset_id"],
     )
 

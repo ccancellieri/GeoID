@@ -139,6 +139,24 @@ class TestAssetReference:
         restored = AssetReference.model_validate(data)
         assert restored == ref
 
+    def test_valid_until_default_none(self):
+        """Active references default valid_until to None (Stage F4)."""
+        ref = self._make()
+        assert ref.valid_until is None
+
+    def test_valid_until_accepts_timestamp(self):
+        """Invalidated references carry the stamp time (Stage F4)."""
+        stamp = datetime.now(timezone.utc)
+        ref = AssetReference(
+            asset_id="a",
+            catalog_id="c",
+            ref_type=CoreAssetReferenceType.COLLECTION,
+            ref_id="r",
+            created_at=stamp,
+            valid_until=stamp,
+        )
+        assert ref.valid_until == stamp
+
 
 # ---------------------------------------------------------------------------
 # AssetReferencedError

@@ -138,6 +138,16 @@ def is_update_archive(sql: str) -> bool:
     return s.lstrip().startswith("UPDATE") and "STATUS = 'DELETED'" in s
 
 
+def is_update_refs_invalidate(sql: str) -> bool:
+    """Match the UPDATE … asset_references SET valid_until = :now stamp."""
+    s = sql.upper()
+    return (
+        s.lstrip().startswith("UPDATE")
+        and "ASSET_REFERENCES" in s
+        and "VALID_UNTIL" in s
+    )
+
+
 def is_insert(sql: str) -> bool:
     return sql.lstrip().upper().startswith("INSERT")
 
@@ -461,3 +471,254 @@ async def test_hash_gating_collapses_update_to_refuse_return(
 
     assert result.action == "returned_existing"
     assert not any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
+
+
+# ---------------------------------------------------------------------------
+# F1 — Concurrent-INSERT race surfaces as AssetSidecarRejectedError (409),
+#       not an unhandled DB exception (500).
+# ---------------------------------------------------------------------------
+
+
+def _make_unique_violation(constraint: str) -> Exception:
+    """Build a dynastore ``UniqueViolationError`` whose ``original_exception``
+    carries the violated constraint name on a synthetic asyncpg-style stub."""
+    from dynastore.modules.db_config.exceptions import UniqueViolationError
+
+    class _AsyncpgStub(Exception):
+        pass
+
+    inner = _AsyncpgStub(f'duplicate key value violates unique constraint "{constraint}"')
+    setattr(inner, "constraint_name", constraint)
+    return UniqueViolationError(
+        f"unique violation on {constraint}", original_exception=inner
+    )
+
+
+@pytest.mark.asyncio
+async def test_race_filename_constraint_maps_to_filename_matcher(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Probes return None — the chain ran without finding a match, then a
+    # concurrent writer landed first and the partial unique index fires.
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("assets_uq_filename_ds_test")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()  # defaults
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    err = exc_info.value
+    assert err.matcher == AssetIdentityMatcher.FILENAME.value
+    assert err.reason == "conflict"
+    assert err.asset_id == "alpha"
+    assert err.existing_id is None  # we don't query the winning row
+
+
+@pytest.mark.asyncio
+async def test_race_href_constraint_maps_to_url_matcher(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("assets_uq_href_ds_test")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=virtual(), policy=policy)
+
+    assert exc_info.value.matcher == AssetIdentityMatcher.URL.value
+    assert exc_info.value.reason == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_race_identity_constraint_maps_to_asset_id_matcher(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("assets_identity_uq")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    assert exc_info.value.matcher == AssetIdentityMatcher.ASSET_ID.value
+    assert exc_info.value.reason == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_race_unknown_constraint_maps_to_unknown_matcher(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("some_other_unique_constraint")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    assert exc_info.value.matcher == "unknown"
+    assert exc_info.value.reason == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_race_via_message_scrape_when_constraint_attr_missing(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the underlying driver doesn't expose ``constraint_name``, the
+    message-scrape fallback recovers the constraint from the error text."""
+    from dynastore.modules.db_config.exceptions import UniqueViolationError
+
+    class _StringInner(Exception):
+        pass
+
+    inner = _StringInner(
+        'duplicate key value violates unique constraint "assets_uq_filename_ds_test"'
+    )
+    # Note: NO constraint_name attr — only the message.
+    err = UniqueViolationError("scraped", original_exception=inner)
+
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise err
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy()
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    assert exc_info.value.matcher == AssetIdentityMatcher.FILENAME.value
+
+
+# ---------------------------------------------------------------------------
+# F4 — NEW_VERSION archives also invalidate the asset_references rows.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_new_version_archive_stamps_asset_references_valid_until(
+    fake_dql: _Recorder,
+) -> None:
+    """When NEW_VERSION archives an existing row, it must also stamp
+    ``valid_until`` on any active asset_references for that asset_id so
+    the new row inheriting the same id isn't blocked by stale references.
+    """
+    fake_dql.when(is_select_by("asset_id"), EXISTING_ROW)
+
+    policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.NEW_VERSION)
+    result = await upsert_asset(
+        conn=object(), scope=SCOPE, payload=physical(), policy=policy
+    )
+    assert result.action == "new_version"
+
+    # Both UPDATEs must be present in the captured call log:
+    archived = [c for c in fake_dql.calls if is_update_archive(c["sql"])]
+    refs_invalidated = [
+        c for c in fake_dql.calls if is_update_refs_invalidate(c["sql"])
+    ]
+    assert len(archived) == 1, "expected exactly one row-archive UPDATE"
+    assert len(refs_invalidated) == 1, (
+        "expected exactly one asset_references invalidation UPDATE"
+    )
+    # The invalidation targets the archived asset_id and only active rows.
+    binds = refs_invalidated[0]["params"]
+    assert binds["asset_id"] == EXISTING_ROW["asset_id"]
+    assert binds["catalog_id"] == SCOPE.catalog_id
+
+
+# ---------------------------------------------------------------------------
+# F2 — content_hash algo-prefix semantics
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_strips_algo_prefix() -> None:
+    assert ad._normalize_content_hash("md5:abc==") == "abc=="
+    assert ad._normalize_content_hash("sha256:0a1b") == "0a1b"
+    # Untagged values pass through.
+    assert ad._normalize_content_hash("legacyhex") == "legacyhex"
+    assert ad._normalize_content_hash(None) is None
+    assert ad._normalize_content_hash("") is None
+
+
+def test_split_returns_algo_and_value() -> None:
+    assert ad._split_content_hash("md5:abc==") == ("md5", "abc==")
+    assert ad._split_content_hash("sha256:01ff") == ("sha256", "01ff")
+    assert ad._split_content_hash("untagged") == (None, "untagged")
+    assert ad._split_content_hash(None) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_content_hash_probe_sends_both_tagged_and_raw_binds(
+    fake_dql: _Recorder,
+) -> None:
+    """The probe SQL OR-clauses on (tagged) and (raw) so legacy untagged
+    rows continue to match. Verify both binds are present."""
+    fake_dql.when(is_select_by("content_hash"), EXISTING_ROW)
+
+    payload = physical()
+    object.__setattr__(payload, "content_hash", "md5:abc==")
+    policy = AssetsWritePolicy(
+        identity_matchers=[AssetIdentityMatcher.CONTENT_HASH],
+    )
+    with pytest.raises(AssetSidecarRejectedError):
+        await upsert_asset(conn=object(), scope=SCOPE, payload=payload, policy=policy)
+
+    # Find the SELECT call hitting content_hash.
+    probe_call = next(c for c in fake_dql.calls if "content_hash" in c["sql"])
+    assert probe_call["params"]["tagged"] == "md5:abc=="
+    assert probe_call["params"]["raw"] == "abc=="
+
+
+@pytest.mark.asyncio
+async def test_hash_gating_normalizes_across_tagged_and_untagged(
+    fake_dql: _Recorder,
+) -> None:
+    """Existing row stores ``md5:abc==`` (post-Stage-F2 finalize); the
+    payload carries the bare ``abc==`` (e.g., a re-finalize or a legacy
+    caller). The gating compare must still treat them as equal and
+    short-circuit UPDATE → REFUSE_RETURN."""
+    tagged_existing = dict(EXISTING_ROW, content_hash="md5:abc==")
+    fake_dql.when(is_select_by("asset_id"), tagged_existing)
+
+    policy = AssetsWritePolicy(
+        on_conflict=AssetWriteConflictPolicy.UPDATE,
+        skip_if_unchanged_content_hash=True,
+    )
+    payload = physical()
+    object.__setattr__(payload, "content_hash", "abc==")  # untagged, raw
+
+    result = await upsert_asset(
+        conn=object(), scope=SCOPE, payload=payload, policy=policy
+    )
+    assert result.action == "returned_existing"
+    assert not any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
+
+
+@pytest.mark.asyncio
+async def test_race_in_new_version_path_preserves_existing_id(
+    fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW_VERSION races: the existing row was found and archived, then the
+    re-INSERT lost the race. The rejection must include the original
+    ``existing_id`` so the client can correlate."""
+    fake_dql.when(is_select_by("asset_id"), EXISTING_ROW)
+
+    async def _raise_unique(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise _make_unique_violation("assets_uq_filename_ds_test")
+
+    monkeypatch.setattr(ad, "_insert_new_row", _raise_unique)
+
+    policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.NEW_VERSION)
+    with pytest.raises(AssetSidecarRejectedError) as exc_info:
+        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+
+    err = exc_info.value
+    assert err.matcher == AssetIdentityMatcher.FILENAME.value
+    assert err.existing_id == "alpha"  # the archived row's id is preserved
+    assert err.reason == "conflict"

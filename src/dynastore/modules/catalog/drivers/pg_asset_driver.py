@@ -178,7 +178,12 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
             filename      VARCHAR,
             href          TEXT,
             uri           TEXT,
-            content_hash  VARCHAR(64),
+            -- content_hash is stored as a tagged scalar "<algo>:<value>"
+            -- (e.g. "md5:abc==", "sha256:0a1b..."). Length budget covers
+            -- algo prefix + base64-encoded MD5 (~24 chars) and hex-encoded
+            -- SHA-256 (64 chars). Untagged legacy values still match the
+            -- CONTENT_HASH probe via the OR-clause in _probe_by_content_hash.
+            content_hash  VARCHAR(96),
             size_bytes    BIGINT,
             metadata      JSONB        DEFAULT '{{}}'::jsonb,
             owned_by      VARCHAR,
@@ -220,11 +225,18 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
             ref_id         VARCHAR     NOT NULL,
             cascade_delete BOOLEAN     NOT NULL DEFAULT TRUE,
             created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            -- valid_until: NULL means the reference is currently active.
+            -- Stamped by soft-delete and NEW_VERSION archive paths so a
+            -- stale reference cannot block hard-deletion of a successor
+            -- asset that re-uses the same asset_id. Audit trail preserved.
+            valid_until    TIMESTAMPTZ DEFAULT NULL,
             PRIMARY KEY (catalog_id, asset_id, ref_type, ref_id)
         );
+        -- Active blocking references: only rows that are non-cascade AND
+        -- still valid (valid_until IS NULL) actually block hard-delete.
         CREATE INDEX IF NOT EXISTS idx_asset_refs_blocking_{schema.replace('.', '_')}
             ON "{schema}".asset_references (catalog_id, asset_id)
-            WHERE cascade_delete = FALSE;
+            WHERE cascade_delete = FALSE AND valid_until IS NULL;
         """
 
         async with managed_transaction(db_resource or self.engine) as conn:
@@ -507,8 +519,12 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
     ) -> List[Any]:
         """Return cascade_delete=False references for the given asset IDs.
 
-        Uses the partial index on ``(catalog_id, asset_id) WHERE
-        cascade_delete = FALSE`` for O(1) per-asset lookup.
+        Uses the partial index on
+        ``(catalog_id, asset_id) WHERE cascade_delete=FALSE AND valid_until IS NULL``
+        for O(1) per-asset lookup. Invalidated references (``valid_until``
+        stamped by a prior soft-delete or NEW_VERSION archive) do NOT count
+        as blocking — the asset they pointed at is gone, so the new asset
+        re-using the same id is free to be hard-deleted.
 
         Called by ``AssetService.delete_assets()`` before hard-deleting owned
         assets.  Returns a list of ``AssetReference``-compatible dicts.
@@ -531,6 +547,7 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
             WHERE catalog_id = :catalog_id
               AND asset_id IN ({placeholders})
               AND cascade_delete = FALSE
+              AND valid_until IS NULL
             ORDER BY asset_id, created_at ASC
         """)
 
@@ -618,6 +635,31 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
                 final_sql, result_handler=ResultHandler.ROWCOUNT
             ).execute(conn, **params)
 
+            # Stamp any active asset_references for the soft-deleted assets
+            # so future hard-deletes of a successor (re-using the same
+            # asset_id via NEW_VERSION) don't get blocked by stale rows.
+            # On hard-delete, the rows are already gone; we don't bother
+            # cleaning up references — the partial unique index guards the
+            # next insert anyway, and the audit trail is preserved.
+            if not hard and asset_rows:
+                deleted_ids = [a["asset_id"] for a in asset_rows]
+                ref_placeholders = ", ".join(
+                    f":raid_{i}" for i in range(len(deleted_ids))
+                )
+                ref_params: Dict[str, Any] = {"cat": catalog_id, "now": now}
+                for i, aid in enumerate(deleted_ids):
+                    ref_params[f"raid_{i}"] = aid
+                ref_sql = text(
+                    f'UPDATE "{schema}".asset_references '
+                    f"SET valid_until = :now "
+                    f"WHERE catalog_id = :cat "
+                    f"AND asset_id IN ({ref_placeholders}) "
+                    f"AND valid_until IS NULL"
+                )
+                await DQLQuery(
+                    ref_sql, result_handler=ResultHandler.ROWCOUNT
+                ).execute(conn, **ref_params)
+
         return rowcount, asset_rows
 
     async def add_asset_reference(
@@ -693,16 +735,27 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         asset_id: str,
         catalog_id: str,
         db_resource: Optional[DbResource] = None,
+        *,
+        include_invalidated: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Return all active references for an asset."""
+        """Return references for an asset.
+
+        By default returns only currently-valid rows (``valid_until IS NULL``).
+        Pass ``include_invalidated=True`` to also surface rows stamped by a
+        prior soft-delete or NEW_VERSION archive — useful for audit /
+        forensics views.
+        """
         schema = await self._resolve_schema(catalog_id, db_resource)
         if not schema:
             return []
 
+        valid_clause = (
+            "" if include_invalidated else " AND valid_until IS NULL"
+        )
         sql = f"""
-            SELECT asset_id, catalog_id, ref_type, ref_id, cascade_delete, created_at
+            SELECT asset_id, catalog_id, ref_type, ref_id, cascade_delete, created_at, valid_until
             FROM "{schema}".asset_references
-            WHERE catalog_id = :catalog_id AND asset_id = :asset_id
+            WHERE catalog_id = :catalog_id AND asset_id = :asset_id{valid_clause}
             ORDER BY created_at ASC
         """
         async with managed_transaction(db_resource or self.engine) as conn:

@@ -321,11 +321,19 @@ async def activate(
         )
 
     update_sql = _update_sql(schema)
+    # Tag the hash with its algorithm so cross-driver comparison via the
+    # CONTENT_HASH matcher can disambiguate (GCS gives base64 MD5; future
+    # backends will provide SHA-256 hex etc.). Untagged values from older
+    # rows continue to compare equal as raw strings — see
+    # _probe_by_content_hash for the comparison rules.
+    tagged_hash = (
+        f"md5:{event.md5_hash}" if event.md5_hash else None
+    )
     await conn.execute(
         text(update_sql),
         {
             "uri": event.uri,
-            "content_hash": event.md5_hash,
+            "content_hash": tagged_hash,
             "size_bytes": event.size_bytes,
             "catalog_id": event.catalog_id,
             "collection_id": event.collection_id,

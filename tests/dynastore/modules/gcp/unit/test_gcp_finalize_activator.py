@@ -208,7 +208,9 @@ async def test_ticket_id_disambiguation_when_present() -> None:
 
 @pytest.mark.asyncio
 async def test_md5_and_size_propagated_to_update() -> None:
-    """The UPDATE bind dict must carry content_hash + size_bytes from the event."""
+    """UPDATE binds carry size_bytes verbatim and content_hash with the
+    ``md5:`` algorithm prefix so cross-driver comparison via the
+    CONTENT_HASH matcher can disambiguate (Stage F2)."""
     rows = [{"asset_id": "asset_M", "status": "pending", "metadata": {}}]
     conn = _FakeConn(select_rows=rows)
     event = _make_event(md5_hash="md5BASE64", size_bytes=98765)
@@ -216,9 +218,23 @@ async def test_md5_and_size_propagated_to_update() -> None:
     await activate(conn, "schema_x", event)
 
     update_call = conn.calls[1]
-    assert update_call["binds"]["content_hash"] == "md5BASE64"
+    assert update_call["binds"]["content_hash"] == "md5:md5BASE64"
     assert update_call["binds"]["size_bytes"] == 98765
     assert update_call["binds"]["uri"] == event.uri
+
+
+@pytest.mark.asyncio
+async def test_missing_md5_writes_null_content_hash() -> None:
+    """When the finalize event has no md5 (rare — e.g. composite uploads),
+    UPDATE binds the content_hash as NULL rather than the literal ``md5:``."""
+    rows = [{"asset_id": "asset_X", "status": "pending", "metadata": {}}]
+    conn = _FakeConn(select_rows=rows)
+    event = _make_event(md5_hash=None, size_bytes=42)
+
+    await activate(conn, "schema_x", event)
+
+    update_call = conn.calls[1]
+    assert update_call["binds"]["content_hash"] is None
 
 
 @pytest.mark.asyncio

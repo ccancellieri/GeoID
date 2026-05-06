@@ -393,6 +393,17 @@ class AssetReference(BaseModel):
         ),
     )
     created_at: datetime = Field(..., description="Timestamp when the reference was registered.")
+    valid_until: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "When the reference was invalidated. NULL means currently active. "
+            "Stamped by soft-delete and NEW_VERSION archive of the referenced "
+            "asset so a successor row re-using the same asset_id isn't blocked "
+            "by stale references. Default `list_asset_references` calls filter "
+            "to active rows only (pass include_invalidated=True for the audit "
+            "view)."
+        ),
+    )
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
