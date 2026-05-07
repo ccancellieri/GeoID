@@ -11,8 +11,6 @@ via `SearchProtocol` — the router has zero imports from any search implementat
 | `POST` | `/search` | Full-featured body-based item search with cursor pagination |
 | `GET/POST` | `/search/catalogs` | Keyword search over the catalog index |
 | `GET/POST` | `/search/collections` | Keyword search over the collection index |
-| `GET` | `/search/geoid/{geoid}` | Single geoid lookup in the private index |
-| `POST` | `/search/geoid` | Batch geoid lookup (`{geoids: [...], catalog_id?, limit?}`) |
 | `POST` | `/search/reindex/catalogs/{catalog_id}` | Trigger full catalog reindex (admin, 202) |
 | `POST` | `/search/reindex/catalogs/{catalog_id}/collections/{collection_id}` | Trigger single collection reindex (admin, 202) |
 
@@ -26,19 +24,20 @@ the protocol contract will work transparently.
 - `search_items(body, base_url)` -> `ItemCollection`
 - `search_catalogs(body, base_url)` -> `GenericCollection`
 - `search_collections(body, base_url)` -> `GenericCollection`
-- `search_by_geoid(geoids, catalog_id?, limit?)` -> `GeoidCollection`
 - `reindex_catalog(catalog_id, mode?)` -> `Dict`
 - `reindex_collection(catalog_id, collection_id, mode?)` -> `Dict`
+
+> **Note:** `/search/catalogs/{cat}/geoid/...` lookup endpoints are served by the
+> geoid extension's `lookup_router.py` (PG-backed). They are not part of this
+> extension's surface and do not depend on `SearchProtocol`.
 
 ## Models
 
 Defined in `search_models.py`:
 - `SearchBody` — STAC Item Search request (q, bbox, datetime, intersects, ids, collections, sortby, limit, token)
 - `CatalogSearchBody` — Catalog/collection keyword search (q, ids, limit, token)
-- `GeoidSearchBody` — Batch geoid lookup (geoids, catalog_id?, limit?)
 - `ItemCollection` — STAC FeatureCollection response
 - `GenericCollection` — Entity collection response (catalogs/collections)
-- `GeoidCollection` — Geoid lookup response (`results: [{geoid, catalog_id, collection_id}]`)
 
 ## Access Control
 

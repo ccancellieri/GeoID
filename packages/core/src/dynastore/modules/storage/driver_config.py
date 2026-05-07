@@ -384,6 +384,15 @@ class ItemsWritePolicy(PluginConfig):
             "to be enabled (it computes geometry_hash on write)."
         ),
     )
+    matcher_actions: Optional[Dict[IdentityMatcher, WriteConflictPolicy]] = Field(
+        default=None,
+        description=(
+            "Per-matcher conflict-action override. When set, the entry for the "
+            "winning matcher overrides the global ``on_conflict``. Unspecified "
+            "matchers fall back to ``on_conflict``. Useful for combinations such "
+            "as ``{external_id: refuse_fail, geometry_hash: refuse_return}``."
+        ),
+    )
     track_asset_id: bool = Field(
         default=True,
         examples=[True, False],

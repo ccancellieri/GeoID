@@ -2,9 +2,10 @@ import os
 import html
 import logging
 import itertools
+from contextlib import asynccontextmanager
 from typing import List, Any, Dict, Optional, Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from fastapi.responses import HTMLResponse
 
 from dynastore.extensions.protocols import ExtensionProtocol
@@ -12,6 +13,8 @@ from dynastore.models.protocols.web import WebOverrideProtocol, WebPageProtocol,
 
 # Use the module-level decorators so Web discovers pages and static files automatically
 from dynastore.modules.web.decorators import expose_static, expose_web_page
+
+from .lookup_router import router as lookup_router
 
 import user_agents  # Enforces installation-driven discovery
 
@@ -164,8 +167,19 @@ class Geoid(ExtensionProtocol, WebOverrideProtocol, WebPageProtocol, StaticFiles
 
     def __init__(self, app: FastAPI):
         self.app = app
-
+        self.router: APIRouter = lookup_router
         self.static_dir = os.path.join(os.path.dirname(__file__), "static")
+
+    @asynccontextmanager
+    async def lifespan(self, app: FastAPI):
+        from dynastore.modules.iam.conditions import register_condition_handler
+        from .conditions import CatalogLookupAudienceHandler, CollectionWriteAudienceHandler
+        from .policies import register_geoid_policies
+
+        register_condition_handler(CatalogLookupAudienceHandler())
+        register_condition_handler(CollectionWriteAudienceHandler())
+        register_geoid_policies()
+        yield
 
     # ------------------------------------------------------------------ #
     #  StaticFilesProtocol                                                 #

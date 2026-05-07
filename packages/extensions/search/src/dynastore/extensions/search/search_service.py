@@ -14,7 +14,7 @@ the search backend via protocol discovery, not direct imports.
 """
 import logging
 import re
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI
 from contextlib import asynccontextmanager
@@ -22,13 +22,8 @@ from dynastore.extensions.protocols import ExtensionProtocol
 
 from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 from dynastore.modules.elasticsearch.mappings import get_search_index
-from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-    get_private_index_name,
-)
 from .search_models import (
     CatalogSearchBody,
-    GeoidCollection,
-    GeoidResult,
     GenericCollection,
     ItemCollection,
     SearchBody,
@@ -370,90 +365,6 @@ class SearchService(ExtensionProtocol):
             links=links,
             numberMatched=total,
             numberReturned=len(features),
-        )
-
-    async def search_by_geoid(
-        self,
-        geoids: Optional[List[str]] = None,
-        catalog_id: Optional[str] = None,
-        limit: int = 100,
-        *,
-        external_id: Optional[str] = None,
-        collection_id: Optional[str] = None,
-    ) -> GeoidCollection:
-        """
-        Tenant-scoped lookup against ``{prefix}-geoid-{catalog_id}``.
-
-        Contract:
-          - ``catalog_id`` is required (the tenant selects the index).
-          - Provide either ``geoids`` (cross-collection lookup within the
-            tenant) or ``(external_id, collection_id)`` together. Bare
-            ``external_id`` is rejected — that would let a caller
-            enumerate across collections.
-
-        Returns full features (geometry + properties + external_id) as
-        recorded in the per-tenant feature index, including any
-        simplification metadata.
-        """
-        from fastapi import HTTPException
-
-        if not catalog_id:
-            raise HTTPException(
-                status_code=400,
-                detail="catalog_id is required (tenant scope) for private lookup.",
-            )
-        has_geoids = bool(geoids)
-        has_external_pair = bool(external_id) and bool(collection_id)
-        if external_id and not collection_id:
-            raise HTTPException(
-                status_code=400,
-                detail="external_id requires collection_id (cross-collection enumeration is not allowed).",
-            )
-        if not has_geoids and not has_external_pair:
-            raise HTTPException(
-                status_code=400,
-                detail="Provide geoids or (external_id, collection_id).",
-            )
-
-        index = get_private_index_name(_get_index_prefix(), catalog_id)
-
-        if has_geoids:
-            query: Dict[str, Any] = {"terms": {"geoid": geoids}}
-        else:
-            query = {
-                "bool": {
-                    "filter": [
-                        {"term": {"external_id": external_id}},
-                        {"term": {"collection_id": collection_id}},
-                    ]
-                }
-            }
-        es_body: Dict[str, Any] = {"query": query, "size": limit}
-
-        es = self._get_es()
-        resp = await es.search(index=index, body=es_body, ignore_unavailable=True)  # type: ignore[call-arg]
-
-        raw_hits = resp.get("hits", {}).get("hits", [])
-        results: List[GeoidResult] = []
-        for h in raw_hits:
-            src = h.get("_source", {})
-            if "geoid" not in src:
-                continue
-            results.append(GeoidResult(
-                geoid=src["geoid"],
-                catalog_id=src.get("catalog_id", catalog_id),
-                collection_id=src.get("collection_id", collection_id or ""),
-                external_id=src.get("external_id"),
-                geometry=src.get("geometry"),
-                bbox=src.get("bbox"),
-                properties=src.get("properties"),
-                simplification_factor=src.get("simplification_factor"),
-                simplification_mode=src.get("simplification_mode"),
-            ))
-
-        return GeoidCollection(
-            results=results,
-            numberReturned=len(results),
         )
 
     async def reindex_catalog(

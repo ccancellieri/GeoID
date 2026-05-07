@@ -31,6 +31,7 @@ from .models import Condition
 from .exceptions import IamError
 from dynastore.modules.iam.iam_storage import AbstractIamStorage
 from dynastore.models.protocols.authorization import IamRoleConfig
+from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
 

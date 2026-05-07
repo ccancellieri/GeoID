@@ -250,6 +250,8 @@ class CatalogPrivacy(PluginConfig):
     )
 
 
+# CatalogLookupAudience moved to packages/extensions/geoid/.../configs.py
+
 # ---------------------------------------------------------------------------
 # Cycle E.2.c — collection-create seed flow
 # ---------------------------------------------------------------------------

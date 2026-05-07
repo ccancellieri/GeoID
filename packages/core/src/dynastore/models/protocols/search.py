@@ -21,12 +21,11 @@ on a specific backend (Elasticsearch, Solr, Meilisearch, etc.).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Protocol, TYPE_CHECKING, runtime_checkable
+from typing import Any, Dict, Optional, Protocol, TYPE_CHECKING, runtime_checkable
 
 if TYPE_CHECKING:
     from dynastore.extensions.search.search_models import (
         CatalogSearchBody,
-        GeoidCollection,
         GenericCollection,
         ItemCollection,
         SearchBody,
@@ -99,32 +98,6 @@ class SearchProtocol(Protocol):
         Returns:
             ``GenericCollection`` with ``entities``, ``links``,
             ``numberReturned``.
-        """
-        ...
-
-    async def search_by_geoid(
-        self,
-        geoids: Optional[List[str]] = None,
-        catalog_id: Optional[str] = None,
-        limit: int = 100,
-        *,
-        external_id: Optional[str] = None,
-        collection_id: Optional[str] = None,
-    ) -> GeoidCollection:
-        """
-        Tenant-scoped lookup against the per-tenant feature index
-        ``{prefix}-geoid-{catalog_id}``.
-
-        Contract:
-          - ``catalog_id`` is required (the tenant selects the index).
-          - Provide either ``geoids`` (cross-collection lookup within the
-            tenant) or the pair ``(external_id, collection_id)``.
-          - Bare ``external_id`` is rejected — that would let a caller
-            enumerate items across collections.
-
-        Returns:
-            ``GeoidCollection`` carrying full features (geometry,
-            properties, ``external_id``) plus simplification metadata.
         """
         ...
 

@@ -49,6 +49,24 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _select_effective_on_conflict(
+    write_policy: Optional["ItemsWritePolicy"],
+    matched_matcher: "IdentityMatcher",
+) -> "WriteConflictPolicy":
+    """Resolve the conflict action for the matcher that won the chain.
+
+    Falls back to ``write_policy.on_conflict`` (or ``UPDATE`` if no policy)
+    when ``matcher_actions`` is unset or has no entry for the winning matcher.
+    """
+    if write_policy is None:
+        return WriteConflictPolicy.UPDATE
+    if write_policy.matcher_actions:
+        action = write_policy.matcher_actions.get(matched_matcher)
+        if action is not None:
+            return action
+    return write_policy.on_conflict
+
+
 class ItemDistributedMixin(_Host):
     """Distributed insert/update operations for ItemService."""
 
@@ -142,6 +160,11 @@ class ItemDistributedMixin(_Host):
                 if active_rec:
                     break
 
+        effective_on_conflict = _select_effective_on_conflict(
+            write_policy,
+            matched_via[0] if matched_via else IdentityMatcher.EXTERNAL_ID,
+        )
+
         # 1.6 Asset-level (batch-level) collision guard.
         # Uses active_rec from identity resolution — if a duplicate was found
         # AND the batch policy is refuse_asset, abort the whole batch via
@@ -179,9 +202,10 @@ class ItemDistributedMixin(_Host):
                     f"{on_conflict} to REFUSE_RETURN (geoid={active_rec.get('geoid')})"
                 )
                 on_conflict = WriteConflictPolicy.REFUSE_RETURN
+                effective_on_conflict = WriteConflictPolicy.REFUSE_RETURN
 
         # 1.8 REFUSE_FAIL: raise immediately so the batch aborts.
-        if active_rec and on_conflict == WriteConflictPolicy.REFUSE_FAIL:
+        if active_rec and effective_on_conflict == WriteConflictPolicy.REFUSE_FAIL:
             matcher_name = matched_via[0] if matched_via else "unknown"
             raise ConflictError(
                 f"Write refused: identity match via {matcher_name} "
@@ -192,7 +216,7 @@ class ItemDistributedMixin(_Host):
 
         # 1.9 REFUSE_RETURN: echo the existing record without writing. Caller
         # picks it up via the bulk read-back keyed on the returned geoid.
-        if active_rec and on_conflict == WriteConflictPolicy.REFUSE_RETURN:
+        if active_rec and effective_on_conflict == WriteConflictPolicy.REFUSE_RETURN:
             logger.info(
                 "DISTRIBUTED UPSERT: REFUSE_RETURN — keeping existing record "
                 f"geoid={active_rec.get('geoid')}"
@@ -201,8 +225,8 @@ class ItemDistributedMixin(_Host):
 
         result = None
         # 2. Execution Path
-        if not active_rec or on_conflict == WriteConflictPolicy.NEW_VERSION:
-            if active_rec and on_conflict == WriteConflictPolicy.NEW_VERSION:
+        if not active_rec or effective_on_conflict == WriteConflictPolicy.NEW_VERSION:
+            if active_rec and effective_on_conflict == WriteConflictPolicy.NEW_VERSION:
                 # Archive the existing version before inserting
                 expire_at = hub_payload.get("valid_from") or datetime.now(timezone.utc)
                 for sidecar in sidecars:
@@ -226,7 +250,7 @@ class ItemDistributedMixin(_Host):
                 processing_context=processing_context,
             )
 
-        elif on_conflict == WriteConflictPolicy.REFUSE:
+        elif effective_on_conflict == WriteConflictPolicy.REFUSE:
             logger.info(
                 "DISTRIBUTED UPSERT: identity matched and REFUSE set. Skipping."
             )

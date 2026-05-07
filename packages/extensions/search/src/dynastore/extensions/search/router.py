@@ -8,26 +8,25 @@ New paths:
   GET/POST /search                                                 – Item search
   GET/POST /search/catalogs                                        – Catalog search
   GET/POST /search/catalogs/{catalog_id}/collections-search        – Collection search scoped to catalog
-  GET/POST /search/catalogs/{catalog_id}/geoid/{geoid}             – GeoID lookup
   POST     /search/catalogs/{catalog_id}/reindex                   – Trigger catalog reindex
   POST     /search/catalogs/{catalog_id}/collections/{cid}/reindex – Trigger collection reindex
 
 Deprecated aliases (kept for backward compat):
   GET/POST /search/collections  → /search/catalogs/{catalog_id}/collections-search
-  GET/POST /search/geoid/{geoid}
   POST     /search/reindex/catalogs/{catalog_id}
   POST     /search/reindex/catalogs/{catalog_id}/collections/{cid}
+
+GeoID lookup routes (/search/catalogs/{cat}/geoid/...) are served by the
+geoid extension's lookup_router.py (PG-backed, no Elasticsearch dependency).
 
 Conformance class: https://api.stacspec.org/v1.0.0/item-search
 """
 import logging
-from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from typing import Any, Dict, Optional
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from .search_models import (
     CatalogSearchBody,
-    GeoidCollection,
-    GeoidSearchBody,
     GenericCollection,
     ItemCollection,
     SearchBody,
@@ -280,74 +279,6 @@ async def get_search_collections(
 )
 async def post_search_collections(request: Request, body: CatalogSearchBody) -> GenericCollection:
     return await _get_search_service().search_collections(body, base_url=_base_url(request))
-
-
-# ---------------------------------------------------------------------------
-# GeoID Lookup – /catalogs/{catalog_id}/geoid/{geoid}
-# ---------------------------------------------------------------------------
-
-@router.get(
-    "/catalogs/{catalog_id}/geoid/{geoid}",
-    response_model=GeoidCollection,
-    summary="Look up a geoid in a catalog's private index.",
-    response_model_exclude_none=True,
-)
-async def get_geoid_scoped(
-    request: Request,
-    catalog_id: str,
-    geoid: str,
-) -> GeoidCollection:
-    return await _get_search_service().search_by_geoid([geoid], catalog_id=catalog_id, limit=1)
-
-
-@router.post(
-    "/catalogs/{catalog_id}/geoid",
-    response_model=GeoidCollection,
-    summary="Batch geoid lookup in a catalog's private index.",
-    response_model_exclude_none=True,
-)
-async def post_geoid_scoped(
-    request: Request, catalog_id: str, body: GeoidSearchBody,
-) -> GeoidCollection:
-    return await _get_search_service().search_by_geoid(
-        body.geoids,
-        catalog_id=catalog_id,
-        limit=body.limit,
-        external_id=body.external_id,
-        collection_id=body.collection_id,
-    )
-
-
-# ---------------------------------------------------------------------------
-# GeoID Lookup – cross-catalog (deprecated alias)
-# ---------------------------------------------------------------------------
-
-@router.get(
-    "/geoid/{geoid}",
-    response_model=GeoidCollection,
-    summary="Look up a geoid (cross-catalog). Deprecated: use /catalogs/{catalog_id}/geoid/{geoid}.",
-    response_model_exclude_none=True,
-    deprecated=True,
-)
-async def get_geoid(
-    request: Request,
-    geoid: str,
-    catalog_id: Optional[str] = Query(None),
-) -> GeoidCollection:
-    return await _get_search_service().search_by_geoid([geoid], catalog_id=catalog_id, limit=1)
-
-
-@router.post(
-    "/geoid",
-    response_model=GeoidCollection,
-    summary="Batch geoid lookup (cross-catalog). Deprecated: use /catalogs/{catalog_id}/geoid.",
-    response_model_exclude_none=True,
-    deprecated=True,
-)
-async def post_geoid(request: Request, body: GeoidSearchBody) -> GeoidCollection:
-    return await _get_search_service().search_by_geoid(
-        body.geoids, catalog_id=body.catalog_id, limit=body.limit,
-    )
 
 
 # ---------------------------------------------------------------------------
