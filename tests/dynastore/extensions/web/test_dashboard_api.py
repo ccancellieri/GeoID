@@ -32,7 +32,7 @@ from tests.dynastore.test_utils import generate_test_id
 pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.xdist_group("catalog_lifespan"),
-    pytest.mark.enable_extensions("logs", "features", "stac"),
+    pytest.mark.enable_extensions("logs", "events", "features", "stac"),
     # 'stac' MODULE (not extension) registers CollectionStacPostgresqlDriver +
     # creates the collection_stac sidecar table at lifespan DDL time;
     # without it any catalog write blows up at first STAC-slice insert.
@@ -263,7 +263,10 @@ async def test_dashboard_collections_unknown_catalog(
 # ---------------------------------------------------------------------------
 
 # Endpoint suffix → kept short so the parametrize stays readable.
-_DASHBOARD_DATA_SUFFIXES = ["stats", "logs", "events", "tasks", "ogc-compliance"]
+# logs and events are intentionally absent: their /web/dashboard/{logs,events}
+# proxy routes were removed; callers use the canonical /logs/ and /events/
+# surfaces directly. The per-catalog access-control tests below cover those.
+_DASHBOARD_DATA_SUFFIXES = ["stats", "tasks", "ogc-compliance"]
 
 
 @pytest.mark.parametrize("suffix", _DASHBOARD_DATA_SUFFIXES)
@@ -329,26 +332,32 @@ async def test_dashboard_platform_stats_catalog_admin_denied(
     assert response.status_code in (401, 403)
 
 
-@pytest.mark.parametrize("endpoint", ["logs", "events"])
-async def test_dashboard_logs_events_catalog_admin_allowed_on_own_catalog(
-    catalog_admin_dashboard_ctx, endpoint: str
+@pytest.mark.parametrize("endpoint,url_fn,assert_fn", [
+    # logs canonical surface returns {"logs": [...], "links": [...]}
+    ("logs", lambda cat: f"/logs/catalogs/{cat}?limit=5", lambda body: "logs" in body),
+    # events canonical surface returns a list of event dicts
+    ("events", lambda cat: f"/events/catalogs/{cat}/events?limit=5", lambda body: isinstance(body, list)),
+])
+async def test_canonical_logs_events_catalog_admin_allowed_on_own_catalog(
+    catalog_admin_dashboard_ctx, endpoint: str, url_fn, assert_fn
 ):
+    """Catalog admin can reach the canonical logs/events surfaces for their own catalog."""
     ctx = catalog_admin_dashboard_ctx
-    response = await ctx["client"].get(
-        f"/web/dashboard/catalogs/{ctx['catalog_a']}/{endpoint}?limit=5"
-    )
+    response = await ctx["client"].get(url_fn(ctx["catalog_a"]))
     assert response.status_code == 200
-    assert isinstance(response.json(), list)
+    assert assert_fn(response.json())
 
 
-@pytest.mark.parametrize("endpoint", ["logs", "events"])
-async def test_dashboard_logs_events_catalog_admin_denied_on_other_catalog(
-    catalog_admin_dashboard_ctx, endpoint: str
+@pytest.mark.parametrize("endpoint,url_fn", [
+    ("logs", lambda cat: f"/logs/catalogs/{cat}?limit=5"),
+    ("events", lambda cat: f"/events/catalogs/{cat}/events?limit=5"),
+])
+async def test_canonical_logs_events_catalog_admin_denied_on_other_catalog(
+    catalog_admin_dashboard_ctx, endpoint: str, url_fn
 ):
+    """Catalog admin is denied on canonical logs/events for a catalog they don't own."""
     ctx = catalog_admin_dashboard_ctx
-    response = await ctx["client"].get(
-        f"/web/dashboard/catalogs/{ctx['catalog_b']}/{endpoint}?limit=5"
-    )
+    response = await ctx["client"].get(url_fn(ctx["catalog_b"]))
     assert response.status_code == 403
 
 
@@ -425,7 +434,8 @@ async def test_dashboard_per_catalog_shell_owned(
 # Collection-scoped routes (NEW): /catalogs/{cat}/collections/{col}/{stats,logs,events}
 # ---------------------------------------------------------------------------
 
-_COLLECTION_DATA_SUFFIXES = ["stats", "logs", "events"]
+# logs and events collection-scoped dashboard proxies were deleted too.
+_COLLECTION_DATA_SUFFIXES = ["stats"]
 
 
 @pytest.mark.parametrize("suffix", _COLLECTION_DATA_SUFFIXES)
