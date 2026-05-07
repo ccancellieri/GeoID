@@ -97,6 +97,39 @@ def _tenant_items_index(catalog_id: str) -> str:
     return get_tenant_items_index(get_index_prefix(), catalog_id)
 
 
+# Per-process cache: catalogs whose tenant items index has already been
+# added to the platform public alias on this worker. Live indexer paths
+# (index() / index_bulk()) consult this before issuing the alias call so
+# the cost is bounded to one ES round-trip per (catalog, process) lifetime
+# rather than per-write. ``ensure_storage`` and the OUTBOX drainer also
+# fire ``add_index_to_public_alias`` (idempotent ES-side) but neither
+# runs on the live ASYNC indexer path that ES auto-creation hits, leaving
+# new tenant indices unaliased and invisible to alias-scoped search.
+_ALIAS_REGISTERED_CATALOGS: set = set()
+
+
+async def _ensure_in_public_alias_once(catalog_id: str, index_name: str) -> None:
+    """Add ``index_name`` to the platform public alias, at most once per
+    process. Failures are swallowed-with-log; the OUTBOX drainer and
+    ``ensure_storage`` paths cover the same ground so a transient miss
+    here is recovered by the next write through one of those routes.
+    """
+    if catalog_id in _ALIAS_REGISTERED_CATALOGS:
+        return
+    try:
+        from dynastore.modules.elasticsearch.aliases import (
+            add_index_to_public_alias,
+        )
+        await add_index_to_public_alias(index_name)
+    except Exception as exc:
+        logger.warning(
+            "ItemsElasticsearchDriver: alias-add failed for '%s': %s",
+            index_name, exc,
+        )
+        return
+    _ALIAS_REGISTERED_CATALOGS.add(catalog_id)
+
+
 # ---------------------------------------------------------------------------
 # Shared base
 # ---------------------------------------------------------------------------
@@ -1044,6 +1077,7 @@ class ItemsElasticsearchDriver(
 
         es = _es_client_required()
         index_name = _tenant_items_index(ctx.catalog)
+        await _ensure_in_public_alias_once(ctx.catalog, index_name)
 
         if op.op_type == "delete":
             await es.delete(
@@ -1090,6 +1124,7 @@ class ItemsElasticsearchDriver(
 
         es = _es_client_required()
         index_name = _tenant_items_index(ctx.catalog)
+        await _ensure_in_public_alias_once(ctx.catalog, index_name)
 
         body: List[dict] = []
         for op in ops:
