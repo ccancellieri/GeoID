@@ -232,7 +232,7 @@ class TaskTableOutboxWriter:
                     execution_mode, inputs, collection_id, dedup_key, status
                 ) VALUES (
                     :task_id, :schema_name, 'CATALOG', :task_type,
-                    'task', 'ASYNCHRONOUS', :inputs::jsonb,
+                    'task', 'ASYNCHRONOUS', CAST(:inputs AS jsonb),
                     :collection_id, :dedup_key, 'PENDING'
                 )
                 ON CONFLICT DO NOTHING
