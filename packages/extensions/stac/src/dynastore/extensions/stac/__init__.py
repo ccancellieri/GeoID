@@ -16,3 +16,14 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+# Eager imports so the package's `__init__` (loaded whenever the
+# `dynastore.extensions:stac` entry point is resolved) populates both
+# sidecar registries before any worker accepts traffic. Without this,
+# `_coerce_pg_sidecar` can fail with
+# `sidecar_type 'stac_metadata' not registered` on a worker whose
+# request path hasn't yet pulled `stac_items_sidecar` lazily.
+from dynastore.extensions.stac import (  # noqa: F401
+    stac_metadata_config as _stac_metadata_config,  # SidecarConfigRegistry
+    stac_items_sidecar as _stac_items_sidecar,      # SidecarRegistry
+)
+

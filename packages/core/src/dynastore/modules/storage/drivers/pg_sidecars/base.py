@@ -309,6 +309,7 @@ class SidecarConfigRegistry:
     """
 
     _registry: Dict[str, Type["SidecarConfig"]] = {}
+    _defaults_loaded: bool = False
 
     @classmethod
     def register(cls, sidecar_type: str, config_cls: Type["SidecarConfig"]):
@@ -316,9 +317,31 @@ class SidecarConfigRegistry:
         cls._registry[sidecar_type] = config_cls
 
     @classmethod
+    def _ensure_defaults(cls) -> None:
+        """Import known extension config modules so their module-level
+        ``register(...)`` side effects run.
+
+        Backstop for workers where the extension hasn't been imported yet
+        when ``_coerce_pg_sidecar`` first runs against a cached driver
+        config dict — see ``stac/__init__.py`` for the primary eager
+        import.  Each import is guarded so absent extensions stay silent.
+        """
+        if cls._defaults_loaded:
+            return
+        cls._defaults_loaded = True
+        try:
+            from dynastore.extensions.stac import stac_metadata_config  # noqa: F401
+        except ImportError:
+            pass
+
+    @classmethod
     def resolve_config_class(cls, sidecar_type: str) -> Type["SidecarConfig"]:
         """Resolve the specialized SidecarConfig subclass for a given type."""
-        return cls._registry.get(sidecar_type, SidecarConfig)
+        hit = cls._registry.get(sidecar_type)
+        if hit is None:
+            cls._ensure_defaults()
+            hit = cls._registry.get(sidecar_type)
+        return hit if hit is not None else SidecarConfig
 
 
 class SidecarConfig(BaseModel):
