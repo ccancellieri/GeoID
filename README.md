@@ -9,7 +9,7 @@ Traditional catalog systems trade interoperability for tenancy or scale for flex
 ## Try it
 
 ```bash
-docker compose -f src/dynastore/docker/dev.compose.yml up -d
+docker compose -f packages/core/src/dynastore/docker/dev.compose.yml up -d
 curl http://localhost/stac/catalogs
 open http://localhost/web/
 ```
