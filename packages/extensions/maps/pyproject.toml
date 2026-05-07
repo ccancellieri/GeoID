@@ -27,3 +27,6 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "dynastore.extensions.maps" = ["static/**/*"]
+
+[tool.uv.sources]
+dynastore = { workspace = true }

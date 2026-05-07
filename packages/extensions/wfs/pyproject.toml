@@ -27,3 +27,6 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "dynastore.extensions.wfs" = ["*.md"]
+
+[tool.uv.sources]
+dynastore = { workspace = true }

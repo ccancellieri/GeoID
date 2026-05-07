@@ -26,3 +26,6 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "dynastore.extensions.notebooks" = ["jupyterlite/**/*", "static/**/*"]
+
+[tool.uv.sources]
+dynastore = { workspace = true }

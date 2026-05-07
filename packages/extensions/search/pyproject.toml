@@ -24,3 +24,6 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "dynastore.extensions.search" = ["*.md"]
+
+[tool.uv.sources]
+dynastore = { workspace = true }
