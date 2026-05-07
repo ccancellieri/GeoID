@@ -278,19 +278,28 @@ class TaskTableOutboxWriter:
         * Anything else — raises so the dispatcher can fall back to
           degraded-WARN mode.
         """
+        # Detect connection flavour without swallowing execute() errors.
+        # The previous shape wrapped the isinstance check AND the execute in
+        # one try/except, so a real SQLAlchemy failure (e.g. poisoned tx
+        # state) silently fell through to the asyncpg branch and produced
+        # a misleading "AsyncConnection.execute() takes 2-3 positional
+        # arguments but N were given" error that masked the actual cause.
+        sa_async_conn_cls: Any = None
+        sa_text: Any = None
         try:
-            from sqlalchemy import text
-            from sqlalchemy.ext.asyncio import AsyncConnection
-            if isinstance(conn, AsyncConnection):
-                await conn.execute(text(sql), params)
-                return
+            from sqlalchemy import text as _sa_text
+            from sqlalchemy.ext.asyncio import AsyncConnection as _SAAsyncConnection
+            sa_async_conn_cls = _SAAsyncConnection
+            sa_text = _sa_text
         except Exception:
             pass
 
+        if sa_async_conn_cls is not None and isinstance(conn, sa_async_conn_cls):
+            await conn.execute(sa_text(sql), params)
+            return
+
         # asyncpg path — translate :name placeholders to $N positional args.
         sql_pg, args = _bind_named_to_positional(sql, params)
-        # conn is asyncpg.Connection (or compatible) at this point; the
-        # isinstance branch above already returned for SQLAlchemy.
         asyncpg_conn: Any = conn
         await asyncpg_conn.execute(sql_pg, *args)
 
