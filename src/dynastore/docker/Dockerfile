@@ -13,7 +13,7 @@ RUN if [ "${BUILD_JUPYTERLITE}" = "true" ]; then \
         echo "JupyterLite builder: skipped (BUILD_JUPYTERLITE=false)"; \
     fi
 
-COPY src/dynastore/extensions/notebooks/jupyterlite/ ./lite-config/
+COPY packages/extensions/notebooks/src/dynastore/extensions/notebooks/jupyterlite/ ./lite-config/
 
 # Pre-download piplite wheels so the built site is fully offline-capable
 # (on-prem docker compose / air-gapped Cloud Run). `pip download` emits pure-Python
