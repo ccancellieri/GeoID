@@ -84,9 +84,15 @@ def resolve_redirect_uri(request: Request, redirect_uri: str) -> str:
     - Absolute ``http://`` URLs are upgraded via :func:`enforce_https`.
 
     The same value must be used at ``/authorize`` and ``/token``; the IdP
-    compares them strictly.
+    compares them strictly. Behind a path-prefix gateway (e.g. Cloud Run with
+    ``root_path=/geospatial/v2/api/auth``) clients sending
+    ``window.location.pathname`` will already include the prefix, so we strip
+    it before prepending the origin to avoid producing a doubled path.
     """
     if redirect_uri.startswith("/"):
+        root_path = request.scope.get("root_path", "").rstrip("/")
+        if root_path and redirect_uri.startswith(root_path + "/"):
+            redirect_uri = redirect_uri[len(root_path):]
         return f"{get_root_url(request)}{redirect_uri}"
     return enforce_https(redirect_uri)
 
