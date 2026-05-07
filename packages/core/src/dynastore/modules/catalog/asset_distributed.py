@@ -544,6 +544,23 @@ async def upsert_asset(
     #    REST surface returns 409 (matching the application-level policy
     #    rejection) instead of bubbling a 500.
     if existing is None:
+        # Assets is partitioned BY LIST (collection_id); ensure the per-collection
+        # partition exists before INSERT. NULL collection_id rows land in the
+        # default partition created by ensure_storage; only non-NULL values need
+        # a per-value partition. Mirrors pg_asset_driver.index_asset.
+        if scope.collection_id is not None:
+            from dynastore.modules.db_config.partition_tools import (
+                ensure_partition_exists,
+            )
+            await ensure_partition_exists(
+                conn,
+                table_name="assets",
+                strategy="LIST",
+                partition_value=scope.collection_id,
+                schema=scope.schema,
+                parent_table_name="assets",
+                parent_table_schema=scope.schema,
+            )
         try:
             inserted = await _insert_new_row(conn, scope, payload, initial_status)
         except UniqueViolationError as exc:
