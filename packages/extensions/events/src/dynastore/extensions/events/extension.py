@@ -251,6 +251,20 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
         return result
 
     # ------------------------------------------------------------------
+    # PolicyContributor — declare authz; IamMiddleware enforces.
+    # No direct PermissionProtocol call, no per-route Depends, no inline
+    # 401/403. See policies.py for the declarations.
+    # ------------------------------------------------------------------
+
+    def get_policies(self):
+        from .policies import events_policies
+        return events_policies()
+
+    def get_role_bindings(self):
+        from .policies import events_role_bindings
+        return events_role_bindings()
+
+    # ------------------------------------------------------------------
     # Lifespan
     # ------------------------------------------------------------------
 
