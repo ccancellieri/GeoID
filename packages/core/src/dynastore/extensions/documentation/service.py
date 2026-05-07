@@ -46,11 +46,35 @@ def configure_swagger_ui(app: FastAPI):
         "displayOperationId": False,
     })
 
-    app.swagger_ui_init_oauth = {
-        "clientId": "dynastore",
+    # Build the OAuth init dict from environment. ``IDP_CLIENT_ID`` is the
+    # SPA login client (e.g. ``geoid-fe``) — Swagger UI's Authorize popup
+    # uses it to start the Authorization Code + PKCE flow against Keycloak.
+    # If unset, omit ``clientId`` entirely so the user notices the missing
+    # config in the popup rather than authenticating as a stale default.
+    init_oauth: dict = {
         "usePkceWithAuthorizationCodeGrant": True,
         "scopes": "openid email profile",
     }
+    client_id = os.getenv("IDP_CLIENT_ID")
+    if client_id:
+        init_oauth["clientId"] = client_id
+
+    # ``IDP_AUDIENCE`` (e.g. ``geoid-be``) — Keycloak setups that gate API
+    # access on the ``aud`` claim need the SPA to request the audience
+    # explicitly. Swagger UI forwards ``additionalQueryStringParams`` to
+    # both the authorize and token requests.
+    audience = os.getenv("IDP_AUDIENCE")
+    if audience:
+        init_oauth["additionalQueryStringParams"] = {"audience": audience}
+
+    app.swagger_ui_init_oauth = init_oauth
+
+    # FastAPI's canonical OAuth2 callback page. Swagger UI's popup posts
+    # the auth-code response to this URL; the page parses it and posts a
+    # message back to the opener so the popup auto-closes. Must be set
+    # BEFORE the /docs handler is built — _fastapi_docs.py reads this
+    # attribute and threads it into get_swagger_ui_html().
+    app.swagger_ui_oauth2_redirect_url = "/docs/oauth2-redirect"
 
     # --- CRITICAL FIX: Remove existing /docs route ---
     for route in list(app.router.routes):
@@ -63,6 +87,18 @@ def configure_swagger_ui(app: FastAPI):
         return await custom_swagger_ui_html(app, req)
 
     app.add_api_route("/docs", _docs_handler, include_in_schema=False)
+
+    # OAuth2 redirect callback — pure FastAPI default page, no customization.
+    from fastapi.openapi.docs import get_swagger_ui_oauth2_redirect_html
+
+    async def _oauth2_redirect_handler():
+        return get_swagger_ui_oauth2_redirect_html()
+
+    app.add_api_route(
+        "/docs/oauth2-redirect",
+        _oauth2_redirect_handler,
+        include_in_schema=False,
+    )
 
 
 def setup_global_help_endpoint(app: FastAPI):

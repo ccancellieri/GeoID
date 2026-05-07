@@ -28,7 +28,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, cast
 
-from fastapi import APIRouter, FastAPI, Response, HTTPException, Request, Query, Header
+from fastapi import APIRouter, FastAPI, Response, HTTPException, Request, Query, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from fastapi.middleware.gzip import GZipMiddleware
 from dynastore.extensions.web.cors_middleware import DynamicCORSMiddleware
@@ -49,6 +50,11 @@ from dynastore.tools.discovery import get_protocol, get_protocols, register_plug
 
 # Register public access policy for web extension
 logger = logging.getLogger(__name__)
+
+# Module-level scheme — ``scheme_name`` must match the key declared by
+# IAM's ``build_iam_openapi_schema`` so Swagger UI ties dashboard routes
+# to the same security scheme entry as the rest of the platform.
+bearer_scheme = HTTPBearer(auto_error=False, scheme_name="HTTPBearer")
 
 def _web_policies(sysadmin_role_name: Optional[str] = None) -> List[Policy]:
     """Pure declaration of the web extension's authorization policies.
@@ -1618,7 +1624,7 @@ async function demoAction(action) {
             q: Optional[str] = Query(None, description="Search query"),
             limit: int = Query(100, ge=1, le=1000),
             offset: int = Query(0, ge=0),
-            authorization: Optional[str] = Header(None),
+            bearer: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
         ):
             """
             List catalogs visible to the caller.
@@ -1655,8 +1661,8 @@ async function demoAction(action) {
             # Legacy fallback: route was originally written before the
             # middleware populated request.state. Keep the manual path so
             # the route works even when the middleware is bypassed.
-            if not user_roles and not principal_id and authorization and authorization.startswith("Bearer "):
-                token = authorization[7:]
+            if not user_roles and not principal_id and bearer is not None:
+                token = bearer.credentials
                 try:
                     from dynastore.modules.iam.interfaces import IdentityProviderProtocol
                     for idp in get_protocols(IdentityProviderProtocol):

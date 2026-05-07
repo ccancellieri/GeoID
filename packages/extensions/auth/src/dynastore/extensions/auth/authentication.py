@@ -2,8 +2,9 @@ import os
 import hashlib
 import secrets
 from typing import List, Any, Dict, Optional
-from fastapi import APIRouter, FastAPI, Request, Depends, HTTPException, Form, Header
+from fastapi import APIRouter, FastAPI, Request, Depends, HTTPException, Form
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from dynastore.extensions.protocols import ExtensionProtocol
@@ -21,6 +22,13 @@ from starlette.middleware.sessions import SessionMiddleware
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Module-level scheme so FastAPI registers a single ``HTTPBearer`` security
+# scheme in the generated OpenAPI document. ``scheme_name`` matches the key
+# used by IAM's ``build_iam_openapi_schema`` so Swagger UI ties the
+# dependency to the right entry in ``components.securitySchemes`` and
+# renders a lock icon on each operation.
+bearer_scheme = HTTPBearer(auto_error=False, scheme_name="HTTPBearer")
 
 _SYSADMIN_PROP_KEY = "auth_sysadmin_password_enc"
 
@@ -79,10 +87,31 @@ def _derive_fernet_key(jwt_secret: str) -> bytes:
 # Identity Provider configuration.
 # IDP_* are the canonical names; KEYCLOAK_* are accepted as aliases for
 # backward compatibility with existing deployments.
-IDP_ISSUER_URL    = os.getenv("IDP_ISSUER_URL")    or os.getenv("KEYCLOAK_ISSUER_URL")
-IDP_CLIENT_ID     = os.getenv("IDP_CLIENT_ID")     or os.getenv("KEYCLOAK_CLIENT_ID")
-IDP_CLIENT_SECRET = os.getenv("IDP_CLIENT_SECRET") or os.getenv("KEYCLOAK_CLIENT_SECRET")
-IDP_PUBLIC_URL    = os.getenv("IDP_PUBLIC_URL")    or os.getenv("KEYCLOAK_PUBLIC_URL")
+#
+# Two-client OAuth/OIDC is the standard layout: a public SPA login client
+# (``IDP_CLIENT_ID``, e.g. ``geoid-fe``) and a separate API audience
+# (``IDP_AUDIENCE``, e.g. ``geoid-be``). Single-client legacy setups can leave
+# ``IDP_AUDIENCE`` unset; it falls back to ``IDP_CLIENT_ID`` and a one-shot
+# deprecation warning is emitted at startup.
+IDP_ISSUER_URL       = os.getenv("IDP_ISSUER_URL")    or os.getenv("KEYCLOAK_ISSUER_URL")
+IDP_CLIENT_ID        = os.getenv("IDP_CLIENT_ID")     or os.getenv("KEYCLOAK_CLIENT_ID")
+IDP_CLIENT_SECRET    = os.getenv("IDP_CLIENT_SECRET") or os.getenv("KEYCLOAK_CLIENT_SECRET")
+IDP_PUBLIC_URL       = os.getenv("IDP_PUBLIC_URL")    or os.getenv("KEYCLOAK_PUBLIC_URL")
+IDP_AUDIENCE         = os.getenv("IDP_AUDIENCE")      or os.getenv("KEYCLOAK_AUDIENCE")
+# Dotted JSON path used to locate roles in the JWT. ``${IDP_AUDIENCE}`` is
+# substituted with the resolved audience. Defaults to
+# ``resource_access.${IDP_AUDIENCE}.roles``. Common operator overrides:
+# ``resource_access.account.roles`` (sysadmin role on Keycloak's built-in
+# account client) or ``realm_access.roles``.
+IDP_ROLES_CLAIM_PATH = os.getenv("IDP_ROLES_CLAIM_PATH")
+
+if IDP_CLIENT_ID and not IDP_AUDIENCE:
+    IDP_AUDIENCE = IDP_CLIENT_ID
+    logger.warning(
+        "IDP_AUDIENCE is unset, falling back to IDP_CLIENT_ID for token "
+        "audience validation. This is deprecated and will be removed in the "
+        "next minor; set IDP_AUDIENCE explicitly."
+    )
 
 
 class Authentication(ExtensionProtocol):
@@ -101,7 +130,9 @@ class Authentication(ExtensionProtocol):
     - Permission checking (that's authorization, not authentication)
     """
 
-    router: APIRouter = APIRouter(tags=["Authentication"], prefix="/auth")
+    router: APIRouter = APIRouter(
+        tags=["Authentication & Authorization"], prefix="/auth"
+    )
 
     # Active identity provider instance (set during lifespan)
     identity_provider = None
@@ -168,7 +199,9 @@ class Authentication(ExtensionProtocol):
 
         @self.router.get("/userinfo")
         @self.router.get("/me")
-        async def userinfo(authorization: str = Header(None)):
+        async def userinfo(
+            bearer: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+        ):
             """
             OAuth2 UserInfo Endpoint.
             Returns normalized user profile from the validated JWT token.
@@ -176,10 +209,10 @@ class Authentication(ExtensionProtocol):
             check) when the token was issued for a different audience (e.g.
             ``account``) but signature + expiry + issuer are still verified.
             """
-            if not authorization or not authorization.startswith("Bearer "):
+            if bearer is None:
                 raise HTTPException(401, "Missing or invalid Authorization header")
 
-            token = authorization[7:]
+            token = bearer.credentials
 
             if self.identity_provider:
                 identity = await self.identity_provider.validate_token(token)
@@ -263,12 +296,15 @@ class Authentication(ExtensionProtocol):
             return RedirectResponse(url=redirect_uri)
 
         @self.router.get("/debug")
-        async def debug_auth(request: Request, authorization: str = Header(None)):
+        async def debug_auth(
+            request: Request,
+            bearer: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+        ):
             """Debug endpoint to inspect authentication state. Requires a valid Bearer token."""
-            if not authorization or not authorization.startswith("Bearer "):
+            if bearer is None:
                 raise HTTPException(401, "Missing or invalid Authorization header")
 
-            token = authorization[7:]
+            token = bearer.credentials
             user_info = None
 
             if self.identity_provider:
@@ -294,11 +330,16 @@ class Authentication(ExtensionProtocol):
 
         if IDP_ISSUER_URL and IDP_CLIENT_ID:
             from dynastore.modules.iam.identity_providers import OidcIdentityProvider
+            # Pass ``audience`` explicitly so the constructor fallback
+            # (``audience or client_id``) cannot silently mask a missing
+            # IDP_AUDIENCE in two-client setups.
             self.identity_provider = OidcIdentityProvider(
                 issuer_url=IDP_ISSUER_URL,
                 client_id=IDP_CLIENT_ID,
                 client_secret=IDP_CLIENT_SECRET,
                 public_url=IDP_PUBLIC_URL,
+                audience=IDP_AUDIENCE,
+                roles_claim_path=IDP_ROLES_CLAIM_PATH,
             )
             logger.info("✓ OIDC identity provider initialized: %s", IDP_ISSUER_URL)
         else:

@@ -37,10 +37,21 @@ GeoID consumes these as:
 IDP_TYPE=oidc
 IDP_ISSUER_URL=https://keycloak.internal/realms/geoid
 IDP_PUBLIC_URL=https://login.example.org/realms/geoid
+# IDP_CLIENT_ID = the OAuth2 client used for LOGIN flows (the SPA + Swagger
+#   Authorize button). For single-client setups this is also the API audience.
 IDP_CLIENT_ID=geoid-api
 IDP_CLIENT_SECRET=<the-secret>
-# IDP_AUDIENCE defaults to IDP_CLIENT_ID. Override only if your tokens
-# carry a different `aud` claim.
+# IDP_AUDIENCE = the API audience (`aud` claim target). Defaults to
+#   IDP_CLIENT_ID for back-compat (with a deprecation warning at process
+#   start). Set explicitly to silence the warning. For two-client setups
+#   (e.g. `geoid-fe` login + `geoid-be` audience), set IDP_AUDIENCE to the
+#   audience client and keep IDP_CLIENT_ID on the login client.
+IDP_AUDIENCE=geoid-api
+# IDP_ROLES_CLAIM_PATH = JSON-path to app roles inside the decoded JWT.
+#   Default: resource_access.${IDP_AUDIENCE}.roles. Common overrides:
+#     resource_access.account.roles  # roles on Keycloak's built-in account client
+#     realm_access.roles             # realm-level roles
+# IDP_ROLES_CLAIM_PATH=resource_access.${IDP_AUDIENCE}.roles
 ```
 
 ---
@@ -156,7 +167,8 @@ Then GeoID extracts (from `oidc_identity.py:262-266`):
   "email": "...",
   "name": "...",
   "realm_roles":   claims["realm_access"]["roles"],
-  "client_roles":  claims["resource_access"]["<IDP_CLIENT_ID>"]["roles"]
+  "client_roles":  claims["resource_access"]["<IDP_AUDIENCE>"]["roles"]
+  # or whatever path IDP_ROLES_CLAIM_PATH points at — see env-var contract above.
 }
 ```
 
@@ -185,9 +197,9 @@ echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null \
 The output must show:
 
 - `iss` exactly equal to `IDP_ISSUER_URL`
-- `aud` containing `IDP_CLIENT_ID` (or your override `IDP_AUDIENCE`)
+- `aud` containing `IDP_AUDIENCE` (the API audience; defaults to `IDP_CLIENT_ID` for back-compat)
 - `realm_access.roles` listing the realm roles (`admin` / `user` / etc.)
-- `resource_access.<IDP_CLIENT_ID>.roles` listing the client roles (`catalog_admin`, etc.)
+- The path named by `IDP_ROLES_CLAIM_PATH` (default `resource_access.<IDP_AUDIENCE>.roles`) listing the client roles (`catalog_admin`, etc.)
 
 If any of these are missing or wrong, fix the realm/client configuration before pointing GeoID at it.
 

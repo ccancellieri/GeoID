@@ -208,26 +208,10 @@ async def health_check():
         "status": "ok",
     }
 
-# Custom Swagger UI to include logo
-@app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui_html():
-    from fastapi.openapi.docs import get_swagger_ui_html
-    return get_swagger_ui_html(
-        openapi_url=app.openapi_url or "/openapi.json",
-        title=app.title + " - Swagger UI",
-        swagger_favicon_url="/web/static/dynastore.png"
-    )
-
-# For ReDoc we can also customize similarly.
-@app.get("/redoc", include_in_schema=False)
-async def custom_redoc_html():
-    from fastapi.openapi.docs import get_redoc_html
-    return get_redoc_html(
-        openapi_url=app.openapi_url or "/openapi.json",
-        title=app.title + " - ReDoc",
-        redoc_favicon_url="/web/static/dynastore.png"
-    )
-
+# /docs is registered later by ``documentation.service.configure_swagger_ui``,
+# which builds the custom Swagger UI (theme + OAuth2 redirect handler).
+# /redoc is currently not exposed; if reintroduced it should also live in the
+# documentation extension so all docs-rendering routes share one owner.
 
 from dynastore.extensions.tools.exception_handlers import setup_exception_handlers
 setup_exception_handlers(app)

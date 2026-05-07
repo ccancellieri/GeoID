@@ -46,8 +46,8 @@ from dynastore.models.driver_context import DriverContext
 logger = logging.getLogger(__name__)
 
 
-router = APIRouter(prefix="/admin", tags=["Authorization Management"])
-me_router = APIRouter(prefix="/me", tags=["Self-Service Authorization"])
+router = APIRouter(prefix="/admin", tags=["Authentication & Authorization"])
+me_router = APIRouter(prefix="/me", tags=["Authentication & Authorization"])
 
 # --- DTOs ---
 

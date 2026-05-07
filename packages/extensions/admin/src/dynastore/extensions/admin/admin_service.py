@@ -77,7 +77,9 @@ class AdminService(ExtensionProtocol):
     fail-closed `DefaultAuthorizer` protects privileged paths.
     """
 
-    router: APIRouter = APIRouter(tags=["Admin"], prefix="/admin")
+    router: APIRouter = APIRouter(
+        tags=["Authentication & Authorization"], prefix="/admin"
+    )
 
     # PolicyContributor: declare authz needs; IAM forwards centrally.
     # No direct call to PermissionProtocol — keeps the plugin agnostic

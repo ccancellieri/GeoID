@@ -27,7 +27,7 @@ See identity_providers/README.md for how to add new provider types.
 """
 
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from importlib.metadata import version, PackageNotFoundError
 
@@ -67,12 +67,25 @@ class OidcIdentityProvider(IdentityProviderProtocol):
         issuer_url:    OIDC issuer URL (backend-internal). Used for discovery,
                        token validation, and userinfo calls.
                        Example: ``http://keycloak:8080/realms/myrealm``
-        client_id:     OAuth2 client ID registered with the IdP.
+        client_id:     OAuth2 client ID registered with the IdP. In two-client
+                       deployments this is the SPA / login client (e.g.
+                       ``geoid-fe``); it is **not** used for audience
+                       validation — see ``audience``.
         client_secret: OAuth2 client secret (for confidential clients).
-        audience:      Expected ``aud`` claim. Defaults to ``client_id``.
+        audience:      Expected ``aud`` claim (e.g. ``geoid-be``). When the
+                       login client and the API audience are the same client,
+                       pass the same value as ``client_id``. Defaults to
+                       ``client_id`` for legacy single-client setups.
         public_url:    Public-facing issuer URL for browser redirects.
                        Example: ``http://localhost:8180/realms/myrealm``
                        Defaults to ``issuer_url``.
+        roles_claim_path: Dotted JSON path used to locate roles inside the
+                       decoded JWT claims. ``${audience}`` is substituted with
+                       the resolved audience. Defaults to
+                       ``resource_access.${audience}.roles``. Common operator
+                       overrides: ``resource_access.account.roles`` (when
+                       sysadmin sits on Keycloak's built-in account client) or
+                       ``realm_access.roles`` (realm roles).
     """
 
     def __init__(
@@ -82,12 +95,21 @@ class OidcIdentityProvider(IdentityProviderProtocol):
         client_secret: Optional[str] = None,
         audience: Optional[str] = None,
         public_url: Optional[str] = None,
+        roles_claim_path: Optional[str] = None,
     ):
         self.issuer_url = issuer_url.rstrip("/")
         self.public_url = (public_url or issuer_url).rstrip("/")
         self.client_id = client_id
         self.client_secret = client_secret
         self.audience = audience or client_id
+
+        # Resolve the roles claim path with ${audience} template substitution.
+        # Default points at the API audience client roles (standard OIDC
+        # pattern); operators can override via IDP_ROLES_CLAIM_PATH to e.g.
+        # ``resource_access.account.roles`` (FAO Keycloak setup) or
+        # ``realm_access.roles``.
+        raw_path = roles_claim_path or "resource_access.${audience}.roles"
+        self.roles_claim_path = raw_path.replace("${audience}", self.audience)
 
         self._meta: Optional[Dict[str, Any]] = None
         self._jwks_client = None  # jwt.PyJWKClient, initialised after discovery
@@ -186,6 +208,76 @@ class OidcIdentityProvider(IdentityProviderProtocol):
     # Token Validation (Resource Server role)
     # ------------------------------------------------------------------
 
+    async def _decode_token(
+        self, token: str, *, verify_audience: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Resolve the signing key and decode the JWT. Raises
+        :class:`jwt.exceptions.InvalidTokenError` (or subclass — including
+        :class:`InvalidAudienceError`) on any verification failure. Returns
+        the decoded claims dict on success.
+
+        Audience enforcement: PyJWT enforces ``aud == self.audience`` when
+        ``audience=`` is passed to :func:`jwt.decode`; if the token's ``aud``
+        is an array, PyJWT also accepts it as long as one element matches.
+        """
+        await self._ensure_meta()
+        if self._jwks_client is None:
+            raise RuntimeError("JWKS client not initialised")
+        signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+        decode_options: Dict[str, Any] = {"verify_exp": True}
+        if not verify_audience:
+            decode_options["verify_aud"] = False
+        # Keycloak sets iss to the public/frontend URL (self.public_url),
+        # which may differ from the internal Docker issuer_url used for
+        # JWKS discovery. Accept either to handle proxy deployments.
+        accepted_issuers = (
+            [self.public_url, self.issuer_url]
+            if self.public_url != self.issuer_url
+            else [self.issuer_url]
+        )
+        last_err: Exception = RuntimeError("No issuers to try")
+        for iss in accepted_issuers:
+            try:
+                # PyJWT enforces aud == self.audience here (raises
+                # InvalidAudienceError on mismatch); accepts aud arrays.
+                return jwt.decode(
+                    token,
+                    key=signing_key.key,
+                    algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+                    audience=self.audience if verify_audience else None,
+                    issuer=iss,
+                    options=decode_options,  # type: ignore[reportArgumentType]
+                )
+            except InvalidTokenError as _e:
+                last_err = _e
+        raise last_err
+
+    def extract_roles(self, claims: Dict[str, Any]) -> List[str]:
+        """
+        Resolve ``self.roles_claim_path`` (a dotted JSON path) against the
+        decoded JWT claims and return the role list found there.
+
+        Walks the path segment-by-segment via ``dict.get(part, {})``; the
+        terminal segment must yield a ``list``. Returns an empty list when
+        any segment is missing or when the terminal value is not a list.
+
+        Does **not** silently merge other paths. Operators choose exactly
+        one location for roles via ``IDP_ROLES_CLAIM_PATH``.
+        """
+        # Late ${audience} substitution in case the path was set after
+        # construction with template syntax still present.
+        path = self.roles_claim_path.replace("${audience}", self.audience)
+        node: Any = claims
+        parts = path.split(".")
+        for part in parts:
+            if not isinstance(node, dict):
+                return []
+            node = node.get(part, {})
+        if isinstance(node, list):
+            return list(node)
+        return []
+
     async def validate_token(
         self, token: str, *, verify_audience: bool = True
     ) -> Optional[Dict[str, Any]]:
@@ -207,38 +299,7 @@ class OidcIdentityProvider(IdentityProviderProtocol):
             return None
 
         try:
-            await self._ensure_meta()
-            if self._jwks_client is None:
-                raise RuntimeError("JWKS client not initialised")
-            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
-            decode_options: Dict[str, Any] = {"verify_exp": True}
-            if not verify_audience:
-                decode_options["verify_aud"] = False
-            # Keycloak sets iss to the public/frontend URL (self.public_url),
-            # which may differ from the internal Docker issuer_url used for
-            # JWKS discovery. Accept either to handle proxy deployments.
-            accepted_issuers = (
-                [self.public_url, self.issuer_url]
-                if self.public_url != self.issuer_url
-                else [self.issuer_url]
-            )
-            claims = None
-            last_err: Exception = RuntimeError("No issuers to try")
-            for iss in accepted_issuers:
-                try:
-                    claims = jwt.decode(
-                        token,
-                        key=signing_key.key,
-                        algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
-                        audience=self.audience if verify_audience else None,
-                        issuer=iss,
-                        options=decode_options,  # type: ignore[reportArgumentType]
-                    )
-                    break
-                except InvalidTokenError as _e:
-                    last_err = _e
-            if claims is None:
-                raise last_err
+            claims = await self._decode_token(token, verify_audience=verify_audience)
         except ExpiredSignatureError:
             logger.debug("OIDC token expired")
             return None
@@ -280,6 +341,11 @@ class OidcIdentityProvider(IdentityProviderProtocol):
             ),
             "email_verified": claims.get("email_verified", False),
             "groups": claims.get("groups", []),
+            # ``roles`` is the operator-shaped result driven by
+            # ``self.roles_claim_path`` (set via IDP_ROLES_CLAIM_PATH); it is
+            # what downstream consumers should migrate to. ``realm_roles`` and
+            # ``client_roles`` remain for back-compat with existing callers.
+            "roles": self.extract_roles(claims),
             "realm_roles": claims.get("realm_access", {}).get("roles", []),
             "client_roles": (
                 claims.get("resource_access", {})
