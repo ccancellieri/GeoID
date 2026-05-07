@@ -2,7 +2,7 @@
 
 [project]
 name = "dynastore-ext-notebooks"
-version = "0.0.0"
+dynamic = ["version"]
 description = "DynaStore Notebooks extension — JupyterLite + tenant initialization."
 requires-python = ">=3.12"
 license-files = ["../../../LICENSE"]
@@ -17,7 +17,7 @@ dependencies = [
 notebooks = "dynastore.extensions.notebooks.notebooks_extension:NotebooksExtension"
 
 [build-system]
-requires = ["setuptools>=80.9.0"]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -29,3 +29,8 @@ namespaces = true
 
 [tool.uv.sources]
 dynastore = { workspace = true }
+
+[tool.setuptools_scm]
+version_file = "src/dynastore/extensions/notebooks/_scm_version.py"
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"

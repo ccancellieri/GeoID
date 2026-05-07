@@ -112,7 +112,7 @@ async def execute_bigquery_async(
 from dynastore.models.query_builder import QueryRequest, FieldSelection, FilterCondition
 
 
-from dynastore.extensions import ExtensionProtocol
+from dynastore.extensions.protocols import ExtensionProtocol
 class DwhService(ExtensionProtocol):
     priority: int = 100
 

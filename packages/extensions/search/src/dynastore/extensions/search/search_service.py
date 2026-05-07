@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, FastAPI
 from contextlib import asynccontextmanager
-from dynastore.extensions import ExtensionProtocol
+from dynastore.extensions.protocols import ExtensionProtocol
 
 from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 from dynastore.modules.elasticsearch.mappings import get_search_index

@@ -2,7 +2,7 @@
 
 [project]
 name = "dynastore-ext-wfs"
-version = "0.0.0"
+dynamic = ["version"]
 description = "DynaStore OGC WFS 2.0 extension."
 requires-python = ">=3.12"
 license-files = ["../../../LICENSE"]
@@ -18,7 +18,7 @@ dependencies = [
 wfs = "dynastore.extensions.wfs.wfs_service:WFSService"
 
 [build-system]
-requires = ["setuptools>=80.9.0"]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -30,3 +30,8 @@ namespaces = true
 
 [tool.uv.sources]
 dynastore = { workspace = true }
+
+[tool.setuptools_scm]
+version_file = "src/dynastore/extensions/wfs/_scm_version.py"
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"

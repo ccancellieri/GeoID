@@ -7,7 +7,7 @@ from typing import List, Any, Dict, Optional, Callable
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from dynastore.extensions import ExtensionProtocol
+from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.models.protocols.web import WebOverrideProtocol, WebPageProtocol, StaticFilesProtocol
 
 # Use the module-level decorators so Web discovers pages and static files automatically

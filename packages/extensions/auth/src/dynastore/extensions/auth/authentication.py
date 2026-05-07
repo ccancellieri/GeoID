@@ -6,9 +6,7 @@ from fastapi import APIRouter, FastAPI, Request, Depends, HTTPException, Form, H
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
 
-from dynastore.extensions import (
-    ExtensionProtocol,
-)
+from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.web import expose_static
 from dynastore.extensions.tools.url import build_sibling_redirect, resolve_redirect_uri
 from dynastore.modules import get_protocol

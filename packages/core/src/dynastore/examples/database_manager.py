@@ -1,4 +1,4 @@
-from dynastore.extensions import ExtensionProtocol
+from dynastore.extensions.protocols import ExtensionProtocol
 from contextlib import asynccontextmanager 
 from fastapi import FastAPI
 

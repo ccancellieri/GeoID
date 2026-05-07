@@ -62,7 +62,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: src/dynastore/docker/Dockerfile
+          file: packages/core/src/dynastore/docker/Dockerfile
           target: tester
           build-args: SCOPE=typecheck
           tags: dynastore-tester:ci
@@ -75,7 +75,7 @@ jobs:
           docker run --rm \
             --workdir /dynastore \
             dynastore-tester:ci \
-            /opt/venv/bin/pyright src/dynastore/ --warnings
+            /opt/venv/bin/pyright packages/core/src/dynastore/ --warnings
 
   unit-tests:
     runs-on: ubuntu-22.04
@@ -114,7 +114,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: src/dynastore/docker/Dockerfile
+          file: packages/core/src/dynastore/docker/Dockerfile
           target: tester
           build-args: SCOPE=all
           tags: geoid-test-runner:ci
@@ -126,10 +126,10 @@ jobs:
       # above, so build it via the canonical compose. Uses the SAME compose
       # file as prod and dev; no separate test compose.
       - name: Build db image
-        run: docker compose -f src/dynastore/docker/docker-compose.yml build db
+        run: docker compose -f packages/core/src/dynastore/docker/docker-compose.yml build db
 
       - name: Start db
-        run: docker compose -f src/dynastore/docker/docker-compose.yml up -d --wait db
+        run: docker compose -f packages/core/src/dynastore/docker/docker-compose.yml up -d --wait db
 
       # Test-runner is invoked as a one-off `docker run` joined to the
       # canonical compose's network so it can resolve `db` by service name
@@ -153,11 +153,11 @@ jobs:
           # Extract just the POSTGRES_* vars we need; the full .env contains
           # placeholder tokens like '<change-me>' that bash `source` mis-parses
           # as redirections (line 84: IDP_CLIENT_SECRET=<change-me>).
-          eval "$(grep -E '^(POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB)=' src/dynastore/docker/.env | sed 's/^/export /')"
+          eval "$(grep -E '^(POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB)=' packages/core/src/dynastore/docker/.env | sed 's/^/export /')"
           docker run --rm \
             --network "$NETWORK" \
             --workdir /dynastore \
-            --env-file src/dynastore/docker/.env \
+            --env-file packages/core/src/dynastore/docker/.env \
             -v "$WORKSPACE":/dynastore/workspace \
             -v "$WORKSPACE/src":/dynastore/src \
             -v "$WORKSPACE/tests":/dynastore/tests \
@@ -174,7 +174,7 @@ jobs:
 
       - name: Stop db
         if: always()
-        run: docker compose -f src/dynastore/docker/docker-compose.yml down -v
+        run: docker compose -f packages/core/src/dynastore/docker/docker-compose.yml down -v
 
       - name: Report unit tests
         uses: dorny/test-reporter@v3
@@ -245,7 +245,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: src/dynastore/docker/Dockerfile
+          file: packages/core/src/dynastore/docker/Dockerfile
           target: tester
           build-args: SCOPE=all
           tags: geoid-test-runner:ci
@@ -266,8 +266,8 @@ jobs:
       # tests actually use.
       - name: Start db
         run: |
-          docker compose -f src/dynastore/docker/docker-compose.yml build db
-          docker compose -f src/dynastore/docker/docker-compose.yml up -d --wait db
+          docker compose -f packages/core/src/dynastore/docker/docker-compose.yml build db
+          docker compose -f packages/core/src/dynastore/docker/docker-compose.yml up -d --wait db
 
       # Tests run via one-off `docker run` joined to the compose network so
       # they can resolve `db` by service name. Project name is derived from
@@ -292,7 +292,7 @@ jobs:
           # Extract just the POSTGRES_* vars we need; the full .env contains
           # placeholder tokens like '<change-me>' that bash `source` mis-parses
           # as redirections (line 84: IDP_CLIENT_SECRET=<change-me>).
-          eval "$(grep -E '^(POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB)=' src/dynastore/docker/.env | sed 's/^/export /')"
+          eval "$(grep -E '^(POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB)=' packages/core/src/dynastore/docker/.env | sed 's/^/export /')"
           docker run --rm \
             --network "$NETWORK" \
             --workdir /dynastore \
@@ -300,7 +300,7 @@ jobs:
             -v "$WORKSPACE/src":/dynastore/src \
             -v "$WORKSPACE/tests":/dynastore/tests \
             -v "$WORKSPACE/pytest.ini":/dynastore/pytest.ini \
-            --env-file src/dynastore/docker/.env \
+            --env-file packages/core/src/dynastore/docker/.env \
             -e DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}" \
             -e REMOTE_TEST_EXECUTION=true \
             -e DYNASTORE_DDL_STATEMENT_TIMEOUT=120s \
@@ -312,11 +312,11 @@ jobs:
 
       - name: Display db logs on failure
         if: failure()
-        run: docker compose -f src/dynastore/docker/docker-compose.yml logs db
+        run: docker compose -f packages/core/src/dynastore/docker/docker-compose.yml logs db
 
       - name: Tear down integration stack
         if: always()
-        run: docker compose -f src/dynastore/docker/docker-compose.yml down -v
+        run: docker compose -f packages/core/src/dynastore/docker/docker-compose.yml down -v
 
       - name: Report integration tests
         uses: dorny/test-reporter@v3
@@ -380,7 +380,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: src/dynastore/docker/Dockerfile
+          file: packages/core/src/dynastore/docker/Dockerfile
           target: tester
           build-args: SCOPE=all
           tags: geoid-test-runner:ci
@@ -390,8 +390,8 @@ jobs:
 
       - name: Start db + elasticsearch
         run: |
-          docker compose -f src/dynastore/docker/docker-compose.yml build db
-          docker compose -f src/dynastore/docker/docker-compose.yml up -d --wait db elasticsearch
+          docker compose -f packages/core/src/dynastore/docker/docker-compose.yml build db
+          docker compose -f packages/core/src/dynastore/docker/docker-compose.yml up -d --wait db elasticsearch
 
       - name: Run elasticsearch-marked tests
         env:
@@ -399,7 +399,7 @@ jobs:
         run: |
           NETWORK=$(docker network ls --filter "name=dynastore_net" --format "{{.Name}}" | head -n1)
           test -n "$NETWORK" || { echo "dynastore_net not found"; docker network ls; exit 1; }
-          eval "$(grep -E '^(POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB)=' src/dynastore/docker/.env | sed 's/^/export /')"
+          eval "$(grep -E '^(POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB)=' packages/core/src/dynastore/docker/.env | sed 's/^/export /')"
           docker run --rm \
             --network "$NETWORK" \
             --workdir /dynastore \
@@ -407,7 +407,7 @@ jobs:
             -v "$WORKSPACE/src":/dynastore/src \
             -v "$WORKSPACE/tests":/dynastore/tests \
             -v "$WORKSPACE/pytest.ini":/dynastore/pytest.ini \
-            --env-file src/dynastore/docker/.env \
+            --env-file packages/core/src/dynastore/docker/.env \
             -e DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}" \
             -e ELASTICSEARCH_URL="http://elasticsearch:9200" \
             -e DYNASTORE_RUN_ELASTICSEARCH_TESTS=true \
@@ -425,12 +425,12 @@ jobs:
       - name: Display elasticsearch logs on failure
         if: failure()
         run: |
-          docker compose -f src/dynastore/docker/docker-compose.yml logs elasticsearch
-          docker compose -f src/dynastore/docker/docker-compose.yml logs db
+          docker compose -f packages/core/src/dynastore/docker/docker-compose.yml logs elasticsearch
+          docker compose -f packages/core/src/dynastore/docker/docker-compose.yml logs db
 
       - name: Tear down stack
         if: always()
-        run: docker compose -f src/dynastore/docker/docker-compose.yml down -v
+        run: docker compose -f packages/core/src/dynastore/docker/docker-compose.yml down -v
 
       - name: Report elasticsearch tests
         uses: dorny/test-reporter@v3

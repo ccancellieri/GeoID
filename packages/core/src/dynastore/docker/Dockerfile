@@ -57,7 +57,13 @@ WORKDIR ${APP_DIR}
 # Virtual Env Setup
 RUN python3.12 -m venv ${VENV_PATH}
 ENV PATH="${VENV_PATH}/bin:$PATH"
-ENV PYTHONPATH=${APP_DIR}/src
+# No PYTHONPATH — `dynastore` and `dynastore.extensions` are PEP 420 namespace
+# packages, contributed to by dynastore-core (modules, tools, models, tasks)
+# AND every dynastore-ext-* wheel (one extension subpackage each). Pointing
+# PYTHONPATH at any single source dir would shadow site-packages and break
+# the namespace merge — Python's `dynastore.__path__` would only see the
+# source tree, missing the ext wheels in site-packages. Letting pip install
+# all wheels into the same site-packages directory is the correct invariant.
 
 # Install uv for workspace-aware package resolution (pip cannot resolve
 # workspace-local packages declared in [tool.uv.sources]).
@@ -77,30 +83,51 @@ ARG APP_VERSION=
 # Install Production Dependencies — split into two layers so source-only
 # commits don't bust the (~3 min) deps-install cache.
 #
-# Layer 1: project metadata. The pip-install layer below caches on
-# pyproject.toml + the stubbed src tree alone; source-only commits hit
-# the cache and skip the heavy GDAL / pyiceberg / etc. install.
+# Layer 1: project metadata + workspace packages stub tree. The deps-install
+# layer below caches on pyproject.toml + the stubbed packages tree alone;
+# source-only commits hit the cache and skip the heavy GDAL / pyiceberg /
+# etc. install. Real source lands in Layer 3.
 COPY pyproject.toml LICENSE README.md requirements*.txt pytest.ini* setup.cfg* .coveragerc* ./
-# Workspace extension packages — must be present so uv can resolve
-# dynastore-ext-* workspace members declared in [tool.uv.sources].
-COPY packages/ ./packages/
+# Workspace members — pyproject.toml files only, so uv can read them and
+# resolve workspace sources. Source files come in Layer 3 (cache-bust on src
+# change is fine; a fresh pyproject.toml authorship is rare).
+COPY packages/core/pyproject.toml ./packages/core/pyproject.toml
+COPY packages/extensions/ ./packages/extensions-meta/
+RUN mkdir -p ./packages/extensions && \
+    for d in ./packages/extensions-meta/*/; do \
+        name=$(basename "$d"); \
+        mkdir -p "./packages/extensions/${name}"; \
+        cp "${d}pyproject.toml" "./packages/extensions/${name}/pyproject.toml"; \
+    done && rm -rf ./packages/extensions-meta
 
 # Copy .env file if it exists (CI creates it in root, local has it in env/)
 # We use pyproject.toml as a sentinel to prevent COPY from failing if .env is missing.
 RUN mkdir -p ./env
 COPY pyproject.toml .en[v]* ./env/
-# Also copy to root and src to be safe for discovery logic
 COPY pyproject.toml .en[v]* ./
-COPY pyproject.toml .en[v]* ./src/
 
-# Layer 2: stub the dynastore package so setuptools can build a wheel
-# without bundling real source. Layer 3 replaces the stub with real files
-# and rebuilds the wheel --no-deps, picking up the real APP_VERSION.
-RUN mkdir -p src/dynastore/scripts && \
-    : > src/dynastore/__init__.py && \
-    : > src/dynastore/scripts/__init__.py && \
-    : > src/dynastore/scripts/start.sh && \
-    : > src/dynastore/scripts/start-task.sh
+# Layer 2 prep: stub every workspace member so uv pip can build wheel
+# metadata without real source (real source lands in Layer 3 and triggers
+# --force-reinstall there). Each wheel needs at least its declared package
+# directory to exist.
+#
+# IMPORTANT: do NOT create `dynastore/__init__.py` or
+# `dynastore/extensions/__init__.py` — those are PEP 420 namespace packages
+# (multiple wheels contribute subpackages). Stubbing them with regular
+# `__init__.py` files would make Python treat the namespace as a regular
+# package, blocking the merge with ext-wheel subdirs at runtime. The leaf
+# subpackages (e.g. `dynastore.extensions.web`, `dynastore.scripts`) do
+# need `__init__.py` since they're regular packages owned by exactly one
+# wheel.
+RUN mkdir -p packages/core/src/dynastore/extensions packages/core/src/dynastore/scripts && \
+    : > packages/core/src/dynastore/scripts/__init__.py && \
+    : > packages/core/src/dynastore/scripts/start.sh && \
+    : > packages/core/src/dynastore/scripts/start-task.sh && \
+    for d in packages/extensions/*/; do \
+        name=$(basename "$d"); \
+        mkdir -p "${d}src/dynastore/extensions/${name}" && \
+        : > "${d}src/dynastore/extensions/${name}/__init__.py"; \
+    done
 
 # SCOPE selects which pyproject.toml extras to install.
 # Set per-service via docker-compose.yml build args (from .env) or CI.
@@ -118,37 +145,51 @@ ARG BUILD_JUPYTERLITE=false
 # → driverShortName='Parquet').  Force fiona to rebuild from sdist against
 # the system libgdal so it inherits every driver the base image ships.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DYNASTORE=0.0.0 \
-    ${VENV_PATH}/bin/pip install --upgrade pip setuptools setuptools-scm wheel && \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DYNASTORE=0.0.0 \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
+    ${VENV_PATH}/bin/pip install --upgrade pip setuptools setuptools-scm wheel uv && \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     ${VENV_PATH}/bin/uv pip install --no-binary fiona ".[${SCOPE}]" uvicorn gunicorn
 
-# Layer 3: real source overlay. Fast layer — busts when src/, tests/, or
-# APP_VERSION change. Re-installs dynastore + every workspace ext wheel
+# Layer 3: real source overlay. Fast layer — busts when packages/ or
+# APP_VERSION change. Re-installs dynastore-core + every workspace ext wheel
 # --no-deps so the wheel metadata (and therefore
-# importlib.metadata.version("DynaStore") / version("dynastore-ext-*"))
+# importlib.metadata.version("dynastore-core") / version("dynastore-ext-*"))
 # reflects the real version baked in via SETUPTOOLS_SCM_PRETEND_VERSION.
 # Layer 2 used "0.0.0" as a cache-stable placeholder; this layer overwrites
 # the wheel metadata with APP_VERSION (CI passes the real git-describe value).
-COPY src ./src
+#
+# Critical: uv installs workspace members editable by default (`.pth` file
+# in site-packages pointing at the source dir). Editable wins in sys.path,
+# so `dynastore.__path__` would only see the source tree and miss the
+# ext-wheel subdirectories under site-packages. We explicitly uninstall the
+# editable install first, then reinstall as a regular wheel — this puts
+# dynastore-core's source physically in site-packages where it shares one
+# directory with every dynastore-ext-* sub-package and the namespace
+# `dynastore.extensions` resolves correctly across all wheels.
+COPY packages ./packages
 COPY tests ./tests
 RUN --mount=type=cache,target=/root/.cache/pip \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DYNASTORE="${APP_VERSION:-0.0.0+unknown}" \
-    ${VENV_PATH}/bin/pip install --no-deps --force-reinstall --no-build-isolation . && \
+    ${VENV_PATH}/bin/pip uninstall -y dynastore-core DynaStore 2>/dev/null || true && \
+    ${VENV_PATH}/bin/pip uninstall -y dynastore-core DynaStore 2>/dev/null || true && \
+    rm -f ${VENV_PATH}/lib/python*/site-packages/__editable__.dynastore_core-*.pth && \
+    rm -rf ${VENV_PATH}/lib/python*/site-packages/dynastore_core-0.0.0.dist-info && \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${APP_VERSION:-0.0.0+unknown}" \
+    ${VENV_PATH}/bin/pip install --no-deps --force-reinstall --no-build-isolation packages/core && \
     for pkg in packages/extensions/*/; do \
         SETUPTOOLS_SCM_PRETEND_VERSION="${APP_VERSION:-0.0.0+unknown}" \
         ${VENV_PATH}/bin/pip install --no-deps --force-reinstall --no-build-isolation "$pkg" \
             || { echo "ERROR: re-install failed for $pkg"; exit 1; }; \
-    done
+    done && \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DYNASTORE="${APP_VERSION:-0.0.0+unknown}" \
+    ${VENV_PATH}/bin/pip install --no-deps --force-reinstall --no-build-isolation .
 
 # Startup scripts ship as package data under dynastore/scripts/ (SSOT).
 # Read them from the local source tree (Layer 3 has overlaid the real files);
 # the deployment-wrapper Dockerfile reads the equivalent files out of
 # ${VENV_PATH}/lib/.../site-packages/dynastore/scripts/. Both reach identical
 # canonical content; only the dispatch path differs.
-RUN install -m 755 /dynastore/src/dynastore/scripts/start.sh /usr/local/bin/start.sh && \
-    install -m 755 /dynastore/src/dynastore/scripts/start-task.sh /usr/local/bin/start-task.sh
+RUN install -m 755 /dynastore/packages/core/src/dynastore/scripts/start.sh /usr/local/bin/start.sh && \
+    install -m 755 /dynastore/packages/core/src/dynastore/scripts/start-task.sh /usr/local/bin/start-task.sh
 
 # Overlay JupyterLite assets when scope includes notebooks; bridge.js (committed) is preserved.
 # After copy, inject bridge.js into lab/index.html so the host can postMessage
@@ -166,7 +207,7 @@ RUN mkdir -p ${JUPYTERLITE_DIR}
 RUN --mount=type=bind,from=jupyterlite-builder,source=/build/lite-output,target=/tmp/lite-output \
     if [ "${BUILD_JUPYTERLITE}" = "true" ]; then \
         cp -r /tmp/lite-output/. "${JUPYTERLITE_DIR}/" && \
-        cp "${APP_DIR}/src/dynastore/extensions/notebooks/static/lite/bridge.js" "${JUPYTERLITE_DIR}/bridge.js" && \
+        cp "${APP_DIR}/packages/extensions/notebooks/src/dynastore/extensions/notebooks/static/lite/bridge.js" "${JUPYTERLITE_DIR}/bridge.js" && \
         for sub in lab notebooks tree edit; do \
             if [ -f "${JUPYTERLITE_DIR}/${sub}/index.html" ]; then \
                 if ! grep -q "bridge.js" "${JUPYTERLITE_DIR}/${sub}/index.html"; then \
@@ -225,7 +266,8 @@ RUN apt-get update && \
 ENV APP_DIR=${APP_DIR}
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=${APP_DIR}/src
+# Runtime: no PYTHONPATH — wheels are installed into site-packages and
+# `dynastore`/`dynastore.extensions` are PEP 420 namespace packages.
 ENV PATH="${VENV_PATH}/bin:${HOME}/.local/bin:$PATH"
 ENV CPLUS_INCLUDE_PATH=/usr/include/gdal
 ENV C_INCLUDE_PATH=/usr/include/gdal

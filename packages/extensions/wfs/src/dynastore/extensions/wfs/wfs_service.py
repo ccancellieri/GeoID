@@ -34,7 +34,7 @@ from contextlib import asynccontextmanager
 from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.db_config.exceptions import TableNotFoundError, SchemaNotFoundError
 
-from dynastore.extensions import get_extension_instance
+from dynastore.extensions.registry import get_extension_instance
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols import (

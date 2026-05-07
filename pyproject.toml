@@ -1,17 +1,17 @@
 [project]
+# DynaStore — meta-package. Pure orchestration: no source code. Pulls in
+# `dynastore-core` (modules + tools + models + tasks + shared extension base)
+# and dispatches the SCOPE composition through `[project.optional-dependencies]`
+# to per-extension wheels (`dynastore-ext-*`). Real code lives under
+# `packages/core/` and `packages/extensions/<name>/`.
 name = "DynaStore"
 dynamic = ["version"]
-description = "DynaStore application"
+description = "DynaStore meta-package — SCOPE composition over per-wheel distributions."
 authors = [
     { name = "Carlo Cancellieri", email = "ccancellieri@gmail.com" }
 ]
-dependencies = [ # Minimal Core Framework
-    "pydantic>=2.0",
-    "pydantic-settings>=2.3.0",
-    "pydantic-extra-types>=2.10.6",
-    "python-dotenv>=1.0.0",
-    "python-dateutil",
-    "orjson>=3.9.0",
+dependencies = [
+    "dynastore-core",
 ]
 requires-python = ">=3.12"
 license-files = ["LICENSE"]
@@ -25,14 +25,16 @@ requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 # ===========================================================================
-# uv workspace — per-extension wheel split (Phase 1+).
-# Each member under packages/* produces its own pip-installable wheel
-# (e.g. dynastore-ext-tasks). See packages/README.md for the migration plan.
+# uv workspace — per-wheel split (extensions + core).
+# Each member under packages/** produces its own pip-installable wheel
+# (e.g. dynastore-core, dynastore-ext-maps). See packages/README.md for the
+# migration plan.
 # ===========================================================================
 [tool.uv.workspace]
-members = ["packages/extensions/*"]
+members = ["packages/core", "packages/extensions/*"]
 
 [tool.uv.sources]
+dynastore-core = { workspace = true }
 dynastore-ext-tasks = { workspace = true }
 dynastore-ext-stats = { workspace = true }
 dynastore-ext-edr = { workspace = true }
@@ -458,59 +460,6 @@ joins = ["google-cloud-bigquery", "db-dtypes", "pandas", "dynastore-ext-joins"]
 dwh = ["dynastore[joins]"]
 psycopg_pool = ["psycopg[binary,pool]"]
 
-[project.entry-points."dynastore.modules"]
-cache = "dynastore.modules.cache.cache_module:CacheModule"
-tasks = "dynastore.modules.tasks.tasks_module:TasksModule"
-proxy = "dynastore.modules.proxy.proxy_module:ProxyModule"
-gdal = "dynastore.modules.gdal.gdal_module:GdalModule"
-catalog = "dynastore.modules.catalog.catalog_module:CatalogModule"
-gcp = "dynastore.modules.gcp.gcp_module:GCPModule"
-tiles = "dynastore.modules.tiles.tiles_module:TilesModule"
-datastore = "dynastore.modules.datastore.datastore_service:DatastoreModule"
-styles = "dynastore.modules.styles.styles_module:StylesModule"
-moving_features = "dynastore.modules.moving_features.mf_module:MovingFeaturesModule"
-local_upload = "dynastore.modules.local.local_upload:LocalUploadModule"
-connected_systems = "dynastore.modules.connected_systems.ddl:ConnectedSystemsModule"
-db_config = "dynastore.modules.db_config.db_config_service:DBConfigModule"
-iam = "dynastore.modules.iam.module:IamModule"
-db = "dynastore.modules.db.db_service:DBService"
-crs = "dynastore.modules.crs.crs_module:CRSModule"
-events = "dynastore.modules.events.events_module:EventsModule"
-notebooks = "dynastore.modules.notebooks.notebooks_module:NotebooksModule"
-stac = "dynastore.modules.stac.module:StacModule"
-elasticsearch = "dynastore.modules.elasticsearch.module:ElasticsearchModule"
-stats = "dynastore.modules.stats.stats_module:STATS"
-web = "dynastore.modules.web.web_module:WebModule"
-storage_postgresql = "dynastore.modules.storage.drivers.postgresql:ItemsPostgresqlDriver"
-storage_elasticsearch = "dynastore.modules.storage.drivers.elasticsearch:ItemsElasticsearchDriver"
-storage_elasticsearch_private = "dynastore.modules.storage.drivers.elasticsearch_private:ItemsElasticsearchPrivateDriver"
-storage_elasticsearch_assets = "dynastore.modules.storage.drivers.elasticsearch:AssetElasticsearchDriver"
-storage_duckdb = "dynastore.modules.storage.drivers.duckdb:ItemsDuckdbDriver"
-storage_iceberg = "dynastore.modules.storage.drivers.iceberg:ItemsIcebergDriver"
-storage_bigquery = "dynastore.modules.storage.drivers.bigquery:ItemsBigQueryDriver"
-collection_elasticsearch = "dynastore.modules.elasticsearch.collection_es_driver:CollectionElasticsearchDriver"
-collection_elasticsearch_private = "dynastore.modules.storage.drivers.elasticsearch_private.collection_driver:CollectionElasticsearchPrivateDriver"
-catalog_elasticsearch = "dynastore.modules.elasticsearch.catalog_es_driver:CatalogElasticsearchDriver"
-# PR 1e step 3b — collection-tier PG metadata is now served by the
-# composition driver ``CollectionPostgresqlDriver``.  It instantiates
-# ``CollectionCorePostgresqlDriver`` + (try-imported)
-# ``CollectionStacPostgresqlDriver`` internally via
-# ``CollectionPgSidecarRegistry``; the two raw drivers' entry-points
-# were removed so ``get_protocols(CollectionStore)`` no longer surfaces
-# them and routing fan-out happens once, inside the wrapper.
-collection_postgresql = "dynastore.modules.storage.drivers.collection_postgresql:CollectionPostgresqlDriver"
-# Catalog-tier PG metadata is served by the composition driver
-# ``CatalogPostgresqlDriver``.  It instantiates ``CatalogCorePostgresqlDriver``
-# + (try-imported) ``CatalogStacPostgresqlDriver`` internally via
-# ``CatalogPgSidecarRegistry``; the two raw drivers' entry-points
-# were removed so ``get_protocols(CatalogStore)`` no longer surfaces them.
-catalog_postgresql = "dynastore.modules.storage.drivers.catalog_postgresql:CatalogPostgresqlDriver"
-# M3.2 — first concrete INDEX-role driver for the catalog tier.
-# Diagnostic-only (logs every dispatch); NOT in the default
-# CatalogRoutingConfig.operations[INDEX] list — opt-in via platform
-# override.  See src/dynastore/modules/storage/drivers/catalog_log_indexer.py
-# for rationale + future real-indexer reference-implementation notes.
-metadata_catalog_log_indexer = "dynastore.modules.storage.drivers.catalog_log_indexer:LogCatalogIndexer"
 
 [project.entry-points."dynastore.extensions"]
 # maps: migrated to packages/extensions/maps (dynastore-ext-maps wheel)
@@ -520,25 +469,25 @@ metadata_catalog_log_indexer = "dynastore.modules.storage.drivers.catalog_log_in
 # tasks: migrated to packages/extensions/tasks (dynastore-ext-tasks wheel) — Phase 1 pilot
 # proxy: migrated to packages/extensions/proxy (dynastore-ext-proxy wheel)
 # gdal: migrated to packages/extensions/gdal (dynastore-ext-gdal wheel)
-auth = "dynastore.extensions.auth.authentication:Authentication"
-web = "dynastore.extensions.web.web:Web"
+# auth: migrated to packages/extensions/auth (dynastore-ext-auth wheel)
+# web: migrated to packages/extensions/web (dynastore-ext-web wheel)
 # processes: migrated to packages/extensions/processes (dynastore-ext-processes wheel)
 # features: migrated to packages/extensions/features (dynastore-ext-features wheel)
 # template: migrated to packages/extensions/template (dynastore-ext-template wheel)
-admin = "dynastore.extensions.admin.admin_service:AdminService"
+# admin: migrated to packages/extensions/admin (dynastore-ext-admin wheel)
 # geoid: migrated to packages/extensions/geoid (dynastore-ext-geoid wheel)
 # gcp_bucket: migrated to packages/extensions/gcp (dynastore-ext-gcp-bucket wheel)
 # search: migrated to packages/extensions/search (dynastore-ext-search wheel)
 # styles: migrated to packages/extensions/styles (dynastore-ext-styles wheel)
 # connected_systems: migrated to packages/extensions/connected_systems (dynastore-ext-connected-systems wheel)
 # httpx: migrated to packages/extensions/httpx (dynastore-ext-httpx wheel)
-iam = "dynastore.extensions.iam.service:IamExtension"
-logs = "dynastore.extensions.logs.log_extension:LogExtension"
-configs = "dynastore.extensions.configs.service:ConfigsService"
+# iam: migrated to packages/extensions/iam (dynastore-ext-iam wheel)
+# logs: migrated to packages/extensions/logs (dynastore-ext-logs wheel)
+# configs: migrated to packages/extensions/configs (dynastore-ext-configs wheel)
 # crs: migrated to packages/extensions/crs (dynastore-ext-crs wheel)
 # events: migrated to packages/extensions/events (dynastore-ext-events wheel)
 # wfs: migrated to packages/extensions/wfs (dynastore-ext-wfs wheel)
-assets = "dynastore.extensions.assets.assets_service:AssetService"
+# assets: migrated to packages/extensions/assets (dynastore-ext-assets wheel)
 # notebooks: migrated to packages/extensions/notebooks (dynastore-ext-notebooks wheel)
 # stats: migrated to packages/extensions/stats (dynastore-ext-stats wheel) — Phase 1 pilot
 # tiles: migrated to packages/extensions/tiles (dynastore-ext-tiles wheel)
@@ -549,38 +498,20 @@ assets = "dynastore.extensions.assets.assets_service:AssetService"
 # moving_features: migrated to packages/extensions/moving_features (dynastore-ext-moving-features wheel)
 # dggs: migrated to packages/extensions/dggs (dynastore-ext-dggs wheel)
 
-[project.entry-points."dynastore.tasks"]
-gdal = "dynastore.tasks.gdal.gdalinfo_task:GdalInfoTask"
-gcp_provision = "dynastore.tasks.gcp_provision.task:ProvisioningTask"
-elasticsearch = "dynastore.tasks.elasticsearch.tasks:ElasticsearchIndexTask"
-elasticsearch_indexer = "dynastore.tasks.elasticsearch_indexer.indexer_task:ElasticsearchIndexerTask"
-elasticsearch_private_tasks = "dynastore.modules.storage.drivers.elasticsearch_private.tasks:PrivateIndexTask"
-ingestion = "dynastore.tasks.ingestion.ingestion_task:IngestionTask"
-dwh_join = "dynastore.tasks.dwh_join.dwh_join_export_task:DwhJoinExportTask"
-export_features = "dynastore.tasks.export_features.export_features_task:ExportFeaturesTask"
-tiles_preseed = "dynastore.tasks.tiles_preseed.task:TilePreseedTask"
-dimensions_materialize = "dynastore.tasks.dimensions_materialize.task:DimensionsMaterializeTask"
-outbox_drain = "dynastore.tasks.outbox_drain.drain_task:OutboxDrainTask"
-gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
-
-[tool.setuptools_scm]
-# Derive version from git tags. Writes the resolved version to a runtime-importable
-# file at build time; downstream pip installs (dynastore-deploy, fao-aip-catalog)
-# inherit it via importlib.metadata. See src/dynastore/_version.py for the lookup.
-version_file = "src/dynastore/_scm_version.py"
-local_scheme = "no-local-version"
-fallback_version = "0.0.0+unknown"
 
 [tool.setuptools]
-# Include files specified in MANIFEST.in
-include-package-data = true
+# Meta-package: no Python source. Tell setuptools auto-discovery
+# explicitly that there are no packages here so it doesn't sweep up
+# `packages/` (the workspace tree) or `notebook_showcase/`.
+packages = []
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-# Include all .html and .sql files found within any package
-"*" = ["*.html", "*.sql", "*.md", "*.css", "*.js", "*.txt", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ipynb", "*.ndjson", "*.sh", "*.env", "*.yml", "Dockerfile*", "static/**"]
+[tool.setuptools_scm]
+# Meta-package version derives from git tags via setuptools-scm. The same tag
+# also stamps every dynastore-{core,ext-*} workspace member, so all wheels in
+# a build share one version (set explicitly via SETUPTOOLS_SCM_PRETEND_VERSION
+# in the Docker layer 3 re-install loop, where APP_VERSION is passed by CI).
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"
 
 [project.urls]
 Homepage = "https://github.com/un-fao/dynastore/"
@@ -597,12 +528,26 @@ pythonPlatform = "Linux"
 typeCheckingMode = "basic"
 venvPath = "."
 venv = ".venv"
-include = ["src/dynastore"]
+# Type-check the workspace tree: dynastore-core + every per-extension wheel.
+# (After the Phase 1 move, src/ at the repo root no longer exists; all
+# Python source lives under packages/core/src/ and packages/extensions/*/src/.)
+include = [
+    "packages/core/src/dynastore",
+    "packages/extensions/*/src/dynastore",
+]
+extraPaths = [
+    "packages/core/src",
+    "packages/extensions/coverages/src",
+    "packages/extensions/gdal/src",
+    "packages/extensions/notebooks/src",
+    "packages/extensions/template/src",
+    "packages/extensions/web/src",
+]
 exclude = [
     "**/__pycache__",
+    "**/build",
     "tests",
     "scripts",
-    "build",
 ]
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
@@ -620,33 +565,33 @@ reportUnnecessaryTypeIgnoreComment = "none"
 reportMissingModuleSource = "none"
 
 [[tool.pyright.executionEnvironments]]
-root = "src/dynastore/models/protocols"
+root = "packages/core/src/dynastore/models/protocols"
 typeCheckingMode = "strict"
 
 # Optional-extra raster paths (rasterio): silence missing-import noise on files
 # that lazy-import these at call time. Runtime guards with try/except.
 [[tool.pyright.executionEnvironments]]
-root = "src/dynastore/modules/coverages"
+root = "packages/core/src/dynastore/modules/coverages"
 reportMissingImports = "none"
 
 [[tool.pyright.executionEnvironments]]
-root = "src/dynastore/modules/gdal"
+root = "packages/core/src/dynastore/modules/gdal"
 reportMissingImports = "none"
 
 [[tool.pyright.executionEnvironments]]
-root = "src/dynastore/modules/edr"
+root = "packages/core/src/dynastore/modules/edr"
 reportMissingImports = "none"
 
 [[tool.pyright.executionEnvironments]]
-root = "src/dynastore/tasks/gdal"
+root = "packages/core/src/dynastore/tasks/gdal"
 reportMissingImports = "none"
 
 [[tool.pyright.executionEnvironments]]
-root = "src/dynastore/tasks/ingestion"
+root = "packages/core/src/dynastore/tasks/ingestion/readers"
 reportMissingImports = "none"
 
 [[tool.pyright.executionEnvironments]]
-root = "src/dynastore/extensions/coverages"
+root = "packages/extensions/coverages/src/dynastore/extensions/coverages"
 reportMissingImports = "none"
 
 [[tool.pyright.executionEnvironments]]

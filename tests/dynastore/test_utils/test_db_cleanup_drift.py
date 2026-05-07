@@ -20,7 +20,7 @@ docstring at ``tests/dynastore/test_utils/db_cleanup.py``):
 1. ``tests/dynastore/test_utils/db_cleanup.py`` — TEST-ONLY, never
    shipped in the production wheel. Used by the test-suite cleanup
    fixture (``tests/dynastore/modules/catalog/cleanup.py``).
-2. ``src/dynastore/scripts/db_reset.py`` — production wheel, invoked
+2. ``packages/core/src/dynastore/scripts/db_reset.py`` — production wheel, invoked
    by the ``Reset database (review only)`` Cloud Run job.
 
 The duplication is intentional: importing the test-utils module from a

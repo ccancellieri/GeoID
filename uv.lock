@@ -13,6 +13,7 @@ resolution-markers = [
 [manifest]
 members = [
     "dynastore",
+    "dynastore-core",
     "dynastore-ext-admin",
     "dynastore-ext-assets",
     "dynastore-ext-auth",
@@ -823,12 +824,7 @@ wheels = [
 name = "dynastore"
 source = { editable = "." }
 dependencies = [
-    { name = "orjson" },
-    { name = "pydantic" },
-    { name = "pydantic-extra-types" },
-    { name = "pydantic-settings" },
-    { name = "python-dateutil" },
-    { name = "python-dotenv" },
+    { name = "dynastore-core" },
 ]
 
 [package.optional-dependencies]
@@ -3074,6 +3070,7 @@ requires-dist = [
     { name = "dynastore", extras = ["task-base"], marker = "extra == 'outbox-drain'" },
     { name = "dynastore", extras = ["test"], marker = "extra == 'dev'" },
     { name = "dynastore", extras = ["test"], marker = "extra == 'notebooks-test'" },
+    { name = "dynastore-core", editable = "packages/core" },
     { name = "dynastore-ext-admin", marker = "extra == 'extension-admin'", editable = "packages/extensions/admin" },
     { name = "dynastore-ext-assets", marker = "extra == 'extension-assets'", editable = "packages/extensions/assets" },
     { name = "dynastore-ext-auth", marker = "extra == 'extension-auth'", editable = "packages/extensions/auth" },
@@ -3153,7 +3150,6 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'geospatial-io'", specifier = "==1.26.4" },
     { name = "ogc-dimensions", marker = "extra == 'extension-dimensions'", git = "https://github.com/ccancellieri/ogc-dimensions.git?subdirectory=reference-implementation&rev=main" },
     { name = "opensearch-py", extras = ["async"], marker = "extra == 'module-elasticsearch'" },
-    { name = "orjson", specifier = ">=3.9.0" },
     { name = "orjson", marker = "extra == 'test'", specifier = ">=3.9.15" },
     { name = "pandas", marker = "extra == 'joins'" },
     { name = "pmtiles", marker = "extra == 'module-gcp'", specifier = ">=3.2.0" },
@@ -3163,10 +3159,7 @@ requires-dist = [
     { name = "psycopg2-binary", marker = "extra == 'module-datastore'", specifier = ">=2.9.7" },
     { name = "pyarrow", marker = "extra == 'geospatial-io'", specifier = ">=16,<19" },
     { name = "pyarrow", marker = "extra == 'module-storage-iceberg'", specifier = ">=14.0.0" },
-    { name = "pydantic", specifier = ">=2.0" },
     { name = "pydantic", extras = ["email"], marker = "extra == 'module-iam'" },
-    { name = "pydantic-extra-types", specifier = ">=2.10.6" },
-    { name = "pydantic-settings", specifier = ">=2.3.0" },
     { name = "pygeofilter", extras = ["backend-sqlalchemy"], marker = "extra == 'extension-features'" },
     { name = "pygeofilter", extras = ["backend-sqlalchemy"], marker = "extra == 'extension-records'" },
     { name = "pyiceberg", extras = ["sql-postgres"], marker = "extra == 'module-storage-iceberg'", specifier = ">=0.9.0" },
@@ -3182,9 +3175,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=4.1.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.3.0" },
     { name = "pytest-xdist", marker = "extra == 'test'", specifier = ">=3.5.0" },
-    { name = "python-dateutil" },
     { name = "python-dateutil", marker = "extra == 'module-db-config'" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "python-dotenv", marker = "extra == 'module-notebooks'" },
     { name = "python-dotenv", marker = "extra == 'notebooks-test'", specifier = ">=1.0" },
     { name = "python-multipart", marker = "extra == 'extension-auth'", specifier = ">=0.0.26" },
@@ -3211,6 +3202,28 @@ requires-dist = [
     { name = "zarr", marker = "extra == 'module-coverages-zarr'", specifier = ">=2.18.0" },
 ]
 provides-extras = ["module-storage", "module-storage-postgresql", "module-storage-duckdb", "module-storage-iceberg", "module-storage-elasticsearch", "module-storage-elasticsearch-private", "module-storage-elasticsearch-assets", "module-collection-elasticsearch", "module-catalog-elasticsearch", "module-stac", "module-catalog", "module-gcp", "module-datastore", "module-db-config", "module-iam", "module-local", "module-db", "module-crs", "module-events", "module-elasticsearch", "module-gdal", "module-tiles", "module-cache", "module-tasks", "module-proxy", "module-styles", "module-moving-features", "module-connected-systems", "module-stats", "module-notebooks", "extension-base", "extension-web", "extension-httpx", "extension-catalog", "extension-stac", "extension-auth", "extension-template", "extension-processes", "extension-features", "extension-tiles", "extension-volumes", "extension-tasks", "extension-proxy", "extension-gdal", "extension-styles", "extension-moving-features", "extension-connected-systems", "extension-iam", "extension-logs", "extension-configs", "extension-stats", "extension-crs", "extension-events", "extension-wfs", "extension-admin", "extension-assets", "extension-notebooks", "extension-records", "extension-search", "extension-gcp-bucket", "extension-geoid", "extension-maps", "extension-coverages", "extension-edr", "extension-dggs", "module-coverages-netcdf", "module-coverages-zarr", "extension-dwh", "extension-dimensions", "task-gdal-deps", "task-elasticsearch-deps", "task-elasticsearch-indexer-deps", "task-ingestion-deps", "task-dwh-join-deps", "task-export-features-deps", "task-tiles-preseed-deps", "task-dimensions-materialize-deps", "catalog-task-gcp-provision", "catalog-task-gcp-catalog-cleanup", "catalog", "gcp", "datastore", "db-config", "iam", "db", "crs", "cache", "events", "elasticsearch", "gdal", "maps", "stac", "stats", "web", "geoid", "processes", "features", "styles", "moving-features", "connected-systems", "tiles", "tasks", "proxy", "logs", "assets", "configs", "search", "storage", "auth", "template", "dimensions", "notebooks", "edr", "geospatial-core", "geospatial-io", "geospatial", "db-async", "db-sync", "core", "catalog-data-grp", "catalog-routes-grp", "catalog-grp", "maps-grp", "dwh-grp", "gcp-routes-grp", "google-grp", "auth-grp", "tools-core-grp", "tools-grp", "monitor-grp", "index-grp", "drivers-grp", "task-base", "ingestion", "outbox-drain", "worker-task-dwh-join", "worker-task-ingestion", "worker-task-export-features", "worker-task-tiles-preseed", "worker-task-gdal", "worker-task-dimensions-materialize", "worker-task-elasticsearch-indexer", "api-open", "api-catalog", "api-maps-open", "api-maps", "api-features", "api-full", "geoid-service", "worker-service", "catalog-local", "worker-local", "scope-catalog", "scope-geoid", "scope-worker", "scope-tools", "scope-maps", "all", "typecheck", "test", "notebooks-test", "lite-build", "dev", "mvt", "joins", "dwh", "psycopg-pool"]
+
+[[package]]
+name = "dynastore-core"
+source = { editable = "packages/core" }
+dependencies = [
+    { name = "orjson" },
+    { name = "pydantic" },
+    { name = "pydantic-extra-types" },
+    { name = "pydantic-settings" },
+    { name = "python-dateutil" },
+    { name = "python-dotenv" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "orjson", specifier = ">=3.9.0" },
+    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pydantic-extra-types", specifier = ">=2.10.6" },
+    { name = "pydantic-settings", specifier = ">=2.3.0" },
+    { name = "python-dateutil" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+]
 
 [[package]]
 name = "dynastore-ext-admin"

@@ -38,7 +38,7 @@ from dynastore.models.protocols.authorization import DefaultRole
 
 
 import dynastore.modules.db_config.shared_queries as shared_queries
-from dynastore.extensions import get_extension_instance
+from dynastore.extensions.registry import get_extension_instance
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.web.decorators import expose_static
 from .policies import stac_policies, stac_role_bindings

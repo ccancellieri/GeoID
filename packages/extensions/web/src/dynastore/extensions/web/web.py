@@ -35,7 +35,8 @@ from dynastore.extensions.web.cors_middleware import DynamicCORSMiddleware
 from fastapi.routing import APIRoute
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
-from dynastore.extensions import ExtensionProtocol, get_extension_instance
+from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.registry import get_extension_instance
 from dynastore.extensions.tools.conformance import (
     get_active_conformance,
     Conformance,

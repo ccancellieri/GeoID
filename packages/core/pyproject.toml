@@ -1,0 +1,127 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../LICENSE.
+#
+# dynastore-core — the foundational wheel of the dynastore platform.
+#
+# Contains:
+#   • dynastore.modules.*         — library code (catalog, gcp, iam, db_config,
+#                                   storage, tasks framework, …)
+#   • dynastore.tools.*           — discovery, cache, db utils, json, …
+#   • dynastore.models.*          — protocol contracts, shared schemas
+#   • dynastore.tasks.*           — concrete task implementations
+#   • dynastore.extensions.{protocols,ogc_base,ogc_models_shared,
+#       lifespan,registry,bootstrap,tools/}  — shared extension base
+#   • dynastore.bootstrap, .main, .main_task, .main_worker
+#   • dynastore.scripts/          — start.sh, start-task.sh (package data)
+#   • dynastore.docker/           — compose fragments + Dockerfile (package data)
+#
+# Heavy module/task third-party deps stay in the root meta-package's
+# `[project.optional-dependencies]` (extras like `module_gcp`, `module_catalog`)
+# so SCOPE composition still controls what gets installed. Core ships
+# the *source* unconditionally; the heavy *libs* only land when an extra
+# pulls them in.
+
+[project]
+name = "dynastore-core"
+dynamic = ["version"]
+description = "DynaStore core — modules, tools, models, tasks, shared extension base."
+requires-python = ">=3.12"
+license-files = ["../../LICENSE"]
+
+# Minimal core framework — same set the root meta-package used to declare
+# under [project.dependencies] before the split. Anything heavier (sqlalchemy,
+# google-cloud-*, GDAL, asyncpg, …) is opt-in via the meta-package's
+# `module_*` extras and only lands in environments whose SCOPE pulls them in.
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.3.0",
+    "pydantic-extra-types>=2.10.6",
+    "python-dotenv>=1.0.0",
+    "python-dateutil",
+    "orjson>=3.9.0",
+]
+
+# ============================================================================
+# MODULES — library entry-points
+# Each module registers itself via `register_plugin(self)` during bootstrap.
+# Discovery loops over these entry-points at startup; modules whose third-party
+# deps aren't installed (because the SCOPE didn't pull them in) raise
+# ImportError and are skipped — same behavior as before the wheel split.
+# ============================================================================
+[project.entry-points."dynastore.modules"]
+cache = "dynastore.modules.cache.cache_module:CacheModule"
+tasks = "dynastore.modules.tasks.tasks_module:TasksModule"
+proxy = "dynastore.modules.proxy.proxy_module:ProxyModule"
+gdal = "dynastore.modules.gdal.gdal_module:GdalModule"
+catalog = "dynastore.modules.catalog.catalog_module:CatalogModule"
+gcp = "dynastore.modules.gcp.gcp_module:GCPModule"
+tiles = "dynastore.modules.tiles.tiles_module:TilesModule"
+datastore = "dynastore.modules.datastore.datastore_service:DatastoreModule"
+styles = "dynastore.modules.styles.styles_module:StylesModule"
+moving_features = "dynastore.modules.moving_features.mf_module:MovingFeaturesModule"
+local_upload = "dynastore.modules.local.local_upload:LocalUploadModule"
+connected_systems = "dynastore.modules.connected_systems.ddl:ConnectedSystemsModule"
+db_config = "dynastore.modules.db_config.db_config_service:DBConfigModule"
+iam = "dynastore.modules.iam.module:IamModule"
+db = "dynastore.modules.db.db_service:DBService"
+crs = "dynastore.modules.crs.crs_module:CRSModule"
+events = "dynastore.modules.events.events_module:EventsModule"
+notebooks = "dynastore.modules.notebooks.notebooks_module:NotebooksModule"
+stac = "dynastore.modules.stac.module:StacModule"
+elasticsearch = "dynastore.modules.elasticsearch.module:ElasticsearchModule"
+stats = "dynastore.modules.stats.stats_module:STATS"
+web = "dynastore.modules.web.web_module:WebModule"
+storage_postgresql = "dynastore.modules.storage.drivers.postgresql:ItemsPostgresqlDriver"
+storage_elasticsearch = "dynastore.modules.storage.drivers.elasticsearch:ItemsElasticsearchDriver"
+storage_elasticsearch_private = "dynastore.modules.storage.drivers.elasticsearch_private:ItemsElasticsearchPrivateDriver"
+storage_elasticsearch_assets = "dynastore.modules.storage.drivers.elasticsearch:AssetElasticsearchDriver"
+storage_duckdb = "dynastore.modules.storage.drivers.duckdb:ItemsDuckdbDriver"
+storage_iceberg = "dynastore.modules.storage.drivers.iceberg:ItemsIcebergDriver"
+storage_bigquery = "dynastore.modules.storage.drivers.bigquery:ItemsBigQueryDriver"
+collection_elasticsearch = "dynastore.modules.elasticsearch.collection_es_driver:CollectionElasticsearchDriver"
+collection_elasticsearch_private = "dynastore.modules.storage.drivers.elasticsearch_private.collection_driver:CollectionElasticsearchPrivateDriver"
+catalog_elasticsearch = "dynastore.modules.elasticsearch.catalog_es_driver:CatalogElasticsearchDriver"
+collection_postgresql = "dynastore.modules.storage.drivers.collection_postgresql:CollectionPostgresqlDriver"
+catalog_postgresql = "dynastore.modules.storage.drivers.catalog_postgresql:CatalogPostgresqlDriver"
+metadata_catalog_log_indexer = "dynastore.modules.storage.drivers.catalog_log_indexer:LogCatalogIndexer"
+
+# ============================================================================
+# TASKS — worker entry-points
+# Each task registers a TaskProtocol implementation. Workers discover what
+# they should run via the `dynastore.tasks` entry-point group; the task
+# routing config in module_tasks decides which task runs in which service.
+# (Future: split into per-task wheels under packages/tasks/<name>/.)
+# ============================================================================
+[project.entry-points."dynastore.tasks"]
+gdal = "dynastore.tasks.gdal.gdalinfo_task:GdalInfoTask"
+gcp_provision = "dynastore.tasks.gcp_provision.task:ProvisioningTask"
+elasticsearch = "dynastore.tasks.elasticsearch.tasks:ElasticsearchIndexTask"
+elasticsearch_indexer = "dynastore.tasks.elasticsearch_indexer.indexer_task:ElasticsearchIndexerTask"
+elasticsearch_private_tasks = "dynastore.modules.storage.drivers.elasticsearch_private.tasks:PrivateIndexTask"
+ingestion = "dynastore.tasks.ingestion.ingestion_task:IngestionTask"
+dwh_join = "dynastore.tasks.dwh_join.dwh_join_export_task:DwhJoinExportTask"
+export_features = "dynastore.tasks.export_features.export_features_task:ExportFeaturesTask"
+tiles_preseed = "dynastore.tasks.tiles_preseed.task:TilePreseedTask"
+dimensions_materialize = "dynastore.tasks.dimensions_materialize.task:DimensionsMaterializeTask"
+outbox_drain = "dynastore.tasks.outbox_drain.drain_task:OutboxDrainTask"
+gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
+
+[build-system]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+# Inherit the same broad globs the root meta-package used before the split.
+# Captures HTML/SQL/MD docstrings, package-shipped JS/CSS, notebook templates,
+# Kibana NDJSON dashboards, shell startup scripts, .env baselines, the
+# Dockerfile + compose fragments, and the entire `static/**` tree wherever
+# it appears (modules.web, modules.notebooks, …).
+"*" = ["*.html", "*.sql", "*.md", "*.css", "*.js", "*.txt", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ipynb", "*.ndjson", "*.sh", "*.env", "*.yml", "Dockerfile*", "static/**"]
+
+[tool.setuptools_scm]
+version_file = "src/dynastore/_scm_version.py"
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"

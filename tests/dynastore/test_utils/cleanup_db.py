@@ -29,7 +29,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://testuser:testpass
 if "asyncpg" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
-# Boot tier (src/dynastore/scripts/db_reset.sh, invoked by the dev/test db container
+# Boot tier (packages/core/src/dynastore/scripts/db_reset.sh, invoked by the dev/test db container
 # entrypoint) already drops all user schemas + orphan cron jobs before Postgres
 # is reported healthy. When that ran recently the pre-session wipe is redundant,
 # so we probe first and short-circuit. The pytest_sessionfinish hook keeps

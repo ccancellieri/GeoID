@@ -19,7 +19,7 @@
 import logging
 import httpx
 from contextlib import asynccontextmanager
-from dynastore.extensions import ExtensionProtocol
+from dynastore.extensions.protocols import ExtensionProtocol
 from fastapi import Request, FastAPI
 from typing import Optional
 

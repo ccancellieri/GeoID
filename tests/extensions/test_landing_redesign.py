@@ -20,8 +20,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GEOID_STATIC = REPO_ROOT / "src/dynastore/extensions/geoid/static"
-GEOID_PY = REPO_ROOT / "src/dynastore/extensions/geoid/geoid.py"
+GEOID_STATIC = REPO_ROOT / "packages/extensions/geoid/src/dynastore/extensions/geoid/static"
+GEOID_PY = REPO_ROOT / "packages/extensions/geoid/src/dynastore/extensions/geoid/geoid.py"
 
 REQUIRED_FILES = [
     GEOID_STATIC / "conformance-snapshot.json",

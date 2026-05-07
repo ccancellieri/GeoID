@@ -22,7 +22,7 @@ from uuid import UUID
 from fastapi import FastAPI, APIRouter, HTTPException, Query, Request
 from contextlib import asynccontextmanager
 
-from dynastore.extensions import ExtensionProtocol
+from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.modules import get_protocol
 from dynastore.modules.iam.iam_service import IamService
 from dynastore.models.protocols.catalogs import CatalogsProtocol

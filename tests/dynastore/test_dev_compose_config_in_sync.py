@@ -1,9 +1,9 @@
 """Drift detector for the per-service dev-compose config dirs.
 
-``src/dynastore/docker/config/<svc>/defaults/`` is duplicated across the
+``packages/core/src/dynastore/docker/config/<svc>/defaults/`` is duplicated across the
 five local-dev services because Docker bind mounts cannot overlay a sub-
 directory inside a ``:ro`` parent (see
-``src/dynastore/docker/config/example/README.md`` "Pitfall" section). This
+``packages/core/src/dynastore/docker/config/example/README.md`` "Pitfall" section). This
 test catches drift between the copies — every ``defaults/*.json`` file in
 every service dir must hold identical content. Without this, a routing
 change to one service silently makes the other four wrong, and the gate
@@ -43,7 +43,7 @@ def test_all_dev_service_dirs_have_defaults():
     assert not missing, (
         f"docker/config/<svc>/defaults/ missing for: {missing}. "
         "Each dev service needs a self-contained config tree — see "
-        "src/dynastore/docker/config/example/README.md (Pitfall section)."
+        "packages/core/src/dynastore/docker/config/example/README.md (Pitfall section)."
     )
 
 

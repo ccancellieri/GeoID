@@ -38,7 +38,7 @@ from fastapi import (
 )
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from dynastore.extensions import ExtensionProtocol
+from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.exception_handlers import http_errors
 from dynastore.models.protocols import CatalogsProtocol

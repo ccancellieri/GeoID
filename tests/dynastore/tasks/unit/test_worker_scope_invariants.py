@@ -290,8 +290,8 @@ def test_every_dynastore_tasks_entry_point_resolves_to_existing_module() -> None
     bad: list[str] = []
     for ep_name, ep_target in entry_points.items():
         module_path = ep_target.split(":")[0]
-        # dynastore.tasks.foo.bar -> src/dynastore/tasks/foo/bar.py OR
-        #                            src/dynastore/tasks/foo/bar/__init__.py
+        # dynastore.tasks.foo.bar -> packages/core/src/dynastore/tasks/foo/bar.py OR
+        #                            packages/core/src/dynastore/tasks/foo/bar/__init__.py
         rel = module_path.replace(".", "/")
         as_file = src_root / f"{rel}.py"
         as_pkg = src_root / rel / "__init__.py"
@@ -307,7 +307,7 @@ def test_every_dynastore_tasks_entry_point_resolves_to_existing_module() -> None
 def _assert_entry_point_group_loads(group: str) -> None:
     """Helper: load every entry-point in ``group`` and assert no real bugs.
 
-    Mirrors ``src/dynastore/tools/discovery.py::discover_and_load_plugins``
+    Mirrors ``packages/core/src/dynastore/tools/discovery.py::discover_and_load_plugins``
     (the function called by ``discover_modules``, ``discover_extensions`` and
     ``discover_tasks`` at every service startup):
     - ``EntryPoint.load()`` per entry — executes module top-level statements

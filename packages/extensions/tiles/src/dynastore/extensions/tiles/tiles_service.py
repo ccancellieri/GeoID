@@ -41,7 +41,8 @@ from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
 from sqlalchemy.ext.asyncio import AsyncConnection
 from pyproj import CRS
 
-from dynastore.extensions import protocols, get_extension_instance
+from dynastore.extensions.registry import get_extension_instance
+from dynastore.extensions import protocols
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.web import WebModuleProtocol, StaticFilesProtocol

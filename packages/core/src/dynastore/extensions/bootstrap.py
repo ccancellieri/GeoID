@@ -18,7 +18,12 @@
 
 import logging
 from typing import List, Optional, Any, cast
-from dynastore import extensions, tasks
+from dynastore import tasks
+from dynastore.extensions.registry import (
+    discover_extensions,
+    instantiate_extensions,
+)
+from dynastore.extensions.lifespan import apply_app_configurations
 from dynastore.bootstrap import bootstrap_foundation, instantiate_foundation
 from dynastore.tools.db import InvalidIdentifierError
 
@@ -45,10 +50,10 @@ def bootstrap_app(
 
     logger.info("--- [extensions/bootstrap.py] Discovering extensions and tasks ---")
     tasks.discover_tasks()
-    extensions.discover_extensions()
+    discover_extensions()
 
-    extensions.instantiate_extensions(app, include_only=include_extensions)
-    extensions.apply_app_configurations(app)
+    instantiate_extensions(app, include_only=include_extensions)
+    apply_app_configurations(app)
 
     # 6. Global Exception Handlers
     @app.exception_handler(InvalidIdentifierError)

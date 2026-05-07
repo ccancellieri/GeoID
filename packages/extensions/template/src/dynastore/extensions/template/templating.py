@@ -48,7 +48,8 @@ import xml.etree.ElementTree as ET
 import dynastore.extensions.httpx.httpx_service as httpx_service
 from pydantic import AnyUrl, confloat
 from dynastore.tools.cache import cached
-from dynastore.extensions import ExtensionProtocol, get_extension_instance
+from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.registry import get_extension_instance
 
 try:
     from lxml import etree as lxml_etree  # type: ignore[import-not-found]
