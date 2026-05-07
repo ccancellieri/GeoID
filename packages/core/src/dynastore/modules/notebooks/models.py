@@ -100,6 +100,22 @@ class PlatformNotebookCreate(NotebookBase):
     content: Dict[str, Any] = Field(..., description="The full .ipynb JSON structure.")
     registered_by: str = Field(..., description="Module name or 'sysadmin'.")
     owner_type: OwnerType = Field(..., description="'module' or 'sysadmin'.")
+    default_catalog_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "UI hint: when the user clicks 'Copy to Catalog', this catalog "
+            "id is pre-selected. Purely advisory; the user can override."
+        ),
+    )
+    applies_to: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Allowlist of catalog ids the notebook is meant for. "
+            "None means it applies to every catalog. (Empty list normalises "
+            "to None — see NotebookContribution for the canonical form used "
+            "by contributors.)"
+        ),
+    )
 
 
 class PlatformNotebook(PlatformNotebookCreate):

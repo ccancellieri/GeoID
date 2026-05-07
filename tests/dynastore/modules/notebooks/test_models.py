@@ -1,7 +1,5 @@
 from datetime import datetime
 from dynastore.modules.notebooks.models import (
-    NotebookBase,
-    NotebookCreate,
     Notebook,
     PlatformNotebookCreate,
     PlatformNotebook,
@@ -72,3 +70,41 @@ def test_tenant_notebook_defaults():
     assert nb.owner_id is None
     assert nb.copied_from is None
     assert nb.deleted_at is None
+
+
+def test_platform_notebook_create_carries_default_catalog_and_applies_to():
+    from dynastore.modules.notebooks.models import (
+        OwnerType,
+        PlatformNotebookCreate,
+    )
+    from dynastore.models.localization import LocalizedText
+
+    nb = PlatformNotebookCreate(
+        notebook_id="x",
+        title=LocalizedText(en="X"),
+        content={"cells": []},
+        registered_by="t",
+        owner_type=OwnerType.MODULE,
+        default_catalog_id="demo-catalog",
+        applies_to=["demo-catalog", "spanner-catalog"],
+    )
+    assert nb.default_catalog_id == "demo-catalog"
+    assert nb.applies_to == ["demo-catalog", "spanner-catalog"]
+
+
+def test_platform_notebook_create_defaults_for_targeting_fields_are_none():
+    from dynastore.modules.notebooks.models import (
+        OwnerType,
+        PlatformNotebookCreate,
+    )
+    from dynastore.models.localization import LocalizedText
+
+    nb = PlatformNotebookCreate(
+        notebook_id="x",
+        title=LocalizedText(en="X"),
+        content={"cells": []},
+        registered_by="t",
+        owner_type=OwnerType.MODULE,
+    )
+    assert nb.default_catalog_id is None
+    assert nb.applies_to is None
