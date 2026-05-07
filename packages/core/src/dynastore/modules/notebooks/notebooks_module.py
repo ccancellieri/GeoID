@@ -59,6 +59,7 @@ class NotebooksModule(ModuleProtocol):
                 "dynastore.modules.storage.notebooks",
                 "dynastore.modules.elasticsearch.notebooks",
                 "dynastore.tasks.ingestion.notebooks",
+                "dynastore.tasks.dimensions_materialize.notebooks",
             ):
                 try:
                     __import__(mod_path)

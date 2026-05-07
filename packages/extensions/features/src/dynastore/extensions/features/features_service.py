@@ -377,6 +377,9 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
     async def lifespan(self, app: FastAPI):
         self.register_policies()
         logger.info("OGCFeaturesService: policies registered.")
+        # Side-effect import: registers showcase notebooks into the
+        # platform notebook table so JupyterLite picks them up.
+        from . import notebooks  # noqa: F401
         yield
 
     def register_policies(self):
