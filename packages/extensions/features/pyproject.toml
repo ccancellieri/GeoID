@@ -27,3 +27,6 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "dynastore.extensions.features" = ["*.md", "notebooks/*"]
+
+[tool.uv.sources]
+dynastore = { workspace = true }

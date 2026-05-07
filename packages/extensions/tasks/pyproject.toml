@@ -37,3 +37,6 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "dynastore.extensions.tasks" = ["*.html"]
+
+[tool.uv.sources]
+dynastore = { workspace = true }
