@@ -472,6 +472,9 @@ class STACItem(Feature):
     def validate_as_stac_item(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         if not values:
             raise ValueError("Request body cannot be empty.")
+        if not isinstance(values, dict):
+            # Pydantic will surface a proper type error; skip STAC-specific validation.
+            return values  # type: ignore[return-value]
 
         try:
             # 1. Prepare a flattened version for strict STAC validation
@@ -553,8 +556,9 @@ class STACItem(Feature):
         except Exception as ve:
             # If validation fails, we log it but don't block.
             # This makes the validation lenient as requested.
+            item_id = values.get("id", "unknown") if isinstance(values, dict) else "unknown"
             logger.warning(
-                f"STAC Item validation warning for {values.get('id', 'unknown')}: {str(ve)}"
+                f"STAC Item validation warning for {item_id}: {str(ve)}"
             )
             # we don't raise here to allow lenient loading of extensions
             # and non-standard fields like boolean 'updated'
