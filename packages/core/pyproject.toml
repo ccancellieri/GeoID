@@ -103,6 +103,7 @@ export_features = "dynastore.tasks.export_features.export_features_task:ExportFe
 tiles_preseed = "dynastore.tasks.tiles_preseed.task:TilePreseedTask"
 dimensions_materialize = "dynastore.tasks.dimensions_materialize.task:DimensionsMaterializeTask"
 outbox_drain = "dynastore.tasks.outbox_drain.drain_task:OutboxDrainTask"
+index_propagation = "dynastore.tasks.index_propagation.task:IndexPropagationTask"
 gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
 
 [build-system]

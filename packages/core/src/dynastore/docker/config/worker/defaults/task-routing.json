@@ -12,6 +12,7 @@
       "elasticsearch_bulk_reindex_catalog":    ["catalog"],
       "elasticsearch_bulk_reindex_collection": ["catalog"],
       "elasticsearch_indexer":                 ["worker"],
+      "index_propagation":                    ["catalog"],
       "ingestion":                             ["worker"],
       "gdal":                                  ["worker"],
       "tiles_preseed":                         ["worker"],
