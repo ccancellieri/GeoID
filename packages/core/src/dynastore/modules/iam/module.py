@@ -179,6 +179,7 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                             os.environ.get("IDP_PUBLIC_URL")
                             or os.environ.get("KEYCLOAK_PUBLIC_URL")
                         ),
+                        roles_claim_path=os.environ.get("IDP_ROLES_CLAIM_PATH"),
                     )
                 )
                 logger.info("Registered OIDC identity provider: %s", idp_issuer)

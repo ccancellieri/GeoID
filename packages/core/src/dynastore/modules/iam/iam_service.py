@@ -360,12 +360,6 @@ class IamService:
         should re-fetch effective permissions in that case.
         """
         cfg = await self._get_oidc_sync_config()
-        logger.info(
-            "OIDC sync probe: enabled=%s role_mapping=%s principal=%s identity_roles=%s issuer=%s",
-            cfg.enabled, cfg.role_mapping, getattr(principal, "id", None),
-            identity.get("roles"),
-            (identity.get("raw_claims") or {}).get("iss") if isinstance(identity.get("raw_claims"), dict) else None,
-        )
         if not cfg.enabled or not cfg.role_mapping:
             return False
 
@@ -374,13 +368,11 @@ class IamService:
             try:
                 principal_id = UUID(str(principal_id))
             except Exception:
-                logger.warning("OIDC sync: principal.id %r not a UUID — skipping", principal_id)
                 return False
 
         now = time.monotonic()
         last = self._oidc_sync_cache.get(principal_id, 0.0)
         if now - last < cfg.ttl_seconds:
-            logger.info("OIDC sync: TTL skip for %s (age=%.1fs)", principal_id, now - last)
             return False
 
         raw_claims = identity.get("raw_claims") or {}
