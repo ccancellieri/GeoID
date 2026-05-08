@@ -53,39 +53,6 @@ from pydantic import Field
 
 logger = logging.getLogger(__name__)
 
-
-def _maybe_raise_mapping_mismatch(
-    exc: Exception, index_name: str, doc: Dict[str, Any]
-) -> None:
-    """Translate an opensearch ``illegal_argument_exception`` raised
-    because of a missing mapped field into a typed
-    :class:`IndexMappingMismatchError` (→ HTTP 503).
-
-    Keeps the original ``exc`` chained for unrelated errors. No-op
-    when the exception isn't an ES mapping mismatch.
-    """
-    info = getattr(exc, "info", None)
-    if not isinstance(info, dict):
-        return
-    err = info.get("error")
-    err_type = err.get("type") if isinstance(err, dict) else None
-    if err_type != "illegal_argument_exception":
-        return
-    reason = (err.get("reason") if isinstance(err, dict) else None) or str(exc)
-    field: Optional[str] = None
-    for key in doc.keys():
-        if key in reason:
-            field = key
-            break
-    from dynastore.modules.storage.errors import IndexMappingMismatchError
-    raise IndexMappingMismatchError(
-        f"ES rejected write to '{index_name}' — mapping is out of date "
-        f"(field '{field}' not in mapping). "
-        f"Reindex required. Original: {reason}",
-        index=index_name,
-        field=field,
-    ) from exc
-
 class CollectionElasticsearchDriverConfig(_PluginDriverConfig):
     """Configuration for the Elasticsearch collection driver.
 
@@ -349,7 +316,10 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 params={"routing": catalog_id, "refresh": "wait_for"},
             )
         except Exception as exc:
-            _maybe_raise_mapping_mismatch(exc, index_name, doc)
+            from dynastore.modules.elasticsearch._mapping_errors import (
+                maybe_raise_mapping_mismatch,
+            )
+            maybe_raise_mapping_mismatch(exc, index_name, doc.keys())
             raise
 
     async def delete_metadata(
