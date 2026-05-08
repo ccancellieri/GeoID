@@ -409,20 +409,16 @@ class ValkeyCacheBackend:
                 self._record_success()
                 return result
             if namespace is not None:
-                # SCAN + UNLINK by prefix pattern
-                # Cache keys use "|" as separator (from _make_cache_key)
+                # Cache keys use "|" as separator (from _make_cache_key).
+                # scan_iter handles both standalone and cluster (where a raw
+                # scan() returns a per-node dict cursor that can't be re-fed).
                 pattern = f"{self._prefix}{namespace}|*"
                 count = 0
-                cursor: int = 0
-                while True:
-                    cursor, keys = await self._client.scan(
-                        cursor, match=pattern, count=200
-                    )
-                    if keys:
-                        await self._client.unlink(*keys)
-                        count += len(keys)
-                    if cursor == 0:
-                        break
+                async for k in self._client.scan_iter(match=pattern, count=200):
+                    # One-key UNLINK avoids CROSSSLOT errors on clustered
+                    # Valkey, where a multi-key call across slots fails.
+                    if await self._client.unlink(k):
+                        count += 1
                 self._record_success()
                 return count > 0
             if tags is not None:
