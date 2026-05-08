@@ -271,38 +271,25 @@ class TaskTableOutboxWriter:
     ) -> None:
         """Execute the INSERT on the caller's connection.
 
-        Detects the connection flavour at call time:
+        Delegates to :class:`DQLQuery` so connection-flavour dispatch
+        (sync/async SA ``Connection``/``Session``) and named-bind
+        translation are handled in one place — same path every other
+        query in the codebase uses. This keeps the OUTBOX writer free
+        of bespoke isinstance ladders and inherits the typed exception
+        surface (``DatabaseConnectionError`` / ``QueryExecutionError``,
+        plus transient-asyncpg detection from #235/#239).
 
-        * SQLAlchemy ``AsyncConnection`` — uses ``conn.execute(text(...))``.
-        * asyncpg connection — uses ``conn.execute(...)`` with ``$N``-style
-          parameters and a positional argument list.
-        * Anything else — raises so the dispatcher can fall back to
-          degraded-WARN mode.
+        ``ctx.pg_conn`` always comes from ``managed_transaction(engine)``
+        which yields a SA resource; raw asyncpg connections are not
+        produced by that contract, so DQLQuery's SA-only dispatch is
+        sufficient.
         """
-        # Detect connection flavour without swallowing execute() errors.
-        # The previous shape wrapped the isinstance check AND the execute in
-        # one try/except, so a real SQLAlchemy failure (e.g. poisoned tx
-        # state) silently fell through to the asyncpg branch and produced
-        # a misleading "AsyncConnection.execute() takes 2-3 positional
-        # arguments but N were given" error that masked the actual cause.
-        sa_async_conn_cls: Any = None
-        sa_text: Any = None
-        try:
-            from sqlalchemy import text as _sa_text
-            from sqlalchemy.ext.asyncio import AsyncConnection as _SAAsyncConnection
-            sa_async_conn_cls = _SAAsyncConnection
-            sa_text = _sa_text
-        except Exception:
-            pass
-
-        if sa_async_conn_cls is not None and isinstance(conn, sa_async_conn_cls):
-            await conn.execute(sa_text(sql), params)
-            return
-
-        # asyncpg path — translate :name placeholders to $N positional args.
-        sql_pg, args = _bind_named_to_positional(sql, params)
-        asyncpg_conn: Any = conn
-        await asyncpg_conn.execute(sql_pg, *args)
+        from dynastore.modules.db_config.query_executor import (
+            DQLQuery, ResultHandler,
+        )
+        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
+            conn, **params,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -558,41 +545,6 @@ async def reset_index_dispatcher() -> None:
     global _DEFAULT_DISPATCHER
     _DEFAULT_DISPATCHER = None
     await _close_outbox_pool()
-
-
-def _bind_named_to_positional(sql: str, params: Dict[str, Any]):
-    """Translate ``:name`` placeholders to ``$N`` for asyncpg.
-
-    Skips PostgreSQL ``::`` cast operators (``:inputs::jsonb`` →
-    ``$1::jsonb``).  Order is determined by first appearance in ``sql``
-    — same convention SQLAlchemy uses internally for named-bind
-    compilation.
-    """
-    out: List[str] = []
-    args: List[Any] = []
-    seen: Dict[str, int] = {}
-    i = 0
-    while i < len(sql):
-        ch = sql[i]
-        # Skip the PG ``::`` cast operator — it's not a bind site.
-        if ch == ":" and i + 1 < len(sql) and sql[i + 1] == ":":
-            out.append("::")
-            i += 2
-            continue
-        if ch == ":" and (i + 1 < len(sql)) and (sql[i + 1].isalpha() or sql[i + 1] == "_"):
-            j = i + 1
-            while j < len(sql) and (sql[j].isalnum() or sql[j] == "_"):
-                j += 1
-            name = sql[i + 1:j]
-            if name not in seen:
-                seen[name] = len(args) + 1
-                args.append(params[name])
-            out.append(f"${seen[name]}")
-            i = j
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out), args
 
 
 # ---------------------------------------------------------------------------

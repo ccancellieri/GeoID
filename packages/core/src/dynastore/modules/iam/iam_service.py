@@ -21,6 +21,7 @@
 import logging
 import secrets
 import os
+import time
 import jwt
 from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple, Any, Dict, Union, AsyncGenerator
@@ -46,6 +47,8 @@ from .exceptions import (
     QuotaExceededError,
     IamError,
 )
+from . import oidc_role_sync
+from .oidc_role_sync_config import OidcRoleSyncConfig
 
 from dynastore.modules.db_config.tools import managed_transaction
 from dynastore.modules import get_protocol
@@ -54,6 +57,7 @@ from dynastore.models.protocols import (
     DatabaseProtocol,
     CatalogsProtocol,
 )
+from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
 from dynastore.models.protocols.policies import PermissionProtocol
 from dynastore.models.driver_context import DriverContext
 
@@ -88,6 +92,9 @@ class IamService:
         # as the fallback) so seed-time naming stays consistent with
         # runtime checks throughout the request lifecycle.
         self._role_config = role_config or IamRoleConfig()
+        # Per-principal "last synced at" monotonic clock; bounds OIDC
+        # reconciliation to one DB write window per TTL per principal.
+        self._oidc_sync_cache: Dict[UUID, float] = {}
 
     async def get_jwt_secret(self) -> str:
         """Retrieves or generates the active JWT secret."""
@@ -293,18 +300,11 @@ class IamService:
         Returns:
             Principal with merged permissions, or None if no access
         """
-        # Use new permission resolution algorithm
-        logger.warning(
-            f"DEBUG: authenticate_and_get_principal for {identity.get('sub')} in {target_schema}"
-        )
         principal = await self.get_effective_permissions(
             identity=identity, catalog_id=target_schema
         )
 
         if principal:
-            logger.warning(
-                f"DEBUG: principal found: {principal.id} with roles: {principal.roles}"
-            )
             # Check if principal is active
             if not principal.is_active:
                 logger.warning(f"Principal {principal.id} is inactive")
@@ -317,6 +317,15 @@ class IamService:
                 logger.warning(f"Principal {principal.id} has expired")
                 return None
 
+            # Keycloak-wins reconciliation. If anything changed, re-resolve
+            # so the returned Principal reflects the new grants.
+            if await self._reconcile_oidc_roles(principal, identity):
+                refreshed = await self.get_effective_permissions(
+                    identity=identity, catalog_id=target_schema
+                )
+                if refreshed:
+                    principal = refreshed
+
             return principal
 
         # Auto-registration (if enabled)
@@ -324,6 +333,127 @@ class IamService:
             return await self._auto_register_principal(identity, target_schema)
 
         return None
+
+    async def _get_oidc_sync_config(self) -> OidcRoleSyncConfig:
+        """Fetch OidcRoleSyncConfig via PlatformConfigsProtocol; falls
+        back to defaults (``enabled=False``) when the protocol or row
+        is unavailable so a missing/unwritten config never blocks auth.
+        """
+        configs = get_protocol(PlatformConfigsProtocol)
+        if configs is None:
+            return OidcRoleSyncConfig()
+        try:
+            cfg = await configs.get_config(OidcRoleSyncConfig)
+            if isinstance(cfg, OidcRoleSyncConfig):
+                return cfg
+            return OidcRoleSyncConfig.model_validate(cfg)
+        except Exception:
+            logger.debug("OidcRoleSyncConfig unavailable; using defaults", exc_info=True)
+            return OidcRoleSyncConfig()
+
+    async def _reconcile_oidc_roles(
+        self, principal: Principal, identity: Dict[str, Any]
+    ) -> bool:
+        """Reconcile mapped OIDC roles into platform-scope grants.
+
+        Returns True iff any grant was added or revoked. The caller
+        should re-fetch effective permissions in that case.
+        """
+        cfg = await self._get_oidc_sync_config()
+        if not cfg.enabled or not cfg.role_mapping:
+            return False
+
+        principal_id = principal.id
+        if not isinstance(principal_id, UUID):
+            try:
+                principal_id = UUID(str(principal_id))
+            except Exception:
+                return False
+
+        now = time.monotonic()
+        last = self._oidc_sync_cache.get(principal_id, 0.0)
+        if now - last < cfg.ttl_seconds:
+            return False
+
+        raw_claims = identity.get("raw_claims") or {}
+        issuer = raw_claims.get("iss") if isinstance(raw_claims, dict) else None
+        if not oidc_role_sync.is_issuer_allowed(issuer, cfg.issuer_whitelist):
+            logger.warning(
+                "OIDC role sync skipped: issuer %r not in whitelist for principal %s",
+                issuer, principal_id,
+            )
+            self._oidc_sync_cache[principal_id] = now
+            return False
+
+        oidc_roles = identity.get("roles") or []
+        mapped_internal = set(cfg.role_mapping.values())
+        try:
+            current_platform_roles = await self.storage.list_platform_roles(
+                principal_id
+            )
+        except Exception:
+            logger.debug(
+                "list_platform_roles failed during OIDC sync; skipping",
+                exc_info=True,
+            )
+            return False
+
+        # Restrict the diff to roles the mapping owns; everything else
+        # (catalog-scope, viewer, manually-granted unrelated roles) is
+        # left untouched by design.
+        scoped_current = [r for r in current_platform_roles if r in mapped_internal]
+        actions = oidc_role_sync.diff(
+            oidc_roles=oidc_roles,
+            current_internal_roles=scoped_current,
+            role_mapping=cfg.role_mapping,
+        )
+
+        if not actions:
+            self._oidc_sync_cache[principal_id] = now
+            return False
+
+        granted: List[str] = []
+        revoked: List[str] = []
+        for act in actions:
+            try:
+                if act.action == "grant":
+                    await self.storage.grant_platform_role(
+                        principal_id=principal_id, role_name=act.role_name
+                    )
+                    granted.append(act.role_name)
+                else:
+                    await self.storage.revoke_platform_role(
+                        principal_id=principal_id, role_name=act.role_name
+                    )
+                    revoked.append(act.role_name)
+            except Exception:
+                logger.exception(
+                    "OIDC role sync %s failed for principal=%s role=%s",
+                    act.action, principal_id, act.role_name,
+                )
+
+        if granted or revoked:
+            try:
+                await self.storage.log_audit_event(
+                    event_type="oidc_role_sync",
+                    principal_id=str(principal_id),
+                    detail={
+                        "source": "oidc_sync",
+                        "issuer": issuer,
+                        "granted": granted,
+                        "revoked": revoked,
+                        "oidc_roles": list(oidc_roles),
+                    },
+                )
+            except Exception:
+                logger.debug("audit write for oidc_role_sync failed", exc_info=True)
+            logger.info(
+                "OIDC role sync principal=%s granted=%s revoked=%s",
+                principal_id, granted, revoked,
+            )
+
+        self._oidc_sync_cache[principal_id] = now
+        return bool(granted or revoked)
 
     async def _auto_register_principal(
         self, identity: Dict[str, Any], catalog_id: str
@@ -366,7 +496,19 @@ class IamService:
             r for r in identity.get("realm_roles", [])
             if r in known_roles
         ]
-        assigned_roles = realm_roles if realm_roles else [cfg.user]
+        base_roles = realm_roles if realm_roles else [cfg.user]
+
+        # Overlay mapped OIDC roles (e.g. geoid.sysadmin -> sysadmin) so a
+        # first-time login lands with the correct grant on the way in.
+        sync_cfg = await self._get_oidc_sync_config()
+        raw_claims = identity.get("raw_claims") or {}
+        issuer = raw_claims.get("iss") if isinstance(raw_claims, dict) else None
+        assigned_roles = oidc_role_sync.initial_role_overlay(
+            oidc_roles=identity.get("roles") or [],
+            base_roles=base_roles,
+            config=sync_cfg,
+            issuer=issuer,
+        )
 
         # Allocate the principal UUID up-front so we can pass it to
         # downstream calls without re-narrowing the model's
