@@ -152,6 +152,10 @@ _ALLOWED_CROSS_EXTENSION_PREFIXES = (
     # Shared lifespan helpers (lifespan context manager + apply_app_configurations)
     # moved from the package root to extensions/lifespan.py in PR #376.
     "dynastore.extensions.lifespan",
+    # Shared HTTP client — get_client / get_httpx_client / get_proxy_httpx_client
+    # are framework-level FastAPI Depends factories; multiple extensions consume
+    # them as plumbing rather than as a cross-extension dependency.
+    "dynastore.extensions.httpx",
 )
 
 # Ratchet: known cross-extension imports that predate the capability-protocol
@@ -163,10 +167,6 @@ _WAIVED_CROSS_EXTENSION_IMPORTS: frozenset[str] = frozenset(
         "extensions/stac/stac_virtual.py:dynastore.extensions.dimensions.dimensions_extension",
         # records → features: shares OGC feature rendering.
         "extensions/records/records_service.py:dynastore.extensions.features.features_service",
-        # Shared HTTP client — candidate for promotion to extensions/tools.
-        "extensions/proxy/proxy_service.py:dynastore.extensions.httpx.httpx_service",
-        "extensions/gdal/gdal_service.py:dynastore.extensions.httpx.httpx_service",
-        "extensions/template/templating.py:dynastore.extensions.httpx.httpx_service",
     }
 )
 
