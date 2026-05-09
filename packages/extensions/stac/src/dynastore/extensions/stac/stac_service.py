@@ -82,7 +82,7 @@ from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegist
 logger = logging.getLogger(__name__)
 from dynastore.modules.db_config.exceptions import TableNotFoundError
 from dynastore.extensions.tools.language_utils import get_language
-from dynastore.extensions.web import expose_web_page
+from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.protocols.web import StaticFilesProtocol
 import os
 from .stac_virtual import StacVirtualMixin

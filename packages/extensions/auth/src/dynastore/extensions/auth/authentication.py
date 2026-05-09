@@ -8,7 +8,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.web import expose_static
+from dynastore.extensions.web.decorators import expose_static
 from dynastore.extensions.tools.url import build_sibling_redirect, resolve_redirect_uri
 from dynastore.modules import get_protocol
 from dynastore.models.protocols import (

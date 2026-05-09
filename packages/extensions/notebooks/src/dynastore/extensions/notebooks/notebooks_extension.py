@@ -6,7 +6,7 @@ from typing import List, Optional, Any, Dict, Tuple
 from fastapi import Query
 
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.web import expose_static, expose_web_page
+from dynastore.extensions.web.decorators import expose_static, expose_web_page
 from dynastore.modules.db_config.exceptions import ResourceNotFoundError
 from dynastore.modules.notebooks import notebooks_module as notebook_service
 from dynastore.modules.notebooks.models import NotebookCreate, Notebook, PlatformNotebookCreate, PlatformNotebook, OwnerType

@@ -43,7 +43,7 @@ from dynastore.models.localization import LocalizedText
 from .maps_models import MapsLandingPage, DatasetMaps, MapContent, Link
 from .maps_config import MapsConfig
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.web import expose_web_page
+from dynastore.extensions.web.decorators import expose_web_page
 import os
 
 # Imports for Tiling Support

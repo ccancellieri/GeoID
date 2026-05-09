@@ -54,7 +54,7 @@ import dynastore.modules.catalog.catalog_module as catalog_manager
 import dynastore.modules.tiles.tiles_module as tms_manager
 from dynastore.tools.ogc_common import parse_subset_parameter
 from dynastore.tools.geospatial import SimplificationAlgorithm
-from dynastore.extensions.web import expose_web_page
+from dynastore.extensions.web.decorators import expose_web_page
 import os
 
 from dynastore.modules.tiles import tiles_db

@@ -167,14 +167,6 @@ _WAIVED_CROSS_EXTENSION_IMPORTS: frozenset[str] = frozenset(
         "extensions/proxy/proxy_service.py:dynastore.extensions.httpx.httpx_service",
         "extensions/gdal/gdal_service.py:dynastore.extensions.httpx.httpx_service",
         "extensions/template/templating.py:dynastore.extensions.httpx.httpx_service",
-        # Top-level `extensions.web` import (package side-effects, not the
-        # decorator module). Candidate for narrowing to .decorators.
-        "extensions/maps/maps_service.py:dynastore.extensions.web",
-        "extensions/stac/stac_service.py:dynastore.extensions.web",
-        "extensions/auth/authentication.py:dynastore.extensions.web",
-        "extensions/tiles/tiles_service.py:dynastore.extensions.web",
-        "extensions/iam/service.py:dynastore.extensions.web",
-        "extensions/notebooks/notebooks_extension.py:dynastore.extensions.web",
     }
 )
 

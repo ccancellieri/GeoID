@@ -41,7 +41,7 @@ from uuid import UUID
 import os
 from fastapi.responses import HTMLResponse
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.web import expose_web_page
+from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.protocols import WebModuleProtocol
 from dynastore.modules.iam.iam_service import IamService
 from dynastore.tools.discovery import get_protocol, get_protocols
