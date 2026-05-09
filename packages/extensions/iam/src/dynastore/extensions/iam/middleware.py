@@ -162,9 +162,6 @@ class IamMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        logger.warning(
-            f"DEBUG: IamMiddleware.dispatch: {request.method} {request.url.path}"
-        )
         start_time = time.time()
         method = request.method
         raw_path = request.url.path
@@ -305,11 +302,6 @@ class IamMiddleware(BaseHTTPMiddleware):
             else ([principal_role] if principal_role else [])
         )
 
-        if "/web/dashboard/catalogs/" in path:
-            logger.warning(
-                f"DBG-PRE-EVAL: ps_type={type(self._policy_service).__name__} "
-                f"ps_eval={self._policy_service.evaluate_access if self._policy_service else None}"
-            )
         result = await self._policy_service.evaluate_access(  # type: ignore[union-attr]
             principals=principals_to_check,
             path=path,
@@ -317,8 +309,6 @@ class IamMiddleware(BaseHTTPMiddleware):
             request_context=ctx,
             catalog_id=catalog_id,
         )
-        if "/web/dashboard/catalogs/" in path:
-            logger.warning(f"DBG-POST-EVAL: result={result}")
         allowed_by_global, reason = result if result is not None else (True, "")
         if not allowed_by_global:
             logger.debug(f"Access denied by Global Security policy: {reason}")

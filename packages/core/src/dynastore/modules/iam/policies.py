@@ -558,8 +558,8 @@ class PolicyService:
                         principal, schema=check_schema
                     )
                     if role_obj:
-                        logger.warning(
-                            f"DBG-ROLE: Found role '{principal}' schema={check_schema} policies={role_obj.policies}"
+                        logger.debug(
+                            f"EVAL: Found role '{principal}' schema={check_schema} policies={role_obj.policies}"
                         )
                         all_policy_ids.update(role_obj.policies)
                     else:
@@ -577,8 +577,6 @@ class PolicyService:
                 pol = await self.get_policy(pid, catalog_id=None)
             if pol:
                 effective_policies.append(pol)
-                if pid in ("web_public_access", "public_access"):
-                    logger.warning(f"DBG-POL: {pid} resources={pol.resources}")
 
         # 3. Include custom policies directly attached to the principal
         if custom_policies:
