@@ -959,6 +959,8 @@ function showProfileModal() {
         modal.querySelector('.glass-panel').classList.remove('scale-95');
         modal.querySelector('.glass-panel').classList.add('scale-100');
     }, 10);
+
+    _startTokenCountdown();
 }
 
 function hideProfileModal() {
@@ -968,10 +970,93 @@ function hideProfileModal() {
     modal.classList.add('opacity-0');
     modal.querySelector('.glass-panel').classList.remove('scale-100');
     modal.querySelector('.glass-panel').classList.add('scale-95');
-    
+
+    _stopTokenCountdown();
+
     setTimeout(() => {
         modal.classList.add('hidden');
     }, 300);
+}
+
+let _tokenCountdownTimer = null;
+
+function _formatRemaining(secs) {
+    if (!Number.isFinite(secs) || secs <= 0) return 'expired';
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+function _renderTokenCountdown() {
+    const el = document.getElementById('token-expiry-countdown');
+    if (!el) return;
+    const exp = _jwtExp(authToken);
+    if (!authToken || !exp) {
+        el.innerText = 'no token';
+        el.className = 'text-sm font-mono text-slate-500';
+        return;
+    }
+    const remaining = exp - Math.floor(Date.now() / 1000);
+    el.innerText = _formatRemaining(remaining);
+    if (remaining <= 0) {
+        el.className = 'text-sm font-mono text-red-400';
+    } else if (remaining < 60) {
+        el.className = 'text-sm font-mono text-amber-400';
+    } else {
+        el.className = 'text-sm font-mono text-emerald-400';
+    }
+}
+
+function _startTokenCountdown() {
+    _stopTokenCountdown();
+    _renderTokenCountdown();
+    _tokenCountdownTimer = setInterval(_renderTokenCountdown, 1000);
+}
+
+function _stopTokenCountdown() {
+    if (_tokenCountdownTimer) {
+        clearInterval(_tokenCountdownTimer);
+        _tokenCountdownTimer = null;
+    }
+}
+
+async function copyAccessToken() {
+    const label = document.getElementById('token-copy-label');
+    if (!authToken) {
+        if (label) label.innerText = 'No token';
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(authToken);
+        if (label) {
+            const original = label.innerText;
+            label.innerText = 'Copied!';
+            setTimeout(() => { label.innerText = original; }, 1500);
+        }
+    } catch (e) {
+        console.warn('Clipboard write failed:', e);
+        if (label) {
+            label.innerText = 'Copy failed';
+            setTimeout(() => { label.innerText = 'Copy token'; }, 2000);
+        }
+    }
+}
+
+async function renewAccessToken() {
+    const label = document.getElementById('token-renew-label');
+    const icon = document.getElementById('token-renew-icon');
+    if (label) label.innerText = 'Renewing…';
+    if (icon) icon.classList.add('fa-spin');
+    const ok = await tryRefreshToken();
+    if (icon) icon.classList.remove('fa-spin');
+    if (label) {
+        label.innerText = ok ? 'Renewed' : 'Failed';
+        setTimeout(() => { label.innerText = 'Renew'; }, 1500);
+    }
+    _renderTokenCountdown();
 }
 
 // Intercept profile form submission
