@@ -163,12 +163,6 @@ _WAIVED_CROSS_EXTENSION_IMPORTS: frozenset[str] = frozenset(
         "extensions/stac/stac_virtual.py:dynastore.extensions.dimensions.dimensions_extension",
         # records → features: shares OGC feature rendering.
         "extensions/records/records_service.py:dynastore.extensions.features.features_service",
-        # stac → search: STAC API search dispatches to the platform-tier
-        # SearchService when ES is the resolved READ primary and the query
-        # is structural-only. Slated for capability-protocol promotion
-        # (ItemSearchProtocol in models/protocols/) once #222 follow-up lands.
-        "extensions/stac/search.py:dynastore.extensions.search.search_models",
-        "extensions/stac/search.py:dynastore.extensions.search.search_service",
         # Shared HTTP client — candidate for promotion to extensions/tools.
         "extensions/proxy/proxy_service.py:dynastore.extensions.httpx.httpx_service",
         "extensions/gdal/gdal_service.py:dynastore.extensions.httpx.httpx_service",

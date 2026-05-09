@@ -256,32 +256,26 @@ async def _maybe_dispatch_to_es_search(
         if _to_snake(driver_id) != es_indexer_id:
             return None  # at least one collection isn't ES — bail
 
-    # All target collections route through ES.  Build a SearchBody and
-    # delegate to SearchService.search_items.
-    try:
-        from dynastore.extensions.search.search_models import SearchBody
-        from dynastore.extensions.search.search_service import SearchService
-    except ImportError:
-        return None  # search extension not loaded
+    # All target collections route through ES. Dispatch via the
+    # backend-agnostic ItemSearchProtocol — this avoids importing
+    # search-extension internals (search_models / search_service) and
+    # keeps stac/search.py free of cross-extension coupling (#234).
+    from dynastore.models.protocols.item_search import ItemSearchProtocol
 
-    search_svc = get_protocol(SearchService)
+    search_svc = get_protocol(ItemSearchProtocol)
     if search_svc is None:
-        return None
+        return None  # no ItemSearchProtocol provider registered
 
-    body = SearchBody(
-        q=None,
-        token=None,
-        sortby=None,
-        catalog_id=cat_id,
-        collections=cids,
-        ids=search_request.ids,
-        bbox=list(search_request.bbox) if search_request.bbox else None,
-        intersects=search_request.intersects,
-        datetime=search_request.datetime,
-        limit=search_request.limit,
-    )
     try:
-        item_collection = await search_svc.search_items(body)
+        result = await search_svc.search_items_struct(
+            catalog_id=cat_id,
+            collections=cids,
+            ids=search_request.ids,
+            bbox=list(search_request.bbox) if search_request.bbox else None,
+            intersects=search_request.intersects,
+            datetime=search_request.datetime,
+            limit=search_request.limit,
+        )
     except Exception as exc:
         logger.warning(
             "STAC search → ES dispatch failed (catalog=%s, collections=%s): %s",
@@ -289,9 +283,7 @@ async def _maybe_dispatch_to_es_search(
         )
         return None  # fall back to PG path on error
 
-    features = item_collection.features
-    total = item_collection.numberMatched or 0
-    return features, total, None
+    return result.features, result.total, None
 
 
 async def search_items(

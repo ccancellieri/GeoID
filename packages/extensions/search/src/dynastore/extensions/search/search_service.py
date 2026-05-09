@@ -367,6 +367,40 @@ class SearchService(ExtensionProtocol):
             numberReturned=len(features),
         )
 
+    async def search_items_struct(
+        self,
+        *,
+        catalog_id: Optional[str],
+        collections: Optional[List[str]],
+        ids: Optional[List[str]],
+        bbox: Optional[List[float]],
+        intersects: Optional[Dict[str, Any]],
+        datetime: Optional[str],
+        limit: int,
+    ) -> "ItemSearchResult":
+        """Backend-agnostic structural search — satisfies
+        :class:`~dynastore.models.protocols.item_search.ItemSearchProtocol`.
+        """
+        from dynastore.models.protocols.item_search import ItemSearchResult
+
+        body = SearchBody(
+            q=None,
+            token=None,
+            sortby=None,
+            catalog_id=catalog_id,
+            collections=collections,
+            ids=ids,
+            bbox=bbox,
+            intersects=intersects,
+            datetime=datetime,
+            limit=limit,
+        )
+        ic = await self.search_items(body)
+        return ItemSearchResult(
+            features=list(ic.features),
+            total=ic.numberMatched or 0,
+        )
+
     async def reindex_catalog(
         self,
         catalog_id: str,
