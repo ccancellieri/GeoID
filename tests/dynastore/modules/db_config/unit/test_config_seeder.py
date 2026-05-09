@@ -132,31 +132,64 @@ async def test_lexical_overlay_last_wins(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_unknown_class_key_skipped(monkeypatch, tmp_path, caplog):
+async def test_unknown_class_key_raises_in_non_prod(monkeypatch, tmp_path, caplog):
     _write_seed(tmp_path / "defaults", "bogus.json", {
         "class_key": "NoSuchPluginConfig",
         "value": {"x": 1},
     })
     monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
+    monkeypatch.delenv("DYNASTORE_ENV", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
 
     config_mgr = AsyncMock()
     config_mgr.list_configs = AsyncMock(return_value={})
     config_mgr.set_config = AsyncMock()
 
-    caplog.set_level("WARNING")
+    caplog.set_level("ERROR")
     with patch("dynastore.tools.discovery.get_protocol", return_value=config_mgr), \
          patch.object(seeder, "acquire_startup_lock", _fake_lock):
-        await seeder.seed_default_configs(engine=object())
+        with pytest.raises(seeder.ConfigSeederError, match="unknown class_key"):
+            await seeder.seed_default_configs(engine=object())
 
     config_mgr.set_config.assert_not_awaited()
-    assert any("unknown class_key" in r.message.lower() for r in caplog.records)
+    assert any("rejected" in r.message.lower() for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_malformed_json_skipped(monkeypatch, tmp_path):
-    (tmp_path / "defaults").mkdir()
-    (tmp_path / "defaults" / "bad.json").write_text("{not json")
+@pytest.mark.parametrize("env_value", ["prod", "production", "PROD"])
+async def test_unknown_class_key_degrades_to_error_in_prod(
+    monkeypatch, tmp_path, caplog, env_value,
+):
+    _write_seed(tmp_path / "defaults", "bogus.json", {
+        "class_key": "NoSuchPluginConfig",
+        "value": {"x": 1},
+    })
     monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
+    monkeypatch.setenv("DYNASTORE_ENV", env_value)
+
+    config_mgr = AsyncMock()
+    config_mgr.list_configs = AsyncMock(return_value={})
+    config_mgr.set_config = AsyncMock()
+
+    caplog.set_level("ERROR")
+    with patch("dynastore.tools.discovery.get_protocol", return_value=config_mgr), \
+         patch.object(seeder, "acquire_startup_lock", _fake_lock):
+        # Production must NOT raise — startup keeps going.
+        await seeder.seed_default_configs(engine=object())
+
+    config_mgr.set_config.assert_not_awaited()
+    assert any(
+        "rejected" in r.message.lower() and "unknown class_key" in r.message.lower()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_class_key_raises_in_non_prod(monkeypatch, tmp_path):
+    _write_seed(tmp_path / "defaults", "no-key.json", {"value": {"x": 1}})
+    monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
+    monkeypatch.delenv("DYNASTORE_ENV", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
 
     config_mgr = AsyncMock()
     config_mgr.list_configs = AsyncMock(return_value={})
@@ -164,7 +197,46 @@ async def test_malformed_json_skipped(monkeypatch, tmp_path):
 
     with patch("dynastore.tools.discovery.get_protocol", return_value=config_mgr), \
          patch.object(seeder, "acquire_startup_lock", _fake_lock):
-        await seeder.seed_default_configs(engine=object())
+        with pytest.raises(seeder.ConfigSeederError, match="missing 'class_key'"):
+            await seeder.seed_default_configs(engine=object())
+
+
+@pytest.mark.asyncio
+async def test_bad_value_raises_in_non_prod(monkeypatch, tmp_path):
+    _write_seed(tmp_path / "defaults", "bad-value.json", {
+        "class_key": "task_routing_config",
+        "value": "not-an-object",
+    })
+    monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
+    monkeypatch.delenv("DYNASTORE_ENV", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    config_mgr = AsyncMock()
+    config_mgr.list_configs = AsyncMock(return_value={})
+    config_mgr.set_config = AsyncMock()
+
+    with patch("dynastore.tools.discovery.get_protocol", return_value=config_mgr), \
+         patch.object(seeder, "acquire_startup_lock", _fake_lock):
+        with pytest.raises(seeder.ConfigSeederError, match="must be a JSON object"):
+            await seeder.seed_default_configs(engine=object())
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_raises_in_non_prod(monkeypatch, tmp_path):
+    (tmp_path / "defaults").mkdir()
+    (tmp_path / "defaults" / "bad.json").write_text("{not json")
+    monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
+    monkeypatch.delenv("DYNASTORE_ENV", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    config_mgr = AsyncMock()
+    config_mgr.list_configs = AsyncMock(return_value={})
+    config_mgr.set_config = AsyncMock()
+
+    with patch("dynastore.tools.discovery.get_protocol", return_value=config_mgr), \
+         patch.object(seeder, "acquire_startup_lock", _fake_lock):
+        with pytest.raises(seeder.ConfigSeederError, match="unreadable"):
+            await seeder.seed_default_configs(engine=object())
 
     config_mgr.set_config.assert_not_awaited()
 

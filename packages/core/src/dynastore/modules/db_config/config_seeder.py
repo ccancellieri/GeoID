@@ -25,12 +25,19 @@ overrides) just drop a JSON file alongside it.
 
 Invoked once during catalog/db_config startup, after ``PlatformConfigsProtocol``
 is registered. Idempotent — safe to re-run on every boot.
+
+Fail-fast posture: when a seed is rejected (unknown class_key, missing key,
+non-object ``value``, malformed JSON), the rejection is summarised at ERROR
+and — in non-production tiers — raised as ``ConfigSeederError``. Production
+startup keeps going so a bad seed cannot take a service down. Validate seed
+files in CI via ``scripts/validate_config_defaults.py``.
 """
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, List, Optional
 
 from dynastore.modules.db_config.instance import DEFAULTS_DIR
 from dynastore.modules.db_config.locking_tools import acquire_startup_lock
@@ -44,6 +51,20 @@ logger = logging.getLogger(__name__)
 
 
 _SEED_LOCK_KEY = "config_seeder.defaults"
+_PRODUCTION_ENV_NAMES = frozenset({"prod", "production"})
+
+
+class ConfigSeederError(RuntimeError):
+    """Raised in non-production tiers when one or more seeds are rejected."""
+
+
+def _is_production_env() -> bool:
+    label = (
+        os.environ.get("DYNASTORE_ENV")
+        or os.environ.get("ENVIRONMENT")
+        or ""
+    ).strip().lower()
+    return label in _PRODUCTION_ENV_NAMES
 
 
 async def seed_default_configs(engine: DbResource) -> None:
@@ -55,8 +76,10 @@ async def seed_default_configs(engine: DbResource) -> None:
       too early; logged as a warning, returns silently).
     - Another process holds the advisory lock (no contention; we just skip).
 
-    Errors on individual files are logged but do not abort the run — a bad
-    seed shouldn't block service startup.
+    Rejected seeds (unknown class_key, missing class_key, bad value, bad JSON)
+    are collected and surfaced together: ERROR-logged in production, raised
+    as ``ConfigSeederError`` in non-production tiers (fail-fast).
+    Per-row ``set_config`` failures are logged at WARNING and never abort.
     """
     if not DEFAULTS_DIR.exists():
         logger.info(
@@ -94,53 +117,69 @@ async def seed_default_configs(engine: DbResource) -> None:
         # Lexical-order pass — later files override earlier ones for same class_key.
         # We deduplicate first so an overlay is applied once with the final payload.
         merged: Dict[str, Dict[str, Any]] = {}
+        rejections: List[str] = []
         for path in json_files:
             try:
                 payload = json.loads(path.read_text())
             except (OSError, json.JSONDecodeError) as exc:
-                logger.warning("config_seeder: skipping %s — unreadable: %s", path, exc)
+                rejections.append(f"{path.name}: unreadable ({exc})")
                 continue
             class_key = payload.get("class_key")
             if not class_key:
-                logger.warning(
-                    "config_seeder: %s missing 'class_key' — skipped.", path,
-                )
+                rejections.append(f"{path.name}: missing 'class_key'")
                 continue
             merged[class_key] = payload  # last-write-wins per class_key
 
         applied = 0
         for class_key, payload in merged.items():
             try:
-                applied += await _apply_one(config_mgr, class_key, payload)
+                outcome = await _apply_one(config_mgr, class_key, payload)
             except Exception as exc:  # noqa: BLE001 — never fail boot
                 logger.warning(
                     "config_seeder: failed to apply seed for %s: %s",
                     class_key, exc,
                 )
+                continue
+            if outcome == "applied":
+                applied += 1
+            elif outcome == "rejected_unknown_class":
+                rejections.append(f"{class_key}: unknown class_key (not registered)")
+            elif outcome == "rejected_bad_value":
+                rejections.append(f"{class_key}: 'value' must be a JSON object")
 
         logger.info(
             "config_seeder: applied %d/%d seed(s) from %s",
             applied, len(merged), DEFAULTS_DIR,
         )
 
+        if rejections:
+            summary = "; ".join(rejections)
+            logger.error(
+                "config_seeder: %d seed(s) rejected — %s",
+                len(rejections), summary,
+            )
+            if not _is_production_env():
+                raise ConfigSeederError(
+                    f"{len(rejections)} seed(s) rejected: {summary}. "
+                    "Run scripts/validate_config_defaults.py before deploy."
+                )
+
 
 async def _apply_one(
     config_mgr: Any, class_key: str, payload: Dict[str, Any],
-) -> int:
-    """Apply a single seed payload. Returns 1 if written, 0 if skipped."""
+) -> str:
+    """Apply a single seed payload.
+
+    Returns one of: ``"applied"``, ``"skipped_existing"``,
+    ``"rejected_unknown_class"``, ``"rejected_bad_value"``.
+    """
     cls: Optional[type[PluginConfig]] = resolve_config_class(class_key)
     if cls is None:
-        logger.warning(
-            "config_seeder: unknown class_key %r — skipped.", class_key,
-        )
-        return 0
+        return "rejected_unknown_class"
 
     value = payload.get("value")
     if not isinstance(value, dict):
-        logger.warning(
-            "config_seeder: %s 'value' must be an object — skipped.", class_key,
-        )
-        return 0
+        return "rejected_bad_value"
 
     override = bool(payload.get("override", False))
 
@@ -155,7 +194,7 @@ async def _apply_one(
                     "config_seeder: %s already present — skipping (override=false).",
                     class_key,
                 )
-                return 0
+                return "skipped_existing"
         except Exception as exc:  # noqa: BLE001 — degrade to apply-anyway
             logger.debug(
                 "config_seeder: list_configs failed (%s) — applying %s anyway.",
@@ -165,4 +204,4 @@ async def _apply_one(
     config = cls.model_validate(value)
     await config_mgr.set_config(cls, config)
     logger.info("config_seeder: applied seed for %s.", class_key)
-    return 1
+    return "applied"
