@@ -82,7 +82,9 @@ class GcpCatalogCleanupTask(TaskProtocol):
         else:
             if not inputs.collection_id:
                 raise ValueError("collection_id is required for COLLECTION scope cleanup")
-            return await self._cleanup_collection(catalog_id, inputs.collection_id)
+            return await self._cleanup_collection(
+                catalog_id, inputs.collection_id, bucket_name=inputs.bucket_name
+            )
 
     # ------------------------------------------------------------------
     # Catalog-level cleanup
@@ -152,7 +154,7 @@ class GcpCatalogCleanupTask(TaskProtocol):
     # ------------------------------------------------------------------
 
     async def _cleanup_collection(
-        self, catalog_id: str, collection_id: str
+        self, catalog_id: str, collection_id: str, bucket_name: Optional[str] = None
     ) -> Dict[str, Any]:
         from dynastore.modules.gcp.gcp_config import (
             GcpCatalogBucketConfig,
@@ -190,9 +192,13 @@ class GcpCatalogCleanupTask(TaskProtocol):
                     "status": "skipped",
                 }
 
-        # 1. Delete objects under the collection prefix
+        # 1. Delete objects under the collection prefix.
+        # Prefer the pre-resolved bucket_name from task inputs (parent
+        # catalog state may have changed by the time the task runs);
+        # fall back to a live lookup if it wasn't pre-resolved.
         if storage:
-            bucket_name = await storage.get_storage_identifier(catalog_id)
+            if not bucket_name:
+                bucket_name = await storage.get_storage_identifier(catalog_id)
             if bucket_name:
                 folder_prefix = bucket_tool.get_blob_path_for_collection_folder(
                     collection_id

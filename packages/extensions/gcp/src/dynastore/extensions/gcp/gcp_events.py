@@ -607,8 +607,15 @@ async def _adapter_catalog_hard_deletion(catalog_id: str, **kwargs):
 async def _adapter_collection_hard_deletion(
     catalog_id: str, collection_id: str, **kwargs
 ):
-    """Enqueues a GcpCatalogCleanupTask when a collection is hard-deleted."""
-    from dynastore.models.protocols import DatabaseProtocol
+    """Enqueues a GcpCatalogCleanupTask when a collection is hard-deleted.
+
+    Fires on BEFORE_COLLECTION_HARD_DELETION — the catalog state is
+    still intact, so we pre-resolve the bucket name and pass it in the
+    task inputs (mirrors :func:`_adapter_catalog_hard_deletion`). This
+    keeps cleanup robust if the parent catalog configuration is mutated
+    or torn down between event emission and task execution.
+    """
+    from dynastore.models.protocols import DatabaseProtocol, StorageProtocol
     from dynastore.models.tasks import TaskCreate
     from dynastore.modules.tasks.tasks_module import create_task_for_catalog
     from dynastore.tasks.gcp.gcp_catalog_cleanup_task import CleanupScope
@@ -618,6 +625,17 @@ async def _adapter_collection_hard_deletion(
         logger.warning("_adapter_collection_hard_deletion: DatabaseProtocol not available.")
         return
 
+    bucket_name = None
+    storage = get_protocol(StorageProtocol)
+    if storage:
+        try:
+            bucket_name = await storage.get_storage_identifier(catalog_id)
+        except Exception as e:
+            logger.debug(
+                f"Could not pre-resolve bucket name for "
+                f"'{catalog_id}:{collection_id}': {e}"
+            )
+
     try:
         task_data = TaskCreate(
             task_type="gcp_catalog_cleanup",
@@ -626,6 +644,7 @@ async def _adapter_collection_hard_deletion(
                 "scope": CleanupScope.COLLECTION.value,
                 "catalog_id": catalog_id,
                 "collection_id": collection_id,
+                "bucket_name": bucket_name,
             },
             dedup_key=f"catalog_cleanup:COLLECTION:{catalog_id}:{collection_id}",
         )
