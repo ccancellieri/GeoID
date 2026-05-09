@@ -322,9 +322,16 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         self.router.add_api_route(
             "/catalogs/{catalog_id}/assets/{asset_id}",
             self.update_catalog_asset,
-            methods=["PUT", "PATCH"],
+            methods=["PUT"],
             response_model=Asset,
-            summary="Update Asset",
+            summary="Replace Asset (full)",
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/assets/{asset_id}",
+            self.update_catalog_asset,
+            methods=["PATCH"],
+            response_model=Asset,
+            summary="Update Asset (partial)",
         )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/assets/{asset_id}",
@@ -376,9 +383,16 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         self.router.add_api_route(
             "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}",
             self.update_collection_asset,
-            methods=["PUT", "PATCH"],
+            methods=["PUT"],
             response_model=Asset,
-            summary="Update Collection Asset",
+            summary="Replace Collection Asset (full)",
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}",
+            self.update_collection_asset,
+            methods=["PATCH"],
+            response_model=Asset,
+            summary="Update Collection Asset (partial)",
         )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}",

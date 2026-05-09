@@ -337,6 +337,49 @@ def is_valid_language_key(key: str) -> bool:
     return _is_valid_lang_key(key)
 
 
+#: Plain-text i18n fields that ``normalize_i18n_for_replace`` will canonicalise.
+#: Excludes structured fields like ``license`` (a ``LicenseUpdate`` object) and
+#: opaque ``extra_metadata`` — wrapping those would corrupt their schema.
+DEFAULT_I18N_TEXT_FIELDS = ("title", "description", "keywords")
+
+
+def normalize_i18n_for_replace(
+    input_data: Dict[str, Any],
+    language: str,
+    fields: tuple = DEFAULT_I18N_TEXT_FIELDS,
+) -> Dict[str, Any]:
+    """Wrap string-shaped i18n fields as ``{language: value}``.
+
+    Replace bodies (PUT) legitimately mix shapes — a client may send
+    ``description`` as a multilanguage dict and ``title`` as a plain
+    string. The merge layer expects one canonical shape per call:
+
+    - ``lang='*'`` plus all-multilang dicts, or
+    - ``lang=<code>`` plus all-strings.
+
+    Mixed input plus ``lang=<code>`` raises ``Conflicting language
+    parameters``; mixed input plus ``lang='*'`` writes plain strings
+    under the literal ``'*'`` key, which ``LocalizedText`` rejects.
+
+    Wrapping any string- or list-of-string-shaped field in
+    ``{language: value}`` canonicalises the dict to multilanguage form
+    so callers can pass ``lang='*'`` unambiguously.
+    """
+    out = dict(input_data)
+    for field in fields:
+        value = out.get(field)
+        if isinstance(value, str) and value:
+            out[field] = {language: value}
+        elif (
+            isinstance(value, list)
+            and value
+            and all(isinstance(v, str) for v in value)
+        ):
+            out[field] = {language: value}
+        # Otherwise (dict, None, structured object) leave as-is.
+    return out
+
+
 def is_multilanguage_input(value: Any) -> bool:
     """
     Detects if a value is a multilanguage dictionary.
