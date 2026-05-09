@@ -776,13 +776,19 @@ class BucketService(ExtensionProtocol):
           or non-FINALIZE / unrecognised events. None of these benefit
           from redelivery.
         * 503 — transient infrastructure failure (DB unreachable, lock
-          timeout, asyncpg pool exhaustion, unexpected exception).
-          Pub/Sub redelivers per its backoff policy.
+          timeout, asyncpg pool exhaustion, unexpected exception) **or**
+          a catalog provisioning race (``CatalogSchemaUnavailable`` —
+          schema not yet visible on this Cloud Run instance). Pub/Sub
+          redelivers per its backoff policy; genuinely missing catalogs
+          eventually flush via the dead-letter policy.
         """
-        # Lazy-import the OrphanFinalizeEvent class so this route module
-        # does not pull the activator chain at import time.
+        # Lazy-import exceptions used for HTTP-status mapping so this
+        # route module does not pull the activator chain at import time.
         from dynastore.modules.gcp.gcp_finalize_activator import (
             OrphanFinalizeEvent,
+        )
+        from dynastore.extensions.gcp.gcp_events import (
+            CatalogSchemaUnavailable,
         )
 
         try:
@@ -887,6 +893,20 @@ class BucketService(ExtensionProtocol):
             # the recovery path.
             logger.info(f"Orphan finalize acked (no PENDING row): {exc}")
             return Response(status_code=status.HTTP_204_NO_CONTENT)
+        except CatalogSchemaUnavailable as exc:
+            # Catalog provisioning race: schema not yet visible on this
+            # Cloud Run instance. Nack with 503 so Pub/Sub redelivers —
+            # by the time it does, the schema is typically live.
+            # Genuinely missing catalogs flush via the dead-letter
+            # policy after the configured retry budget.
+            logger.warning(
+                f"Catalog schema unavailable for push event: {exc} — "
+                f"requesting Pub/Sub redelivery."
+            )
+            return Response(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content=str(exc).encode(),
+            )
         except HTTPException:
             # Auth / validation failure — re-raise so FastAPI's normal
             # handler builds the response. JWT verify already did this

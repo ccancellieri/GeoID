@@ -284,6 +284,47 @@ async def test_finalize_returns_5xx_on_unexpected_exception(
 
 
 @pytest.mark.asyncio
+async def test_finalize_returns_503_on_missing_catalog_schema(
+    client: TestClient,
+) -> None:
+    """Closes followup #5 from PR #420.
+
+    When a Pub/Sub OBJECT_FINALIZE arrives for a catalog whose physical
+    schema is not yet visible on this Cloud Run instance (provisioning
+    race), the handler must return 503 so Pub/Sub redelivers — by the
+    time it does, the schema is typically live. Returning 204 here was
+    a silent-loss bug: Pub/Sub stops retrying on 2xx, and the
+    OBJECT_FINALIZE event is gone.
+
+    This pins the contract: ``CatalogSchemaUnavailable`` raised from
+    ``handle_asset_events`` propagates through ``dispatch_gcp_event``
+    and is caught by the push handler, which maps it to 503.
+    """
+    envelope = make_pubsub_envelope()
+
+    from dynastore.extensions.gcp.gcp_events import CatalogSchemaUnavailable
+
+    fake_assets = AsyncMock(
+        side_effect=CatalogSchemaUnavailable("cat_a", "col1")
+    )
+
+    with patch(
+        "dynastore.extensions.gcp.gcp_events.handle_asset_events",
+        fake_assets,
+    ):
+        from dynastore.extensions.gcp import gcp_events as ge
+        ge._gcp_event_listeners.clear()
+        ge.register_gcp_event_listener("*", ge.handle_gcs_notification)
+        resp = client.post("/gcp/events/pubsub-push", json=envelope)
+
+    assert resp.status_code == 503, (
+        f"Expected 503 for missing-schema (Pub/Sub redelivery), got "
+        f"{resp.status_code}. Body: {resp.text!r}"
+    )
+    fake_assets.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_non_finalize_event_does_not_invoke_activator(
     client: TestClient,
 ) -> None:

@@ -144,6 +144,26 @@ def register_gcp_event_listener(subscription_id_pattern: str, listener: Callable
     )
 
 
+class CatalogSchemaUnavailable(Exception):
+    """Raised when a Pub/Sub event arrives for a catalog whose physical
+    schema is not yet visible (or has been hard-deleted).
+
+    The push handler maps this to a 5xx so Pub/Sub redelivers — the
+    most common cause is a race between catalog provisioning and the
+    first OBJECT_FINALIZE on a freshly bound bucket. Genuinely
+    unrecoverable cases (catalog deleted for good) flush via the
+    push subscription's dead-letter policy.
+    """
+
+    def __init__(self, catalog_id: str, collection_id: Optional[str] = None):
+        self.catalog_id = catalog_id
+        self.collection_id = collection_id
+        super().__init__(
+            f"No physical schema for catalog '{catalog_id}'"
+            + (f" (collection '{collection_id}')" if collection_id else "")
+        )
+
+
 async def dispatch_gcp_event(payload: Dict[str, Any]):
     """
     Dispatches a received Pub/Sub event payload to all registered listeners
@@ -689,12 +709,15 @@ async def handle_asset_events(
       path executed (success or idempotent re-delivery). The HTTP push
       handler maps this to a 200 ack.
     * ``None`` for non-FINALIZE events, missing/unsupported events, or
-      missing dependencies (DatabaseProtocol / catalog schema). These
-      paths are intentionally non-fatal — operators see them via logs.
+      missing protocol providers (DatabaseProtocol / CatalogsProtocol).
+      These paths are intentionally non-fatal — operators see them via
+      logs and they will not benefit from redelivery.
 
     Exceptions propagate (they are NOT swallowed here): the HTTP push
-    route maps :class:`OrphanFinalizeEvent` to a 200 ack and any other
-    exception to 5xx so Pub/Sub redelivers.
+    route maps :class:`OrphanFinalizeEvent` to a 204 ack,
+    :class:`CatalogSchemaUnavailable` to 503 (Pub/Sub redelivers — the
+    schema may appear shortly because of a provisioning race), and any
+    other exception to 5xx so Pub/Sub redelivers.
     """
     event_type = event_type_str or event_payload.get("eventType")
     # OBJECT_DELETE / OBJECT_ARCHIVE handling: deferred. The legacy
@@ -732,10 +755,17 @@ async def handle_asset_events(
         catalog_id, ctx=DriverContext(db_resource=db.engine), allow_missing=True
     )
     if not schema:
+        # Most common cause: the catalog is provisioning and the first
+        # OBJECT_FINALIZE on its bucket landed before the schema is
+        # visible to this Cloud Run instance. Surface as an exception so
+        # the push handler returns 5xx and Pub/Sub redelivers; genuinely
+        # missing catalogs eventually fall through to the dead-letter
+        # policy.
         logger.warning(
-            f"handle_asset_events: no physical schema for catalog '{catalog_id}'."
+            f"handle_asset_events: no physical schema for catalog "
+            f"'{catalog_id}' — requesting Pub/Sub redelivery."
         )
-        return None
+        raise CatalogSchemaUnavailable(catalog_id, collection_id)
 
     finalize_event = finalize_event_from_pubsub(
         event_payload,
