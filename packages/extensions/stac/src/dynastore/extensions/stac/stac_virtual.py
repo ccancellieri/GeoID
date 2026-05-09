@@ -558,41 +558,6 @@ class StacVirtualMixin(_Host):
 
         return stac_config.hierarchy.rules.get(hierarchy_id)
 
-    def _autobuild_dimension_provider_cfg(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        hierarchy_id: str,
-    ) -> Optional[dict]:
-        """Return a synthetic `dimension-backed` provider config when the
-        collection is a materialized hierarchical dimension.
-
-        Activates only when:
-          - catalog_id is the dimensions catalog ("_dimensions_"), AND
-          - `collection_id == hierarchy_id` names a dimension whose provider
-            advertises `hierarchical=True`.
-
-        Returns ``None`` otherwise; caller falls back to the normal lookup.
-        """
-        from dynastore.models.dimensions import DIMENSIONS_CATALOG_ID
-        if catalog_id != DIMENSIONS_CATALOG_ID or collection_id != hierarchy_id:
-            return None
-        try:
-            from dynastore.models.protocols.dimensions import DimensionsProtocol  # type: ignore
-            dim_proto = get_protocol(DimensionsProtocol)
-            if dim_proto is None:
-                return None
-            provider = dim_proto.get_provider(hierarchy_id)
-        except Exception:
-            return None
-        if not getattr(provider, "hierarchical", False):
-            return None
-        return {
-            "kind": "dimension-backed",
-            "hierarchy_id": hierarchy_id,
-            "dimension_id": hierarchy_id,
-        }
-
     async def _render_virtual_collection_via_provider(
         self,
         *,
@@ -634,15 +599,6 @@ class StacVirtualMixin(_Host):
             catalog_id=catalog_id,
             collection_id=collection_id,
         )
-        # dimension-backed resolves its ogc-dimensions provider via protocol lookup.
-        if provider_cfg.kind == "dimension-backed":
-            try:
-                from dynastore.models.protocols.dimensions import DimensionsProtocol  # type: ignore
-                dim_proto = get_protocol(DimensionsProtocol)
-                if dim_proto is not None:
-                    ctx.get_provider = lambda dim_id: dim_proto.get_provider(dim_id)
-            except Exception:
-                pass
 
         try:
             provider = get_hierarchy_provider(provider_cfg, ctx)
@@ -754,24 +710,6 @@ class StacVirtualMixin(_Host):
                     StacPluginConfig, catalog_id, collection_id, ctx=DriverContext(db_resource=conn
                 )),
             )
-
-            # Auto-register: a collection under the dimensions catalog whose
-            # `collection_id` names a hierarchical dimension provider gets a
-            # synthetic dimension-backed provider config — no stac_config needed.
-            auto_cfg_raw = self._autobuild_dimension_provider_cfg(
-                catalog_id, collection_id, hierarchy_id,
-            )
-            if auto_cfg_raw is not None:
-                return await self._render_virtual_collection_via_provider(
-                    provider_cfg_raw=auto_cfg_raw,
-                    conn=conn,
-                    catalog_id=catalog_id,
-                    collection_id=collection_id,
-                    hierarchy_id=hierarchy_id,
-                    parent_value=parent_value,
-                    limit=limit,
-                    request=request,
-                )
 
             if not stac_config.hierarchy or not stac_config.hierarchy.enabled:
                 raise HTTPException(
