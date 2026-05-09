@@ -845,31 +845,51 @@ class Web(ExtensionProtocol):
         FAMILIES_LABEL = {"en": "standard families", "es": "familias de estándares", "fr": "familles de standards"}
 
         # OGC coverage — server-rendered from the live conformance registry.
+        # Implemented cards and roadmap pills link out to each standard's
+        # canonical OGC documentation page (URLs from OGC_COMPATIBILITY_STUDY).
         try:
             summary = get_conformance_summary()
             standards_html_parts: List[str] = []
             for s in summary.standards:
-                standards_html_parts.append(
-                    f"""
-                    <div class="glass-panel p-4 rounded-xl border border-white/5">
-                        <div class="flex items-center justify-between mb-1">
-                            <h4 class="text-sm font-semibold text-white">{s.name}</h4>
-                            <span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
-                                {s.implemented}
-                            </span>
-                        </div>
-                        <div class="text-[10px] text-slate-500 uppercase tracking-wider">{s.status}</div>
+                card_inner = f"""
+                    <div class="flex items-center justify-between mb-1">
+                        <h4 class="text-sm font-semibold text-white group-hover:text-emerald-300 transition-colors">{s.name}</h4>
+                        <span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                            {s.implemented}
+                        </span>
                     </div>
-                    """
-                )
+                    <div class="text-[10px] text-slate-500 uppercase tracking-wider">{s.status}</div>
+                """
+                if s.doc_url:
+                    standards_html_parts.append(
+                        f'<a href="{s.doc_url}" target="_blank" rel="noopener" '
+                        f'class="block glass-panel p-4 rounded-xl border border-white/5 '
+                        f'hover:border-emerald-500/40 transition-colors group">{card_inner}</a>'
+                    )
+                else:
+                    standards_html_parts.append(
+                        f'<div class="glass-panel p-4 rounded-xl border border-white/5 group">{card_inner}</div>'
+                    )
             standards_grid = "".join(standards_html_parts) or (
                 f'<div class="text-slate-500 text-sm col-span-full">No conformance classes registered.</div>'
             )
 
-            not_impl_pills = "".join(
-                f'<span class="px-2 py-1 rounded-full text-[11px] text-slate-500 border border-slate-700/60 bg-slate-800/40">{name}</span>'
-                for name in summary.not_implemented
-            ) or '<span class="text-slate-500 text-sm">All advertised standards have at least one conformance class registered.</span>'
+            not_impl_pill_parts: List[str] = []
+            for entry in summary.roadmap:
+                base_cls = "px-2 py-1 rounded-full text-[11px] border border-slate-700/60 bg-slate-800/40"
+                if entry.doc_url:
+                    not_impl_pill_parts.append(
+                        f'<a href="{entry.doc_url}" target="_blank" rel="noopener" '
+                        f'class="{base_cls} text-slate-400 hover:text-emerald-300 hover:border-emerald-500/40 transition-colors">'
+                        f'{entry.name}</a>'
+                    )
+                else:
+                    not_impl_pill_parts.append(
+                        f'<span class="{base_cls} text-slate-500">{entry.name}</span>'
+                    )
+            not_impl_pills = "".join(not_impl_pill_parts) or (
+                '<span class="text-slate-500 text-sm">All advertised standards have at least one conformance class registered.</span>'
+            )
 
             ogc_total = summary.total_conformance_classes
             ogc_families = len(summary.standards)

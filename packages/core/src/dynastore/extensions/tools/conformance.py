@@ -21,7 +21,7 @@
 import re
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 from pydantic import BaseModel
 
 from dynastore.modules import get_protocols
@@ -40,6 +40,12 @@ class StandardSummary(BaseModel):
     implemented: int
     uris: List[str]
     status: str
+    doc_url: Optional[str] = None
+
+
+class RoadmapEntry(BaseModel):
+    name: str
+    doc_url: Optional[str] = None
 
 
 class ConformanceSummary(BaseModel):
@@ -47,6 +53,7 @@ class ConformanceSummary(BaseModel):
     total_conformance_classes: int
     standards: List[StandardSummary]
     not_implemented: List[str]
+    roadmap: List[RoadmapEntry] = []
 
 
 # --- Pattern map: standard display name -> regex matching its conformance URIs
@@ -76,6 +83,34 @@ _STANDARD_PATTERNS: Dict[str, str] = {
 # `conformance_uris` entry. This list is for the home-page roadmap pills
 # only — every entry MUST be a published OGC standard or a recognised STAC
 # spec; research proposals do not belong here.
+# Documentation URLs for the OGC / STAC family — surfaced as clickable links
+# from the home-page coverage panel so visitors can dig into a standard
+# directly from the platform without leaving the landing page.
+# Source: OGC_COMPATIBILITY_STUDY.md (2026-05).
+_STANDARD_DOC_URLS: Dict[str, str] = {
+    "OGC API Common": "https://ogcapi.ogc.org/common/",
+    "OGC API Features": "https://ogcapi.ogc.org/features/",
+    "OGC API Tiles": "https://ogcapi.ogc.org/tiles/",
+    "OGC API Maps": "https://ogcapi.ogc.org/maps/",
+    "OGC API Processes": "https://ogcapi.ogc.org/processes/",
+    "OGC API Records": "https://ogcapi.ogc.org/records/",
+    "OGC API Coverages": "https://ogcapi.ogc.org/coverages/",
+    "OGC API DGGS": "https://ogcapi.ogc.org/dggs/",
+    "OGC API Connected Systems": "https://ogcapi.ogc.org/connectedsystems/",
+    "OGC API Moving Features": "https://ogcapi.ogc.org/movingfeatures/",
+    "OGC API Styles": "https://ogcapi.ogc.org/styles/",
+    "OGC API EDR": "https://ogcapi.ogc.org/edr/",
+    "OGC API Routes": "https://ogcapi.ogc.org/routes/",
+    "OGC API Joins": "https://github.com/opengeospatial/ogcapi-joins",
+    "OGC API 3D GeoVolumes": "https://ogcapi.ogc.org/geovolumes/",
+    "SensorThings API": "https://www.ogc.org/standard/sensorthings/",
+    "STAC API": "https://github.com/radiantearth/stac-api-spec",
+    # Aggregate bucket — link to the OGC API hub so unclassified URIs still
+    # have somewhere meaningful to point.
+    "Other / OGC Common": "https://ogcapi.ogc.org/common/",
+}
+
+
 _ALL_OGC_STANDARDS = [
     "OGC API Common",
     "OGC API Features",
@@ -147,6 +182,7 @@ def get_conformance_summary() -> ConformanceSummary:
                 implemented=len(uris),
                 uris=uris,
                 status="implemented",
+                doc_url=_STANDARD_DOC_URLS.get(name),
             ))
 
     # Add unclassified URIs as a bucket if any exist
@@ -156,6 +192,7 @@ def get_conformance_summary() -> ConformanceSummary:
             implemented=len(unclassified),
             uris=unclassified,
             status="implemented",
+            doc_url=_STANDARD_DOC_URLS.get("Other / OGC Common"),
         ))
         implemented_names.add("OGC API Common")
 
@@ -163,10 +200,15 @@ def get_conformance_summary() -> ConformanceSummary:
     not_implemented = sorted(
         s for s in _ALL_OGC_STANDARDS if s not in implemented_names
     )
+    roadmap = [
+        RoadmapEntry(name=n, doc_url=_STANDARD_DOC_URLS.get(n))
+        for n in not_implemented
+    ]
 
     return ConformanceSummary(
         timestamp=datetime.now(timezone.utc).isoformat(),
         total_conformance_classes=len(all_uris),
         standards=standards,
         not_implemented=not_implemented,
+        roadmap=roadmap,
     )
