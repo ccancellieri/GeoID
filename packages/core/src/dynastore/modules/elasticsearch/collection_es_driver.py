@@ -322,6 +322,57 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             maybe_raise_mapping_mismatch(exc, index_name, doc.keys())
             raise
 
+    async def ensure_indexer(self, ctx: Any) -> None:
+        """Idempotent bootstrap — delegates to :meth:`ensure_storage`."""
+        await self.ensure_storage(ctx.catalog)
+
+    async def index(self, ctx: Any, op: Any) -> None:
+        """Apply a single collection-tier op (upsert or delete).
+
+        ``op.entity_id`` is the collection id; ``ctx.catalog`` is the
+        owning catalog. ``op.payload`` carries the collection metadata
+        for upserts.
+        """
+        if op.op_type == "upsert":
+            payload = op.payload or {}
+            await self.upsert_metadata(ctx.catalog, op.entity_id, payload)
+        elif op.op_type == "delete":
+            await self.delete_metadata(ctx.catalog, op.entity_id)
+        else:
+            raise ValueError(
+                f"CollectionElasticsearchDriver.index: unsupported op_type "
+                f"{op.op_type!r}"
+            )
+
+    async def index_bulk(self, ctx: Any, ops: Any) -> Any:
+        """Apply a batch of collection-tier ops via per-op :meth:`index`.
+
+        Collection cardinality per catalog is typically moderate; a
+        per-op loop is fine. ES ``_bulk`` optimisation can land later if
+        a real tenant hits a hot loop.
+        """
+        from dynastore.models.protocols.indexer import BulkResult
+
+        total = len(ops)
+        failures: List[Dict[str, Any]] = []
+        succeeded = 0
+        for op in ops:
+            try:
+                await self.index(ctx, op)
+                succeeded += 1
+            except Exception as exc:
+                failures.append({
+                    "entity_id": op.entity_id,
+                    "op_type": op.op_type,
+                    "error": str(exc),
+                })
+        return BulkResult(
+            total=total,
+            succeeded=succeeded,
+            failed=len(failures),
+            failures=failures,
+        )
+
     async def delete_metadata(
         self,
         catalog_id: str,

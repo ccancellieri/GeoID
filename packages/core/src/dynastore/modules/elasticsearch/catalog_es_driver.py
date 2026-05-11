@@ -37,7 +37,7 @@ deliberate counterpart to the per-catalog
 """
 
 import logging
-from typing import Any, ClassVar, Dict, FrozenSet, Optional, Tuple
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.entity_store import EntityStoreCapability
@@ -302,6 +302,60 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
             logger.debug(
                 "delete_catalog_metadata ES error for %s: %s", catalog_id, e,
             )
+
+    # ------------------------------------------------------------------
+    # Indexer Protocol — dispatcher-facing surface
+    # ------------------------------------------------------------------
+
+    async def ensure_indexer(self, ctx: Any) -> None:
+        """Idempotent bootstrap — delegates to :meth:`ensure_storage`."""
+        await self.ensure_storage(ctx.catalog)
+
+    async def index(self, ctx: Any, op: Any) -> None:
+        """Apply a single catalog-tier op (upsert or delete).
+
+        ``op.entity_id`` is the catalog id; ``op.payload`` carries the
+        catalog metadata for upserts.
+        """
+        if op.op_type == "upsert":
+            payload = op.payload or {}
+            await self.upsert_catalog_metadata(op.entity_id, payload)
+        elif op.op_type == "delete":
+            await self.delete_catalog_metadata(op.entity_id)
+        else:
+            raise ValueError(
+                f"CatalogElasticsearchDriver.index: unsupported op_type "
+                f"{op.op_type!r}"
+            )
+
+    async def index_bulk(self, ctx: Any, ops: Any) -> Any:
+        """Apply a batch of catalog-tier ops via per-op :meth:`index`.
+
+        Catalog cardinality is low (typically <100); a per-op loop costs
+        one round-trip per op but keeps the failure-isolation simple. ES
+        ``_bulk`` is reserved for high-cardinality tiers (items/assets).
+        """
+        from dynastore.models.protocols.indexer import BulkResult
+
+        total = len(ops)
+        failures: List[Dict[str, Any]] = []
+        succeeded = 0
+        for op in ops:
+            try:
+                await self.index(ctx, op)
+                succeeded += 1
+            except Exception as exc:
+                failures.append({
+                    "entity_id": op.entity_id,
+                    "op_type": op.op_type,
+                    "error": str(exc),
+                })
+        return BulkResult(
+            total=total,
+            succeeded=succeeded,
+            failed=len(failures),
+            failures=failures,
+        )
 
     # ------------------------------------------------------------------
     # Plumbing
