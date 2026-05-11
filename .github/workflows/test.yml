@@ -310,7 +310,7 @@ jobs:
             -e LOG_LEVEL=INFO \
             -e PYTEST_CURRENT_TEST=true \
             geoid-test-runner:ci \
-            bash -c 'set -euo pipefail; mapfile -d "" -t TESTS < <(find tests -path "*/integration/*" -name "test_*.py" -type f -print0 | sort -z); test "${#TESTS[@]}" -gt 0 || { echo "no integration tests found"; exit 1; }; PYTHONUNBUFFERED=1 /opt/venv/bin/pytest "${TESTS[@]}" -v --tb=short -p no:cacheprovider --durations=20 --junitxml=/dynastore/workspace/test-results.xml'
+            bash -c 'set -euo pipefail; mapfile -d "" -t TESTS < <(find tests -path "*/integration/*" -name "test_*.py" -type f -print0 | sort -z); test "${#TESTS[@]}" -gt 0 || { echo "no integration tests found"; exit 1; }; PYTHONUNBUFFERED=1 /opt/venv/bin/pytest "${TESTS[@]}" -v --tb=short -p no:cacheprovider --durations=20 --junitxml=/dynastore/workspace/test-results.xml 2>&1 | tee /dynastore/workspace/integration-tests.log'
 
       - name: Display db logs on failure
         if: failure()
@@ -345,6 +345,7 @@ jobs:
           path: |
             test-results.xml
             integration-badge.svg
+            integration-tests.log
           if-no-files-found: warn
 
   integration-tests-elasticsearch:
