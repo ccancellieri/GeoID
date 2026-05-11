@@ -527,18 +527,10 @@ async def run_dispatcher(
                     # uncertainty (no capability declared, oracle says live,
                     # advisory lock contention) fall through to the standard
                     # back-off + reset-to-pending path.
-                    required_cap_fn = getattr(
-                        type(task_instance), "required_capability", None,
+                    from dynastore.modules.tasks.capability_oracle import (
+                        resolve_required_capability,
                     )
-                    cap_id = None
-                    if callable(required_cap_fn):
-                        try:
-                            cap_id = required_cap_fn(row)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug(
-                                "Dispatcher: required_capability raised for "
-                                "task %s: %s", task_id, exc,
-                            )
+                    cap_id = resolve_required_capability(task_instance, row)
                     if cap_id:
                         dlqed = await _maybe_dlq_unclaimable(
                             engine, row, capability_id=cap_id,

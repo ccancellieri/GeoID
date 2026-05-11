@@ -744,44 +744,58 @@ async def _warn_stuck_pending_tasks(
                 rows = await query.execute(
                     conn, min_age_s=min_age_s, sample_limit=sample_limit,
                 )
-            for row in rows or []:
-                cap_id, cap_live = await _resolve_capability_liveness(row)
-                logger.warning(
-                    "stuck-pending: task '%s' (%s, schema=%s) has been "
-                    "PENDING for %.0fs with retry_count=0 — %s",
-                    row["task_id"], row["task_type"], row.get("schema_name"),
-                    row["age_s"],
-                    _stuck_pending_hint(row["task_type"], cap_id, cap_live),
-                )
+            await _emit_stuck_pending_logs(rows or [])
         except Exception as exc:  # noqa: BLE001 — never crash on diagnostic
             logger.warning("stuck-pending warner: scan failed: %s", exc)
 
 
-async def _resolve_capability_liveness(
-    row: Dict[str, Any],
-) -> tuple[Optional[str], Optional[bool]]:
-    """Return ``(capability_id, is_live)`` for a stuck PENDING row.
+async def _emit_stuck_pending_logs(rows: List[Dict[str, Any]]) -> None:
+    """Pre-resolve capability ids with per-cycle memoization, query the
+    oracle once per distinct capability, then emit one WARN per row.
 
-    ``capability_id`` is ``None`` when the task type does not declare a
-    ``required_capability`` (e.g. capability-agnostic tasks). ``is_live``
-    is ``None`` in that case, otherwise ``True``/``False`` reflecting
-    :func:`is_capability_live`.
+    Coalescing matters in the common pathological case: dozens of rows
+    share the same dead ``indexer_id`` (a single SCOPE-drift fault
+    backlogs many propagations) and we would otherwise hit the cache
+    once per row.
+    """
+    cap_per_row: List[Optional[str]] = []
+    task_instance_cache: Dict[str, Any] = {}
+    for row in rows:
+        cap_per_row.append(_resolve_row_capability(row, task_instance_cache))
 
-    Defensive: never raises. On any failure returns ``(None, None)`` so
-    the warner falls back to its generic hint.
+    live_cache: Dict[str, bool] = {}
+    for cap_id in {c for c in cap_per_row if c}:
+        live_cache[cap_id] = await _safe_is_live(cap_id)
+
+    for row, cap_id in zip(rows, cap_per_row):
+        cap_live = live_cache.get(cap_id) if cap_id else None
+        logger.warning(
+            "stuck-pending: task '%s' (%s, schema=%s) has been "
+            "PENDING for %.0fs with retry_count=0 — %s",
+            row["task_id"], row["task_type"], row.get("schema_name"),
+            row["age_s"],
+            _stuck_pending_hint(row["task_type"], cap_id, cap_live),
+        )
+
+
+def _resolve_row_capability(
+    row: Dict[str, Any], task_instance_cache: Dict[str, Any],
+) -> Optional[str]:
+    """Return the capability id required to claim ``row`` or ``None``.
+
+    Uses ``task_instance_cache`` to avoid re-walking the task registry
+    when many rows share a ``task_type`` (the common case).
     """
     try:
         from dynastore.tasks import get_task_instance
-        from dynastore.modules.tasks.capability_oracle import is_capability_live
-
-        task_instance = get_task_instance(row["task_type"])
-        if task_instance is None:
-            return (None, None)
-        required_cap_fn = getattr(
-            type(task_instance), "required_capability", None,
+        from dynastore.modules.tasks.capability_oracle import (
+            resolve_required_capability,
         )
-        if not callable(required_cap_fn):
-            return (None, None)
+
+        task_type = row["task_type"]
+        if task_type not in task_instance_cache:
+            task_instance_cache[task_type] = get_task_instance(task_type)
+        task_instance = task_instance_cache[task_type]
         inputs_raw = row.get("inputs")
         if isinstance(inputs_raw, str):
             try:
@@ -789,13 +803,21 @@ async def _resolve_capability_liveness(
             except Exception:  # noqa: BLE001
                 inputs_raw = None
         payload = {"inputs": inputs_raw} if inputs_raw is not None else {}
-        cap_id = required_cap_fn(payload)
-        if not isinstance(cap_id, str) or not cap_id:
-            return (None, None)
-        live = await is_capability_live(cap_id)
-        return (cap_id, bool(live))
+        return resolve_required_capability(task_instance, payload)
     except Exception:  # noqa: BLE001 — diagnostic must never crash
-        return (None, None)
+        return None
+
+
+async def _safe_is_live(capability_id: str) -> Optional[bool]:
+    """Wrap :func:`is_capability_live` so the warner never crashes on a
+    cache failure. ``None`` falls back to the generic routing hint.
+    """
+    try:
+        from dynastore.modules.tasks.capability_oracle import is_capability_live
+
+        return bool(await is_capability_live(capability_id))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _stuck_pending_hint(

@@ -18,7 +18,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from dynastore.modules.tasks.tasks_module import (
-    _resolve_capability_liveness,
+    _emit_stuck_pending_logs,
+    _resolve_row_capability,
+    _safe_is_live,
     _stuck_pending_hint,
     _warn_stuck_pending_tasks,
 )
@@ -159,57 +161,93 @@ def test_hint_surfaces_transient_starvation_when_capability_alive():
     assert "transient pool starvation" in msg
 
 
-# --- _resolve_capability_liveness -------------------------------------------
+# --- _resolve_row_capability + _safe_is_live + _emit_stuck_pending_logs ---
 
 
-@pytest.mark.asyncio
-async def test_resolve_returns_none_when_task_unknown():
-    with patch(
-        "dynastore.tasks.get_task_instance", return_value=None,
-    ):
-        cap, live = await _resolve_capability_liveness(
-            {"task_type": "no_such_task", "inputs": None},
+def test_resolve_row_capability_returns_none_when_task_unknown():
+    with patch("dynastore.tasks.get_task_instance", return_value=None):
+        cache: dict = {}
+        cap = _resolve_row_capability(
+            {"task_type": "no_such_task", "inputs": None}, cache,
         )
-    assert cap is None and live is None
+    assert cap is None
+    assert "no_such_task" in cache  # memoized as None
 
 
-@pytest.mark.asyncio
-async def test_resolve_returns_capability_and_liveness_for_index_propagation():
-    """When the task declares a capability, oracle is consulted and the
-    result returned. Verifies json-string inputs are parsed."""
+def test_resolve_row_capability_parses_json_string_inputs():
     class _FakeTask:
         @classmethod
         def required_capability(cls, payload):
             return payload["inputs"]["indexer_id"]
 
-    with patch(
-        "dynastore.tasks.get_task_instance", return_value=_FakeTask(),
-    ), patch(
-        "dynastore.modules.tasks.capability_oracle.is_capability_live",
-        new=AsyncMock(return_value=False),
-    ):
-        cap, live = await _resolve_capability_liveness({
-            "task_type": "index_propagation",
-            "inputs": '{"indexer_id": "collection_elasticsearch_driver"}',
-        })
+    with patch("dynastore.tasks.get_task_instance", return_value=_FakeTask()):
+        cap = _resolve_row_capability(
+            {"task_type": "index_propagation",
+             "inputs": '{"indexer_id": "collection_elasticsearch_driver"}'},
+            {},
+        )
     assert cap == "collection_elasticsearch_driver"
-    assert live is False
 
 
-@pytest.mark.asyncio
-async def test_resolve_swallows_oracle_failures():
+def test_resolve_row_capability_uses_task_instance_cache():
+    """Many rows with the same task_type → ONE get_task_instance call."""
     class _FakeTask:
         @classmethod
         def required_capability(cls, payload):
-            return "x"
+            return payload["inputs"]["indexer_id"]
 
+    call_count = {"n": 0}
+
+    def _stub_get(task_type):
+        call_count["n"] += 1
+        return _FakeTask()
+
+    with patch("dynastore.tasks.get_task_instance", side_effect=_stub_get):
+        cache: dict = {}
+        for _ in range(5):
+            _resolve_row_capability(
+                {"task_type": "index_propagation",
+                 "inputs": {"indexer_id": "d1"}},
+                cache,
+            )
+    assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_safe_is_live_returns_none_on_cache_failure():
     with patch(
-        "dynastore.tasks.get_task_instance", return_value=_FakeTask(),
-    ), patch(
         "dynastore.modules.tasks.capability_oracle.is_capability_live",
         new=AsyncMock(side_effect=RuntimeError("cache down")),
     ):
-        cap, live = await _resolve_capability_liveness({
-            "task_type": "index_propagation", "inputs": {"indexer_id": "x"},
-        })
-    assert cap is None and live is None
+        live = await _safe_is_live("x")
+    assert live is None
+
+
+@pytest.mark.asyncio
+async def test_emit_coalesces_oracle_calls_per_distinct_capability(caplog):
+    """30 rows sharing a dead indexer_id → ONE oracle call, 30 WARN lines."""
+    class _FakeTask:
+        @classmethod
+        def required_capability(cls, payload):
+            return payload["inputs"]["indexer_id"]
+
+    rows = [
+        {"task_id": f"r-{i}", "task_type": "index_propagation",
+         "schema_name": "s", "age_s": 999.0,
+         "inputs": {"indexer_id": "dead_driver"}}
+        for i in range(30)
+    ]
+
+    oracle = AsyncMock(return_value=False)
+    caplog.set_level(logging.WARNING)
+    with patch("dynastore.tasks.get_task_instance", return_value=_FakeTask()), \
+         patch(
+             "dynastore.modules.tasks.capability_oracle.is_capability_live",
+             new=oracle,
+         ):
+        await _emit_stuck_pending_logs(rows)
+
+    assert oracle.await_count == 1
+    warn_lines = [r.message for r in caplog.records if "stuck-pending:" in r.message]
+    assert len(warn_lines) == 30
+    assert all("live=false" in m for m in warn_lines)

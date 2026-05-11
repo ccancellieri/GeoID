@@ -20,6 +20,7 @@ cache outage) is swallowed and the oracle returns ``True`` — preferring
 from __future__ import annotations
 
 import logging
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -51,3 +52,35 @@ async def is_capability_live(capability_id: str) -> bool:
             capability_id, exc,
         )
         return True
+
+
+def resolve_required_capability(
+    task_instance: Any, payload: Any,
+) -> Optional[str]:
+    """Return the capability id required to claim ``payload``, or ``None``.
+
+    Pure helper consumed by every callsite that needs to translate a task
+    row into a capability id (the reactive reaper in ``dispatcher.py``,
+    the stuck-pending warner in ``tasks_module.py``, and the inbound
+    admin route for ``requeue_dead_letter_tasks_by_type`` — #523).
+
+    Defensive: returns ``None`` when ``task_instance`` is missing,
+    ``required_capability`` is not declared on the class, the method
+    raises, or the result is not a non-empty string. Never raises.
+    """
+    if task_instance is None:
+        return None
+    required_cap_fn = getattr(
+        type(task_instance), "required_capability", None,
+    )
+    if not callable(required_cap_fn):
+        return None
+    try:
+        cap = required_cap_fn(payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "capability_oracle: required_capability raised on %s: %s",
+            type(task_instance).__name__, exc,
+        )
+        return None
+    return cap if isinstance(cap, str) and cap else None
