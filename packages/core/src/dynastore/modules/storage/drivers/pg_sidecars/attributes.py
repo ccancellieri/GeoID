@@ -1730,9 +1730,14 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         else:
             val = data.get(path)
 
-        # Fallback to properties if not found at root (standard GIS/STAC behavior)
-        if val is None and ("id" in path or "asset_id" in path):
-            val = data.get("properties", {}).get(path)
+        # Fallback to properties if not found at root (standard GIS/STAC behavior).
+        # GDAL/shapefile features arrive as {"properties": {...}, "geometry": ...};
+        # any configured external_id_field must resolve from the properties bag,
+        # not just the legacy id/asset_id paths.
+        if val is None and "." not in path:
+            props = data.get("properties")
+            if isinstance(props, dict):
+                val = props.get(path)
 
         return val
 
@@ -1744,7 +1749,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         """
         external_id = self._extract_value(feature, self.config.external_id_field)
 
-        if self.config.require_external_id and external_id is None:
+        if self.config.require_external_id and not external_id:
             logger.warning(
                 f"Feature rejected: external_id missing (required by config)"
             )
