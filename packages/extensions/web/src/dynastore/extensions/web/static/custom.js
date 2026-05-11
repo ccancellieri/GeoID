@@ -829,7 +829,7 @@ async function exchangeCodeForToken(code) {
     }
 }
 
-async function refreshUserProfile() {
+async function refreshUserProfile(alreadyRefreshed = false) {
     if (!authToken) return;
 
     try {
@@ -845,10 +845,21 @@ async function refreshUserProfile() {
             await loadSidebar();
             _scheduleTokenRefresh();
         } else if (response.status === 401) {
-            // Token expired — try silent refresh before giving up
+            // /me rejected the access token. Try a silent refresh ONCE; if
+            // the refresh succeeds but the new token is also rejected, the
+            // failure is persistent (disabled account, audience drift, clock
+            // skew, …) — sign out so the user gets a clear signal instead of
+            // an invisible /me-401 ↔ /refresh-200 loop (issue #516).
+            if (alreadyRefreshed) {
+                console.warn(
+                    "/me still 401 after a successful refresh — signing out to break the loop."
+                );
+                handleLogout();
+                return;
+            }
             const refreshed = await tryRefreshToken();
             if (refreshed) {
-                await refreshUserProfile(); // retry with new token
+                await refreshUserProfile(true);
             } else {
                 handleLogout();
             }
