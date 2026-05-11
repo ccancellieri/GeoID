@@ -104,6 +104,7 @@ def make_item(item_id: str, lon: float = 10.0, lat: float = 40.0) -> dict:
         "id": item_id,
         "type": "Feature",
         "geometry": {"type": "Point", "coordinates": [lon, lat]},
+        "bbox": [lon, lat, lon, lat],
         "properties": {
             "datetime": "2024-01-15T00:00:00Z",
             "title": {"en": f"ES Integration Test {item_id}"},
