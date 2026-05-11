@@ -1615,17 +1615,29 @@ async def claim_for_dispatch(
 async def reset_task_to_pending(
     engine: DbResource,
     task_id: uuid.UUID,
+    backoff: Optional[timedelta] = None,
 ) -> None:
     """Requeue an ACTIVE task to PENDING without incrementing retry_count.
 
     Called by run_ephemeral on CancelledError so the task stays visible
     for another process to pick up rather than being lost on shutdown.
+
+    ``backoff`` sets ``locked_until = NOW() + backoff`` so the same worker
+    that released the claim cannot immediately re-claim on the next poll.
+    Without back-off a worker that consistently refuses to handle a row
+    (e.g. payload-aware ``can_claim`` returning False) would hot-loop.
     """
     task_schema = get_task_schema()
+    params: Dict[str, Any] = {"task_id": task_id}
+    if backoff is not None:
+        locked_until_clause = "locked_until = :backoff_until"
+        params["backoff_until"] = datetime.now(timezone.utc) + backoff
+    else:
+        locked_until_clause = "locked_until = NULL"
     sql = f"""
         UPDATE {task_schema}.tasks
         SET status = 'PENDING',
-            locked_until = NULL,
+            {locked_until_clause},
             owner_id = NULL,
             last_heartbeat_at = NULL
         WHERE task_id = :task_id
@@ -1633,7 +1645,7 @@ async def reset_task_to_pending(
     """
     async with managed_transaction(engine) as conn:
         await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-            conn, task_id=task_id,
+            conn, **params,
         )
 
 

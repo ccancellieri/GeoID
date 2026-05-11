@@ -45,6 +45,23 @@ class TaskProtocol(HasConfigService, Protocol, Generic[DefinitionType, PayloadTy
         """
         return True
 
+    @classmethod
+    def can_claim(cls, payload: Any) -> bool:
+        """Payload-aware claim predicate.
+
+        Called by the dispatcher AFTER ``claim_batch`` returns a row of
+        this task_type, BEFORE the task is handed to a runner.  Returning
+        ``False`` releases the claim back to PENDING (with a small back-off
+        to avoid hot-looping the same worker on the same row).  Default
+        returns ``True`` so existing tasks keep their previous behaviour.
+
+        Use cases: a task class whose execution depends on a per-row
+        capability that varies across worker pools (e.g. a specific
+        Indexer module being registered in this process — see
+        :class:`~dynastore.tasks.index_propagation.task.IndexPropagationTask`).
+        """
+        return True
+
     @asynccontextmanager
     async def lifespan(self, app_state: Any) -> AsyncGenerator[None, None]:
         """

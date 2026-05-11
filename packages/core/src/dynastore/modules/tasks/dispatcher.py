@@ -98,6 +98,14 @@ _RUNNER_ID = _runner_id()
 from dynastore.modules.db_config.instance import get_service_name as _get_service_name
 
 _SERVICE_NAME: Optional[str] = _get_service_name()
+
+# Back-off applied to a row when a worker's payload-aware ``can_claim``
+# refuses it.  Keeps the same worker from immediately re-claiming on the
+# next poll while leaving the row visible to any other worker (whose
+# ``claim_batch`` filter is ``locked_until IS NULL OR locked_until <= NOW()``).
+_CLAIM_REJECT_BACKOFF = timedelta(
+    seconds=int(os.environ.get("DISPATCHER_CLAIM_REJECT_BACKOFF_SECONDS", "30")),
+)
 if _SERVICE_NAME:
     logger.info("Dispatcher: service_name=%r (from instance.json)", _SERVICE_NAME)
 else:
@@ -295,8 +303,11 @@ async def run_dispatcher(
     """
     from dynastore.modules.tasks.runners import capability_map
     from dynastore.modules.tasks.models import TaskExecutionMode, PermanentTaskFailure
-    from dynastore.modules.tasks.tasks_module import claim_batch, complete_task, fail_task
+    from dynastore.modules.tasks.tasks_module import (
+        claim_batch, complete_task, fail_task, reset_task_to_pending,
+    )
     from dynastore.modules.tasks.execution import execution_engine
+    from dynastore.tasks import get_task_instance
 
     # Refresh capability map at startup
     await capability_map.refresh()
@@ -334,6 +345,35 @@ async def run_dispatcher(
         task_id = row["task_id"]
         timestamp = row["timestamp"]
         deferred = False
+
+        # Payload-aware claim predicate.  If the task class refuses this
+        # specific row (e.g. ``IndexPropagationTask`` whose target indexer
+        # is not registered in this process), release the claim back to
+        # PENDING with a small back-off so another worker can pick it up
+        # without this one hot-looping.  See #491.
+        task_instance = get_task_instance(row["task_type"])
+        if task_instance is not None:
+            can_claim_fn = getattr(type(task_instance), "can_claim", None)
+            if callable(can_claim_fn):
+                try:
+                    accepted = can_claim_fn(row)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Dispatcher: can_claim raised for task %s (%s): %s — "
+                        "falling through to runner so the failure surfaces.",
+                        task_id, row["task_type"], exc,
+                    )
+                    accepted = True
+                if not accepted:
+                    logger.info(
+                        "Dispatcher: task %s (%s) released — can_claim returned "
+                        "False on this worker.",
+                        task_id, row["task_type"],
+                    )
+                    await reset_task_to_pending(
+                        engine, task_id, backoff=_CLAIM_REJECT_BACKOFF,
+                    )
+                    return
 
         await heartbeat.register(str(task_id), timestamp)
         try:
