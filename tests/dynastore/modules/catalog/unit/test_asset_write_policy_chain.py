@@ -33,8 +33,11 @@ Stage 4.1 / 4.2 add the real-DB test that complements this one.
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.modules.catalog import asset_distributed as ad
 from dynastore.modules.catalog.asset_distributed import (
@@ -158,6 +161,17 @@ def is_insert(sql: str) -> bool:
 
 
 SCOPE = Scope(schema="ds_test", catalog_id="cat", collection_id="col")
+
+
+def _spec_conn() -> MagicMock:
+    """Mock that passes `isinstance(_, AsyncConnection)` and carries a real
+    PG dialect so TemplateQueryBuilder can resolve identifier quoting when
+    any code path bypasses the fake-DQLQuery monkeypatch."""
+    conn = MagicMock(spec=AsyncConnection)
+    conn.dialect = postgresql.dialect()
+    return conn
+
+
 EXISTING_ROW: Dict[str, Any] = {
     "asset_id": "alpha",
     "catalog_id": "cat",
@@ -203,7 +217,7 @@ async def test_refuse_fail_on_asset_id_match(fake_dql: _Recorder) -> None:
 
     policy = AssetsWritePolicy()  # defaults: REFUSE_FAIL on [ASSET_ID, FILENAME]
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
     err = exc_info.value
     assert err.matcher == "asset_id"
@@ -241,7 +255,7 @@ async def test_refuse_fail_on_filename_match(fake_dql: _Recorder) -> None:
     )
     payload = physical(asset_id="brand_new", filename="alpha.tif")
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=payload, policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
     assert exc_info.value.matcher == "filename"
     # Two SELECTs — chain ran ASSET_ID then FILENAME.
@@ -262,7 +276,7 @@ async def test_update_on_asset_id_keeps_filename(fake_dql: _Recorder) -> None:
 
     policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.UPDATE)
     payload = physical(metadata={"version": 99})
-    result = await upsert_asset(conn=object(), scope=SCOPE, payload=payload, policy=policy)
+    result = await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
     assert result.action == "updated"
     assert result.matcher_hit == AssetIdentityMatcher.ASSET_ID
@@ -282,7 +296,7 @@ async def test_refuse_returns_existing_silently(fake_dql: _Recorder) -> None:
 
     policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.REFUSE)
     result = await upsert_asset(
-        conn=object(), scope=SCOPE, payload=physical(), policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy
     )
 
     assert result.action == "refused"
@@ -312,7 +326,7 @@ async def test_metadata_field_matcher(fake_dql: _Recorder) -> None:
     )
     payload = physical(metadata={"iso19115": {"fileIdentifier": "URN:1"}})
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=payload, policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
     assert exc_info.value.matcher == "metadata_field"
 
@@ -350,7 +364,7 @@ async def test_chain_first_match_wins(fake_dql: _Recorder) -> None:
         metadata={"iso19115": {"fileIdentifier": "URN:1"}},
     )
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=payload, policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
     assert exc_info.value.matcher == "metadata_field"
     # Three SELECT probes: the first two missed, the third hit and stopped
@@ -379,7 +393,7 @@ async def test_new_version_archives_old(fake_dql: _Recorder) -> None:
     policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.NEW_VERSION)
     payload = physical(metadata={"version": 2})
     result = await upsert_asset(
-        conn=object(), scope=SCOPE, payload=payload, policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
     )
 
     assert result.action == "new_version"
@@ -405,23 +419,13 @@ async def test_new_version_archives_old(fake_dql: _Recorder) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "tracked by #514 — TemplateQueryBuilder is reached with conn=object() "
-        "and rejects dialect resolution. The fake DQLQuery monkeypatch is in "
-        "place but some code path bypasses it post-refactor. Needs a fixture "
-        "audit (use a MagicMock(spec=AsyncConnection) for conn, or monkeypatch "
-        "TemplateQueryBuilder directly)."
-    ),
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_no_match_inserts_pending_when_requested(fake_dql: _Recorder) -> None:
     fake_dql.when(is_insert, dict(EXISTING_ROW, status="pending"))
 
     policy = AssetsWritePolicy()
     result = await upsert_asset(
-        conn=object(),
+        conn=_spec_conn(),
         scope=SCOPE,
         payload=physical(asset_id="brand_new"),
         policy=policy,
@@ -446,7 +450,7 @@ async def test_refuse_return_echoes_existing(fake_dql: _Recorder) -> None:
 
     policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.REFUSE_RETURN)
     result = await upsert_asset(
-        conn=object(), scope=SCOPE, payload=physical(), policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy
     )
 
     assert result.action == "returned_existing"
@@ -476,7 +480,7 @@ async def test_hash_gating_collapses_update_to_refuse_return(
     object.__setattr__(payload, "content_hash", "deadbeef")  # same as EXISTING_ROW
 
     result = await upsert_asset(
-        conn=object(), scope=SCOPE, payload=payload, policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
     )
 
     assert result.action == "returned_existing"
@@ -504,7 +508,6 @@ def _make_unique_violation(constraint: str) -> Exception:
     )
 
 
-@pytest.mark.xfail(reason="tracked by #514 — fixture conn=object() now hits TemplateQueryBuilder strict dialect resolution", strict=False)
 @pytest.mark.asyncio
 async def test_race_filename_constraint_maps_to_filename_matcher(
     fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
@@ -518,7 +521,7 @@ async def test_race_filename_constraint_maps_to_filename_matcher(
 
     policy = AssetsWritePolicy()  # defaults
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
     err = exc_info.value
     assert err.matcher == AssetIdentityMatcher.FILENAME.value
@@ -527,7 +530,6 @@ async def test_race_filename_constraint_maps_to_filename_matcher(
     assert err.existing_id is None  # we don't query the winning row
 
 
-@pytest.mark.xfail(reason="tracked by #514 — fixture conn=object() now hits TemplateQueryBuilder strict dialect resolution", strict=False)
 @pytest.mark.asyncio
 async def test_race_href_constraint_maps_to_url_matcher(
     fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
@@ -539,13 +541,12 @@ async def test_race_href_constraint_maps_to_url_matcher(
 
     policy = AssetsWritePolicy()
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=virtual(), policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=virtual(), policy=policy)
 
     assert exc_info.value.matcher == AssetIdentityMatcher.URL.value
     assert exc_info.value.reason == "conflict"
 
 
-@pytest.mark.xfail(reason="tracked by #514 — fixture conn=object() now hits TemplateQueryBuilder strict dialect resolution", strict=False)
 @pytest.mark.asyncio
 async def test_race_identity_constraint_maps_to_asset_id_matcher(
     fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
@@ -557,13 +558,12 @@ async def test_race_identity_constraint_maps_to_asset_id_matcher(
 
     policy = AssetsWritePolicy()
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
     assert exc_info.value.matcher == AssetIdentityMatcher.ASSET_ID.value
     assert exc_info.value.reason == "conflict"
 
 
-@pytest.mark.xfail(reason="tracked by #514 — fixture conn=object() now hits TemplateQueryBuilder strict dialect resolution", strict=False)
 @pytest.mark.asyncio
 async def test_race_unknown_constraint_maps_to_unknown_matcher(
     fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
@@ -575,13 +575,12 @@ async def test_race_unknown_constraint_maps_to_unknown_matcher(
 
     policy = AssetsWritePolicy()
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
     assert exc_info.value.matcher == "unknown"
     assert exc_info.value.reason == "conflict"
 
 
-@pytest.mark.xfail(reason="tracked by #514 — fixture conn=object() now hits TemplateQueryBuilder strict dialect resolution", strict=False)
 @pytest.mark.asyncio
 async def test_race_via_message_scrape_when_constraint_attr_missing(
     fake_dql: _Recorder, monkeypatch: pytest.MonkeyPatch
@@ -606,7 +605,7 @@ async def test_race_via_message_scrape_when_constraint_attr_missing(
 
     policy = AssetsWritePolicy()
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
     assert exc_info.value.matcher == AssetIdentityMatcher.FILENAME.value
 
@@ -628,7 +627,7 @@ async def test_new_version_archive_stamps_asset_references_valid_until(
 
     policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.NEW_VERSION)
     result = await upsert_asset(
-        conn=object(), scope=SCOPE, payload=physical(), policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy
     )
     assert result.action == "new_version"
 
@@ -682,7 +681,7 @@ async def test_content_hash_probe_sends_both_tagged_and_raw_binds(
         identity_matchers=[AssetIdentityMatcher.CONTENT_HASH],
     )
     with pytest.raises(AssetSidecarRejectedError):
-        await upsert_asset(conn=object(), scope=SCOPE, payload=payload, policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
     # Find the SELECT call hitting content_hash.
     probe_call = next(c for c in fake_dql.calls if "content_hash" in c["sql"])
@@ -709,7 +708,7 @@ async def test_hash_gating_normalizes_across_tagged_and_untagged(
     object.__setattr__(payload, "content_hash", "abc==")  # untagged, raw
 
     result = await upsert_asset(
-        conn=object(), scope=SCOPE, payload=payload, policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
     )
     assert result.action == "returned_existing"
     assert not any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
@@ -731,7 +730,7 @@ async def test_race_in_new_version_path_preserves_existing_id(
 
     policy = AssetsWritePolicy(on_conflict=AssetWriteConflictPolicy.NEW_VERSION)
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
-        await upsert_asset(conn=object(), scope=SCOPE, payload=physical(), policy=policy)
+        await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
     err = exc_info.value
     assert err.matcher == AssetIdentityMatcher.FILENAME.value
