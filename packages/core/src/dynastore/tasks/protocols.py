@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import abc
-from typing import Protocol, AsyncGenerator, TypeVar, Generic, runtime_checkable, Any
+from typing import Protocol, AsyncGenerator, Optional, TypeVar, Generic, runtime_checkable, Any
 from contextlib import asynccontextmanager
 from dynastore.modules.protocols import HasConfigService
 
@@ -44,6 +44,20 @@ class TaskProtocol(HasConfigService, Protocol, Generic[DefinitionType, PayloadTy
         Return True if this task is available for execution.
         """
         return True
+
+    @classmethod
+    def required_capability(cls, payload: Any) -> Optional[str]:
+        """Return the capability id this row needs, or ``None`` if the row
+        is not capability-gated.
+
+        Companion to :meth:`can_claim`. The dispatcher uses this to query
+        the shared-cache liveness oracle when ``can_claim`` rejects a row:
+        if no live worker advertises this capability anywhere in the
+        deployment, the row is DLQed instead of left PENDING (#502).
+
+        Default ``None`` keeps existing tasks out of the reaper's path.
+        """
+        return None
 
     @classmethod
     def can_claim(cls, payload: Any) -> bool:

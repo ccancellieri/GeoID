@@ -31,6 +31,32 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    capability_publisher_ttl_seconds: float = Field(
+        default=60.0,
+        ge=10.0,
+        le=600.0,
+        description=(
+            "TTL (seconds) for capability liveness sentinel keys written to "
+            "the shared cache by every pod that can service a capability "
+            "(e.g. an Indexer registered in this process). Read by the "
+            "reactive reaper (#502): when the last pod with a capability "
+            "dies, no one refreshes the key, the TTL expires, and "
+            "unclaimable task rows are DLQed on the next dispatcher pass. "
+            "Pair with capability_publisher_refresh_seconds <= ttl/2 so "
+            "one missed tick is absorbed."
+        ),
+    )
+
+    capability_publisher_refresh_seconds: float = Field(
+        default=30.0,
+        ge=5.0,
+        description=(
+            "How often each pod refreshes its capability sentinel keys. "
+            "Must be <= capability_publisher_ttl_seconds / 2 to tolerate a "
+            "single missed tick without false-positive DLQs."
+        ),
+    )
+
 
 class TaskRoutingConfig(ExposableConfigMixin, PluginConfig):
     """Service-affinity routing for the global task queue.

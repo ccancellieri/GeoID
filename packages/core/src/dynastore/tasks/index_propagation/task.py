@@ -104,15 +104,19 @@ class IndexPropagationInputs(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _registered_indexer_ids() -> List[str]:
+def registered_indexer_ids() -> List[str]:
     """Snake-cased class names of every :class:`Indexer` registered in this
-    process.  Used by both :meth:`IndexPropagationTask.can_claim` and
-    :meth:`IndexPropagationTask.run`.
+    process.  Used by :meth:`IndexPropagationTask.can_claim`,
+    :meth:`IndexPropagationTask.run`, and the capability publisher that
+    keeps the shared cache liveness sentinel keys refreshed (#502).
     """
     from dynastore.models.protocols.indexer import Indexer
     from dynastore.modules.storage.routing_config import _to_snake
 
     return [_to_snake(type(impl).__name__) for impl in get_protocols(Indexer)]
+
+
+_registered_indexer_ids = registered_indexer_ids
 
 
 class IndexPropagationTask(TaskProtocol):
@@ -128,6 +132,25 @@ class IndexPropagationTask(TaskProtocol):
 
     def is_available(self) -> bool:  # pragma: no cover — discovery hook
         return True
+
+    @classmethod
+    def required_capability(cls, payload: Any) -> Optional[str]:
+        """The capability id needed to run a given row = its ``indexer_id``.
+
+        Used by the dispatcher's reactive reaper (#502): when ``can_claim``
+        rejects a row, the dispatcher consults the shared-cache liveness
+        oracle for this capability id and DLQs the row if no live worker
+        advertises it.
+        """
+        try:
+            inputs_raw = (payload.get("inputs") if isinstance(payload, dict)
+                          else getattr(payload, "inputs", None)) or {}
+            if isinstance(inputs_raw, dict):
+                cap = inputs_raw.get("indexer_id")
+                return cap if isinstance(cap, str) and cap else None
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     @classmethod
     def can_claim(cls, payload: Any) -> bool:

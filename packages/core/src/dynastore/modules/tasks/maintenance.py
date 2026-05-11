@@ -157,6 +157,63 @@ async def requeue_dead_letter_task(
     return False
 
 
+async def requeue_dead_letter_tasks_by_type(
+    engine: AsyncEngine,
+    task_type: str,
+    *,
+    since: Optional[datetime] = None,
+    limit: int = 1000,
+    reset_retries: bool = True,
+) -> int:
+    """Bulk-requeue every DEAD_LETTER row of ``task_type`` (optionally
+    filtered by ``finished_at >= since``).
+
+    Companion to the reactive reaper added in #502: after fixing a
+    persistent SCOPE drift, operators run this to replay reaped
+    ``index_propagation`` rows in one call instead of looping
+    :func:`requeue_dead_letter_task`.
+
+    Returns the count of rows transitioned back to PENDING.
+    """
+    task_schema = get_task_schema()
+    retry_clause = "retry_count = 0," if reset_retries else ""
+    since_filter = "AND finished_at >= :since" if since is not None else ""
+    sql = f"""
+        WITH victims AS (
+            SELECT task_id, timestamp
+            FROM {task_schema}.tasks
+            WHERE status    = 'DEAD_LETTER'
+              AND task_type = :task_type
+              {since_filter}
+            ORDER BY finished_at DESC
+            LIMIT :lim
+        )
+        UPDATE {task_schema}.tasks t
+        SET status        = 'PENDING',
+            {retry_clause}
+            locked_until  = NULL,
+            finished_at   = NULL,
+            error_message = NULL
+        FROM victims v
+        WHERE t.task_id   = v.task_id
+          AND t.timestamp = v.timestamp
+        RETURNING t.task_id;
+    """
+    params: Dict[str, Any] = {"task_type": task_type, "lim": limit}
+    if since is not None:
+        params["since"] = since
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(
+            sql, result_handler=ResultHandler.ALL_DICTS,
+        ).execute(conn, **params) or []
+    count = len(rows)
+    logger.info(
+        "Maintenance: requeued %d DEAD_LETTER row(s) of type %r%s.",
+        count, task_type, f" since {since.isoformat()}" if since else "",
+    )
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Completed task purge
 # ---------------------------------------------------------------------------

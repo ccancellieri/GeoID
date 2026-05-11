@@ -43,11 +43,30 @@ Both are stateless: any worker instance can resume any task after a crash.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
+
+
+def _stable_advisory_lock_key(*parts: str) -> int:
+    """Process-stable signed bigint for ``pg_try_advisory_xact_lock``.
+
+    Python's builtin ``hash()`` is salted per-process (PEP 456) unless
+    ``PYTHONHASHSEED`` is fixed — two pods hashing the same string will
+    pick different lock keys, so any "single-leader across the deployment"
+    guarantee that depends on it is silently broken. ``hashlib.blake2b``
+    is deterministic across pods, processes, and Python versions.
+
+    Returns a non-negative 63-bit int that fits PostgreSQL's signed
+    bigint ``pg_try_advisory_xact_lock(bigint)`` signature.
+    """
+    h = hashlib.blake2b(
+        b"\x00".join(p.encode("utf-8") for p in parts), digest_size=8,
+    )
+    return int.from_bytes(h.digest(), "big") & 0x7FFFFFFFFFFFFFFF
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -201,6 +220,99 @@ class BatchedHeartbeat:
 
 
 # ---------------------------------------------------------------------------
+# Reactive reaper — DLQ unclaimable rows when no live worker advertises the
+# required capability (issue #502). Companion to ``TaskProtocol.can_claim``
+# and ``TaskProtocol.required_capability``.
+# ---------------------------------------------------------------------------
+
+
+async def _maybe_dlq_unclaimable(
+    engine: DbResource, row: Dict[str, Any], *, capability_id: str,
+) -> bool:
+    """If no live worker advertises ``capability_id``, move ``row`` to
+    DEAD_LETTER with a clear ``error_message`` and return ``True``.
+
+    Returns ``False`` if the row should stay PENDING (oracle says live,
+    advisory lock contended, infra error). On any uncertainty we prefer
+    "leave PENDING + WARN" over a false DLQ — the caller falls back to
+    the standard ``reset_task_to_pending`` back-off.
+
+    Single-actor guarded by a transaction-scoped ``pg_try_advisory_xact_lock``
+    keyed by capability id: when N dispatchers see the same rejected row in
+    parallel, at most one performs the UPDATE; the others skip and let the
+    standard back-off path run.
+    """
+    from dynastore.modules.tasks.capability_oracle import is_capability_live
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, DDLQuery, ResultHandler, managed_transaction,
+    )
+    from dynastore.modules.tasks.tasks_module import get_task_schema
+
+    task_id = row["task_id"]
+    timestamp = row["timestamp"]
+
+    try:
+        if await is_capability_live(capability_id):
+            return False
+
+        lock_key = _stable_advisory_lock_key(
+            "dynastore.idx_reaper", capability_id,
+        )
+        schema = get_task_schema()
+        error_message = (
+            f"reaped: no live worker advertises capability {capability_id!r} "
+            f"(check SCOPE/B6 — module not loaded in any reachable pool)"
+        )
+        async with managed_transaction(engine) as conn:
+            got_lock = await DQLQuery(
+                "SELECT pg_try_advisory_xact_lock(:k) AS got",
+                result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, k=lock_key)
+            if not got_lock or not got_lock.get("got"):
+                return False
+
+            # Re-check liveness inside the locked transaction: another pod
+                # may have appeared between the unlocked oracle call above and
+                # the lock acquisition. Conservative double-check is cheap.
+            if await is_capability_live(capability_id):
+                return False
+
+            # CAS guard: only DLQ rows still PENDING with retry_count=0. If
+            # any dispatcher raced and claimed it, the UPDATE matches zero
+            # rows and we fall through harmlessly.
+            sql = f"""
+                UPDATE "{schema}".tasks
+                SET status        = 'DEAD_LETTER',
+                    error_message = :err,
+                    finished_at   = NOW(),
+                    owner_id      = NULL,
+                    locked_until  = NULL
+                WHERE timestamp = :ts
+                  AND task_id   = :tid
+                  AND status    = 'PENDING'
+                  AND retry_count = 0
+                RETURNING task_id
+            """
+            updated = await DQLQuery(
+                sql, result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, err=error_message, ts=timestamp, tid=task_id)
+            if updated:
+                logger.warning(
+                    "dispatcher: DLQ'd task %s (%s) — capability %r has no "
+                    "live worker in the deployment",
+                    task_id, row.get("task_type"), capability_id,
+                )
+                return True
+            return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "dispatcher: reactive reaper failed for task %s (%s) — "
+            "leaving PENDING: %s", task_id, row.get("task_type"), exc,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Janitor — recovery of stale ACTIVE tasks + orphan cleanup
 # ---------------------------------------------------------------------------
 
@@ -220,7 +332,7 @@ async def _run_janitor(
     from dynastore.modules.tasks.tasks_module import find_stale_tasks, fail_task, cleanup_orphan_tasks
     from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler, managed_transaction
 
-    _JANITOR_LOCK_KEY = hash("dynastore.janitor.global") & 0x7FFFFFFFFFFFFFFF
+    _JANITOR_LOCK_KEY = _stable_advisory_lock_key("dynastore.janitor.global")
 
     async with managed_transaction(engine) as conn:
         try:
@@ -365,6 +477,31 @@ async def run_dispatcher(
                     )
                     accepted = True
                 if not accepted:
+                    # Reactive reaper (#502): if the task is capability-gated
+                    # and no live worker advertises the required capability,
+                    # the row is unclaimable across the entire deployment.
+                    # DLQ it instead of leaving it PENDING forever. On any
+                    # uncertainty (no capability declared, oracle says live,
+                    # advisory lock contention) fall through to the standard
+                    # back-off + reset-to-pending path.
+                    required_cap_fn = getattr(
+                        type(task_instance), "required_capability", None,
+                    )
+                    cap_id = None
+                    if callable(required_cap_fn):
+                        try:
+                            cap_id = required_cap_fn(row)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug(
+                                "Dispatcher: required_capability raised for "
+                                "task %s: %s", task_id, exc,
+                            )
+                    if cap_id:
+                        dlqed = await _maybe_dlq_unclaimable(
+                            engine, row, capability_id=cap_id,
+                        )
+                        if dlqed:
+                            return
                     logger.info(
                         "Dispatcher: task %s (%s) released — can_claim returned "
                         "False on this worker.",

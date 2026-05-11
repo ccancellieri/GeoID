@@ -555,6 +555,8 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
 
                 poll_interval = 30.0
                 hard_cap = get_hard_retry_cap()
+                cap_ttl = 60.0
+                cap_refresh = 30.0
                 config_mgr = get_protocol(PlatformConfigsProtocol)
                 if config_mgr:
                     try:
@@ -563,6 +565,8 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                             poll_interval = tasks_config.queue_poll_interval
                             hard_cap = tasks_config.hard_retry_cap
                             set_hard_retry_cap(hard_cap)
+                            cap_ttl = tasks_config.capability_publisher_ttl_seconds
+                            cap_refresh = tasks_config.capability_publisher_refresh_seconds
                     except Exception as e:
                         logger.warning(f"TasksModule: Failed to load TasksPluginConfig, defaulting to {poll_interval}s / hard_cap={hard_cap}: {e}")
 
@@ -630,6 +634,26 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 async with managed_transaction(engine) as probe_conn:
                     await _assert_current_partition_ready(probe_conn, schema)
 
+                # Capability publisher (#502) initial refresh runs SYNCHRONOUSLY
+                # before the dispatcher is submitted — otherwise create_task'd
+                # coroutines race and the dispatcher could evaluate a row
+                # before any pod has published a sentinel, causing a
+                # false-positive DLQ. Fail-open if the cache isn't ready.
+                from dynastore.modules.tasks.capability_publisher import (
+                    _collect_local_capabilities,
+                    _refresh_once,
+                    run_capability_publisher,
+                )
+                try:
+                    await _refresh_once(
+                        _collect_local_capabilities(), ttl_seconds=cap_ttl,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "TasksModule: initial capability publish skipped: %s",
+                        exc,
+                    )
+
                 executor.submit(start_queue_listener(engine, shutdown_event, poll_timeout=poll_interval), task_name="service:queue_listener")
                 executor.submit(run_dispatcher(engine, None, shutdown_event), task_name="service:dispatcher")
                 # Stuck-PENDING warner — periodic read-only scan for tasks that
@@ -639,6 +663,18 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 executor.submit(
                     _warn_stuck_pending_tasks(engine, schema, shutdown_event),
                     task_name="service:stuck_pending_warner",
+                )
+                # Async refresh loop. Initial publish already ran
+                # synchronously above (before run_dispatcher was submitted)
+                # so dispatcher reactive-reaper checks never see an empty
+                # cache during cold start.
+                executor.submit(
+                    run_capability_publisher(
+                        shutdown_event,
+                        ttl_seconds=cap_ttl,
+                        refresh_seconds=cap_refresh,
+                    ),
+                    task_name="service:capability_publisher",
                 )
                 logger.info(f"TasksModule: QueueListener (poll_interval={poll_interval}s) and Multi-Tenant Dispatcher launched.")
             else:
