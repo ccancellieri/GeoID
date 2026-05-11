@@ -30,8 +30,9 @@ can be called from admin endpoints or scheduled pg_cron jobs.
 """
 
 import logging
+import re
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Mapping, Optional, Dict, Any, Union
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -45,6 +46,8 @@ from dynastore.modules.tasks.models import Task, TaskStatusEnum
 from dynastore.modules.tasks.tasks_module import get_task_schema
 
 logger = logging.getLogger(__name__)
+
+_SAFE_JSONB_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -164,20 +167,47 @@ async def requeue_dead_letter_tasks_by_type(
     since: Optional[datetime] = None,
     limit: int = 1000,
     reset_retries: bool = True,
+    inputs_match: Optional[Mapping[str, str]] = None,
 ) -> int:
     """Bulk-requeue every DEAD_LETTER row of ``task_type`` (optionally
-    filtered by ``finished_at >= since``).
+    filtered by ``finished_at >= since`` and/or JSONB equality on selected
+    ``inputs`` keys).
 
     Companion to the reactive reaper added in #502: after fixing a
     persistent SCOPE drift, operators run this to replay reaped
     ``index_propagation`` rows in one call instead of looping
     :func:`requeue_dead_letter_task`.
 
+    ``inputs_match`` is an AND-joined set of ``inputs->>'key' = value``
+    JSONB equality filters. The caller picks the JSONB keys appropriate
+    to the given ``task_type`` (e.g. ``{"catalog": "c1"}`` for
+    ``index_propagation``). Keys MUST match ``[A-Za-z_][A-Za-z0-9_]*``
+    so the literal can be safely inlined; anything else raises
+    :class:`ValueError`.
+
     Returns the count of rows transitioned back to PENDING.
     """
     task_schema = get_task_schema()
     retry_clause = "retry_count = 0," if reset_retries else ""
     since_filter = "AND finished_at >= :since" if since is not None else ""
+
+    extra_filters = ""
+    params: Dict[str, Any] = {"task_type": task_type, "lim": limit}
+    if since is not None:
+        params["since"] = since
+    if inputs_match:
+        clauses: List[str] = []
+        for raw_key, value in inputs_match.items():
+            if not _SAFE_JSONB_KEY.match(raw_key):
+                raise ValueError(
+                    f"requeue_dead_letter_tasks_by_type: unsafe JSONB key "
+                    f"{raw_key!r}; expected [A-Za-z_][A-Za-z0-9_]*",
+                )
+            param_name = f"jm_{raw_key}"
+            clauses.append(f"AND inputs->>'{raw_key}' = :{param_name}")
+            params[param_name] = value
+        extra_filters = "\n              ".join(clauses)
+
     sql = f"""
         WITH victims AS (
             SELECT task_id, timestamp
@@ -185,6 +215,7 @@ async def requeue_dead_letter_tasks_by_type(
             WHERE status    = 'DEAD_LETTER'
               AND task_type = :task_type
               {since_filter}
+              {extra_filters}
             ORDER BY finished_at DESC
             LIMIT :lim
         )
@@ -199,17 +230,16 @@ async def requeue_dead_letter_tasks_by_type(
           AND t.timestamp = v.timestamp
         RETURNING t.task_id;
     """
-    params: Dict[str, Any] = {"task_type": task_type, "lim": limit}
-    if since is not None:
-        params["since"] = since
     async with managed_transaction(engine) as conn:
         rows = await DQLQuery(
             sql, result_handler=ResultHandler.ALL_DICTS,
         ).execute(conn, **params) or []
     count = len(rows)
     logger.info(
-        "Maintenance: requeued %d DEAD_LETTER row(s) of type %r%s.",
-        count, task_type, f" since {since.isoformat()}" if since else "",
+        "Maintenance: requeued %d DEAD_LETTER row(s) of type %r%s%s.",
+        count, task_type,
+        f" since {since.isoformat()}" if since else "",
+        f" matching {dict(inputs_match)!r}" if inputs_match else "",
     )
     return count
 
