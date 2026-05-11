@@ -382,6 +382,14 @@ async def grant_global_roles(email: EmailStr, request: RoleGrantRequest):
         except (TypeError, ValueError):
             granted_by_uuid = None
 
+    registered = {r.name for r in await storage.list_roles(schema="iam")}
+    unknown = [r for r in request.roles if r not in registered]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Role(s) not registered in the platform role registry: {unknown}",
+        )
+
     for role_name in request.roles:
         await storage.grant_platform_role(
             principal_id=principal_id,
@@ -434,6 +442,16 @@ async def grant_catalog_roles(
             granted_by_uuid = UUID(request.granted_by)
         except (TypeError, ValueError):
             granted_by_uuid = None
+
+    registered = {r.name for r in await storage.list_roles(schema=catalog_schema)}
+    unknown = [r for r in request.roles if r not in registered]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Role(s) not registered for catalog '{catalog_id}': {unknown}"
+            ),
+        )
 
     for role_name in request.roles:
         await storage.grant_catalog_role(

@@ -110,14 +110,14 @@ class TestAuthorizationAPI:
 
         response = await in_process_client.post(
             f"/iam/admin/users/{email}/roles/global",
-            json={"roles": ["DataSteward", "Auditor"]},
+            json={"roles": ["admin", "user"]},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
         if response.status_code != 201:
             print(f"DEBUG: Response error: {response.text}")
 
         assert response.status_code == 201
-        assert "DataSteward" in response.json()["roles"]
+        assert "admin" in response.json()["roles"]
 
     async def test_get_global_roles(
         self, in_process_client: AsyncClient, admin_token: str, created_user_email: str
@@ -128,7 +128,7 @@ class TestAuthorizationAPI:
         # Grant roles first
         await in_process_client.post(
             f"/iam/admin/users/{email}/roles/global",
-            json={"roles": ["DataSteward"]},
+            json={"roles": ["admin"]},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
 
@@ -139,7 +139,7 @@ class TestAuthorizationAPI:
         )
 
         assert response.status_code == 200
-        assert "DataSteward" in response.json()
+        assert "admin" in response.json()
 
     async def test_revoke_global_role(
         self, in_process_client: AsyncClient, admin_token: str, created_user_email: str
@@ -150,12 +150,12 @@ class TestAuthorizationAPI:
         # Grant roles
         await in_process_client.post(
             f"/iam/admin/users/{email}/roles/global",
-            json={"roles": ["DataSteward", "Auditor"]},
+            json={"roles": ["admin", "user"]},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
 
         # Revoke one role
-        role = "Auditor"
+        role = "user"
         response = await in_process_client.delete(
             f"/iam/admin/users/{email}/roles/global/{role}",
             headers={"Authorization": f"Bearer {admin_token}"},
@@ -168,8 +168,8 @@ class TestAuthorizationAPI:
             f"/iam/admin/users/{email}/roles/global",
             headers={"Authorization": f"Bearer {admin_token}"},
         )
-        assert "DataSteward" in response.json()
-        assert "Auditor" not in response.json()
+        assert "admin" in response.json()
+        assert "user" not in response.json()
 
     async def test_grant_catalog_roles(
         self,
@@ -184,12 +184,41 @@ class TestAuthorizationAPI:
 
         response = await in_process_client.post(
             f"/iam/admin/users/{email}/roles/catalogs/{catalog_id}",
-            json={"roles": ["Editor", "Viewer"]},
+            json={"roles": ["editor", "allUsers"]},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
 
         assert response.status_code == 201
-        assert "Editor" in response.json()["roles"]
+        assert "editor" in response.json()["roles"]
+
+    async def test_grant_global_roles_unknown_role_422(
+        self, in_process_client: AsyncClient, admin_token: str, created_user_email: str
+    ):
+        """Unknown platform role -> 422 (issue #499: align with /admin/.../roles)."""
+        response = await in_process_client.post(
+            f"/iam/admin/users/{created_user_email}/roles/global",
+            json={"roles": ["NotARealRole"]},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert response.status_code == 422, response.text
+        assert "NotARealRole" in response.text
+
+    async def test_grant_catalog_roles_unknown_role_422(
+        self,
+        in_process_client: AsyncClient,
+        admin_token: str,
+        created_user_email: str,
+        setup_catalogs,
+    ):
+        """Unknown catalog-scope role -> 422 (issue #499)."""
+        catalog_id = setup_catalogs[0]
+        response = await in_process_client.post(
+            f"/iam/admin/users/{created_user_email}/roles/catalogs/{catalog_id}",
+            json={"roles": ["NotARealRole"]},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert response.status_code == 422, response.text
+        assert "NotARealRole" in response.text
 
     async def test_get_user_catalogs(
         self,
@@ -204,14 +233,14 @@ class TestAuthorizationAPI:
         # Grant global roles
         await in_process_client.post(
             f"/iam/admin/users/{email}/roles/global",
-            json={"roles": ["DataSteward"]},
+            json={"roles": ["admin"]},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
 
         # Grant catalog roles
         resp = await in_process_client.post(
             f"/iam/admin/users/{email}/roles/catalogs/{setup_catalogs[1]}",
-            json={"roles": ["Editor"]},
+            json={"roles": ["editor"]},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
         assert resp.status_code == 201, f"Failed to grant catalog role: {resp.text}"
@@ -244,12 +273,12 @@ class TestAuthorizationAPI:
         # Grant global and catalog roles
         await in_process_client.post(
             f"/iam/admin/users/{email}/roles/global",
-            json={"roles": ["DataSteward"]},
+            json={"roles": ["admin"]},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
         await in_process_client.post(
             f"/iam/admin/users/{email}/roles/catalogs/{catalog_id}",
-            json={"roles": ["Editor"]},
+            json={"roles": ["editor"]},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
 
@@ -263,9 +292,9 @@ class TestAuthorizationAPI:
         auth = response.json()
 
         assert auth["email"] == email
-        assert "DataSteward" in auth["global_roles"]
-        assert "Editor" in auth["catalog_roles"]
-        assert set(auth["effective_roles"]) == {"DataSteward", "Editor"}
+        assert "admin" in auth["global_roles"]
+        assert "editor" in auth["catalog_roles"]
+        assert set(auth["effective_roles"]) == {"admin", "editor"}
 
     async def test_email_not_found(
         self, in_process_client: AsyncClient, admin_token: str
@@ -449,12 +478,12 @@ async def user_token(
 
 #         response = await in_process_client.post(
 #             f"/admin/users/{email}/roles/global",
-#             json={"roles": ["DataSteward", "Auditor"]},
+#             json={"roles": ["admin", "user"]},
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 
 #         assert response.status_code == 201
-#         assert "DataSteward" in response.json()["roles"]
+#         assert "admin" in response.json()["roles"]
 
 #     async def test_get_global_roles(self, in_process_client: AsyncClient, admin_token: str):
 #         """Test getting global roles via API."""
@@ -463,7 +492,7 @@ async def user_token(
 #         # Grant roles first
 #         await in_process_client.post(
 #             f"/admin/users/{email}/roles/global",
-#             json={"roles": ["DataSteward"]},
+#             json={"roles": ["admin"]},
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 
@@ -474,7 +503,7 @@ async def user_token(
 #         )
 
 #         assert response.status_code == 200
-#         assert "DataSteward" in response.json()
+#         assert "admin" in response.json()
 
 #     async def test_revoke_global_role(self, in_process_client: AsyncClient, admin_token: str):
 #         """Test revoking a global role via API."""
@@ -483,13 +512,13 @@ async def user_token(
 #         # Grant roles
 #         await in_process_client.post(
 #             f"/admin/users/{email}/roles/global",
-#             json={"roles": ["DataSteward", "Auditor"]},
+#             json={"roles": ["admin", "user"]},
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 
 #         # Revoke one role
 #         response = await in_process_client.delete(
-#             f"/admin/users/{email}/roles/global/Auditor",
+#             f"/admin/users/{email}/roles/global/user",
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 
@@ -500,8 +529,8 @@ async def user_token(
 #             f"/admin/users/{email}/roles/global",
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
-#         assert "DataSteward" in response.json()
-#         assert "Auditor" not in response.json()
+#         assert "admin" in response.json()
+#         assert "user" not in response.json()
 
 #     async def test_grant_catalog_roles(self, in_process_client: AsyncClient, admin_token: str):
 #         """Test granting catalog-specific roles via API."""
@@ -510,12 +539,12 @@ async def user_token(
 
 #         response = await in_process_client.post(
 #             f"/admin/users/{email}/roles/catalogs/{catalog_id}",
-#             json={"roles": ["Editor", "Viewer"]},
+#             json={"roles": ["editor", "allUsers"]},
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 
 #         assert response.status_code == 201
-#         assert "Editor" in response.json()["roles"]
+#         assert "editor" in response.json()["roles"]
 
 #     async def test_get_user_catalogs(self, in_process_client: AsyncClient, admin_token: str):
 #         """Test getting all catalogs for a user via API."""
@@ -524,14 +553,14 @@ async def user_token(
 #         # Grant global roles
 #         await in_process_client.post(
 #             f"/admin/users/{email}/roles/global",
-#             json={"roles": ["DataSteward"]},
+#             json={"roles": ["admin"]},
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 
 #         # Grant catalog roles
 #         await in_process_client.post(
 #             f"/admin/users/{email}/roles/catalogs/catalog_a",
-#             json={"roles": ["Editor"]},
+#             json={"roles": ["editor"]},
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 
@@ -557,12 +586,12 @@ async def user_token(
 #         # Grant global and catalog roles
 #         await in_process_client.post(
 #             f"/admin/users/{email}/roles/global",
-#             json={"roles": ["DataSteward"]},
+#             json={"roles": ["admin"]},
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 #         await in_process_client.post(
 #             f"/admin/users/{email}/roles/catalogs/{catalog_id}",
-#             json={"roles": ["Editor"]},
+#             json={"roles": ["editor"]},
 #             headers={"Authorization": f"Bearer {admin_token}"}
 #         )
 
@@ -576,9 +605,9 @@ async def user_token(
 #         auth = response.json()
 
 #         assert auth["email"] == email
-#         assert "DataSteward" in auth["global_roles"]
-#         assert "Editor" in auth["catalog_roles"]
-#         assert set(auth["effective_roles"]) == {"DataSteward", "Editor"}
+#         assert "admin" in auth["global_roles"]
+#         assert "editor" in auth["catalog_roles"]
+#         assert set(auth["effective_roles"]) == {"admin", "editor"}
 
 #     async def test_email_not_found(self, in_process_client: AsyncClient, admin_token: str):
 #         """Test API with non-existent email."""
