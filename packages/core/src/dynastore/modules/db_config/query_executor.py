@@ -27,6 +27,7 @@ import contextvars
 import hashlib
 import os
 import secrets
+import time
 from uuid import UUID, uuid4
 from abc import abstractmethod, ABC
 from contextlib import asynccontextmanager, contextmanager
@@ -1050,16 +1051,29 @@ def retry_on_transient_connect(
                     return await func(*args, **kwargs)
                 except _TRANSIENT_CONNECT_EXCEPTIONS as exc:
                     last_err = exc
+                    fn_mod = getattr(func, "__module__", "<unknown>")
+                    fn_name = getattr(func, "__qualname__", getattr(func, "__name__", "<fn>"))
                     if attempt == max_retries - 1:
+                        # Terminal failure after exhausting retries — keep as WARNING
+                        # so real exhaustion remains visible in Cloud Logging.
+                        logger.warning(
+                            "retry_on_transient_connect: %s.%s exhausted %d attempts "
+                            "(%s: %s)",
+                            fn_mod, fn_name, max_retries,
+                            type(exc).__name__, exc,
+                        )
                         raise
                     delay = min(base_delay * (2 ** attempt), max_delay)
                     if jitter:
                         delay *= random.uniform(1.0 - jitter, 1.0 + jitter)
-                    logger.warning(
+                    # Demoted from WARNING → DEBUG (issue #486): per-attempt retries
+                    # under transient pool pressure flood Cloud Logging and mask the
+                    # actual root-cause signal. Terminal exhaustion above is the
+                    # WARNING that operators need to see.
+                    logger.debug(
                         "retry_on_transient_connect: %s.%s attempt %d/%d failed "
                         "(%s: %s); retrying in %.2fs",
-                        getattr(func, "__module__", "<unknown>"),
-                        getattr(func, "__qualname__", getattr(func, "__name__", "<fn>")),
+                        fn_mod, fn_name,
                         attempt + 1,
                         max_retries,
                         type(exc).__name__,
@@ -1073,6 +1087,14 @@ def retry_on_transient_connect(
         return wrapper
 
     return decorator
+
+
+# M3 (issue #486): emit a structured log line on every async pool acquire so a
+# GCP log-based metric can compute db_pool_wait_seconds histograms per service
+# without needing a prometheus_client dep + scrape endpoint. INFO when slow,
+# DEBUG otherwise.
+_SLOW_POOL_ACQUIRE_THRESHOLD_S = 0.5
+_SERVICE_NAME_FOR_METRICS = os.getenv("SERVICE_NAME", "unknown")
 
 
 @retry_on_transient_connect()
@@ -1093,7 +1115,27 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
     failure) does not crash a module's lifespan. On retry we close any
     half-acquired connection so we do not leak pool slots.
     """
-    conn = await engine.connect()
+    t0 = time.monotonic()
+    try:
+        conn = await engine.connect()
+    except BaseException:
+        wait_s = time.monotonic() - t0
+        logger.info(
+            "db_pool_acquire failed service=%s wait_seconds=%.4f",
+            _SERVICE_NAME_FOR_METRICS, wait_s,
+        )
+        raise
+    wait_s = time.monotonic() - t0
+    if wait_s >= _SLOW_POOL_ACQUIRE_THRESHOLD_S:
+        logger.info(
+            "db_pool_acquire slow service=%s wait_seconds=%.4f threshold=%.2f",
+            _SERVICE_NAME_FOR_METRICS, wait_s, _SLOW_POOL_ACQUIRE_THRESHOLD_S,
+        )
+    else:
+        logger.debug(
+            "db_pool_acquire service=%s wait_seconds=%.4f",
+            _SERVICE_NAME_FOR_METRICS, wait_s,
+        )
     try:
         try:
             await conn.rollback()
