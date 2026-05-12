@@ -35,15 +35,21 @@ from dynastore.modules.storage.drivers.elasticsearch_private import (
 )
 
 
-@pytest.mark.xfail(reason="#514 — `indexer_id` attribute was renamed/removed during indexer refactor.", strict=False)
-def test_indexer_id_is_distinct():
-    assert (
-        CollectionElasticsearchPrivateDriver.indexer_id
-        == "collection_elasticsearch_private_driver"
-    )
-    # The public driver doesn't declare an ``indexer_id`` ClassVar
-    # (it's identified via class-name → snake-case in the dispatcher),
-    # so the comparison check is just an explicit-value pin here.
+def test_indexer_id_resolves_via_class_name_snake_case():
+    """Indexer identity is ``_to_snake(type(impl).__name__)`` per the
+    convention pinned in ``IndexDispatcher._make_default_indexer_registry``
+    (no separate ``indexer_id`` ClassVar — that attribute was removed
+    during the indexer refactor). This test pins that the private
+    driver's class name resolves to a *distinct* id from the public
+    driver so dispatcher routing can target either independently.
+    """
+    from dynastore.tools.typed_store.base import _to_snake
+
+    private_id = _to_snake(CollectionElasticsearchPrivateDriver.__name__)
+    public_id = _to_snake(CollectionElasticsearchDriver.__name__)
+    assert private_id == "collection_elasticsearch_private_driver"
+    assert public_id == "collection_elasticsearch_driver"
+    assert private_id != public_id
 
 
 def test_auto_register_for_routing_is_empty():
