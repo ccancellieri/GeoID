@@ -87,7 +87,7 @@ class NotebooksModule(ModuleProtocol):
                         try:
                             register_platform_notebook(
                                 notebook_id=nb.notebook_id,
-                                registered_by=contributor_label,
+                                registered_by=nb.registered_by or contributor_label,
                                 notebook_path=nb.notebook_path,
                                 notebook_content=nb.notebook_content,
                                 title=nb.title,
