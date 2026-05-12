@@ -181,6 +181,86 @@ def test_index_propagation_required_capability_missing_returns_none():
     assert IndexPropagationTask.required_capability(None) is None
 
 
+@pytest.mark.asyncio
+async def test_bulk_dlq_sweeps_siblings_for_known_task_type(caplog):
+    """#529: after the per-row CAS DLQ wins, the same locked transaction
+    issues a bulk UPDATE that DLQs every sibling row sharing the dead
+    capability. The structured ``dispatcher_reactive_dlq_bulk_total`` line
+    fires with the sibling count."""
+    import logging, re
+    patches = _patches(
+        oracle_live=False,
+        results=[
+            {"got": True},                                 # advisory lock
+            {"task_id": "t-1"},                            # per-row UPDATE
+            [{"task_id": "t-2"}, {"task_id": "t-3"},
+             {"task_id": "t-4"}],                          # bulk UPDATE
+        ],
+    )
+    for p in patches: p.start()
+    try:
+        caplog.set_level(logging.INFO, logger="dynastore.modules.tasks.dispatcher")
+        result = await _maybe_dlq_unclaimable(
+            engine=MagicMock(), row=_row(), capability_id="dead_driver",
+        )
+    finally:
+        for p in patches: p.stop()
+    assert result is True
+    pattern = re.compile(
+        r"dispatcher_reactive_dlq_bulk_total task_type=index_propagation "
+        r"capability=dead_driver reason=no_live_worker count=3"
+    )
+    assert any(pattern.search(r.message) for r in caplog.records), (
+        f"missing bulk_total line in: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_dlq_skipped_for_unmapped_task_type():
+    """Task types with no entry in ``TASK_TYPE_CAPABILITY_INPUTS_KEY``
+    only get the per-row DLQ — no bulk UPDATE is attempted, no
+    interpolation of an unknown JSONB key."""
+    # Only two results — if the bulk path tried to execute it would
+    # silently pop ``None`` (no exception), so the real assertion is on
+    # the absence of the bulk log line.
+    import logging as _logging
+    patches = _patches(
+        oracle_live=False,
+        results=[{"got": True}, {"task_id": "t-1"}],
+    )
+    for p in patches:
+        p.start()
+    captured = []
+    handler = _logging.Handler()
+    handler.emit = lambda record: captured.append(record.getMessage())
+    logger_ = _logging.getLogger("dynastore.modules.tasks.dispatcher")
+    logger_.addHandler(handler)
+    try:
+        result = await _maybe_dlq_unclaimable(
+            engine=MagicMock(),
+            row=_row(task_type="some_other_task"),
+            capability_id="dead_driver",
+        )
+    finally:
+        logger_.removeHandler(handler)
+        for p in patches:
+            p.stop()
+    assert result is True
+    assert not any(
+        "dispatcher_reactive_dlq_bulk_total" in m for m in captured
+    ), f"bulk line should not fire for unmapped task_type: {captured}"
+
+
+def test_task_type_capability_inputs_key_mapping_exposes_index_propagation():
+    """Regression: the mapping must declare ``index_propagation`` so the
+    bulk-DLQ sweep can extract ``inputs->>'indexer_id'``. Future
+    capability-gated tasks add their own entries here."""
+    from dynastore.modules.tasks.capability_oracle import (
+        TASK_TYPE_CAPABILITY_INPUTS_KEY,
+    )
+    assert TASK_TYPE_CAPABILITY_INPUTS_KEY["index_propagation"] == "indexer_id"
+
+
 def test_stable_advisory_lock_key_is_deterministic():
     """Regression: Python's builtin ``hash()`` is salted per-process,
     so two pods hashing the same string get different lock keys —

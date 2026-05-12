@@ -276,7 +276,9 @@ async def _maybe_dlq_unclaimable(
     parallel, at most one performs the UPDATE; the others skip and let the
     standard back-off path run.
     """
-    from dynastore.modules.tasks.capability_oracle import is_capability_live
+    from dynastore.modules.tasks.capability_oracle import (
+        TASK_TYPE_CAPABILITY_INPUTS_KEY, is_capability_live,
+    )
     from dynastore.modules.db_config.query_executor import (
         DQLQuery, DDLQuery, ResultHandler, managed_transaction,
     )
@@ -345,6 +347,50 @@ async def _maybe_dlq_unclaimable(
                     "reason=no_live_worker task_id=%s",
                     row.get("task_type") or "-", capability_id, task_id,
                 )
+                # Bulk fast-path (#529): once we have proven the capability
+                # is dead AND the advisory lock is ours, sweep every other
+                # PENDING/retry_count=0 row of the same task_type whose
+                # JSONB capability field matches. Without this, a 500-row
+                # backlog needs 500 separate dispatcher passes to drain.
+                #
+                # ``inputs_key`` is only interpolated from the hardcoded
+                # mapping above — never user input — so direct format is
+                # safe. Bound parameters carry the per-row values.
+                task_type = row.get("task_type") or ""
+                inputs_key = TASK_TYPE_CAPABILITY_INPUTS_KEY.get(task_type)
+                if inputs_key:
+                    bulk_sql = f"""
+                        UPDATE "{schema}".tasks
+                        SET status        = 'DEAD_LETTER',
+                            error_message = :err,
+                            finished_at   = NOW(),
+                            owner_id      = NULL,
+                            locked_until  = NULL
+                        WHERE task_type    = :tt
+                          AND status       = 'PENDING'
+                          AND retry_count  = 0
+                          AND inputs->>'{inputs_key}' = :cap
+                        RETURNING task_id
+                    """
+                    sibling_rows = await DQLQuery(
+                        bulk_sql, result_handler=ResultHandler.ALL_DICTS,
+                    ).execute(
+                        conn, err=error_message, tt=task_type,
+                        cap=capability_id,
+                    )
+                    sibling_count = len(sibling_rows or [])
+                    if sibling_count:
+                        logger.warning(
+                            "dispatcher: bulk-DLQ'd %d sibling task(s) of "
+                            "type %s for dead capability %r",
+                            sibling_count, task_type, capability_id,
+                        )
+                        logger.info(
+                            "dispatcher_reactive_dlq_bulk_total "
+                            "task_type=%s capability=%s "
+                            "reason=no_live_worker count=%d",
+                            task_type, capability_id, sibling_count,
+                        )
                 return True
             return False
     except Exception as exc:  # noqa: BLE001

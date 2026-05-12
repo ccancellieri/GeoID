@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 CAPABILITY_KEY_PREFIX = "dynastore:caps:"
 
 
+# Task types whose capability id is sourced from a single ``inputs.<key>``
+# JSONB field. Used by the reactive reaper's bulk-DLQ path (#529) to sweep
+# every sibling row for a confirmed-dead capability in one UPDATE instead
+# of waiting for each row to be re-claimed and rejected individually.
+#
+# Keys must be safe SQL identifiers — interpolated into JSONB extraction
+# (``inputs->>'<key>'``). Add a new entry here when a new capability-gated
+# TaskProtocol lands; the mapping intentionally lives alongside the oracle
+# so all capability-aware code paths share one source of truth.
+TASK_TYPE_CAPABILITY_INPUTS_KEY: dict[str, str] = {
+    "index_propagation": "indexer_id",
+}
+
+
 def capability_key(capability_id: str) -> str:
     """Return the cache key used by both publisher and oracle."""
     return f"{CAPABILITY_KEY_PREFIX}{capability_id}"
