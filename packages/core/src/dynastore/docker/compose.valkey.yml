@@ -14,7 +14,7 @@
 
 services:
   valkey:
-    image: valkey/valkey:8-alpine
+    image: valkey/valkey:9-alpine
     container_name: geoid_valkey
     # Lightweight Valkey for shared-cache parity between on-prem and
     # review/prod. Backs the capability liveness oracle that powers the
