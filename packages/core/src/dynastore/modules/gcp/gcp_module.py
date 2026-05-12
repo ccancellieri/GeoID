@@ -94,7 +94,6 @@ if not TYPE_CHECKING:
     except ImportError:
         run_v2 = None
 from dynastore.modules.gcp.bucket_service import BucketService
-# from google.cloud import compute_v1
 from .gcp_catalog_ops import GcpCatalogOpsMixin
 from .gcp_eventing_ops import GcpEventingOpsMixin
 from .gcp_storage_ops import GcpStorageOpsMixin

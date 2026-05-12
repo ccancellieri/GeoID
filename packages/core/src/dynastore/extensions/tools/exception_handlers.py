@@ -29,8 +29,6 @@ Integration with FastAPI:
     3. Or manually call handle_exception() in try-except blocks
 """
 
-# from dynastore.models.protocols.database import DatabaseProtocol
-
 import logging
 import functools
 from contextlib import asynccontextmanager

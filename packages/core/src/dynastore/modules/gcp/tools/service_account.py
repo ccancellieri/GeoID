@@ -16,9 +16,6 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-# from osgeo import gdal
-# from google.oauth2 import service_account, credentials
-
 import logging
 from typing import Dict, Optional, Any
 import requests
