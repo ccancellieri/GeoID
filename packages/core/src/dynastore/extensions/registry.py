@@ -21,7 +21,6 @@
 import logging
 from typing import Any, Dict, Type, TypeVar, Optional, List, cast
 from dataclasses import dataclass
-import warnings
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.tools.env import load_component_dotenv
@@ -63,31 +62,6 @@ def _register_extension(cls: Type[T_Extension], registration_name: Optional[str]
 def dynastore_extension(cls: Type[T_Extension]) -> Type[T_Extension]:
     """A decorator to register a class as a DynaStore Extension."""
     return _register_extension(cls)
-
-def get_extension_instance(name: str) -> ExtensionProtocol | None:
-    """Retrieves the singleton instance of a registered extension by name."""
-    warnings.warn(
-        f"get_extension_instance('{name}') is deprecated. Use get_protocol(...) instead for better decoupling.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    config = _DYNASTORE_EXTENSIONS.get(name)
-    return config.instance if config else None
-
-def get_extension_instance_by_class(cls: Type[T_Extension]) -> T_Extension | None:
-    """
-    Retrieves the singleton instance of a registered extension by its class type.
-    This provides better type hinting than get_extension_instance(name).
-    """
-    warnings.warn(
-        f"get_extension_instance_by_class({cls.__name__}) is deprecated. Use get_protocol(...) instead for better decoupling.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    for _, config in _DYNASTORE_EXTENSIONS.items():
-        if config.instance and isinstance(config.instance, cls):
-            return cast(T_Extension, config.instance)
-    return None
 
 def discover_extensions():
     """Discover every ``dynastore.extensions`` entry-point from installed packages.

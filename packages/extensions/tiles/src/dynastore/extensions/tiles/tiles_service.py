@@ -41,7 +41,6 @@ from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
 from sqlalchemy.ext.asyncio import AsyncConnection
 from pyproj import CRS
 
-from dynastore.extensions.registry import get_extension_instance
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.ogc_common_models import Conformance, LandingPage
