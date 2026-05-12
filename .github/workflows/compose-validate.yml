@@ -1,11 +1,12 @@
 name: Compose Validate
 
-# Validates that the canonical compose files parse standalone AND merged.
-# Closes #575: docker compose `extends` pulls a single service, NOT its
-# transitive `depends_on` graph, so docker-compose.dev.yml must remain
-# loadable on its own (VS Code right-click "Compose Up" runs it alone).
-# Commit 64f011c regressed this by moving valkey to the base file while
-# leaving `depends_on: valkey` in every dev-only service; PR #573 fixed it.
+# Validates the canonical compose files in two layers:
+#   1. `validate` — `docker compose config --quiet` (structural; closes #575)
+#   2. `build`    — `docker buildx bake catalog` against the compose file,
+#                   exercising the actual `context:` / `dockerfile:` paths
+#                   (closes #582; PR #581 caught the 5-day-latent context drift
+#                   from the Phase-1 packages/core move that `config --quiet`
+#                   could not see).
 #
 # Uses only safe expression contexts (no untrusted user input flows into
 # any `run:` shell — github.ref is used in concurrency.group only, which
@@ -16,8 +17,16 @@ on:
     paths:
       - 'packages/core/src/dynastore/docker/docker-compose*.yml'
       - 'packages/core/src/dynastore/docker/compose.*.yml'
+      - 'packages/core/src/dynastore/docker/Dockerfile'
+      - 'packages/core/src/dynastore/docker/Dockerfile.db'
+      - 'packages/core/pyproject.toml'
+      - 'packages/extensions/**/pyproject.toml'
+      - 'pyproject.toml'
+      - 'LICENSE'
+      - 'README.md'
       - '.github/workflows/compose-validate.yml'
   workflow_dispatch:
+
 
 concurrency:
   group: compose-validate-${{ github.ref }}
@@ -59,3 +68,74 @@ jobs:
             -f packages/core/src/dynastore/docker/docker-compose.yml \
             -f packages/core/src/dynastore/docker/docker-compose.dev.yml \
             config --quiet
+
+  # Closes #582 — exercise the actual compose build path so that any future
+  # drift between `context:` / `dockerfile:` and the Dockerfile's COPY
+  # expectations fails CI within the PR (not 5 days later in deploy).
+  # The latent regression from `6d8aef8` (Phase 1 packages/core move) shipped
+  # because test.yml builds via `docker/build-push-action` with `context: .`
+  # — it never traverses the compose-side path resolution that prod uses.
+  #
+  # Uses `docker buildx bake` against the compose file because it reads the
+  # `build:` block directly and resolves `context:` relative to the file,
+  # exactly like `docker compose build`. Targets the `tester` stage (cheapest
+  # that exercises all COPYs incl. `COPY tests`, `COPY packages`) and shares
+  # GHA cache `scope=tester` with test.yml so warm runs land in seconds.
+  build:
+    runs-on: ubuntu-22.04
+    needs: validate
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      # Bake reads `context:` relative to the compose file, which references
+      # ../../../../.. — i.e. the repo root. Free disk so the resulting image
+      # layers don't push past the 14 GB default (same recipe as test.yml).
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+
+      - name: Seed .env from .env.example
+        working-directory: packages/core/src/dynastore/docker
+        run: cp .env.example .env
+
+      - uses: docker/setup-buildx-action@v3
+
+      # `--set` injects buildx cache hooks without modifying the tracked
+      # compose file. Cache scope matches test.yml's `tester` so we ride its
+      # warm layers; `target=tester` overrides the default runtime stage
+      # (full prod image is ~3 GB heavier and unnecessary for COPY validation).
+      # SCOPE=all matches test.yml so the pip-install layer is shared too.
+      #
+      # GitHub Actions populates the GHA cache via the buildx GitHub Actions
+      # cache backend; this requires ACTIONS_CACHE_URL + ACTIONS_RUNTIME_TOKEN
+      # which the `docker/build-push-action` populates automatically but a
+      # plain `docker buildx` invocation needs forwarded via env. The
+      # docker/setup-buildx-action sets these in the workflow env on its own.
+      # Must `cd` into the docker dir: the compose file uses
+      # `extends: { file: ./compose.es.yml, ... }` which buildx resolves
+      # relative to the *current working directory*, not the --file path.
+      # `context: ../../../../..` then climbs back to the repo root, which
+      # is what the prod compose actually does.
+      - name: Bake catalog from compose (tester stage, gha cache)
+        working-directory: packages/core/src/dynastore/docker
+        env:
+          # Bake's `context: ../../../../..` climbs outside the compose file
+          # dir; buildx requires explicit fs.read entitlement for that. The
+          # repo root is the build context test.yml already uses, so granting
+          # read is identical in scope, just made explicit here.
+          BUILDX_BAKE_ENTITLEMENTS_FS: "0"
+        run: |
+          set -euo pipefail
+          docker buildx bake \
+            --file docker-compose.yml \
+            --set '*.target=tester' \
+            --set '*.args.SCOPE=all' \
+            --set '*.args.BUILD_JUPYTERLITE=false' \
+            --set '*.cache-from=type=gha,scope=tester' \
+            --set '*.cache-to=type=gha,mode=max,scope=tester' \
+            catalog
