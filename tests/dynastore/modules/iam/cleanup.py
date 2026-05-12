@@ -7,16 +7,14 @@ logger = logging.getLogger(__name__)
 
 @CleanupRegistry.register
 async def cleanup_iam(engine):
-    """
-    Cleans up the iam and users schemas.
-    """
-    # CRITICAL: In parallel execution (pytest-xdist), we skip truncation of shared tables
-    # because one worker finishing a module would destroy the state for other active workers.
-    import os
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        logger.info("Parallel worker detected. Skipping shared table truncation for iam/users.")
-        return
+    """Truncate the iam and users schemas on the worker's DB.
 
+    Safe under pytest-xdist: each worker has its own cloned database
+    (``gis_dev_<worker_id>``, see ``tests/conftest.py::_ensure_worker_db``
+    commit ``e3d5458``), so truncating shared tables here cannot affect
+    another worker's state. The earlier ``PYTEST_XDIST_WORKER`` early-return
+    was a stale guard from before per-worker DB cloning landed.
+    """
     async with managed_nested_transaction(engine) as conn:
         logger.info("Cleaning up iam and users schemas...")
 

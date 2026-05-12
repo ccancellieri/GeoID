@@ -15,16 +15,15 @@ logger = logging.getLogger(__name__)
 
 @CleanupRegistry.register
 async def cleanup_catalog(engine):
-    """
-    Cleans up the catalog schema and drops tenant schemas.
-    """
-    # CRITICAL: In parallel execution (pytest-xidst), we skip global schema deletion 
-    # to avoid workers destroying each other's environment.
-    import os
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        logger.info("Parallel worker detected. Skipping catalog/tenant cleanup.")
-        return
+    """Truncate the catalog schema and drop tenant schemas on the worker's DB.
 
+    Safe under pytest-xdist: each worker has its own cloned database
+    (``gis_dev_<worker_id>``, see ``tests/conftest.py::_ensure_worker_db``
+    commit ``e3d5458``), so dropping ``s_*`` tenant schemas here cannot
+    affect another worker's state. The earlier ``PYTEST_XDIST_WORKER``
+    early-return was a stale guard from before per-worker DB cloning
+    landed.
+    """
     async with managed_nested_transaction(engine) as conn:
         logger.info("Cleaning up catalog schema and dropping tenant schemas...")
 
