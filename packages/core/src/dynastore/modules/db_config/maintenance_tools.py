@@ -40,24 +40,6 @@ from dynastore.modules.db_config.locking_tools import (
 
 logger = logging.getLogger(__name__)
 
-# --- Legacy Compatibility (Deprecating) ---
-
-
-async def execute_ddl_block(conn: DbResource, ddl_block: str, **kwargs):
-    """
-    Deprecated: Use DDLQuery(ddl_block).execute(conn, **params) instead.
-    This wrapper delegates to DDLQuery which handles splitting and locking centrally.
-    """
-    import warnings
-
-    warnings.warn(
-        "execute_ddl_block is deprecated and will be removed in a future version. "
-        "Use DDLQuery(ddl_block).execute(conn, **params) instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    await DDLQuery(ddl_block).execute(conn, **kwargs)
-
 
 async def ensure_db_extension(conn: DbResource, extension_name: str):
     """
