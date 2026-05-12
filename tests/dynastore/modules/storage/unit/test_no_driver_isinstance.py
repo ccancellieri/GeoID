@@ -10,8 +10,6 @@ services is an architecture violation. Use Capability constants instead.
 
 import re
 
-import pytest
-
 from tests._repo_paths import CORE_SRC, EXTENSIONS_ROOTS, REPO_ROOT
 
 # Directories where driver isinstance leakage is forbidden:
@@ -40,7 +38,6 @@ def _grep_for_violations() -> list[str]:
     return violations
 
 
-@pytest.mark.xfail(reason="#514 — invariant fired; a service re-introduced isinstance(driver_class). Audit needed.", strict=False)
 def test_no_driver_class_isinstance_in_services():
     """No isinstance check on a concrete driver class in extensions or catalog modules."""
     violations = _grep_for_violations()

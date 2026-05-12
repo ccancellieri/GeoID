@@ -147,6 +147,14 @@ class Capability:
     # Driver supports a fast-path bulk ingest channel (e.g. COPY for PG,
     # append for Iceberg).  Callers check this before invoking bulk_copy().
 
+    # --- Tenant isolation ---
+    TENANT_ISOLATED = "tenant_isolated"
+    # Driver maintains a per-catalog physical storage unit (ES index,
+    # PG schema, bucket, …) that must be provisioned proactively when a
+    # tenant flips its privacy policy.  Replaces isinstance(driver,
+    # SomePrivateDriver) callsites that target the privacy-cascade
+    # ensure_storage hook.
+
 
 @runtime_checkable
 class CollectionItemsStore(Protocol):

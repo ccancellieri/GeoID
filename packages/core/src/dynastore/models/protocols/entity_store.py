@@ -90,6 +90,13 @@ class EntityStoreCapability:
     # Callers that write to PG directly then sync to other drivers skip any
     # driver that declares this capability (it was already written).
 
+    # --- Tenant isolation ---
+    TENANT_ISOLATED = "tenant_isolated"
+    # Driver maintains a per-catalog physical storage unit (ES index,
+    # PG schema, bucket, …) that must be provisioned proactively when a
+    # tenant flips its privacy policy.  See storage_driver.Capability
+    # for the mirror constant on item drivers.
+
 
 @runtime_checkable
 class CollectionStore(Protocol):

@@ -56,6 +56,7 @@ from __future__ import annotations
 import logging
 from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
+from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.modules.elasticsearch.collection_es_driver import (
     CollectionElasticsearchDriver,
     _bbox_to_envelope,
@@ -96,7 +97,13 @@ class CollectionElasticsearchPrivateDriver(CollectionElasticsearchDriver):
     })
 
     # Collection-tier indexer marker stays True (parent declares it).
-    # capabilities inherited.
+    # Extend the parent's capabilities with TENANT_ISOLATED so the privacy
+    # cascade can find per-tenant drivers via capability membership instead
+    # of isinstance() on the concrete class.
+    capabilities: FrozenSet[str] = frozenset(
+        CollectionElasticsearchDriver.capabilities
+        | {EntityStoreCapability.TENANT_ISOLATED}
+    )
 
     # ------------------------------------------------------------------
     # Index-name resolution — the only structural difference from the public

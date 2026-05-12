@@ -463,47 +463,35 @@ async def _on_apply_catalog_privacy(
         return
 
     from dynastore.tools.discovery import get_protocols
-    from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
-        ItemsElasticsearchPrivateDriver,
+    from dynastore.models.protocols.entity_store import (
+        CollectionStore,
+        EntityStoreCapability,
     )
-    from dynastore.modules.storage.drivers.elasticsearch_private.collection_driver import (
-        CollectionElasticsearchPrivateDriver,
+    from dynastore.models.protocols.storage_driver import (
+        Capability,
+        CollectionItemsStore,
     )
-    from dynastore.models.protocols.entity_store import CollectionStore
-    from dynastore.models.protocols.storage_driver import CollectionItemsStore
 
-    items_private: Optional[ItemsElasticsearchPrivateDriver] = next(
-        (
-            d
-            for d in get_protocols(CollectionItemsStore)
-            if isinstance(d, ItemsElasticsearchPrivateDriver)
-        ),
-        None,
-    )
-    if items_private is not None:
+    for d in get_protocols(CollectionItemsStore):
+        if Capability.TENANT_ISOLATED not in getattr(d, "capabilities", frozenset()):
+            continue
         try:
-            await items_private.ensure_storage(catalog_id)
+            await d.ensure_storage(catalog_id)
         except Exception as exc:
             logger.warning(
-                "CatalogPrivacy apply: items-private ensure_storage(%r) failed: %s",
-                catalog_id, exc,
+                "CatalogPrivacy apply: items ensure_storage(%r) on %s failed: %s",
+                catalog_id, type(d).__name__, exc,
             )
 
-    coll_private: Optional[CollectionElasticsearchPrivateDriver] = next(
-        (
-            d
-            for d in get_protocols(CollectionStore)
-            if isinstance(d, CollectionElasticsearchPrivateDriver)
-        ),
-        None,
-    )
-    if coll_private is not None:
+    for d in get_protocols(CollectionStore):
+        if EntityStoreCapability.TENANT_ISOLATED not in getattr(d, "capabilities", frozenset()):
+            continue
         try:
-            await coll_private.ensure_storage(catalog_id)
+            await d.ensure_storage(catalog_id)
         except Exception as exc:
             logger.warning(
-                "CatalogPrivacy apply: collection-private ensure_storage(%r) failed: %s",
-                catalog_id, exc,
+                "CatalogPrivacy apply: collection ensure_storage(%r) on %s failed: %s",
+                catalog_id, type(d).__name__, exc,
             )
 
 

@@ -101,6 +101,7 @@ class ItemsElasticsearchPrivateDriver(
         Capability.STREAMING,
         Capability.PHYSICAL_ADDRESSING,
         Capability.INTROSPECTION,
+        Capability.TENANT_ISOLATED,
     })
     preferred_for: FrozenSet[Hint] = frozenset()
     supported_hints: FrozenSet[Hint] = frozenset({
