@@ -110,9 +110,14 @@ async def test_handler_calls_both_private_drivers_when_private_and_discoverable(
         CollectionElasticsearchPrivateDriver,
     )
 
+    from dynastore.models.protocols.entity_store import EntityStoreCapability
+    from dynastore.models.protocols.storage_driver import Capability
+
     items_private = MagicMock(spec=ItemsElasticsearchPrivateDriver)
+    items_private.capabilities = frozenset({Capability.TENANT_ISOLATED})
     items_private.ensure_storage = AsyncMock()
     coll_private = MagicMock(spec=CollectionElasticsearchPrivateDriver)
+    coll_private.capabilities = frozenset({EntityStoreCapability.TENANT_ISOLATED})
     coll_private.ensure_storage = AsyncMock()
 
     def fake_get_protocols(proto):
@@ -148,8 +153,10 @@ async def test_handler_skips_missing_driver_gracefully():
     from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
         ItemsElasticsearchPrivateDriver,
     )
+    from dynastore.models.protocols.storage_driver import Capability
 
     items_private = MagicMock(spec=ItemsElasticsearchPrivateDriver)
+    items_private.capabilities = frozenset({Capability.TENANT_ISOLATED})
     items_private.ensure_storage = AsyncMock()
 
     def fake_get_protocols(proto):
@@ -190,9 +197,14 @@ async def test_handler_swallows_ensure_storage_exceptions(caplog):
         CollectionElasticsearchPrivateDriver,
     )
 
+    from dynastore.models.protocols.entity_store import EntityStoreCapability
+    from dynastore.models.protocols.storage_driver import Capability
+
     items_private = MagicMock(spec=ItemsElasticsearchPrivateDriver)
+    items_private.capabilities = frozenset({Capability.TENANT_ISOLATED})
     items_private.ensure_storage = AsyncMock(side_effect=RuntimeError("ES boom"))
     coll_private = MagicMock(spec=CollectionElasticsearchPrivateDriver)
+    coll_private.capabilities = frozenset({EntityStoreCapability.TENANT_ISOLATED})
     coll_private.ensure_storage = AsyncMock()
 
     def fake_get_protocols(proto):
@@ -222,8 +234,115 @@ async def test_handler_swallows_ensure_storage_exceptions(caplog):
     coll_private.ensure_storage.assert_awaited_once_with("cat-a")
     # Failure recorded as a warning, not a blocking error.
     assert any(
-        "items-private ensure_storage" in r.message and r.levelname == "WARNING"
+        "items ensure_storage" in r.message and r.levelname == "WARNING"
         for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_handler_picks_driver_with_tenant_isolated_capability():
+    """#562 G1 positive: a driver advertising
+    ``Capability.TENANT_ISOLATED`` is picked by the items loop;
+    a sibling driver without the capability is skipped.
+
+    Pins the capability-filter loop in
+    ``catalog_config.py:_on_apply_catalog_privacy`` independent of
+    isinstance inspection or ``MagicMock(spec=...)`` introspection
+    behaviour — only the ``capabilities`` frozenset is consulted.
+    """
+    from dynastore.models.protocols.storage_driver import Capability
+
+    tenant_isolated_driver = MagicMock()
+    tenant_isolated_driver.capabilities = frozenset({Capability.TENANT_ISOLATED})
+    tenant_isolated_driver.ensure_storage = AsyncMock()
+
+    non_isolated_driver = MagicMock()
+    non_isolated_driver.capabilities = frozenset()
+    non_isolated_driver.ensure_storage = AsyncMock()
+
+    def fake_get_protocols(proto):
+        from dynastore.models.protocols.entity_store import CollectionStore
+        from dynastore.models.protocols.storage_driver import CollectionItemsStore
+
+        if proto is CollectionItemsStore:
+            return [non_isolated_driver, tenant_isolated_driver]
+        if proto is CollectionStore:
+            return []
+        return []
+
+    with patch(
+        "dynastore.tools.discovery.get_protocols",
+        side_effect=fake_get_protocols,
+    ):
+        await _on_apply_catalog_privacy(
+            CatalogPrivacy(
+                collection_defaults=CollectionPrivacyDefaults(is_private=True),
+            ),
+            "cat-a", None, None,
+        )
+
+    tenant_isolated_driver.ensure_storage.assert_awaited_once_with("cat-a")
+    non_isolated_driver.ensure_storage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handler_noop_when_no_driver_advertises_tenant_isolated():
+    """#562 G1 negative / fail-closed: if no discoverable
+    ``CollectionItemsStore`` declares ``Capability.TENANT_ISOLATED``
+    the handler is a graceful no-op for the items tier. The handler
+    must not raise, and no driver's ``ensure_storage`` is called.
+
+    This pins the "no eligible driver" path as silent. Operators are
+    expected to surface this via deployment-time invariant checks
+    (e.g. SCOPE pulled the wrong drivers), not via privacy-write
+    failure — the cascade handler is not the right place for a
+    fail-loud error since the write itself is otherwise valid.
+    """
+    plain_driver = MagicMock()
+    plain_driver.capabilities = frozenset()
+    plain_driver.ensure_storage = AsyncMock()
+
+    def fake_get_protocols(proto):
+        from dynastore.models.protocols.entity_store import CollectionStore
+        from dynastore.models.protocols.storage_driver import CollectionItemsStore
+
+        if proto is CollectionItemsStore:
+            return [plain_driver]
+        if proto is CollectionStore:
+            return []
+        return []
+
+    with patch(
+        "dynastore.tools.discovery.get_protocols",
+        side_effect=fake_get_protocols,
+    ):
+        await _on_apply_catalog_privacy(
+            CatalogPrivacy(
+                collection_defaults=CollectionPrivacyDefaults(is_private=True),
+            ),
+            "cat-a", None, None,
+        )
+
+    plain_driver.ensure_storage.assert_not_awaited()
+
+
+def test_tenant_isolated_string_matches_entity_store_mirror():
+    """#562 G2: the two ``TENANT_ISOLATED`` enum values live in
+    different protocol modules but MUST share the same string. The
+    privacy-cascade handler reads ``Capability.TENANT_ISOLATED`` in
+    the items loop and ``EntityStoreCapability.TENANT_ISOLATED`` in
+    the collection loop — a rename in only one place would silently
+    break the other branch.
+    """
+    from dynastore.models.protocols.entity_store import (
+        EntityStoreCapability,
+    )
+    from dynastore.models.protocols.storage_driver import Capability
+
+    assert Capability.TENANT_ISOLATED == EntityStoreCapability.TENANT_ISOLATED, (
+        "Capability.TENANT_ISOLATED and EntityStoreCapability.TENANT_ISOLATED "
+        "must share the same string value (see KEEP IN SYNC notes in both "
+        "constant definitions)."
     )
 
 

@@ -154,6 +154,15 @@ class Capability:
     # tenant flips its privacy policy.  Replaces isinstance(driver,
     # SomePrivateDriver) callsites that target the privacy-cascade
     # ensure_storage hook.
+    #
+    # KEEP IN SYNC: the string value is mirrored on
+    # ``entity_store.EntityStoreCapability.TENANT_ISOLATED``. The
+    # privacy-cascade handler reads one in each protocol loop
+    # (``catalog_config.py:_on_apply_catalog_privacy``); a rename here
+    # without the matching change there silently breaks the
+    # collection-tier branch. Test:
+    # ``tests/dynastore/modules/catalog/unit/test_catalog_policy_apply_handler.py
+    # ::test_tenant_isolated_string_matches_entity_store_mirror``.
 
 
 @runtime_checkable

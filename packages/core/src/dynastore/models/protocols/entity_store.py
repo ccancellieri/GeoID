@@ -96,6 +96,13 @@ class EntityStoreCapability:
     # PG schema, bucket, …) that must be provisioned proactively when a
     # tenant flips its privacy policy.  See storage_driver.Capability
     # for the mirror constant on item drivers.
+    #
+    # KEEP IN SYNC: see the longer note on
+    # ``storage_driver.Capability.TENANT_ISOLATED``. Both string values
+    # must remain equal; the privacy-cascade handler depends on the
+    # equality, and a sync test in
+    # ``tests/dynastore/modules/catalog/unit/test_catalog_policy_apply_handler.py``
+    # pins it.
 
 
 @runtime_checkable
