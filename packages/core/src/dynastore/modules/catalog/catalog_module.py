@@ -763,24 +763,6 @@ class CatalogModule(ModuleProtocol):
         assert self.config_service is not None
         return self.config_service
 
-    def get_config_service(self) -> ConfigService:
-        # DEPRECATED: use .configs or get_protocol(ConfigsProtocol)
-        logger.warning(
-            "get_config_service is deprecated, use the 'configs' protocol property instead.",
-            stack_info=True,
-        )
-        assert self.config_service is not None
-        return self.config_service
-
-    def get_asset_service(self) -> AssetService:
-        # DEPRECATED: use .assets or get_protocol(AssetsProtocol)
-        logger.warning(
-            "get_asset_service is deprecated, use the 'assets' protocol property instead.",
-            stack_info=True,
-        )
-        assert self.asset_service is not None
-        return self.asset_service
-
     @property
     def count_items_by_asset_id_query(self) -> Any:
         return self._item_svc.count_items_by_asset_id_query
