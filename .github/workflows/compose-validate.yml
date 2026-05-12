@@ -1,0 +1,61 @@
+name: Compose Validate
+
+# Validates that the canonical compose files parse standalone AND merged.
+# Closes #575: docker compose `extends` pulls a single service, NOT its
+# transitive `depends_on` graph, so docker-compose.dev.yml must remain
+# loadable on its own (VS Code right-click "Compose Up" runs it alone).
+# Commit 64f011c regressed this by moving valkey to the base file while
+# leaving `depends_on: valkey` in every dev-only service; PR #573 fixed it.
+#
+# Uses only safe expression contexts (no untrusted user input flows into
+# any `run:` shell — github.ref is used in concurrency.group only, which
+# GitHub escapes server-side).
+
+on:
+  pull_request:
+    paths:
+      - 'packages/core/src/dynastore/docker/docker-compose*.yml'
+      - 'packages/core/src/dynastore/docker/compose.*.yml'
+      - '.github/workflows/compose-validate.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: compose-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      # .env is gitignored. Copy the tracked .env.example so variable
+      # interpolation has values; the values don't need to be valid since
+      # `config --quiet` only checks structure.
+      - name: Seed .env from .env.example
+        working-directory: packages/core/src/dynastore/docker
+        run: cp .env.example .env
+
+      - name: Validate base compose (standalone)
+        run: |
+          docker compose \
+            -f packages/core/src/dynastore/docker/docker-compose.yml \
+            config --quiet
+
+      # The load-bearing check from #575: dev.yml must parse on its own.
+      # A base-only service added without a matching dev.yml `extends`
+      # block will fail this step with "depends on undefined service".
+      - name: Validate dev compose (standalone)
+        run: |
+          docker compose \
+            -f packages/core/src/dynastore/docker/docker-compose.dev.yml \
+            config --quiet
+
+      - name: Validate merged base + dev compose
+        run: |
+          docker compose \
+            -f packages/core/src/dynastore/docker/docker-compose.yml \
+            -f packages/core/src/dynastore/docker/docker-compose.dev.yml \
+            config --quiet
