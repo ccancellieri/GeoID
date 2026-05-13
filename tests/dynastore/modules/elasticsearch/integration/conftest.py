@@ -7,6 +7,7 @@ All tests in this directory require:
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 
@@ -38,6 +39,50 @@ async def setup_collection(sysadmin_in_process_client, setup_catalog, collection
 # ---------------------------------------------------------------------------
 # ES refresh helpers
 # ---------------------------------------------------------------------------
+
+def _resolve_asyncpg_url() -> str:
+    """Test DB URL in asyncpg-native form (strip SQLAlchemy driver prefix)."""
+    url = os.getenv(
+        "DATABASE_URL",
+        "postgresql://testuser:testpassword@localhost:54320/gis_dev",
+    )
+    return url.replace("postgresql+asyncpg://", "postgresql://")
+
+
+async def drain_es_items_outbox(catalog_id: str) -> int:
+    """Drive the ES items OUTBOX drain in-process until the queue is empty.
+
+    Production runs the drain inside a separate Cloud Run Job whose
+    ``CapabilityMap`` advertises ``outbox_drain``; the in-process test
+    harness never claims that task, so a STAC POST's atomically-enqueued
+    ``OutboxDrainTask`` sits forever and a follow-up ``refresh + search``
+    hits an empty index (#614). We open a dedicated asyncpg connection,
+    pin ``search_path`` to the catalog schema, and call ``drain_once()``
+    until it reports zero.
+
+    Returns the total rows drained (informational; tests rely on the
+    side effect of items appearing in ES).
+    """
+    import asyncpg
+
+    from dynastore.tasks.outbox_drain.es_entrypoint import build_es_drain_task
+
+    conn = await asyncpg.connect(_resolve_asyncpg_url())
+    try:
+        await conn.execute(f'SET search_path TO "{catalog_id}"')
+        task = await build_es_drain_task(conn=conn, catalog_id=catalog_id)
+        total = 0
+        # Bounded loop: a healthy claim batch is finite; the cap guards
+        # against an indexer that keeps marking rows transient.
+        for _ in range(50):
+            n = await task.drain_once()
+            total += n
+            if n == 0:
+                break
+        return total
+    finally:
+        await conn.close()
+
 
 async def refresh_items_index(catalog_id: str) -> None:
     """Force ES to make all recently written item docs searchable."""

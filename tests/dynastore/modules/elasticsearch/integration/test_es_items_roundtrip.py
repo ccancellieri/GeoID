@@ -15,6 +15,7 @@ import pytest
 from httpx import AsyncClient
 
 from tests.dynastore.modules.elasticsearch.integration.conftest import (
+    drain_es_items_outbox,
     make_item,
     refresh_items_index,
 )
@@ -51,8 +52,16 @@ async def _delete_item(client: AsyncClient, catalog_id: str, collection_id: str,
 
 
 async def _yield_to_async_writer(catalog_id: str) -> None:
-    """Let any pending asyncio ES write tasks run, then flush the index."""
+    """Drive the ES items OUTBOX drain in-process, then refresh the index.
+
+    Items POSTed via STAC are written PG-first; a sibling row is
+    atomically enqueued into ``storage_outbox`` for the ES driver. The
+    in-process test harness does not run the Cloud Run Job that owns
+    ``outbox_drain``, so we step into the drain pathway directly here
+    before flushing the index (#614).
+    """
     await asyncio.sleep(0)
+    await drain_es_items_outbox(catalog_id)
     await refresh_items_index(catalog_id)
 
 
