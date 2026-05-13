@@ -59,7 +59,7 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
             "Per-class documentation mode injected INLINE on each in-scope "
             "plugin leaf as a ``_meta`` sibling.  ``none`` — no ``_meta`` key "
             "on any leaf.  ``field`` (default) — leaf carries ``_meta = "
-            "{field_docs: {field_name: description}}``.  ``schema`` — leaf "
+            "{docs: {field_name: description}}``.  ``schema`` — leaf "
             "carries ``_meta = {json_schema: <full Pydantic schema 2020-12>}`` "
             "(heavier, form-builder ready)."
         ),
@@ -101,18 +101,19 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
         "py_type": str,
         "type": "string",
         "enum": ["none", "minimal", "full"],
-        "default": "none",
-        "examples": ["none", "minimal", "full"],
+        "default": "minimal",
+        "examples": ["minimal", "full", "none"],
         "description": (
             "Per-plugin HATEOAS edit affordances injected INLINE on each "
             "in-scope leaf as a ``_links`` sibling.  Each leaf gets 4 "
             "affordances: ``self`` (GET), ``edit`` (PUT — replace), ``edit`` "
             "(DELETE — clear override), ``describedby`` (GET "
-            "registry/{class_key}).  ``none`` (default) — no ``_links`` on "
-            "any leaf, wire-compatible with pre-#517 clients.  ``minimal`` — "
+            "registry/{class_key}).  ``minimal`` (default) — "
             "``rel``/``href``/``method`` only.  ``full`` — adds a contextual "
             "``title`` per link naming the class key and tier "
-            "(catalog/collection ids included)."
+            "(catalog/collection ids included), plus ``rel=schema`` and "
+            "``rel=engine`` cross-links.  ``none`` — no ``_links`` on any "
+            "leaf (opt-out for terse payloads)."
         ),
     },
 }

@@ -643,7 +643,7 @@ async def test_compose_collection_config_meta_none(mock_config_service):
 
 @pytest.mark.asyncio
 async def test_compose_catalog_meta_field_inlines_meta_on_leaf(mock_config_service):
-    """#517: ``meta=field`` injects ``_meta = {field_docs: {...}}`` INLINE
+    """#517: ``meta=field`` injects ``_meta = {docs: {...}}`` INLINE
     on each in-scope plugin leaf — replacing the retired parallel ``meta``
     tree.  Path through ``configs`` resolves to the leaf, which carries
     its plugin fields alongside the ``_meta`` sibling."""
@@ -660,7 +660,7 @@ async def test_compose_catalog_meta_field_inlines_meta_on_leaf(mock_config_servi
     by_class = {"WebConfig": {"brand_name": "x"}}
     sources = {"WebConfig": "default"}
     registry = {"WebConfig": FakeWebConfig}
-    ConfigApiService._extract_field_docs.cache_clear()
+    ConfigApiService._extract_docs.cache_clear()
     with patch.object(svc, "_get_effective_configs",
                       new=AsyncMock(return_value=(by_class, sources, {"platform":{},"catalog":{},"collection":{}}))), \
          patch.object(svc, "_get_extra_refs", new=AsyncMock(return_value={})), \
@@ -676,7 +676,7 @@ async def test_compose_catalog_meta_field_inlines_meta_on_leaf(mock_config_servi
         )
     leaf = r.configs["platform"]["web"]["WebConfig"]
     assert leaf["brand_name"] == "x"
-    assert leaf["_meta"] == {"field_docs": {"brand_name": "Brand label."}}
+    assert leaf["_meta"] == {"docs": {"brand_name": "Brand label."}}
     # Top-level ``meta`` field is gone.
     assert not hasattr(r, "meta")
 
@@ -720,10 +720,9 @@ async def test_compose_catalog_meta_schema_inlines_full_json_schema(mock_config_
 
 
 @pytest.mark.asyncio
-async def test_compose_catalog_links_none_default_no_leaf_links(mock_config_service):
-    """Default ``links=none`` keeps response wire-compatible with
-    pre-#517 clients: no leaf carries ``_links``; response-level
-    ``_links`` holds only the ``self`` discovery entry."""
+async def test_compose_catalog_links_none_opt_out_suppresses_leaf_links(mock_config_service):
+    """``links=none`` is the opt-out path: no leaf carries ``_links``;
+    response-level ``_links`` holds only the ``self`` discovery entry."""
     svc = ConfigApiService(config_service=mock_config_service)
 
     class FakeWebConfig:
@@ -747,7 +746,7 @@ async def test_compose_catalog_links_none_default_no_leaf_links(mock_config_serv
          ):
         r = await svc.compose_catalog_config(
             base_url="http://test/configs/catalogs/c", catalog_id="c",
-            meta="none", include="upstream",
+            meta="none", include="upstream", links="none",
         )
     leaf = r.configs["platform"]["web"]["WebConfig"]
     assert "_links" not in leaf
@@ -1157,7 +1156,7 @@ def test_compose_tree_inherited_meta_skips_inherited_classes():
     by_class = {"elasticsearch_catalog_config": {"private": True}}
     sources = {"elasticsearch_catalog_config": "catalog"}
     registry = {"elasticsearch_catalog_config": FakeESCatConfig}
-    ConfigApiService._extract_field_docs.cache_clear()
+    ConfigApiService._extract_docs.cache_clear()
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
         return_value=registry,
@@ -1397,7 +1396,7 @@ def test_abstract_subclass_without_address_ok():
 # NOTE: The Phase 4 waterfall trace (``meta.<class>.layers``) and the
 # ``_build_meta_entry`` helper were retired in Cycle B of the
 # config-API restructure (2026-05-05).  ``meta`` is now a hierarchical
-# tree mirroring ``configs`` with ``{field_docs}`` or ``{json_schema}``
+# tree mirroring ``configs`` with ``{docs}`` or ``{json_schema}``
 # leaves; tier-of-origin is communicated via the top-level
 # ``inherited`` map.  The dropped tests covered:
 #   - test_build_meta_entry_default_only

@@ -432,7 +432,7 @@ class ConfigsService(ExtensionProtocol):
         meta: MetaQuery = "field",
         include: IncludeQuery = "scope",
         strict: StrictQuery = True,
-        links: LinksQuery = "none",
+        links: LinksQuery = "minimal",
     ) -> Any:
         base_url = str(request.url).split("?")[0]
         response = await self._config_api.compose_platform_config(
@@ -453,7 +453,7 @@ class ConfigsService(ExtensionProtocol):
         meta: MetaQuery = "field",
         include: IncludeQuery = "scope",
         strict: StrictQuery = True,
-        links: LinksQuery = "none",
+        links: LinksQuery = "minimal",
     ) -> Any:
         base_url = str(request.url).split("?")[0]
         response = await self._config_api.compose_catalog_config(
@@ -476,7 +476,7 @@ class ConfigsService(ExtensionProtocol):
         meta: MetaQuery = "field",
         include: IncludeQuery = "scope",
         strict: StrictQuery = True,
-        links: LinksQuery = "none",
+        links: LinksQuery = "minimal",
     ) -> Any:
         base_url = str(request.url).split("?")[0]
         response = await self._config_api.compose_collection_config(

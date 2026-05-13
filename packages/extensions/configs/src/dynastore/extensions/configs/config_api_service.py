@@ -306,7 +306,7 @@ class ConfigApiService:
 
     @staticmethod
     @functools.lru_cache(maxsize=256)
-    def _extract_field_docs(model_cls: Type[PluginConfig]) -> Dict[str, str]:
+    def _extract_docs(model_cls: Type[PluginConfig]) -> Dict[str, str]:
         """Extract ``{field_name: description}`` from a Pydantic class's JSON schema.
 
         Lightweight alternative to attaching the full ``model_json_schema()``:
@@ -353,7 +353,7 @@ class ConfigApiService:
         inline on each in-scope leaf as a ``_meta`` sibling:
 
         - ``"none"`` — no ``_meta`` key on any leaf.
-        - ``"field"`` (default) — leaf carries ``_meta = {"field_docs":
+        - ``"field"`` (default) — leaf carries ``_meta = {"docs":
           {field_name: description}}``, extracted from the class JSON
           Schema.  Lightweight, suitable for dashboards.
         - ``"schema"`` — leaf carries ``_meta = {"json_schema": <full
@@ -454,7 +454,7 @@ class ConfigApiService:
             """Build the meta-leaf payload for a class according to ``meta_mode``."""
             if meta_mode == "schema":
                 return {"json_schema": cls.model_json_schema()}
-            return {"field_docs": ConfigApiService._extract_field_docs(cls)}
+            return {"docs": ConfigApiService._extract_docs(cls)}
 
         def _place_at(
             target: Dict[str, Any],
@@ -803,7 +803,7 @@ class ConfigApiService:
         meta: str = "field",
         include: str = "scope",
         strict: bool = True,
-        links: str = "none",
+        links: str = "minimal",
     ) -> CollectionConfigResponse:
         by_class, sources, _tier_data = await self._get_effective_configs(
             catalog_id=catalog_id, collection_id=collection_id, resolved=resolved,
@@ -836,7 +836,7 @@ class ConfigApiService:
         meta: str = "field",
         include: str = "scope",
         strict: bool = True,
-        links: str = "none",
+        links: str = "minimal",
     ) -> CatalogConfigResponse:
         by_class, sources, _tier_data = await self._get_effective_configs(
             catalog_id=catalog_id, collection_id=None, resolved=resolved,
@@ -867,7 +867,7 @@ class ConfigApiService:
         meta: str = "field",
         include: str = "scope",
         strict: bool = True,
-        links: str = "none",
+        links: str = "minimal",
     ) -> PlatformConfigResponse:
         by_class, sources, _tier_data = await self._get_effective_configs(
             catalog_id=None, collection_id=None, resolved=resolved,

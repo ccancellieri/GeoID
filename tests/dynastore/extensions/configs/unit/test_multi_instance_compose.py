@@ -102,7 +102,7 @@ def test_compose_tree_extra_ref_with_unknown_class_skipped():
 
 def test_compose_tree_meta_inlined_on_extra_ref_under_field_mode():
     """Post-#517: a multi-instance ref leaf carries its ``_meta`` inline
-    alongside the plugin payload — same field_docs as the canonical
+    alongside the plugin payload — same docs as the canonical
     class (schema is per-class, not per-instance)."""
     by_class, sources = _by_class_with_canonical_tiles()
     extra_refs = {
@@ -117,4 +117,4 @@ def test_compose_tree_meta_inlined_on_extra_ref_under_field_mode():
     assert "tiles_secondary" in tiles_node
     leaf = tiles_node["tiles_secondary"]
     assert "_meta" in leaf
-    assert "field_docs" in leaf["_meta"]
+    assert "docs" in leaf["_meta"]

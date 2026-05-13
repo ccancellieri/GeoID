@@ -5,7 +5,7 @@ on each in-scope plugin leaf as a ``_meta`` sibling — replacing the
 retired parallel ``meta`` tree mirroring ``configs``.
 
   * ``?meta=none``           — no ``_meta`` key on any leaf.
-  * ``?meta=field`` (default) — leaf carries ``_meta = {field_docs:
+  * ``?meta=field`` (default) — leaf carries ``_meta = {docs:
                                 {field_name: description}}``.
   * ``?meta=schema``         — leaf carries ``_meta = {json_schema:
                                 <full Pydantic schema>}``.
@@ -56,8 +56,8 @@ def test_compose_tree_meta_none_suppresses_meta():
     assert "_meta" not in tree["platform"]["web"]["web_config"]
 
 
-def test_compose_tree_meta_field_attaches_field_docs():
-    """``meta_mode="field"`` injects ``_meta = {field_docs: …}`` ON each
+def test_compose_tree_meta_field_attaches_docs():
+    """``meta_mode="field"`` injects ``_meta = {docs: …}`` ON each
     in-scope plugin leaf (sibling of the plugin's own fields)."""
     schema = {
         "properties": {
@@ -73,13 +73,13 @@ def test_compose_tree_meta_field_attaches_field_docs():
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
         return_value=registry,
     ):
-        ConfigApiService._extract_field_docs.cache_clear()
+        ConfigApiService._extract_docs.cache_clear()
         tree, _ = ConfigApiService._compose_tree(
             by_class, sources={}, active_scope="platform", meta_mode="field",
         )
     leaf = tree["platform"]["web"]["web_config"]
     assert leaf["brand_name"] == "X"
-    assert leaf["_meta"]["field_docs"] == {
+    assert leaf["_meta"]["docs"] == {
         "brand_name": "Display name.",
         "version":    "Schema version.",
     }
@@ -102,7 +102,7 @@ def test_compose_tree_meta_schema_attaches_full_json_schema():
     leaf = tree["platform"]["web"]["web_config"]
     assert leaf["_meta"]["json_schema"] == schema
     # Field-docs leaf must not appear under schema mode.
-    assert "field_docs" not in leaf["_meta"]
+    assert "docs" not in leaf["_meta"]
 
 
 def test_compose_tree_meta_field_skips_inherited_classes():
@@ -149,7 +149,7 @@ def test_compose_tree_catalog_tier_under_upstream_mode_gets_meta():
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
         return_value=registry,
     ):
-        ConfigApiService._extract_field_docs.cache_clear()
+        ConfigApiService._extract_docs.cache_clear()
         tree, inherited = ConfigApiService._compose_tree(
             by_class, sources={"elasticsearch_catalog_config": "catalog"},
             active_scope="collection", meta_mode="field",
@@ -160,4 +160,4 @@ def test_compose_tree_catalog_tier_under_upstream_mode_gets_meta():
     # No inherited tree under upstream mode.
     assert inherited is None
     # Meta is inline on the leaf.
-    assert leaf["_meta"]["field_docs"] == {"private": "Private mode."}
+    assert leaf["_meta"]["docs"] == {"private": "Private mode."}

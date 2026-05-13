@@ -104,7 +104,7 @@ def test_inline_meta_and_links_on_leaf_payload():
                 "web": {
                     "web_config": {
                         "brand_name": "DynaStore",
-                        "_meta": {"field_docs": {"brand_name": "Display name."}},
+                        "_meta": {"docs": {"brand_name": "Display name."}},
                         "_links": [
                             {"rel": "self", "method": "GET",
                              "href": "/configs/catalogs/cat/plugins/web_config"},
@@ -116,7 +116,7 @@ def test_inline_meta_and_links_on_leaf_payload():
     )
     leaf = r.configs["platform"]["web"]["web_config"]
     assert leaf["brand_name"] == "DynaStore"
-    assert leaf["_meta"]["field_docs"]["brand_name"] == "Display name."
+    assert leaf["_meta"]["docs"]["brand_name"] == "Display name."
     assert leaf["_links"][0]["rel"] == "self"
 
 

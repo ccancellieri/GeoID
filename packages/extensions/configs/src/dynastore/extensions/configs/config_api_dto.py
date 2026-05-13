@@ -28,12 +28,13 @@ land at if rendered.
 Field-level docs and per-class HATEOAS edit affordances live INLINE on
 each plugin leaf:
 
-- ``_meta`` — ``{"field_docs": {field: description}}`` (default
+- ``_meta`` — ``{"docs": {field: description}}`` (default
   ``?meta=field``) or ``{"json_schema": {...}}`` (``?meta=schema``).
   Suppressed entirely with ``?meta=none``.
 - ``_links`` — per-leaf HATEOAS edit affordances pointing at the active
   scope's per-plugin CRUD endpoint and at the registry's JSON Schema
-  entry.  Suppressed by default; opt-in via ``?links=minimal|full``.
+  entry.  Emitted by default (``?links=minimal``); opt-out with
+  ``?links=none``; opt-in to verbose ``?links=full``.
 """
 
 from typing import Any, Dict, List, Optional
@@ -232,7 +233,7 @@ class CollectionConfigResponse(BaseModel):
             "forks at each tier).  Each leaf is the raw plugin payload "
             "keyed by ``class_key``.  When ``?meta=field|schema`` is set "
             "(default ``field``), each leaf carries a ``_meta`` sibling "
-            "(``{field_docs: {...}}`` or ``{json_schema: {...}}``).  "
+            "(``{docs: {...}}`` or ``{json_schema: {...}}``).  "
             "When ``?links=minimal|full`` is set, each leaf also carries "
             "a ``_links`` sibling — a HATEOAS array with ``self`` (GET), "
             "``edit`` (PUT — replace), ``edit`` (DELETE — clear override) "
