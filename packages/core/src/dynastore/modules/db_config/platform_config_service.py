@@ -427,33 +427,27 @@ class PluginConfig(PersistentModel):
         the composed-config endpoint and may declare fields that
         subclasses re-annotate or override.
 
-        Enforcement gating: ``DYNASTORE_MUTABILITY_STRICT=1`` (default
-        for new deployments) raises ``TypeError`` immediately on any
-        unmarked field.  Unset (during the slice-4.x migration window)
-        emits a one-time per-class warning so partially-migrated trees
-        still boot — the gate flips to default-strict in slice 4.z once
-        every subclass is annotated.
+        Every concrete ``PluginConfig`` subclass MUST annotate each
+        Pydantic field with exactly one of ``Mutable[T]`` /
+        ``WriteOnce[T]`` / ``Immutable[T]`` / ``Computed[T]``.  The
+        framework raises ``TypeError`` at class definition otherwise.
+        The slice-4.x migration window's ``DYNASTORE_MUTABILITY_STRICT``
+        env-var gate was removed in slice 4.z (#665 closed); every
+        existing subclass is annotated.
         """
         super().__pydantic_init_subclass__(**kwargs)
         if cls.__dict__.get("is_abstract_base", False):
             return
-        import os
         from dynastore.models.mutability import missing_markers
         missing = list(missing_markers(cls))
         if missing:
-            msg = (
+            raise TypeError(
                 f"{cls.__module__}.{cls.__qualname__}: every Pydantic field must "
                 f"carry exactly one mutability marker — "
                 f"``Mutable[T]`` / ``WriteOnce[T]`` / ``Immutable[T]`` / "
                 f"``Computed[T]`` from ``dynastore.models.mutability``.  "
                 f"Fields missing a marker: {missing}.  See #665 slice 4."
             )
-            if os.environ.get("DYNASTORE_MUTABILITY_STRICT", "").lower() in (
-                "1", "true", "yes", "on",
-            ):
-                raise TypeError(msg)
-            import warnings
-            warnings.warn(msg, DeprecationWarning, stacklevel=2)
         # Install the WriteOnce setter guard: every field annotated
         # ``WriteOnce[T]`` rejects post-construction mutation.  The guard
         # is installed once at class creation; runtime construction sets
