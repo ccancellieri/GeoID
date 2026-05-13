@@ -81,16 +81,23 @@ from dynastore.tools.async_utils import signal_bus
 logger = logging.getLogger(__name__)
 
 
-# Upper bound on the inner ``is_capability_live`` call inside the reactive
-# reaper's locked transaction (#629). The outer probe at the top of
-# ``_maybe_dlq_unclaimable`` is unbounded — it holds no DB resources, so
-# letting it wait the full cache socket timeout is harmless. The inner
-# re-check, by contrast, holds the DB connection and the advisory xact
-# lock for its full duration and convoys peer dispatchers behind it under
-# cache slowness. 0.5s matches the existing ``db_pool_acquire`` slow-log
-# threshold; on timeout we fail-open (treat as live), which is consistent
-# with ``capability_oracle.is_capability_live``'s own error path.
-_INNER_CAPABILITY_LIVE_TIMEOUT_S: float = 0.5
+async def _load_oracle_inner_timeout() -> float:
+    """Load oracle_inner_timeout_seconds from CachePluginConfig.
+
+    Falls back to 0.5 s if ConfigsProtocol is unavailable or config load
+    fails — consistent with CacheModule._load_cache_config.
+    """
+    try:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.frameworks.plugin import get_protocol
+        configs_proto = get_protocol(ConfigsProtocol)
+        cfg = await configs_proto.get_config(CachePluginConfig)
+        if cfg:
+            return cfg.oracle_inner_timeout_seconds
+    except Exception:
+        pass
+    return 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +307,8 @@ async def _maybe_dlq_unclaimable(
     timestamp = row["timestamp"]
 
     try:
+        timeout_s = await _load_oracle_inner_timeout()
+
         if await is_capability_live(capability_id):
             return False
 
@@ -334,10 +343,15 @@ async def _maybe_dlq_unclaimable(
             try:
                 live = await asyncio.wait_for(
                     is_capability_live(capability_id),
-                    timeout=_INNER_CAPABILITY_LIVE_TIMEOUT_S,
+                    timeout=timeout_s,
                 )
             except asyncio.TimeoutError:
                 live = True
+                logger.info(
+                    "dispatcher: inner oracle timeout capability=%s "
+                    "timeout_s=%.2f treating_as=live",
+                    capability_id, timeout_s,
+                )
             if live:
                 return False
 

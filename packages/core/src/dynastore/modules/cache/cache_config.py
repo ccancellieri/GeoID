@@ -74,3 +74,17 @@ class CachePluginConfig(ExposableConfigMixin, PluginConfig):
             "(falls back to LocalAsyncCacheBackend, logs ERROR, unregisters backend)."
         ),
     )
+
+    oracle_inner_timeout_seconds: float = Field(
+        default=0.5,
+        ge=0.05,
+        le=5.0,
+        description=(
+            "Upper bound on the inner is_capability_live re-check inside the "
+            "reactive reaper's locked DB transaction. The call holds the "
+            "connection + advisory xact lock for its duration; a slow Valkey "
+            "response convoys peer dispatchers. On timeout the reaper "
+            "fails-open (treats as live, never false-DLQs). "
+            "0.5 s matches the db_pool_acquire slow-log threshold."
+        ),
+    )

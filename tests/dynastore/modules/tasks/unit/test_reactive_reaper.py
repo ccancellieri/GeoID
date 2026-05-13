@@ -216,8 +216,62 @@ async def test_inner_oracle_timeout_treated_as_live(caplog):
             return_value="tasks",
         ),
         patch(
-            "dynastore.modules.tasks.dispatcher._INNER_CAPABILITY_LIVE_TIMEOUT_S",
-            0.05,
+            "dynastore.modules.tasks.dispatcher._load_oracle_inner_timeout",
+            new=AsyncMock(return_value=0.05),
+        ),
+    ]
+    _FakeQuery._q = [{"got": True}]
+    _FakeQuery._sql_log = []
+    for p in patches: p.start()
+    try:
+        result = await _maybe_dlq_unclaimable(
+            engine=MagicMock(), row=_row(), capability_id="x",
+        )
+    finally:
+        for p in patches: p.stop()
+
+    assert result is False
+    assert call_count["n"] == 2
+    assert not any("UPDATE" in s and "DEAD_LETTER" in s for s in _FakeQuery._sql_log)
+
+
+@pytest.mark.asyncio
+async def test_inner_oracle_timeout_uses_cache_config(caplog):
+    """#639: _maybe_dlq_unclaimable reads oracle_inner_timeout_seconds from
+    CachePluginConfig (via _load_oracle_inner_timeout) instead of a hardcoded
+    constant. Patching the helper to 0.05 s must still trigger the fail-open path.
+    """
+    import asyncio
+
+    call_count = {"n": 0}
+
+    async def _oracle(_cap_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return False
+        await asyncio.sleep(10)
+        return False
+
+    patches = [
+        patch(
+            "dynastore.modules.tasks.capability_oracle.is_capability_live",
+            side_effect=_oracle,
+        ),
+        patch(
+            "dynastore.modules.db_config.query_executor.DQLQuery",
+            _FakeQuery,
+        ),
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+            return_value=_FakeTxCtx(),
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module.get_task_schema",
+            return_value="tasks",
+        ),
+        patch(
+            "dynastore.modules.tasks.dispatcher._load_oracle_inner_timeout",
+            new=AsyncMock(return_value=0.05),
         ),
     ]
     _FakeQuery._q = [{"got": True}]

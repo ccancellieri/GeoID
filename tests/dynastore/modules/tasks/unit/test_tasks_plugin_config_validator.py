@@ -27,3 +27,27 @@ def test_refresh_greater_than_half_ttl_is_rejected():
             capability_publisher_ttl_seconds=60.0,
             capability_publisher_refresh_seconds=40.0,
         )
+
+
+def test_cache_plugin_config_oracle_inner_timeout_defaults():
+    from dynastore.modules.cache.cache_config import CachePluginConfig
+    cfg = CachePluginConfig()
+    assert cfg.oracle_inner_timeout_seconds == 0.5
+
+
+def test_cache_plugin_config_oracle_inner_timeout_valid():
+    from dynastore.modules.cache.cache_config import CachePluginConfig
+    cfg = CachePluginConfig(oracle_inner_timeout_seconds=1.5)
+    assert cfg.oracle_inner_timeout_seconds == 1.5
+
+
+def test_cache_plugin_config_oracle_inner_timeout_below_min():
+    from dynastore.modules.cache.cache_config import CachePluginConfig
+    with pytest.raises(ValidationError):
+        CachePluginConfig(oracle_inner_timeout_seconds=0.04)
+
+
+def test_cache_plugin_config_oracle_inner_timeout_above_max():
+    from dynastore.modules.cache.cache_config import CachePluginConfig
+    with pytest.raises(ValidationError):
+        CachePluginConfig(oracle_inner_timeout_seconds=6.0)
