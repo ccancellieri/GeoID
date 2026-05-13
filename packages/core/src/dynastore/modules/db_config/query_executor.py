@@ -86,8 +86,10 @@ from .exceptions import (
 # ConnectionDoesNotExistError must be retryable at pool-checkout so the
 # decorator can invalidate the poisoned wire and acquire a fresh one.
 try:
-    from asyncpg.exceptions import ConnectionDoesNotExistError as AsyncpgConnectionDoesNotExistError
-    from asyncpg.exceptions._base import InternalClientError as AsyncpgInternalClientError
+    from asyncpg.exceptions import (
+        ConnectionDoesNotExistError as AsyncpgConnectionDoesNotExistError,
+        InternalClientError as AsyncpgInternalClientError,
+    )
 except ImportError:
     AsyncpgConnectionDoesNotExistError = type("AsyncpgConnectionDoesNotExistError", (Exception,), {})
     AsyncpgInternalClientError = type("AsyncpgInternalClientError", (Exception,), {})
