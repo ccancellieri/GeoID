@@ -14,7 +14,7 @@
 
 from typing import ClassVar, Optional, Tuple
 
-from dynastore.modules.db_config.platform_config_service import PluginConfig
+from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 
 
@@ -23,11 +23,11 @@ class CoveragesConfig(ExposableConfigMixin, PluginConfig):
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "coverages")
 
     # `enabled` inherited from ExposableConfigMixin.
-    max_bands_per_request: int = 16
-    request_deadline_soft_s: int = 60
-    request_deadline_hard_s: int = 120
-    default_block_size: int = 512
-    default_style_id: Optional[str] = None
+    max_bands_per_request: Mutable[int] = 16
+    request_deadline_soft_s: Mutable[int] = 60
+    request_deadline_hard_s: Mutable[int] = 120
+    default_block_size: Mutable[int] = 512
+    default_style_id: Mutable[Optional[str]] = None
 
 
 # Backward-compatible alias — historical name used elsewhere in the codebase.

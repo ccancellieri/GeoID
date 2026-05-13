@@ -28,7 +28,7 @@ from typing import ClassVar, Tuple
 from pydantic import Field
 
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
-from dynastore.modules.db_config.platform_config_service import PluginConfig
+from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class ElasticsearchClientConfig(ExposableConfigMixin, PluginConfig):
 
     _address: ClassVar[Tuple[str, ...]] = ("platform", "elasticsearch", "client")
 
-    request_timeout_seconds: int = Field(
+    request_timeout_seconds: Mutable[int] = Field(
         default=60,
         ge=1,
         le=600,
@@ -51,7 +51,7 @@ class ElasticsearchClientConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
-    connections_per_node: int = Field(
+    connections_per_node: Mutable[int] = Field(
         default=10,
         ge=1,
         le=200,
@@ -62,7 +62,7 @@ class ElasticsearchClientConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
-    max_retries: int = Field(
+    max_retries: Mutable[int] = Field(
         default=3,
         ge=0,
         le=10,

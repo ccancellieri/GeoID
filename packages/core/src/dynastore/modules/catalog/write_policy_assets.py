@@ -35,7 +35,7 @@ from typing import ClassVar, List, Optional, Tuple
 
 from pydantic import Field, model_validator
 
-from dynastore.modules.db_config.platform_config_service import PluginConfig
+from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
 
 
 class AssetWriteConflictPolicy(StrEnum):
@@ -164,7 +164,7 @@ class AssetsWritePolicy(PluginConfig):
     )
     _visibility: ClassVar[Optional[str]] = "collection"
 
-    on_conflict: AssetWriteConflictPolicy = Field(
+    on_conflict: Mutable[AssetWriteConflictPolicy] = Field(
         default=AssetWriteConflictPolicy.REFUSE_FAIL,
         examples=["refuse_fail", "update", "new_version", "refuse_return"],
         description=(
@@ -178,7 +178,7 @@ class AssetsWritePolicy(PluginConfig):
             "returns the existing row so the caller observes idempotence."
         ),
     )
-    identity_matchers: List[AssetIdentityMatcher] = Field(
+    identity_matchers: Mutable[List[AssetIdentityMatcher]] = Field(
         default_factory=lambda: [
             AssetIdentityMatcher.ASSET_ID,
             AssetIdentityMatcher.FILENAME,
@@ -197,7 +197,7 @@ class AssetsWritePolicy(PluginConfig):
             "``metadata_field`` requires ``metadata_match_path``."
         ),
     )
-    metadata_match_path: Optional[str] = Field(
+    metadata_match_path: Mutable[Optional[str]] = Field(
         default=None,
         examples=[None, "iso19115.fileIdentifier", "external.urn"],
         description=(
@@ -206,7 +206,7 @@ class AssetsWritePolicy(PluginConfig):
             "Required when ``metadata_field`` appears in ``identity_matchers``."
         ),
     )
-    require_filename: bool = Field(
+    require_filename: Mutable[bool] = Field(
         default=True,
         examples=[True, False],
         description=(
@@ -216,7 +216,7 @@ class AssetsWritePolicy(PluginConfig):
             "rule earlier (service layer) with a typed error."
         ),
     )
-    skip_if_unchanged_content_hash: bool = Field(
+    skip_if_unchanged_content_hash: Mutable[bool] = Field(
         default=False,
         examples=[False, True],
         description=(
@@ -294,7 +294,7 @@ class AssetWritePolicyDefaults(PluginConfig):
         "policy_defaults",
     )
 
-    on_conflict: AssetWriteConflictPolicy = Field(
+    on_conflict: Mutable[AssetWriteConflictPolicy] = Field(
         default=AssetWriteConflictPolicy.REFUSE_FAIL,
         examples=["refuse_fail", "update", "new_version", "refuse_return"],
         description=(
@@ -302,7 +302,7 @@ class AssetWritePolicyDefaults(PluginConfig):
             "overrides it. Cascades platform → catalog → collection."
         ),
     )
-    require_filename: bool = Field(
+    require_filename: Mutable[bool] = Field(
         default=True,
         examples=[True, False],
         description=(

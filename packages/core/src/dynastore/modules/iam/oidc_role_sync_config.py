@@ -19,7 +19,7 @@ from typing import ClassVar, Dict, List, Optional, Tuple
 from pydantic import Field
 
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
-from dynastore.modules.db_config.platform_config_service import PluginConfig
+from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
 
 
 class OidcRoleSyncConfig(ExposableConfigMixin, PluginConfig):
@@ -33,7 +33,7 @@ class OidcRoleSyncConfig(ExposableConfigMixin, PluginConfig):
 
     _address: ClassVar[Tuple[str, ...]] = ("platform", "iam", "oidc_role_sync")
 
-    enabled: bool = Field(
+    enabled: Mutable[bool] = Field(
         default=False,
         description="If False the reconciler is a no-op (default).",
     )
@@ -42,7 +42,7 @@ class OidcRoleSyncConfig(ExposableConfigMixin, PluginConfig):
     # platform role defaults fails CI here instead of silently breaking
     # the OIDC reconciler. Operators that rename roles at runtime should
     # PATCH this config alongside the IamRolesConfig change.
-    role_mapping: Dict[str, str] = Field(
+    role_mapping: Mutable[Dict[str, str]] = Field(
         default_factory=lambda: {
             "geoid.sysadmin": "sysadmin",
             "geoid.editor": "editor",
@@ -52,14 +52,14 @@ class OidcRoleSyncConfig(ExposableConfigMixin, PluginConfig):
             "identity['roles'] field) to internal role names."
         ),
     )
-    ttl_seconds: int = Field(
+    ttl_seconds: Mutable[int] = Field(
         default=60,
         description=(
             "Per-principal cache TTL: skip reconciliation if the same "
             "principal was synced more recently than this."
         ),
     )
-    issuer_whitelist: Optional[List[str]] = Field(
+    issuer_whitelist: Mutable[Optional[List[str]]] = Field(
         default=None,
         description=(
             "If set, only tokens whose 'iss' claim is in this list are "
