@@ -253,6 +253,58 @@ async def test_non_retryable_from_connect_propagates(monkeypatch):
     assert engine.connect_calls == 1
 
 
+@pytest.mark.asyncio
+async def test_cancellation_drains_rollback_before_pool_release(monkeypatch):
+    """#628: when the user body is cancelled mid-query, ``managed_transaction``
+    must drive the transaction's ``__aexit__`` (which issues ROLLBACK) to
+    completion before letting the connection go back to the pool. Without
+    this drain the asyncpg wire returns in state 15 (IN_QUERY) and the
+    next acquire trips PR #619's invalidate-recover path.
+
+    Asserts the order: yield → CancelledError → rollback emitted via
+    ``__aexit__`` → close.
+    """
+    import asyncio as _asyncio
+
+    qe = _patch_async_engine(monkeypatch)
+    _silence_sleep(monkeypatch, qe)
+
+    log: List[str] = []
+
+    class _TrackingTx:
+        def __init__(self, sink: List[str]):
+            self._sink = sink
+
+        async def __aenter__(self):
+            self._sink.append("begin")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self._sink.append(f"exit:{exc_type.__name__ if exc_type else None}")
+            return False
+
+    class _CancelConn(_FakeConn):
+        def begin(self):  # type: ignore[override]
+            self.begin_count += 1
+            return _TrackingTx(self._log)
+
+    conn = _CancelConn(poisoned=False, log=log)
+    engine = _FakeEngine([conn])
+
+    async def _body():
+        async with qe.managed_transaction(engine):
+            raise _asyncio.CancelledError()
+
+    with pytest.raises(_asyncio.CancelledError):
+        await _body()
+
+    assert "begin" in log
+    exits = [e for e in log if e.startswith("exit:")]
+    assert exits and exits[-1] == "exit:CancelledError", log
+    assert log.index("exit:CancelledError") < log.index("close"), log
+    assert conn.closed is True
+
+
 @pytest.mark.xfail(reason="#514 — same as above; retry observation point changed.", strict=False)
 @pytest.mark.asyncio
 async def test_executor_workflow_uses_connect_retry(monkeypatch, caplog):

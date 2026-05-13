@@ -1108,6 +1108,22 @@ _SLOW_POOL_ACQUIRE_THRESHOLD_S = 0.5
 _SERVICE_NAME_FOR_METRICS = os.getenv("SERVICE_NAME", "unknown")
 
 
+async def _drain_rollback_exit(txn_cm: Any, exc: BaseException) -> None:
+    """Best-effort ROLLBACK drain used by :func:`managed_transaction` on
+    the cancelled / exception exit path. Invokes the transaction context
+    manager's ``__aexit__`` so SQLAlchemy emits the wire-level ROLLBACK,
+    then swallows any error — the caller is already re-raising the
+    original exception; a failed rollback must not mask it. See #628 for
+    the IN_QUERY state-15 cascade this drain prevents.
+    """
+    try:
+        await txn_cm.__aexit__(type(exc), exc, exc.__traceback__)
+    except Exception as drain_exc:  # noqa: BLE001
+        logger.debug(
+            "managed_transaction: rollback drain failed: %s", drain_exc,
+        )
+
+
 @retry_on_transient_connect()
 async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnection:
     """Pool-hygienized async connection from an :class:`AsyncEngine`.
@@ -1216,8 +1232,36 @@ async def managed_transaction(db_resource: Optional[DbResource]):
             # retry, since DML/DQL idempotency is the caller's responsibility.
             conn = await _acquire_async_engine_connection(db_resource)
             try:
-                async with conn.begin():
+                txn_cm = conn.begin()
+                await txn_cm.__aenter__()
+                try:
                     yield conn
+                except BaseException as exc:
+                    # Drain the rollback to completion before letting the
+                    # connection go back to the pool. Without this, a
+                    # CancelledError fired mid-query (e.g. by a leader-
+                    # loop cancellation or task timeout) propagates before
+                    # SQLAlchemy's transactional ``__aexit__`` can finish
+                    # the wire-level ROLLBACK; the underlying asyncpg
+                    # connection then lands in pool inventory still in
+                    # state 15 (IN_QUERY), and the next acquire hits the
+                    # invalidate-recover path added by PR #619. ``shield``
+                    # keeps the rollback awaitable alive across a re-fired
+                    # cancellation on this task. See #628.
+                    drain_fut = asyncio.ensure_future(
+                        _drain_rollback_exit(txn_cm, exc),
+                    )
+                    try:
+                        await asyncio.shield(drain_fut)
+                    except asyncio.CancelledError:
+                        # Re-fired cancellation during drain. Let the
+                        # rollback task continue; ``conn.close()`` below
+                        # will block on the same wire lock so the protocol
+                        # finishes draining before the pool sees it.
+                        pass
+                    raise
+                else:
+                    await txn_cm.__aexit__(None, None, None)
             finally:
                 await conn.close()
         else:
