@@ -661,6 +661,12 @@ async def materialize_all_dimensions(
 
 class DimensionsExtension(ExtensionProtocol, OGCServiceMixin):
     priority: int = 200
+    # FAO research extension — `conformance_uris` are declared so the mixin
+    # registers the contributor, BUT the public-facing standards coverage
+    # panel deliberately excludes this entry: see the rule documented at
+    # `packages/core/src/dynastore/extensions/tools/conformance.py` next to
+    # `_STANDARD_PATTERNS` (research proposals do not belong on the OGC
+    # conformance matrix).
     conformance_uris = OGC_DIMENSIONS_URIS
 
     def __init__(self, app: FastAPI):
