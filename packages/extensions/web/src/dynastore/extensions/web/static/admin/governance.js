@@ -21,6 +21,7 @@ const state = {
   roles: [],
   policies: [],
   principals: [],
+  editingRoleName: null,
 };
 
 function csv(s) {
@@ -102,6 +103,14 @@ async function refreshRoles() {
 
     const actions = document.createElement("td");
     actions.style.textAlign = "right";
+    const edit = document.createElement("button");
+    edit.className = "btn btn-secondary btn-xs";
+    edit.textContent = "Edit";
+    edit.style.marginRight = "4px";
+    edit.disabled = !canWrite;
+    edit.addEventListener("click", () => enterEditRoleMode(r));
+    actions.appendChild(edit);
+
     const del = document.createElement("button");
     del.className = "btn btn-danger btn-xs";
     del.textContent = "Delete";
@@ -111,6 +120,7 @@ async function refreshRoles() {
       try {
         await deleteRole(r.name, scopeCatalogId());
         setStatus("#role-status", `Deleted ${r.name}.`, "ok");
+        if (state.editingRoleName === r.name) exitEditRoleMode();
         refreshRoles();
       } catch (e) {
         setStatus("#role-status", `Delete failed: ${e.message}`, "err");
@@ -123,10 +133,52 @@ async function refreshRoles() {
   }
 }
 
-async function onCreateRole(e) {
+function enterEditRoleMode(r) {
+  state.editingRoleName = r.name;
+  $("#role-name").value = r.name;
+  $("#role-name").readOnly = true;
+  $("#role-description").value = r.description || "";
+  $("#role-policies").value = (r.policies || []).join(", ");
+  $("#role-parents").value = (r.parent_roles || []).join(", ");
+  $("#role-form-title").textContent = `Edit role '${r.name}'`;
+  $("#role-form-route").textContent = `PUT /admin/roles/${r.name}`;
+  $("#role-submit-btn").textContent = "Update";
+  $("#role-cancel-btn").style.display = "";
+  setStatus("#role-status", "", "");
+  $("#role-description").focus();
+}
+
+function exitEditRoleMode() {
+  state.editingRoleName = null;
+  $("#role-create").reset();
+  $("#role-name").readOnly = false;
+  $("#role-form-title").textContent = "Charter a role";
+  $("#role-form-route").textContent = "POST /admin/roles";
+  $("#role-submit-btn").textContent = "Charter";
+  $("#role-cancel-btn").style.display = "none";
+}
+
+async function onSubmitRole(e) {
   e.preventDefault();
   if (!canWriteAtScope()) {
-    setStatus("#role-status", "You cannot create roles at this scope.", "err");
+    setStatus("#role-status", "You cannot modify roles at this scope.", "err");
+    return;
+  }
+  const editing = state.editingRoleName;
+  if (editing) {
+    const patch = {
+      description: $("#role-description").value.trim() || null,
+      policies: csv($("#role-policies").value),
+      parent_roles: csv($("#role-parents").value),
+    };
+    try {
+      await updateRole(editing, patch, scopeCatalogId());
+      setStatus("#role-status", `Updated ${editing}.`, "ok");
+      exitEditRoleMode();
+      refreshRoles();
+    } catch (err) {
+      setStatus("#role-status", `Update failed: ${err.message}`, "err");
+    }
     return;
   }
   const body = {
@@ -144,8 +196,8 @@ async function onCreateRole(e) {
     setStatus("#role-status", "Created.", "ok");
     $("#role-create").reset();
     refreshRoles();
-  } catch (e) {
-    setStatus("#role-status", `Create failed: ${e.message}`, "err");
+  } catch (err) {
+    setStatus("#role-status", `Create failed: ${err.message}`, "err");
   }
 }
 
@@ -456,6 +508,7 @@ async function boot() {
         scope = { kind: "catalog", catalogId: state.ownedCatalogs[0].catalog_id };
       }
       state.scope = scope;
+      if (state.editingRoleName) exitEditRoleMode();
       await Promise.all([refreshRoles(), refreshPolicies()]);
       if ($("#tab-principals").classList.contains("active")) refreshPrincipals();
     },
@@ -469,7 +522,8 @@ async function boot() {
     });
   });
 
-  $("#role-create").addEventListener("submit", onCreateRole);
+  $("#role-create").addEventListener("submit", onSubmitRole);
+  $("#role-cancel-btn").addEventListener("click", exitEditRoleMode);
   $("#roles-refresh").addEventListener("click", refreshRoles);
   $("#policy-create").addEventListener("submit", onCreatePolicy);
   $("#policies-refresh").addEventListener("click", refreshPolicies);

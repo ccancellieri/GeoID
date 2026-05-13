@@ -37,8 +37,8 @@
     <section id="tab-roles" class="tab-panel active">
       <div class="plate">
         <div class="plate-header">
-          <h3>Charter a role</h3>
-          <div class="plate-meta">POST /admin/roles</div>
+          <h3 id="role-form-title">Charter a role</h3>
+          <div class="plate-meta" id="role-form-route">POST /admin/roles</div>
         </div>
         <form id="role-create">
           <div class="form-row">
@@ -62,7 +62,8 @@
             </div>
           </div>
           <div class="row">
-            <button class="btn" type="submit">Charter</button>
+            <button class="btn" type="submit" id="role-submit-btn">Charter</button>
+            <button class="btn btn-secondary" type="button" id="role-cancel-btn" style="display:none">Cancel</button>
             <span id="role-status" class="status"></span>
           </div>
         </form>
