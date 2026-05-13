@@ -654,9 +654,23 @@ class AssetRoutingConfig(PluginConfig):
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
-            # Mirrors ItemsRoutingConfig: ES (public) primary indexer for
-            # READ, PG authoritative for WRITE. See companion memory note +
-            # ItemsRoutingConfig.operations comment for rationale.
+            # Assets routing: PG is the canonical system of record;
+            # Elasticsearch is the *index* (search/geo/faceted query
+            # side), not a parallel storage tier.
+            #
+            # WRITE: PG primary (FATAL — gates operation success); ES
+            # secondary via ASYNC + OUTBOX so a transient ES write
+            # failure is durably retried instead of being lost as a
+            # single WARN. Matches the items-tier shape at
+            # ``ItemsRoutingConfig.operations`` (lines 479–488).
+            #
+            # READ: PG primary (FATAL). Asset identity / existence /
+            # direct-lookup paths (e.g. ``asset_manager.get_asset``)
+            # must consult the SOR first — ES-first turned a swallowed
+            # ES write failure into a fatal "Asset not found" ingestion
+            # raise (#620). ES remains a secondary at WARN with
+            # ``GEOMETRY_SIMPLIFIED`` so search-style consumers can opt
+            # in via ``get_driver(..., hint=...)``.
             Operation.WRITE: [
                 OperationDriverEntry(
                     driver_ref="asset_postgresql_driver",
@@ -664,24 +678,28 @@ class AssetRoutingConfig(PluginConfig):
                 ),
                 OperationDriverEntry(
                     driver_ref="asset_elasticsearch_driver",
-                    on_failure=FailurePolicy.WARN,
+                    write_mode=WriteMode.ASYNC,
+                    on_failure=FailurePolicy.OUTBOX,
                 ),
             ],
             Operation.READ: [
-                OperationDriverEntry(
-                    driver_ref="asset_elasticsearch_driver",
-                    hints={Hint.GEOMETRY_SIMPLIFIED},
-                    on_failure=FailurePolicy.WARN,
-                ),
                 OperationDriverEntry(
                     driver_ref="asset_postgresql_driver",
                     hints={Hint.GEOMETRY_EXACT},
                     on_failure=FailurePolicy.FATAL,
                 ),
+                OperationDriverEntry(
+                    driver_ref="asset_elasticsearch_driver",
+                    hints={Hint.GEOMETRY_SIMPLIFIED},
+                    on_failure=FailurePolicy.WARN,
+                ),
             ],
         },
         description=(
             "Operation → ordered driver list for asset drivers. "
+            "PG is the system of record (FATAL for both WRITE primary "
+            "and READ primary); ES is the index (ASYNC/OUTBOX on WRITE, "
+            "WARN secondary on READ for simplified-geometry hints). "
             "``operations[INDEX]`` is auto-augmented at validation time "
             "with discoverable AssetIndexer drivers; ``operations[UPLOAD]`` "
             "with discoverable AssetUploadProtocol impls."

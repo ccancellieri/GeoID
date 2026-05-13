@@ -396,6 +396,34 @@ class TestAssetRoutingConfig:
         assert Operation.WRITE in cfg.operations
         assert cfg.operations[Operation.WRITE][0].driver_ref == "asset_postgresql_driver"
 
+    def test_write_es_secondary_is_async_outbox(self):
+        """#620: assets WRITE must route ES through OUTBOX, not WARN.
+        ES is the *index*, not parallel storage — losing an indexing
+        write as a single WARN line silently inverts the design intent
+        (READ later raises "not found" against an empty index).
+        """
+        cfg = AssetRoutingConfig()
+        write = cfg.operations[Operation.WRITE]
+        es_entry = next(
+            e for e in write if e.driver_ref == "asset_elasticsearch_driver"
+        )
+        assert es_entry.on_failure == FailurePolicy.OUTBOX
+        assert es_entry.write_mode == WriteMode.ASYNC
+
+    def test_read_default_is_pg_first(self):
+        """#620: PG is the canonical SOR for assets; identity/existence
+        reads must consult PG first. ES-first turned a swallowed ES
+        write into a fatal "Asset not found" in ingestion.
+        """
+        cfg = AssetRoutingConfig()
+        read = cfg.operations[Operation.READ]
+        assert read[0].driver_ref == "asset_postgresql_driver"
+        assert read[0].on_failure == FailurePolicy.FATAL
+        # ES still available as secondary for simplified-geometry hints.
+        assert any(
+            e.driver_ref == "asset_elasticsearch_driver" for e in read
+        )
+
 
 # ---------------------------------------------------------------------------
 # M4 — env vs per-collection config split
