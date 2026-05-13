@@ -30,7 +30,6 @@ from dynastore.modules.db_config.query_executor import (
 )
 from dynastore.models.protocols import (
     ConfigsProtocol,
-    CatalogsProtocol,
 )
 from dynastore.modules.gcp import gcp_db
 from dynastore.modules.gcp.gcp_config import (
@@ -343,7 +342,7 @@ class GcpCatalogOpsMixin:
                                 "uri": "gs://{bucket_id}/{object_id}",
                             },
                             "reporting": {
-                                "gcs_detailed": {
+                                "gcs_detailed_reporter": {
                                     "enabled": True,
                                     "report_file_path": "gs://{bucket_id}/ingestion_reports/report_{asset_code}.json",
                                 }
@@ -439,7 +438,7 @@ class GcpCatalogOpsMixin:
                     logger.warning(f"Failed to cleanup orphaned bucket: {cleanup_e}")
 
             if provisioned_topic:
-                logger.info(f"Cleanup: Tearing down orphaned eventing topic/channel...")
+                logger.info("Cleanup: Tearing down orphaned eventing topic/channel...")
                 try:
                     # We need the config object to teardown topics/subscriptions
                     # Ensure eventing_config is defined and has managed_eventing
