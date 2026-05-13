@@ -12,7 +12,7 @@ forwards them to ``PermissionProtocol``. This file never calls
 from typing import List, Optional
 from dynastore.models.auth import Condition, Policy
 from dynastore.models.auth_models import Role
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 
 
 def admin_policies() -> List[Policy]:
@@ -76,8 +76,9 @@ def admin_role_bindings(
     catalog-admin authority through the same DB-resident flow they use
     for any custom role.
     """
-    sysadmin_role_name = sysadmin_role_name or DefaultRole.SYSADMIN.value
-    admin_role_name = admin_role_name or DefaultRole.ADMIN.value
+    cfg = IamRolesConfig()
+    sysadmin_role_name = sysadmin_role_name or cfg.sysadmin_role_name
+    admin_role_name = admin_role_name or cfg.admin_role_name
     return [
         Role(name=sysadmin_role_name, policies=["admin_access"]),
         Role(name=admin_role_name, policies=["admin_access"]),

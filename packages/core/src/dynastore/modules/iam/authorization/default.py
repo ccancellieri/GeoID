@@ -18,16 +18,15 @@ carrying a broad ALLOW policy (e.g. a baseline `user` role with
 `resource=".*"`) would bypass the role-level checks for sysadmin and admin.
 Role enforcement must be independent of path-level policy decisions.
 
-Role *names* (sysadmin/admin/etc.) are read from a constructor-supplied
-``IamRoleConfig`` so deployments that rename the platform super-user
-role wire it through without code changes. Defaults reproduce the
-seeded ``DefaultRole`` names.
+Role *names* are read from a constructor-supplied ``IamRolesConfig`` so
+deployments that rename the platform super-user role wire it through
+without code changes.
 """
 
 from typing import Optional
 
 from dynastore.models.protocols.authorization import (
-    IamRoleConfig,
+    IamRolesConfig,
     Permission,
 )
 from dynastore.models.protocols.authorization_context import SecurityContext
@@ -36,8 +35,8 @@ from dynastore.models.protocols.authorization_context import SecurityContext
 class DefaultAuthorizer:
     """Minimal role-based authorizer. Reads only `SecurityContext.roles`."""
 
-    def __init__(self, role_config: Optional[IamRoleConfig] = None) -> None:
-        self._role_config = role_config or IamRoleConfig()
+    def __init__(self, role_config: Optional[IamRolesConfig] = None) -> None:
+        self._role_config = role_config or IamRolesConfig()
 
     async def check(self, ctx: SecurityContext, permission: Permission) -> None:
         cfg = self._role_config
@@ -50,7 +49,7 @@ class DefaultAuthorizer:
                 return
             raise PermissionError("Administrative privileges required.")
         if permission is Permission.SYSADMIN:
-            if cfg.sysadmin in ctx.roles:
+            if cfg.sysadmin_role_name in ctx.roles:
                 return
             raise PermissionError("System administrator privileges required.")
         raise PermissionError(f"Unknown permission: {permission!r}")

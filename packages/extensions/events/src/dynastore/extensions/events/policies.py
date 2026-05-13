@@ -26,7 +26,7 @@ from typing import List, Optional
 
 from dynastore.models.auth import Condition, Policy
 from dynastore.models.auth_models import Role
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 
 
 def events_policies() -> List[Policy]:
@@ -64,13 +64,14 @@ def events_role_bindings(
     admin_role_name: Optional[str] = None,
 ) -> List[Role]:
     """Default role bindings: sysadmin gets both policies; admin gets per-catalog only."""
+    cfg = IamRolesConfig()
     return [
         Role(
-            name=sysadmin_role_name or DefaultRole.SYSADMIN.value,
+            name=sysadmin_role_name or cfg.sysadmin_role_name,
             policies=["events_platform_access", "events_catalog_access"],
         ),
         Role(
-            name=admin_role_name or DefaultRole.ADMIN.value,
+            name=admin_role_name or cfg.admin_role_name,
             policies=["events_catalog_access"],
         ),
     ]

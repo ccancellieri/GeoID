@@ -29,7 +29,7 @@ from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.extensions.tools.web_collect import collect_web_pages
 from dynastore.models.auth import Policy
 from dynastore.models.auth_models import Role
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.database import DatabaseProtocol
 from dynastore.models.protocols.catalogs import CatalogsProtocol
 from dynastore.models.protocols.policies import PermissionProtocol
@@ -46,8 +46,9 @@ def _stats_policy(sysadmin_role_name: Optional[str] = None) -> Policy:
 
     Returned to IAM via ``StatsExtension.get_policies``; never registers
     anything itself. ``sysadmin_role_name`` (default
-    ``DefaultRole.SYSADMIN.value``) is a foreign key into ``iam.roles``
-    and only carries through to the role binding emitted alongside.
+    ``IamRolesConfig().sysadmin_role_name``) is a foreign key into
+    ``iam.roles`` and only carries through to the role binding emitted
+    alongside.
     """
     return Policy(
         id="stats_endpoint_access",
@@ -61,7 +62,7 @@ def _stats_policy(sysadmin_role_name: Optional[str] = None) -> Policy:
 def _stats_role_binding(sysadmin_role_name: Optional[str] = None) -> Role:
     """Pure declaration of the role binding for the stats policy."""
     return Role(
-        name=sysadmin_role_name or DefaultRole.SYSADMIN.value,
+        name=sysadmin_role_name or IamRolesConfig().sysadmin_role_name,
         policies=["stats_endpoint_access"],
     )
 

@@ -31,7 +31,7 @@ from dynastore.modules.iam.conditions import condition_manager, EvaluationContex
 from dynastore.models.protocols.stats import StatsProtocol
 from dynastore.models.protocols.policies import PermissionProtocol
 from dynastore.models.protocols.authentication import AuthenticatorProtocol
-from dynastore.models.protocols.authorization import IamRoleConfig
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.modules.iam.models import PolicyBundle
 from dynastore.modules.iam.exceptions import InvalidAuthTokenError
 
@@ -56,11 +56,11 @@ class IamMiddleware(BaseHTTPMiddleware):
     #
     # Both are class attributes so subclasses (or test harnesses) can
     # rename them without touching the dispatch logic. ``catalog_admin_role``
-    # defaults to the active IamRoleConfig's admin name so env-renamed
+    # defaults to the active IamRolesConfig's admin name so renamed
     # deployments derive the catalog sentinel from their own role names.
     @staticmethod
     def _default_catalog_admin_role() -> str:
-        return IamRoleConfig().admin
+        return IamRolesConfig().admin_role_name
 
     catalog_admin_role: str = ""
     catalog_admin_sentinel: str = "catalog_admin"
@@ -263,14 +263,14 @@ class IamMiddleware(BaseHTTPMiddleware):
             except jwt.InvalidTokenError:
                 pass
 
-        cfg = IamRoleConfig()
-        if principal_role and cfg.sysadmin in principal_role:
-            source = cfg.sysadmin
+        cfg = IamRolesConfig()
+        if principal_role and cfg.sysadmin_role_name in principal_role:
+            source = cfg.sysadmin_role_name
 
         effective_principal_id = (
             (principal_obj.display_name or principal_obj.subject_id)
             if principal_obj
-            else (principal_role[0] if principal_role else cfg.anonymous)
+            else (principal_role[0] if principal_role else cfg.anonymous_role_name)
         )
         request.state.principal_id = effective_principal_id
 

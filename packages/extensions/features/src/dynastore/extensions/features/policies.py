@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.policies import Policy, Role
 from dynastore.tools.discovery import get_protocol
 
@@ -45,7 +45,7 @@ def register_features_policies():
     )
     pm.register_policy(features_policy)
     pm.register_role(Role(
-        name=DefaultRole.ANONYMOUS.value,
+        name=IamRolesConfig().anonymous_role_name,
         description="Anonymous user with limited access.",
         policies=["features_public_access"],
     ))

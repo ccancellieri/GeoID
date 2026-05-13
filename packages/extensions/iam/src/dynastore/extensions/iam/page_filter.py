@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from starlette.requests import Request
 
-from dynastore.models.protocols.authorization import IamRoleConfig
+from dynastore.models.protocols.authorization import IamRolesConfig
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +43,13 @@ class IamPageVisibilityFilter:
 
     The sysadmin role name is configurable per construction so
     deployments that rename the platform super-user role wire it
-    through. Defaults to ``DefaultRole.SYSADMIN.value``.
+    through. Defaults to ``IamRolesConfig().sysadmin_role_name``.
     """
 
     def __init__(self, sysadmin_role_name: Optional[str] = None) -> None:
-        self._sysadmin_role = sysadmin_role_name or IamRoleConfig().sysadmin
-        self._anonymous_role = IamRoleConfig().anonymous
+        cfg = IamRolesConfig()
+        self._sysadmin_role = sysadmin_role_name or cfg.sysadmin_role_name
+        self._anonymous_role = cfg.anonymous_role_name
 
     async def filter_visible(
         self,

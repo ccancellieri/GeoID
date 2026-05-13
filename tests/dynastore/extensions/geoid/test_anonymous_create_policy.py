@@ -1,7 +1,9 @@
 """Unit tests for the anonymous-create policy registered by the geoid extension."""
 from unittest.mock import MagicMock
 
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
+
+_ANON = IamRolesConfig().anonymous_role_name
 
 
 def test_register_geoid_policies_registers_anonymous_create_allow(monkeypatch):
@@ -43,7 +45,7 @@ def test_anonymous_role_grant_includes_create_policy(monkeypatch):
     granted = set()
     for call in pm.register_role.call_args_list:
         r = call.args[0]
-        if r.name == DefaultRole.ANONYMOUS.value:
+        if r.name == _ANON:
             granted.update(r.policies)
     assert "geoid_anonymous_create_per_collection" in granted
 

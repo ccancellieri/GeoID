@@ -34,7 +34,7 @@ def _validate_schema_name(schema: str) -> str:
         raise ValueError(f"Invalid schema name: {schema!r}")
     return schema
 
-from dynastore.models.protocols.authorization import IamRoleConfig
+from dynastore.models.protocols.authorization import IamRolesConfig
 
 from .models import PolicyBundle, Policy, Condition, Role, Principal
 from .policy_storage import AbstractPolicyStorage
@@ -61,7 +61,7 @@ class PolicyService:
         app_state: object,
         storage: Optional[AbstractPolicyStorage] = None,
         iam_storage: Optional[AbstractIamStorage] = None,
-        role_config: Optional[IamRoleConfig] = None,
+        role_config: Optional[IamRolesConfig] = None,
     ):
         self._state = app_state
         db = get_protocol(DatabaseProtocol)
@@ -72,7 +72,7 @@ class PolicyService:
         # IAM_ROLE_* env vars (with seeded ``DefaultRole`` values as the
         # ultimate fallback), so deployments configure custom names without
         # subclassing.
-        self._role_config = role_config or IamRoleConfig()
+        self._role_config = role_config or IamRolesConfig()
 
     async def _resolve_schema(
         self, catalog_id: Optional[str], conn: Optional[Any] = None
@@ -337,43 +337,20 @@ class PolicyService:
         ]
 
     def _get_default_roles(self) -> List[Role]:
-        """Return the core default roles, named via ``self._role_config``.
+        """Return the platform-tier role seed list from ``IamRolesConfig``.
 
-        Operators wiring custom role names (env or constructor arg) seed
-        their chosen names through this method without any code change.
+        Operators add, rename, or drop a role by editing
+        ``IamRolesConfig.roles`` via ``PATCH /api/catalog/v2/configs`` —
+        no code change.
         """
-        cfg = self._role_config
         return [
             Role(
-                name=cfg.sysadmin,
-                description="System Administrator with full access.",
-                policies=["sysadmin_full_access"],
-            ),
-            Role(
-                name=cfg.admin,
-                description="Administrator with full access.",
-                policies=["sysadmin_full_access"],
-            ),
-            Role(
-                name=cfg.anonymous,
-                description="Anonymous user with limited access.",
-                policies=["public_access"],
-            ),
-            Role(
-                name=cfg.editor,
-                description="Content editor with write access below admin.",
-                policies=["self_service_access"],
-            ),
-            Role(
-                name=cfg.user,
-                description="Default role for any authenticated user.",
-                policies=["self_service_access"],
-            ),
-            Role(
-                name=cfg.viewer,
-                description="Read-only role for newly auto-registered principals.",
-                policies=["self_service_access"],
-            ),
+                name=seed.name,
+                description=seed.description,
+                policies=list(seed.policies),
+            )
+            for seed in self._role_config.roles
+            if seed.is_platform_tier
         ]
 
     async def provision_default_policies(
@@ -436,8 +413,8 @@ class PolicyService:
                                 role_def, schema=schema, conn=db
                             )
 
-                # Seed default role hierarchy:
-                #   sysadmin > admin > editor > user > viewer > anonymous
+                # Seed role hierarchy from IamRolesConfig.hierarchy. Default
+                # edges form: sysadmin > admin > editor > user > anonymous.
                 # Direction: parent inherits child's policies (see
                 # `get_role_hierarchy` in postgres_iam_storage.py — it returns
                 # `role_names + children`). With this seed an authenticated
@@ -451,15 +428,7 @@ class PolicyService:
                 # Idempotent: ON CONFLICT DO NOTHING in `add_role_hierarchy`,
                 # so reprovision on every cold start is safe and self-heals
                 # databases that pre-date this seed.
-                cfg = self._role_config
-                _DEFAULT_HIERARCHY = [
-                    (cfg.sysadmin, cfg.admin),
-                    (cfg.admin,    cfg.editor),
-                    (cfg.editor,   cfg.user),
-                    (cfg.user,     cfg.viewer),
-                    (cfg.viewer,   cfg.anonymous),
-                ]
-                for parent, child in _DEFAULT_HIERARCHY:
+                for parent, child in self._role_config.hierarchy:
                     try:
                         await self.iam_storage.add_role_hierarchy(
                             parent_role=parent, child_role=child,
@@ -474,7 +443,7 @@ class PolicyService:
                         # observable — silent failures here put the platform
                         # into a "no inheritance" state where authenticated
                         # users see narrower access than anonymous browsers
-                        # (the seed wires sysadmin → admin → editor → user → viewer → anonymous,
+                        # (the default seed wires sysadmin → admin → editor → user → anonymous,
                         # so users *inherit* every public policy bound to
                         # anonymous; without the chain, registering for an
                         # account silently *removes* access).

@@ -27,7 +27,7 @@ from typing import List, Optional, Tuple, Any, Dict, Union, AsyncGenerator
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-from dynastore.models.protocols.authorization import IamRoleConfig
+from dynastore.models.protocols.authorization import IamRolesConfig
 
 from .models import (
     Principal,
@@ -79,7 +79,7 @@ class IamService:
         storage: Optional[AbstractIamStorage] = None,
         policy_service: Optional[object] = None,
         app_state: Optional[object] = None,
-        role_config: Optional[IamRoleConfig] = None,
+        role_config: Optional[IamRolesConfig] = None,
     ):
         # In V2, we prefer PostgresIamStorage which implements both interfaces.
         # Typed as Any because PostgresIamStorage has methods not declared in either
@@ -88,11 +88,11 @@ class IamService:
         self.policy_service = policy_service
         self.app_state = app_state
         self._jwt_secret: Optional[str] = None
-        # Same role-name configuration used by the seeding flow. Defaults
-        # read from IAM_ROLE_* env vars (with seeded ``DefaultRole`` values
-        # as the fallback) so seed-time naming stays consistent with
-        # runtime checks throughout the request lifecycle.
-        self._role_config = role_config or IamRoleConfig()
+        # Same role landscape configuration used by the seeding flow. When
+        # ``IamModule`` is mounted, lifespan loads the PluginConfig from the
+        # DB and passes it in here so a runtime PATCH of the role landscape
+        # takes effect on the next request without redeploy.
+        self._role_config = role_config or IamRolesConfig()
         # Bounded per-principal throttle + serialization lock for OIDC
         # reconciliation. TTL is updated lazily from PluginConfig on first
         # use (see ``_get_oidc_sync_gate``).
@@ -353,6 +353,24 @@ class IamService:
 
         return None
 
+    async def _get_roles_config(self) -> IamRolesConfig:
+        """Fetch IamRolesConfig via PlatformConfigsProtocol; falls back to
+        defaults when the protocol or row is unavailable so authentication
+        never blocks on missing config. A runtime PATCH of the config takes
+        effect on the next request without restart.
+        """
+        configs = get_protocol(PlatformConfigsProtocol)
+        if configs is None:
+            return self._role_config
+        try:
+            cfg = await configs.get_config(IamRolesConfig)
+            if isinstance(cfg, IamRolesConfig):
+                return cfg
+            return IamRolesConfig.model_validate(cfg)
+        except Exception:
+            logger.debug("IamRolesConfig unavailable; using in-memory fallback", exc_info=True)
+            return self._role_config
+
     async def _get_oidc_sync_config(self) -> OidcRoleSyncConfig:
         """Fetch OidcRoleSyncConfig via PlatformConfigsProtocol; falls
         back to defaults (``enabled=False``) when the protocol or row
@@ -526,20 +544,25 @@ class IamService:
                 attributes["azp"] = identity["azp"]
 
         # Use realm_roles from OIDC token if present, otherwise default to
-        # the configured "user" role name. Known-role filtering is over the
-        # active IamRoleConfig values rather than the DefaultRole enum so
-        # operator-renamed deployments still recognise their own seeded
-        # role names from incoming JWT claims.
-        cfg = self._role_config
-        known_roles = {
-            cfg.sysadmin, cfg.admin, cfg.editor,
-            cfg.user, cfg.viewer, cfg.anonymous,
-        }
+        # the configured user role name. Known-role filtering reads the
+        # active ``IamRolesConfig`` so operator-renamed deployments AND
+        # operator-added roles (e.g. a custom "reviewer" seeded via PATCH)
+        # are recognised against incoming JWT claims. Plus any role row
+        # present in the DB (created via /admin/roles POST) — this widens
+        # ``known_roles`` past the static seed so dynamically-created roles
+        # in JWT realm claims are not silently filtered.
+        cfg = await self._get_roles_config()
+        known_roles = set(cfg.role_names)
+        try:
+            db_roles = await self.storage.list_roles(schema="iam")
+            known_roles.update(r.name for r in db_roles)
+        except Exception:
+            logger.debug("list_roles unavailable; using config-only known_roles", exc_info=True)
         realm_roles = [
             r for r in identity.get("realm_roles", [])
             if r in known_roles
         ]
-        base_roles = realm_roles if realm_roles else [cfg.user]
+        base_roles = realm_roles if realm_roles else [cfg.default_user_role_name]
 
         # Overlay mapped OIDC roles (e.g. geoid.sysadmin -> sysadmin) so a
         # first-time login lands with the correct grant on the way in.
@@ -655,7 +678,7 @@ class IamService:
         new_p = Principal(
             id=uuid4(),
             display_name=identity.get("email", "Unknown"),
-            roles=[self._role_config.viewer],
+            roles=[self._role_config.default_user_role_name],
             attributes=attributes,
         )
         created = await self.storage.create_principal_link(new_p, identity)
@@ -895,11 +918,11 @@ class IamService:
         whose ``.roles`` is ``None``/empty) would surface as ANONYMOUS-
         equivalent at the policy layer — breaking ``/iam/me/*`` self-service
         endpoints that any authenticated user should reach. The default
-        role name is read from ``self._role_config.user``.
+        role name is read from ``self._role_config.default_user_role_name``.
 
         Accepts:
-          - ``None``                  → ``[self._role_config.user]``
-          - missing / empty list      → ``[self._role_config.user]``
+          - ``None``                  → ``[default_user_role_name]``
+          - missing / empty list      → ``[default_user_role_name]``
           - a single role as ``str``  → ``[role]``
           - a list of role names      → returned verbatim
 
@@ -910,7 +933,7 @@ class IamService:
             return [raw]
         roles = list(raw or [])
         if not roles:
-            roles = [self._role_config.user]
+            roles = [self._role_config.default_user_role_name]
         return roles
 
     async def _expand_role_hierarchy_dual_scope(
@@ -947,7 +970,8 @@ class IamService:
         """
         token = self.extract_token_from_request(request)
         if not token:
-            return [self._role_config.anonymous], None
+            roles_cfg = await self._get_roles_config()
+            return [roles_cfg.anonymous_role_name], None
 
         catalog_id = getattr(getattr(request, "state", {}), "catalog_id", None)
         schema = await self._resolve_schema(catalog_id)

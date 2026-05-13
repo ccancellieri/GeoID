@@ -30,7 +30,7 @@ from starlette.requests import Request
 from .models import Condition
 from .exceptions import IamError
 from dynastore.modules.iam.iam_storage import AbstractIamStorage
-from dynastore.models.protocols.authorization import IamRoleConfig
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
@@ -318,11 +318,11 @@ class CatalogAdminConditionConfig(BaseModel):
         ),
     )
     sysadmin_role: str = Field(
-        default_factory=lambda: IamRoleConfig().sysadmin,
+        default_factory=lambda: IamRolesConfig().sysadmin_role_name,
         description=(
             "Name of the platform super-user role used by the "
-            "sysadmin-bypass. Defaults to the active ``IamRoleConfig`` "
-            "(env-driven via ``IAM_ROLE_SYSADMIN``)."
+            "sysadmin-bypass. Defaults to the active "
+            "``IamRolesConfig.sysadmin_role_name``."
         ),
     )
     allow_platform: bool = Field(
@@ -460,7 +460,7 @@ class CatalogMembershipHandler(ConditionHandler):
             # anonymous on a per-catalog policy — fail closed
             return False
         roles = getattr(principal, "roles", None) or []
-        sysadmin_role = str(config.get("sysadmin_role", IamRoleConfig().sysadmin))
+        sysadmin_role = str(config.get("sysadmin_role", IamRolesConfig().sysadmin_role_name))
         if config.get("allow_sysadmin", True) and sysadmin_role in roles:
             return True
         provider = getattr(principal, "provider", None)

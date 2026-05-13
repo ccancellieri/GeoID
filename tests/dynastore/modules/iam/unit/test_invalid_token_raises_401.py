@@ -35,12 +35,17 @@ class _RejectingProvider:
 
 def _build_svc(secret: str = "x" * 32) -> Any:
     from dynastore.modules.iam.iam_service import IamService
-    from dynastore.models.protocols.authorization import IamRoleConfig
+    from dynastore.models.protocols.authorization import IamRolesConfig
 
     svc = object.__new__(IamService)
     svc.storage = _FakeStorage()
     svc._identity_providers = [_RejectingProvider()]
-    svc._role_config = IamRoleConfig()
+    svc._role_config = IamRolesConfig()
+
+    async def _get_roles_config() -> IamRolesConfig:
+        return svc._role_config
+
+    svc._get_roles_config = _get_roles_config
 
     async def _get_jwt_secrets_for_verification() -> List[str]:
         return [secret]
@@ -77,12 +82,12 @@ def _make_request(token: str) -> Any:
 async def test_no_token_still_returns_anonymous() -> None:
     """The "no Authorization header" path is legitimate anonymous traffic
     (health checks, public landing pages). It must NOT raise."""
-    from dynastore.models.protocols.authorization import DefaultRole
+    from dynastore.models.protocols.authorization import IamRolesConfig
 
     svc = _build_svc()
     roles, principal = await svc.authenticate_and_get_role(_make_request(""))
     assert principal is None
-    assert DefaultRole.ANONYMOUS.value in roles
+    assert IamRolesConfig().anonymous_role_name in roles
 
 
 @pytest.mark.asyncio

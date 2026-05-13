@@ -18,7 +18,9 @@ from typing import Any, List, Tuple
 
 import pytest
 
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
+
+_DEFAULTS = IamRolesConfig()
 
 
 class _FakeStorage:
@@ -43,12 +45,17 @@ def _build_iam_service_for_hs256(secret: str) -> Any:
     """Construct a minimal IamService instance wired just enough to exercise
     ``authenticate_and_get_role`` along the HS256 fallback path."""
     from dynastore.modules.iam.iam_service import IamService
-    from dynastore.models.protocols.authorization import IamRoleConfig
+    from dynastore.models.protocols.authorization import IamRolesConfig
 
     svc = object.__new__(IamService)
     svc.storage = _FakeStorage()
     svc._identity_providers = [_FakeIdentityProvider()]
-    svc._role_config = IamRoleConfig()
+    svc._role_config = IamRolesConfig()
+
+    async def _get_roles_config() -> IamRolesConfig:
+        return svc._role_config
+
+    svc._get_roles_config = _get_roles_config
 
     async def _get_jwt_secrets_for_verification() -> List[str]:
         return [secret]
@@ -104,11 +111,11 @@ async def test_hs256_jwt_with_empty_roles_defaults_to_user_role() -> None:
     effective_roles, principal = await svc.authenticate_and_get_role(_make_request(token))
 
     assert principal is not None, "Principal should be resolved from valid HS256 token"
-    assert DefaultRole.USER.value in effective_roles, (
-        f"Expected USER role default for empty-roles HS256 JWT, got {effective_roles!r}"
+    assert _DEFAULTS.default_user_role_name in effective_roles, (
+        f"Expected default-user role for empty-roles HS256 JWT, got {effective_roles!r}"
     )
-    assert DefaultRole.ANONYMOUS.value not in effective_roles, (
-        f"Authenticated principal must NOT carry ANONYMOUS role, got {effective_roles!r}"
+    assert _DEFAULTS.anonymous_role_name not in effective_roles, (
+        f"Authenticated principal must NOT carry anonymous role, got {effective_roles!r}"
     )
 
 
@@ -135,8 +142,8 @@ async def test_hs256_jwt_without_roles_field_defaults_to_user_role() -> None:
     effective_roles, principal = await svc.authenticate_and_get_role(_make_request(token))
 
     assert principal is not None
-    assert DefaultRole.USER.value in effective_roles, (
-        f"Expected USER role default for roles-omitted HS256 JWT, got {effective_roles!r}"
+    assert _DEFAULTS.default_user_role_name in effective_roles, (
+        f"Expected default-user role for roles-omitted HS256 JWT, got {effective_roles!r}"
     )
 
 
@@ -150,15 +157,15 @@ def test_normalize_authenticated_roles_helper_defaults() -> None:
     from two separate auth-flow branches.
     """
     from dynastore.modules.iam.iam_service import IamService
-    from dynastore.models.protocols.authorization import IamRoleConfig
+    from dynastore.models.protocols.authorization import IamRolesConfig
 
     # _normalize_authenticated_roles is an instance method — build a minimal stub.
     svc = object.__new__(IamService)
-    svc._role_config = IamRoleConfig()
+    svc._role_config = IamRolesConfig()
     norm = svc._normalize_authenticated_roles
-    # None / empty list → USER default
-    assert norm(None) == [DefaultRole.USER.value]
-    assert norm([]) == [DefaultRole.USER.value]
+    # None / empty list → default-user role
+    assert norm(None) == [_DEFAULTS.default_user_role_name]
+    assert norm([]) == [_DEFAULTS.default_user_role_name]
     # Single-string role → wrapped, NOT defaulted
     assert norm("editor") == ["editor"]
     # Non-empty list → returned verbatim

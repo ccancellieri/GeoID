@@ -40,7 +40,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from dynastore.extensions.iam.membership_cache import get_membership_cached as _get_membership
-from dynastore.models.protocols.authorization import IamRoleConfig
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.iam_query import IamQueryProtocol
 from dynastore.tools.discovery import get_protocol
 
@@ -183,9 +183,9 @@ class TenantScopeMiddleware(BaseHTTPMiddleware):
 
         # Sysadmin label-based bypass — fast path that avoids the IAM round
         # trip when the role hierarchy already expanded to sysadmin. Role
-        # name read from active IamRoleConfig so deployments that rename
+        # name read from active IamRolesConfig so deployments that rename
         # the platform super-user role wire it through without code edits.
-        if IamRoleConfig().sysadmin in roles:
+        if IamRolesConfig().sysadmin_role_name in roles:
             return await call_next(request)
 
         iam_query = get_protocol(IamQueryProtocol)

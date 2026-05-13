@@ -26,7 +26,7 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.auth import Condition, Policy
 from dynastore.models.auth_models import Role
-from dynastore.models.protocols.authorization import DefaultRole, IamRoleConfig
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
@@ -170,12 +170,12 @@ def _logs_dashboard_policy() -> Policy:
 def _logs_dashboard_role_binding(sysadmin_role_name: Optional[str] = None) -> Role:
     """Pure declaration of the role binding for the logs policy.
 
-    ``sysadmin_role_name`` (default ``DefaultRole.SYSADMIN.value``) is a
-    foreign key into ``iam.roles``; operators wiring a custom landscape
-    pass an explicit name through their bootstrap.
+    ``sysadmin_role_name`` defaults to the active
+    ``IamRolesConfig().sysadmin_role_name``; operators wiring a custom
+    landscape pass an explicit name through their bootstrap.
     """
     return Role(
-        name=sysadmin_role_name or DefaultRole.SYSADMIN.value,
+        name=sysadmin_role_name or IamRolesConfig().sysadmin_role_name,
         policies=["logs_dashboard_sysadmin_access"],
     )
 
@@ -199,7 +199,7 @@ def _logs_system_policy(sysadmin_role_name: Optional[str] = None) -> Policy:
 
 def _logs_system_role_binding(sysadmin_role_name: Optional[str] = None) -> Role:
     return Role(
-        name=sysadmin_role_name or DefaultRole.SYSADMIN.value,
+        name=sysadmin_role_name or IamRolesConfig().sysadmin_role_name,
         policies=["logs_system_sysadmin_access"],
     )
 
@@ -217,7 +217,7 @@ def _logs_per_catalog_policy(sysadmin_role_name: Optional[str] = None) -> Policy
     endpoint, the ``/logs`` suffix variant, and the per-collection
     nested path.
     """
-    role_name = sysadmin_role_name or IamRoleConfig().sysadmin
+    role_name = sysadmin_role_name or IamRolesConfig().sysadmin_role_name
     return Policy(
         id="logs_per_catalog_access",
         description=(
@@ -245,9 +245,9 @@ def _logs_per_catalog_role_bindings(
     Sysadmin access is handled inside the condition handler, not via a
     separate role binding — same shape as ``web_dashboard_per_catalog_access``.
     """
-    cfg = IamRoleConfig()
-    admin = admin_role_name or cfg.admin
-    user = user_role_name or cfg.user
+    cfg = IamRolesConfig()
+    admin = admin_role_name or cfg.admin_role_name
+    user = user_role_name or cfg.default_user_role_name
     return [
         Role(name=admin, policies=["logs_per_catalog_access"]),
         Role(name=user, policies=["logs_per_catalog_access"]),

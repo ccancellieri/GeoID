@@ -1,5 +1,5 @@
 import logging
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.policies import Policy, Role
 from dynastore.tools.discovery import get_protocol
 
@@ -27,6 +27,6 @@ def register_notebooks_policies():
         effect="ALLOW",
     )
     pm.register_policy(notebooks_policy)
-    pm.register_role(Role(name=DefaultRole.ANONYMOUS.value, policies=["notebooks_public_access"]))
+    pm.register_role(Role(name=IamRolesConfig().anonymous_role_name, policies=["notebooks_public_access"]))
 
     logger.debug("Notebooks policies registered via PermissionProtocol.")

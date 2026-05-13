@@ -44,7 +44,7 @@ from dynastore.extensions.tools.conformance import (
 )
 from dynastore.extensions.web.decorators import expose_static, expose_web_page
 from dynastore.models.auth import Condition
-from dynastore.models.protocols.authorization import IamRoleConfig
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role, Principal
 from dynastore.tools.discovery import get_protocol, get_protocols, register_plugin
 
@@ -64,7 +64,7 @@ def _web_policies(sysadmin_role_name: Optional[str] = None) -> List[Policy]:
     its ``catalog_membership_required`` condition so seed-time bindings
     and runtime bypass checks share a single source of truth.
     """
-    sysadmin_role_name = sysadmin_role_name or IamRoleConfig().sysadmin
+    sysadmin_role_name = sysadmin_role_name or IamRolesConfig().sysadmin_role_name
     return [
         # Anonymous-allowed web paths. Resource patterns are anchored where
         # ambiguity matters because PolicyService uses ``re.match`` (matches
@@ -167,11 +167,11 @@ def _web_role_bindings(
     anonymous_role_name: Optional[str] = None,
 ) -> List[Role]:
     """Pure declaration of the web extension's role-to-policy bindings."""
-    cfg = IamRoleConfig()
-    sysadmin_role_name = sysadmin_role_name or cfg.sysadmin
-    admin_role_name = admin_role_name or cfg.admin
-    user_role_name = user_role_name or cfg.user
-    anonymous_role_name = anonymous_role_name or cfg.anonymous
+    cfg = IamRolesConfig()
+    sysadmin_role_name = sysadmin_role_name or cfg.sysadmin_role_name
+    admin_role_name = admin_role_name or cfg.admin_role_name
+    user_role_name = user_role_name or cfg.default_user_role_name
+    anonymous_role_name = anonymous_role_name or cfg.anonymous_role_name
     return [
         Role(name=anonymous_role_name, policies=["web_public_access"]),
         Role(name=sysadmin_role_name, policies=["web_sysadmin_access"]),
@@ -192,7 +192,7 @@ def _register_anonymous_principal() -> None:
     authz wiring. Kept as an explicit side-effecting call that runs once
     at extension init.
     """
-    anonymous_role = IamRoleConfig().anonymous
+    anonymous_role = IamRolesConfig().anonymous_role_name
     register_plugin(
         Principal(
             provider="system",
@@ -1458,7 +1458,7 @@ async function demoAction(action) {
             from dynastore.models.protocols.page_visibility_filter import (
                 PageVisibilityFilter,
             )
-            anonymous = IamRoleConfig().anonymous
+            anonymous = IamRolesConfig().anonymous_role_name
 
             pages = await self.web_module.get_web_pages_config(language)
             page_filter = get_protocol(PageVisibilityFilter)
@@ -1714,7 +1714,7 @@ async function demoAction(action) {
             if not catalogs_provider:
                 return []
 
-            if IamRoleConfig().sysadmin in user_roles:
+            if IamRolesConfig().sysadmin_role_name in user_roles:
                 # Sysadmin sees every catalog
                 cats = await catalogs_provider.list_catalogs(limit=limit, offset=offset, q=q)
             elif principal_id:

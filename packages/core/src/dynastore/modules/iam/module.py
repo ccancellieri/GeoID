@@ -85,13 +85,13 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
 
         self.storage = PostgresIamStorage(app_state)
         policy_storage = PostgresPolicyStorage(app_state)
-        # Single IamRoleConfig instance shared between policy seeding and
-        # runtime authentication so a single env-var change covers both.
-        # Operators wanting programmatic control can attach an instance to
-        # ``app_state.iam_role_config`` before lifespan; a fresh instance
-        # otherwise honors IAM_ROLE_* env vars on construction.
-        from dynastore.models.protocols.authorization import IamRoleConfig
-        role_config = getattr(app_state, "iam_role_config", None) or IamRoleConfig()
+        # Single IamRolesConfig instance shared between policy seeding and
+        # runtime authentication. Lifespan-time value comes from app_state
+        # or the PluginConfig defaults; the IamService hot path re-resolves
+        # via ``_get_roles_config`` so a runtime PATCH takes effect on the
+        # next request without restart.
+        from dynastore.models.protocols.authorization import IamRolesConfig
+        role_config = getattr(app_state, "iam_roles_config", None) or IamRolesConfig()
         self._policy_service = PolicyService(
             app_state,
             storage=policy_storage,

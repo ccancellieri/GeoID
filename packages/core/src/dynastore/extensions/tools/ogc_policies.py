@@ -21,7 +21,7 @@ from typing import List, Optional
 
 from dynastore.models.auth import Policy
 from dynastore.models.auth_models import Role
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +63,11 @@ def ogc_anonymous_role_binding(
     Args:
         protocol_prefix: Same prefix passed to ``ogc_public_access_policy``.
         anonymous_role_name: Role name to bind. Defaults to
-                            ``DefaultRole.ANONYMOUS.value`` for back-compat;
+                            ``IamRolesConfig().anonymous_role_name``;
                             operators wiring a custom role landscape pass
                             an explicit name.
     """
     return Role(
-        name=anonymous_role_name or DefaultRole.ANONYMOUS.value,
+        name=anonymous_role_name or IamRolesConfig().anonymous_role_name,
         policies=[f"{protocol_prefix}_public_access"],
     )

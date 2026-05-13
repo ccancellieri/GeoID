@@ -2,13 +2,11 @@
 #    Licensed under the Apache License, Version 2.0 (the "License").
 
 import logging
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.policies import Policy, Role
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
-
-_REINDEX_ADMIN_ROLES = (DefaultRole.SYSADMIN.value, DefaultRole.ADMIN.value)
 
 
 def register_search_policies():
@@ -33,7 +31,8 @@ def register_search_policies():
     )
     pm.register_policy(reindex_policy)
 
-    for role_name in _REINDEX_ADMIN_ROLES:
+    cfg = IamRolesConfig()
+    for role_name in (cfg.sysadmin_role_name, cfg.admin_role_name):
         pm.register_role(Role(name=role_name, policies=["search_reindex_admin"]))
 
     logger.debug("Search reindex policies registered via PermissionProtocol.")

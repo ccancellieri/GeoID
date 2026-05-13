@@ -7,7 +7,7 @@ the relevant audience config.
 """
 import logging
 
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.policies import Policy, Role
 from dynastore.tools.discovery import get_protocol
 
@@ -126,7 +126,7 @@ def register_geoid_policies():
         effect="ALLOW",
     ))
     pm.register_role(Role(
-        name=DefaultRole.ANONYMOUS.value,
+        name=IamRolesConfig().anonymous_role_name,
         policies=[
             "geoid_anonymous_lookup_per_catalog",
             "geoid_anonymous_stac_deny_lookup_only",

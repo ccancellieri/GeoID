@@ -34,7 +34,7 @@ from dynastore.models.protocols import (
     StorageProtocol,
 )
 from dynastore.models.protocols.authentication import AuthenticatorProtocol
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
 
 
 import dynastore.modules.db_config.shared_queries as shared_queries
@@ -372,7 +372,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         principal = getattr(request.state, "principal", None)
         if principal and principal.roles:
             roles = set(principal.roles)
-            if DefaultRole.ADMIN.value in roles and DefaultRole.SYSADMIN.value not in roles:
+            _roles_cfg = IamRolesConfig()
+            if _roles_cfg.admin_role_name in roles and _roles_cfg.sysadmin_role_name not in roles:
                 try:
                     iam = get_protocol(AuthenticatorProtocol)
                     if iam and iam.storage:  # type: ignore[attr-defined]

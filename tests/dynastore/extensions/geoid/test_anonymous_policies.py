@@ -6,7 +6,9 @@
 """
 from unittest.mock import MagicMock
 
-from dynastore.models.protocols.authorization import DefaultRole
+from dynastore.models.protocols.authorization import IamRolesConfig
+
+_ANON = IamRolesConfig().anonymous_role_name
 
 
 def test_register_geoid_policies_registers_anonymous_lookup_allow(monkeypatch):
@@ -81,7 +83,7 @@ def test_anonymous_role_grants_all_three_lookup_policies(monkeypatch):
 
     anon_grants = [
         call.args[0] for call in pm.register_role.call_args_list
-        if call.args[0].name == DefaultRole.ANONYMOUS.value
+        if call.args[0].name == _ANON
     ]
     assert anon_grants, "ANONYMOUS role grant missing"
     granted_policies = set()
