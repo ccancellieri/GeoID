@@ -33,6 +33,7 @@ from dynastore.modules.storage.driver_config import (
     DriverPluginConfig,
     ItemsDuckdbDriverConfig,
     ItemsElasticsearchDriverConfig,
+    ItemsElasticsearchPrivateDriverConfig,
     ItemsIcebergDriverConfig,
     ItemsPostgresqlDriverConfig,
 )
@@ -43,6 +44,10 @@ _EXPECTED_BY_CLASS = {
         {DriverCapability.SYNC, DriverCapability.TRANSACTIONAL}
     ),
     ItemsElasticsearchDriverConfig: frozenset({DriverCapability.ASYNC}),
+    # Inherits the base's empty default — pre-existing gap (driver impl is
+    # async but the config-side DriverCapability set was never declared).
+    # Pin the current state so a future audit can promote it intentionally.
+    ItemsElasticsearchPrivateDriverConfig: frozenset(),
     ItemsDuckdbDriverConfig: frozenset(
         {DriverCapability.ASYNC, DriverCapability.BATCH}
     ),

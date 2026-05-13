@@ -37,7 +37,7 @@ etc.), not *what operation* it performs.  Operations are defined in
 import json
 import os
 from enum import StrEnum
-from typing import Annotated, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from pydantic import (
     ConfigDict,
@@ -1032,7 +1032,6 @@ class AssetElasticsearchDriverConfig(AssetDriverConfig):
 # PluginConfig.__init_subclass__ — no explicit registration needed.
 
 from dynastore.models.protocols.field_definition import (  # noqa: E402
-    FeatureTypeDefinition as _FeatureTypeBase,
     FieldDefinition as _FieldDefinition,
     EntityLevel as _EntityLevel,
 )
