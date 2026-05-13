@@ -25,7 +25,7 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
     def __init__(self, app: Optional[Any] = None):
         super().__init__()
         self.app = app
-        self._engine: Optional[DbResource] = None
+        self.engine: Optional[DbResource] = None
         self._register_routes()
 
     def _register_routes(self):
@@ -274,7 +274,7 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
         if db:
             self.engine = db.engine
 
-        if not self._engine:
+        if not self.engine:
             logger.warning(
                 "EventsExtension: No DB engine found via DatabaseProtocol. Extension disabled."
             )
