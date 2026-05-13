@@ -167,9 +167,8 @@ class CollectionElasticsearchPrivateDriver(CollectionElasticsearchDriver):
                 )
             except Exception as exc:
                 # Tolerate "already exists" races between concurrent
-                # ensure_storage callers (the public driver does the same
-                # via ``ignore=400`` — pyright stubs reject the kwarg so
-                # we use try/except instead).
+                # ensure_storage callers. opensearch-py 3.x dropped the
+                # ``ignore=`` kwarg, so we catch and filter instead.
                 if "resource_already_exists" not in str(exc):
                     raise
             logger.info(

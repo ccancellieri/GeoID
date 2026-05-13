@@ -10,7 +10,7 @@
 #   • dynastore.tasks.*           — concrete task implementations
 #   • dynastore.extensions.{protocols,ogc_base,ogc_models_shared,
 #       lifespan,registry,bootstrap,tools/}  — shared extension base
-#   • dynastore.bootstrap, .main, .main_task, .main_worker
+#   • dynastore.bootstrap, .main, .main_task
 #   • dynastore.scripts/          — start.sh, start-task.sh (package data)
 #   • dynastore.docker/           — compose fragments + Dockerfile (package data)
 #

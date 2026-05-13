@@ -4,8 +4,8 @@ Production symptom (2026-04-22): `get_protocol(StorageProtocol)` returned
 None on some pods, causing `gcp_provision_catalog` tasks to fail with
 "StorageProtocol not available - GCP module not loaded".
 
-Hypothesis under test: the production app has five callers of
-`discover_modules()` (main, main_worker, bootstrap, extensions.bootstrap,
+Hypothesis under test: the production app has multiple callers of
+`discover_modules()` (main, bootstrap, extensions.bootstrap,
 tasks.bootstrap). On re-entry the old `discover_modules()` unconditionally
 reset `_DYNASTORE_MODULES[name] = ModuleConfig(cls=cls)`, wiping the live
 `.instance` reference. If a later `instantiate_modules(include_only=…)`

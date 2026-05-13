@@ -35,7 +35,7 @@ set -e
 : "${ACCESS_LOG:=-}"
 : "${ERROR_LOG:=-}"
 : "${VENV_PATH:=/opt/venv}"
-# Worker concurrency: number of parallel worker processes for the Procrastinate worker.
+# Worker concurrency: number of parallel worker processes for the in-app worker.
 # Multiple processes prevent deadlocks when tasks write to shared resources (e.g. static files).
 : "${WORKER_CONCURRENCY:=4}"
 # --- Durable Task Environment ---
