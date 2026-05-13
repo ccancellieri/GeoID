@@ -758,6 +758,11 @@ class IamService:
 
     async def create_role(self, role: Role, catalog_id: Optional[str] = None) -> Role:
         schema = await self._resolve_schema(catalog_id)
+        existing = await self.storage.get_role(role.name, schema=schema)
+        if existing is not None:
+            raise ValueError(
+                f"Role '{role.name}' already exists. Use PUT /admin/roles/{role.name} to update."
+            )
         return await self.storage.create_role(role, schema=schema)
 
     async def list_roles(self, catalog_id: Optional[str] = None) -> List[Role]:

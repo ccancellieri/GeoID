@@ -781,7 +781,10 @@ class IamExtension(ExtensionProtocol):
     async def create_role(self, role_req: Role, request: Request):
         """Creates a new dynamic role."""
         catalog_id = getattr(request.state, "catalog_id", None)
-        return await self.iam_manager.create_role(role_req, catalog_id=catalog_id)
+        try:
+            return await self.iam_manager.create_role(role_req, catalog_id=catalog_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
 
     async def update_role(self, name: str, role_req: Role, request: Request):
         """Updates an existing role."""

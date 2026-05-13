@@ -461,7 +461,10 @@ class AdminService(ExtensionProtocol):
             policies=body.policies,
             parent_roles=body.parent_roles,
         )
-        created = await mgr.create_role(role, catalog_id=catalog_id)
+        try:
+            created = await mgr.create_role(role, catalog_id=catalog_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
         return RoleResponse(
             name=created.name, description=created.description,
             policies=created.policies or [], parent_roles=created.parent_roles or [],
