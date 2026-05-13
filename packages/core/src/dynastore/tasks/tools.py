@@ -65,23 +65,32 @@ def initialize_reporters(
     if not reporting_config or not registry:
         return reporters
 
+    unresolved: List[str] = []
     for reporter_name, config_dict in reporting_config.items():
-        if reporter_name in registry:
-            reporter_class = registry[reporter_name]
-            config_model_class = _get_config_model_from_reporter(reporter_class)
-            
-            config_obj = None
-            if config_model_class and config_dict:
-                try:
-                    config_obj = config_model_class(**config_dict)
-                except Exception as e:
-                    logger.warning(f"Task '{task_id}': Failed to validate config for reporter '{reporter_name}': {e}")
-                    # Initialize without config or skip? Usually skip if config is invalid but required.
-                    # For now, try initializing without specific config.
-            
-            reporters.append(reporter_class(**base_args, config=config_obj))
-            logger.info(f"Task '{task_id}': Reporter '{reporter_name}' initialized.")
-        else:
-            logger.warning(f"Task '{task_id}': Reporter '{reporter_name}' not found in registry.")
+        if reporter_name not in registry:
+            unresolved.append(reporter_name)
+            continue
+        reporter_class = registry[reporter_name]
+        config_model_class = _get_config_model_from_reporter(reporter_class)
+
+        config_obj = None
+        if config_model_class and config_dict:
+            try:
+                config_obj = config_model_class(**config_dict)
+            except Exception as e:
+                logger.warning(f"Task '{task_id}': Failed to validate config for reporter '{reporter_name}': {e}")
+
+        reporters.append(reporter_class(**base_args, config=config_obj))
+        logger.info(f"Task '{task_id}': Reporter '{reporter_name}' initialized.")
+
+    if unresolved:
+        # Silent skip used to mask user typos (e.g. issue #654: `gcs_detailed` vs
+        # the registered `gcs_detailed_reporter`) — the task completed but no
+        # report ever appeared. Fail loud so callers correct the config.
+        available = ", ".join(sorted(registry.keys())) or "<none>"
+        raise ValueError(
+            f"Task '{task_id}': unknown reporter(s) {unresolved!r}; "
+            f"available: [{available}]"
+        )
 
     return reporters

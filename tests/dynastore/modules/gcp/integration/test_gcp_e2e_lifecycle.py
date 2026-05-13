@@ -268,7 +268,7 @@ async def test_gcp_end_to_end_lifecycle(
         task["ingestion_request"]["asset"]["asset_id"] = asset_id
         task["ingestion_request"]["asset"]["uri"] = artifact_uri
         task["ingestion_request"]["reporting"] = {
-            "GcsDetailedReporter": {
+            "gcs_detailed_reporter": {
                 "report_file_path": (
                     f"gs://{bucket_name}/ingestion-reports/"
                     "{task_id}-{timestamp_utc}.json"
