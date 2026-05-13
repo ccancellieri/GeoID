@@ -784,11 +784,7 @@ class AssetService(AssetsProtocol):
                 break
 
         if not has_complex_filter:
-            # Route through the search driver (ES if configured), fall back to READ
-            try:
-                driver = await get_asset_driver("SEARCH", catalog_id, collection_id, hint="search")
-            except ValueError:
-                driver = await get_asset_driver("READ", catalog_id, collection_id)
+            driver = await get_asset_driver("READ", catalog_id, collection_id)
             docs = await driver.search_assets(
                 catalog_id,
                 collection_id=collection_id,
