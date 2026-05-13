@@ -81,6 +81,18 @@ from dynastore.tools.async_utils import signal_bus
 logger = logging.getLogger(__name__)
 
 
+# Upper bound on the inner ``is_capability_live`` call inside the reactive
+# reaper's locked transaction (#629). The outer probe at the top of
+# ``_maybe_dlq_unclaimable`` is unbounded — it holds no DB resources, so
+# letting it wait the full cache socket timeout is harmless. The inner
+# re-check, by contrast, holds the DB connection and the advisory xact
+# lock for its full duration and convoys peer dispatchers behind it under
+# cache slowness. 0.5s matches the existing ``db_pool_acquire`` slow-log
+# threshold; on timeout we fail-open (treat as live), which is consistent
+# with ``capability_oracle.is_capability_live``'s own error path.
+_INNER_CAPABILITY_LIVE_TIMEOUT_S: float = 0.5
+
+
 # ---------------------------------------------------------------------------
 # Runner identity (owner_id for task claiming)
 # ---------------------------------------------------------------------------
@@ -309,8 +321,24 @@ async def _maybe_dlq_unclaimable(
 
             # Re-check liveness inside the locked transaction: another pod
             # may have appeared between the unlocked oracle call above and
-            # the lock acquisition. Conservative double-check is cheap.
-            if await is_capability_live(capability_id):
+            # the lock acquisition. Conservative double-check.
+            #
+            # Bounded: this call holds the DB connection + advisory xact
+            # lock for its full duration. Under cache slowness (Valkey
+            # cluster-mode timeout, network blip) an unbounded ``exists``
+            # convoys every other dispatcher behind the same connection,
+            # cascading into ``db_pool_acquire`` stalls (#629). The oracle
+            # is already fail-open on error (returns True), so an
+            # ``asyncio.TimeoutError`` here maps to the same "treat as
+            # live, leave PENDING + WARN" outcome — never a false DLQ.
+            try:
+                live = await asyncio.wait_for(
+                    is_capability_live(capability_id),
+                    timeout=_INNER_CAPABILITY_LIVE_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                live = True
+            if live:
                 return False
 
             # CAS guard: only DLQ rows still PENDING with retry_count=0. If

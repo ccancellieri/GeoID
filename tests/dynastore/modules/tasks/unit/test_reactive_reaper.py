@@ -175,6 +175,66 @@ async def test_infra_failure_fails_safe():
     assert result is False
 
 
+@pytest.mark.asyncio
+async def test_inner_oracle_timeout_treated_as_live(caplog):
+    """#629: inside the locked transaction, the ``is_capability_live``
+    re-check is bounded by ``_INNER_CAPABILITY_LIVE_TIMEOUT_S``. A cache
+    that hangs longer than the bound must not convoy peer dispatchers
+    behind the held DB connection + advisory xact lock; the bound expires
+    and we fail-open (treat as live → return False, no DLQ).
+
+    Outer call: returns False (live=False, would proceed). Inner call:
+    hangs past the bound → wait_for raises TimeoutError → live=True →
+    return False. Verifies CAS UPDATE is never reached.
+    """
+    import asyncio
+
+    call_count = {"n": 0}
+
+    async def _oracle(_cap_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return False
+        await asyncio.sleep(10)
+        return False
+
+    patches = [
+        patch(
+            "dynastore.modules.tasks.capability_oracle.is_capability_live",
+            side_effect=_oracle,
+        ),
+        patch(
+            "dynastore.modules.db_config.query_executor.DQLQuery",
+            _FakeQuery,
+        ),
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+            return_value=_FakeTxCtx(),
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module.get_task_schema",
+            return_value="tasks",
+        ),
+        patch(
+            "dynastore.modules.tasks.dispatcher._INNER_CAPABILITY_LIVE_TIMEOUT_S",
+            0.05,
+        ),
+    ]
+    _FakeQuery._q = [{"got": True}]
+    _FakeQuery._sql_log = []
+    for p in patches: p.start()
+    try:
+        result = await _maybe_dlq_unclaimable(
+            engine=MagicMock(), row=_row(), capability_id="x",
+        )
+    finally:
+        for p in patches: p.stop()
+
+    assert result is False
+    assert call_count["n"] == 2
+    assert not any("UPDATE" in s and "DEAD_LETTER" in s for s in _FakeQuery._sql_log)
+
+
 def test_index_propagation_required_capability_from_payload():
     payload = {"inputs": {"indexer_id": "collection_elasticsearch_driver"}}
     assert (
