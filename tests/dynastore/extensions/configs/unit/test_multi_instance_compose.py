@@ -39,7 +39,7 @@ def test_compose_tree_places_extra_ref_as_sibling_of_canonical_class():
     secondary_payload = TilesConfig(min_zoom=5, max_zoom=15).model_dump()
     extra_refs = {"tiles_secondary": (CANONICAL_KEY, secondary_payload)}
 
-    tree, _ = ConfigApiService._compose_tree(
+    tree = ConfigApiService._compose_tree(
         by_class=by_class,
         sources=sources,
         active_scope="platform",
@@ -66,11 +66,11 @@ def test_compose_tree_no_extra_refs_unchanged():
     the canonical-only path is the regression invariant since
     pre-F.4d.1 deployments take this branch unconditionally."""
     by_class, sources = _by_class_with_canonical_tiles()
-    tree_a, _ = ConfigApiService._compose_tree(
+    tree_a = ConfigApiService._compose_tree(
         by_class=by_class, sources=sources, active_scope="platform",
         meta_mode="none", include_mode="upstream", strict=False,
     )
-    tree_b, _ = ConfigApiService._compose_tree(
+    tree_b = ConfigApiService._compose_tree(
         by_class=by_class, sources=sources, active_scope="platform",
         meta_mode="none", include_mode="upstream", strict=False,
         extra_refs={},
@@ -91,7 +91,7 @@ def test_compose_tree_extra_ref_with_unknown_class_skipped():
     extra_refs = {
         "ghost_ref": ("class_that_was_unregistered", {"some": "payload"}),
     }
-    tree, _ = ConfigApiService._compose_tree(
+    tree = ConfigApiService._compose_tree(
         by_class=by_class, sources=sources, active_scope="platform",
         meta_mode="none", include_mode="upstream", strict=False,
         extra_refs=extra_refs,
@@ -108,7 +108,7 @@ def test_compose_tree_meta_inlined_on_extra_ref_under_field_mode():
     extra_refs = {
         "tiles_secondary": (CANONICAL_KEY, TilesConfig().model_dump()),
     }
-    tree, _ = ConfigApiService._compose_tree(
+    tree = ConfigApiService._compose_tree(
         by_class=by_class, sources=sources, active_scope="platform",
         meta_mode="field", include_mode="upstream", strict=False,
         extra_refs=extra_refs,

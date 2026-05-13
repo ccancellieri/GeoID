@@ -43,10 +43,9 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
         "examples": [True, False],
         "description": (
             "When true (default): all registered configs with waterfall-resolved "
-            "values; the top-level ``inherited`` tree (hierarchical, mirrors "
-            "``configs`` shape) tells you which tier provided each upstream "
-            "value.  When false: only configs explicitly stored at this scope "
-            "(delta-only, safe for read-modify-write flows)."
+            "values; each leaf's ``_meta.source`` tells you which tier "
+            "provided the resolved value.  When false: only configs explicitly "
+            "stored at this scope (delta-only, safe for read-modify-write flows)."
         ),
     },
     "meta": {
@@ -57,11 +56,11 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
         "examples": ["field", "schema", "none"],
         "description": (
             "Per-class documentation mode injected INLINE on each in-scope "
-            "plugin leaf as a ``_meta`` sibling.  ``none`` — no ``_meta`` key "
-            "on any leaf.  ``field`` (default) — leaf carries ``_meta = "
-            "{docs: {field_name: description}}``.  ``schema`` — leaf "
-            "carries ``_meta = {json_schema: <full Pydantic schema 2020-12>}`` "
-            "(heavier, form-builder ready)."
+            "plugin leaf as a ``_meta`` sibling.  Every leaf always carries "
+            "``_meta = {tier, source}`` (provenance is structural).  ``none`` "
+            "— that's all.  ``field`` (default) — adds ``docs: {field_name: "
+            "description}``.  ``schema`` — adds ``json_schema: <full "
+            "Pydantic schema 2020-12>`` (heavier, form-builder ready)."
         ),
     },
     "include": {
@@ -73,12 +72,11 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Body-rendering mode.  ``scope`` (default) — body lists only "
             "configs owned by the active scope; upstream-tier configs are "
-            "summarised in the hierarchical ``inherited`` tree (mirrors "
-            "``configs`` shape; leaves carry ``{source: <tier>}``).  "
-            "``upstream`` — every visible class rendered with its "
-            "waterfall-resolved value (today's verbose default; useful when "
-            "you want the full payload).  At platform scope this flag is a "
-            "no-op since platform IS the top tier."
+            "filtered out (their provenance is recoverable from any "
+            "rendered leaf's ``_meta.source``).  ``upstream`` — every "
+            "visible class rendered with its waterfall-resolved value "
+            "(useful when you want the full payload).  At platform scope "
+            "this flag is a no-op since platform IS the top tier."
         ),
     },
     "strict": {
@@ -90,11 +88,10 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
             "Cycle F.7d.2 — at platform scope, narrow the body to "
             "platform-intrinsic configs (``modules``, ``extensions``, "
             "``tasks``, ``engines``).  Catalog-/collection-tier templates "
-            "route to ``inherited`` instead.  ``false`` restores the previous "
-            "always-true platform-scope inclusion (catalog templates inline "
-            "in the body).  No effect at catalog or collection scope; "
-            "accepted for API symmetry so the same query-string template "
-            "works at every tier."
+            "are filtered out.  ``false`` restores the previous always-true "
+            "platform-scope inclusion (catalog templates inline in the body). "
+            " No effect at catalog or collection scope; accepted for API "
+            "symmetry so the same query-string template works at every tier."
         ),
     },
     "links": {

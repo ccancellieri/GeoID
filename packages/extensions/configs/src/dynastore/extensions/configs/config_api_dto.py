@@ -20,17 +20,13 @@ payloads keyed by class_key.  No wrapper envelopes, no duplicated
 driver configs inline under routing entries, no ``class_key`` field
 (the map key IS the class_key).
 
-Tier-of-origin information lives in the top-level ``inherited`` tree,
-which mirrors the ``configs`` shape — each leaf carries
-``{"source": <tier>}`` at the same address the resolved value would
-land at if rendered.
+Provenance + HATEOAS edit affordances live INLINE on each plugin leaf:
 
-Field-level docs and per-class HATEOAS edit affordances live INLINE on
-each plugin leaf:
-
-- ``_meta`` — ``{"docs": {field: description}}`` (default
-  ``?meta=field``) or ``{"json_schema": {...}}`` (``?meta=schema``).
-  Suppressed entirely with ``?meta=none``.
+- ``_meta`` — always carries ``{"tier": <active_scope>, "source":
+  <originating_tier>}``.  ``?meta=field`` (default) adds ``"docs":
+  {field: description}``; ``?meta=schema`` adds ``"json_schema":
+  {...}``; ``?meta=none`` strips the extras but keeps ``tier``+
+  ``source`` (per #665 slice 3 — provenance is structural).
 - ``_links`` — per-leaf HATEOAS edit affordances pointing at the active
   scope's per-plugin CRUD endpoint and at the registry's JSON Schema
   entry.  Emitted by default (``?links=minimal``); opt-out with
@@ -173,16 +169,12 @@ class Link(BaseModel):
     )
 
 
-# NOTE: ConfigLayer and ConfigMeta were retired in Cycle B of the
-# config-API restructure (2026-05-05).  The waterfall-trace meta
-# (``source`` + ``layers``) was dropped — operators didn't find the
-# per-tier presence breadcrumb interesting; the tier-of-origin
-# information now lives in the top-level ``inherited`` map.
-#
-# The top-level ``meta`` response field (a parallel tree mirroring
-# ``configs``) was retired in #517: per-class field docs and JSON
-# Schema now live INLINE as ``_meta`` siblings on each plugin leaf,
-# alongside the new ``_links`` array.  Single source of truth, no
+# NOTE: ConfigLayer / ConfigMeta (Cycle B, 2026-05-05) and the top-level
+# parallel ``meta`` tree (#517) were retired upstream.  The parallel
+# ``inherited`` tree was retired in #665 slice 3 — tier-of-origin lives
+# inline on each leaf's ``_meta.source``.  Per-class field docs and JSON
+# Schema also live INLINE as ``_meta`` siblings on each plugin leaf,
+# alongside the ``_links`` array.  Single source of truth, no
 # cross-walk required when staring at a leaf.
 
 
@@ -197,49 +189,23 @@ class Link(BaseModel):
 class CollectionConfigResponse(BaseModel):
     """Composed view of all effective configs at a single collection scope."""
 
-    links: List[Link] = Field(
-        default_factory=list,
-        serialization_alias="_links",
-        description=(
-            "Response-level JSON Hyper-Schema links.  Holds only ``self`` "
-            "(carries ``hrefSchema`` advertising supported query params).  "
-            "Per-plugin edit affordances live inline as ``_links`` on each "
-            "leaf when ``?links=minimal|full`` (see ``configs`` description)."
-        ),
-    )
     collection_id: str
     catalog_id: str
-    inherited: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Hierarchical breadcrumb tree mirroring the ``configs`` shape "
-            "for configs that resolved at this scope but are NOT rendered "
-            "in ``configs`` (default ``?include=scope`` mode). Each leaf "
-            "carries ``{\"source\": <tier>}`` — ``platform`` / ``catalog`` / "
-            "``default`` — at the same path the resolved value would land "
-            "at if it were inlined. Operators see WHICH upstream-tier "
-            "configs influence this collection AND at which natural "
-            "address, without the full payloads flooding the body. Set "
-            "``?include=upstream`` to render the resolved bodies inline "
-            "in ``configs`` (today's verbose mode); ``inherited`` is "
-            "``null`` in that mode."
-        ),
-    )
     configs: Dict[str, Any] = Field(
         default_factory=dict,
         description=(
             "Effective configs at this collection scope, nested as a "
             "tier-first tree (platform/catalog/collection/items + assets "
             "forks at each tier).  Each leaf is the raw plugin payload "
-            "keyed by ``class_key``.  When ``?meta=field|schema`` is set "
-            "(default ``field``), each leaf carries a ``_meta`` sibling "
-            "(``{docs: {...}}`` or ``{json_schema: {...}}``).  "
+            "keyed by ``class_key``.  Every leaf carries a ``_meta`` "
+            "sibling with ``{tier, source}``; ``?meta=field`` (default) "
+            "adds ``docs`` and ``?meta=schema`` adds ``json_schema``.  "
             "When ``?links=minimal|full`` is set, each leaf also carries "
             "a ``_links`` sibling — a HATEOAS array with ``self`` (GET), "
             "``edit`` (PUT — replace), ``edit`` (DELETE — clear override) "
             "and ``describedby`` (GET registry/{class_key}).  "
-            "``?links=full`` adds contextual ``title`` per link naming "
-            "the class_key and scope."
+            "``?links=full`` additionally adds ``rel=schema`` and "
+            "(when ``engine_ref`` is bound) ``rel=engine``."
         ),
     )
 
@@ -247,24 +213,7 @@ class CollectionConfigResponse(BaseModel):
 class CatalogConfigResponse(BaseModel):
     """Composed view of all effective configs at a single catalog scope."""
 
-    links: List[Link] = Field(
-        default_factory=list,
-        serialization_alias="_links",
-        description=(
-            "JSON Hyper-Schema link descriptors. See "
-            "``CollectionConfigResponse._links`` for the link semantics."
-        ),
-    )
     catalog_id: str
-    inherited: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Hierarchical breadcrumb tree mirroring the ``configs`` shape "
-            "for configs that resolved at this scope but are NOT rendered "
-            "in ``configs`` (default ``?include=scope`` mode). See "
-            "``CollectionConfigResponse.inherited`` for full semantics."
-        ),
-    )
     configs: Dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -279,14 +228,6 @@ class CatalogConfigResponse(BaseModel):
 class PlatformConfigResponse(BaseModel):
     """Composed view of all effective configs at the platform scope."""
 
-    links: List[Link] = Field(
-        default_factory=list,
-        serialization_alias="_links",
-        description=(
-            "JSON Hyper-Schema link descriptors. See "
-            "``CollectionConfigResponse._links`` for the link semantics."
-        ),
-    )
     scope: str = Field("platform", frozen=True)
     configs: Dict[str, Any] = Field(
         default_factory=dict,
@@ -298,18 +239,8 @@ class PlatformConfigResponse(BaseModel):
             "``_links`` per-leaf semantics."
         ),
     )
-    inherited: Optional[Dict[str, Any]] = Field(
-        None,
-        description=(
-            "Hierarchical breadcrumb tree mirroring the ``configs`` shape "
-            "for catalog-/collection-tier templates filtered out under "
-            "``?strict=true`` (Cycle F.7d.2).  None when no entries were "
-            "filtered (e.g. ``?strict=false`` restores the previous "
-            "always-true platform-scope inclusion).  Each leaf carries "
-            "``{\"source\": <tier>}`` indicating where the resolved value "
-            "comes from."
-        ),
-    )
+
+
 class PatchConfigBody(RootModel[Dict[str, Optional[Dict[str, Any]]]]):
     """Partial composed configuration.
 

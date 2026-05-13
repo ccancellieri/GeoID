@@ -302,37 +302,21 @@ def test_compose_collection_inherited_mirrors_configs_for_real_classes():
     if "tiles_config" not in list_registered_configs():
         pytest.skip("tiles_config not registered (slim runtime build)")
 
-    tree, inherited = ConfigApiService._compose_tree(
+    tree = ConfigApiService._compose_tree(
         by_class, sources=sources, active_scope="collection",
     )
 
-    # collection-vis stays in body
-    assert (
-        tree.get("platform", {}).get("catalog", {}).get("collection", {})
-            .get("items", {}).get("routing", {}).get("items_routing_config")
-        == {"enabled": False}
+    # collection-vis stays in body; _meta carries the active-tier provenance.
+    leaf = (
+        tree["platform"]["catalog"]["collection"]
+        ["items"]["routing"]["items_routing_config"]
     )
+    assert leaf["enabled"] is False
+    assert leaf["_meta"] == {"tier": "collection", "source": "collection"}
 
-    # platform-vis surfaces in inherited tree (mirrors configs shape)
-    assert inherited is not None
-    # tiles_config _address is platform-tier — find by walking inherited tree
-    found_source = None
-    stack = [inherited]
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, dict):
-            continue
-        if "tiles_config" in node and isinstance(
-            node["tiles_config"], dict
-        ) and "source" in node["tiles_config"]:
-            found_source = node["tiles_config"]["source"]
-            break
-        for v in node.values():
-            stack.append(v)
-    assert found_source == "platform", (
-        "tiles_config should surface in the hierarchical inherited tree "
-        "with {source: 'platform'}"
-    )
+    # Per #665 slice 3 the parallel ``inherited`` tree is retired —
+    # platform-tier configs are filtered out under slim mode, full stop.
+    assert "tiles" not in tree.get("platform", {})
 
-    # No ``inherited_from_catalog`` sibling — D.3 dropped it.
+    # No ``inherited_from_catalog`` sibling — D.3 dropped it (also gone in slice 3).
     assert "inherited_from_catalog" not in tree
