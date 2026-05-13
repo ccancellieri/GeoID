@@ -37,6 +37,11 @@ class OidcRoleSyncConfig(ExposableConfigMixin, PluginConfig):
         default=False,
         description="If False the reconciler is a no-op (default).",
     )
+    # Default values track IamRolesConfig.{sysadmin,editor}_role_name; a
+    # unit test (issue #659) pins them so any future rename of the
+    # platform role defaults fails CI here instead of silently breaking
+    # the OIDC reconciler. Operators that rename roles at runtime should
+    # PATCH this config alongside the IamRolesConfig change.
     role_mapping: Dict[str, str] = Field(
         default_factory=lambda: {
             "geoid.sysadmin": "sysadmin",

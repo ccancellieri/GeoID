@@ -183,3 +183,19 @@ def test_config_defaults_off():
 
 def test_config_address_is_platform_iam_oidc_role_sync():
     assert OidcRoleSyncConfig._address == ("platform", "iam", "oidc_role_sync")
+
+
+def test_default_role_mapping_tracks_iam_roles_config_defaults():
+    # Issue #659: the OidcRoleSyncConfig default role_mapping literal must
+    # stay in sync with IamRolesConfig.{sysadmin,editor}_role_name. If the
+    # platform role names are renamed via the IamRolesConfig defaults, the
+    # OIDC mapping needs a deliberate update — this test fails loudly to
+    # force that. Operator-side runtime overrides still work as before.
+    from dynastore.models.protocols.authorization import IamRolesConfig
+
+    defaults = IamRolesConfig()
+    expected = {
+        f"geoid.{defaults.sysadmin_role_name}": defaults.sysadmin_role_name,
+        f"geoid.{defaults.editor_role_name}": defaults.editor_role_name,
+    }
+    assert OidcRoleSyncConfig().role_mapping == expected
