@@ -356,7 +356,6 @@ class _StubEs:
 
 
 class TestEnsureStorageTenantIndex:
-    @pytest.mark.xfail(reason="#514 — body now includes settings.index.mapping.total_fields.limit (#489 / ElasticsearchIndexConfig). Update expected payload.", strict=False)
     @pytest.mark.asyncio
     async def test_creates_tenant_index_and_adds_to_alias(self):
         es = _StubEs(exists=False)
@@ -377,11 +376,15 @@ class TestEnsureStorageTenantIndex:
             driver = ItemsElasticsearchDriver()
             await driver.ensure_storage("cat1")
 
-        assert es.indices.create_calls == [{
-            "index": "dynastore-cat1-items",
-            "body": {"mappings": es.indices.create_calls[0]["body"]["mappings"]},
-            "kwargs": {},
-        }]
+        assert len(es.indices.create_calls) == 1
+        call = es.indices.create_calls[0]
+        assert call["index"] == "dynastore-cat1-items"
+        assert call["kwargs"] == {}
+        body = call["body"]
+        assert set(body.keys()) == {"settings", "mappings"}
+        # ElasticsearchIndexConfig defaults when no PlatformConfigsProtocol is
+        # registered (unit-test path): items_total_fields_limit=2000.
+        assert body["settings"] == {"index.mapping.total_fields.limit": 2000}
         assert added == ["dynastore-cat1-items"]
 
     @pytest.mark.asyncio

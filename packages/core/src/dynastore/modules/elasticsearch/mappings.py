@@ -229,12 +229,6 @@ COLLECTION_MAPPING: Dict[str, Any] = {
         **COMMON_PROPERTIES,
         "created": {"type": "date"},
         "updated": {"type": "date"},
-        # Denormalised CollectionPrivacyConfig.is_private — sourced at
-        # collection-metadata write time so privacy-aware search can
-        # filter without joining against the configs table. Reindex flow
-        # (collection_metadata writer or PluginConfig change subscriber)
-        # is responsible for keeping this in sync with the config plugin.
-        "is_private": {"type": "boolean"},
         # Spatial/temporal extent – explicitly typed for geo queries
         "extent": {
             "properties": {

@@ -101,8 +101,8 @@ async def _warn_if_mapping_drifted(
     ``expected_mapping``.
 
     Catches the "field added in code, index never re-rolled" class of
-    bug (e.g. ``is_private`` added to ``COLLECTION_MAPPING`` post-F.0d
-    but live ``dynastore-collections`` predates it). Top-level only:
+    bug — a new property in the mapping is silently ignored by live
+    indices that predate it. Top-level only:
     deep mapping equality is fragile (ES adds metadata) and field
     additions are by far the common case. Operator sees an actionable
     log line at startup; runtime writes that touch the missing field

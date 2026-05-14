@@ -200,28 +200,6 @@ def _register_collection_privacy_cascade_handler() -> None:
 _register_collection_privacy_cascade_handler()
 
 
-def _register_collection_privacy_es_sync_handler() -> None:
-    """Hook ``_sync_collection_privacy_to_es`` so a direct PATCH on the
-    ``CollectionPrivacy`` plugin reflects in the ES collections doc
-    without waiting for the next collection-model write.
-
-    The handler itself is imported lazily inside a thin async wrapper to
-    avoid a module-load cycle between ``catalog_config`` and
-    ``collection_service`` (the latter imports the former at module top).
-    """
-
-    async def _lazy_sync(*args: Any, **kwargs: Any) -> None:
-        from dynastore.modules.catalog.collection_service import (
-            _sync_collection_privacy_to_es,
-        )
-        await _sync_collection_privacy_to_es(*args, **kwargs)
-
-    CollectionPrivacy.register_apply_handler(_lazy_sync)
-
-
-_register_collection_privacy_es_sync_handler()
-
-
 class CollectionPrivacyDefaults(BaseModel):
     """Catalog-level defaults seeded onto newly-created collections.
 

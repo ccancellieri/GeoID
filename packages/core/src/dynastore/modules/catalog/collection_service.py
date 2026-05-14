@@ -620,35 +620,6 @@ class CollectionService:
             metadata_payload = collection_model.model_dump(
                 by_alias=True, exclude_none=True
             )
-            # Denormalise CollectionPrivacyConfig.is_private into the
-            # metadata payload so search-capable drivers (notably the
-            # ES collection driver) can filter on it without joining
-            # back to the configs table. The Pydantic dump above does
-            # not carry it because is_private lives in a separate
-            # PluginConfig (CollectionPrivacy), not on the Collection
-            # model itself.
-            try:
-                from dynastore.modules.catalog.catalog_config import (
-                    CollectionPrivacy,
-                )
-                _privacy_configs = get_protocol(ConfigsProtocol)
-                if _privacy_configs is not None:
-                    _privacy_cfg = await _privacy_configs.get_config(
-                        CollectionPrivacy,
-                        catalog_id=catalog_id,
-                        collection_id=collection_model.id,
-                        ctx=DriverContext(db_resource=conn),
-                    )
-                    metadata_payload["is_private"] = bool(
-                        getattr(_privacy_cfg, "is_private", False),
-                    )
-            except Exception as _e:
-                logger.debug(
-                    "Could not resolve CollectionPrivacy for %s/%s "
-                    "during metadata write (is_private will be missing "
-                    "from search index): %s",
-                    catalog_id, collection_model.id, _e,
-                )
             await _route_upsert_metadata(
                 catalog_id, collection_model.id, metadata_payload,
                 db_resource=conn,
@@ -857,29 +828,6 @@ class CollectionService:
             metadata_payload = merged_model.model_dump(
                 by_alias=True, exclude_none=True
             )
-            # Denormalise CollectionPrivacy.is_private — see create_collection
-            # for rationale (search-capable drivers filter on this).
-            try:
-                from dynastore.modules.catalog.catalog_config import (
-                    CollectionPrivacy,
-                )
-                _privacy_configs = get_protocol(ConfigsProtocol)
-                if _privacy_configs is not None:
-                    _privacy_cfg = await _privacy_configs.get_config(
-                        CollectionPrivacy,
-                        catalog_id=catalog_id,
-                        collection_id=collection_id,
-                        ctx=DriverContext(db_resource=conn),
-                    )
-                    metadata_payload["is_private"] = bool(
-                        getattr(_privacy_cfg, "is_private", False),
-                    )
-            except Exception as _e:
-                logger.debug(
-                    "Could not resolve CollectionPrivacy for %s/%s "
-                    "during metadata write: %s",
-                    catalog_id, collection_id, _e,
-                )
             await _route_upsert_metadata(
                 catalog_id, collection_id, metadata_payload,
                 db_resource=conn,
@@ -1090,62 +1038,4 @@ class CollectionService:
                 catalog_id, collection_id
             )
             return True
-
-
-async def _sync_collection_privacy_to_es(
-    config: Any,
-    catalog_id: Optional[str],
-    collection_id: Optional[str],
-    db_resource: Optional[Any],
-) -> None:
-    """Apply handler for ``CollectionPrivacy`` — re-upsert the collection's
-    metadata so the denormalised ``is_private`` in ``dynastore-collections``
-    stays in sync with the privacy plugin.
-
-    Without this, a direct PATCH on ``CollectionPrivacy`` updates the configs
-    table but leaves the search index lagging until the next collection-model
-    write touches the doc. Operators expect privacy edits to take effect at
-    search time immediately after the PATCH commits.
-
-    No-op at platform/catalog scope — privacy is a per-collection concept.
-    Best-effort: any error is logged and swallowed (the privacy write itself
-    has already committed by the time apply handlers run).
-    """
-    from dynastore.modules.catalog.catalog_config import CollectionPrivacy
-    if not isinstance(config, CollectionPrivacy):
-        return
-    if not catalog_id or not collection_id:
-        return
-
-    try:
-        catalogs = get_protocol(CatalogsProtocol)
-        if catalogs is None:
-            return
-        from dynastore.models.driver_context import DriverContext
-        collection_model = await catalogs.get_collection(
-            catalog_id,
-            collection_id,
-            ctx=DriverContext(db_resource=db_resource) if db_resource else None,
-        )
-        if collection_model is None:
-            return
-        metadata_payload = collection_model.model_dump(
-            by_alias=True, exclude_none=True,
-        )
-        metadata_payload["is_private"] = bool(
-            getattr(config, "is_private", False),
-        )
-        from dynastore.modules.catalog.collection_router import (
-            upsert_collection_metadata as _route_upsert_metadata,
-        )
-        await _route_upsert_metadata(
-            catalog_id, collection_id, metadata_payload,
-            db_resource=db_resource,
-        )
-    except Exception as e:
-        logger.warning(
-            "CollectionPrivacy → ES sync failed for %s/%s: %s "
-            "(search index will lag until next metadata write).",
-            catalog_id, collection_id, e,
-        )
 

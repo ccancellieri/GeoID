@@ -13,8 +13,6 @@ Two layers under test:
    ``_ensure_defaults`` instead of returning the base ``SidecarConfig``.
 """
 
-import pytest
-
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarConfig,
     SidecarConfigRegistry,
@@ -34,10 +32,19 @@ class TestEagerImportRegistersStacMetadata:
 
 
 class TestBackstopRecovers:
-    @pytest.mark.xfail(reason="#514 — SidecarConfigRegistry.__dict__ is now a mappingproxy; monkeypatch.setitem fails. Fixture needs rewriting.", strict=False)
     def test_resolve_self_heals_when_registry_empty(self, monkeypatch):
-        monkeypatch.setitem(
-            SidecarConfigRegistry.__dict__, "_defaults_loaded", False
+        # Simulate a cold worker where stac hasn't been imported. Drop
+        # every cached stac extension module so `_ensure_defaults`'s
+        # internal `from dynastore.extensions.stac import stac_metadata_config`
+        # re-executes the module-level `SidecarConfigRegistry.register(...)`
+        # side effect against the empty registry below.
+        import sys
+        for mod in list(sys.modules):
+            if mod.startswith("dynastore.extensions.stac"):
+                monkeypatch.delitem(sys.modules, mod, raising=False)
+
+        monkeypatch.setattr(
+            SidecarConfigRegistry, "_defaults_loaded", False, raising=False
         )
         monkeypatch.setattr(
             SidecarConfigRegistry, "_registry", {}, raising=False

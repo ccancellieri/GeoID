@@ -2,14 +2,16 @@
 """
 test_es_audit_fixes.py — Customer verification script for PR #408 ES audit fixes.
 
-Covers 7 regression tests (one per commit):
+Covers 5 regression tests (one per commit):
   T1  Items SEARCH routing  — ES returns items that PG misses
   T2  HATEOAS link methods  — plugin-config endpoints advertise PUT, not PATCH
   T3  Registry re-key       — GET /configs/.../plugins/items_postgresql_driver returns 200
   T4  STAC error surfacing  — malformed item POST returns a real error code (not 500)
   T5  Alias maintenance     — fresh catalog's items index joins dynastore-items alias
-  T6  is_private mapping    — collections ES doc contains is_private boolean field
-  T7  Privacy apply handler — toggling is_private on collection config syncs to ES
+
+(T6/T7 from PR #408 covered the is_private denormalisation onto the ES
+collection doc — retired by #698 in favour of physical routing to the
+private items driver + PermissionProtocol enforcement.)
 
 Usage
 -----
@@ -21,7 +23,7 @@ Usage
       [--catalog-id  my-test-<timestamp>]  # auto-generated if omitted
       [--keep]  # skip cleanup on exit (default: delete test catalog)
 
-T5-T7 (ES-direct checks) are skipped automatically when --es-url/--es-key are absent.
+T5 (ES-direct check) is skipped automatically when --es-url/--es-key are absent.
 
 Requirements: pip install requests
 """
@@ -331,138 +333,6 @@ class Runner:
                        f"(direct index has {direct_count} — alias not updated)")
 
     # ==================================================================
-    # T6 — is_private field in collection mapping  (commit 93923dc)
-    # ==================================================================
-
-    def t6_is_private_mapping(self) -> None:
-        print("\n[T6] is_private field in dynastore-collections ES mapping")
-        if not (self.es_url and self.es_key):
-            self._skip("T6 is_private mapping", "no --es-url/--es-key provided")
-            return
-
-        # Use a terms aggregation — works with read privilege only.
-        # If the field is mapped as boolean, the agg returns true/false/missing buckets.
-        # Before the fix all 15 docs return MISSING; after the fix our new collection
-        # returns a boolean value.
-        r = requests.post(
-            f"{self.es_url}/dynastore-collections/_search",
-            headers=self._es_headers(),
-            json={
-                "size": 0,
-                "aggs": {"priv": {"terms": {"field": "is_private", "missing": "__MISSING__"}}},
-            },
-            timeout=30,
-        )
-        if not r.ok:
-            self._fail("T6 is_private mapping", f"ES search failed: {r.status_code}")
-            return
-        buckets = r.json().get("aggregations", {}).get("priv", {}).get("buckets", [])
-        bucket_keys = [b["key"] for b in buckets]
-        # Any bucket that is not "__MISSING__" means real values are present
-        real_values = [k for k in bucket_keys if k != "__MISSING__"]
-
-        if real_values:
-            self._ok("T6 is_private mapping",
-                     f"field has indexed values: {real_values} "
-                     f"(buckets: {buckets})")
-        else:
-            self._fail("T6 is_private mapping",
-                       f"all docs have is_private=MISSING — field not indexed. "
-                       f"Buckets: {buckets}")
-
-        # Also check our specific new collection doc
-        doc_r = requests.post(
-            f"{self.es_url}/dynastore-collections/_search",
-            headers=self._es_headers(),
-            json={
-                "query": {"term": {"collection_id": self.coll_id}},
-                "_source": ["collection_id", "is_private"],
-                "size": 1,
-            },
-            timeout=30,
-        ).json()
-        hits = doc_r.get("hits", {}).get("hits", [])
-        if hits:
-            src = hits[0].get("_source", {})
-            if "is_private" in src:
-                self._ok("T6 is_private value (new collection)",
-                         f"doc has is_private={src['is_private']}")
-            else:
-                self._fail("T6 is_private value (new collection)",
-                           f"doc missing is_private. Source: {src}")
-        else:
-            self._skip("T6 is_private value (new collection)",
-                       "collection not yet indexed in ES (may need time)")
-
-    # ==================================================================
-    # T7 — Privacy apply handler  (commit 4c2b147)  — ES-direct
-    # ==================================================================
-
-    def t7_privacy_apply_handler(self) -> None:
-        print("\n[T7] CollectionPrivacy apply-handler syncs is_private to ES")
-        if not (self.es_url and self.es_key):
-            self._skip("T7 privacy handler", "no --es-url/--es-key provided")
-            return
-
-        # Read current privacy config
-        r = self._get(
-            f"/configs/catalogs/{self.catalog_id}/collections/{self.coll_id}/plugins/collection_privacy"
-        )
-        if r.status_code == 404:
-            # create it
-            r = self._put(
-                f"/configs/catalogs/{self.catalog_id}/collections/{self.coll_id}/plugins/collection_privacy",
-                {"is_private": True},
-            )
-            if not r.ok:
-                self._fail("T7 privacy handler",
-                           f"could not PUT collection_privacy: {r.status_code} {r.text[:150]}")
-                return
-        elif r.ok:
-            # toggle
-            current = r.json().get("is_private", False)
-            r2 = self._put(
-                f"/configs/catalogs/{self.catalog_id}/collections/{self.coll_id}/plugins/collection_privacy",
-                {"is_private": not current},
-            )
-            if not r2.ok:
-                self._fail("T7 privacy handler",
-                           f"PUT failed: {r2.status_code} {r2.text[:150]}")
-                return
-        else:
-            self._fail("T7 privacy handler", f"config GET failed: {r.status_code}")
-            return
-
-        print("  waiting 4 s for apply handler …")
-        time.sleep(4)
-
-        # Now check ES
-        search_body = {
-            "query": {"term": {"collection_id": self.coll_id}},
-            "_source": ["collection_id", "is_private"],
-            "size": 1,
-        }
-        doc = requests.post(
-            f"{self.es_url}/dynastore-collections/_search",
-            headers=self._es_headers(),
-            json=search_body,
-            timeout=30,
-        ).json()
-        hits = doc.get("hits", {}).get("hits", [])
-        if hits:
-            src = hits[0].get("_source", {})
-            es_val = src.get("is_private")
-            if es_val is not None:
-                self._ok("T7 privacy handler",
-                         f"ES doc is_private={es_val} (apply handler fired)")
-            else:
-                self._fail("T7 privacy handler",
-                           "is_private still missing from ES doc after PUT")
-        else:
-            self._fail("T7 privacy handler",
-                       "collection not found in ES after apply handler")
-
-    # ==================================================================
     # Teardown
     # ==================================================================
 
@@ -496,8 +366,6 @@ class Runner:
         self.t3_registry_rekey()
         self.t4_stac_error_surfacing()
         self.t5_alias_maintenance()
-        self.t6_is_private_mapping()
-        self.t7_privacy_apply_handler()
 
         self.teardown()
 
@@ -537,12 +405,12 @@ def main() -> None:
     p.add_argument(
         "--es-url",
         dest="es_url",
-        help="Elasticsearch cluster URL (optional — enables T5/T6/T7)",
+        help="Elasticsearch cluster URL (optional — enables T5)",
     )
     p.add_argument(
         "--es-key",
         dest="es_key",
-        help="Elasticsearch ApiKey (base64, optional — enables T5/T6/T7)",
+        help="Elasticsearch ApiKey (base64, optional — enables T5)",
     )
     p.add_argument(
         "--catalog-id",

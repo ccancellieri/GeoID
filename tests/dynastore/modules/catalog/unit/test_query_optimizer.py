@@ -102,10 +102,23 @@ def test_optimizer_initialization(mock_col_config, mock_registry):
     assert "external_id" in optimizer.field_index
 
 
-@pytest.mark.xfail(reason="#514 — fixture passes a MagicMock that doesn't have `serves_consumers` attr. Needs spec= update.", strict=False)
+class _SidecarLike(MagicMock):
+    """MagicMock subclass that carries a class-level ``serves_consumers``.
+
+    ``QueryOptimizer.determine_required_sidecars`` resolves
+    ``type(sc).serves_consumers()`` to decide whether a sidecar serves the
+    active consumer; bare ``MagicMock`` instances have no such classmethod
+    on the type, so the lookup raises. Returning ``None`` here means
+    "consumer-agnostic" — matches the production default.
+    """
+    @classmethod
+    def serves_consumers(cls):
+        return None
+
+
 def test_determine_required_sidecars(mock_col_config, mock_registry):
     # Setup mocks
-    mock_geom = MagicMock()
+    mock_geom = _SidecarLike()
     mock_geom.config.sidecar_id = "geometries"
     mock_geom.sidecar_id = "geometries"
     mock_geom.get_queryable_fields.return_value = {
@@ -118,7 +131,7 @@ def test_determine_required_sidecars(mock_col_config, mock_registry):
     }
     mock_geom.get_main_geometry_field.return_value = "geom"
 
-    mock_attr = MagicMock()
+    mock_attr = _SidecarLike()
     mock_attr.config.sidecar_id = "attributes"
     mock_attr.sidecar_id = "attributes"
     mock_attr.get_queryable_fields.return_value = {
