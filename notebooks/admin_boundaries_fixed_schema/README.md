@@ -83,11 +83,15 @@ a `**Gap A/B/C**` markdown cell at the relevant step:
   depend on this bootstrap path.
 - **Gap B** — OTF as **WRITE-primary** is not live-tested in review env;
   the notebook keeps PG as primary and notes how to swap.
-- **Gap C** — GCS tile-cache config + observability lives in
-  `fao-maps-titiler` and is not surfaced through geoid's config API.
+- **Gap C** — L2 bucket-cache config (`TilesCachingConfig`: `key_prefix` +
+  `ttl_seconds`) and per-response observability (`X-Tile-Cache`,
+  `X-Tile-Source` headers) **ship on geoid**. Per-catalog bucket name is
+  discoverable via `GET /admin/catalogs/{cat}`. Residual scope on #475:
+  fao-maps-titiler upstream wiring (F1), Kibana cache-hit-ratio panel
+  (F2), review-env smoke (F6).
 
 Tracker issues: Gap A → [#671](https://github.com/un-fao/GeoID/issues/671)
 (TestClient integration for bootstrap-schema composition), Gap B →
 [#474](https://github.com/un-fao/GeoID/issues/474) (OTF write-primary live
 test), Gap C → [#475](https://github.com/un-fao/GeoID/issues/475)
-(TilesCachingConfig surface + observability).
+(residual: titiler / Kibana panel / review-env smoke).
