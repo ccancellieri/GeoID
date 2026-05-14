@@ -124,15 +124,23 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     # Provision default global policies
                     await self._policy_service.provision_default_policies(conn=conn)
 
-                    # Self-heal guard: if anonymous role is still absent after
-                    # normal provision (e.g. iam_storage was None on first pass,
-                    # or a DB reset happened before a previous restart), force a
-                    # full re-seed so the service is never left in a locked-out state.
-                    anon = await self.storage.get_role("anonymous", schema="iam", conn=conn)
-                    if anon is None:
+                    # Self-heal guard: if the platform-tier sysadmin role
+                    # is still absent after normal provision (e.g. iam_storage
+                    # was None on first pass, or a DB reset happened before a
+                    # previous restart), force a full re-seed so the service
+                    # is never left in a locked-out state. Per geoid#643 the
+                    # platform tier collapses to {sysadmin} — catalog-tier
+                    # roles (admin/editor/user/unauthenticated) are seeded
+                    # by the per-catalog lifecycle hook, not here.
+                    sysadmin_name = role_config.sysadmin_role_name
+                    sysadmin = await self.storage.get_role(
+                        sysadmin_name, schema="iam", conn=conn
+                    )
+                    if sysadmin is None:
                         logger.critical(
-                            "IamModule: 'anonymous' role missing after provision — "
-                            "DB may have been reset. Forcing full re-seed."
+                            "IamModule: %r role missing after provision — "
+                            "DB may have been reset. Forcing full re-seed.",
+                            sysadmin_name,
                         )
                         await self._policy_service.provision_default_policies(
                             conn=conn, force=True

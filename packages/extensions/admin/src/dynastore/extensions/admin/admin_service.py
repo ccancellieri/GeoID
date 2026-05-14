@@ -428,6 +428,13 @@ class AdminService(ExtensionProtocol):
     async def list_roles(catalog_id: Optional[str] = Query(None)):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
         roles = await mgr.list_roles(catalog_id=catalog_id)
+        # Per geoid#643: when scoped to a catalog, hide platform-tier
+        # roles (e.g. sysadmin) — they're not grantable per-catalog and
+        # surfacing them in the admin grant UI is misleading.
+        if catalog_id is not None:
+            roles_cfg = await mgr._get_roles_config()
+            platform_only = roles_cfg.platform_role_names
+            roles = [r for r in roles if r.name not in platform_only]
         return [
             RoleResponse(
                 name=r.name,

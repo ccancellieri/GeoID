@@ -78,7 +78,7 @@ GeoID maps Keycloak realm roles to entries in the `IamRolesConfig` PluginConfig 
 
 > The names above are the convention shipped in the local realm export. They are case-sensitive. GeoID's middleware (`extensions/iam/middleware.py:169`) reads the active `IamRolesConfig.sysadmin_role_name` (default `"sysadmin"`) and checks for that value in the principal's roles — keep the literal string aligned if you rename it via PATCH.
 
-Anonymous (unauthenticated) requests are mapped to the `IamRolesConfig.anonymous_role_name` slot (default `"anonymous"`) automatically — do not create an explicit `anonymous` realm role in Keycloak.
+Anonymous (unauthenticated) requests are mapped to the `IamRolesConfig.anonymous_role_name` slot (default `"unauthenticated"` post-geoid#643) automatically — do not create an explicit `unauthenticated` realm role in Keycloak.
 
 > Operators can add, rename, or drop roles at runtime by PATCH-ing `/api/catalog/v2/configs` at the `platform.iam.roles` address. Renames take effect on the next request without redeploying — but coordinate with the Keycloak realm so the realm-role names still match the PluginConfig.
 

@@ -68,10 +68,11 @@ class PolicyService:
         self._engine = db.engine if db else None
         self.storage = storage or PostgresPolicyStorage(app_state=app_state)
         self.iam_storage = iam_storage
-        # Role names + hierarchy + named slots are sourced from the
+        # Role names + tier split + named slots are sourced from the
         # ``IamRolesConfig`` PluginConfig (``("platform","iam","roles")``).
-        # Defaults seed sysadmin/admin/editor/user/anonymous; operators
-        # rename, add, or drop roles via PATCH at runtime — no subclassing.
+        # Defaults seed platform-tier [sysadmin] and catalog-tier
+        # [admin, editor, user, unauthenticated]. Operators rename, add,
+        # or drop roles via PATCH at runtime — no subclassing.
         self._role_config = role_config or IamRolesConfig()
 
     async def _resolve_schema(
@@ -336,22 +337,46 @@ class PolicyService:
             ),
         ]
 
-    def _get_default_roles(self) -> List[Role]:
-        """Return the platform-tier role seed list from ``IamRolesConfig``.
+    def _get_default_roles(self, catalog_id: Optional[str] = None) -> List[Role]:
+        """Return the role seed list for the requested tier.
+
+        ``catalog_id is None`` returns platform-tier seeds (seeded once
+        in the global ``iam`` schema); any catalog id returns
+        catalog-tier seeds (seeded per-catalog in each tenant schema).
 
         Operators add, rename, or drop a role by editing
-        ``IamRolesConfig.roles`` via ``PATCH /api/catalog/v2/configs`` —
-        no code change.
+        ``IamRolesConfig.platform_roles`` / ``catalog_roles`` via
+        ``PATCH /api/catalog/v2/configs`` — no code change.
         """
+        seeds = (
+            self._role_config.platform_roles
+            if catalog_id is None
+            else self._role_config.catalog_roles
+        )
         return [
             Role(
                 name=seed.name,
                 description=seed.description,
                 policies=list(seed.policies),
             )
-            for seed in self._role_config.roles
-            if seed.is_platform_tier
+            for seed in seeds
         ]
+
+    def _get_default_role_hierarchy(
+        self, catalog_id: Optional[str] = None
+    ) -> List[Tuple[str, str]]:
+        """Return ``(parent, child)`` edges derived from ``RoleSeed.parent``
+        for the requested tier.
+
+        Parent inherits child's policies (see ``get_role_hierarchy`` in
+        ``postgres_iam_storage.py``).
+        """
+        seeds = (
+            self._role_config.platform_roles
+            if catalog_id is None
+            else self._role_config.catalog_roles
+        )
+        return [(s.parent, s.name) for s in seeds if s.parent]
 
     async def provision_default_policies(
         self,
@@ -397,9 +422,11 @@ class PolicyService:
                     if not existing:
                         await self.storage.update_policy(policy_def, schema=schema, conn=db)
 
-            # Provision default roles
+            # Provision default roles for the current tier.
+            # ``catalog_id is None`` → platform tier (global ``iam`` schema);
+            # any catalog_id → catalog tier (per-tenant schema).
             if self.iam_storage:
-                for role_def in self._get_default_roles():
+                for role_def in self._get_default_roles(catalog_id):
                     existing = await self.iam_storage.get_role(
                         role_def.name, schema=schema, conn=db
                     )
@@ -413,22 +440,20 @@ class PolicyService:
                                 role_def, schema=schema, conn=db
                             )
 
-                # Seed role hierarchy from IamRolesConfig.hierarchy. Default
-                # edges form: sysadmin > admin > editor > user > anonymous.
-                # Direction: parent inherits child's policies (see
-                # `get_role_hierarchy` in postgres_iam_storage.py — it returns
-                # `role_names + children`). With this seed an authenticated
-                # ``user`` automatically inherits every ``*_public_access``
-                # policy bound to ``anonymous``, which is the natural
-                # "everything anonymous can do, authenticated users can do
-                # too" semantics. Without it, registering with Keycloak
-                # silently *narrows* the user's access vs. browsing
-                # unauthenticated.
+                # Seed role hierarchy edges derived from RoleSeed.parent
+                # for the current tier. Catalog-tier default chain:
+                # admin > editor > user > unauthenticated. Direction:
+                # parent inherits child's policies (see `get_role_hierarchy`
+                # in postgres_iam_storage.py — it returns `role_names + children`).
+                # With this seed an authenticated ``user`` automatically
+                # inherits every ``*_public_access`` policy bound to
+                # ``unauthenticated``, so registering with Keycloak does
+                # NOT silently narrow access vs. browsing unauthenticated.
                 #
                 # Idempotent: ON CONFLICT DO NOTHING in `add_role_hierarchy`,
                 # so reprovision on every cold start is safe and self-heals
                 # databases that pre-date this seed.
-                for parent, child in self._role_config.hierarchy:
+                for parent, child in self._get_default_role_hierarchy(catalog_id):
                     try:
                         await self.iam_storage.add_role_hierarchy(
                             parent_role=parent, child_role=child,
@@ -443,10 +468,11 @@ class PolicyService:
                         # observable — silent failures here put the platform
                         # into a "no inheritance" state where authenticated
                         # users see narrower access than anonymous browsers
-                        # (the default seed wires sysadmin → admin → editor → user → anonymous,
-                        # so users *inherit* every public policy bound to
-                        # anonymous; without the chain, registering for an
-                        # account silently *removes* access).
+                        # (the catalog-tier default seed wires admin → editor
+                        # → user → unauthenticated, so users *inherit* every
+                        # public policy bound to unauthenticated; without
+                        # the chain, registering for an account silently
+                        # *removes* access).
                         logger.warning(
                             "provision_default_policies: failed to seed role "
                             "hierarchy edge %r → %r in schema %r: %s",

@@ -362,44 +362,12 @@ INSERT_ROLE_HIERARCHY = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
-# Tenant default role seeds. Inserted with ON CONFLICT DO NOTHING so a
-# tenant admin can rename/restructure these without the next provisioning
-# pass clobbering their changes (D3 — tenants own their role definitions).
-#
-# D5 chain of authority: admin → editor (admin inherits editor's policies
-# via role_hierarchy). `allUsers` and `unauthenticated` are read-only
-# floors — no inheritance, no policies seeded here. Per-permission policy
-# wiring lives on `iam.policies` and ships in PR-2 with the per-tenant
-# policy registry; PR-1 keeps the seed roles policy-free so the unified
-# grants table is the only thing the resolver evaluates.
-SEED_TENANT_DEFAULT_ROLES_SQL = """
-    INSERT INTO {schema}.roles
-        (id, name, description, level, parent_roles, policies, metadata)
-    VALUES
-        ('admin', 'admin',
-         'Tenant administrator — manages roles, grants, and members.',
-         100, '[]'::jsonb, '[]'::jsonb,
-         '{"seed": true, "scope": "catalog"}'::jsonb),
-        ('editor', 'editor',
-         'Catalog editor — creates and updates content.',
-         50,  '[]'::jsonb, '[]'::jsonb,
-         '{"seed": true, "scope": "catalog"}'::jsonb),
-        ('allUsers', 'allUsers',
-         'Read-only floor for any authenticated user.',
-         10,  '[]'::jsonb, '[]'::jsonb,
-         '{"seed": true, "scope": "catalog"}'::jsonb),
-        ('unauthenticated', 'unauthenticated',
-         'Read-only floor for anonymous (unauthenticated) requests.',
-         0,   '[]'::jsonb, '[]'::jsonb,
-         '{"seed": true, "scope": "catalog"}'::jsonb)
-    ON CONFLICT (id) DO NOTHING;
-"""
-
-SEED_TENANT_ROLE_HIERARCHY_SQL = """
-    INSERT INTO {schema}.role_hierarchy (parent_role, child_role)
-    VALUES ('admin', 'editor')
-    ON CONFLICT DO NOTHING;
-"""
+# Note: the historical ``SEED_TENANT_DEFAULT_ROLES_SQL`` and
+# ``SEED_TENANT_ROLE_HIERARCHY_SQL`` constants were retired in geoid#643.
+# Catalog-tier role seeding is now config-driven via
+# ``IamRolesConfig.catalog_roles`` and ``RoleSeed.parent``, executed by
+# ``PolicyService.provision_default_policies(catalog_id, ...)`` from the
+# IamModule's ``initialize_iam_tenant`` lifecycle hook.
 
 DELETE_ROLE_HIERARCHY = DQLQuery(
     "DELETE FROM {schema}.role_hierarchy WHERE parent_role = :parent_role AND child_role = :child_role;",
