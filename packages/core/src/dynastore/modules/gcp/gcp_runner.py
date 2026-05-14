@@ -43,12 +43,15 @@ logger = logging.getLogger(__name__)
 # job runs, and the pg_cron reaper resets the row if the lease lapses.
 _DEFAULT_TASK_TIMEOUT_SECONDS = int(os.getenv("TASK_TIMEOUT", "3600"))
 
-# Short lease used for the REST-path INSERT-as-claimed flow.  Long enough for
-# the Cloud Run RunJob API call + container cold start + main_task.py taking
-# ownership and extending the lease via its own heartbeat.  Short enough that
-# if the spawner pod dies between INSERT and RunJob the reaper releases the
-# row promptly without a 1-hour wait.
-_SPAWN_LEASE_SECONDS = int(os.getenv("GCP_RUNNER_SPAWN_LEASE", "60"))
+# Lease used for the REST-path INSERT-as-claimed flow.  Must outlast the whole
+# gap from RunJob trigger until main_task.py reaches its claim step and its
+# heartbeat starts extending the lease — Cloud Run RunJob API call + container
+# cold start + module init.  Observed cold-start on the review env is ~1m45s;
+# the old 60s default lapsed mid-boot, so the pg_cron reaper reclaimed the row
+# and a second Cloud Run execution was spawned (#726).  300s clears observed
+# cold-start with margin while still releasing a genuinely dead spawner well
+# inside the reaper cycle.  Env-overridable for per-environment tuning.
+_SPAWN_LEASE_SECONDS = int(os.getenv("GCP_RUNNER_SPAWN_LEASE", "300"))
 
 # Bounded retry around RunJob — handles transient Cloud Run control-plane
 # blips without surfacing them as task failures.  Exhausted retries fall back

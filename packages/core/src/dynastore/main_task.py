@@ -128,7 +128,7 @@ async def main(task_name: str, payload: dict, schema: str):
     from dynastore.modules import lifespan as modules_lifespan
     from dynastore import tasks
     from dynastore.tasks.bootstrap import bootstrap_task_env
-    from dynastore.modules.tasks.models import TaskUpdate, TaskStatusEnum, PermanentTaskFailure
+    from dynastore.modules.tasks.models import PermanentTaskFailure
     from datetime import datetime, timezone
 
     # Create a simple app_state object. The lifespan managers will populate it.
@@ -177,19 +177,35 @@ async def main(task_name: str, payload: dict, schema: str):
 
                 hb_task = None
                 if task_id_uuid is not None and engine is not None and tasks_mgr is not None:
-                    # Take ownership: extend locked_until and stamp this execution as owner.
+                    # Take ownership via an atomic, status-guarded claim. The
+                    # owner id MUST share the spawner's ``gcp_cloud_run_``
+                    # family (GcpJobRunner stamps it and passes the same id
+                    # through ``DYNASTORE_EXECUTION_ID``) so the happy-path
+                    # "ACTIVE & mine" branch of claim_for_execution matches
+                    # instead of reading as a foreign owner.
+                    from dynastore.modules.tasks.tasks_module import claim_for_execution
                     execution_id = os.getenv("DYNASTORE_EXECUTION_ID") or task_id_str
-                    new_locked_until = datetime.now(timezone.utc) + _VISIBILITY_TIMEOUT
-                    await tasks_mgr.update_task(
+                    owner_id = f"gcp_cloud_run_{execution_id}"
+                    claimed_row = await claim_for_execution(
                         engine,
                         task_id_uuid,
-                        TaskUpdate(
-                            status=TaskStatusEnum.ACTIVE,
-                            owner_id=f"cloud-run-job-{execution_id}",
-                            locked_until=new_locked_until,
-                        ),
-                        schema=schema,
+                        schema,
+                        owner_id,
+                        _VISIBILITY_TIMEOUT,
                     )
+                    if claimed_row is None:
+                        # Lost claim: the row is already terminal, or ACTIVE
+                        # with a live lease held by another execution. This is
+                        # the #726 guard — a Cloud Run Job spawned by a reaper
+                        # re-enqueue (lease lapsed mid-cold-start) must NOT
+                        # re-run a task another execution already finished or
+                        # is finishing. Exit cleanly; the lifespans unwind.
+                        logger.warning(
+                            f"--- [main_task.py] Task {task_id_uuid} not claimable "
+                            f"(already terminal or owned by a live execution) — "
+                            f"skipping execution, no double-run. ---"
+                        )
+                        return
                     interval = _VISIBILITY_TIMEOUT.total_seconds() / 3
                     hb_task = asyncio.create_task(
                         _heartbeat_loop(engine, task_id_uuid, interval)

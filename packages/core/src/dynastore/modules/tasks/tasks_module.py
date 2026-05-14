@@ -1681,6 +1681,66 @@ async def claim_by_id(
         )
 
 
+async def claim_for_execution(
+    engine: DbResource,
+    task_id: uuid.UUID,
+    schema: str,
+    owner_id: str,
+    visibility_timeout: timedelta,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim a task for in-job execution (``main_task.py``).
+
+    This is the consuming-side counterpart to ``claim_by_id`` /
+    ``claim_for_dispatch``: the Cloud Run Job container calls it once it is up,
+    to take ownership of the row the spawner created for it. Unlike the legacy
+    unconditional ``update_task(status=ACTIVE)`` it replaced, the claim is
+    status-guarded — it matches the row **only if** it is safe to (re-)execute:
+
+    * refuses any terminal row (``COMPLETED`` / ``FAILED`` / ``DISMISSED`` /
+      ``DEAD_LETTER``) — re-running a finished task is the #726 regression
+      (the reaper reclaimed a still-cold-starting row, a second Cloud Run
+      execution spawned, and it re-ran an already-COMPLETED task);
+    * refuses an ``ACTIVE`` row whose lease is still live and whose ``owner_id``
+      belongs to a *different* execution — that is a concurrent duplicate.
+
+    The happy path still matches: a freshly born-claimed row is ``ACTIVE`` under
+    *this* execution's ``owner_id`` (the spawner stamps ``gcp_cloud_run_{id}``
+    and passes the same id via ``DYNASTORE_EXECUTION_ID``), and a row the reaper
+    reset is back to ``PENDING``.
+
+    Returns the claimed row dict, or ``None`` when the task must not run — the
+    caller (``main_task.py``) then exits cleanly without executing it.
+    """
+    task_schema = get_task_schema()
+    locked_until = datetime.now(timezone.utc) + visibility_timeout
+    sql = f"""
+        UPDATE {task_schema}.tasks
+        SET status = 'ACTIVE',
+            owner_id = :owner_id,
+            locked_until = :locked_until,
+            started_at = COALESCE(started_at, NOW()),
+            last_heartbeat_at = NOW()
+        WHERE task_id = :task_id
+          AND schema_name = :schema_name
+          AND status NOT IN ('COMPLETED', 'FAILED', 'DISMISSED', 'DEAD_LETTER')
+          AND NOT (
+                status = 'ACTIVE'
+                AND locked_until IS NOT NULL
+                AND locked_until > NOW()
+                AND owner_id IS DISTINCT FROM :owner_id
+          )
+        RETURNING task_id, status, owner_id;
+    """
+    async with managed_transaction(engine) as conn:
+        return await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
+            conn,
+            task_id=task_id,
+            schema_name=schema,
+            owner_id=owner_id,
+            locked_until=locked_until,
+        )
+
+
 async def claim_for_dispatch(
     engine: DbResource,
     task_id: uuid.UUID,
