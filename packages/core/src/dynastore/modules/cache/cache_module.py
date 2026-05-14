@@ -298,10 +298,24 @@ class CacheModule(ModuleProtocol):
                 cache_cfg.probe_timeout_seconds,
             )
             try:
+                # Pull the connection-hardening defaults from ValkeyEngineConfig
+                # so the bootstrap-fallback path is NOT a hole that re-opens the
+                # un-hardened-socket regression that #720 / #724 closed for the
+                # engine-driven mode (idle Cloud NAT drops + cold cluster-topology
+                # fetch exceeding valkey-py's 5s hard default).
+                from dynastore.modules.db_config.engine_config import (
+                    ValkeyEngineConfig,
+                )
                 from dynastore.tools.cache_valkey import ValkeyCacheBackend
 
+                _engine_defaults = ValkeyEngineConfig()
                 backend = ValkeyCacheBackend(
                     url=valkey_url,
+                    socket_connect_timeout=_engine_defaults.socket_connect_timeout_seconds,
+                    socket_timeout=_engine_defaults.socket_timeout_seconds,
+                    tcp_keepalive_idle=_engine_defaults.tcp_keepalive_idle_seconds,
+                    tcp_keepalive_interval=_engine_defaults.tcp_keepalive_interval_seconds,
+                    tcp_keepalive_count=_engine_defaults.tcp_keepalive_count,
                     circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
                 )
             except Exception as exc:

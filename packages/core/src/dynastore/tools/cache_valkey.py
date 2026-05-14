@@ -19,10 +19,19 @@ Implements ``CacheBackend`` + ``LockableCacheBackend`` protocols.
 Serialization uses msgpack with ExtType handlers for Pydantic models,
 datetime, Enum, and UUID.
 
-Registered by ``CacheModule`` when ``VALKEY_URL`` is set.
-Falls back to ``LocalAsyncCacheBackend`` (priority=1000) when unavailable.
+Registered by ``CacheModule``. Falls back to ``LocalAsyncCacheBackend``
+(priority=1000) when Valkey is unavailable.
 
-Env vars:
+Configuration SSOT is ``ValkeyEngineConfig`` (in
+``modules/db_config/engine_config.py``), exposed via the configs API
+under ``platform/module_cache`` and applied live without restart —
+URL, discovery_host/port, cluster_mode, require_full_coverage,
+dynamic_startup_nodes, TLS, IAM, socket_timeout/connect_timeout,
+TCP keepalives.
+
+Env-var bootstrap fallback (used only when the engine cache isn't
+available, e.g. a minimal worker SCOPE that omits ``DBConfigModule``):
+
   VALKEY_URL           — connection URL (e.g. ``valkey://10.0.0.1:6379``)
   VALKEY_TLS           — ``true`` to wrap the connection in TLS (independent
                          of URL scheme). Required for GCP Memorystore IAM mode.
@@ -34,7 +43,10 @@ Env vars:
                          (provided by the ``module_gcp`` extra).
   VALKEY_CLUSTER       — ``true`` for GCP Memorystore for Valkey CLUSTER
                          instances. Uses ``ValkeyCluster`` (handles MOVED/ASK
-                         redirects, per-node pools).
+                         redirects, per-node pools). For Memorystore CLUSTER
+                         the discovery-only pattern (host+port,
+                         ``dynamic_startup_nodes=False``) is the engine-driven
+                         path — there is no env-var alias for it.
 """
 
 from __future__ import annotations
