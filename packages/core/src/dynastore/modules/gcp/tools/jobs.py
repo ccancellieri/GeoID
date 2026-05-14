@@ -16,14 +16,13 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 from dynastore.modules import get_protocol
 from dynastore.models.protocols import JobExecutionProtocol
 from dynastore.tools.cache import cached
 import logging
 
 if TYPE_CHECKING:
-    from google.api_core.operation import Operation
     from dynastore.modules.processes.models import Process
 
 logger = logging.getLogger(__name__)
@@ -53,9 +52,35 @@ def get_job_max_retries(task_type: str) -> Optional[int]:
         return None
 
 
+def extract_execution_name(operation: Any) -> Optional[str]:
+    """Mine the Cloud Run execution resource name from a RunJob ``Operation``.
+
+    ``JobsAsyncClient.run_job`` returns a long-running ``Operation`` whose
+    ``metadata`` is the ``Execution`` proto; ``metadata.name`` is the execution
+    resource path
+    (``projects/{p}/locations/{r}/jobs/{j}/executions/{e}``) — the handle the
+    liveness probe needs. The ``operation.name`` LRO path is checked as a
+    fallback. Returns ``None`` when no handle is shaped as expected; callers
+    treat ``None`` as "no probe ref" and the probe degrades to UNKNOWN.
+    """
+    if operation is None:
+        return None
+    for getter in (
+        lambda op: getattr(getattr(op, "metadata", None), "name", None),
+        lambda op: getattr(getattr(op, "operation", None), "name", None),
+    ):
+        try:
+            name = getter(operation)
+        except Exception:  # noqa: BLE001 — defensive: never raise from a getter
+            name = None
+        if isinstance(name, str) and "/executions/" in name:
+            return name
+    return None
+
+
 async def run_cloud_run_job_async(
     job_name: str, args: Optional[list] = None, env_vars: Optional[dict] = None
-) -> "Operation":
+) -> Optional[str]:
     """
     Triggers a serverless job asynchronously using the JobExecutionProtocol.
 
@@ -65,7 +90,10 @@ async def run_cloud_run_job_async(
         env_vars (dict, optional): A dictionary of environment variables to override in the job's container.
 
     Returns:
-        Operation: The long-running operation object for the job execution.
+        Optional[str]: The Cloud Run execution resource name
+        (``projects/{p}/locations/{r}/jobs/{j}/executions/{e}``), mined from the
+        returned ``Operation`` — the durable handle a liveness probe queries.
+        ``None`` when it cannot be determined (probe then degrades to UNKNOWN).
 
     Raises:
         RuntimeError: If the JobExecutionProtocol implementation is not available.
@@ -74,7 +102,8 @@ async def run_cloud_run_job_async(
     if not job_runner:
         raise RuntimeError("JobExecutionProtocol not available. Unable to trigger job.")
 
-    return await job_runner.run_job(job_name, args, env_vars)
+    operation = await job_runner.run_job(job_name, args, env_vars)
+    return extract_execution_name(operation)
 
 
 async def _fetch_job_config() -> Dict[str, str]:

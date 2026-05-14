@@ -227,7 +227,10 @@ async def main(task_name: str, payload: dict, schema: str):
 
                     # Success: mark COMPLETED in the same row that GcpJobRunner created.
                     if task_id_uuid is not None and engine is not None:
-                        from dynastore.modules.tasks.tasks_module import complete_task
+                        from dynastore.modules.tasks.tasks_module import (
+                            complete_task,
+                            persist_outputs,
+                        )
                         finished_at = datetime.now(timezone.utc)
                         try:
                             jsonable_res = (
@@ -235,6 +238,31 @@ async def main(task_name: str, payload: dict, schema: str):
                             )
                         except Exception:
                             jsonable_res = str(res)
+                        # Persist outputs as a distinct, bounded-retry write
+                        # BEFORE the terminal status flip. Cloud Run reports an
+                        # execution SUCCEEDED only once this container exits 0 —
+                        # i.e. only after both writes — so the liveness
+                        # reconciler (#735), finding a SUCCEEDED execution on a
+                        # still-ACTIVE row, can complete it from the outputs
+                        # already on the row instead of recovering an empty
+                        # result. A lost outputs write would defeat that, so it
+                        # is retried; the status flip stays with complete_task.
+                        for _attempt in range(1, 4):
+                            try:
+                                await persist_outputs(
+                                    engine, task_id_uuid, jsonable_res
+                                )
+                                break
+                            except Exception as _persist_err:
+                                if _attempt == 3:
+                                    logger.error(
+                                        f"--- [main_task.py] Failed to persist "
+                                        f"outputs for task {task_id_uuid} after "
+                                        f"3 attempts: {_persist_err} — proceeding "
+                                        f"to complete_task. ---"
+                                    )
+                                else:
+                                    await asyncio.sleep(0.5 * _attempt)
                         await complete_task(
                             engine, task_id_uuid, finished_at, outputs=jsonable_res
                         )

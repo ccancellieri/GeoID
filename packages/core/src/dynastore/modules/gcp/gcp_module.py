@@ -190,8 +190,13 @@ class GCPModule(
     # :class:`dynastore.tools.async_utils.WaitableSignal`.
     _jobs_client: Optional["run_v2.JobsAsyncClient"] = None
     _run_client: Optional["run_v2.ServicesAsyncClient"] = None
+    _executions_client: Optional["run_v2.ExecutionsAsyncClient"] = None
     _async_clients_loop: Optional[asyncio.AbstractEventLoop] = None
     _bucket_service: Optional[BucketService] = None
+    # Background reconciler that probes lapsed-lease Cloud Run task rows for
+    # real execution liveness (#735). Started in lifespan, gated by
+    # _should_register_gcp_job_runner(); None on hosts that don't run it.
+    _liveness_reconciler: Optional[Any] = None
 
     def __init__(self, app_state: object) -> None:
         logger.info("GCPModule.__init__: START")
@@ -269,12 +274,13 @@ class GCPModule(
                 credentials=self._credentials
             )
 
-            # Async clients are built lazily in get_jobs_client/get_run_client
-            # on the running event loop. Reinitializing sync clients invalidates
-            # any previously-bound async clients so the next accessor rebuilds
-            # them against fresh credentials.
+            # Async clients are built lazily in get_jobs_client/get_run_client/
+            # get_executions_client on the running event loop. Reinitializing
+            # sync clients invalidates any previously-bound async clients so the
+            # next accessor rebuilds them against fresh credentials.
             self._jobs_client = None
             self._run_client = None
+            self._executions_client = None
             self._async_clients_loop = None
 
             # Update BucketService if it exists
@@ -406,9 +412,53 @@ class GCPModule(
             )
             register_bucket_annotation_patcher()
 
+            # --- Liveness reconciler (#735) ---
+            # Replaces the fixed spawn-lease guess: probe lapsed-lease Cloud Run
+            # task rows for real execution liveness before the pg_cron reaper
+            # blindly reclaims them. Gated by _should_register_gcp_job_runner()
+            # — Cloud Run Job containers and opted-out services must NOT run it
+            # (they would compete needlessly and never own a gcp_cloud_run_ row).
+            self._liveness_reconciler = None
+            if _should_register_gcp_job_runner() and self._engine is not None:
+                try:
+                    from dynastore.modules.gcp.liveness_reconciler import (
+                        GcpLivenessReconciler,
+                    )
+                    cfg = self._module_config
+                    self._liveness_reconciler = GcpLivenessReconciler(
+                        engine=self._engine,
+                        interval_seconds=getattr(
+                            cfg, "liveness_reconciler_interval_seconds", 20
+                        ),
+                        extend_visibility_seconds=getattr(
+                            cfg, "liveness_extend_visibility_seconds", 300
+                        ),
+                        unknown_grace_seconds=getattr(
+                            cfg, "liveness_unknown_grace_seconds", 180
+                        ),
+                    )
+                    self._liveness_reconciler.start()
+                    logger.info("GCP Module: liveness reconciler started.")
+                except Exception as e:
+                    logger.error(
+                        "GCP Module: failed to start liveness reconciler "
+                        "(%s). pg_cron reaper remains the backstop.", e,
+                        exc_info=True,
+                    )
+                    self._liveness_reconciler = None
+
             yield
         finally:
             logger.info("GCP Module: Exiting lifespan - closing all clients.")
+            # Stop the liveness reconciler before tearing down clients it uses.
+            if self._liveness_reconciler is not None:
+                try:
+                    await self._liveness_reconciler.stop()
+                except Exception as e:  # noqa: BLE001 — best-effort teardown
+                    logger.warning(
+                        "GCP Module: error stopping liveness reconciler: %s", e
+                    )
+                self._liveness_reconciler = None
             # Unregister BigQuery plugins
             from dynastore.tools.discovery import unregister_plugin
 
@@ -437,6 +487,7 @@ class GCPModule(
             ("_subscriber_client", self._subscriber_client),
             ("_jobs_client", self._jobs_client),
             ("_run_client", self._run_client),
+            ("_executions_client", self._executions_client),
         ]
 
         for attr, client in clients_to_close:
@@ -532,6 +583,7 @@ class GCPModule(
         if (
             self._jobs_client is not None
             and self._run_client is not None
+            and self._executions_client is not None
             and self._async_clients_loop is loop
         ):
             return
@@ -542,6 +594,9 @@ class GCPModule(
         # tear down the orphaned grpc transport.
         self._jobs_client = run_v2.JobsAsyncClient(credentials=self._credentials)
         self._run_client = run_v2.ServicesAsyncClient(credentials=self._credentials)
+        self._executions_client = run_v2.ExecutionsAsyncClient(
+            credentials=self._credentials
+        )
         self._async_clients_loop = loop
         logger.info("GCP async clients built on event loop %r.", loop)
 
@@ -561,6 +616,23 @@ class GCPModule(
                 + ("credentials missing" if not self._credentials else "no running event loop")
             )
         return self._jobs_client
+
+    def get_executions_client(self) -> "run_v2.ExecutionsAsyncClient":
+        """
+        Returns the async Cloud Run Executions client, bound to the current loop.
+
+        Used by the liveness probe (#735) to ask the Executions API whether the
+        execution backing a lapsed-lease task is still alive. Built lazily and
+        rebound on loop change for the same reason as ``get_jobs_client`` — see
+        :meth:`_ensure_async_clients_for_current_loop`.
+        """
+        self._ensure_async_clients_for_current_loop()
+        if not self._executions_client:
+            raise RuntimeError(
+                "GCPModule executions client unavailable: "
+                + ("credentials missing" if not self._credentials else "no running event loop")
+            )
+        return self._executions_client
 
     # --- JobExecutionProtocol Implementation ---
 

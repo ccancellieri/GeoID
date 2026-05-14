@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS {schema}.tasks (
     locked_until      TIMESTAMPTZ,
     last_heartbeat_at TIMESTAMPTZ,
     owner_id          VARCHAR(255),
+    runner_ref        TEXT,
     retry_count       INT           NOT NULL DEFAULT 0,
     max_retries       INT           NOT NULL DEFAULT 3,
     PRIMARY KEY (timestamp, task_id)
@@ -1651,6 +1652,92 @@ async def heartbeat_tasks(
         await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
             conn, locked_until=new_locked_until, task_ids=list(task_ids)
         )
+
+
+async def set_runner_ref(
+    engine: DbResource,
+    task_id: uuid.UUID,
+    runner_ref: str,
+) -> None:
+    """Stamp a runner's opaque execution handle onto a task row.
+
+    Generic and runner-agnostic: ``runner_ref`` is whatever string a runner
+    needs to later identify its out-of-process execution. ``GcpJobRunner``
+    parks the Cloud Run execution resource name here so the liveness probe can
+    query the Executions API. Writes only ``runner_ref`` — no status churn —
+    and works identically for the REST and dispatcher spawn paths.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        UPDATE {task_schema}.tasks
+        SET runner_ref = :runner_ref
+        WHERE task_id = :task_id;
+    """
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
+            conn, task_id=task_id, runner_ref=runner_ref
+        )
+
+
+async def persist_outputs(
+    engine: DbResource,
+    task_id: uuid.UUID,
+    outputs: Optional[Any],
+) -> None:
+    """Persist ``outputs`` (and ``progress = 100``) WITHOUT flipping the status.
+
+    The #726-followup hardening: a distinct, idempotent write a runner lands
+    *before* the terminal status flip (``complete_task``). Cloud Run reports an
+    execution SUCCEEDED only once the container exits 0 — i.e. only after both
+    writes — so a liveness reconciler that finds a SUCCEEDED execution on a
+    still-``ACTIVE`` row can complete it from the ``outputs`` already on the
+    row, instead of recovering an empty result. The status flip stays the
+    exclusive job of ``complete_task``.
+    """
+    task_schema = get_task_schema()
+    serialized_outputs = None
+    if outputs is not None:
+        from dynastore.tools.json import CustomJSONEncoder
+        serialized_outputs = json.dumps(outputs, cls=CustomJSONEncoder)
+
+    sql = f"""
+        UPDATE {task_schema}.tasks
+        SET outputs = :outputs,
+            progress = 100
+        WHERE task_id = :task_id;
+    """
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
+            conn, task_id=task_id, outputs=serialized_outputs
+        )
+
+
+async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
+    """Return lapsed-lease Cloud Run task rows for the liveness reconciler.
+
+    A single scan of the global tasks table for rows that are ``ACTIVE`` with
+    an expired ``locked_until`` and a ``gcp_cloud_run_*`` owner — i.e. exactly
+    the rows the pg_cron reaper would otherwise reclaim blindly. ``FOR UPDATE
+    SKIP LOCKED`` so the reconciler and the reaper never fight over a row.
+
+    Surfaces ``runner_ref`` (the probe handle), ``started_at`` (young-row grace
+    check) and ``outputs`` (TERMINAL_SUCCEEDED reconciliation) so the caller
+    has everything it needs without a second round-trip.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        SELECT task_id, schema_name, task_type, owner_id, runner_ref,
+               started_at, locked_until, retry_count, max_retries, outputs
+        FROM {task_schema}.tasks
+        WHERE status = 'ACTIVE'
+          AND locked_until < NOW()
+          AND owner_id LIKE 'gcp_cloud_run_%'
+        FOR UPDATE SKIP LOCKED
+        LIMIT 500;
+    """
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(conn)
+    return rows or []
 
 
 async def claim_by_id(

@@ -317,6 +317,13 @@ class Task(TaskBase):
     locked_until: Optional[datetime] = None
     last_heartbeat_at: Optional[datetime] = None
     owner_id: Optional[str] = None        # CloudIdentity email or caller_id
+    runner_ref: Optional[str] = Field(
+        default=None,
+        description="Opaque, runner-specific handle to the out-of-process "
+                    "execution backing this task (e.g. the Cloud Run execution "
+                    "resource name). Read by the liveness probe; NULL for "
+                    "in-process runners.",
+    )
     retry_count: int = Field(default=0)
     max_retries: int = Field(default=3)
 

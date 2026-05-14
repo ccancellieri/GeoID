@@ -20,7 +20,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from dynastore.modules.processes.models import Process, ExecuteRequest, as_process_task_payload
 from dynastore.modules.tasks import tasks_module
@@ -35,6 +35,9 @@ from dynastore.modules.tasks.models import (
 from dynastore.tools.identifiers import generate_id_hex
 from dynastore.tools.plugin import ProtocolPlugin
 
+if TYPE_CHECKING:
+    from dynastore.modules.tasks.liveness import LivenessVerdict
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,15 +46,40 @@ logger = logging.getLogger(__name__)
 # job runs, and the pg_cron reaper resets the row if the lease lapses.
 _DEFAULT_TASK_TIMEOUT_SECONDS = int(os.getenv("TASK_TIMEOUT", "3600"))
 
-# Lease used for the REST-path INSERT-as-claimed flow.  Must outlast the whole
-# gap from RunJob trigger until main_task.py reaches its claim step and its
-# heartbeat starts extending the lease — Cloud Run RunJob API call + container
-# cold start + module init.  Observed cold-start on the review env is ~1m45s;
-# the old 60s default lapsed mid-boot, so the pg_cron reaper reclaimed the row
-# and a second Cloud Run execution was spawned (#726).  300s clears observed
-# cold-start with margin while still releasing a genuinely dead spawner well
-# inside the reaper cycle.  Env-overridable for per-environment tuning.
+# Lease used for the REST-path INSERT-as-claimed flow.  No longer a cold-start
+# *guess* (#726's 60→300s bump was a fragile fixed timer) — it is now just a
+# modest floor covering the window before the GcpLivenessReconciler's first
+# pass.  Once the reconciler runs it extends the lease of any execution it
+# confirms ALIVE, so the floor never has to outlast cold start (#735).
+#
+# The live value is ``GcpModuleConfig.spawn_lease_seconds`` — a runtime-tunable
+# PluginConfig field.  This module-level constant is only the fallback default
+# used when the config registry is not yet available (early startup, tests).
 _SPAWN_LEASE_SECONDS = int(os.getenv("GCP_RUNNER_SPAWN_LEASE", "300"))
+
+
+async def _resolve_spawn_lease_seconds() -> int:
+    """Read the spawn-lease floor from ``GcpModuleConfig`` (runtime-mutable).
+
+    Falls back to :data:`_SPAWN_LEASE_SECONDS` when the config registry is not
+    available — so the runner still works during early startup and in tests.
+    """
+    try:
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols import ConfigsProtocol
+        from dynastore.modules.gcp.gcp_config import GcpModuleConfig
+
+        cfg_svc = get_protocol(ConfigsProtocol)
+        if cfg_svc is not None:
+            cfg = await cfg_svc.get_config(GcpModuleConfig)
+            if isinstance(cfg, GcpModuleConfig):
+                return int(cfg.spawn_lease_seconds)
+    except Exception as e:  # noqa: BLE001 — config is best-effort, fall back
+        logger.debug(
+            "GcpJobRunner: GcpModuleConfig unavailable (%s); "
+            "using fallback spawn lease %ds.", e, _SPAWN_LEASE_SECONDS,
+        )
+    return _SPAWN_LEASE_SECONDS
 
 # Bounded retry around RunJob — handles transient Cloud Run control-plane
 # blips without surfacing them as task failures.  Exhausted retries fall back
@@ -242,9 +270,10 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 max_retries=job_max_retries if job_max_retries is not None else 3,
                 dedup_key=dedup_key,
             )
+            spawn_lease_seconds = await _resolve_spawn_lease_seconds()
             spawn_lease_until = (
                 datetime.now(timezone.utc)
-                + timedelta(seconds=_SPAWN_LEASE_SECONDS)
+                + timedelta(seconds=spawn_lease_seconds)
             )
             new_task = await tasks_module.create_task(
                 context.engine,
@@ -266,7 +295,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
             logger.info(
                 f"GcpJobRunner: REST-path born-claimed task '{new_task.task_id}' for "
                 f"job '{job_name}' (execution_id={execution_id}, "
-                f"spawn_lease={_SPAWN_LEASE_SECONDS}s, "
+                f"spawn_lease={spawn_lease_seconds}s, "
                 f"max_retries={job_max_retries if job_max_retries is not None else 'default'})."
             )
 
@@ -296,9 +325,10 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         env_vars = {"DYNASTORE_EXECUTION_ID": execution_id}
 
         last_exc: Optional[BaseException] = None
+        runner_ref: Optional[str] = None
         for attempt in range(1, _RUNJOB_MAX_ATTEMPTS + 1):
             try:
-                await run_cloud_run_job_async(
+                runner_ref = await run_cloud_run_job_async(
                     job_name=job_name, args=args, env_vars=env_vars,
                 )
                 last_exc = None
@@ -353,6 +383,30 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
         logger.info(f"Dispatched Cloud Run job '{job_name}'.")
 
+        # Persist the Cloud Run execution handle on the row so the liveness
+        # probe can later ask the Executions API "is this execution alive?".
+        # Done on BOTH paths (REST born-claimed + dispatcher reuse) — the row
+        # exists either way.  Best-effort: a missed write just leaves
+        # runner_ref NULL and the probe degrades to UNKNOWN (pg_cron reaper
+        # backstops) — never worth failing a successfully-dispatched job over.
+        if runner_ref:
+            try:
+                await tasks_module.set_runner_ref(
+                    context.engine, task_id_for_payload, runner_ref
+                )
+            except Exception as ref_err:  # noqa: BLE001 — diagnostic only
+                logger.warning(
+                    "GcpJobRunner: failed to persist runner_ref for task '%s' "
+                    "(%s) — liveness probe will degrade to UNKNOWN for this row.",
+                    task_id_for_payload, ref_err,
+                )
+        else:
+            logger.debug(
+                "GcpJobRunner: no execution handle returned for task '%s' — "
+                "liveness probe will degrade to UNKNOWN for this row.",
+                task_id_for_payload,
+            )
+
         # Dispatcher path: tell the dispatcher the row is being handled
         # asynchronously by the Cloud Run Job container — it will write
         # COMPLETED / FAILED itself via main_task.py.
@@ -360,3 +414,117 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
             return DEFERRED_COMPLETION
 
         return existing_task
+
+    # ------------------------------------------------------------------
+    # LivenessProbeProtocol — #735
+    #
+    # GcpJobRunner spawns Cloud Run Job *executions* that outlive this
+    # process. The pg_cron reaper resetting a lapsed-lease row to PENDING
+    # is therefore wrong for these rows when the execution is still alive
+    # (cold start) — it spawns a duplicate. The liveness reconciler asks
+    # this runner whether the execution is actually alive before the
+    # reaper acts; this is how it knows.
+    # ------------------------------------------------------------------
+
+    def owns(self, owner_id: str) -> bool:
+        """True if ``owner_id`` was stamped by this runner family.
+
+        GcpJobRunner stamps ``gcp_cloud_run_{execution_id}`` on every row it
+        claims (both REST and dispatcher paths), so the prefix is a reliable,
+        durable discriminator.
+        """
+        return bool(owner_id) and owner_id.startswith("gcp_cloud_run_")
+
+    @staticmethod
+    def _completion_time_set(execution: Any) -> bool:
+        """True when the execution has a real ``completion_time``.
+
+        ``run_v2.Execution`` has no single state enum; ``completion_time`` is a
+        timestamp that is unset (epoch / None) until the execution terminates.
+        proto-plus maps it to a ``datetime``; an unset field reads as epoch
+        (year 1970) or ``None`` depending on the client version — both are
+        treated as "not completed".
+        """
+        ct = getattr(execution, "completion_time", None)
+        if ct is None:
+            return False
+        try:
+            return getattr(ct, "year", 1970) > 1970
+        except Exception:  # noqa: BLE001 — unknown shape, be conservative
+            return bool(ct)
+
+    @staticmethod
+    def _map_execution_state(execution: Any) -> "LivenessVerdict":
+        """Derive a :class:`LivenessVerdict` from a ``run_v2.Execution``.
+
+        Pure function — no I/O — so it is trivially unit-testable against fake
+        execution objects. State is derived from the per-attempt counts plus
+        ``completion_time`` because ``Execution`` exposes no single status enum.
+        """
+        from dynastore.modules.tasks.liveness import LivenessVerdict
+
+        succeeded = getattr(execution, "succeeded_count", 0) or 0
+        cancelled = getattr(execution, "cancelled_count", 0) or 0
+        running = getattr(execution, "running_count", 0) or 0
+
+        if GcpJobRunner._completion_time_set(execution):
+            # Terminated. Succeeded wins; an explicit cancellation reads as
+            # DEAD (gone, retry it); anything else completed is a real failure.
+            if succeeded > 0:
+                return LivenessVerdict.TERMINAL_SUCCEEDED
+            if cancelled > 0:
+                return LivenessVerdict.DEAD
+            return LivenessVerdict.TERMINAL_FAILED
+
+        if running > 0:
+            return LivenessVerdict.ALIVE
+        # No completion, no running task yet: pending / scheduling / cold
+        # start. The execution exists, so it counts as alive — this is exactly
+        # the window the fixed spawn-lease used to mis-handle.
+        return LivenessVerdict.ALIVE
+
+    async def probe_liveness(self, task: Any) -> "LivenessVerdict":
+        """Query the Cloud Run Executions API for the execution backing ``task``.
+
+        Never raises — every failure mode degrades to ``UNKNOWN`` so the
+        reconciler loop survives and the pg_cron reaper remains the backstop:
+
+        * ``runner_ref`` not captured yet (sub-second spawn→capture gap) → UNKNOWN
+        * execution ``NotFound`` (deleted / never materialized)         → DEAD
+        * any other error (transient API blip, missing client, …)       → UNKNOWN
+        """
+        from dynastore.modules.tasks.liveness import LivenessVerdict
+
+        runner_ref = getattr(task, "runner_ref", None)
+        if not runner_ref:
+            return LivenessVerdict.UNKNOWN
+
+        try:
+            from dynastore.modules import get_protocol
+            from dynastore.models.protocols import JobExecutionProtocol
+
+            gcp_module = get_protocol(JobExecutionProtocol)
+            if gcp_module is None or not hasattr(gcp_module, "get_executions_client"):
+                logger.debug(
+                    "GcpJobRunner.probe_liveness: no executions client available "
+                    "for runner_ref '%s' — UNKNOWN.", runner_ref,
+                )
+                return LivenessVerdict.UNKNOWN
+
+            # ``get_executions_client`` is GCPModule-specific, not part of the
+            # JobExecutionProtocol contract — guarded by the hasattr check above.
+            client = gcp_module.get_executions_client()  # type: ignore[attr-defined]
+            execution = await client.get_execution(name=runner_ref)
+            return self._map_execution_state(execution)
+        except Exception as exc:  # noqa: BLE001 — MUST NOT raise; map to a verdict
+            if type(exc).__name__ == "NotFound" or "NotFound" in type(exc).__name__:
+                logger.info(
+                    "GcpJobRunner.probe_liveness: execution '%s' NotFound — DEAD.",
+                    runner_ref,
+                )
+                return LivenessVerdict.DEAD
+            logger.warning(
+                "GcpJobRunner.probe_liveness: inconclusive probe for '%s' (%s) "
+                "— UNKNOWN, pg_cron reaper backstops.", runner_ref, exc,
+            )
+            return LivenessVerdict.UNKNOWN

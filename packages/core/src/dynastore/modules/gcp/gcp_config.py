@@ -185,6 +185,34 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
         description="Interval between visibility checks, in seconds."
     )
 
+    # --- Cloud Run execution-liveness reconciler (#735) ---
+    # These supersede the fixed GCP_RUNNER_SPAWN_LEASE env guess: runtime-tunable
+    # PluginConfig fields consumed by GcpJobRunner and GcpLivenessReconciler.
+    spawn_lease_seconds: Mutable[int] = Field(
+        default=int(os.environ.get("GCP_RUNNER_SPAWN_LEASE", "300")),
+        description="Lease (seconds) stamped on a freshly born-claimed Cloud Run "
+                    "task row. No longer a cold-start guess — just a modest floor "
+                    "covering the window before the liveness reconciler's first "
+                    "pass, which then extends the lease of any live execution."
+    )
+    liveness_reconciler_interval_seconds: Mutable[int] = Field(
+        default=int(os.environ.get("GCP_LIVENESS_RECONCILER_INTERVAL", "20")),
+        description="How often (seconds) the liveness reconciler scans lapsed-lease "
+                    "Cloud Run task rows. Kept below the 60s pg_cron reaper cadence "
+                    "so the reconciler gets first look."
+    )
+    liveness_extend_visibility_seconds: Mutable[int] = Field(
+        default=int(os.environ.get("GCP_LIVENESS_EXTEND_VISIBILITY", "300")),
+        description="Lease extension (seconds) applied when the reconciler confirms "
+                    "a Cloud Run execution is still alive."
+    )
+    liveness_unknown_grace_seconds: Mutable[int] = Field(
+        default=int(os.environ.get("GCP_LIVENESS_UNKNOWN_GRACE", "180")),
+        description="Grace window (seconds) for a young task row whose runner_ref "
+                    "is not captured yet: the reconciler extends its lease once to "
+                    "cover the spawn→capture gap before leaving it to the pg_cron reaper."
+    )
+
 class TriggeredAction(BaseModel):
     """Defines a process to be triggered by a GCS event."""
     process_id: str = Field(..., description="The ID of the process to execute (e.g., 'ingestion').")
