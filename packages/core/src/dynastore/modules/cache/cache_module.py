@@ -18,13 +18,17 @@ CacheModule — registers a shared Valkey cache backend when VALKEY_URL is set.
 Falls back to local in-memory cache (LocalAsyncCacheBackend, priority=1000)
 when Valkey is unavailable or VALKEY_URL is not configured.
 
-Configuration (via PluginConfig framework, not env vars):
+Configuration (via PluginConfig framework, not env vars). CacheModule wires
+the Valkey backend, so it loads ``ValkeyCachePluginConfig`` — the Valkey
+specialisation of the standard ``CachePluginConfig``:
   - probe_timeout_seconds: timeout for backend.info() probe (default 5s)
   - socket_connect_timeout_seconds: timeout per socket connection (default 10s)
-  - socket_timeout_seconds: read timeout per op (default 2s — fail fast to source)
-  - tcp_keepalive_idle_seconds / _interval_seconds / _count: TCP keepalive
-    tuning so idle Cloud Run↔Memorystore sockets aren't silently dropped (#655)
   - circuit_breaker_threshold: failures before fallback (default 3)
+  - socket_timeout_seconds: per-operation read/write timeout (default 15s) —
+    gives a cold cluster-topology fetch room to complete instead of surfacing
+    a spurious read TimeoutError
+  - tcp_keepalive_idle/interval_seconds, tcp_keepalive_count: TCP keepalive
+    tuning so idle Cloud Run↔Memorystore sockets aren't silently dropped (#655)
 
 Access via: /api/catalog/v2/configs?plugin_id=module_cache
 
@@ -39,21 +43,27 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import TYPE_CHECKING, AsyncGenerator
 
 from dynastore.modules.protocols import ModuleProtocol
+
+if TYPE_CHECKING:
+    from dynastore.modules.cache.cache_config import ValkeyCachePluginConfig
 
 logger = logging.getLogger(__name__)
 
 
-async def _load_cache_config() -> "CachePluginConfig":
-    """Load cache config from PluginConfig protocol.
+async def _load_cache_config() -> "ValkeyCachePluginConfig":
+    """Load the Valkey cache config from the PluginConfig protocol.
 
-    Falls back to defaults if config is missing or protocol unavailable
-    (e.g., during early bootstrap before ConfigProtocol is registered).
+    Loads ``ValkeyCachePluginConfig`` (the Valkey specialisation), so callers
+    get both the standard cache fields and the Valkey-specific connection
+    knobs. Falls back to defaults if config is missing or the protocol is
+    unavailable (e.g., during early bootstrap before ConfigProtocol is
+    registered).
     """
     try:
-        from dynastore.modules.cache.cache_config import CachePluginConfig
+        from dynastore.modules.cache.cache_config import ValkeyCachePluginConfig
         from dynastore.models.protocols.configs import ConfigsProtocol
 
         try:
@@ -61,20 +71,20 @@ async def _load_cache_config() -> "CachePluginConfig":
             configs_proto = get_protocol(ConfigsProtocol)
         except Exception as e:
             logger.debug("CacheModule: ConfigsProtocol not available yet (%s), using defaults", e)
-            return CachePluginConfig()
+            return ValkeyCachePluginConfig()
 
         try:
-            cfg = await configs_proto.get_config(CachePluginConfig)
+            cfg = await configs_proto.get_config(ValkeyCachePluginConfig)
             if cfg:
                 return cfg
         except Exception as e:
-            logger.debug("CacheModule: failed to load CachePluginConfig (%s), using defaults", e)
+            logger.debug("CacheModule: failed to load ValkeyCachePluginConfig (%s), using defaults", e)
 
     except Exception as e:
         logger.debug("CacheModule: config protocol unavailable (%s), using defaults", e)
 
-    from dynastore.modules.cache.cache_config import CachePluginConfig
-    return CachePluginConfig()  # Return defaults
+    from dynastore.modules.cache.cache_config import ValkeyCachePluginConfig
+    return ValkeyCachePluginConfig()  # Return defaults
 
 
 class CacheModule(ModuleProtocol):

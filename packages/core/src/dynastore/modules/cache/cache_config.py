@@ -13,7 +13,14 @@
 #    limitations under the License.
 
 """
-Cache module configuration (Valkey timeouts, circuit breaker, etc.).
+Cache module configuration.
+
+``CachePluginConfig`` is the **standard** cache config — backend-agnostic
+settings shared by every shared-cache implementation (probe + connect
+timeouts, circuit breaker). A concrete backend plugin specialises it by
+subclassing and adding only the params that plugin uses — see
+``ValkeyCachePluginConfig``. Implementation-specific params must not pollute
+the standard config.
 
 Registered via PluginConfig framework so settings are:
 - Runtime-configurable (no redeploy needed)
@@ -27,14 +34,19 @@ from __future__ import annotations
 
 from typing import ClassVar, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
 
 
 class CachePluginConfig(ExposableConfigMixin, PluginConfig):
-    """PluginConfig entry for cache module (Valkey timeouts, circuit breaker).
+    """Standard (backend-agnostic) cache config — timeouts + circuit breaker.
+
+    Holds only settings every shared-cache backend understands. Concrete
+    backends (Valkey today; Redis, an in-memory DB, etc. tomorrow) specialise
+    this via subclassing and add their own implementation-specific params —
+    they must not be declared here.
 
     Live edits via `PUT /api/catalog/v2/configs?plugin_id=module_cache` apply
     immediately — no redeploy needed. Settings are per-catalog overridable.
@@ -42,7 +54,6 @@ class CachePluginConfig(ExposableConfigMixin, PluginConfig):
 
     _address: ClassVar[Tuple[str, ...]] = ("platform", "module_cache", None)
 
-    # Re-export CacheConfig fields directly for cleaner API
     probe_timeout_seconds: Mutable[float] = Field(
         default=5.0,
         ge=1,
@@ -59,57 +70,9 @@ class CachePluginConfig(ExposableConfigMixin, PluginConfig):
         ge=1,
         le=60,
         description=(
-            "Timeout for individual Valkey socket connection attempts. "
+            "Timeout for individual cache-backend socket connection attempts. "
             "Applies to each node in cluster mode. "
             "Increase if cluster discovery or node connectivity is slow."
-        ),
-    )
-
-    socket_timeout_seconds: Mutable[float] = Field(
-        default=2.0,
-        ge=0.5,
-        le=120,
-        description=(
-            "Read timeout for individual Valkey operations. A cache must "
-            "fail fast: every op is wrapped so a timeout falls straight "
-            "through to the source (which is sub-second), and three "
-            "consecutive failures trip the circuit breaker that drops "
-            "Valkey from rotation entirely. A short timeout makes that "
-            "fallback and trip happen quickly; a long one just convoys "
-            "requests behind a backend that's already unhealthy. 2s is "
-            "~hundreds of times a healthy same-VPC op — generous headroom "
-            "without ever blocking the hot path on a slow backend."
-        ),
-    )
-
-    tcp_keepalive_idle_seconds: Mutable[int] = Field(
-        default=300,
-        ge=10,
-        le=1200,
-        description=(
-            "Idle time before the first TCP keepalive probe on a Valkey "
-            "connection. Sits well under Cloud NAT's ~1200s established-"
-            "connection timeout so idle Cloud Run↔Memorystore sockets are "
-            "kept alive instead of being silently dropped — a dropped socket "
-            "forces an expensive ValkeyCluster re-initialisation on the next "
-            "op. Mirrors the DB pool keepalive parity (#655)."
-        ),
-    )
-
-    tcp_keepalive_interval_seconds: Mutable[int] = Field(
-        default=30,
-        ge=5,
-        le=300,
-        description="Interval between TCP keepalive probes once a Valkey connection is idle.",
-    )
-
-    tcp_keepalive_count: Mutable[int] = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description=(
-            "Number of unacknowledged TCP keepalive probes before a Valkey "
-            "connection is considered dead."
         ),
     )
 
@@ -130,9 +93,67 @@ class CachePluginConfig(ExposableConfigMixin, PluginConfig):
         description=(
             "Upper bound on the inner is_capability_live re-check inside the "
             "reactive reaper's locked DB transaction. The call holds the "
-            "connection + advisory xact lock for its duration; a slow Valkey "
+            "connection + advisory xact lock for its duration; a slow cache "
             "response convoys peer dispatchers. On timeout the reaper "
             "fails-open (treats as live, never false-DLQs). "
             "0.5 s matches the db_pool_acquire slow-log threshold."
+        ),
+    )
+
+
+class ValkeyCachePluginConfig(CachePluginConfig):
+    """Valkey-specific cache config — specialises the standard cache config.
+
+    Adds the connection knobs that only the Valkey backend uses. These exist
+    here, not on ``CachePluginConfig``, so the standard config stays
+    backend-agnostic. Inherits every standard field, so ``CacheModule`` can
+    load this one class and still read ``probe_timeout_seconds`` etc.
+    """
+
+    # Same topic as the standard cache config — exposed as a distinct
+    # ClassName under ``module_cache`` (mirrors how gcp_config registers
+    # several classes under one address).
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "module_cache", None)
+
+    socket_timeout_seconds: Mutable[float] = Field(
+        default=15.0,
+        ge=1,
+        le=120,
+        description=(
+            "Timeout for individual Valkey socket read/write operations "
+            "(once connected). valkey-py defaults this to 5s; on GCP a cold "
+            "cluster-topology fetch (CLUSTER SLOTS / COMMAND) can exceed that "
+            "and surface as a read TimeoutError. Bounds each op so a slow "
+            "node trips the circuit breaker deterministically instead of "
+            "convoying callers."
+        ),
+    )
+
+    tcp_keepalive_idle_seconds: Mutable[int] = Field(
+        default=300,
+        ge=10,
+        le=1200,
+        description=(
+            "TCP_KEEPIDLE — seconds an idle Valkey socket waits before the "
+            "first keepalive probe. Keeps Cloud NAT from silently dropping "
+            "idle Cloud Run↔Memorystore sockets (mirrors the DB-pool "
+            "keepalive hygiene)."
+        ),
+    )
+
+    tcp_keepalive_interval_seconds: Mutable[int] = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description="TCP_KEEPINTVL — seconds between Valkey keepalive probes.",
+    )
+
+    tcp_keepalive_count: Mutable[int] = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description=(
+            "TCP_KEEPCNT — failed keepalive probes before the Valkey socket "
+            "is considered dead."
         ),
     )

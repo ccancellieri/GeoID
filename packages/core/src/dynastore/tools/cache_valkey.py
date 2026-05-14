@@ -43,6 +43,7 @@ import asyncio
 import importlib
 import logging
 import os
+import socket
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -167,30 +168,6 @@ def _msgpack_ext_hook(code: int, data: bytes) -> Any:
     return msgpack.ExtType(code, data)
 
 
-def _build_keepalive_options(
-    idle: Optional[int],
-    interval: Optional[int],
-    count: Optional[int],
-) -> Dict[int, int]:
-    """Map TCP keepalive tunables onto platform socket-option constants.
-
-    ``TCP_KEEPIDLE`` / ``TCP_KEEPINTVL`` / ``TCP_KEEPCNT`` exist on Linux
-    (where Cloud Run runs) but not on macOS, so missing constants are
-    skipped — the connection still gets ``socket_keepalive=True`` with OS
-    defaults, the per-probe tuning is just a Linux refinement.
-    """
-    import socket
-
-    options: Dict[int, int] = {}
-    if idle is not None and hasattr(socket, "TCP_KEEPIDLE"):
-        options[socket.TCP_KEEPIDLE] = idle
-    if interval is not None and hasattr(socket, "TCP_KEEPINTVL"):
-        options[socket.TCP_KEEPINTVL] = interval
-    if count is not None and hasattr(socket, "TCP_KEEPCNT"):
-        options[socket.TCP_KEEPCNT] = count
-    return options
-
-
 def _serialize(value: Any) -> bytes:
     """Serialize a value to msgpack bytes."""
     return msgpack.packb(value, default=_msgpack_default, use_bin_type=True)  # type: ignore[return-value]
@@ -199,6 +176,29 @@ def _serialize(value: Any) -> bytes:
 def _deserialize(data: bytes) -> Any:
     """Deserialize msgpack bytes to a value."""
     return msgpack.unpackb(data, ext_hook=_msgpack_ext_hook, raw=False)
+
+
+def _build_keepalive_options(
+    idle: Optional[int],
+    interval: Optional[int],
+    count: Optional[int],
+) -> Dict[int, int]:
+    """Map TCP keepalive tunables to ``socket.setsockopt`` option codes.
+
+    Returns the ``socket_keepalive_options`` dict valkey-py feeds to each
+    connection. Option constants (``TCP_KEEPIDLE`` / ``TCP_KEEPINTVL`` /
+    ``TCP_KEEPCNT``) are platform-specific — ``getattr``-guarded so this is a
+    no-op on platforms (e.g. macOS dev boxes) that don't expose them. Linux,
+    where Cloud Run runs, has all three.
+    """
+    opts: Dict[int, int] = {}
+    if idle is not None and hasattr(socket, "TCP_KEEPIDLE"):
+        opts[socket.TCP_KEEPIDLE] = idle
+    if interval is not None and hasattr(socket, "TCP_KEEPINTVL"):
+        opts[socket.TCP_KEEPINTVL] = interval
+    if count is not None and hasattr(socket, "TCP_KEEPCNT"):
+        opts[socket.TCP_KEEPCNT] = count
+    return opts
 
 
 # ---------------------------------------------------------------------------
@@ -330,27 +330,24 @@ class ValkeyCacheBackend:
         if socket_connect_timeout is not None:
             pool_kwargs["socket_connect_timeout"] = socket_connect_timeout
 
-        # Read timeout for individual ops — deliberately short. A cache must
-        # fail fast: get()/set()/exists() wrap the call so a timeout returns
-        # a miss and the caller falls through to the source (sub-second),
-        # and three consecutive failures trip the circuit breaker that drops
-        # this backend from rotation. A short timeout makes both happen
-        # quickly; a long one just convoys requests behind an unhealthy
-        # backend. The keepalives below are what actually prevent the
-        # dead-socket / cluster re-init condition in the first place.
+        # Per-operation read/write timeout. valkey-py hard-defaults this to 5s;
+        # an explicit, larger value gives a cold cluster-topology fetch room to
+        # complete instead of surfacing a spurious read TimeoutError.
         if socket_timeout is not None:
             pool_kwargs["socket_timeout"] = socket_timeout
 
-        # TCP keepalives: Cloud NAT silently drops the established-connection
-        # mapping after long idle. Without probes the next op gets a dead
-        # socket and ValkeyCluster pays a full re-initialisation. Mirrors the
-        # DB pool keepalive parity (#655).
-        if any(v is not None for v in
-               (tcp_keepalive_idle, tcp_keepalive_interval, tcp_keepalive_count)):
+        # TCP keepalives — stop Cloud NAT from silently dropping idle
+        # Cloud Run↔Memorystore sockets (parity with the DB-pool keepalive
+        # hygiene). Inherited by the cluster client's per-node pools too.
+        keepalive_options = _build_keepalive_options(
+            tcp_keepalive_idle, tcp_keepalive_interval, tcp_keepalive_count
+        )
+        if (
+            tcp_keepalive_idle is not None
+            or tcp_keepalive_interval is not None
+            or tcp_keepalive_count is not None
+        ):
             pool_kwargs["socket_keepalive"] = True
-            keepalive_options = _build_keepalive_options(
-                tcp_keepalive_idle, tcp_keepalive_interval, tcp_keepalive_count
-            )
             if keepalive_options:
                 pool_kwargs["socket_keepalive_options"] = keepalive_options
 
