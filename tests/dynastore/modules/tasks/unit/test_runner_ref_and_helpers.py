@@ -131,3 +131,53 @@ def test_heartbeat_task_if_active_sql_shape():
     assert "SET LOCKED_UNTIL = :LOCKED_UNTIL" in normalised
     assert "WHERE TASK_ID = :TASK_ID" in normalised
     assert "STATUS = 'ACTIVE'" in normalised
+
+
+# --- fail_task / complete_task owner-guard (#750: terminal-path race guard) ---
+
+
+def test_fail_task_accepts_owner_id_guard_and_returns_bool():
+    """#750 — ``fail_task`` gains an optional keyword-only ``owner_id`` race
+    guard and returns ``bool`` (whether a row matched), so the reconciler can
+    only fail the exact execution attempt it probed."""
+    import typing
+
+    fn = _tasks_module().fail_task
+    sig = inspect.signature(fn)
+    assert "owner_id" in sig.parameters, "fail_task must accept an owner_id guard"
+    assert sig.parameters["owner_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["owner_id"].default is None  # opt-in: off by default
+    assert typing.get_type_hints(fn).get("return") is bool
+
+
+def test_complete_task_accepts_owner_id_guard_and_returns_bool():
+    """#750 — ``complete_task`` gains the same opt-in ``owner_id`` race guard
+    and ``bool`` return as ``fail_task``."""
+    import typing
+
+    fn = _tasks_module().complete_task
+    sig = inspect.signature(fn)
+    assert "owner_id" in sig.parameters, "complete_task must accept an owner_id guard"
+    assert sig.parameters["owner_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["owner_id"].default is None
+    assert typing.get_type_hints(fn).get("return") is bool
+
+
+def test_fail_task_owner_guard_is_conditional_in_sql():
+    """The ``owner_id`` predicate is appended to the WHERE clause ONLY when an
+    owner_id is supplied — every existing caller (no owner_id) keeps today's
+    unconditional ``WHERE task_id = :task_id`` behaviour. ``ROWCOUNT`` handler
+    backs the bool return."""
+    src = inspect.getsource(_tasks_module().fail_task)
+    assert 'owner_guard = " AND owner_id = :owner_id" if owner_id is not None else ""' in src
+    assert "ResultHandler.ROWCOUNT" in src
+    # The hard-cap retry logic must be untouched by the guard.
+    assert "LEAST(max_retries, :hard_cap)" in src
+
+
+def test_complete_task_owner_guard_is_conditional_in_sql():
+    """Same conditional-guard contract for ``complete_task``."""
+    src = inspect.getsource(_tasks_module().complete_task)
+    assert 'owner_guard = " AND owner_id = :owner_id" if owner_id is not None else ""' in src
+    assert "ResultHandler.ROWCOUNT" in src
+    assert "SET status = 'COMPLETED'" in src or "status = 'COMPLETED'" in src

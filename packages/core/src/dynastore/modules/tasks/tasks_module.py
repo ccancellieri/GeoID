@@ -430,7 +430,9 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
         timestamp: Any,
         outputs: Optional[Any] = None,
     ) -> None:
-        return await complete_task(engine, task_id, timestamp, outputs)
+        # ``complete_task`` now returns a bool (owner-guard match); the
+        # TaskQueueProtocol contract is fire-and-forget — discard it.
+        await complete_task(engine, task_id, timestamp, outputs)
 
     async def fail(
         self,
@@ -440,7 +442,9 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
         error_message: str,
         retry: bool = True,
     ) -> None:
-        return await fail_task(engine, task_id, timestamp, error_message, retry)
+        # ``fail_task`` now returns a bool (owner-guard match); the
+        # TaskQueueProtocol contract is fire-and-forget — discard it.
+        await fail_task(engine, task_id, timestamp, error_message, retry)
 
     async def heartbeat(
         self,
@@ -1531,14 +1535,29 @@ async def complete_task(
     task_id: uuid.UUID,
     timestamp: Any,
     outputs: Optional[Any] = None,
-) -> None:
-    """Mark a claimed task as COMPLETED."""
+    *,
+    owner_id: Optional[str] = None,
+) -> bool:
+    """Mark a claimed task as COMPLETED.
+
+    Returns ``True`` when a row was updated, ``False`` when none matched.
+
+    ``owner_id`` is an optional race guard: when provided, the UPDATE also
+    requires ``owner_id`` to still equal the given value. The liveness
+    reconciler passes the ``owner_id`` it probed so it can only complete the
+    exact execution attempt it observed — if the pg_cron reaper reclaimed the
+    row (``owner_id`` → NULL) and the dispatcher re-claimed it as a fresh
+    attempt (``owner_id`` → a different value) between the reconciler's SELECT
+    and this write, no row matches and the caller treats the ``False`` return
+    as a lost race rather than clobbering the new attempt. See #750.
+    """
     task_schema = get_task_schema()
     serialized_outputs = None
     if outputs is not None:
         from dynastore.tools.json import CustomJSONEncoder
         serialized_outputs = json.dumps(outputs, cls=CustomJSONEncoder)
 
+    owner_guard = " AND owner_id = :owner_id" if owner_id is not None else ""
     sql = f"""
         UPDATE {task_schema}.tasks
         SET status = 'COMPLETED',
@@ -1546,12 +1565,20 @@ async def complete_task(
             outputs = :outputs,
             locked_until = NULL,
             owner_id = NULL
-        WHERE task_id = :task_id;
+        WHERE task_id = :task_id{owner_guard};
     """
+    params: Dict[str, Any] = {
+        "task_id": task_id,
+        "finished_at": timestamp,
+        "outputs": serialized_outputs,
+    }
+    if owner_id is not None:
+        params["owner_id"] = owner_id
     async with managed_transaction(engine) as conn:
-        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-            conn, task_id=task_id, finished_at=timestamp, outputs=serialized_outputs
-        )
+        rowcount = await DQLQuery(
+            sql, result_handler=ResultHandler.ROWCOUNT
+        ).execute(conn, **params)
+    return bool(rowcount and rowcount > 0)
 
 
 async def fail_task(
@@ -1560,12 +1587,26 @@ async def fail_task(
     timestamp: Any,
     error_message: str,
     retry: bool = True,
-) -> None:
+    *,
+    owner_id: Optional[str] = None,
+) -> bool:
     """
     Mark a claimed task as failed. If retry=True and retries remain,
     requeue with exponential backoff. Otherwise move to DEAD_LETTER.
+
+    Returns ``True`` when a row was updated, ``False`` when none matched.
+
+    ``owner_id`` is an optional race guard: when provided, the UPDATE also
+    requires ``owner_id`` to still equal the given value. The liveness
+    reconciler passes the ``owner_id`` it probed so it can only fail the exact
+    execution attempt it observed — if the pg_cron reaper reclaimed the row
+    and the dispatcher re-claimed it as a fresh attempt between the
+    reconciler's SELECT and this write, no row matches and the caller treats
+    the ``False`` return as a lost race rather than failing a task that is
+    legitimately running again. See #750.
     """
     task_schema = get_task_schema()
+    owner_guard = " AND owner_id = :owner_id" if owner_id is not None else ""
 
     if retry:
         # Attempt retry: increment retry_count, reset to PENDING with backoff.
@@ -1599,7 +1640,7 @@ async def fail_task(
                     WHEN retry_count + 1 < LEAST(max_retries, :hard_cap) THEN NULL
                     ELSE owner_id
                 END
-            WHERE task_id = :task_id;
+            WHERE task_id = :task_id{owner_guard};
         """
         params = {
             "task_id": task_id,
@@ -1615,7 +1656,7 @@ async def fail_task(
                 finished_at = :finished_at,
                 locked_until = NULL,
                 owner_id = NULL
-            WHERE task_id = :task_id;
+            WHERE task_id = :task_id{owner_guard};
         """
         params = {
             "task_id": task_id,
@@ -1623,10 +1664,14 @@ async def fail_task(
             "finished_at": timestamp,
         }
 
+    if owner_id is not None:
+        params["owner_id"] = owner_id
+
     async with managed_transaction(engine) as conn:
-        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-            conn, **params,
-        )
+        rowcount = await DQLQuery(
+            sql, result_handler=ResultHandler.ROWCOUNT
+        ).execute(conn, **params)
+    return bool(rowcount and rowcount > 0)
 
 
 async def heartbeat_tasks(

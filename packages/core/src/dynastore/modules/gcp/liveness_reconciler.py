@@ -280,32 +280,59 @@ class GcpLivenessReconciler:
                 if verdict == LivenessVerdict.TERMINAL_FAILED
                 else "Cloud Run execution gone/cancelled"
             )
-            await tasks_module.fail_task(
+            # Race-guarded by ``owner_id``: only fail the exact execution
+            # attempt the probe observed. If the pg_cron reaper reclaimed the
+            # row and the dispatcher re-claimed it as a fresh attempt between
+            # this reconciler's SELECT and now, ``fail_task`` matches 0 rows —
+            # don't fail a task that is legitimately running again (#750).
+            acted = await tasks_module.fail_task(
                 self._engine, task_id, now,
                 f"GcpLivenessReconciler: {reason} ({runner_ref})",
-                retry=True,
+                retry=True, owner_id=owner_id,
             )
-            logger.warning(
-                "GcpLivenessReconciler: task %s %s (execution=%s) — failed (retry).",
-                task_id, verdict.value, runner_ref,
-            )
-            return ReconcileOutcome(verdict)
+            if acted:
+                logger.warning(
+                    "GcpLivenessReconciler: task %s %s (execution=%s) — failed (retry).",
+                    task_id, verdict.value, runner_ref,
+                )
+            else:
+                logger.warning(
+                    "GcpLivenessReconciler: task %s %s (execution=%s) but fail_task "
+                    "matched 0 rows — the pg_cron reaper won the SELECT→probe→act race. "
+                    "Consider tuning liveness_reconciler_interval_seconds down.",
+                    task_id, verdict.value, runner_ref,
+                )
+            return ReconcileOutcome(verdict, race_lost=not acted)
         elif verdict == LivenessVerdict.TERMINAL_SUCCEEDED:
             # The execution exited 0 but the row is still ACTIVE — reconcile it
             # to COMPLETED from the outputs the container persisted before exit
             # (main_task.py writes outputs before the terminal status flip, so
             # they are already on the row by the time the execution SUCCEEDED).
+            #
+            # Race-guarded by ``owner_id`` exactly like the fail path: if the
+            # row was reclaimed and re-dispatched, ``complete_task`` matches 0
+            # rows and we report a lost race instead of completing a fresh
+            # attempt out from under Cloud Run (#750).
             outputs = row.get("outputs")
-            await tasks_module.complete_task(
-                self._engine, task_id, now, outputs=outputs,
+            acted = await tasks_module.complete_task(
+                self._engine, task_id, now, outputs=outputs, owner_id=owner_id,
             )
-            logger.info(
-                "GcpLivenessReconciler: task %s TERMINAL_SUCCEEDED (execution=%s) "
-                "— reconciled to COMPLETED%s.",
-                task_id, runner_ref,
-                "" if outputs is not None else " (no outputs on row)",
-            )
-            return ReconcileOutcome(verdict)
+            if acted:
+                logger.info(
+                    "GcpLivenessReconciler: task %s TERMINAL_SUCCEEDED (execution=%s) "
+                    "— reconciled to COMPLETED%s.",
+                    task_id, runner_ref,
+                    "" if outputs is not None else " (no outputs on row)",
+                )
+            else:
+                logger.warning(
+                    "GcpLivenessReconciler: task %s TERMINAL_SUCCEEDED (execution=%s) but "
+                    "complete_task matched 0 rows — the pg_cron reaper won the "
+                    "SELECT→probe→act race. Consider tuning "
+                    "liveness_reconciler_interval_seconds down.",
+                    task_id, runner_ref,
+                )
+            return ReconcileOutcome(verdict, race_lost=not acted)
         else:  # LivenessVerdict.UNKNOWN
             started_at = row.get("started_at")
             young = (

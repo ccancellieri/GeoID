@@ -80,14 +80,17 @@ def _patch_actions(monkeypatch):
     * ``heartbeat_task_if_active`` — the single-row conditional helper (#741),
                                     used by the ALIVE path so the rowcount
                                     can surface a reaper-won-race signal.
-    * ``fail_task`` / ``complete_task`` — the terminal-verdict actions.
+    * ``fail_task`` / ``complete_task`` — the terminal-verdict actions; like
+                                    ``heartbeat_task_if_active`` they return a
+                                    bool (#750 owner-guarded race signal), so
+                                    they default to ``True`` (acted on a row).
     """
     from dynastore.modules.tasks import tasks_module
 
     hb = AsyncMock()
     hb_if_active = AsyncMock(return_value=True)
-    fail = AsyncMock()
-    complete = AsyncMock()
+    fail = AsyncMock(return_value=True)
+    complete = AsyncMock(return_value=True)
     monkeypatch.setattr(tasks_module, "heartbeat_tasks", hb)
     monkeypatch.setattr(tasks_module, "heartbeat_task_if_active", hb_if_active)
     monkeypatch.setattr(tasks_module, "fail_task", fail)
@@ -141,6 +144,9 @@ async def test_dead_fails_task_with_retry(monkeypatch):
 
     actions.fail.assert_awaited_once()
     assert actions.fail.await_args.kwargs.get("retry") is True
+    # #750: the terminal-verdict write is owner-guarded — the reconciler
+    # passes the owner_id it probed so it can only fail that exact attempt.
+    assert actions.fail.await_args.kwargs.get("owner_id") == row["owner_id"]
     actions.heartbeat.assert_not_awaited()
     actions.complete.assert_not_awaited()
 
@@ -172,6 +178,8 @@ async def test_terminal_succeeded_completes_task_with_outputs(monkeypatch):
 
     actions.complete.assert_awaited_once()
     assert actions.complete.await_args.kwargs.get("outputs") == {"result": "ok"}
+    # #750: owner-guarded — only completes the exact attempt the probe saw.
+    assert actions.complete.await_args.kwargs.get("owner_id") == row["owner_id"]
     actions.fail.assert_not_awaited()
 
 
@@ -491,3 +499,97 @@ async def test_alive_logs_warning_when_reaper_won_race(monkeypatch, caplog):
         "reaper-race loss must log a WARNING — without it the race window "
         "is operationally invisible."
     )
+
+
+# --- #750: terminal-verdict paths are race-guarded too ---------------------
+
+
+@pytest.mark.asyncio
+async def test_dead_race_lost_when_fail_task_skips(monkeypatch, caplog):
+    """#750 — the DEAD path is owner-guarded. When ``fail_task`` matches 0
+    rows (the row was reclaimed + re-dispatched between SELECT and write),
+    ``_reconcile_row`` reports ``race_lost=True`` and logs a WARNING — it
+    does NOT fail a task that is legitimately running again."""
+    from dynastore.modules.tasks import tasks_module
+    from dynastore.modules.tasks.liveness import LivenessVerdict
+
+    _patch_actions(monkeypatch)
+    monkeypatch.setattr(tasks_module, "fail_task", AsyncMock(return_value=False))
+    _patch_probe(monkeypatch, LivenessVerdict.DEAD)
+    rec = _make_reconciler()
+
+    with caplog.at_level("WARNING", logger="dynastore.modules.gcp.liveness_reconciler"):
+        outcome = await rec._reconcile_row(_row())
+
+    assert outcome.verdict == LivenessVerdict.DEAD
+    assert outcome.race_lost is True
+    race_warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING"
+        and "reaper" in r.getMessage().lower()
+        and "race" in r.getMessage().lower()
+    ]
+    assert race_warnings, "a lost DEAD-path race must log a WARNING"
+
+
+@pytest.mark.asyncio
+async def test_terminal_succeeded_race_lost_when_complete_task_skips(monkeypatch, caplog):
+    """#750 — the TERMINAL_SUCCEEDED path is owner-guarded the same way. A
+    0-row ``complete_task`` means the reaper won the race; report it instead
+    of completing a fresh attempt out from under Cloud Run."""
+    from dynastore.modules.tasks import tasks_module
+    from dynastore.modules.tasks.liveness import LivenessVerdict
+
+    _patch_actions(monkeypatch)
+    monkeypatch.setattr(tasks_module, "complete_task", AsyncMock(return_value=False))
+    _patch_probe(monkeypatch, LivenessVerdict.TERMINAL_SUCCEEDED)
+    rec = _make_reconciler()
+
+    with caplog.at_level("WARNING", logger="dynastore.modules.gcp.liveness_reconciler"):
+        outcome = await rec._reconcile_row(_row(outputs={"result": "ok"}))
+
+    assert outcome.verdict == LivenessVerdict.TERMINAL_SUCCEEDED
+    assert outcome.race_lost is True
+    race_warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING"
+        and "reaper" in r.getMessage().lower()
+        and "race" in r.getMessage().lower()
+    ]
+    assert race_warnings, "a lost TERMINAL_SUCCEEDED-path race must log a WARNING"
+
+
+@pytest.mark.asyncio
+async def test_terminal_race_losses_counted_in_pass_summary(monkeypatch, caplog):
+    """#750 — race losses on the terminal paths feed the same ``RACE_LOST``
+    tally as the ALIVE path, so the per-pass summary line reflects every
+    SELECT→probe→act race the reconciler lost, not just the ALIVE ones."""
+    from dynastore.modules.tasks import tasks_module
+    from dynastore.modules.tasks.liveness import LivenessVerdict
+
+    _patch_actions(monkeypatch)
+    monkeypatch.setattr(tasks_module, "fail_task", AsyncMock(return_value=False))
+    monkeypatch.setattr(tasks_module, "complete_task", AsyncMock(return_value=False))
+    rows = [_row(), _row()]
+    monkeypatch.setattr(
+        tasks_module, "select_lapsed_gcp_tasks", AsyncMock(return_value=rows)
+    )
+    verdicts = iter([LivenessVerdict.DEAD, LivenessVerdict.TERMINAL_SUCCEEDED])
+
+    class _RotatingProbe:
+        runner_type = "gcp_cloud_run"
+
+        def owns(self, owner_id):
+            return True
+
+        async def probe_liveness(self, task):
+            return next(verdicts)
+
+    monkeypatch.setattr(_reconciler_mod(), "resolve_probe", lambda owner_id: _RotatingProbe())
+    rec = _make_reconciler()
+
+    with caplog.at_level("INFO", logger="dynastore.modules.gcp.liveness_reconciler"):
+        await rec._reconcile_once()
+
+    msg = _summary_lines(caplog)[-1].getMessage()
+    assert "RACE_LOST=2" in msg, "both terminal-path race losses must be tallied"
