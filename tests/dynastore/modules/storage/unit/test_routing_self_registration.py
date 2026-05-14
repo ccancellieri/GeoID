@@ -147,20 +147,24 @@ def test_indexer_marker_lands_in_INDEX_with_async_outbox_defaults():
     assert entries[0].write_mode == WriteMode.ASYNC
 
 
-def test_apply_handlers_invoke_indexer_self_registration():
-    """Each routing-config apply handler MUST invoke
+def test_validate_handlers_invoke_indexer_self_registration():
+    """Each routing-config validate handler MUST invoke
     ``_self_register_indexers_into`` against the matching tier marker.
     Pins the wiring against accidental drop in a future refactor.
+
+    Self-registration moved apply→validate in #738/#747 — it must run
+    pre-persist so the auto-registered ``source="auto"`` entries are
+    actually serialized into the stored config.
     """
     import asyncio
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import (
         AssetRoutingConfig,
-        _on_apply_asset_routing_config,
-        _on_apply_catalog_routing_config,
-        _on_apply_collection_routing_config,
-        _on_apply_items_routing_config,
+        _validate_asset_routing_config,
+        _validate_catalog_routing_config,
+        _validate_collection_routing_config,
+        _validate_items_routing_config,
     )
 
     calls: list[type] = []
@@ -188,16 +192,16 @@ def test_apply_handlers_invoke_indexer_self_registration():
         "dynastore.tools.discovery.get_protocols",
         lambda proto: [],
     ):
-        asyncio.run(_on_apply_items_routing_config(
+        asyncio.run(_validate_items_routing_config(
             items, catalog_id=None, collection_id=None, db_resource=None,
         ))
-        asyncio.run(_on_apply_collection_routing_config(
+        asyncio.run(_validate_collection_routing_config(
             coll, catalog_id=None, collection_id=None, db_resource=None,
         ))
-        asyncio.run(_on_apply_asset_routing_config(
+        asyncio.run(_validate_asset_routing_config(
             asset, catalog_id=None, collection_id=None, db_resource=None,
         ))
-        asyncio.run(_on_apply_catalog_routing_config(
+        asyncio.run(_validate_catalog_routing_config(
             cat, catalog_id=None, collection_id=None, db_resource=None,
         ))
 
@@ -207,20 +211,20 @@ def test_apply_handlers_invoke_indexer_self_registration():
         CollectionIndexer,
         ItemIndexer,
     )
-    # Each tier's apply handler invokes indexer registration with its own
+    # Each tier's validate handler invokes indexer registration with its own
     # marker Protocol. Order matches the invocation order above.
     assert calls == [ItemIndexer, CollectionIndexer, AssetIndexer, CatalogIndexer]
 
 
-def test_end_to_end_marker_to_INDEX_entry_via_real_apply_handler():
+def test_end_to_end_marker_to_INDEX_entry_via_real_validate_handler():
     """End-to-end: register a real driver opting in to ``CatalogIndexer``,
-    invoke ``_on_apply_catalog_routing_config`` against a fresh
+    invoke ``_validate_catalog_routing_config`` against a fresh
     ``CatalogRoutingConfig``, assert the driver lands in
     ``operations[INDEX]`` with the marker's defaults (async + outbox).
 
-    Validates the full chain shipped in d1aa321 + dbe505f + 98d0801
-    (and the WARN→OUTBOX flip): marker discovery → helper invocation →
-    entry with correct durable-retry policy.
+    Validates the full chain: marker discovery → helper invocation →
+    entry with correct durable-retry policy.  Self-registration moved
+    apply→validate in #738/#747.
     """
     import asyncio
     from typing import ClassVar
@@ -228,7 +232,7 @@ def test_end_to_end_marker_to_INDEX_entry_via_real_apply_handler():
     from dynastore.models.protocols.indexer import CatalogIndexer
     from dynastore.modules.storage.routing_config import (
         WriteMode,
-        _on_apply_catalog_routing_config,
+        _validate_catalog_routing_config,
     )
     from dynastore.tools.discovery import register_plugin, unregister_plugin
 
@@ -248,7 +252,7 @@ def test_end_to_end_marker_to_INDEX_entry_via_real_apply_handler():
         cfg = CatalogRoutingConfig()
         cfg.operations.clear()  # skip default validation against unregistered drivers
 
-        asyncio.run(_on_apply_catalog_routing_config(
+        asyncio.run(_validate_catalog_routing_config(
             cfg, catalog_id=None, collection_id=None, db_resource=None,
         ))
 
@@ -722,19 +726,20 @@ def test_source_field_rejects_invalid_value():
 # ---------------------------------------------------------------------------
 
 
-def test_apply_handlers_invoke_searcher_self_registration():
-    """The items-tier, collection-tier and catalog-tier apply handlers MUST
+def test_validate_handlers_invoke_searcher_self_registration():
+    """The items-tier, collection-tier and catalog-tier validate handlers MUST
     each call `_self_register_searchers_into` (asset tier doesn't, by design —
-    no SEARCH op for assets)."""
+    no SEARCH op for assets).  Self-registration moved apply→validate in
+    #738/#747."""
     import asyncio
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import (
         AssetRoutingConfig,
-        _on_apply_asset_routing_config,
-        _on_apply_catalog_routing_config,
-        _on_apply_collection_routing_config,
-        _on_apply_items_routing_config,
+        _validate_asset_routing_config,
+        _validate_catalog_routing_config,
+        _validate_collection_routing_config,
+        _validate_items_routing_config,
     )
 
     calls: list[type] = []
@@ -760,16 +765,16 @@ def test_apply_handlers_invoke_searcher_self_registration():
         "dynastore.tools.discovery.get_protocols",
         lambda proto: [],
     ):
-        asyncio.run(_on_apply_items_routing_config(
+        asyncio.run(_validate_items_routing_config(
             items, catalog_id=None, collection_id=None, db_resource=None,
         ))
-        asyncio.run(_on_apply_collection_routing_config(
+        asyncio.run(_validate_collection_routing_config(
             coll, catalog_id=None, collection_id=None, db_resource=None,
         ))
-        asyncio.run(_on_apply_asset_routing_config(
+        asyncio.run(_validate_asset_routing_config(
             asset, catalog_id=None, collection_id=None, db_resource=None,
         ))
-        asyncio.run(_on_apply_catalog_routing_config(
+        asyncio.run(_validate_catalog_routing_config(
             cat, catalog_id=None, collection_id=None, db_resource=None,
         ))
 
@@ -778,7 +783,7 @@ def test_apply_handlers_invoke_searcher_self_registration():
         CollectionStore,
     )
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
-    # Each tier's apply handler invokes searcher registration once with its
+    # Each tier's validate handler invokes searcher registration once with its
     # own marker Protocol. Order matches invocation order above.
     assert calls == [
         CollectionItemsStore,

@@ -84,12 +84,17 @@ class ConfigsProtocol(Protocol):
         collection_id: Optional[str] = None,
         check_immutability: bool = True,
         ctx: Optional["DriverContext"] = None,
-    ) -> None:
+    ) -> "PluginConfig":
         """
         Sets configuration at the appropriate level based on provided parameters:
         - If collection_id is provided: sets at collection level
         - If only catalog_id is provided: sets at catalog level
         - If neither is provided: sets at platform level
+
+        Returns the persisted config — the post-apply object, mutated in
+        place by the validate phase (``_self_register_*`` augmentation).
+        The configs API route returns this body; #738/#747 — a successful
+        PUT now returns the effective config, not ``200 + null``.
         """
         ...
 
@@ -197,8 +202,8 @@ class ConfigsProtocol(Protocol):
         collection_id: Optional[str] = None,
         check_immutability: bool = True,
         ctx: Optional["DriverContext"] = None,
-    ) -> None:
-        """Store ``config`` at ``(ref_key, scope)``.
+    ) -> "PluginConfig":
+        """Store ``config`` at ``(ref_key, scope)`` and return it.
 
         ``config`` carries its own dispatch class — implementations persist
         the row with ``class_key`` derived from ``type(config).class_key()``
@@ -211,6 +216,9 @@ class ConfigsProtocol(Protocol):
         Immutability is enforced on the row at the same ref_key (an
         operator can't repurpose a ref to a different class) when
         ``check_immutability=True``.
+
+        Returns the post-apply config (mutated in place by the validate
+        phase).
         """
         ...
 

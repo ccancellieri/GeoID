@@ -372,7 +372,15 @@ class ConfigService(ConfigsProtocol):
         collection_id: Optional[str] = None,
         check_immutability: bool = True,
         ctx: Optional[DriverContext] = None,
-    ) -> None:
+    ) -> "PluginConfig":
+        """Persist a config and return it.
+
+        The returned object is the post-apply config — validate handlers
+        and the ``_self_register_*`` augmentation mutate ``config`` in
+        place before the upsert, so callers (and the configs API route)
+        get the *effective* stored shape rather than ``None``.  #738/#747
+        — returning the config is what replaces the silent ``200 + null``.
+        """
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
         if collection_id is not None:
@@ -393,6 +401,7 @@ class ConfigService(ConfigsProtocol):
                 check_immutability=check_immutability,
                 ctx=DriverContext(db_resource=db_resource) if db_resource else None,
             )
+        return config
 
     async def _set_catalog_config(
         self,
@@ -798,8 +807,12 @@ class ConfigService(ConfigsProtocol):
         collection_id: Optional[str] = None,
         check_immutability: bool = True,
         ctx: Optional[DriverContext] = None,
-    ) -> None:
-        """Tier-local write at ``(ref_key, scope)`` — see ConfigsProtocol."""
+    ) -> "PluginConfig":
+        """Tier-local write at ``(ref_key, scope)`` — see ConfigsProtocol.
+
+        Returns the post-apply config (mutated in place by the validate
+        phase) — #738/#747, replaces the silent ``200 + null``.
+        """
         if collection_id is not None and catalog_id is None:
             raise ValueError("catalog_id is required when collection_id is provided")
 
@@ -814,14 +827,14 @@ class ConfigService(ConfigsProtocol):
                 ref_key, catalog_id, collection_id, cls, config,
                 check_immutability=check_immutability, db_resource=db_resource,
             )
-            return
+            return config
 
         if catalog_id is not None:
             await self._set_catalog_config_by_ref(
                 ref_key, catalog_id, cls, config,
                 check_immutability=check_immutability, db_resource=db_resource,
             )
-            return
+            return config
 
         # Platform scope — delegate.
         platform_svc = self._get_platform_config_service()
@@ -838,6 +851,7 @@ class ConfigService(ConfigsProtocol):
         )
         # Class-keyed cache lives on the platform service; nothing to bust here.
         _maybe_bust_router(cls, None, None)
+        return config
 
     async def _set_catalog_config_by_ref(
         self,

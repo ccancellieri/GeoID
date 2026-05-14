@@ -1121,7 +1121,7 @@ _logger = _logging.getLogger(__name__)
 _ALWAYS_VALID_EXTERNAL_ID_FIELDS = frozenset({"geoid", "id"})
 
 
-async def _on_apply_write_policy(
+async def _validate_write_policy(
     config: PluginConfig,
     catalog_id: "Optional[str]",
     collection_id: "Optional[str]",
@@ -1180,15 +1180,15 @@ async def _on_apply_write_policy(
         )
 
 
-ItemsWritePolicy.register_apply_handler(_on_apply_write_policy)
+ItemsWritePolicy.register_validate_handler(_validate_write_policy)
 
 
 # ---------------------------------------------------------------------------
-# Apply handler — ItemsSchema required/unique vs primary-driver capabilities
+# Validate handler — ItemsSchema required/unique vs primary-driver capabilities
 # ---------------------------------------------------------------------------
 
 
-async def _on_apply_items_schema(
+async def _validate_items_schema(
     config: PluginConfig,
     catalog_id: "Optional[str]",
     collection_id: "Optional[str]",
@@ -1272,4 +1272,4 @@ async def _on_apply_items_schema(
         )
 
 
-ItemsSchema.register_apply_handler(_on_apply_items_schema)
+ItemsSchema.register_validate_handler(_validate_items_schema)

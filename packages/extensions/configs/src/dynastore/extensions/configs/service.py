@@ -40,7 +40,6 @@ from dynastore.modules import get_protocol
 from dynastore.models.protocols import WebModuleProtocol, ConfigsProtocol
 from dynastore.modules.db_config.engine_config import EngineConfig
 from dynastore.modules.db_config.platform_config_service import (
-    enforce_config_immutability,
     require_config_class,
     resolve_config_class,
     list_registered_configs,

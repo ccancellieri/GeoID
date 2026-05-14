@@ -1160,25 +1160,23 @@ def _self_register_store_drivers(
             )
 
 
-async def _on_apply_items_routing_config(
+async def _validate_items_routing_config(
     config: ItemsRoutingConfig,
     catalog_id: Optional[str],
     collection_id: Optional[str],
     db_resource: Optional[Any],
 ) -> None:
-    """Called after items routing config is written.
+    """Validate-phase handler for items routing config (#738).
 
     Validates driver_ref, hints, operations, write_mode for items dispatch
-    entries (``CollectionItemsStore`` drivers); auto-registers discoverable
-    ``ItemIndexer`` drivers and SEARCH-capable items drivers; invalidates
-    the router cache.
+    entries (``CollectionItemsStore`` drivers) and auto-registers
+    discoverable ``ItemIndexer`` drivers and SEARCH-capable items drivers.
 
-    NOTE: ensure_storage() for collection WRITE/READ drivers is intentionally
-    NOT called here. It is invoked by the collection-creation flow
-    (CollectionService._create_collection_internal step 6) on the write driver,
-    which is the only correct point because the ItemsPostgresqlDriverConfig
-    (physical_table, sidecars) must be fully resolved before storage is
-    provisioned.
+    Runs PRE-PERSIST: a failure here propagates as HTTP 4xx and the upsert
+    is rolled back.  The ``_self_register_*`` calls mutate ``config.operations``
+    in place — running them pre-upsert means the auto-registered
+    ``source="auto"`` entries are actually persisted (they were silently
+    dropped when this ran post-upsert).
     """
     from dynastore.models.protocols.indexer import ItemIndexer
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
@@ -1190,11 +1188,31 @@ async def _on_apply_items_routing_config(
     # Items-tier: auto-register ItemIndexer drivers (gated on
     # ``Operation.INDEX in driver.auto_register_for_routing``) +
     # ``CollectionItemsStore`` drivers opting into ``Operation.SEARCH``
-    # — apply-handler parity with the read-time model_validator so
-    # operator PUTs also pick up auto-augmentation.
+    # — parity with the read-time model_validator so operator PUTs also
+    # pick up auto-augmentation.
     _self_register_indexers_into(config.operations, ItemIndexer)
     _self_register_searchers_into(config.operations, CollectionItemsStore)
 
+
+async def _on_apply_items_routing_config(
+    config: ItemsRoutingConfig,
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    db_resource: Optional[Any],
+) -> None:
+    """Apply-phase handler for items routing config — side effects only.
+
+    Invalidates the router cache and syncs the catalog-wide DENY policy.
+    Validation + self-registration moved to ``_validate_items_routing_config``
+    (the validate phase) in #738/#747.
+
+    NOTE: ensure_storage() for collection WRITE/READ drivers is intentionally
+    NOT called here. It is invoked by the collection-creation flow
+    (CollectionService._create_collection_internal step 6) on the write driver,
+    which is the only correct point because the ItemsPostgresqlDriverConfig
+    (physical_table, sidecars) must be fully resolved before storage is
+    provisioned.
+    """
     # Invalidate router cache
     try:
         from dynastore.modules.storage.router import invalidate_router_cache
@@ -1252,22 +1270,20 @@ async def _sync_deny_policy_for_catalog(
         )
 
 
-async def _on_apply_collection_routing_config(
+async def _validate_collection_routing_config(
     config: CollectionRoutingConfig,
     catalog_id: Optional[str],
     collection_id: Optional[str],
     db_resource: Optional[Any],
 ) -> None:
-    """Called after collection-metadata routing config is written.
+    """Validate-phase handler for collection-metadata routing config (#738).
 
-    Validates entries against the ``CollectionStore`` registry,
-    auto-registers installed metadata drivers (READ/WRITE), auto-registers
+    Validates entries against the ``CollectionStore`` registry and
+    auto-registers installed metadata drivers (READ/WRITE) plus
     discoverable ``CollectionIndexer`` and SEARCH-capable
-    ``CollectionStore`` drivers, and calls ``ensure_storage()`` on
-    READ drivers.
-
-    The collection-metadata router is cache-free (pure discovery fan-out);
-    nothing to invalidate after this apply.
+    ``CollectionStore`` drivers.  Runs PRE-PERSIST so the
+    ``_self_register_*`` ``source="auto"`` entries persist and a bad
+    driver_ref propagates as HTTP 4xx.
     """
     from dynastore.models.protocols.entity_store import CollectionStore
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
@@ -1318,34 +1334,60 @@ async def _on_apply_collection_routing_config(
                     entry.driver_ref,
                 )
 
-    # Auto-register discoverable indexers + searchers — apply-handler parity
-    # with the read-time model_validator on CollectionRoutingConfig.
+    # Auto-register discoverable indexers + searchers — parity with the
+    # read-time model_validator on CollectionRoutingConfig.
     _self_register_indexers_into(config.operations, CollectionIndexer)
     _self_register_searchers_into(config.operations, CollectionStore)
 
-    # Call ensure_storage() on READ drivers (idempotent, catalog-scoped).
-    if catalog_id:
-        for entry in config.operations.get(Operation.READ, []):
-            driver = store_driver_index.get(entry.driver_ref)
-            if driver is None:
-                continue
-            try:
-                await driver.ensure_storage(catalog_id)
-            except Exception as exc:
-                logger.warning(
-                    "ensure_storage failed for metadata driver '%s' on catalog '%s': %s",
-                    entry.driver_ref, catalog_id, exc,
-                )
+
+async def _on_apply_collection_routing_config(
+    config: CollectionRoutingConfig,
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    db_resource: Optional[Any],
+) -> None:
+    """Apply-phase handler for collection-metadata routing config — side
+    effects only.
+
+    Calls ``ensure_storage()`` on READ drivers (idempotent, catalog-scoped).
+    Validation + self-registration moved to
+    ``_validate_collection_routing_config`` in #738/#747.  The
+    collection-metadata router is cache-free, so there's nothing else to do.
+    """
+    if not catalog_id:
+        return
+    from dynastore.models.protocols.entity_store import CollectionStore
+    from dynastore.tools.discovery import get_protocols
+
+    store_driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionStore)}
+    for entry in config.operations.get(Operation.READ, []):
+        driver = store_driver_index.get(entry.driver_ref)
+        if driver is None:
+            continue
+        try:
+            await driver.ensure_storage(catalog_id)
+        except Exception as exc:
+            logger.warning(
+                "ensure_storage failed for metadata driver '%s' on catalog '%s': %s",
+                entry.driver_ref, catalog_id, exc,
+            )
 
 
-async def _on_apply_asset_routing_config(
+async def _validate_asset_routing_config(
     config: AssetRoutingConfig,
     catalog_id: Optional[str],
     collection_id: Optional[str],
     db_resource: Optional[Any],
 ) -> None:
-    """Called after asset routing config is written."""
+    """Validate-phase handler for asset routing config (#738).
+
+    Validates entries against the ``AssetStore`` registry and auto-registers
+    discoverable ``AssetIndexer`` + ``AssetUploadProtocol`` drivers.  Runs
+    PRE-PERSIST so the ``source="auto"`` entries persist and a bad
+    driver_ref / hint propagates as HTTP 4xx.
+    """
     from dynastore.models.protocols.asset_driver import AssetStore
+    from dynastore.models.protocols.asset_upload import AssetUploadProtocol
     from dynastore.tools.discovery import get_protocols
 
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(AssetStore)}
@@ -1355,8 +1397,23 @@ async def _on_apply_asset_routing_config(
     _self_register_indexers_into(config.operations, AssetIndexer)
 
     # Auto-register installed AssetUploadProtocol impls under operations[UPLOAD].
-    from dynastore.models.protocols.asset_upload import AssetUploadProtocol
     _self_register_upload_into(config.operations, AssetUploadProtocol)
+
+
+async def _on_apply_asset_routing_config(
+    config: AssetRoutingConfig,
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    db_resource: Optional[Any],
+) -> None:
+    """Apply-phase handler for asset routing config — side effects only.
+
+    Invalidates the asset router cache and calls ``ensure_storage()`` on
+    referenced asset drivers.  Validation + self-registration moved to
+    ``_validate_asset_routing_config`` in #738/#747.
+    """
+    from dynastore.models.protocols.asset_driver import AssetStore
+    from dynastore.tools.discovery import get_protocols
 
     # Invalidate router cache
     try:
@@ -1368,6 +1425,7 @@ async def _on_apply_asset_routing_config(
 
     # Call ensure_storage() on all referenced asset drivers (idempotent).
     if catalog_id and collection_id:
+        driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(AssetStore)}
         seen_ids: set[str] = set()
         for entries in config.operations.values():
             for entry in entries:
@@ -1385,21 +1443,26 @@ async def _on_apply_asset_routing_config(
                 )
 
 
-async def _on_apply_catalog_routing_config(
+async def _validate_catalog_routing_config(
     config: CatalogRoutingConfig,
     catalog_id: Optional[str],
     collection_id: Optional[str],
     db_resource: Optional[Any],
 ) -> None:
-    """Called after catalog routing config is written.
+    """Validate-phase handler for catalog routing config (#738).
 
     Validates ``driver_ref``, hints, and operation capability for every entry in
-    ``config.operations`` against the ``CatalogStore`` driver registry.
-    Mirrors :func:`_on_apply_routing_config` for the catalog tier.
+    ``config.operations`` against the ``CatalogStore`` driver registry, and
+    auto-registers installed store drivers + ``CatalogIndexer`` /
+    SEARCH-capable ``CatalogStore`` drivers.  Runs PRE-PERSIST.
 
     INDEX / BACKUP entries are validated against the same registry — role is a
     config assignment, not a driver-internal contract (see role-based driver
     plan §Routing).
+
+    There is no catalog-tier apply handler: the catalog router is cache-free
+    until ``catalog_router.py`` lands (M2), so once validation + self-register
+    have shaped the config, the upsert is all that remains.
     """
     from dynastore.models.protocols.entity_store import CatalogStore
     from dynastore.tools.discovery import get_protocols
@@ -1414,17 +1477,18 @@ async def _on_apply_catalog_routing_config(
     _self_register_indexers_into(config.operations, CatalogIndexer)
     _self_register_searchers_into(config.operations, CatalogStore)
 
-    # Catalog router cache invalidation is wired in M2 when `catalog_router.py`
-    # lands.  Until then, config changes are picked up on the next resolution
-    # because there's no catalog-tier router to cache.
 
-
-# Register handlers on the config classes themselves.
+# Register handlers on the config classes themselves (#738/#747 — the
+# three-phase lifecycle).  Validate handlers run pre-persist and propagate;
+# apply handlers run post-persist and are best-effort side effects.
 _HandlerSig = Callable[[PluginConfig, Optional[str], Optional[str], Optional[Any]], Any]
+ItemsRoutingConfig.register_validate_handler(cast(_HandlerSig, _validate_items_routing_config))
 ItemsRoutingConfig.register_apply_handler(cast(_HandlerSig, _on_apply_items_routing_config))
+CollectionRoutingConfig.register_validate_handler(cast(_HandlerSig, _validate_collection_routing_config))
 CollectionRoutingConfig.register_apply_handler(cast(_HandlerSig, _on_apply_collection_routing_config))
+AssetRoutingConfig.register_validate_handler(cast(_HandlerSig, _validate_asset_routing_config))
 AssetRoutingConfig.register_apply_handler(cast(_HandlerSig, _on_apply_asset_routing_config))
-CatalogRoutingConfig.register_apply_handler(cast(_HandlerSig, _on_apply_catalog_routing_config))
+CatalogRoutingConfig.register_validate_handler(cast(_HandlerSig, _validate_catalog_routing_config))
 
 
 # ---------------------------------------------------------------------------
@@ -1564,7 +1628,7 @@ async def _enforce_items_routing_privacy_cascade(
 # The collection-side cascade handler is registered from
 # ``modules/catalog/catalog_config.py`` after ``CollectionPrivacy``
 # is fully defined — see the bottom of that module.
-ItemsRoutingConfig.register_apply_handler(
+ItemsRoutingConfig.register_validate_handler(
     cast(_HandlerSig, _enforce_items_routing_privacy_cascade),
 )
 

@@ -192,7 +192,7 @@ def _register_collection_privacy_cascade_handler() -> None:
         _enforce_collection_privacy_cascade,
     )
 
-    CollectionPrivacy.register_apply_handler(
+    CollectionPrivacy.register_validate_handler(
         _enforce_collection_privacy_cascade,
     )
 
