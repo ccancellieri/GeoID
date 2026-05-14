@@ -2,13 +2,18 @@
 
 Covers:
 - ``CollectionPrivacy.is_private`` is ``Immutable[bool]`` —
-  ``enforce_config_immutability`` rejects flips at apply time.
+  ``enforce_config_immutability`` rejects flips **once the collection
+  has been materialized** (at least one item exists).  Empty
+  collections may still flip — see #738 (provisioning-gated
+  immutability).
 - ``CatalogPrivacy.collection_defaults.is_private`` defaults to
   ``False`` and accepts only bool values.
 - The privacy configs participate in PluginConfig discovery
   (``list_registered_configs``) under the right address keys.
 """
 from __future__ import annotations
+
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -22,6 +27,11 @@ from dynastore.modules.db_config.platform_config_service import (
     ImmutableConfigError,
     enforce_config_immutability,
 )
+
+# Patch target: the module-level ``is_materialized`` consumed by
+# ``enforce_config_immutability``.  Tests assert the *gated* enforcement —
+# materialized=True → Immutable rejection fires; materialized=False → no-op.
+_MATERIALIZED = "dynastore.modules.db_config.platform_config_service.is_materialized"
 
 
 # ---------------------------------------------------------------------------
@@ -39,30 +49,55 @@ def test_is_private_can_be_set_true_at_construction():
     assert cfg.is_private is True
 
 
-def test_is_private_immutable_rejects_flip_to_true():
-    """Privacy flip on an existing collection requires moving its
-    docs across indexes — schema-level operation, not a runtime PATCH.
-    The Immutable annotation makes ``enforce_config_immutability``
-    refuse the change."""
+async def test_is_private_immutable_rejects_flip_to_true_when_materialized():
+    """Privacy flip on a collection that already has items requires
+    moving docs across indexes — schema-level operation, not a runtime
+    PATCH.  The Immutable annotation makes ``enforce_config_immutability``
+    refuse the change once the resource is materialized."""
     current = CollectionPrivacy(is_private=False)
     new = CollectionPrivacy(is_private=True)
-    with pytest.raises(ImmutableConfigError, match=r"is_private.*Immutable"):
-        enforce_config_immutability(current, new)
+    with patch(_MATERIALIZED, AsyncMock(return_value=True)):
+        with pytest.raises(ImmutableConfigError, match=r"is_private.*Immutable"):
+            await enforce_config_immutability(
+                current, new,
+                catalog_id="c", collection_id="x", conn=object(),
+            )
 
 
-def test_is_private_immutable_rejects_flip_to_false():
+async def test_is_private_immutable_rejects_flip_to_false_when_materialized():
     current = CollectionPrivacy(is_private=True)
     new = CollectionPrivacy(is_private=False)
-    with pytest.raises(ImmutableConfigError, match=r"is_private.*Immutable"):
-        enforce_config_immutability(current, new)
+    with patch(_MATERIALIZED, AsyncMock(return_value=True)):
+        with pytest.raises(ImmutableConfigError, match=r"is_private.*Immutable"):
+            await enforce_config_immutability(
+                current, new,
+                catalog_id="c", collection_id="x", conn=object(),
+            )
 
 
-def test_is_private_unchanged_does_not_raise():
+async def test_is_private_flip_on_empty_collection_does_not_raise():
+    """#738 — provisioning-gated immutability.  On an empty collection
+    (no items yet) the privacy flag may still be flipped; the
+    Immutable enforcement engages only after the first item lands."""
+    current = CollectionPrivacy(is_private=False)
+    new = CollectionPrivacy(is_private=True)
+    with patch(_MATERIALIZED, AsyncMock(return_value=False)):
+        await enforce_config_immutability(
+            current, new,
+            catalog_id="c", collection_id="x", conn=object(),
+        )  # No exception.
+
+
+async def test_is_private_unchanged_does_not_raise():
     """Re-applying the same config without changing ``is_private``
-    is a no-op for the immutability check."""
+    is a no-op even on a materialized collection."""
     current = CollectionPrivacy(is_private=True)
     new = CollectionPrivacy(is_private=True)
-    enforce_config_immutability(current, new)  # No exception.
+    with patch(_MATERIALIZED, AsyncMock(return_value=True)):
+        await enforce_config_immutability(
+            current, new,
+            catalog_id="c", collection_id="x", conn=object(),
+        )  # No exception.
 
 
 def test_collection_privacy_address_and_visibility():

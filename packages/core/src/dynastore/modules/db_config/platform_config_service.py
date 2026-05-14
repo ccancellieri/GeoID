@@ -63,7 +63,10 @@ from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
 from dynastore.models.driver_context import DriverContext
 
 # imported to avoid circular imports
-from dynastore.modules.db_config.exceptions import ImmutableConfigError
+from dynastore.modules.db_config.exceptions import (
+    ConfigValidationError,
+    ImmutableConfigError,
+)
 from dynastore.tools.json import CustomJSONEncoder
 
 # --- Mutability framework + PluginConfig base (re-exported) ---
@@ -91,6 +94,7 @@ from dynastore.models.mutability import (  # noqa: F401
 )
 from dynastore.modules.db_config.plugin_config import (  # noqa: F401
     _APPLY_HANDLERS,
+    _VALIDATE_HANDLERS,
     PluginConfig,
     _collect_required_fields,
     list_registered_configs,
@@ -100,14 +104,196 @@ from dynastore.modules.db_config.plugin_config import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-def enforce_config_immutability(
-    current_config: Optional["PluginConfig"], new_config: "PluginConfig"
+async def is_materialized(
+    cls: Type["PluginConfig"],
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    conn: Any,
+) -> bool:
+    """True iff the physical resource the config governs has been materialized.
+
+    Per-tier dispatch on ``cls._visibility``:
+
+    - ``"collection"`` → at least one row in the collection's physical items table
+    - ``"catalog"``    → at least one collection registered in the catalog
+    - ``"platform"`` / ``None`` → at least one catalog provisioned in the platform
+
+    Classes may override the default check via a ``_materialization_check``
+    classmethod ``(cat, col, conn) -> bool`` for resource-specific triggers
+    (e.g. bucket exists, ES index created).  The default dispatch is correct
+    for every currently-``Immutable[]`` field; the hook is documented for
+    future tightening.
+
+    The check runs only when ``enforce_config_immutability`` has a non-None
+    ``current_config`` (i.e. on UPDATES, not first writes) — so the cost is
+    one cheap ``EXISTS`` query on the slow path, never on creation.
+
+    On any error (missing catalog/schema, lookup failure) the check returns
+    ``False`` — i.e. pre-materialization — so the gate fails *open* to the
+    less-restrictive side.  An apply handler or the underlying physical
+    layer will surface the real error if one exists.
+    """
+    override = getattr(cls, "_materialization_check", None)
+    if override is not None:
+        try:
+            res = override(catalog_id, collection_id, conn)
+            if inspect.isawaitable(res):
+                res = await res
+            return bool(res)
+        except Exception:
+            logger.debug(
+                "is_materialized: %s._materialization_check raised; "
+                "treating resource as not materialized.",
+                cls.__qualname__, exc_info=True,
+            )
+            return False
+
+    visibility = getattr(cls, "_visibility", None)
+    try:
+        if visibility == "collection":
+            return await _collection_is_materialized(catalog_id, collection_id, conn)
+        if visibility == "catalog":
+            return await _catalog_is_materialized(catalog_id, conn)
+        # platform / None → global catalogs count
+        return await _platform_is_materialized(conn)
+    except Exception:
+        logger.debug(
+            "is_materialized: default dispatch for %s raised; "
+            "treating resource as not materialized.",
+            cls.__qualname__, exc_info=True,
+        )
+        return False
+
+
+async def _collection_is_materialized(
+    catalog_id: Optional[str], collection_id: Optional[str], conn: Any,
+) -> bool:
+    """True iff the collection's physical items table has at least one row.
+
+    Resolves the physical schema via the catalog manager + the writer's
+    ``physical_table`` from ``ItemsPostgresqlDriverConfig`` (the only
+    canonical SOR — ES is an index, not a system of record).  An empty
+    or missing table → not materialized → ``Immutable`` not enforced.
+    """
+    if not catalog_id or not collection_id:
+        return False
+    # Lazy imports to avoid platform-tier import cycles.
+    from dynastore.models.driver_context import DriverContext
+    from dynastore.tools.discovery import get_protocol
+    from dynastore.models.protocols import CatalogsProtocol
+    from dynastore.modules.db_config.locking_tools import check_table_exists
+
+    catalogs = get_protocol(CatalogsProtocol)
+    if catalogs is None:
+        return False
+    catalog_manager = catalogs.catalog_manager  # type: ignore[attr-defined]
+    phys_schema = await catalog_manager.resolve_physical_schema(
+        catalog_id, ctx=DriverContext(db_resource=conn),
+    )
+    if not phys_schema:
+        return False
+    # Resolve the items physical_table from the collection's items PG
+    # driver config (the canonical writer).  Lookup is best-effort —
+    # if any layer is absent, treat as not materialized.
+    from dynastore.modules.storage.driver_config import (
+        ItemsPostgresqlDriverConfig,
+    )
+    cfg_service = get_protocol(__configs_protocol_ref())
+    if cfg_service is None:
+        return False
+    try:
+        items_cfg = await cfg_service.get_config(
+            ItemsPostgresqlDriverConfig,
+            catalog_id=catalog_id, collection_id=collection_id,
+            ctx=DriverContext(db_resource=conn),
+        )
+    except Exception:
+        return False
+    phys_table = getattr(items_cfg, "physical_table", None) if items_cfg else None
+    if not phys_table:
+        return False
+    if not await check_table_exists(conn, phys_table, phys_schema):
+        return False
+    row = await conn.fetchrow(
+        f'SELECT 1 FROM "{phys_schema}"."{phys_table}" LIMIT 1'
+    )
+    return row is not None
+
+
+async def _catalog_is_materialized(
+    catalog_id: Optional[str], conn: Any,
+) -> bool:
+    """True iff the catalog has at least one physically-created collection."""
+    if not catalog_id:
+        return False
+    from dynastore.models.driver_context import DriverContext
+    from dynastore.tools.discovery import get_protocol
+    from dynastore.models.protocols import CatalogsProtocol
+    from dynastore.modules.db_config.locking_tools import check_table_exists
+
+    catalogs = get_protocol(CatalogsProtocol)
+    if catalogs is None:
+        return False
+    catalog_manager = catalogs.catalog_manager  # type: ignore[attr-defined]
+    phys_schema = await catalog_manager.resolve_physical_schema(
+        catalog_id, ctx=DriverContext(db_resource=conn),
+    )
+    if not phys_schema:
+        return False
+    if not await check_table_exists(conn, "collections", phys_schema):
+        return False
+    row = await conn.fetchrow(
+        f'SELECT 1 FROM "{phys_schema}"."collections" LIMIT 1'
+    )
+    return row is not None
+
+
+async def _platform_is_materialized(conn: Any) -> bool:
+    """True iff the platform has at least one provisioned catalog."""
+    from dynastore.modules.db_config.locking_tools import check_table_exists
+    if not await check_table_exists(conn, "catalogs", "configs"):
+        return False
+    row = await conn.fetchrow('SELECT 1 FROM "configs"."catalogs" LIMIT 1')
+    return row is not None
+
+
+def __configs_protocol_ref():
+    """Late-bound ConfigsProtocol resolution — avoids a top-of-file import
+    cycle (configs → catalog → db_config → configs)."""
+    from dynastore.models.protocols.configs import ConfigsProtocol
+    return ConfigsProtocol
+
+
+async def enforce_config_immutability(
+    current_config: Optional["PluginConfig"],
+    new_config: "PluginConfig",
+    *,
+    catalog_id: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    conn: Any = None,
 ) -> None:
-    """Reject Immutable / WriteOnce field mutations."""
+    """Reject Immutable / WriteOnce field mutations once the physical
+    resource has been materialized.
+
+    Three gates compose:
+    1. ``current_config is None`` → first write, no constraint.
+    2. ``not is_materialized(...)`` → physical layer empty; Immutable
+       fields are still safely changeable.  No enforcement.
+    3. Materialized → Immutable + WriteOnce checks fire as before.
+
+    ``WriteOnce`` semantics are unchanged either way (it's used for
+    system-assigned identity like ``physical_table``/``engine_ref`` that
+    transition None→value exactly once at provisioning).  Routing /
+    schema / storage layout fields marked ``Immutable[]`` become
+    editable on empty resources and frozen after data lands — which is
+    the operator mental model the markers were meant to encode.
+    """
     if current_config is None:
         return
     model_class = type(current_config)
     if not isinstance(new_config, model_class):
+        return
+    if not await is_materialized(model_class, catalog_id, collection_id, conn):
         return
     for field_name, field_info in model_class.model_fields.items():
         current_val = getattr(current_config, field_name)
@@ -124,6 +310,74 @@ def enforce_config_immutability(
                     f"Configuration field '{field_name}' in '{model_class.__name__}' is WriteOnce. "
                     f"Cannot change a non-None value: {current_val!r} -> {new_val!r}"
                 )
+
+
+async def run_validate_handlers(
+    cls: Type["PluginConfig"],
+    config: "PluginConfig",
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    conn: Any,
+) -> None:
+    """Phase 2 — validate, pre-upsert.
+
+    Runs each registered validate handler in order; first failure
+    short-circuits and PROPAGATES so the enclosing ``managed_transaction``
+    rolls back the (not-yet-issued) upsert.
+
+    Exception normalization for HTTP mapping:
+    - ``ConfigValidationError`` (already → 400) re-raised as-is.
+    - ``ImmutableConfigError`` (already → 409) re-raised as-is, preserving
+      the distinct 409 path for mutability vs validation.
+    - Any other ``ValueError`` is wrapped in ``ConfigValidationError`` so
+      it lands on the 400 mapping rather than the catch-all ``ValueError``
+      → 422 path (which is reserved for schema / shape violations).
+    - Non-ValueError exceptions propagate untouched (real bugs, not
+      domain violations).
+    """
+    for handler in cls.get_validate_handlers():
+        try:
+            res = handler(config, catalog_id, collection_id, conn)
+            if inspect.isawaitable(res):
+                await res
+        except ConfigValidationError:
+            raise
+        except ImmutableConfigError:
+            raise
+        except ValueError as e:
+            raise ConfigValidationError(str(e)) from e
+
+
+async def run_apply_handlers(
+    cls: Type["PluginConfig"],
+    config: "PluginConfig",
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    conn: Any,
+) -> None:
+    """Phase 3 — apply, post-upsert.
+
+    Side effects only (cache invalidation, auto-registration, ensure_storage,
+    deny-policy sync, plugin reconnect/restart).  Best-effort: each handler
+    is wrapped in ``try/except Exception`` that logs and continues.  A
+    transient side-effect blip does not roll back a valid persisted config.
+
+    Extension point (deferred per the #738 plan): a future
+    ``register_apply_handler(handler, *, fatal=True)`` flag would let
+    specific handlers opt into propagation+rollback.  No current consumer.
+    """
+    class_key = cls.class_key()
+    for handler in cls.get_apply_handlers():
+        try:
+            res = handler(config, catalog_id, collection_id, conn)
+            if inspect.isawaitable(res):
+                await res
+        except Exception as e:
+            logger.error(
+                "apply handler failed for class=%r catalog=%r collection=%r: %s",
+                class_key, catalog_id, collection_id, e,
+                exc_info=True,
+            )
 
 
 # --- Field-level change detection ---
@@ -344,7 +598,14 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                     current_data, cls
                 ) else current_data
                 if check_immutability:
-                    enforce_config_immutability(old_config, config)
+                    await enforce_config_immutability(
+                        old_config, config,
+                        catalog_id=None, collection_id=None, conn=conn,
+                    )
+
+            # Phase 2 — validate (pre-persist).  Propagates on failure;
+            # ``managed_transaction`` rolls back the (not-yet-issued) upsert.
+            await run_validate_handlers(cls, config, None, None, conn)
 
             await _register_schema(conn, config)
 
@@ -366,16 +627,8 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 ),
             )
 
-            for apply_handler in cls.get_apply_handlers():
-                try:
-                    res = apply_handler(config, None, None, conn)
-                    if inspect.isawaitable(res):
-                        await res
-                except Exception as e:
-                    logger.error(
-                        f"Failed to apply platform configuration for '{class_key}': {e}",
-                        exc_info=True,
-                    )
+            # Phase 3 — apply (post-persist, best-effort).
+            await run_apply_handlers(cls, config, None, None, conn)
 
         self.get_platform_config_internal_cached.cache_invalidate(class_key)
         # Post-commit router bust closes the race where an apply_handler
@@ -501,7 +754,13 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                     )
                 if check_immutability:
                     old_config = cls.model_validate(existing_row["config_data"])
-                    enforce_config_immutability(old_config, config)
+                    await enforce_config_immutability(
+                        old_config, config,
+                        catalog_id=None, collection_id=None, conn=conn,
+                    )
+
+            # Phase 2 — validate (pre-persist).
+            await run_validate_handlers(cls, config, None, None, conn)
 
             await _register_schema(conn, config)
 
@@ -520,17 +779,8 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 ),
             )
 
-            for apply_handler in cls.get_apply_handlers():
-                try:
-                    res = apply_handler(config, None, None, conn)
-                    if inspect.isawaitable(res):
-                        await res
-                except Exception as e:
-                    logger.error(
-                        f"Failed to apply platform configuration for "
-                        f"ref={ref_key!r} class={class_key!r}: {e}",
-                        exc_info=True,
-                    )
+            # Phase 3 — apply (post-persist, best-effort).
+            await run_apply_handlers(cls, config, None, None, conn)
 
         # Invalidate the class-keyed cache for the dispatch class so any
         # waterfall reads pick up the change.  Multi-instance rows still

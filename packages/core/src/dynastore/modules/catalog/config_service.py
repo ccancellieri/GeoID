@@ -18,7 +18,6 @@
 
 import logging
 import json
-import inspect
 from typing import Optional, Dict, Any, Type, Union, TYPE_CHECKING
 from dynastore.tools.cache import cached
 from dynastore.modules.storage.router import invalidate_router_cache
@@ -77,6 +76,8 @@ from dynastore.modules.db_config.platform_config_service import (
     enforce_config_immutability,
     require_config_class,
     resolve_config_class,
+    run_apply_handlers,
+    run_validate_handlers,
     _register_schema,
 )
 from dynastore.modules.db_config.locking_tools import check_table_exists
@@ -431,7 +432,13 @@ class ConfigService(ConfigsProtocol):
                 )
                 if current_data:
                     current_config = cls.model_validate(current_data)
-                    enforce_config_immutability(current_config, config)
+                    await enforce_config_immutability(
+                        current_config, config,
+                        catalog_id=catalog_id, collection_id=None, conn=conn,
+                    )
+
+            # Phase 2 — validate (pre-persist).
+            await run_validate_handlers(cls, config, catalog_id, None, conn)
 
             await _register_schema(conn, config)
 
@@ -457,16 +464,8 @@ class ConfigService(ConfigsProtocol):
                 config_data=json.dumps(config_data, cls=CustomJSONEncoder),
             )
 
-            for apply_handler in cls.get_apply_handlers():
-                try:
-                    res = apply_handler(config, catalog_id, None, conn)
-                    if inspect.isawaitable(res):
-                        await res
-                except Exception as e:
-                    logger.error(
-                        f"Failed to apply catalog configuration for '{class_key}' on catalog '{catalog_id}': {e}",
-                        exc_info=True,
-                    )
+            # Phase 3 — apply (post-persist, best-effort).
+            await run_apply_handlers(cls, config, catalog_id, None, conn)
 
         _catalog_config_cache.cache_invalidate(
             self.engine, self._get_catalog_manager(), catalog_id, class_key
@@ -524,7 +523,13 @@ class ConfigService(ConfigsProtocol):
                 )
                 if current_data:
                     current_config = cls.model_validate(current_data)
-                    enforce_config_immutability(current_config, config)
+                    await enforce_config_immutability(
+                        current_config, config,
+                        catalog_id=catalog_id, collection_id=collection_id, conn=conn,
+                    )
+
+            # Phase 2 — validate (pre-persist).
+            await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
 
             await _register_schema(conn, config)
 
@@ -551,16 +556,8 @@ class ConfigService(ConfigsProtocol):
                 config_data=json.dumps(config_data, cls=CustomJSONEncoder),
             )
 
-            for apply_handler in cls.get_apply_handlers():
-                try:
-                    res = apply_handler(config, catalog_id, collection_id, conn)
-                    if inspect.isawaitable(res):
-                        await res
-                except Exception as e:
-                    logger.error(
-                        f"Failed to apply collection configuration for '{class_key}' on '{catalog_id}/{collection_id}': {e}",
-                        exc_info=True,
-                    )
+            # Phase 3 — apply (post-persist, best-effort).
+            await run_apply_handlers(cls, config, catalog_id, collection_id, conn)
 
         _collection_config_cache.cache_invalidate(
             self.engine, self._get_catalog_manager(), catalog_id, collection_id, class_key
@@ -884,9 +881,13 @@ class ConfigService(ConfigsProtocol):
                         f"pick a different name."
                     )
                 if check_immutability:
-                    enforce_config_immutability(
+                    await enforce_config_immutability(
                         cls.model_validate(existing["config_data"]), config,
+                        catalog_id=catalog_id, collection_id=None, conn=conn,
                     )
+
+            # Phase 2 — validate (pre-persist).
+            await run_validate_handlers(cls, config, catalog_id, None, conn)
 
             await _register_schema(conn, config)
 
@@ -907,17 +908,8 @@ class ConfigService(ConfigsProtocol):
                 config_data=json.dumps(config_data, cls=CustomJSONEncoder),
             )
 
-            for apply_handler in cls.get_apply_handlers():
-                try:
-                    res = apply_handler(config, catalog_id, None, conn)
-                    if inspect.isawaitable(res):
-                        await res
-                except Exception as e:
-                    logger.error(
-                        f"Failed to apply catalog config for ref={ref_key!r} "
-                        f"class={class_key!r} on catalog '{catalog_id}': {e}",
-                        exc_info=True,
-                    )
+            # Phase 3 — apply (post-persist, best-effort).
+            await run_apply_handlers(cls, config, catalog_id, None, conn)
 
         _catalog_config_cache.cache_invalidate(
             self.engine, self._get_catalog_manager(), catalog_id, class_key
@@ -970,9 +962,13 @@ class ConfigService(ConfigsProtocol):
                         f"overwrite with class_key={class_key!r}."
                     )
                 if check_immutability:
-                    enforce_config_immutability(
+                    await enforce_config_immutability(
                         cls.model_validate(existing["config_data"]), config,
+                        catalog_id=catalog_id, collection_id=collection_id, conn=conn,
                     )
+
+            # Phase 2 — validate (pre-persist).
+            await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
 
             await _register_schema(conn, config)
 
@@ -994,18 +990,8 @@ class ConfigService(ConfigsProtocol):
                 config_data=json.dumps(config_data, cls=CustomJSONEncoder),
             )
 
-            for apply_handler in cls.get_apply_handlers():
-                try:
-                    res = apply_handler(config, catalog_id, collection_id, conn)
-                    if inspect.isawaitable(res):
-                        await res
-                except Exception as e:
-                    logger.error(
-                        f"Failed to apply collection config for ref={ref_key!r} "
-                        f"class={class_key!r} on {catalog_id}/{collection_id}: "
-                        f"{e}",
-                        exc_info=True,
-                    )
+            # Phase 3 — apply (post-persist, best-effort).
+            await run_apply_handlers(cls, config, catalog_id, collection_id, conn)
 
         _collection_config_cache.cache_invalidate(
             self.engine,

@@ -47,6 +47,17 @@ from dynastore.tools.typed_store.registry import TypedModelRegistry
 # imperative call supports multiple handlers per class natively).
 _APPLY_HANDLERS: Dict[Type["PluginConfig"], List[Callable[..., Any]]] = {}
 
+# Module-level validate-handler registry — mirrors ``_APPLY_HANDLERS``.
+# Validate handlers run **pre-persist** (before the upsert, inside the same
+# transaction); their exceptions PROPAGATE so the API returns 4xx and the
+# upsert is rolled back.  Apply handlers run post-persist and are best-
+# effort (log + swallow).  See #738 — putting validation in apply handlers
+# wrapped in a blanket ``except Exception: logger.error(...)`` silently
+# persists invalid configs and returns 200.  Same callable signature as
+# apply handlers: ``(config, catalog_id, collection_id, db_resource) -> None``,
+# sync or async.
+_VALIDATE_HANDLERS: Dict[Type["PluginConfig"], List[Callable[..., Any]]] = {}
+
 
 class PluginConfig(PersistentModel):
     """Base class for all mutable plugin configurations.
@@ -225,6 +236,26 @@ class PluginConfig(PersistentModel):
     @classmethod
     def get_apply_handlers(cls) -> List[Callable[..., Any]]:
         return list(_APPLY_HANDLERS.get(cls, []))
+
+    @classmethod
+    def register_validate_handler(
+        cls, handler: Callable[..., Any]
+    ) -> None:
+        """Attach a validate-handler to this config class.
+
+        Validate handlers run pre-persist, inside the config-write txn.
+        Their exceptions PROPAGATE (and roll back the upsert) — unlike
+        apply handlers, which are best-effort post-persist side effects.
+        Use for content checks that need runtime discovery (driver
+        registry, sibling-config cross-checks) and must surface as 4xx.
+        Same signature as apply handlers — ``(config, catalog_id,
+        collection_id, db_resource) -> None``, sync or async.
+        """
+        _VALIDATE_HANDLERS.setdefault(cls, []).append(handler)
+
+    @classmethod
+    def get_validate_handlers(cls) -> List[Callable[..., Any]]:
+        return list(_VALIDATE_HANDLERS.get(cls, []))
 
 
 def resolve_config_class(

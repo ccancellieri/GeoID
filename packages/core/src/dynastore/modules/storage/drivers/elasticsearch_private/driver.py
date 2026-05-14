@@ -107,6 +107,13 @@ class ItemsElasticsearchPrivateDriver(
     supported_hints: FrozenSet[Hint] = frozenset({
         Hint.SEARCH,
         Hint.FULLTEXT,
+        # The private driver shrinks oversized docs via ``simplify_to_fit``
+        # (tools/geometry_simplify.py) and persists the resulting
+        # ``simplification_factor`` — it serves the simplified-geometry
+        # read path exactly like the public ES sibling, which also lists
+        # this hint.  #738: the omission silently failed routing-config
+        # PUTs that pinned this driver with a ``geometry_simplified`` hint.
+        Hint.GEOMETRY_SIMPLIFIED,
         Hint.SPATIAL_FILTER,
         Hint.ATTRIBUTE_FILTER,
         Hint.SORT,
