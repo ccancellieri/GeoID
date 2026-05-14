@@ -134,3 +134,54 @@ async def test_explicit_entries_are_not_overridden() -> None:
         f"Fallback fired even when explicit entries were present. "
         f"Got {result[0][0]!r} instead of explicitly_chosen_driver."
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_drivers_logs_selection_at_debug(monkeypatch, caplog):
+    """After a successful resolve_drivers call a DEBUG record must exist
+    whose message starts with 'router-resolve' and contains the selected
+    driver's class name."""
+    import logging
+
+    from dynastore.modules.storage import router as router_mod
+    from dynastore.modules.storage.routing_config import ItemsRoutingConfig, Operation
+
+    # Fake _resolve_driver_ids_cached: return one (driver_ref, on_failure, write_mode)
+    # tuple so resolve_drivers assembles a ResolvedDriver from the driver_index.
+    async def _fake_ids(routing_plugin_cls, catalog_id, collection_id, operation, hint):
+        return [("items_postgresql_driver", "fatal", "sync")]
+
+    class _FakePostgresDriver:
+        pass
+
+    # Patch the cached async function with our fake.
+    monkeypatch.setattr(router_mod, "_resolve_driver_ids_cached", _fake_ids)
+
+    # Patch DriverRegistry.collection_index to return our fake driver instance.
+    monkeypatch.setattr(
+        router_mod.DriverRegistry,
+        "collection_index",
+        classmethod(lambda cls: {"items_postgresql_driver": _FakePostgresDriver()}),
+    )
+
+    # Bypass the L4 request cache so we always go through resolution logic.
+    monkeypatch.setattr(router_mod, "get_request_driver_cache", lambda: {})
+
+    with caplog.at_level(logging.DEBUG, logger=router_mod.__name__):
+        result = await router_mod.resolve_drivers(
+            Operation.READ,
+            "test_cat_debug_log",
+            "test_col",
+            routing_plugin_cls=ItemsRoutingConfig,
+        )
+
+    assert result, "Expected at least one resolved driver."
+    # driver_ref = type(driver).__name__ = "_FakePostgresDriver" for the patched driver
+    expected_driver_name = _FakePostgresDriver.__name__
+    assert any(
+        "router-resolve" in r.message and expected_driver_name in r.message
+        for r in caplog.records
+    ), (
+        f"Expected a DEBUG record containing 'router-resolve' and "
+        f"{expected_driver_name!r}. Records: {[r.message for r in caplog.records]!r}"
+    )

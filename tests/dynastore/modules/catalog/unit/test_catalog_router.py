@@ -462,19 +462,22 @@ class TestMetadataChangedEventEmission:
 
 
 def test_catalog_routing_config_defaults_use_canonical_names():
-    """After M2.1/M2.3b the defaults must reference the canonical drivers.
+    """The defaults must reference the canonical registered driver_ref.
 
-    Drift here silently breaks ``_validate_routing_entries`` on any
-    deployment that loads ``CatalogRoutingConfig``'s defaults without
-    an explicit platform override.
+    ``catalog_core_postgresql_driver`` / ``catalog_stac_postgresql_driver``
+    were never registered as entry-points — the registered ``CatalogStore``
+    is ``catalog_postgresql_driver``, a composition wrapper that fans CRUD
+    across the catalog_core + catalog_stac PG sidecars internally. Drift
+    here silently breaks ``_validate_routing_entries`` on any deployment
+    that loads ``CatalogRoutingConfig``'s defaults without an explicit
+    platform override.
     """
     from dynastore.modules.storage.routing_config import (
         CatalogRoutingConfig, Operation,
     )
 
     cfg = CatalogRoutingConfig()
-    # Both WRITE and READ fan out across the two domain-scoped primaries.
     write_ids = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
     read_ids = {e.driver_ref for e in cfg.operations[Operation.READ]}
-    assert write_ids == {"catalog_core_postgresql_driver", "catalog_stac_postgresql_driver"}
-    assert read_ids == {"catalog_core_postgresql_driver", "catalog_stac_postgresql_driver"}
+    assert write_ids == {"catalog_postgresql_driver"}
+    assert read_ids == {"catalog_postgresql_driver"}

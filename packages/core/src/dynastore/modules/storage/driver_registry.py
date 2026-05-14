@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 if TYPE_CHECKING:
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
     from dynastore.models.protocols.asset_driver import AssetStore
+    from dynastore.models.protocols.entity_store import CollectionStore, CatalogStore
 
 
 class DriverRegistry:
@@ -55,6 +56,8 @@ class DriverRegistry:
 
     _collection_index: Optional[Dict[str, "CollectionItemsStore"]] = None
     _asset_index: Optional[Dict[str, "AssetStore"]] = None
+    _collection_store_index: Optional[Dict[str, "CollectionStore"]] = None
+    _catalog_store_index: Optional[Dict[str, "CatalogStore"]] = None
     _lock = threading.Lock()
 
     @classmethod
@@ -99,6 +102,42 @@ class DriverRegistry:
         return cls._asset_index
 
     @classmethod
+    def _build_collection_store(cls) -> "Dict[str, CollectionStore]":
+        from dynastore.models.protocols.entity_store import CollectionStore
+        from dynastore.tools.discovery import get_protocols
+        from dynastore.tools.typed_store.base import _to_snake
+        return {
+            _to_snake(type(d).__name__): d
+            for d in get_protocols(CollectionStore)
+        }
+
+    @classmethod
+    def _build_catalog_store(cls) -> "Dict[str, CatalogStore]":
+        from dynastore.models.protocols.entity_store import CatalogStore
+        from dynastore.tools.discovery import get_protocols
+        from dynastore.tools.typed_store.base import _to_snake
+        return {
+            _to_snake(type(d).__name__): d
+            for d in get_protocols(CatalogStore)
+        }
+
+    @classmethod
+    def _ensure_collection_store(cls) -> "Dict[str, CollectionStore]":
+        if cls._collection_store_index is None:
+            with cls._lock:
+                if cls._collection_store_index is None:
+                    cls._collection_store_index = cls._build_collection_store()
+        return cls._collection_store_index
+
+    @classmethod
+    def _ensure_catalog_store(cls) -> "Dict[str, CatalogStore]":
+        if cls._catalog_store_index is None:
+            with cls._lock:
+                if cls._catalog_store_index is None:
+                    cls._catalog_store_index = cls._build_catalog_store()
+        return cls._catalog_store_index
+
+    @classmethod
     def get_collection(
         cls, driver_id: str
     ) -> "Optional[CollectionItemsStore]":
@@ -121,6 +160,16 @@ class DriverRegistry:
         return cls._ensure_asset()
 
     @classmethod
+    def collection_store_index(cls) -> "Dict[str, CollectionStore]":
+        """Full collection-envelope (CollectionStore) driver index, by snake_case ref."""
+        return cls._ensure_collection_store()
+
+    @classmethod
+    def catalog_store_index(cls) -> "Dict[str, CatalogStore]":
+        """Full catalog-envelope (CatalogStore) driver index, by snake_case ref."""
+        return cls._ensure_catalog_store()
+
+    @classmethod
     def clear(cls) -> None:
         """Force rebuild on next access.
 
@@ -129,3 +178,5 @@ class DriverRegistry:
         with cls._lock:
             cls._collection_index = None
             cls._asset_index = None
+            cls._collection_store_index = None
+            cls._catalog_store_index = None

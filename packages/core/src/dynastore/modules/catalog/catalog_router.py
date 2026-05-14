@@ -94,7 +94,6 @@ fuse against that regression.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -102,6 +101,8 @@ from dynastore.models.protocols.entity_store import (
     CatalogStore,
     EntityStoreCapability,
 )
+from dynastore.modules.storage.routed_resolver import resolve_routed
+from dynastore.modules.storage.routing_config import CatalogRoutingConfig, Operation
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,28 @@ def _resolve_catalog_store_drivers() -> List[CatalogStore]:
     return drivers
 
 
+async def _routed_catalog_drivers(
+    operation: str,
+    catalog_id: str,
+    *,
+    db_resource: Optional[Any] = None,
+) -> Optional[List[CatalogStore]]:
+    """Config-driven CatalogStore list for an operation.
+
+    Returns the ordered :class:`CatalogStore` instances configured under
+    ``CatalogRoutingConfig.operations[operation]``, or ``None`` when the
+    routing config could not be consulted (early boot — caller falls back
+    to :func:`_resolve_catalog_store_drivers` discovery).
+    """
+    resolved = await resolve_routed(
+        CatalogRoutingConfig, operation, catalog_id, collection_id=None,
+        db_resource=db_resource,
+    )
+    if not resolved:
+        return None
+    return [driver for _entry, driver in resolved]
+
+
 async def get_catalog_metadata(
     catalog_id: str,
     *,
@@ -193,7 +216,11 @@ async def get_catalog_metadata(
     future refactor that gives each driver its own pooled connection
     can re-enable ``gather`` at that point.
     """
-    drivers = drivers if drivers is not None else _resolve_catalog_store_drivers()
+    if drivers is None:
+        routed = await _routed_catalog_drivers(
+            Operation.READ, catalog_id, db_resource=db_resource,
+        )
+        drivers = routed if routed is not None else _resolve_catalog_store_drivers()
     if not drivers:
         return None
 
@@ -272,9 +299,15 @@ async def upsert_catalog_metadata(
     from the mixin stub.
     """
     if drivers is None:
-        drivers = _filter_capable(
-            _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,
+        routed = await _routed_catalog_drivers(
+            Operation.WRITE, catalog_id, db_resource=db_resource,
         )
+        if routed is not None:
+            drivers = routed
+        else:
+            drivers = _filter_capable(
+                _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,
+            )
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["catalog_write"]:
             logger.warning(
@@ -317,9 +350,15 @@ async def delete_catalog_metadata(
     only drivers never receive ``delete_catalog_metadata``.
     """
     if drivers is None:
-        drivers = _filter_capable(
-            _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,
+        routed = await _routed_catalog_drivers(
+            Operation.WRITE, catalog_id, db_resource=db_resource,
         )
+        if routed is not None:
+            drivers = routed
+        else:
+            drivers = _filter_capable(
+                _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,
+            )
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["catalog_delete"]:
             logger.warning(

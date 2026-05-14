@@ -36,7 +36,6 @@ the driver.  Same pattern as the catalog-tier router.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,6 +43,8 @@ from dynastore.models.protocols.entity_store import (
     CollectionStore,
     EntityStoreCapability,
 )
+from dynastore.modules.storage.routed_resolver import resolve_routed
+from dynastore.modules.storage.routing_config import CollectionRoutingConfig, Operation
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,86 @@ def _resolve_drivers() -> List[CollectionStore]:
     return drivers
 
 
+async def _routed_drivers(
+    operation: str,
+    catalog_id: str,
+    collection_id: Optional[str],
+    *,
+    db_resource: Optional[Any] = None,
+) -> Optional[List[CollectionStore]]:
+    """Config-driven driver list for an operation.
+
+    Returns the ordered ``CollectionStore`` instances configured under
+    ``CollectionRoutingConfig.operations[operation]``, or ``None`` when the
+    routing config could not be consulted (early boot — caller falls back
+    to :func:`_resolve_drivers` discovery).
+    """
+    resolved = await resolve_routed(
+        CollectionRoutingConfig, operation, catalog_id, collection_id,
+        db_resource=db_resource,
+    )
+    if not resolved:
+        return None
+    return [driver for _entry, driver in resolved]
+
+
+def _get_index_dispatcher() -> Any:
+    """Indirection seam — lets tests substitute a fake dispatcher."""
+    from dynastore.modules.storage.index_dispatcher import get_index_dispatcher
+    return get_index_dispatcher()
+
+
+async def _dispatch_collection_index(
+    catalog_id: str,
+    collection_id: str,
+    metadata: Dict[str, Any],
+    *,
+    db_resource: Optional[Any] = None,
+) -> None:
+    """Fan the collection envelope to every Indexer configured under
+    ``CollectionRoutingConfig.operations[INDEX]``.
+
+    Mirrors :meth:`item_service.ItemService._dispatch_index_upsert` at the
+    collection-envelope tier — the single dispatch call site that replaces
+    per-driver ES event listeners.  Failure handling is governed by each
+    routing entry's ``on_failure`` (OUTBOX enqueues a durable retry row,
+    WARN logs, FATAL raises out so the caller's TX rolls back).
+
+    Non-FATAL failures are absorbed here: the PG WRITE has already
+    committed/queued and must stand.  ``IndexerFatal`` propagates.
+    """
+    from dynastore.models.protocols.indexer import IndexContext, IndexOp
+    from dynastore.modules.storage.index_dispatcher import IndexerFatal
+    from dynastore.tools.correlation import get_correlation_id
+
+    dispatcher = _get_index_dispatcher()
+    ops = [
+        IndexOp(
+            op_type="upsert",
+            entity_type="collection",
+            entity_id=collection_id,
+            payload=metadata,
+        )
+    ]
+    ctx = IndexContext(
+        catalog=catalog_id,
+        collection=collection_id,
+        correlation_id=get_correlation_id() or "",
+        pg_conn=db_resource,
+    )
+    try:
+        await dispatcher.fan_out_bulk(ctx, ops)
+    except IndexerFatal:
+        # FATAL contract — propagate so the caller's TX rolls back.
+        raise
+    except Exception as exc:  # noqa: BLE001 — non-FATAL paths absorb
+        logger.warning(
+            "Collection INDEX-hop dispatch failed for %s/%s: %s — "
+            "PG write stands; ES may be stale until reindex",
+            catalog_id, collection_id, exc,
+        )
+
+
 async def get_collection_metadata(
     catalog_id: str,
     collection_id: str,
@@ -109,7 +190,11 @@ async def get_collection_metadata(
     round-trip anyway.  A future refactor that hands each driver its own
     pooled connection can re-enable ``gather`` at that point.
     """
-    drivers = drivers if drivers is not None else _resolve_drivers()
+    if drivers is None:
+        routed = await _routed_drivers(
+            Operation.READ, catalog_id, collection_id, db_resource=db_resource,
+        )
+        drivers = routed if routed is not None else _resolve_drivers()
     if not drivers:
         return None
 
@@ -169,7 +254,13 @@ async def upsert_collection_metadata(
     — they'd raise ``NotImplementedError`` from the mixin stub.
     """
     if drivers is None:
-        drivers = _filter_capable(_resolve_drivers(), EntityStoreCapability.WRITE)
+        routed = await _routed_drivers(
+            Operation.WRITE, catalog_id, collection_id, db_resource=db_resource,
+        )
+        if routed is not None:
+            drivers = routed
+        else:
+            drivers = _filter_capable(_resolve_drivers(), EntityStoreCapability.WRITE)
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["collection_write"]:
             logger.warning(
@@ -192,6 +283,14 @@ async def upsert_collection_metadata(
             )
             raise
 
+    # INDEX hop — propagate the envelope to ES (and any other configured
+    # Indexer).  Pure post-write propagation; PG above is the system of
+    # record.  db_resource (when a live conn) makes the OUTBOX enqueue
+    # atomic with the caller's transaction.
+    await _dispatch_collection_index(
+        catalog_id, collection_id, metadata, db_resource=db_resource,
+    )
+
 
 async def delete_collection_metadata(
     catalog_id: str,
@@ -213,7 +312,13 @@ async def delete_collection_metadata(
     only drivers never receive ``delete_metadata``.
     """
     if drivers is None:
-        drivers = _filter_capable(_resolve_drivers(), EntityStoreCapability.WRITE)
+        routed = await _routed_drivers(
+            Operation.WRITE, catalog_id, collection_id, db_resource=db_resource,
+        )
+        if routed is not None:
+            drivers = routed
+        else:
+            drivers = _filter_capable(_resolve_drivers(), EntityStoreCapability.WRITE)
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["collection_delete"]:
             logger.warning(
@@ -254,7 +359,11 @@ async def search_collection_metadata(
     drivers: Optional[List[CollectionStore]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Delegate SEARCH to the first driver capable of serving the query shape."""
-    drivers = drivers if drivers is not None else _resolve_drivers()
+    if drivers is None:
+        routed = await _routed_drivers(
+            Operation.SEARCH, catalog_id, collection_id=None, db_resource=db_resource,
+        )
+        drivers = routed if routed is not None else _resolve_drivers()
     if not drivers:
         return [], 0
 

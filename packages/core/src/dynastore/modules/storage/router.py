@@ -227,6 +227,16 @@ async def resolve_drivers(
                 operation,
             )
 
+    logger.debug(
+        "router-resolve %s op=%s catalog=%s collection=%s hint=%s -> [%s]",
+        routing_plugin_cls.__name__,
+        operation,
+        catalog_id,
+        collection_id,
+        hint,
+        ", ".join(rd.driver_ref for rd in result) or "(none)",
+    )
+
     # Store in L4 for reuse later in the same request
     l4[l4_key] = result
     return result

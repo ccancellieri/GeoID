@@ -597,13 +597,57 @@ class CollectionRoutingConfig(PluginConfig):
     model_config = ConfigDict(json_schema_extra=ui(category="routing"))
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
-        default_factory=lambda: {},
+        default_factory=lambda: {
+            # Collection-envelope routing. The PG collection driver
+            # (collection_postgresql_driver — internally fans CRUD across
+            # the collection_core + collection_stac sidecars) is the
+            # system of record: primary for both WRITE and READ.
+            # Elasticsearch is the *index* — populated asynchronously via
+            # the INDEX hop (OUTBOX-durable) and fronting SEARCH. PG is
+            # the SEARCH fallback so a deploy without ES still answers
+            # collection search from the authoritative store.
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.INDEX: [
+                OperationDriverEntry(
+                    driver_ref="collection_elasticsearch_driver",
+                    write_mode=WriteMode.ASYNC,
+                    on_failure=FailurePolicy.OUTBOX,
+                    source="auto",
+                ),
+            ],
+            Operation.SEARCH: [
+                # ES is the primary search backend (fast, simplified
+                # geometry). PG is the fallback AND the exact-geometry
+                # path: a consumer needing full-precision geometry passes
+                # hint=Hint.GEOMETRY_EXACT to route SEARCH to PG.
+                OperationDriverEntry(
+                    driver_ref="collection_elasticsearch_driver",
+                    hints={Hint.GEOMETRY_SIMPLIFIED},
+                ),
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    hints={Hint.GEOMETRY_EXACT},
+                ),
+            ],
+        },
         description=(
-            "Operation → ordered driver list for collection-tier routing.  "
-            "READ  = first-match ``CollectionStore`` drivers.  "
-            "TRANSFORM = lazy enrichers.  "
-            "INDEX = async search-sink propagation.  "
-            "BACKUP = async export-sink propagation."
+            "Operation -> ordered driver list for collection-tier routing. "
+            "WRITE/READ = collection_postgresql_driver (system of record). "
+            "INDEX = async OUTBOX-durable propagation to Elasticsearch. "
+            "SEARCH = Elasticsearch primary (geometry_simplified), "
+            "PostgreSQL fallback (geometry_exact). "
+            "TRANSFORM/BACKUP entries are auto-augmented at validation time."
         ),
     )
 
@@ -734,11 +778,11 @@ class CatalogRoutingConfig(PluginConfig):
     role-based driver refactor so catalogs follow the same Primary /
     Transformer / Indexer / Backup pattern as collections.
 
-    M2.1 ships the first two concrete drivers
-    (``CatalogCorePostgresqlDriver`` / ``CatalogStacPostgresqlDriver``);
-    the defaults below pin both under WRITE and READ so a deployment
-    with a catalog containing both CORE and STAC envelopes resolves
-    correctly without explicit platform config.
+    The registered ``CatalogStore`` is ``CatalogPostgresqlDriver`` — a
+    composition wrapper that fans CRUD across the ``catalog_core`` and
+    ``catalog_stac`` PG sidecars internally. The defaults below pin it
+    under WRITE and READ so a deployment resolves correctly without
+    explicit platform config.
 
     ``operations`` supports the same keys as :class:`CollectionRoutingConfig`:
     ``WRITE``, ``READ``, ``SEARCH``, ``TRANSFORM``, ``INDEX``, ``BACKUP``.
@@ -752,29 +796,42 @@ class CatalogRoutingConfig(PluginConfig):
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
-            # M2.3b: fan-out across the domain-scoped Primary drivers.
-            # CORE is first (matches ``_sort_hooks`` priority: required
-            # registry data lands before the optional STAC row).  The
-            # catalog-metadata router merges both results on READ and
-            # parallelises the upsert on WRITE.
+            # catalog_postgresql_driver is the registered CatalogStore
+            # composition wrapper — it fans CRUD across the catalog_core +
+            # catalog_stac PG sidecars internally. It is the system of
+            # record (FATAL) for both WRITE and READ. INDEX propagates to
+            # Elasticsearch asynchronously (OUTBOX-durable). INDEX is also
+            # auto-augmented at validation time with discoverable
+            # CatalogIndexer drivers; the explicit entry keeps the default
+            # config self-contained.
             Operation.WRITE: [
-                OperationDriverEntry(driver_ref="catalog_core_postgresql_driver"),
-                OperationDriverEntry(driver_ref="catalog_stac_postgresql_driver"),
+                OperationDriverEntry(
+                    driver_ref="catalog_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
             ],
             Operation.READ: [
-                OperationDriverEntry(driver_ref="catalog_core_postgresql_driver"),
-                OperationDriverEntry(driver_ref="catalog_stac_postgresql_driver"),
+                OperationDriverEntry(
+                    driver_ref="catalog_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.INDEX: [
+                OperationDriverEntry(
+                    driver_ref="catalog_elasticsearch_driver",
+                    write_mode=WriteMode.ASYNC,
+                    on_failure=FailurePolicy.OUTBOX,
+                    source="auto",
+                ),
             ],
         },
         description=(
-            "Operation → ordered driver list for catalog-tier ``CatalogStore`` drivers. "
-            "Supports WRITE, READ, SEARCH, TRANSFORM, INDEX, BACKUP. "
-            "Default fans out to the CORE + STAC PG Primaries; INDEX and "
-            "SEARCH entries are auto-augmented at validation time with "
-            "every discoverable CatalogIndexer / SEARCH-capable "
-            "CatalogStore (typically CatalogElasticsearchDriver). "
-            "Operator-explicit entries take precedence; auto-augmentation "
-            "is idempotent set-default behaviour, never overwrite."
+            "Operation -> ordered driver list for catalog-tier CatalogStore "
+            "drivers. WRITE/READ = catalog_postgresql_driver (system of "
+            "record). INDEX = async OUTBOX-durable propagation to "
+            "Elasticsearch; auto-augmented at validation time with every "
+            "discoverable CatalogIndexer. Operator-explicit entries take "
+            "precedence; auto-augmentation is idempotent set-default."
         ),
     )
 

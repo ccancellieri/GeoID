@@ -258,6 +258,64 @@ class CatalogPrivacy(PluginConfig):
 # ---------------------------------------------------------------------------
 
 
+def _build_private_collection_routing() -> Any:
+    """Build the ``CollectionRoutingConfig`` seeded onto a private collection.
+
+    ``collection_router.py`` is config-driven: it resolves WRITE/READ/SEARCH
+    from ``CollectionRoutingConfig``, falling back to the model defaults
+    (public PG + public ES) when no explicit config is present.  All four
+    operations must therefore be pinned explicitly:
+
+    - WRITE / READ → ``collection_postgresql_driver`` (PG is the system of
+      record for collection envelopes; durable, strongly consistent).
+    - INDEX / SEARCH → ``collection_elasticsearch_private_driver`` (per-tenant
+      private index; DENY policy blocks ``all_users`` GET access).
+
+    Without an explicit SEARCH entry a private collection's
+    ``search_collection_metadata`` call would fall through to the model
+    default ``collection_elasticsearch_driver`` — the PUBLIC shared index —
+    leaking private collection envelopes into public search results.
+    """
+    from dynastore.modules.storage.routing_config import (
+        CollectionRoutingConfig,
+        FailurePolicy,
+        Operation,
+        OperationDriverEntry,
+        WriteMode,
+    )
+
+    return CollectionRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.INDEX: [
+                OperationDriverEntry(
+                    driver_ref="collection_elasticsearch_private_driver",
+                    write_mode=WriteMode.ASYNC,
+                    on_failure=FailurePolicy.OUTBOX,
+                    source="auto",
+                ),
+            ],
+            Operation.SEARCH: [
+                OperationDriverEntry(
+                    driver_ref="collection_elasticsearch_private_driver",
+                    source="auto",
+                ),
+            ],
+        },
+    )
+
+
 async def apply_catalog_default_privacy_seed(
     catalog_id: str,
     collection_id: str,
@@ -397,18 +455,7 @@ async def apply_catalog_default_privacy_seed(
     # CollectionRoutingConfig has no cross-config constraint, so this
     # write's position relative to the pair above is incidental (we
     # put it last for clarity).
-    private_collection_routing = CollectionRoutingConfig(
-        operations={
-            Operation.INDEX: [
-                OperationDriverEntry(
-                    driver_ref="collection_elasticsearch_private_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    source="auto",
-                ),
-            ],
-        },
-    )
+    private_collection_routing = _build_private_collection_routing()
     await configs.set_config(
         CollectionRoutingConfig,
         private_collection_routing,
