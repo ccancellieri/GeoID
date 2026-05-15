@@ -38,6 +38,64 @@ from dynastore.modules.iam.exceptions import InvalidAuthTokenError
 logger = logging.getLogger(__name__)
 
 
+def _build_rate_limit_headers(inspections: list, *, deny: bool) -> dict:
+    """Project ``inspect()`` payloads from rate_limit / max_count handlers
+    onto the response headers per the RFC-6585 / IETF rate-limit draft.
+
+    Most restrictive bucket wins (smallest ``remaining``). On deny we
+    also emit ``Retry-After`` so well-behaved clients back off; for
+    rate windows that's ``reset_at - now`` (or the window width as a
+    floor); for lifetime quotas there is no retry-after — operators
+    have to reset the counter.
+    """
+    if not inspections:
+        return {}
+
+    import time
+
+    best: dict = {}
+    for entry in inspections:
+        if not isinstance(entry, dict):
+            continue
+        t = entry.get("type")
+        if t not in ("rate_limit", "max_count"):
+            continue
+        remaining = entry.get("remaining")
+        if remaining is None:
+            continue
+        if "remaining" not in best or remaining < best.get("remaining", 0):
+            best = entry
+
+    if not best:
+        return {}
+
+    headers: dict = {}
+    limit = best.get("limit")
+    remaining = best.get("remaining")
+    if limit is not None:
+        headers["X-RateLimit-Limit"] = str(int(limit))
+    if remaining is not None:
+        # On deny, the live ``remaining`` is 0 (or negative if the
+        # backend reports an over-the-cap snapshot) — clients only care
+        # about the floor.
+        headers["X-RateLimit-Remaining"] = str(max(int(remaining), 0))
+    reset_at = best.get("reset_at")
+    if reset_at is not None:
+        headers["X-RateLimit-Reset"] = str(int(reset_at))
+
+    if deny:
+        now = int(time.time())
+        if best.get("type") == "rate_limit" and reset_at is not None:
+            headers["Retry-After"] = str(max(int(reset_at) - now, 1))
+        elif best.get("type") == "rate_limit":
+            window = int(best.get("window_seconds") or 60)
+            headers["Retry-After"] = str(window)
+        # max_count: no Retry-After — the quota is lifetime, only an
+        # operator reset will free it.
+
+    return headers
+
+
 class IamMiddleware(BaseHTTPMiddleware):
     _iam_manager: Optional[AuthenticatorProtocol] = None
     _policy_service: Optional[PermissionProtocol] = None
@@ -339,8 +397,12 @@ class IamMiddleware(BaseHTTPMiddleware):
         request.state.policy_allowed = True
 
         # 5. Evaluate All Accumulated Conditions (from Key and Principal)
+        rate_limit_headers: dict = {}
         if all_conditions:
-            from dynastore.modules.iam.conditions import evaluate_conditions
+            from dynastore.modules.iam.conditions import (
+                condition_registry,
+                evaluate_conditions,
+            )
             from dynastore.modules.iam.exceptions import IamError
 
             try:
@@ -348,14 +410,23 @@ class IamMiddleware(BaseHTTPMiddleware):
             except IamError as exc:
                 # Rate-limit / quota handlers raise typed errors so the
                 # response carries the right status (429 vs 403) and the
-                # client gets a human-readable reason.
+                # client gets a human-readable reason. On 429 also emit
+                # Retry-After so well-behaved clients back off.
                 status_code = getattr(exc, "status_code", 429)
                 logger.warning(
                     "Condition deny for '%s' via '%s': %s",
                     effective_principal_id, source, exc,
                 )
+                deny_headers = {}
+                if status_code == 429:
+                    deny_headers = _build_rate_limit_headers(
+                        await condition_registry.inspect_all(all_conditions, ctx),
+                        deny=True,
+                    )
                 return JSONResponse(
-                    {"detail": str(exc)}, status_code=status_code
+                    {"detail": str(exc)},
+                    status_code=status_code,
+                    headers=deny_headers or None,
                 )
             if not allowed:
                 logger.warning(
@@ -365,7 +436,19 @@ class IamMiddleware(BaseHTTPMiddleware):
                     {"detail": "Rate limit or Quota exceeded."}, status_code=429
                 )
 
+            # Successful evaluation — capture inspect() projection so
+            # the response carries X-RateLimit-* headers. Most
+            # restrictive bucket (smallest remaining) wins when two
+            # rate-limits target the same request.
+            try:
+                inspections = await condition_registry.inspect_all(all_conditions, ctx)
+                rate_limit_headers = _build_rate_limit_headers(inspections, deny=False)
+            except Exception:
+                logger.debug("inspect_all failed; skipping rate-limit headers", exc_info=True)
+
         response = await call_next(request)
+        for k, v in rate_limit_headers.items():
+            response.headers[k] = v
 
         # Stats Logging (Best Effort)
         try:
