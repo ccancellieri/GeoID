@@ -69,6 +69,24 @@ class ConditionHandler(abc.ABC):
 
 # --- Condition Handlers ---
 
+def _policy_id_for(config: Dict[str, Any], ctx: EvaluationContext) -> Optional[str]:
+    """Resolve the owning policy id for a condition's config dict.
+
+    The middleware stores a mapping ``id(config) -> policy_id`` in
+    ``ctx.extras["_policy_id_by_config_id"]`` so handlers can namespace
+    their counter rows without the middleware mutating
+    ``condition.config`` in place (which would leak across requests if
+    the Principal is cached). The legacy on-config ``_policy_id`` key
+    is honored as a fallback for tests that build conditions by hand.
+    """
+    mapping = (ctx.extras or {}).get("_policy_id_by_config_id")
+    if mapping:
+        pid = mapping.get(id(config))
+        if pid:
+            return pid
+    return config.get("_policy_id")
+
+
 def _principal_key_for(scope: str, ctx: EvaluationContext) -> Optional[str]:
     """Resolve the opaque ``principal_key`` for a condition scope.
 
@@ -133,11 +151,11 @@ class RateLimitHandler(ConditionHandler):
         if not _path_method_matches(config, ctx):
             return True
 
-        policy_id = config.get("_policy_id")
+        policy_id = _policy_id_for(config, ctx)
         if not policy_id:
             # Caller failed to inject the policy id; without it we can't
             # namespace the counter — allow but log once.
-            logger.debug("rate_limit: missing _policy_id in config, skipping")
+            logger.debug("rate_limit: missing policy_id mapping, skipping")
             return True
 
         scope = config.get("scope", "principal")
@@ -171,7 +189,7 @@ class RateLimitHandler(ConditionHandler):
         return True
 
     async def inspect(self, config: Dict[str, Any], ctx: EvaluationContext) -> Optional[Dict[str, Any]]:
-        policy_id = config.get("_policy_id")
+        policy_id = _policy_id_for(config, ctx)
         scope = config.get("scope", "principal")
         principal_key = _principal_key_for(scope, ctx) if policy_id else None
         limit = int(config.get("limit", 0))
@@ -219,9 +237,9 @@ class MaxCountHandler(ConditionHandler):
         if not _path_method_matches(config, ctx):
             return True
 
-        policy_id = config.get("_policy_id")
+        policy_id = _policy_id_for(config, ctx)
         if not policy_id:
-            logger.debug("max_count: missing _policy_id in config, skipping")
+            logger.debug("max_count: missing policy_id mapping, skipping")
             return True
 
         scope = config.get("scope", "principal")
@@ -253,7 +271,7 @@ class MaxCountHandler(ConditionHandler):
         return True
 
     async def inspect(self, config: Dict[str, Any], ctx: EvaluationContext) -> Optional[Dict[str, Any]]:
-        policy_id = config.get("_policy_id")
+        policy_id = _policy_id_for(config, ctx)
         scope = config.get("scope", "principal")
         principal_key = _principal_key_for(scope, ctx) if policy_id else None
         limit = int(config.get("limit", config.get("max_count", 0)))

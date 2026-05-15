@@ -359,12 +359,18 @@ class IamMiddleware(BaseHTTPMiddleware):
                 )
             # Add Conditions. Tag each one with its owning policy id so
             # the rate-limit / max-count handlers can namespace their
-            # counter rows; ``_policy_id`` is reserved and stripped from
-            # operator-supplied configs.
+            # counter rows. The mapping lives on ``ctx.extras`` keyed by
+            # the config dict's identity — we deliberately do NOT mutate
+            # ``c.config`` because the Principal (and its attached
+            # Condition objects) may be cached across requests, and a
+            # leftover key would persist beyond its evaluation lifetime.
+            policy_id_by_config_id: dict[int, str] = ctx.extras.setdefault(
+                "_policy_id_by_config_id", {}
+            )
             for p in principal_obj.custom_policies:
                 if p.conditions:
                     for c in p.conditions:
-                        c.config["_policy_id"] = p.id
+                        policy_id_by_config_id[id(c.config)] = p.id
                     all_conditions.extend(p.conditions)
 
         # C. Global System Policies
