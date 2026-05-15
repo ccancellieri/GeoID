@@ -12,12 +12,16 @@ from dynastore.extensions.search.search_service import SearchService
 
 
 def _service() -> SearchService:
-    svc = SearchService.__new__(SearchService)
-    svc._es = object()  # type: ignore[attr-defined]
-    return svc
+    return SearchService.__new__(SearchService)
 
 
-def _capturing_es():
+def _capturing_driver():
+    """Return a (fake_driver, captured) pair.
+
+    The fake mimics the surface ``SearchService`` reaches for through
+    :meth:`SearchService._resolve_items_driver` — only ``es_client`` is
+    consulted, so we wrap a no-result ES double behind that property.
+    """
     captured: dict = {}
 
     class _FakeES:
@@ -27,21 +31,24 @@ def _capturing_es():
             captured["kwargs"] = kwargs
             return {"hits": {"hits": [], "total": {"value": 0}}}
 
-    return _FakeES(), captured
+    class _FakeDriver:
+        es_client = _FakeES()
+
+    return _FakeDriver(), captured
 
 
 @pytest.fixture(autouse=True)
 def _patch_index_prefix(monkeypatch):
     monkeypatch.setattr(
-        "dynastore.extensions.search.search_service._get_index_prefix",
+        "dynastore.modules.elasticsearch.client.get_index_prefix",
         lambda: "test",
     )
 
 
 async def test_search_items_scoped_targets_per_catalog_index(monkeypatch):
     svc = _service()
-    fake, captured = _capturing_es()
-    monkeypatch.setattr(svc, "_get_es", lambda: fake)
+    driver, captured = _capturing_driver()
+    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
 
     await svc.search_items(SearchBody(catalog_id="acme", limit=10))
 
@@ -50,8 +57,8 @@ async def test_search_items_scoped_targets_per_catalog_index(monkeypatch):
 
 async def test_search_items_unscoped_targets_public_alias(monkeypatch):
     svc = _service()
-    fake, captured = _capturing_es()
-    monkeypatch.setattr(svc, "_get_es", lambda: fake)
+    driver, captured = _capturing_driver()
+    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
 
     await svc.search_items(SearchBody(catalog_id=None, limit=10))
 
@@ -60,8 +67,8 @@ async def test_search_items_unscoped_targets_public_alias(monkeypatch):
 
 async def test_search_items_uses_ignore_unavailable(monkeypatch):
     svc = _service()
-    fake, captured = _capturing_es()
-    monkeypatch.setattr(svc, "_get_es", lambda: fake)
+    driver, captured = _capturing_driver()
+    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
 
     await svc.search_items(SearchBody(catalog_id="missing-catalog", limit=10))
 
@@ -70,8 +77,8 @@ async def test_search_items_uses_ignore_unavailable(monkeypatch):
 
 async def test_search_collections_targets_singleton(monkeypatch):
     svc = _service()
-    fake, captured = _capturing_es()
-    monkeypatch.setattr(svc, "_get_es", lambda: fake)
+    driver, captured = _capturing_driver()
+    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
 
     await svc.search_collections(CatalogSearchBody(catalog_id="acme", limit=10))
 
@@ -80,8 +87,8 @@ async def test_search_collections_targets_singleton(monkeypatch):
 
 async def test_search_collections_unscoped_targets_singleton(monkeypatch):
     svc = _service()
-    fake, captured = _capturing_es()
-    monkeypatch.setattr(svc, "_get_es", lambda: fake)
+    driver, captured = _capturing_driver()
+    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
 
     await svc.search_collections(CatalogSearchBody(catalog_id=None, limit=10))
 
@@ -90,8 +97,8 @@ async def test_search_collections_unscoped_targets_singleton(monkeypatch):
 
 async def test_search_catalogs_unchanged(monkeypatch):
     svc = _service()
-    fake, captured = _capturing_es()
-    monkeypatch.setattr(svc, "_get_es", lambda: fake)
+    driver, captured = _capturing_driver()
+    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
 
     await svc.search_catalogs(CatalogSearchBody(limit=10))
 

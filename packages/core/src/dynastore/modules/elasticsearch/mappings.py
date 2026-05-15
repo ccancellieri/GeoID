@@ -368,29 +368,6 @@ def get_tenant_collections_private_index(prefix: str, catalog_id: str) -> str:
     return f"{prefix}-{catalog_id}-collections-private"
 
 
-def get_search_index(
-    prefix: str,
-    entity_type: str,
-    catalog_id: str | None = None,
-) -> str:
-    """Resolve the read-side index for the search service.
-
-    - ``item``       → per-catalog ``{prefix}-{cat}-items`` when scoped, else
-                       the public alias ``{prefix}-items``.
-    - ``collection`` → singleton ``{prefix}-collections``. Scoped queries
-                       filter via ``_routing=catalog_id`` rather than
-                       targeting a different physical index.
-    - ``catalog``    → singleton ``{prefix}-catalogs``.
-    """
-    if entity_type == "item":
-        return (
-            get_tenant_items_index(prefix, catalog_id)
-            if catalog_id
-            else get_public_items_alias(prefix)
-        )
-    return get_index_name(prefix, entity_type)
-
-
 def get_log_index_name(prefix: str) -> str:
     """Return the name of the logs index."""
     return f"{prefix}-logs"

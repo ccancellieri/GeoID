@@ -331,6 +331,24 @@ class ItemsElasticsearchDriver(
             return False
         return get_client() is not None
 
+    @property
+    def es_client(self) -> Any:
+        """Shared async ES client.
+
+        The platform's ``ElasticsearchModule.lifespan`` initialises the
+        singleton; this property returns the same instance every driver
+        and the search extension use. Consumers outside this module
+        (notably ``SearchService``) reach the ES engine through this
+        property so that nothing imports
+        :func:`dynastore.modules.elasticsearch.client.get_client` directly
+        — the search extension reuses the platform engine via the
+        routing-resolved driver instance.
+
+        Raises ``RuntimeError`` when ``ElasticsearchModule.lifespan``
+        has not started yet.
+        """
+        return _es_client_required()
+
     @asynccontextmanager
     async def lifespan(self, app_state: object):
         """No-op lifecycle.

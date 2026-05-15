@@ -57,6 +57,14 @@ class SearchBody(BaseModel):
             "Sortable fields: 'id', 'properties.title', 'properties.datetime', 'properties.updated'."
         )
     )
+    driver: Optional[str] = Field(
+        None,
+        description=(
+            "Hint: driver_ref of a SEARCH entry pinned in the catalog/collection's "
+            "ItemsRoutingConfig.operations[SEARCH]. When omitted (or unknown), the "
+            "first entry's driver is used. Unknown hints warn-and-fall-back to default."
+        ),
+    )
 
 
 class CatalogSearchBody(BaseModel):

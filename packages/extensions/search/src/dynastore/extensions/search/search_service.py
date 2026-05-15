@@ -20,8 +20,6 @@ from fastapi import APIRouter, FastAPI
 from contextlib import asynccontextmanager
 from dynastore.extensions.protocols import ExtensionProtocol
 
-from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-from dynastore.modules.elasticsearch.mappings import get_search_index
 from .search_models import (
     CatalogSearchBody,
     GenericCollection,
@@ -270,21 +268,60 @@ class SearchService(ExtensionProtocol):
     def __init__(self):
         from .router import router as search_router
         self.router = search_router
-        self._es = None  # set during lifespan
         logger.info("SearchService: Initializing extension.")
 
-    def _get_es(self):
-        """Return the shared ES client (cached after first lifespan startup)."""
-        if self._es is None:
-            # Lazy fallback: look up the singleton from the elasticsearch module.
-            from dynastore.modules.elasticsearch.client import get_client
-            self._es = get_client()
-            if self._es is None:
-                raise RuntimeError(
-                    "Elasticsearch client is not initialized. "
-                    "Ensure ElasticsearchModule is registered and its lifespan has started."
-                )
-        return self._es
+    def _resolve_items_driver(self) -> Any:
+        """Discover the platform's items search driver instance.
+
+        Returns the registered :class:`ItemsElasticsearchDriver` (or any
+        items-tier ES driver of the same shape). The driver instance is
+        the entry point to the platform ES engine — callers reach the ES
+        client via ``driver.es_client`` rather than importing
+        ``dynastore.modules.elasticsearch.client.get_client`` directly.
+        Centralising here means swapping the items search backend is a
+        single driver-registration change.
+        """
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        driver = get_protocol(ItemsElasticsearchDriver)
+        if driver is None:
+            raise RuntimeError(
+                "SearchService: no ItemsElasticsearchDriver registered. "
+                "Ensure storage drivers are loaded before the search "
+                "extension queries items."
+            )
+        return driver
+
+    async def _resolve_items_search_driver_ref(
+        self,
+        catalog_id: Optional[str],
+        collections: Optional[List[str]],
+        driver_hint: Optional[str],
+    ) -> Optional[str]:
+        """Honor a routing-config pin via :func:`get_search_driver`.
+
+        Returns the driver_ref to use for SEARCH dispatch, or ``None``
+        when no per-collection ``ItemsRoutingConfig.operations[SEARCH]``
+        applies (cross-collection or unscoped queries fall through to
+        the platform default — :meth:`_resolve_items_driver`).
+
+        ``ItemsRoutingConfig`` is keyed at the (catalog, collection)
+        pair, so routing-config dispatch is only meaningful when a
+        single concrete collection is in scope.
+        """
+        if not catalog_id or not collections or len(collections) != 1:
+            return None
+        from dynastore.modules.storage.routing_config import get_search_driver
+
+        return await get_search_driver(
+            catalog_id,
+            entity="item",
+            collection_id=collections[0],
+            driver_hint=driver_hint,
+        )
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
@@ -295,11 +332,16 @@ class SearchService(ExtensionProtocol):
         Implements paginated search for Items, Catalogs, and Collections.
         """
         from .policies import register_search_policies
-        from dynastore.modules.elasticsearch.client import get_client
+        from dynastore.modules.elasticsearch.aliases import (
+            ensure_public_alias_exists,
+        )
         register_search_policies()
-        self._es = get_client()  # cache the module-level singleton for all requests
+        # Force-materialise the platform public items alias so a fresh
+        # deployment with no catalog onboarded yet responds 200/empty on
+        # the unscoped /search path instead of 404. Idempotent — no-op
+        # when the alias already has members.
+        await ensure_public_alias_exists()
         yield
-        self._es = None
 
     async def search_items(
         self,
@@ -312,7 +354,7 @@ class SearchService(ExtensionProtocol):
         Supports: q (full-text, multilingual), bbox, intersects, datetime,
                   ids, collections, sortby, and cursor-based pagination via token.
         """
-        index = get_search_index(_get_index_prefix(), "item", body.catalog_id)
+        index = await self._resolve_items_index(body.catalog_id, body.collections, body.driver)
         sort = _parse_sort(body.sortby)
         query = _build_item_query(body)
 
@@ -330,7 +372,7 @@ class SearchService(ExtensionProtocol):
             except Exception:
                 logger.warning(f"Ignoring invalid search token: {body.token!r}")
 
-        es = self._get_es()
+        es = self._resolve_items_driver().es_client
         resp = await es.search(index=index, body=es_body, ignore_unavailable=True)  # type: ignore[call-arg]
 
         hits = resp.get("hits", {})
@@ -499,13 +541,59 @@ class SearchService(ExtensionProtocol):
         """Search Collections."""
         return await self._search_generic(body, "collection", base_url)
 
+    async def _resolve_items_index(
+        self,
+        catalog_id: Optional[str],
+        collections: Optional[List[str]],
+        driver_hint: Optional[str],
+    ) -> str:
+        """Resolve the ES index/alias to query for an items SEARCH.
+
+        - Catalog-scoped (``catalog_id`` set): per-tenant index
+          ``{prefix}-{catalog}-items`` owned by the items driver.
+        - Unscoped (no ``catalog_id``): platform public alias
+          ``{prefix}-items`` whose membership is managed by
+          :meth:`ItemsElasticsearchDriver.ensure_storage`.
+
+        Honors routing-config pins via
+        :meth:`_resolve_items_search_driver_ref` when a single
+        collection is in scope — a warn-and-fallback in
+        :func:`get_search_driver` covers unknown hints. The returned
+        driver_ref is logged for observability; the live ES query goes
+        through the platform driver's client either way because all ES
+        items live in a single shared cluster.
+        """
+        from dynastore.modules.elasticsearch.client import get_index_prefix
+        from dynastore.modules.elasticsearch.mappings import (
+            get_public_items_alias,
+            get_tenant_items_index,
+        )
+
+        driver_ref = await self._resolve_items_search_driver_ref(
+            catalog_id, collections, driver_hint,
+        )
+        if driver_ref:
+            logger.debug(
+                "SearchService: routing items SEARCH via driver_ref=%s "
+                "(catalog=%s, collections=%s)",
+                driver_ref, catalog_id, collections,
+            )
+
+        prefix = get_index_prefix()
+        if catalog_id:
+            return get_tenant_items_index(prefix, catalog_id)
+        return get_public_items_alias(prefix)
+
     async def _search_generic(
         self,
         body: CatalogSearchBody,
         entity_type: str,
         base_url: str = "",
     ) -> GenericCollection:
-        index = get_search_index(_get_index_prefix(), entity_type, body.catalog_id)
+        from dynastore.modules.elasticsearch.client import get_index_prefix
+        from dynastore.modules.elasticsearch.mappings import get_index_name
+
+        index = get_index_name(get_index_prefix(), entity_type)
         query = _build_generic_query(body)
         # Singleton catalogs/collections indexes use catalog_id as the routing
         # key; scoped requests narrow to one shard + filter by catalog_id so
@@ -538,7 +626,7 @@ class SearchService(ExtensionProtocol):
         if entity_type == "collection" and body.catalog_id:
             search_kwargs["params"] = {"routing": body.catalog_id}
 
-        es = self._get_es()
+        es = self._resolve_items_driver().es_client
         resp = await es.search(**search_kwargs)
 
         raw_hits = resp.get("hits", {}).get("hits", [])

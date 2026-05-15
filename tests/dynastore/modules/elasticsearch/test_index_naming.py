@@ -13,7 +13,6 @@ from dynastore.modules.elasticsearch.mappings import (
     DYNAMIC_TEMPLATES,
     get_index_name,
     get_public_items_alias,
-    get_search_index,
     get_tenant_items_index,
 )
 from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
@@ -42,28 +41,6 @@ def test_public_items_alias_drops_public_suffix():
 
 def test_private_items_uses_catalog_first_naming():
     assert get_private_index_name(PREFIX, "adm2_catalog") == "dynastore-adm2_catalog-private-items"
-
-
-def test_search_items_scoped_targets_per_catalog_index():
-    assert get_search_index(PREFIX, "item", "adm2_catalog") == "dynastore-adm2_catalog-items"
-
-
-def test_search_items_unscoped_targets_alias():
-    assert get_search_index(PREFIX, "item", None) == "dynastore-items"
-
-
-def test_search_collections_scoped_targets_singleton():
-    # Collections move to a singleton — scoped search filters via _routing,
-    # not via separate per-catalog indexes.
-    assert get_search_index(PREFIX, "collection", "adm2_catalog") == "dynastore-collections"
-
-
-def test_search_collections_unscoped_targets_singleton():
-    assert get_search_index(PREFIX, "collection", None) == "dynastore-collections"
-
-
-def test_search_catalogs_targets_singleton():
-    assert get_search_index(PREFIX, "catalog", None) == "dynastore-catalogs"
 
 
 def test_per_catalog_assets_index_uses_catalog_first_naming():
