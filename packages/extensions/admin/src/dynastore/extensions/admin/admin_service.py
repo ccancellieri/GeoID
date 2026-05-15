@@ -35,6 +35,7 @@ from .models import (
     RoleCreate, RoleUpdate, RoleResponse,
     PolicyCreate, PolicyUpdate, PolicyResponse,
     PrincipalResponse, AssignRoleRequest,
+    UsagePage, UsageResetResponse, UsageRow,
 )
 from .policies import admin_policies, admin_role_bindings
 
@@ -591,6 +592,17 @@ class AdminService(ExtensionProtocol):
     # Policy Management (/admin/policies)
     # -------------------------------------------------------------------------
 
+    def _policy_to_response(p: Policy) -> PolicyResponse:
+        return PolicyResponse(
+            id=p.id,
+            description=p.description,
+            actions=p.actions,
+            resources=p.resources,
+            effect=p.effect,
+            partition_key=p.partition_key,
+            conditions=getattr(p, "conditions", []) or [],
+        )
+
     @router.get("/policies", summary="List all policies")
     async def list_policies(catalog_id: Optional[str] = Query(None)):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
@@ -598,13 +610,7 @@ class AdminService(ExtensionProtocol):
         if not pm:
             raise HTTPException(status_code=503, detail="Policy manager not available.")
         policies = await pm.list_policies(catalog_id=catalog_id)
-        return [
-            PolicyResponse(
-                id=p.id, description=p.description, actions=p.actions,
-                resources=p.resources, effect=p.effect, partition_key=p.partition_key,
-            )
-            for p in policies
-        ]
+        return [_policy_to_response(p) for p in policies]
 
     @router.post("/policies", summary="Create a new policy", status_code=201)
     async def create_policy(body: PolicyCreate, catalog_id: Optional[str] = Query(None)):  # type: ignore[reportGeneralTypeIssues]
@@ -618,15 +624,13 @@ class AdminService(ExtensionProtocol):
             actions=body.actions,
             resources=body.resources,
             effect=body.effect,
+            conditions=body.conditions,
         )
         try:
             created = await pm.create_policy(policy, catalog_id=catalog_id)
         except ValueError as e:
             raise HTTPException(status_code=409, detail=str(e))
-        return PolicyResponse(
-            id=created.id, description=created.description, actions=created.actions,
-            resources=created.resources, effect=created.effect, partition_key=created.partition_key,
-        )
+        return _policy_to_response(created)
 
     @router.put("/policies/{policy_id}", summary="Update a policy")
     async def update_policy(
@@ -649,13 +653,12 @@ class AdminService(ExtensionProtocol):
             existing.resources = body.resources
         if body.effect is not None:
             existing.effect = body.effect
+        if body.conditions is not None:
+            existing.conditions = body.conditions
         updated = await pm.update_policy(existing, catalog_id=catalog_id)
         if updated is None:
             raise HTTPException(status_code=404, detail="Policy not found after update.")
-        return PolicyResponse(
-            id=updated.id, description=updated.description, actions=updated.actions,
-            resources=updated.resources, effect=updated.effect, partition_key=updated.partition_key,
-        )
+        return _policy_to_response(updated)
 
     @router.delete("/policies/{policy_id}", status_code=204, summary="Delete a policy")
     async def delete_policy(policy_id: str, catalog_id: Optional[str] = Query(None)):  # type: ignore[reportGeneralTypeIssues]
@@ -666,6 +669,99 @@ class AdminService(ExtensionProtocol):
         deleted = await pm.delete_policy(policy_id, catalog_id=catalog_id)
         if not deleted:
             raise HTTPException(status_code=404, detail=f"Policy '{policy_id}' not found.")
+
+    # -------------------------------------------------------------------------
+    # Usage Inspection (/admin/policies/{policy_id}/usage)
+    # -------------------------------------------------------------------------
+
+    @router.get(
+        "/policies/{policy_id}/usage",
+        summary="List rate-limit / quota counter rows for a policy",
+        response_model=UsagePage,
+    )
+    async def list_policy_usage(  # type: ignore[reportGeneralTypeIssues]
+        policy_id: str,
+        catalog_id: Optional[str] = Query(None),
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ):
+        from dynastore.modules.iam.usage_counter_pg import PostgresUsageCounter
+
+        # Use the PG driver directly for inspection — the layered driver
+        # delegates list_for_policy to PG anyway (Valkey doesn't support
+        # efficient SCAN-by-prefix at scale).
+        pg = PostgresUsageCounter()
+        rows = await pg.list_for_policy(policy_id, limit=limit + 1, offset=offset)
+        next_offset = None
+        if len(rows) > limit:
+            rows = rows[:limit]
+            next_offset = offset + limit
+        return UsagePage(
+            policy_id=policy_id,
+            rows=[
+                UsageRow(
+                    principal_key=str(r["principal_key"]),
+                    count=int(r["count"]),
+                    window_start=r["window_start"].isoformat()
+                    if hasattr(r["window_start"], "isoformat")
+                    else str(r["window_start"]),
+                    expires_at=(
+                        r["expires_at"].isoformat()
+                        if r.get("expires_at") and hasattr(r["expires_at"], "isoformat")
+                        else (str(r["expires_at"]) if r.get("expires_at") else None)
+                    ),
+                    last_seen_at=(
+                        r["last_seen_at"].isoformat()
+                        if r.get("last_seen_at") and hasattr(r["last_seen_at"], "isoformat")
+                        else (str(r["last_seen_at"]) if r.get("last_seen_at") else None)
+                    ),
+                )
+                for r in rows
+            ],
+            next_offset=next_offset,
+        )
+
+    @router.delete(
+        "/policies/{policy_id}/usage/{principal_key}",
+        summary="Reset (renew) the counter row for a (policy, principal) pair",
+        response_model=UsageResetResponse,
+    )
+    async def reset_policy_usage(  # type: ignore[reportGeneralTypeIssues]
+        policy_id: str,
+        principal_key: str,
+        request: Request,
+        catalog_id: Optional[str] = Query(None),
+        window_seconds: Optional[int] = Query(
+            None,
+            description=(
+                "Window width that originally produced the bucket — "
+                "omit for lifetime quotas (max_count). The handler "
+                "floors ``now`` to derive the live bucket and resets "
+                "exactly that row."
+            ),
+        ),
+    ):
+        # Authorization is enforced router-side by IamMiddleware on
+        # every /admin/* path — no extra guard call is needed here.
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols.usage_counter import UsageCounterProtocol
+        from dynastore.modules.iam.usage_counter_pg import PostgresUsageCounter
+
+        # Reset on the live counter (Valkey-backed layered driver clears
+        # both tiers) so the next request hits a fresh bucket.
+        counter = get_protocol(UsageCounterProtocol) or PostgresUsageCounter()
+
+        before = await counter.get(
+            policy_id, principal_key, window_seconds=window_seconds
+        )
+        await counter.reset(
+            policy_id, principal_key, window_seconds=window_seconds
+        )
+        return UsageResetResponse(
+            policy_id=policy_id,
+            principal_key=principal_key,
+            reset_count=int(before or 0),
+        )
 
     # -------------------------------------------------------------------------
     # System Defaults (/admin/reset-defaults)

@@ -4,6 +4,8 @@
 from typing import Literal, Optional, List
 from pydantic import BaseModel, Field
 
+from dynastore.models.auth import Condition
+
 
 # --- User models ---
 
@@ -60,6 +62,7 @@ class PolicyCreate(BaseModel):
     actions: List[str]
     resources: List[str]
     effect: Literal["ALLOW", "DENY"] = "ALLOW"
+    conditions: List[Condition] = Field(default_factory=list)
 
 
 class PolicyUpdate(BaseModel):
@@ -67,6 +70,7 @@ class PolicyUpdate(BaseModel):
     actions: Optional[List[str]] = None
     resources: Optional[List[str]] = None
     effect: Optional[Literal["ALLOW", "DENY"]] = None
+    conditions: Optional[List[Condition]] = None
 
 
 class PolicyResponse(BaseModel):
@@ -76,6 +80,31 @@ class PolicyResponse(BaseModel):
     resources: List[str]
     effect: Literal["ALLOW", "DENY"]
     partition_key: Optional[str] = None
+    conditions: List[Condition] = Field(default_factory=list)
+
+
+class UsageRow(BaseModel):
+    """One row of usage-counter state returned by ``GET /admin/policies/{id}/usage``."""
+
+    principal_key: str
+    count: int
+    window_start: str
+    expires_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+
+
+class UsagePage(BaseModel):
+    """Paged listing of usage-counter rows for a given policy."""
+
+    policy_id: str
+    rows: List[UsageRow]
+    next_offset: Optional[int] = None
+
+
+class UsageResetResponse(BaseModel):
+    policy_id: str
+    principal_key: str
+    reset_count: int
 
 
 # --- Principal / assignment models ---

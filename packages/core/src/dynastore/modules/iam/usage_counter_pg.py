@@ -132,6 +132,17 @@ _REAP_EXPIRED = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
+_LIST_FOR_POLICY = DQLQuery(
+    """
+    SELECT principal_key, count, window_start, expires_at, last_seen_at
+      FROM {schema}.usage_counters
+     WHERE policy_id = :policy_id
+     ORDER BY last_seen_at DESC NULLS LAST, principal_key
+     LIMIT :limit OFFSET :offset;
+    """,
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
 
 # --- Driver ---------------------------------------------------------------
 
@@ -242,3 +253,27 @@ class PostgresUsageCounter:
     async def reap_expired(self) -> int:
         async with managed_transaction(self._engine) as db:
             return int(await _REAP_EXPIRED.execute(conn=db, schema=self._schema) or 0)
+
+    async def list_for_policy(
+        self,
+        policy_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list:
+        """Paged listing of counter rows for one policy.
+
+        Not part of :class:`UsageCounterProtocol` — admin-only side
+        door for the usage panel. The layered driver delegates here
+        because Valkey can't ``SCAN`` by policy prefix efficiently at
+        scale; the durable table is the right source for inspection.
+        """
+        async with managed_transaction(self._engine) as db:
+            rows = await _LIST_FOR_POLICY.execute(
+                conn=db,
+                schema=self._schema,
+                policy_id=policy_id,
+                limit=limit,
+                offset=offset,
+            )
+        return list(rows or [])
