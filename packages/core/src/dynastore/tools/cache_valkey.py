@@ -24,7 +24,7 @@ Registered by ``CacheModule``. Falls back to ``LocalAsyncCacheBackend``
 
 Configuration SSOT is ``ValkeyEngineConfig`` (in
 ``modules/db_config/engine_config.py``), exposed via the configs API
-under ``platform/module_cache`` and applied live without restart —
+under ``platform/engines`` and applied live without restart —
 URL, discovery_host/port, cluster_mode, require_full_coverage,
 dynamic_startup_nodes, TLS, IAM, socket_timeout/connect_timeout,
 TCP keepalives.

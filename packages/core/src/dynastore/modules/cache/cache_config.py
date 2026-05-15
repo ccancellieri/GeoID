@@ -18,7 +18,7 @@ Cache module configuration (probe timeout, circuit breaker, oracle timeout).
 Registered via PluginConfig framework so settings are:
 - Runtime-configurable (no redeploy needed)
 - Per-catalog overridable
-- Accessible via /configs?plugin_id=module_cache API
+- Accessible via /configs?plugin_id=cache_plugin_config API
 
 **Migration note (operators):** Connection params (socket timeouts, TCP keepalives,
 TLS, IAM, cluster settings) have moved to ``ValkeyEngineConfig`` at
@@ -29,7 +29,7 @@ control the underlying connection.
 
 from __future__ import annotations
 
-from typing import ClassVar, Optional, Tuple
+from typing import ClassVar, Tuple
 
 from pydantic import Field
 
@@ -40,14 +40,14 @@ from dynastore.modules.db_config.platform_config_service import Mutable, PluginC
 class CachePluginConfig(ExposableConfigMixin, PluginConfig):
     """PluginConfig entry for cache module (probe timeout, circuit breaker).
 
-    Live edits via `PUT /api/catalog/v2/configs?plugin_id=module_cache` apply
-    immediately — no redeploy needed. Settings are per-catalog overridable.
+    Live edits via `PUT /api/catalog/v2/configs?plugin_id=cache_plugin_config`
+    apply immediately — no redeploy needed. Settings are per-catalog overridable.
 
     **Connection tuning:** See ``ValkeyEngineConfig`` for socket timeouts,
     TCP keepalives, TLS, IAM auth, and cluster discovery settings.
     """
 
-    _address: ClassVar[Tuple[Optional[str], ...]] = ("platform", "module_cache", None)
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "cache")
 
     probe_timeout_seconds: Mutable[float] = Field(
         default=5.0,
