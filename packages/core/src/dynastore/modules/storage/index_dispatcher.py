@@ -566,6 +566,17 @@ def _make_default_routing_resolver():
     """Build a resolver that loads the live :class:`CollectionRoutingConfig`
     via ``ConfigsProtocol.get_config`` — the same path used elsewhere in
     the storage layer.
+
+    NOTE (un-fao/GeoID#810): :class:`IndexDispatcher` is reached from
+    ``item_service._dispatch_index_upsert`` (OGC ingest path) and from
+    ``item_query`` (item delete path). Both construct items-tier
+    ``IndexOp`` with ``entity_type="item"``, but this resolver reads
+    ``CollectionRoutingConfig.operations[INDEX]``. Items-tier indexers
+    must be pinned there (not in :class:`ItemsRoutingConfig`) to fire
+    on item upsert/delete via the OGC endpoints.
+    :class:`ItemsRoutingConfig` ``operations[INDEX]`` is consumed only
+    by ``item_service.upsert_bulk``, which has no production caller on
+    the OGC ingest flow today.
     """
 
     async def resolve(catalog: str, collection: Optional[str]):

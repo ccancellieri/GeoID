@@ -513,7 +513,13 @@ class ItemsRoutingConfig(PluginConfig):
         description=(
             "Operation → ordered driver list for items dispatch.  "
             "Immutable: to change driver mapping, create a new config.  "
-            "Hints and on_failure within entries are mutable."
+            "Hints and on_failure within entries are mutable.  "
+            "NOTE: operations[INDEX] entries are consumed by "
+            "item_service.upsert_bulk only; the OGC ingest path uses "
+            "item_service.upsert, which dispatches via IndexDispatcher "
+            "reading CollectionRoutingConfig.operations[INDEX]. Pin "
+            "indexers there too if they must fire on item upserts via "
+            "the OGC endpoints. See un-fao/GeoID#810."
         ),
     )
 
