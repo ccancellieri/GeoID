@@ -345,15 +345,20 @@ class TestWriteMode:
 
 
 class TestMetadataRoutingConfig:
-    def test_default_operations_empty(self):
+    def test_default_operations_shape(self):
         cfg = CollectionRoutingConfig()
-        # After Phase 2c, the Searcher auto-self-registration validator may
-        # seed Operation.SEARCH on construction once a Searcher has registered
-        # itself. The invariant that still holds: no WRITE/READ/TRANSFORM
-        # entries are seeded by default — those remain operator-driven.
-        for op in (Operation.WRITE, Operation.READ, Operation.TRANSFORM):
-            assert op not in cfg.operations, (
-                f"{op} unexpectedly present in default operations: {cfg.operations}"
+        # #732 ships non-empty WRITE/READ defaults: the PG collection driver
+        # is the system of record for both. INDEX/SEARCH may also be seeded
+        # (explicit default entry + Searcher auto-self-registration). The
+        # invariant that still holds: TRANSFORM is never seeded by default —
+        # it remains operator-driven.
+        assert Operation.TRANSFORM not in cfg.operations, (
+            f"TRANSFORM unexpectedly present in default operations: {cfg.operations}"
+        )
+        for op in (Operation.WRITE, Operation.READ):
+            refs = {e.driver_ref for e in cfg.operations[op]}
+            assert "collection_postgresql_driver" in refs, (
+                f"{op} default should pin the PG collection driver: {cfg.operations}"
             )
 
     def test_read_operation(self):

@@ -436,20 +436,27 @@ def test_catalog_routing_validator_augments_INDEX_and_SEARCH():
     search_ids = {e.driver_ref for e in cfg.operations.get(Operation.SEARCH, [])}
     assert "_cat_es" in index_ids
     assert "_cat_es" in search_ids
-    # Default WRITE/READ entries unchanged.
+    # Default WRITE/READ entries unchanged — the registered CatalogStore is
+    # the ``catalog_postgresql_driver`` composition wrapper (#732), which
+    # fans CRUD across the catalog_core + catalog_stac sidecars internally.
     write_ids = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
-    assert write_ids == {"catalog_core_postgresql_driver", "catalog_stac_postgresql_driver"}
+    assert write_ids == {"catalog_postgresql_driver"}
 
 
 def test_catalog_routing_validator_no_op_when_no_indexers_discoverable():
     """No discoverable indexer/searcher → operations stays at the
-    default-factory shape (just WRITE+READ, no INDEX/SEARCH keys)."""
+    default-factory shape: WRITE+READ plus the explicit INDEX default
+    entry (#732), and no SEARCH key folded in by discovery."""
     from unittest.mock import patch
 
     with patch("dynastore.tools.discovery.get_protocols", lambda proto: []):
         cfg = CatalogRoutingConfig()
 
-    assert Operation.INDEX not in cfg.operations or cfg.operations[Operation.INDEX] == []
+    # The default factory ships an explicit INDEX entry pointing at the ES
+    # catalog driver; with nothing discoverable, that's all INDEX contains.
+    index_ids = {e.driver_ref for e in cfg.operations.get(Operation.INDEX, [])}
+    assert index_ids == {"catalog_elasticsearch_driver"}
+    # SEARCH is purely discovery-driven — empty when nothing is discoverable.
     assert Operation.SEARCH not in cfg.operations or cfg.operations[Operation.SEARCH] == []
 
 
@@ -566,11 +573,14 @@ def test_validator_failure_in_discovery_does_not_break_construction():
     with patch("dynastore.tools.discovery.get_protocols", _boom):
         cfg = CatalogRoutingConfig()  # must not raise
 
-    # Default WRITE/READ unaffected.
+    # Default WRITE/READ unaffected — the registered CatalogStore is the
+    # ``catalog_postgresql_driver`` composition wrapper (#732).
     write_ids = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
-    assert write_ids == {"catalog_core_postgresql_driver", "catalog_stac_postgresql_driver"}
-    # INDEX/SEARCH absent because the augmentation was skipped.
-    assert Operation.INDEX not in cfg.operations or cfg.operations[Operation.INDEX] == []
+    assert write_ids == {"catalog_postgresql_driver"}
+    # INDEX keeps only its explicit default entry (discovery augmentation
+    # was skipped); SEARCH is discovery-only, so it stays absent.
+    index_ids = {e.driver_ref for e in cfg.operations.get(Operation.INDEX, [])}
+    assert index_ids == {"catalog_elasticsearch_driver"}
     assert Operation.SEARCH not in cfg.operations or cfg.operations[Operation.SEARCH] == []
 
 
