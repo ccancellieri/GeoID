@@ -104,18 +104,21 @@ class MyCustomModule(ModuleProtocol):
         catalog_id = event.get("catalog_id")
         collection_id = event.get("collection_id")
         item_id = event.get("item_id")
-        
+
         # NOTE: Do heavy lifting via TaskDispatcher, not directly in this handler!
+        # (For item INDEX propagation specifically, prefer the routing-config
+        # rail — IndexDispatcher.fan_out_bulk reads
+        # ItemsRoutingConfig.operations[INDEX] and handles outbox/retry. Bespoke
+        # listener-driven dispatch is the right shape only when you're emitting
+        # work for a NEW task type that has no routing-config home.)
         dispatcher = get_protocol(TaskDispatcher)
         if dispatcher:
-            from dynastore.modules.elasticsearch.tasks import ElasticsearchIndexInputs
             await dispatcher.dispatch_task(
-                task_type="elasticsearch_index",
-                payload_data=ElasticsearchIndexInputs(
-                    entity_type="item",
-                    entity_id=item_id,
+                task_type="your_custom_task",
+                payload_data=YourCustomTaskInputs(
                     catalog_id=catalog_id,
-                    payload=event.get("payload", {})
+                    collection_id=collection_id,
+                    item_id=item_id,
                 ).model_dump()
             )
 ```

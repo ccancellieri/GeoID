@@ -107,13 +107,12 @@ logging.root.handlers = [_handler]
 
 # Cap noisy third-party library loggers regardless of root LOG_LEVEL.
 # opensearch-py logs every HTTP exchange at DEBUG (full request/response
-# bodies) and every 4xx at WARNING — including idempotent 404s that our
-# task code catches and treats as success (see
-# tasks/elasticsearch/tasks.py:84-87). Without this cap, a dev run with
-# LOG_LEVEL=DEBUG produces hundreds of index_not_found_exception body
-# dumps during bulk delete flows. Set OPENSEARCH_LOG_LEVEL=WARNING (or
-# INFO) to tune; default ERROR hides routine 404s but still surfaces
-# auth / connectivity failures.
+# bodies) and every 4xx at WARNING — including idempotent 404s that
+# driver-level delete paths catch and treat as success. Without this cap,
+# a dev run with LOG_LEVEL=DEBUG produces hundreds of
+# index_not_found_exception body dumps during bulk delete flows. Set
+# OPENSEARCH_LOG_LEVEL=WARNING (or INFO) to tune; default ERROR hides
+# routine 404s but still surfaces auth / connectivity failures.
 _os_log_level_name = os.getenv("OPENSEARCH_LOG_LEVEL", "ERROR").upper()
 _os_log_level = getattr(logging, _os_log_level_name, logging.ERROR)
 for _lib in ("opensearch", "elasticsearch", "elastic_transport"):

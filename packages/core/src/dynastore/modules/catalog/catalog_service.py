@@ -1390,6 +1390,15 @@ class CatalogService(CatalogsProtocol):
                     catalog_id=catalog_id,
                     db_resource=conn,
                 )
+                await emit_event(
+                    CatalogEventType.CATALOG_METADATA_CHANGED,
+                    catalog_id=catalog_id,
+                    db_resource=conn,
+                    payload={
+                        "catalog_id": catalog_id,
+                        "operation": "soft_delete",
+                    },
+                )
                 self._get_catalog_model_cached.cache_invalidate(catalog_id)
                 return True
 
@@ -1465,6 +1474,21 @@ class CatalogService(CatalogsProtocol):
                 physical_schema=physical_schema,
             )
             logger.warning(f"DEBUG: delete_catalog: Emitted CATALOG_HARD_DELETION")
+
+            # Fire the canonical INDEX-side cleanup signal: ReindexWorker
+            # picks this up and fans out to CatalogRoutingConfig.operations[INDEX]
+            # drivers (ES catalog doc gets dropped). Emitted inline rather
+            # than via catalog_router.delete_catalog_metadata so we don't
+            # fan-out into the tenant schema that was just dropped above.
+            await emit_event(
+                CatalogEventType.CATALOG_METADATA_CHANGED,
+                catalog_id=catalog_id,
+                db_resource=conn,
+                payload={
+                    "catalog_id": catalog_id,
+                    "operation": "delete",
+                },
+            )
 
             # Emit AFTER event
             logger.warning(f"DEBUG: delete_catalog: Emitting AFTER_CATALOG_HARD_DELETION")

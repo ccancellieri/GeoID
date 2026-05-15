@@ -4,17 +4,23 @@ This module automatically indexes DynaStore entities (Catalogs, Collections, Ite
 
 ## Protocols
 
-The module implements `IndexerProtocol` (`models/protocols/indexer.py`), exposing a backend-agnostic contract for document indexing. Other components discover it via `get_protocol(IndexerProtocol)` — no direct imports needed. The companion search extension implements `SearchProtocol` (`models/protocols/search.py`), also discovered at runtime.
+The module ships ES-backed driver implementations of the routing-config rails:
+- `catalog_elasticsearch_driver` (`CatalogStore`) — read/write for the platform-wide `{prefix}-catalogs` and `{prefix}-collections` indices.
+- `items_elasticsearch_driver` / `items_elasticsearch_private_driver` (`Indexer` + `ItemsSearchProtocol`) — per-tenant `{prefix}-{cat}-items` indices; the private variant is what `CollectionPrivacy.is_private` collections pin under `ItemsRoutingConfig.operations[INDEX]`.
 
-To swap to a different backend, implement the same protocols in a new module/extension.
+The companion search extension implements `SearchProtocol` (`models/protocols/search.py`), discovered at runtime.
+
+To swap to a different backend, implement the same protocols in a new module/extension and pin the new driver_ref under the relevant `*RoutingConfig.operations[...]`.
 
 ## Architecture
 
-The module leverages DynaStore's asynchronous, event-driven architecture and durable task queue to ensure reliability and performance.
-1. **Event Emission:** Core services (CatalogService, CollectionService, etc.) emit events (e.g. `CATALOG_CREATION`, `ITEM_CREATION`, `BULK_ITEM_CREATION`) during their database transactions.
-2. **Event Listening:** The `ElasticsearchModule` listens to these events using the generic `EventsProtocol`.
-3. **Task Enqueuing:** Upon receiving an event, the module immediately enqueues a *durable background task* to the `TasksModule` queue and returns control, ensuring the HTTP request is not blocked by Elasticsearch network operations.
-4. **Task Execution & Retries:** Background workers execute the indexing tasks (`ElasticsearchIndexTask`, `ElasticsearchDeleteTask`). If Elasticsearch is temporarily unavailable, the task is automatically retried with exponential backoff.
+DynaStore routes catalog / collection / item INDEX hops through routing-config rails, not through this module's lifecycle-event listeners (the listener path that owned these dispatches before #825 was retired — it ran in parallel to the canonical rails and emitted misleading "Indexing collection …" log lines on every routing-config PUT).
+
+1. **Items.** `IndexDispatcher.fan_out_bulk(ctx, ops)` reads `ItemsRoutingConfig.operations[INDEX]` via the entity-aware resolver (#820) and dispatches to whichever Indexer drivers are pinned there — typically `items_elasticsearch_driver` (public) or `items_elasticsearch_private_driver` (private). Soft-delete fan-out uses the same dispatcher.
+2. **Collections.** `collection_router._dispatch_collection_index` calls `IndexDispatcher.fan_out_bulk` with `entity_type='collection'`; resolver returns `CollectionRoutingConfig.operations[INDEX]`. Both upsert and hard-delete paths trigger the dispatch.
+3. **Catalogs.** `catalog_router.upsert_catalog_metadata` and `catalog_service.delete_catalog` (soft + hard) emit `CATALOG_METADATA_CHANGED`; `ReindexWorker` consumes the event and fans out to `CatalogRoutingConfig.operations[INDEX]` (defaults pin `catalog_elasticsearch_driver` with `OUTBOX`-durable async semantics).
+
+This module's lifespan still creates the shared `{prefix}-catalogs` / `{prefix}-collections` indices and the `{prefix}-items` public alias at startup, and `bulk_reindex(catalog_id, collection_id=…)` remains the entry point for full-index rebuilds (Cloud Run Job task types `elasticsearch_bulk_reindex_{catalog,collection}`).
 
 ## Configuration
 

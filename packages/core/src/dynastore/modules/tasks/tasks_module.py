@@ -58,15 +58,10 @@ def _serialize_inputs(inputs: Any) -> Optional[str]:
     UUID / Decimal / shapely values survive the round-trip to PG.
 
     Without this, producers that pass ``model_dump()`` of a pydantic
-    model containing a ``datetime`` (e.g. ``BulkCatalogReindexInputs``
-    emitted by the Elasticsearch module after a ``catalog_metadata_changed``
-    event) blow up in ``tasks.create_task`` with::
-
-        ElasticsearchModule: Failed to dispatch task
-        elasticsearch_index: Object of type datetime is not JSON serializable
-
-    The task row is never created, the reindex never runs, and the
-    catalog silently drifts from its search index.
+    model containing a ``datetime`` (e.g. ``BulkCatalogReindexInputs``)
+    blow up in ``tasks.create_task`` with ``Object of type datetime is
+    not JSON serializable``. The task row is never created, the reindex
+    never runs, and the catalog silently drifts from its search index.
 
     Returns ``None`` when ``inputs`` is empty so the DB column stays
     NULL (matches the legacy behaviour).

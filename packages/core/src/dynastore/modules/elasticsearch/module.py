@@ -1,23 +1,17 @@
 import fnmatch
 import logging
-import re
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from contextlib import asynccontextmanager
 
 # Hard runtime dep — fail entry-point load on services without ``opensearch-py``
-# installed (i.e. SCOPEs that don't include ``module_elasticsearch``).  Without
-# this, the module imports cleanly via lazy ``opensearchpy`` calls inside method
-# bodies and registers as an ``IndexerProtocol`` provider, which makes the
-# CapabilityMap mark ``elasticsearch_index`` claimable on services that cannot
-# actually run it (tools, etc.).  Failing the import here makes the framework
-# fall back to ``_register_definition_only_placeholders`` and keep these tasks
-# off that service's claim list.
+# installed (i.e. SCOPEs that don't include ``module_elasticsearch``). Failing
+# the import here keeps the bulk-reindex task wrappers and ES-backed drivers
+# (catalog_elasticsearch_driver, items_elasticsearch_driver, …) off the claim
+# list of services that cannot actually run them.
 import opensearchpy  # noqa: F401
 
 from dynastore.modules import ModuleProtocol
-from dynastore.models.protocols.event_bus import EventBusProtocol
 from dynastore.tools.discovery import get_protocol
-from dynastore.modules.catalog.event_service import CatalogEventType
 
 logger = logging.getLogger(__name__)
 
@@ -186,83 +180,24 @@ async def _is_es_active(catalog_id: str, collection_id: str) -> bool:
         return False
 
 
-async def _stac_serialize_item(catalog_id: str, collection_id: str, item_id: str) -> Optional[dict]:
-    """Fetch the item and serialize it as a full STAC document."""
-    try:
-        from dynastore.modules.catalog.item_service import ItemService
-        from dynastore.models.protocols import DbProtocol
-
-        db = get_protocol(DbProtocol)
-        item_svc = get_protocol(ItemService)
-        if not item_svc:
-            item_svc = ItemService(engine=db)  # type: ignore[arg-type]
-
-        feature = await item_svc.get_item(catalog_id, collection_id, item_id)
-        if feature is None:
-            return None
-
-        doc = feature.model_dump(by_alias=True, exclude_none=True)
-        doc["catalog_id"] = catalog_id
-        doc["collection_id"] = collection_id
-        return doc
-    except Exception as e:
-        logger.warning(
-            "Failed to STAC-serialize item %s/%s/%s: %s",
-            catalog_id, collection_id, item_id, e,
-        )
-        return None
-
-
-async def _stac_serialize_catalog(catalog_id: str) -> Optional[dict]:
-    """Serialize a catalog as a STAC dict from its metadata model."""
-    try:
-        from dynastore.models.protocols import CatalogsProtocol
-        catalogs = get_protocol(CatalogsProtocol)
-        if not catalogs:
-            return None
-        model = await catalogs.get_catalog_model(catalog_id)
-        if model is None:
-            return None
-        doc = model.model_dump(by_alias=True, exclude_none=True) if hasattr(model, "model_dump") else {}
-        doc["catalog_id"] = catalog_id
-        doc.setdefault("id", catalog_id)
-        return doc
-    except Exception as e:
-        logger.warning("Failed to serialize catalog %s: %s", catalog_id, e)
-        return None
-
-
-async def _stac_serialize_collection(catalog_id: str, collection_id: str) -> Optional[dict]:
-    """Serialize a collection as a STAC dict from its metadata model."""
-    try:
-        from dynastore.models.protocols import CatalogsProtocol
-        catalogs = get_protocol(CatalogsProtocol)
-        if not catalogs:
-            return None
-        model = await catalogs.get_collection_model(catalog_id, collection_id)  # type: ignore[attr-defined]
-        if model is None:
-            return None
-        doc = model.model_dump(by_alias=True, exclude_none=True) if hasattr(model, "model_dump") else {}
-        doc["catalog_id"] = catalog_id
-        doc["collection_id"] = collection_id
-        doc.setdefault("id", collection_id)
-        return doc
-    except Exception as e:
-        logger.warning("Failed to serialize collection %s/%s: %s", catalog_id, collection_id, e)
-        return None
-
-
 # ---------------------------------------------------------------------------
 # ElasticsearchModule
 # ---------------------------------------------------------------------------
 
 class ElasticsearchModule(ModuleProtocol):
     """
-    Listens to domain events and dispatches indexing tasks to Elasticsearch.
+    Ensures the platform-wide ES indices/aliases exist and exposes
+    bulk-reindex orchestration entry points.
 
-    Implements ``IndexerProtocol`` so that other components can discover the
-    indexing backend via ``get_protocol(IndexerProtocol)`` without importing
-    this module directly.
+    Catalog, collection, and item INDEX propagation are all driven by the
+    routing-config rails today — items via ``IndexDispatcher.fan_out_bulk``
+    reading ``ItemsRoutingConfig``/``CollectionRoutingConfig`` (#820), catalogs
+    via ``ReindexWorker`` consuming ``CATALOG_METADATA_CHANGED`` events and
+    fanning out to ``CatalogRoutingConfig.operations[INDEX]``. The legacy
+    listener path that dispatched ``elasticsearch_index``/``elasticsearch_delete``
+    tasks on catalog/collection lifecycle events was retired in #825 — it ran
+    in parallel to the canonical rails and was the source of the misleading
+    "Indexing collection …" log line that surfaced #810.
 
     Privacy is per-collection (Cycle E) — see
     ``CollectionPrivacy.is_private`` and the
@@ -277,42 +212,6 @@ class ElasticsearchModule(ModuleProtocol):
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
-        events = get_protocol(EventBusProtocol)
-
-        # ITEM_* propagation moved to the IndexDispatcher (Phase 2d of
-        # the indexer-protocol harmonisation).  Catalog/collection-tier
-        # listeners stay event-driven for now — a follow-up phase will
-        # migrate those to the dispatcher too.
-        _registered: list = []
-        if events:
-            for etype, handler in [
-                (CatalogEventType.CATALOG_CREATION,         self._on_catalog_upsert),
-                (CatalogEventType.CATALOG_UPDATE,           self._on_catalog_upsert),
-                (CatalogEventType.CATALOG_DELETION,         self._on_catalog_delete),
-                (CatalogEventType.CATALOG_HARD_DELETION,    self._on_catalog_delete),
-                (CatalogEventType.COLLECTION_CREATION,      self._on_collection_upsert),
-                (CatalogEventType.COLLECTION_UPDATE,        self._on_collection_upsert),
-                (CatalogEventType.COLLECTION_DELETION,      self._on_collection_delete),
-                (CatalogEventType.COLLECTION_HARD_DELETION, self._on_collection_delete),
-            ]:
-                decorator = events.async_event_listener(etype)
-                if decorator:
-                    decorator(handler)
-                    _registered.append((etype, handler))
-                else:
-                    logger.warning(
-                        "ElasticsearchModule: Failed to register listener for %s", etype
-                    )
-            logger.info(
-                "ElasticsearchModule: Registered catalog/collection listeners "
-                "(item propagation now dispatched via IndexDispatcher).",
-            )
-        else:
-            logger.warning(
-                "ElasticsearchModule: EventsProtocol not found. "
-                "Catalog/collection events not captured.",
-            )
-
         from dynastore.modules.elasticsearch import client as es_client
         await es_client.init()
 
@@ -487,9 +386,6 @@ class ElasticsearchModule(ModuleProtocol):
         try:
             yield
         finally:
-            for etype, handler in _registered:
-                if events is not None:
-                    events.unregister(etype, handler)  # type: ignore[attr-defined]
             await es_client.close()
 
     # ------------------------------------------------------------------
@@ -521,119 +417,10 @@ class ElasticsearchModule(ModuleProtocol):
             )
         except Exception as e:
             logger.error("ElasticsearchModule: Failed to dispatch task %s: %s", task_type, e)
-    # Async event handlers
-    # ------------------------------------------------------------------
-
-    async def _on_catalog_upsert(self, catalog_id: Optional[str] = None, payload=None, **kwargs):
-        if not catalog_id:
-            return
-        doc = await _stac_serialize_catalog(catalog_id)
-        if doc is None:
-            doc = payload if isinstance(payload, dict) else {}
-
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchIndexInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_index",
-            inputs=ElasticsearchIndexInputs(
-                entity_type="catalog",
-                entity_id=catalog_id,
-                catalog_id=catalog_id,
-                payload=doc,
-            ).model_dump(),
-        )
-
-    async def _on_catalog_delete(self, catalog_id: Optional[str] = None, **kwargs):
-        if not catalog_id:
-            return
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchDeleteInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_delete",
-            inputs=ElasticsearchDeleteInputs(
-                entity_type="catalog",
-                entity_id=catalog_id,
-            ).model_dump(),
-        )
-
-    async def _on_collection_upsert(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None, payload=None, **kwargs,
-    ):
-        if not catalog_id or not collection_id:
-            return
-
-        doc = await _stac_serialize_collection(catalog_id, collection_id)
-        if doc is None:
-            doc = payload if isinstance(payload, dict) else {}
-
-        entity_id = f"{catalog_id}:{collection_id}"
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchIndexInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_index",
-            inputs=ElasticsearchIndexInputs(
-                entity_type="collection",
-                entity_id=entity_id,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-                payload=doc,
-            ).model_dump(),
-        )
-
-    async def _on_collection_delete(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None, **kwargs,
-    ):
-        if not catalog_id or not collection_id:
-            return
-        entity_id = f"{catalog_id}:{collection_id}"
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchDeleteInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_delete",
-            inputs=ElasticsearchDeleteInputs(
-                entity_type="collection",
-                entity_id=entity_id,
-            ).model_dump(),
-        )
 
     # ------------------------------------------------------------------
-    # IndexerProtocol facade — exposes indexing via protocol discovery
+    # Bulk-reindex orchestration entry point
     # ------------------------------------------------------------------
-
-    async def index_document(
-        self,
-        entity_type: Literal["catalog", "collection", "item", "asset"],
-        entity_id: str,
-        document: Dict[str, Any],
-        catalog_id: Optional[str] = None,
-        collection_id: Optional[str] = None,
-        db_resource: Optional[Any] = None,
-    ) -> None:
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchIndexInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_index",
-            inputs=ElasticsearchIndexInputs(
-                entity_type=entity_type,
-                entity_id=entity_id,
-                catalog_id=catalog_id or "",
-                collection_id=collection_id,
-                payload=document,
-            ).model_dump(),
-            db_resource=db_resource,
-        )
-
-    async def delete_document(
-        self,
-        entity_type: Literal["catalog", "collection", "item", "asset"],
-        entity_id: str,
-        catalog_id: Optional[str] = None,
-        db_resource: Optional[Any] = None,
-    ) -> None:
-        from dynastore.tasks.elasticsearch.tasks import ElasticsearchDeleteInputs
-        await self._dispatch_task(
-            task_type="elasticsearch_delete",
-            inputs=ElasticsearchDeleteInputs(
-                entity_type=entity_type,
-                entity_id=entity_id,
-            ).model_dump(),
-            db_resource=db_resource,
-        )
 
     async def bulk_reindex(
         self,

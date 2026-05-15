@@ -9,12 +9,6 @@ from dynastore.tasks import hydrate_task_payload
 from dynastore.modules.processes.models import ExecuteRequest
 from dynastore.tasks.tiles_preseed.task import TilePreseedTask
 from dynastore.tasks.tiles_preseed.models import TilePreseedRequest
-from dynastore.tasks.elasticsearch.tasks import (
-    ElasticsearchIndexTask,
-    ElasticsearchIndexInputs,
-    ElasticsearchDeleteTask,
-    ElasticsearchDeleteInputs,
-)
 from dynastore.tasks.gcp.gcp_catalog_cleanup_task import (
     GcpCatalogCleanupTask,
     GcpCatalogCleanupInputs,
@@ -56,31 +50,6 @@ class TestHydrateTaskPayload:
         validated = TilePreseedRequest.model_validate(payload.inputs.inputs)
         assert validated.catalog_id == "cat_test"
         assert validated.collection_id == "col_test"
-
-    def test_elasticsearch_index_hydrated(self):
-        task = ElasticsearchIndexTask.__new__(ElasticsearchIndexTask)
-        raw = _make_raw_payload({
-            "entity_type": "item",
-            "entity_id": "test-id",
-            "payload": {"foo": "bar"},
-            "catalog_id": "cat_test",
-            "collection_id": "col_test",
-        })
-        payload = hydrate_task_payload(task, raw)
-        assert isinstance(payload.inputs, ElasticsearchIndexInputs)
-        assert payload.inputs.entity_type == "item"
-
-    def test_elasticsearch_delete_hydrated(self):
-        task = ElasticsearchDeleteTask.__new__(ElasticsearchDeleteTask)
-        raw = _make_raw_payload({
-            "entity_type": "item",
-            "entity_id": "del-id",
-            "catalog_id": "cat_test",
-            "collection_id": "col_test",
-        })
-        payload = hydrate_task_payload(task, raw)
-        assert isinstance(payload.inputs, ElasticsearchDeleteInputs)
-        assert payload.inputs.entity_id == "del-id"
 
     def test_gcp_catalog_cleanup_hydrated(self):
         task = GcpCatalogCleanupTask.__new__(GcpCatalogCleanupTask)

@@ -1,15 +1,11 @@
 """Unit tests for ``_serialize_inputs``.
 
-Regression coverage for the 2026-04-21 production bug:
-
-    ElasticsearchModule: Failed to dispatch task elasticsearch_index:
-    Object of type datetime is not JSON serializable
-
-Root cause: ``create_task`` / ``enqueue_task`` called ``json.dumps(inputs)``
-without the :class:`CustomJSONEncoder`, so any producer that put a
-``datetime`` / ``UUID`` / ``Decimal`` into ``TaskCreate.inputs`` would
-crash before the task row was ever written — the reindex never ran
-and the catalog silently drifted from its search index.
+Regression coverage for the 2026-04-21 production bug: ``create_task`` /
+``enqueue_task`` called ``json.dumps(inputs)`` without the
+:class:`CustomJSONEncoder`, so any producer that put a ``datetime`` /
+``UUID`` / ``Decimal`` into ``TaskCreate.inputs`` would crash before the
+task row was ever written — the task never ran and the catalog silently
+drifted from its search index.
 
 The fix routes both insert call sites through ``_serialize_inputs``
 which uses the custom encoder.  These tests pin the contract.
