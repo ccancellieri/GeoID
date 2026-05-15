@@ -299,9 +299,14 @@ class IamMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     {"detail": "Access denied by Principal policy."}, status_code=403
                 )
-            # Add Conditions
+            # Add Conditions. Tag each one with its owning policy id so
+            # the rate-limit / max-count handlers can namespace their
+            # counter rows; ``_policy_id`` is reserved and stripped from
+            # operator-supplied configs.
             for p in principal_obj.custom_policies:
                 if p.conditions:
+                    for c in p.conditions:
+                        c.config["_policy_id"] = p.id
                     all_conditions.extend(p.conditions)
 
         # C. Global System Policies
@@ -336,8 +341,23 @@ class IamMiddleware(BaseHTTPMiddleware):
         # 5. Evaluate All Accumulated Conditions (from Key and Principal)
         if all_conditions:
             from dynastore.modules.iam.conditions import evaluate_conditions
+            from dynastore.modules.iam.exceptions import IamError
 
-            if not await evaluate_conditions(all_conditions, ctx):
+            try:
+                allowed = await evaluate_conditions(all_conditions, ctx)
+            except IamError as exc:
+                # Rate-limit / quota handlers raise typed errors so the
+                # response carries the right status (429 vs 403) and the
+                # client gets a human-readable reason.
+                status_code = getattr(exc, "status_code", 429)
+                logger.warning(
+                    "Condition deny for '%s' via '%s': %s",
+                    effective_principal_id, source, exc,
+                )
+                return JSONResponse(
+                    {"detail": str(exc)}, status_code=status_code
+                )
+            if not allowed:
                 logger.warning(
                     f"Rate Limit/Quota Exceeded for '{effective_principal_id}' via '{source}'"
                 )

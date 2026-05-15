@@ -168,6 +168,12 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             self._authorizer = IamAuthorizer()
             register_plugin(self._authorizer)
 
+            # Usage-counter drivers for rate-limit / quota conditions.
+            # Always register PG (the durable single-source-of-truth).
+            # Layer on Valkey when a CountingCacheBackend is up so
+            # cross-pod increments stay atomic without a parallel client.
+            await self._register_usage_counter_drivers(stack)
+
             # IdP factory — IDP_TYPE selects the backend (default: oidc)
             # KEYCLOAK_* vars are read as fallbacks for backward compatibility.
             # See modules/iam/identity_providers/README.md for adding new types.
@@ -223,6 +229,57 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
         
         # Finally unregister self
         unregister_plugin(self)
+
+    async def _register_usage_counter_drivers(self, stack: AsyncExitStack) -> None:
+        """Wire a :class:`UsageCounterProtocol` driver for rate-limit / quota.
+
+        Exactly one driver is registered (``get_protocol`` returns the
+        lowest-priority match). When a :class:`CountingCacheBackend` is
+        up we use the layered Valkey-hot + PG-durable driver; otherwise
+        we fall back to the standalone Postgres driver.
+
+        The layered driver owns a background flush task; binding its
+        lifespan to ``stack`` ensures it stops cleanly on module unload.
+        """
+        from contextlib import asynccontextmanager
+
+        from dynastore.models.protocols.cache import CountingCacheBackend
+        from dynastore.modules.iam.usage_counter_pg import PostgresUsageCounter
+
+        pg_counter = PostgresUsageCounter()
+
+        try:
+            from dynastore.tools.cache import get_cache_manager
+
+            active = get_cache_manager().get_async_backend()
+        except Exception:
+            active = None
+
+        if not isinstance(active, CountingCacheBackend):
+            register_plugin(pg_counter)
+            stack.callback(unregister_plugin, pg_counter)
+            logger.info(
+                "UsageCounter: no CountingCacheBackend active; using "
+                "PG-only driver for rate-limit / quota enforcement."
+            )
+            return
+
+        from dynastore.modules.iam.usage_counter_layered import LayeredUsageCounter
+
+        layered = LayeredUsageCounter(postgres=pg_counter)
+
+        @asynccontextmanager
+        async def _lifespan():
+            await layered.start()
+            try:
+                yield
+            finally:
+                await layered.stop()
+
+        await stack.enter_async_context(_lifespan())
+        register_plugin(layered)
+        stack.callback(unregister_plugin, layered)
+        logger.info("UsageCounter: layered Valkey+PG driver registered.")
 
     async def resolve_principal(self, credentials: Any) -> Optional[Principal]:
         """

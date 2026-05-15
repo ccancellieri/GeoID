@@ -28,7 +28,8 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from .models import Condition
-from .exceptions import IamError
+from .exceptions import IamError, QuotaExceededError, RateLimitExceededError
+from dynastore.models.protocols.usage_counter import UsageCounterProtocol
 from dynastore.modules.iam.iam_storage import AbstractIamStorage
 from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.tools.discovery import get_protocol
@@ -68,57 +69,211 @@ class ConditionHandler(abc.ABC):
 
 # --- Condition Handlers ---
 
-class RateLimitHandler(ConditionHandler):
-    """
-    Rate limiting condition handler.
+def _principal_key_for(scope: str, ctx: EvaluationContext) -> Optional[str]:
+    """Resolve the opaque ``principal_key`` for a condition scope.
 
-    NOTE: The usage-counter storage backend (API key usage tables) was removed
-    in Phase 1 of the IAM refactor.  This handler is kept as a no-op stub so
-    that condition configs referencing "rate_limit" do not crash at runtime.
-    A new rate-limiting backend (e.g. Redis/Valkey sliding window) can be
-    plugged in here in the future.
+    Returns ``None`` when the scope can't be evaluated for the current
+    request (anonymous traffic on a ``principal`` scope, missing role,
+    etc.) — the handler treats that as fail-open per ``rate_limit``
+    semantics (no principal → no rate-limit row to update). Anonymous
+    quotas live behind ``scope=client_ip``.
+    """
+    if scope == "principal":
+        return ctx.principal_id
+    if scope == "role":
+        principal = (ctx.extras or {}).get("principal_obj")
+        roles = getattr(principal, "roles", None) if principal else None
+        # Use the first role — multi-role principals fall back to a deterministic pick.
+        return roles[0] if roles else None
+    if scope == "client_ip":
+        request = ctx.request
+        client = getattr(request, "client", None) if request else None
+        host = getattr(client, "host", None) if client else None
+        return f"ip:{host}" if host else None
+    if scope == "catalog":
+        return ctx.catalog_id
+    # Unknown scope — log once and fail-open via None.
+    logger.warning("rate_limit/max_count: unknown scope %r", scope)
+    return None
+
+
+def _path_method_matches(config: Dict[str, Any], ctx: EvaluationContext) -> bool:
+    """Apply ``path_pattern`` / ``methods`` gate; conditions skip non-matching requests."""
+    pattern = config.get("path_pattern")
+    if pattern and not re.search(pattern, ctx.path or ""):
+        return False
+    methods = config.get("methods")
+    if methods and ctx.method.upper() not in {m.upper() for m in methods}:
+        return False
+    return True
+
+
+class RateLimitHandler(ConditionHandler):
+    """Per-window rate limit backed by :class:`UsageCounterProtocol`.
+
+    Config keys
+    -----------
+    * ``limit`` (int, required)         — max hits per window.
+    * ``window_seconds`` (int, required) — window width.
+    * ``scope`` (str)                   — ``principal`` (default), ``role``,
+      ``client_ip``, ``catalog``.
+    * ``path_pattern`` (str, optional)   — regex; condition only enforces
+      when ``ctx.path`` matches. Other requests pass through.
+    * ``methods`` (list[str], optional)  — same allow-list semantics on
+      ``ctx.method``.
+    * ``mode`` ('graceful'|'strict')    — when no counter Protocol is
+      registered, ``graceful`` (default) allows the request,
+      ``strict`` fails closed.
     """
 
     @property
     def type(self) -> str: return "rate_limit"
 
     async def evaluate(self, config: Dict[str, Any], ctx: EvaluationContext) -> bool:
-        # Usage-counter storage removed — allow all requests and log once.
-        logger.debug(
-            "rate_limit condition evaluated but no usage-counter backend is configured; allowing request."
+        if not _path_method_matches(config, ctx):
+            return True
+
+        policy_id = config.get("_policy_id")
+        if not policy_id:
+            # Caller failed to inject the policy id; without it we can't
+            # namespace the counter — allow but log once.
+            logger.debug("rate_limit: missing _policy_id in config, skipping")
+            return True
+
+        scope = config.get("scope", "principal")
+        principal_key = _principal_key_for(scope, ctx)
+        if principal_key is None:
+            return True  # see _principal_key_for docstring
+
+        counter = get_protocol(UsageCounterProtocol)
+        if counter is None:
+            mode = config.get("mode", "graceful")
+            if mode == "strict":
+                raise RateLimitExceededError(
+                    "rate_limit condition cannot be enforced (no counter backend)"
+                )
+            logger.debug("rate_limit: no counter backend; allowing request")
+            return True
+
+        limit = int(config.get("limit", 0))
+        window = int(config.get("window_seconds", 60))
+        if limit <= 0 or window <= 0:
+            return True  # misconfigured policy — no enforcement
+
+        _, allowed = await counter.incr_if_below(
+            policy_id, principal_key, limit, window_seconds=window
         )
+        if not allowed:
+            raise RateLimitExceededError(
+                f"Rate limit of {limit} requests per {window}s exceeded "
+                f"for {scope}={principal_key}."
+            )
         return True
 
-class MaxCountHandler(ConditionHandler):
-    """
-    Lifetime quota condition handler.
+    async def inspect(self, config: Dict[str, Any], ctx: EvaluationContext) -> Optional[Dict[str, Any]]:
+        policy_id = config.get("_policy_id")
+        scope = config.get("scope", "principal")
+        principal_key = _principal_key_for(scope, ctx) if policy_id else None
+        limit = int(config.get("limit", 0))
+        window = int(config.get("window_seconds", 60))
 
-    NOTE: The usage-counter storage backend (API key usage tables) was removed
-    in Phase 1 of the IAM refactor.  This handler is kept as a no-op stub so
-    that condition configs referencing "max_count" do not crash at runtime.
-    A new quota backend can be plugged in here in the future.
+        used = 0
+        counter = get_protocol(UsageCounterProtocol)
+        if counter is not None and policy_id and principal_key is not None:
+            try:
+                used = await counter.get(
+                    policy_id, principal_key, window_seconds=window
+                )
+            except Exception:
+                logger.debug("rate_limit inspect failed", exc_info=True)
+
+        # Bucket end = next window boundary after now.
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        reset_at = ((now_ts // window) + 1) * window if window > 0 else None
+        return {
+            "type": "rate_limit",
+            "scope": scope,
+            "limit": limit,
+            "used": used,
+            "remaining": max(limit - used, 0),
+            "window_seconds": window,
+            "reset_at": reset_at,
+        }
+
+
+class MaxCountHandler(ConditionHandler):
+    """Lifetime quota backed by :class:`UsageCounterProtocol`.
+
+    Config keys
+    -----------
+    * ``limit`` (int, required) — max lifetime hits.
+    * ``scope`` (str)           — as in :class:`RateLimitHandler`.
+    * ``path_pattern`` / ``methods`` (optional) — same gate semantics.
+    * ``mode`` ('graceful'|'strict') — same fallback semantics.
     """
 
     @property
     def type(self) -> str: return "max_count"
 
     async def evaluate(self, config: Dict[str, Any], ctx: EvaluationContext) -> bool:
-        # Usage-counter storage removed — allow all requests and log once.
-        logger.debug(
-            "max_count condition evaluated but no usage-counter backend is configured; allowing request."
+        if not _path_method_matches(config, ctx):
+            return True
+
+        policy_id = config.get("_policy_id")
+        if not policy_id:
+            logger.debug("max_count: missing _policy_id in config, skipping")
+            return True
+
+        scope = config.get("scope", "principal")
+        principal_key = _principal_key_for(scope, ctx)
+        if principal_key is None:
+            return True
+
+        counter = get_protocol(UsageCounterProtocol)
+        if counter is None:
+            mode = config.get("mode", "graceful")
+            if mode == "strict":
+                raise QuotaExceededError(
+                    "max_count condition cannot be enforced (no counter backend)"
+                )
+            return True
+
+        # Accept either "limit" (new) or "max_count" (legacy config shape).
+        limit = int(config.get("limit", config.get("max_count", 0)))
+        if limit <= 0:
+            return True
+
+        _, allowed = await counter.incr_if_below(
+            policy_id, principal_key, limit, window_seconds=None
         )
+        if not allowed:
+            raise QuotaExceededError(
+                f"Lifetime quota of {limit} exceeded for {scope}={principal_key}."
+            )
         return True
 
     async def inspect(self, config: Dict[str, Any], ctx: EvaluationContext) -> Optional[Dict[str, Any]]:
-        max_count = config.get("max_count", 0)
-        scope = config.get("scope", "iam")
+        policy_id = config.get("_policy_id")
+        scope = config.get("scope", "principal")
+        principal_key = _principal_key_for(scope, ctx) if policy_id else None
+        limit = int(config.get("limit", config.get("max_count", 0)))
+
+        used = 0
+        counter = get_protocol(UsageCounterProtocol)
+        if counter is not None and policy_id and principal_key is not None:
+            try:
+                used = await counter.get(
+                    policy_id, principal_key, window_seconds=None
+                )
+            except Exception:
+                logger.debug("max_count inspect failed", exc_info=True)
+
         return {
             "type": "max_count",
             "scope": scope,
-            "limit": max_count,
-            "used": 0,
-            "remaining": max_count,
-            "note": "Usage-counter backend not configured.",
+            "limit": limit,
+            "used": used,
+            "remaining": max(limit - used, 0),
         }
 
 class QueryParamHandler(ConditionHandler):
