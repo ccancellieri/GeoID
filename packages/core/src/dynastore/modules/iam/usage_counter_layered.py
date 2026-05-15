@@ -110,6 +110,8 @@ class LayeredUsageCounter:
         window_seconds: Optional[int] = None,
         amount: int = 1,
     ) -> int:
+        if amount <= 0:
+            raise ValueError(f"amount must be > 0, got {amount}")
         try:
             new_count = await self._valkey.incr(
                 policy_id,
@@ -143,6 +145,8 @@ class LayeredUsageCounter:
         window_seconds: Optional[int] = None,
         amount: int = 1,
     ) -> Tuple[int, bool]:
+        if amount <= 0:
+            raise ValueError(f"amount must be > 0, got {amount}")
         try:
             new_count, allowed = await self._valkey.incr_if_below(
                 policy_id,

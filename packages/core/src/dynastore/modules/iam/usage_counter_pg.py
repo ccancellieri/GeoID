@@ -177,6 +177,8 @@ class PostgresUsageCounter:
         window_seconds: Optional[int] = None,
         amount: int = 1,
     ) -> int:
+        if amount <= 0:
+            raise ValueError(f"amount must be > 0, got {amount}")
         bucket = _bucket_for(window_seconds)
         async with managed_transaction(self._engine) as db:
             return await _INCR_AND_RETURN.execute(
@@ -216,6 +218,8 @@ class PostgresUsageCounter:
         window_seconds: Optional[int] = None,
         amount: int = 1,
     ) -> Tuple[int, bool]:
+        if amount <= 0:
+            raise ValueError(f"amount must be > 0, got {amount}")
         bucket = _bucket_for(window_seconds)
         async with managed_transaction(self._engine) as db:
             row = await _INCR_IF_BELOW.execute(

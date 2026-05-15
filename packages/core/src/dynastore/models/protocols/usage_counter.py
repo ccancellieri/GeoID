@@ -81,7 +81,12 @@ class UsageCounterProtocol(Protocol):
         window_seconds: Optional[int] = None,
         amount: int = 1,
     ) -> int:
-        """Atomically increment the counter; return the new value."""
+        """Atomically increment the counter; return the new value.
+
+        ``amount`` must be positive. Drivers raise ``ValueError`` on
+        ``amount <= 0`` rather than silently no-op'ing (zero) or
+        corrupting the counter (negative).
+        """
         ...
 
     async def get(
@@ -108,6 +113,9 @@ class UsageCounterProtocol(Protocol):
         Returns ``(new_count, allowed)``. ``allowed`` is ``True`` iff the
         increment kept the counter at or below ``limit``. On denial the
         counter is left unchanged and the current value is returned.
+
+        ``amount`` must be positive; drivers raise ``ValueError`` on
+        ``amount <= 0``.
         """
         ...
 
