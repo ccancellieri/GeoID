@@ -19,7 +19,6 @@
 # File: dynastore/extensions/iam/service.py
 
 import logging
-from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from fastapi import (
     APIRouter,
@@ -28,7 +27,7 @@ from fastapi import (
     FastAPI,
 )
 from fastapi.openapi.utils import get_openapi
-from typing import List, Optional, Any, Dict
+from typing import Optional, Any, Dict
 from datetime import datetime
 
 import os
@@ -253,16 +252,6 @@ def build_iam_openapi_schema(app: FastAPI) -> Dict[str, Any]:
     openapi_schema["tags"] = pruned_tags
 
     return openapi_schema
-
-
-# --- DTOs (Data Transfer Objects) ---
-
-
-class TokenRefreshRequest(BaseModel):
-    """Standardized refresh request."""
-
-    refresh_token: str
-    ttl_seconds: int = Field(default=3600, ge=60, le=2592000)
 
 
 class IamExtension(ExtensionProtocol):

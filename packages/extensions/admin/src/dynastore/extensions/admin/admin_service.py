@@ -28,6 +28,8 @@ from dynastore.modules.iam.iam_service import IamService
 from dynastore.models.protocols.catalogs import CatalogsProtocol
 from dynastore.models.protocols.policies import Policy, Role, Principal
 
+from dynastore.extensions.iam.guards import ensure_privileged_role_assignment
+
 from .models import (
     UserCreate, UserUpdate,
     RoleCreate, RoleUpdate, RoleResponse,
@@ -151,8 +153,14 @@ class AdminService(ExtensionProtocol):
         return out
 
     @router.post("/users", summary="Create a principal (local user or raw)", status_code=201)
-    async def create_user(body: UserCreate):  # type: ignore[reportGeneralTypeIssues]
+    async def create_user(request: Request, body: UserCreate):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
+
+        # Privilege-escalation guard: only sysadmins can mint a principal
+        # with a privileged role (admin/sysadmin by default — actual set is
+        # IamRolesConfig.admin_role_set, operator-tunable).
+        for role in body.roles or []:
+            await ensure_privileged_role_assignment(request, role)
 
         # Local-IdP user path: `provider="local"` + `password` set → go through
         # the local provider's `create_user` so the credential gets persisted
@@ -214,11 +222,18 @@ class AdminService(ExtensionProtocol):
         )
 
     @router.put("/users/{principal_id}", summary="Update user")
-    async def update_user(principal_id: UUID, body: UserUpdate):  # type: ignore[reportGeneralTypeIssues]
+    async def update_user(request: Request, principal_id: UUID, body: UserUpdate):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
         p = await mgr.get_principal(principal_id)
         if not p:
             raise HTTPException(status_code=404, detail="User not found.")
+        # Privilege-escalation guard: only sysadmins may manage a principal
+        # that already holds a privileged role, or assign one via the update.
+        for role in p.roles:
+            await ensure_privileged_role_assignment(request, role)
+        if body.roles is not None:
+            for role in body.roles:
+                await ensure_privileged_role_assignment(request, role)
         if body.is_active is not None:
             p.is_active = body.is_active
         if body.roles is not None:
@@ -232,8 +247,14 @@ class AdminService(ExtensionProtocol):
         )
 
     @router.delete("/users/{principal_id}", status_code=204, summary="Delete user")
-    async def delete_user(principal_id: UUID):  # type: ignore[reportGeneralTypeIssues]
+    async def delete_user(request: Request, principal_id: UUID):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
+        p = await mgr.get_principal(principal_id)
+        if p:
+            # Privilege-escalation guard: only sysadmins may delete a
+            # principal that holds a privileged role.
+            for role in p.roles:
+                await ensure_privileged_role_assignment(request, role)
         deleted = await mgr.delete_principal(principal_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="User not found.")
@@ -245,8 +266,10 @@ class AdminService(ExtensionProtocol):
         status_code=204,
         summary="Grant a platform-scope role to a principal",
     )
-    async def grant_platform_role(principal_id: UUID, body: AssignRoleRequest):  # type: ignore[reportGeneralTypeIssues]
+    async def grant_platform_role(request: Request, principal_id: UUID, body: AssignRoleRequest):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
+        # Privilege-escalation guard: only sysadmins may grant a privileged role.
+        await ensure_privileged_role_assignment(request, body.role)
         p = await mgr.get_principal(principal_id)
         if not p:
             raise HTTPException(status_code=404, detail="Principal not found.")
@@ -269,8 +292,10 @@ class AdminService(ExtensionProtocol):
         status_code=204,
         summary="Revoke a platform-scope role from a principal",
     )
-    async def revoke_platform_role(principal_id: UUID, role_name: str):  # type: ignore[reportGeneralTypeIssues]
+    async def revoke_platform_role(request: Request, principal_id: UUID, role_name: str):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
+        # Privilege-escalation guard: only sysadmins may revoke a privileged role.
+        await ensure_privileged_role_assignment(request, role_name)
         p = await mgr.get_principal(principal_id)
         if not p:
             raise HTTPException(status_code=404, detail="Principal not found.")
@@ -325,11 +350,17 @@ class AdminService(ExtensionProtocol):
         summary="Grant a catalog-scope role to a principal",
     )
     async def grant_catalog_role(
-        catalog_id: str,  # type: ignore[reportGeneralTypeIssues]
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
         principal_id: UUID,
         body: AssignRoleRequest,
     ):
         mgr = _iam()
+        # Privilege-escalation guard: only sysadmins may grant a privileged role
+        # at any scope. Catalog-scope grants of platform-privileged roles are
+        # rejected upstream (see role-registry split), but we still gate here
+        # in case an operator extends the privileged set.
+        await ensure_privileged_role_assignment(request, body.role)
         await _assert_catalog_exists(catalog_id)
         p = await mgr.get_principal(principal_id)
         if not p:
@@ -355,11 +386,14 @@ class AdminService(ExtensionProtocol):
         summary="Revoke a catalog-scope role from a principal",
     )
     async def revoke_catalog_role(
-        catalog_id: str,  # type: ignore[reportGeneralTypeIssues]
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
         principal_id: UUID,
         role_name: str,
     ):
         mgr = _iam()
+        # Privilege-escalation guard: only sysadmins may revoke a privileged role.
+        await ensure_privileged_role_assignment(request, role_name)
         await _assert_catalog_exists(catalog_id)
         p = await mgr.get_principal(principal_id)
         if not p:
