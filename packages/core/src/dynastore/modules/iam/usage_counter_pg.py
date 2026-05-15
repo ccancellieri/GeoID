@@ -31,7 +31,10 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     managed_transaction,
 )
-from dynastore.modules.iam.iam_queries import REAP_EXPIRED_USAGE_COUNTERS_SQL
+from dynastore.modules.iam.iam_queries import (
+    REAP_EXPIRED_USAGE_COUNTERS_SQL,
+    REAP_ORPHAN_USAGE_COUNTERS_SQL,
+)
 from dynastore.modules.iam.usage_counter_bucket import (
     bucket_for as _bucket_for,
     expires_for as _expires_for,
@@ -127,6 +130,16 @@ _RESET = DQLQuery(
 # block in `iam_queries.REAP_EXPIRED_USAGE_COUNTERS_SQL`.
 _REAP_EXPIRED = DQLQuery(
     REAP_EXPIRED_USAGE_COUNTERS_SQL,
+    result_handler=ResultHandler.ROWCOUNT,
+)
+
+# Safety-net reaper for orphan lifetime rows whose policy is gone.
+# SSOT lives in `iam_queries.REAP_ORPHAN_USAGE_COUNTERS_SQL` and is the
+# same string the pg_cron prune function interpolates — keep them
+# aligned so a future tweak (e.g. archive-instead-of-delete) lands in
+# both places at once.
+_REAP_ORPHANS = DQLQuery(
+    REAP_ORPHAN_USAGE_COUNTERS_SQL,
     result_handler=ResultHandler.ROWCOUNT,
 )
 
@@ -271,6 +284,19 @@ class PostgresUsageCounter:
     async def reap_expired(self) -> int:
         async with managed_transaction(self._engine) as db:
             return int(await _REAP_EXPIRED.execute(conn=db, schema=self._schema) or 0)
+
+    async def reap_orphans(self) -> int:
+        """Safety-net reaper for lifetime rows whose parent policy is gone.
+
+        Not part of :class:`UsageCounterProtocol` — the protocol exposes
+        ``reap_expired`` only, mirroring TTL semantics common to both PG
+        and Valkey. Orphan-policy cleanup is PG-specific (Valkey has no
+        notion of "policy"), and the canonical site in production is the
+        pg_cron prune function — this method is a local-dev / test
+        affordance using the same SSOT string the cron job interpolates.
+        """
+        async with managed_transaction(self._engine) as db:
+            return int(await _REAP_ORPHANS.execute(conn=db, schema=self._schema) or 0)
 
     async def list_for_policy(
         self,

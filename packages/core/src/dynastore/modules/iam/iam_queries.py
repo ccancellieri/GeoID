@@ -233,6 +233,35 @@ REAP_EXPIRED_USAGE_COUNTERS_SQL = (
     "WHERE expires_at IS NOT NULL AND expires_at < NOW();"
 )
 
+# Safety-net reaper for lifetime quotas whose policy is gone.
+#
+# Lifetime rows (``expires_at IS NULL``) are intentionally skipped by the
+# windowed reaper above — they encode "use this policy at most N times,
+# ever" semantics and must survive indefinitely. But if the parent
+# policy is deleted, those rows become permanent orphans:
+# ``usage_counters`` carries no FK to ``policies`` (intentional —
+# counters are hot-path; a FK would force a row lock on the policies row
+# for every incr).
+#
+# The transactional path on ``DELETE_POLICY`` already drops the rows in
+# the same transaction (gap #2 / PR #828), so this cron-side reaper is a
+# defence-in-depth safety net for rows orphaned via non-transactional
+# paths — manual SQL, partial restore from backup, schema-level cascades
+# disabled in some envs. Without it, a backup-restore that drops the
+# policies row but keeps usage_counters silently strands lifetime rows
+# under a now-nonexistent policy_id.
+#
+# We deliberately do NOT use ``last_seen_at`` as a reap criterion —
+# lifetime means lifetime; a quiet principal must keep their counter.
+# ``last_seen_at`` is reserved for admin-sort in ``list_for_policy``.
+REAP_ORPHAN_USAGE_COUNTERS_SQL = (
+    'DELETE FROM "{schema}".usage_counters u '
+    "WHERE u.expires_at IS NULL "
+    "  AND NOT EXISTS ("
+    '    SELECT 1 FROM "{schema}".policies p WHERE p.id = u.policy_id'
+    "  );"
+)
+
 # --- Audit Log Table ---
 
 CREATE_AUDIT_LOG_TABLE = DDLQuery("""

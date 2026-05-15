@@ -156,11 +156,14 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             # on the old body when the prune logic changes (e.g. a new
             # ``DELETE`` line for a newly-added table).
             #
-            # ``usage_counters`` reaper line is sourced from the SSOT
-            # constant in ``iam_queries`` — the in-process
-            # ``PostgresUsageCounter.reap_expired`` uses the same string
-            # so the two paths cannot drift on grace-period tweaks.
+            # ``usage_counters`` reaper lines are sourced from SSOT
+            # constants in ``iam_queries`` — the in-process
+            # ``PostgresUsageCounter`` driver uses the same strings so
+            # the two paths cannot drift on grace-period or join tweaks.
             _reap_usage_counters_sql = REAP_EXPIRED_USAGE_COUNTERS_SQL.format(
+                schema=schema
+            )
+            _reap_orphan_usage_counters_sql = REAP_ORPHAN_USAGE_COUNTERS_SQL.format(
                 schema=schema
             )
             _prune_function_ddl = f"""
@@ -185,6 +188,15 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 -- their grace period). Lifetime counters
                 -- (expires_at IS NULL) are kept indefinitely.
                 {_reap_usage_counters_sql}
+
+                -- Orphan lifetime usage counters whose parent policy is
+                -- gone. Defence-in-depth — the transactional path on
+                -- DELETE_POLICY (gap #2) already drops these rows; this
+                -- catches non-transactional orphans (manual SQL, partial
+                -- backup restore). last_seen_at intentionally NOT used —
+                -- lifetime means lifetime; a quiet principal must keep
+                -- their counter.
+                {_reap_orphan_usage_counters_sql}
             END;
             $$ LANGUAGE plpgsql;
             """
