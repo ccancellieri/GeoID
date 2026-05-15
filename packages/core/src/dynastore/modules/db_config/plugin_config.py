@@ -234,6 +234,23 @@ class PluginConfig(PersistentModel):
         _APPLY_HANDLERS.setdefault(cls, []).append(handler)
 
     @classmethod
+    def unregister_apply_handler(
+        cls, handler: Callable[..., Any]
+    ) -> bool:
+        """Detach a previously-registered apply-handler.
+
+        Returns True when the handler was found and removed, False otherwise.
+        Symmetric with ``register_apply_handler``; required because
+        ``get_apply_handlers`` returns a copy, so removing through it is a
+        silent no-op on the underlying registry.
+        """
+        handlers = _APPLY_HANDLERS.get(cls)
+        if not handlers or handler not in handlers:
+            return False
+        handlers.remove(handler)
+        return True
+
+    @classmethod
     def get_apply_handlers(cls) -> List[Callable[..., Any]]:
         return list(_APPLY_HANDLERS.get(cls, []))
 

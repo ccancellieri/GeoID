@@ -83,10 +83,11 @@ from dynastore.models.protocols.cache import CacheStats
 
 logger = logging.getLogger(__name__)
 
-# Legacy env var support (deprecated, use PluginConfig instead)
-_VALKEY_CIRCUIT_BREAKER_THRESHOLD = int(
-    os.getenv("VALKEY_CIRCUIT_BREAKER_THRESHOLD", "3")
-)
+# Circuit breaker default — used only when a backend is built without an
+# explicit ``circuit_breaker_threshold`` (test/legacy paths). The SSOT
+# is ``CachePluginConfig.circuit_breaker_threshold``, which the
+# ``CacheModule`` lifespan plumbs through to every constructor.
+_VALKEY_CIRCUIT_BREAKER_DEFAULT = 3
 
 # ---------------------------------------------------------------------------
 #  Valkey INFO section → field mapping (used by ValkeyCacheBackend.info())
@@ -552,7 +553,7 @@ class ValkeyCacheBackend:
         self._locks: Dict[str, asyncio.Lock] = {}
         self._consecutive_failures: int = 0
         self._circuit_breaker_threshold = (
-            circuit_breaker_threshold or _VALKEY_CIRCUIT_BREAKER_THRESHOLD
+            circuit_breaker_threshold or _VALKEY_CIRCUIT_BREAKER_DEFAULT
         )
 
     @property

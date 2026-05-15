@@ -380,13 +380,18 @@ class TestCircuitBreaker:
             sys.modules.pop("valkey.asyncio", None)
             sys.modules.pop("valkey", None)
 
-    def test_threshold_value_from_env(self):
-        """VALKEY_CIRCUIT_BREAKER_THRESHOLD can be configured."""
-        from dynastore.tools.cache_valkey import _VALKEY_CIRCUIT_BREAKER_THRESHOLD
+    def test_circuit_breaker_default_constant(self):
+        """Sane default exposed for the circuit-breaker threshold.
 
-        # Default is 3
-        assert _VALKEY_CIRCUIT_BREAKER_THRESHOLD >= 1
-        assert isinstance(_VALKEY_CIRCUIT_BREAKER_THRESHOLD, int)
+        The env-var path (VALKEY_CIRCUIT_BREAKER_THRESHOLD) was removed —
+        the runtime value flows from CachePluginConfig.circuit_breaker_threshold
+        into ValkeyCacheBackend.__init__; this constant is the fallback when
+        the PluginConfig knob is unset.
+        """
+        from dynastore.tools.cache_valkey import _VALKEY_CIRCUIT_BREAKER_DEFAULT
+
+        assert _VALKEY_CIRCUIT_BREAKER_DEFAULT >= 1
+        assert isinstance(_VALKEY_CIRCUIT_BREAKER_DEFAULT, int)
 
     async def test_set_failure_logs_at_warning_with_exc_info(self, caplog):
         """#590: per-op failures emit at WARNING with exc_info so the

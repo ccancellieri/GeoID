@@ -122,6 +122,7 @@ async def _on_valkey_engine_config_change(
         )
         return
 
+    _t0 = asyncio.get_event_loop().time()
     async with _apply_lock:
         # 1. Close + unregister old backend.
         old_backend = _current_backend
@@ -154,10 +155,16 @@ async def _on_valkey_engine_config_change(
         try:
             client = await engine_cache.get("valkey_engine")
         except Exception as e:
+            _dur_ms = int((asyncio.get_event_loop().time() - _t0) * 1000)
             logger.error(
                 "ValkeyEngineConfig apply handler: failed to re-init engine (%s). "
                 "Cache degrades to L1-only until next successful config apply.",
                 e,
+            )
+            logger.info(
+                "CACHE RECONNECT: success=false stage=engine_init "
+                "duration_ms=%d error=%s",
+                _dur_ms, type(e).__name__,
             )
             return
 
@@ -187,18 +194,29 @@ async def _on_valkey_engine_config_change(
             _reason = (
                 "probe timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
             )
+            _dur_ms = int((asyncio.get_event_loop().time() - _t0) * 1000)
             logger.error(
                 "CacheModule (reconnect): Valkey probe failed (%s). "
                 "Cache degrades to L1-only.",
                 _reason,
+            )
+            logger.info(
+                "CACHE RECONNECT: success=false stage=probe "
+                "duration_ms=%d error=%s",
+                _dur_ms, type(exc).__name__,
             )
             return
 
         get_cache_manager().register_backend(new_backend)
         _notify_backend_upgrade()
         _current_backend = new_backend
+        _dur_ms = int((asyncio.get_event_loop().time() - _t0) * 1000)
         logger.info(
             "CACHE BACKEND: VALKEY (reconnected) — version=%s mode=%s", version, mode
+        )
+        logger.info(
+            "CACHE RECONNECT: success=true version=%s mode=%s duration_ms=%d",
+            version, mode, _dur_ms,
         )
 
 
@@ -416,7 +434,7 @@ class CacheModule(ModuleProtocol):
                         ValkeyEngineConfig,
                     )
 
-                    ValkeyEngineConfig.get_apply_handlers().remove(
+                    ValkeyEngineConfig.unregister_apply_handler(
                         _on_valkey_engine_config_change
                     )
                 except Exception:
