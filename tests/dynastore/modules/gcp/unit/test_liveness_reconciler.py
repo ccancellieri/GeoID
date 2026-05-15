@@ -306,6 +306,47 @@ def test_lifespan_gates_reconciler_on_job_runner_host():
     assert "_should_register_gcp_job_runner" in src
 
 
+def test_lifespan_reconciler_start_uses_engine_property_not_raw_attr():
+    """#778 regression — the reconciler-start gate added in #735 used raw
+    ``self._engine`` which is *never assigned* in production: ``@engine.setter``
+    has no callers (``grep -rn '.engine\\s*=' packages/core/src/`` is empty),
+    so the raw attribute stays ``None`` forever. The DDL schema-init above
+    the gate uses ``self.engine`` (the property with ``get_engine()`` fallback)
+    and works; the reconciler gate used the raw attribute and silently
+    skipped on every Cloud Run service since #735 shipped.
+
+    Pin the gate to obtain the engine through the property so the
+    ``get_engine()`` fallback applies — parity with the DDL section directly
+    above it.
+    """
+    from dynastore.modules.gcp import gcp_module
+
+    src = inspect.getsource(gcp_module.GCPModule.lifespan)
+    start_marker = "Liveness reconciler"
+    assert start_marker in src, (
+        "Reconciler-start block lost its marker comment; rename only after "
+        "deleting this regression test or updating the marker here."
+    )
+    start_idx = src.index(start_marker)
+    # The reconciler-start block is short (~30 lines); 2500 chars covers it
+    # plus a safety margin without pulling in the teardown branch.
+    block = src[start_idx:start_idx + 2500]
+
+    # Bug shape — raw attribute check — MUST NOT reappear.
+    assert "self._engine is not None" not in block, (
+        "The reconciler-start gate must NOT use raw ``self._engine``: the "
+        "``@engine.setter`` is uncalled in production so the raw attribute "
+        "stays ``None`` forever and the reconciler silently skips. "
+        "Use ``self.engine`` (the property with ``get_engine()`` fallback) "
+        "instead — same path the schema-init above already uses. See #778."
+    )
+    # Property path MUST be used to resolve the engine for the reconciler.
+    assert "self.engine" in block, (
+        "Reconciler-start must read the engine through ``self.engine`` "
+        "(the property), not a raw attribute access. See #778."
+    )
+
+
 # --- #741 item 3: observability + reaper-race detection --------------------
 
 

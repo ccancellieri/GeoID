@@ -418,15 +418,30 @@ class GCPModule(
             # blindly reclaims them. Gated by _should_register_gcp_job_runner()
             # — Cloud Run Job containers and opted-out services must NOT run it
             # (they would compete needlessly and never own a gcp_cloud_run_ row).
+            #
+            # #778 — resolve the engine through ``self.engine`` (the property,
+            # with ``get_engine()`` fallback), NOT raw ``self._engine``:
+            # ``@engine.setter`` has no production callers (no code does
+            # ``gcp_module.engine = …``), so the raw attribute stays ``None``
+            # forever and the gate silently False'd on every Cloud Run service
+            # since #735 shipped. The schema-init right above already uses the
+            # property; the reconciler must too.
             self._liveness_reconciler = None
-            if _should_register_gcp_job_runner() and self._engine is not None:
+            try:
+                reconciler_engine = self.engine
+            except AssertionError:
+                # No DB engine available at all; schema-init's warning above
+                # already covers operator visibility. Reconciler stays inert,
+                # pg_cron reaper remains the backstop.
+                reconciler_engine = None
+            if _should_register_gcp_job_runner() and reconciler_engine is not None:
                 try:
                     from dynastore.modules.gcp.liveness_reconciler import (
                         GcpLivenessReconciler,
                     )
                     cfg = self._module_config
                     self._liveness_reconciler = GcpLivenessReconciler(
-                        engine=self._engine,
+                        engine=reconciler_engine,
                         interval_seconds=getattr(
                             cfg, "liveness_reconciler_interval_seconds", 20
                         ),
