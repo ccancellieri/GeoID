@@ -36,6 +36,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Tuple,
     Union,
     runtime_checkable,
 )
@@ -315,6 +316,64 @@ class TaggableCacheBackend(CacheBackend, Protocol):
     ) -> bool: ...
 
     async def clear_tags(self, *tags: str) -> bool: ...
+
+
+@runtime_checkable
+class CountingCacheBackend(CacheBackend, Protocol):
+    """For backends supporting atomic counter primitives (Redis/Valkey INCR).
+
+    Used by ``UsageCounterProtocol`` Valkey driver to share rate-limit /
+    quota state across pods without spinning up a parallel client. Any
+    backend exposing this protocol is automatically selected as the hot
+    path for counting; in-memory backends simply omit it and the layered
+    composite degrades to the durable PG driver.
+    """
+
+    async def get_count(self, key: str) -> Optional[int]:
+        """Return the current integer counter value (``None`` if no row).
+
+        Distinct from :meth:`CacheBackend.get` — counter values are stored
+        as native server integers (Redis ``INCRBY`` encoding), not as
+        serialized cache payloads, so the generic ``get`` may not decode
+        them correctly. Use this method to read counts back.
+        """
+        ...
+
+    async def incr(
+        self,
+        key: str,
+        amount: int = 1,
+        *,
+        ttl: Optional[float] = None,
+    ) -> int:
+        """Atomically add ``amount`` and return the new value.
+
+        If ``ttl`` is given and the key did not previously exist, the
+        backend MUST set an expiry of ``ttl`` seconds on creation.
+        """
+        ...
+
+    async def incr_if_below(
+        self,
+        key: str,
+        limit: int,
+        amount: int = 1,
+        *,
+        ttl: Optional[float] = None,
+    ) -> Tuple[int, bool]:
+        """Atomic check-and-increment.
+
+        Returns ``(new_count, allowed)``. ``allowed`` is ``True`` iff the
+        increment kept the counter at or below ``limit``. On denial the
+        counter is left unchanged and the current value is returned. Both
+        the check and the mutation MUST happen atomically (single command
+        or server-side script) so two pods cannot both succeed at the cap.
+        """
+        ...
+
+    async def expireat(self, key: str, ts: float) -> bool:
+        """Set absolute expiry (Unix epoch seconds). Returns ``True`` if applied."""
+        ...
 
 
 # ---------------------------------------------------------------------------

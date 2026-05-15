@@ -58,7 +58,7 @@ import os
 import socket
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 # msgpack + valkey are optional — provided by the ``module_cache`` extra.
@@ -692,6 +692,123 @@ class ValkeyCacheBackend:
         if key not in self._locks:
             self._locks[key] = asyncio.Lock()
         return self._locks[key]
+
+    # ------------------------------------------------------------------
+    # CountingCacheBackend extension protocol
+    # ------------------------------------------------------------------
+    #
+    # Three atomic primitives backing :class:`UsageCounterProtocol` Valkey
+    # driver. ``incr_if_below`` runs server-side as a Lua script so the
+    # cap check and the increment commit in one round trip — two pods
+    # cannot both succeed at the boundary the way they could with a
+    # GET-then-INCR sequence.
+
+    _INCR_IF_BELOW_SCRIPT = (
+        # KEYS[1] = prefixed key, ARGV = {limit, amount, ttl_ms}
+        # Returns {new_value, allowed_int}. allowed_int = 1 iff committed.
+        "local cur = tonumber(redis.call('GET', KEYS[1]) or '0') "
+        "local lim = tonumber(ARGV[1]) "
+        "local inc = tonumber(ARGV[2]) "
+        "local ttl_ms = tonumber(ARGV[3]) "
+        "if cur + inc > lim then "
+        "  return {cur, 0} "
+        "end "
+        "local nv = redis.call('INCRBY', KEYS[1], inc) "
+        "if ttl_ms > 0 and tonumber(nv) == inc then "
+        "  redis.call('PEXPIRE', KEYS[1], ttl_ms) "
+        "end "
+        "return {tonumber(nv), 1}"
+    )
+
+    async def get_count(self, key: str) -> Optional[int]:
+        full = self._key(key)
+        try:
+            raw = await self._client.get(full)
+            self._record_success()
+            if raw is None:
+                return None
+            # ``INCRBY`` stores native integers — the client returns them
+            # as bytes (or str) of the ASCII digit form, not msgpack.
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8")
+            return int(raw)
+        except (ValueError, TypeError):
+            logger.warning(
+                "ValkeyCacheBackend.get_count: non-integer payload at key=%s", full
+            )
+            return None
+        except Exception:
+            self._record_failure()
+            logger.warning(
+                "ValkeyCacheBackend.get_count failed (key=%s)", full, exc_info=True
+            )
+            return None
+
+    async def incr(
+        self,
+        key: str,
+        amount: int = 1,
+        *,
+        ttl: Optional[float] = None,
+    ) -> int:
+        full = self._key(key)
+        try:
+            new_value = await self._client.incrby(full, amount)
+            # Only stamp TTL on creation (avoid resetting expiry on every hit).
+            if ttl is not None and int(new_value) == int(amount):
+                await self._client.pexpire(full, int(ttl * 1000))
+            self._record_success()
+            return int(new_value)
+        except Exception:
+            self._record_failure()
+            logger.warning(
+                "ValkeyCacheBackend.incr failed (key=%s)", full, exc_info=True
+            )
+            raise
+
+    async def incr_if_below(
+        self,
+        key: str,
+        limit: int,
+        amount: int = 1,
+        *,
+        ttl: Optional[float] = None,
+    ) -> Tuple[int, bool]:
+        full = self._key(key)
+        ttl_ms = int(ttl * 1000) if ttl is not None else 0
+        try:
+            # Server-side Lua via the EVAL command — single round trip,
+            # atomic check-and-increment. Avoid the client's ``eval``
+            # helper to dodge static-analysis false positives that
+            # confuse it with the unsafe Python builtin.
+            result = await self._client.execute_command(
+                "EVAL", self._INCR_IF_BELOW_SCRIPT, 1, full, limit, amount, ttl_ms
+            )
+            self._record_success()
+            new_value = int(result[0])
+            allowed = bool(int(result[1]))
+            return (new_value, allowed)
+        except Exception:
+            self._record_failure()
+            logger.warning(
+                "ValkeyCacheBackend.incr_if_below failed (key=%s)", full, exc_info=True
+            )
+            raise
+
+    async def expireat(self, key: str, ts: float) -> bool:
+        full = self._key(key)
+        try:
+            # EXPIREAT takes seconds; PEXPIREAT takes ms. Stick to ms for
+            # sub-second precision parity with set()'s px argument.
+            result = await self._client.pexpireat(full, int(ts * 1000))
+            self._record_success()
+            return bool(result)
+        except Exception:
+            self._record_failure()
+            logger.warning(
+                "ValkeyCacheBackend.expireat failed (key=%s)", full, exc_info=True
+            )
+            return False
 
     async def ping(self) -> bool:
         """Health check — verify Valkey connectivity."""

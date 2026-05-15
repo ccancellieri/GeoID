@@ -24,7 +24,6 @@ handlers consume only the protocol so the wiring stays unchanged.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from dynastore.modules.db_config.query_executor import (
@@ -32,33 +31,14 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     managed_transaction,
 )
+from dynastore.modules.iam.usage_counter_bucket import (
+    LIFETIME_BUCKET as _LIFETIME_BUCKET,  # re-exported for tests
+    bucket_for as _bucket_for,
+    expires_for as _expires_for,
+)
 from dynastore.tools.protocol_helpers import get_engine
 
-# Fixed-bucket sentinel for lifetime counters. Postgres ``TIMESTAMPTZ``
-# epoch is ``1970-01-01 UTC``; chosen so the PK index keeps lifetime
-# rows clustered at the low end of the window_start range.
-_LIFETIME_BUCKET = datetime.fromtimestamp(0, tz=timezone.utc)
-
-
-def _bucket_for(window_seconds: Optional[int], now: Optional[datetime] = None) -> datetime:
-    if window_seconds is None or window_seconds <= 0:
-        return _LIFETIME_BUCKET
-    moment = now or datetime.now(timezone.utc)
-    floor_ts = (int(moment.timestamp()) // window_seconds) * window_seconds
-    return datetime.fromtimestamp(floor_ts, tz=timezone.utc)
-
-
-def _expires_for(
-    bucket: datetime, window_seconds: Optional[int]
-) -> Optional[datetime]:
-    if window_seconds is None or window_seconds <= 0:
-        return None
-    # One window of grace past the bucket close — the nightly reaper
-    # drops rows whose window has fully aged out. Short-lived in-flight
-    # decisions during the trailing window still read a fresh count.
-    return datetime.fromtimestamp(
-        bucket.timestamp() + 2 * window_seconds, tz=timezone.utc
-    )
+__all__ = ["PostgresUsageCounter", "_LIFETIME_BUCKET", "_bucket_for", "_expires_for"]
 
 
 # --- Queries --------------------------------------------------------------
