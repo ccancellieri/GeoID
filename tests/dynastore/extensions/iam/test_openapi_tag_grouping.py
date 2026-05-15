@@ -35,10 +35,7 @@ from fastapi import FastAPI
 
 from dynastore.extensions.iam.service import build_iam_openapi_schema
 from dynastore.extensions.auth.authentication import Authentication
-from dynastore.extensions.iam.authorization_api import (
-    router as iam_admin_router,
-    me_router as iam_me_router,
-)
+from dynastore.extensions.iam.authorization_api import me_router as iam_me_router
 from dynastore.extensions.admin.admin_service import AdminService
 
 
@@ -62,10 +59,9 @@ def _build_app_with_auth_routers() -> FastAPI:
     auth_ext._setup_routes()
     app.include_router(auth_ext.router)
 
-    # IAM extension's authorization_api routers ship as module-level
-    # singletons — include them under the /iam prefix that the
-    # IamExtension would otherwise mount them at.
-    app.include_router(iam_admin_router, prefix="/iam")
+    # IAM extension's self-service router ships as a module-level
+    # singleton — include it under the /iam prefix that the
+    # IamExtension would otherwise mount it at.
     app.include_router(iam_me_router, prefix="/iam")
 
     # Admin extension owns /admin (including /admin/users).
