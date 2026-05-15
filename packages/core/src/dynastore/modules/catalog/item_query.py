@@ -598,6 +598,7 @@ class ItemQueryMixin:
                             collection=collection_id,
                             correlation_id=get_correlation_id() or "",
                             pg_conn=conn,
+                            entity_type="item",
                         ),
                         [IndexOp(
                             op_type="delete",

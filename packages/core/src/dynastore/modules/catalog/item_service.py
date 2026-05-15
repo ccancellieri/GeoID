@@ -881,6 +881,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             collection=collection_id,
             correlation_id=get_correlation_id() or "",
             pg_conn=pg_conn,
+            entity_type="item",
         )
         try:
             await dispatcher.fan_out_bulk(ctx, ops)

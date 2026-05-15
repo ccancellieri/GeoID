@@ -563,40 +563,93 @@ class _DualOutbox:
 
 
 def _make_default_routing_resolver():
-    """Build a resolver that loads the live :class:`CollectionRoutingConfig`
-    via ``ConfigsProtocol.get_config`` — the same path used elsewhere in
-    the storage layer.
+    """Build an entity-aware resolver that loads the live PluginConfig
+    matching the dispatched tier via ``ConfigsProtocol.get_config``.
 
-    NOTE (un-fao/GeoID#810): :class:`IndexDispatcher` is reached from
-    ``item_service._dispatch_index_upsert`` (OGC ingest path) and from
-    ``item_query`` (item delete path). Both construct items-tier
-    ``IndexOp`` with ``entity_type="item"``, but this resolver reads
-    ``CollectionRoutingConfig.operations[INDEX]``. Items-tier indexers
-    must be pinned there (not in :class:`ItemsRoutingConfig`) to fire
-    on item upsert/delete via the OGC endpoints.
-    :class:`ItemsRoutingConfig` ``operations[INDEX]`` is consumed only
-    by ``item_service.upsert_bulk``, which has no production caller on
-    the OGC ingest flow today.
+    Per un-fao/GeoID#810 (Option B): the dispatcher is reached from three
+    tiers and each must read its own PluginConfig:
+
+    * ``entity_type="item"`` -> :class:`ItemsRoutingConfig` — OGC ingest
+      (``item_service._dispatch_index_upsert``) and item delete
+      (``item_query``). Carries the privacy-cascade validator's contract
+      into runtime: a private collection that pins
+      ``items_elasticsearch_private_driver`` in
+      ``ItemsRoutingConfig.operations[INDEX]`` now fires on item
+      upsert/delete via the OGC endpoints.
+    * ``entity_type="collection"`` -> :class:`CollectionRoutingConfig` —
+      collection metadata propagation (``_dispatch_collection_index``).
+    * ``entity_type="catalog"`` -> :class:`CatalogRoutingConfig` — catalog
+      metadata propagation (event-driven via ``ReindexWorker`` today, which
+      resolves through its own ``_resolve_catalog_indexers`` rather than
+      this dispatcher path; supported here for symmetry / future callers).
+    * ``entity_type="asset"`` -> :class:`AssetRoutingConfig` — no
+      production caller through this dispatcher today; supported for
+      symmetry.
+    * ``entity_type=None`` -> :class:`CollectionRoutingConfig` —
+      back-compat for any caller that built an :class:`IndexContext`
+      before the field was introduced.
     """
 
-    async def resolve(catalog: str, collection: Optional[str]):
+    async def resolve(
+        catalog: str,
+        collection: Optional[str],
+        *,
+        entity_type: Optional[str] = None,
+    ):
         from dynastore.models.protocols.configs import ConfigsProtocol
-        from dynastore.modules.storage.routing_config import CollectionRoutingConfig
+        from dynastore.modules.storage.routing_config import (
+            AssetRoutingConfig,
+            CatalogRoutingConfig,
+            CollectionRoutingConfig,
+            ItemsRoutingConfig,
+        )
         from dynastore.tools.discovery import get_protocol
+
+        if entity_type == "item":
+            config_cls = ItemsRoutingConfig
+        elif entity_type == "catalog":
+            config_cls = CatalogRoutingConfig
+        elif entity_type == "asset":
+            config_cls = AssetRoutingConfig
+        else:
+            # "collection" and the back-compat None branch both read
+            # CollectionRoutingConfig.
+            config_cls = CollectionRoutingConfig
 
         configs = get_protocol(ConfigsProtocol)
         if configs is None:
             # No platform configs in this process — return a default
             # routing config so the dispatcher gracefully degrades to
             # empty-INDEX (no fan-out).
-            return CollectionRoutingConfig()
+            return config_cls()
         return await configs.get_config(
-            CollectionRoutingConfig,
+            config_cls,
             catalog_id=catalog,
             collection_id=collection,
         )
 
     return resolve
+
+
+async def _call_resolver(
+    resolver,
+    catalog: str,
+    collection: Optional[str],
+    entity_type: Optional[str],
+):
+    """Invoke a routing resolver with entity-type awareness, tolerating
+    legacy ``(catalog, collection)`` test stubs that predate the kwarg.
+
+    Production resolvers (``_make_default_routing_resolver``) accept the
+    ``entity_type`` kwarg; some unit-test stubs do not. Catching the
+    ``TypeError`` lets the dispatcher route correctly in prod while
+    preserving the existing test seam without forcing every fixture to
+    grow a parameter it doesn't read.
+    """
+    try:
+        return await resolver(catalog, collection, entity_type=entity_type)
+    except TypeError:
+        return await resolver(catalog, collection)
 
 
 def _make_default_indexer_registry():
@@ -688,9 +741,16 @@ class IndexDispatcher:
     Parameters
     ----------
     routing_resolver
-        Async callable ``(catalog, collection) -> CollectionRoutingConfig``
-        used to look up ``operations[INDEX]``.  Pluggable so the dispatcher
-        is testable without booting the full config service.
+        Async callable used to look up ``operations[INDEX]``. The
+        production resolver accepts an ``entity_type`` keyword and returns
+        the matching ``*RoutingConfig`` per tier (items/collection/
+        catalog/asset). Legacy 2-arg ``(catalog, collection)`` stubs are
+        still accepted via :func:`_call_resolver`'s ``TypeError``
+        fallback so existing fixtures continue to work; pre-#810 callers
+        that don't set ``IndexContext.entity_type`` resolve to
+        ``CollectionRoutingConfig`` (back-compat default). Pluggable so
+        the dispatcher is testable without booting the full config
+        service.
     indexer_registry
         Async callable ``(indexer_id) -> Indexer | None`` resolving the
         runtime instance for a routing entry's ``driver_id``.
@@ -866,7 +926,12 @@ class IndexDispatcher:
         self, ctx: IndexContext,
     ) -> List[OperationDriverEntry]:
         try:
-            routing = await self._resolve_routing(ctx.catalog, ctx.collection)
+            routing = await _call_resolver(
+                self._resolve_routing,
+                ctx.catalog,
+                ctx.collection,
+                ctx.entity_type,
+            )
         except Exception as exc:
             logger.warning(
                 "IndexDispatcher: routing lookup failed for %s/%s: %s",

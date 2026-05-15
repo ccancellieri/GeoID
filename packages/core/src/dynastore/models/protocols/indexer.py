@@ -99,6 +99,19 @@ class IndexContext(BaseModel):
             "non-PG context (e.g. operator-triggered bulk reindex)."
         ),
     )
+    entity_type: Optional[EntityType] = Field(
+        default=None,
+        description=(
+            "Tier of the ops being dispatched in this call. Read by the "
+            "default routing resolver to pick the right PluginConfig: "
+            "``item`` -> ItemsRoutingConfig, ``collection`` -> "
+            "CollectionRoutingConfig, ``catalog`` -> CatalogRoutingConfig, "
+            "``asset`` -> AssetRoutingConfig. ``None`` falls back to "
+            "CollectionRoutingConfig for back-compat with pre-#810 callers. "
+            "Per-call dispatch is homogeneous (all ops share the same "
+            "entity_type), so the resolver only needs the context value."
+        ),
+    )
 
     model_config = {"arbitrary_types_allowed": True, "frozen": True}
 

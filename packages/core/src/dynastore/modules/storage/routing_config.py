@@ -514,12 +514,13 @@ class ItemsRoutingConfig(PluginConfig):
             "Operation → ordered driver list for items dispatch.  "
             "Immutable: to change driver mapping, create a new config.  "
             "Hints and on_failure within entries are mutable.  "
-            "NOTE: operations[INDEX] entries are consumed by "
-            "item_service.upsert_bulk only; the OGC ingest path uses "
-            "item_service.upsert, which dispatches via IndexDispatcher "
-            "reading CollectionRoutingConfig.operations[INDEX]. Pin "
-            "indexers there too if they must fire on item upserts via "
-            "the OGC endpoints. See un-fao/GeoID#810."
+            "operations[INDEX] is the source of truth for the items-tier "
+            "INDEX hop on item upsert/delete (OGC ingest path through "
+            "item_service._dispatch_index_upsert -> IndexDispatcher, and "
+            "item_query soft-delete). Pinning a private indexer here is "
+            "what the privacy-cascade validator enforces; the entry-aware "
+            "default resolver picks this config for entity_type='item'. "
+            "See un-fao/GeoID#810 (Option B)."
         ),
     )
 

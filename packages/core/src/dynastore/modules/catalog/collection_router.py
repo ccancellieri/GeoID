@@ -185,6 +185,7 @@ async def _dispatch_collection_index(
         collection=collection_id,
         correlation_id=get_correlation_id() or "",
         pg_conn=db_resource,
+        entity_type="collection",
     )
     try:
         await dispatcher.fan_out_bulk(ctx, ops)
