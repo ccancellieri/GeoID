@@ -757,6 +757,34 @@ class AdminService(ExtensionProtocol):
         await counter.reset(
             policy_id, principal_key, window_seconds=window_seconds
         )
+
+        # Audit: quota reset is a high-trust operator action (clears an
+        # exhausted lifetime quota or zeroes a windowed limit). Failure
+        # to record must NOT block the reset, but must be visible — log
+        # at WARNING so it surfaces, matching the oidc_role_sync pattern.
+        actor_id = getattr(request.state, "principal_id", None)
+        client_ip = request.client.host if request.client else None
+        try:
+            await _iam().storage.log_audit_event(
+                event_type="usage_counter_reset",
+                principal_id=str(actor_id) if actor_id else None,
+                ip_address=client_ip,
+                detail={
+                    "policy_id": policy_id,
+                    "subject_principal_key": principal_key,
+                    "window_seconds": window_seconds,
+                    "previous_count": int(before or 0),
+                    "catalog_id": catalog_id,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "audit write for usage_counter_reset failed "
+                "(actor=%s policy=%s subject_key=%s)",
+                actor_id, policy_id, principal_key,
+                exc_info=True,
+            )
+
         return UsageResetResponse(
             policy_id=policy_id,
             principal_key=principal_key,
