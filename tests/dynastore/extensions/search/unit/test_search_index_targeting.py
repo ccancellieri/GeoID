@@ -1,4 +1,4 @@
-"""End-to-end index targeting through SearchService.
+"""End-to-end index targeting through SearchService — item-only (#819).
 
 Pins the actual index argument the service passes to ``es.search`` for
 each public method. Helper-level naming contracts live in
@@ -7,7 +7,7 @@ each public method. Helper-level naming contracts live in
 
 import pytest
 
-from dynastore.extensions.search.search_models import CatalogSearchBody, SearchBody
+from dynastore.extensions.search.search_models import SearchBody
 from dynastore.extensions.search.search_service import SearchService
 
 
@@ -73,33 +73,3 @@ async def test_search_items_uses_ignore_unavailable(monkeypatch):
     await svc.search_items(SearchBody(catalog_id="missing-catalog", limit=10))
 
     assert captured["kwargs"].get("ignore_unavailable") is True
-
-
-async def test_search_collections_targets_singleton(monkeypatch):
-    svc = _service()
-    driver, captured = _capturing_driver()
-    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
-
-    await svc.search_collections(CatalogSearchBody(catalog_id="acme", limit=10))
-
-    assert captured["index"] == "test-collections"
-
-
-async def test_search_collections_unscoped_targets_singleton(monkeypatch):
-    svc = _service()
-    driver, captured = _capturing_driver()
-    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
-
-    await svc.search_collections(CatalogSearchBody(catalog_id=None, limit=10))
-
-    assert captured["index"] == "test-collections"
-
-
-async def test_search_catalogs_unchanged(monkeypatch):
-    svc = _service()
-    driver, captured = _capturing_driver()
-    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
-
-    await svc.search_catalogs(CatalogSearchBody(limit=10))
-
-    assert captured["index"] == "test-catalogs"

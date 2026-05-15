@@ -1,27 +1,15 @@
-"""
-Integration tests for the Search extension.
-
-Covers:
-- GET /search                      — simple item search (q, bbox, limit, collections)
-- POST /search                     — full-featured item search body
-- GET /search/catalogs             — cross-catalog catalog search
-- GET /search/collections          — cross-catalog collection search
-- POST /search/collections         — collection search POST
-
-All tests use the sysadmin client (no auth complexity) and rely on the
-shared catalog/collection fixtures from the root conftest.
-"""
+"""Integration tests for the Search extension — item-only API (#819)."""
 
 import pytest
 from httpx import AsyncClient
 
 
 MARKER = pytest.mark.enable_extensions("stac", "assets", "features", "search")
-# The search extension reaches into Elasticsearch directly via
-# `_get_es()` (search_service.py:288). Without the ElasticsearchModule
-# registered in `enable_modules`, the in-process app loads the search
-# extension but the ES client is never instantiated — every search
-# call returns 500: "Elasticsearch client is not initialized."
+# The search extension reaches into Elasticsearch via the items driver
+# (`SearchService._resolve_items_driver().es_client`). Without
+# ElasticsearchModule registered in `enable_modules`, the in-process app
+# loads the search extension but the ES client is never instantiated —
+# every search call would surface a registration failure.
 ES_MODULE_MARKER = pytest.mark.enable_modules("elasticsearch")
 ES_MARKER = pytest.mark.elasticsearch
 
@@ -173,7 +161,7 @@ async def test_search_post_with_ids(
 
 
 # ---------------------------------------------------------------------------
-# GET /search/catalogs — catalog search
+# GET/POST /search/catalogs/{catalog_id} — catalog-scoped item search
 # ---------------------------------------------------------------------------
 
 
@@ -181,57 +169,43 @@ async def test_search_post_with_ids(
 @ES_MODULE_MARKER
 @ES_MARKER
 @pytest.mark.asyncio
-async def test_search_catalogs_get(
+async def test_search_catalog_scoped_get(
     sysadmin_in_process_client: AsyncClient, setup_catalog
 ):
-    """GET /search/catalogs — returns catalog list."""
+    """GET /search/catalogs/{catalog_id} — catalog-scoped item search."""
     catalog_id = setup_catalog
-    r = await sysadmin_in_process_client.get("/search/catalogs")
+    r = await sysadmin_in_process_client.get(f"/search/catalogs/{catalog_id}")
     assert r.status_code == 200
+    data = r.json()
+    assert data.get("type") == "FeatureCollection"
 
 
 @MARKER
 @ES_MODULE_MARKER
 @ES_MARKER
 @pytest.mark.asyncio
-async def test_search_catalogs_get_with_q(
+async def test_search_catalog_scoped_post(
     sysadmin_in_process_client: AsyncClient, setup_catalog
 ):
-    """GET /search/catalogs?q= — text search over catalogs."""
+    """POST /search/catalogs/{catalog_id} — catalog-scoped item search body."""
     catalog_id = setup_catalog
-    r = await sysadmin_in_process_client.get(
-        "/search/catalogs", params={"q": catalog_id[:8]}
+    r = await sysadmin_in_process_client.post(
+        f"/search/catalogs/{catalog_id}", json={"limit": 5}
     )
     assert r.status_code == 200
-
-
-# ---------------------------------------------------------------------------
-# GET /search/collections — collection search
-# ---------------------------------------------------------------------------
+    data = r.json()
+    assert data.get("type") == "FeatureCollection"
 
 
 @MARKER
 @ES_MODULE_MARKER
 @ES_MARKER
 @pytest.mark.asyncio
-async def test_search_collections_get(
-    sysadmin_in_process_client: AsyncClient, setup_catalog, setup_collection
+async def test_search_catalogs_index_removed(
+    sysadmin_in_process_client: AsyncClient, setup_catalog
 ):
-    """GET /search/collections — returns collection list."""
-    r = await sysadmin_in_process_client.get("/search/collections")
-    assert r.status_code == 200
-
-
-@MARKER
-@ES_MODULE_MARKER
-@ES_MARKER
-@pytest.mark.asyncio
-async def test_search_collections_get_with_q(
-    sysadmin_in_process_client: AsyncClient, setup_catalog, setup_collection
-):
-    """GET /search/collections?q= — text search over collections."""
-    collection_id = setup_collection
-    r = await sysadmin_in_process_client.get(
-        "/search/collections", params={"q": collection_id[:8]}
-    )
-    assert r.status_code == 200
+    """Per #819 catalog/collection keyword search routes are gone — 404."""
+    r1 = await sysadmin_in_process_client.get("/search/catalogs")
+    r2 = await sysadmin_in_process_client.get("/search/collections")
+    assert r1.status_code == 404
+    assert r2.status_code == 404

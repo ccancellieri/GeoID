@@ -15,8 +15,12 @@
 """
 Search protocol definitions.
 
-Abstracts search capabilities so that the search extension does not depend
-on a specific backend (Elasticsearch, Solr, Meilisearch, etc.).
+Abstracts search capabilities so the search extension does not depend on
+a specific backend (Elasticsearch, Solr, Meilisearch, etc.).
+
+Item-only since #819 — catalog/collection keyword search was retired
+from the public router and the protocol. Implementations only need to
+provide item search plus admin-side reindex triggers.
 """
 
 from __future__ import annotations
@@ -25,8 +29,6 @@ from typing import Any, Dict, Optional, Protocol, TYPE_CHECKING, runtime_checkab
 
 if TYPE_CHECKING:
     from dynastore.extensions.search.search_models import (
-        CatalogSearchBody,
-        GenericCollection,
         ItemCollection,
         SearchBody,
     )
@@ -37,9 +39,9 @@ class SearchProtocol(Protocol):
     """
     Protocol for search operations over indexed entities.
 
-    Implementations provide full-text, spatial, and temporal search across
-    catalogs, collections, and items.  The search extension discovers this
-    protocol at runtime and delegates all query execution to it.
+    Implementations provide full-text, spatial, and temporal item search.
+    The search extension discovers this protocol at runtime and delegates
+    query execution to it.
 
     Implementors:
         - ``SearchService`` (backed by Elasticsearch) in
@@ -56,48 +58,13 @@ class SearchProtocol(Protocol):
 
         Args:
             body: Structured search request (q, bbox, datetime, intersects,
-                  ids, collections, sortby, limit, token).
+                  ids, geoid, external_id, collections, sortby, limit, token,
+                  driver).
             base_url: Base URL for constructing pagination links.
 
         Returns:
             STAC ``ItemCollection`` with ``features``, ``links``,
             ``numberMatched``, ``numberReturned``.
-        """
-        ...
-
-    async def search_catalogs(
-        self,
-        body: CatalogSearchBody,
-        base_url: str = "",
-    ) -> GenericCollection:
-        """
-        Search catalogs by keyword.
-
-        Args:
-            body: Structured search request (q, ids, limit, token).
-            base_url: Base URL for constructing pagination links.
-
-        Returns:
-            ``GenericCollection`` with ``entities``, ``links``,
-            ``numberReturned``.
-        """
-        ...
-
-    async def search_collections(
-        self,
-        body: CatalogSearchBody,
-        base_url: str = "",
-    ) -> GenericCollection:
-        """
-        Search collections by keyword.
-
-        Args:
-            body: Structured search request (q, ids, limit, token).
-            base_url: Base URL for constructing pagination links.
-
-        Returns:
-            ``GenericCollection`` with ``entities``, ``links``,
-            ``numberReturned``.
         """
         ...
 
@@ -108,10 +75,6 @@ class SearchProtocol(Protocol):
     ) -> Dict[str, Any]:
         """
         Trigger a full catalog reindex.
-
-        Args:
-            catalog_id: The catalog to reindex.
-                  from the catalog's indexer configuration.
 
         Returns:
             Dict with ``task_id``, ``catalog_id``, ``status``.
@@ -126,10 +89,6 @@ class SearchProtocol(Protocol):
     ) -> Dict[str, Any]:
         """
         Trigger a single collection reindex.
-
-        Args:
-            catalog_id: The catalog owning the collection.
-            collection_id: The collection to reindex.
 
         Returns:
             Dict with ``task_id``, ``catalog_id``, ``collection_id``,
