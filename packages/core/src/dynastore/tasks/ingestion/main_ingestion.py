@@ -40,6 +40,29 @@ from .operations import initialize_operations, run_pre_operations, run_post_oper
 logger = logging.getLogger(__name__)
 
 
+async def _broadcast_batch_outcome(reporters, batch: list, upsert_result):
+    """Fan out per-row outcomes to every reporter after a successful batch upsert.
+
+    ``catalog_module.upsert`` is transactional — a clean return means every row
+    in the batch persisted, so synthesize SUCCESS outcomes 1:1 with the input
+    batch. The upsert return is preferred as the canonical ``record`` (carries
+    server-assigned fields like ``item_id``); if its shape doesn't align with
+    the input length, fall back to the input feature. Contract for the
+    payload shape lives on ``ReportingInterface.process_batch_outcome`` —
+    each item is ``{"status", "message", "record"}``.
+    """
+    if isinstance(upsert_result, list) and len(upsert_result) == len(batch):
+        records = upsert_result
+    else:
+        records = batch
+    outcomes = [
+        {"status": "SUCCESS", "message": None, "record": rec} for rec in records
+    ]
+    await asyncio.gather(
+        *(reporter.process_batch_outcome(outcomes) for reporter in reporters)
+    )
+
+
 # Top-level keys yielded by readers (e.g. GdalOsgeoReader) that are GeoJSON
 # envelope markers or reader-internal geometry slots — never publisher DBF
 # columns. Excluded from the merge into feature["properties"] so they don't
@@ -442,7 +465,7 @@ async def run_ingestion_task(
                 current_batch.append(feature)
 
                 if len(current_batch) >= batch_size:
-                    await catalog_module.upsert(
+                    upsert_result = await catalog_module.upsert(
                         catalog_id,
                         collection_id,
                         current_batch,
@@ -450,6 +473,9 @@ async def run_ingestion_task(
                         processing_context=upsert_context,
                     )
                     rows_ingested += len(current_batch)
+                    await _broadcast_batch_outcome(
+                        reporters, current_batch, upsert_result
+                    )
                     await asyncio.gather(
                         *(
                             reporter.update_progress(rows_ingested, total_features)
@@ -459,7 +485,7 @@ async def run_ingestion_task(
                     current_batch = []
 
             if current_batch:
-                await catalog_module.upsert(
+                upsert_result = await catalog_module.upsert(
                     catalog_id,
                     collection_id,
                     current_batch,
@@ -467,6 +493,9 @@ async def run_ingestion_task(
                     processing_context=upsert_context,
                 )
                 rows_ingested += len(current_batch)
+                await _broadcast_batch_outcome(
+                    reporters, current_batch, upsert_result
+                )
                 await asyncio.gather(
                     *(
                         reporter.update_progress(rows_ingested, total_features)
