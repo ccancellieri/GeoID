@@ -11,8 +11,8 @@
       },
       "pathMappings": [
         {
-          "localRoot": "${workspaceFolder}/src",
-          "remoteRoot": "/dynastore/src"
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/dynastore"
         }
       ],
       "justMyCode": false
@@ -27,8 +27,8 @@
       },
       "pathMappings": [
         {
-          "localRoot": "${workspaceFolder}/src",
-          "remoteRoot": "/dynastore/src"
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/dynastore"
         }
       ],
       "justMyCode": false
@@ -43,8 +43,8 @@
       },
       "pathMappings": [
         {
-          "localRoot": "${workspaceFolder}/src",
-          "remoteRoot": "/dynastore/src"
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/dynastore"
         }
       ],
       "justMyCode": false
@@ -59,8 +59,8 @@
       },
       "pathMappings": [
         {
-          "localRoot": "${workspaceFolder}/src",
-          "remoteRoot": "/dynastore/src"
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/dynastore"
         }
       ],
       "justMyCode": false
