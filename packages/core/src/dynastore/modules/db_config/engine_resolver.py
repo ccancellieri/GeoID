@@ -183,8 +183,34 @@ def make_resolver(
     return _resolve
 
 
+def make_writer(
+    snapshot: Dict[str, EngineConfig],
+) -> Callable[[EngineConfig], None]:
+    """Return a writer closure that swaps a fresh config into the snapshot.
+
+    Symmetric to :func:`make_resolver`.  Writes ``config`` under BOTH
+    ``class_key()`` and ``engine_class`` (when distinct) so any driver
+    referencing either form sees the new instance on the next resolve.
+
+    Used by :meth:`EngineInstanceCache.update_config` to push the fresh
+    config received by a ``register_apply_handler`` callback back into the
+    snapshot — without this, the apply handler invalidates the cached
+    runtime instance but the next ``get`` re-instantiates against the
+    stale boot-time config (#827).
+    """
+
+    def _write(config: EngineConfig) -> None:
+        class_key = type(config).class_key()
+        snapshot[class_key] = config
+        if config.engine_class and config.engine_class != class_key:
+            snapshot[config.engine_class] = config
+
+    return _write
+
+
 __all__ = [
     "build_engine_snapshot",
     "make_resolver",
+    "make_writer",
     "refresh_snapshot_until_ready",
 ]

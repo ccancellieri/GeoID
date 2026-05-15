@@ -97,8 +97,8 @@ async def _load_cache_config() -> "CachePluginConfig":
 
 async def _on_valkey_engine_config_change(
     config: Any,
-    _old: Any,
-    _ctx: Any,
+    _catalog_id: Any,
+    _collection_id: Any,
     _conn: Any,
 ) -> None:
     """Apply handler for ValkeyEngineConfig — live reconnect on config change.
@@ -106,7 +106,8 @@ async def _on_valkey_engine_config_change(
     Called by PlatformConfigService after a PATCH to the engine config.
     Sequence:
       1. Close + unregister the old backend.
-      2. Evict the old engine instance from engine_cache.
+      2. Push the fresh ``config`` into the engine_cache snapshot + evict
+         the cached instance (#827).
       3. Re-get the engine (lazy re-init with new config).
       4. Build + probe + register the new backend.
     """
@@ -143,15 +144,17 @@ async def _on_valkey_engine_config_change(
                 )
             _current_backend = None
 
-        # 2. Evict the old engine instance.
+        # 2. Push the fresh config into the snapshot + evict the cached
+        # instance.  Without the snapshot swap, the next ``get`` would
+        # rebuild the client against the stale boot-time config (#827).
         try:
-            await engine_cache.evict("valkey_engine")
+            await engine_cache.update_config(config)
         except Exception:
             logger.exception(
-                "ValkeyEngineConfig apply handler: engine_cache.evict failed"
+                "ValkeyEngineConfig apply handler: engine_cache.update_config failed"
             )
 
-        # 3. Re-get the engine (lazy re-init).
+        # 3. Re-get the engine (lazy re-init with the freshly-stamped config).
         try:
             client = await engine_cache.get("valkey_engine")
         except Exception as e:

@@ -37,6 +37,7 @@ from .engine_instance_cache import EngineInstanceCache
 from .engine_resolver import (
     build_engine_snapshot,
     make_resolver,
+    make_writer,
     refresh_snapshot_until_ready,
 )
 from .platform_config_service import PlatformConfigService
@@ -88,7 +89,10 @@ class DBConfigModule(ModuleProtocol):
         """
         snapshot: Dict[str, Any] = {}
         await build_engine_snapshot(pcfg, into=snapshot)
-        cache = EngineInstanceCache(engine_resolver=make_resolver(snapshot))
+        cache = EngineInstanceCache(
+            engine_resolver=make_resolver(snapshot),
+            engine_writer=make_writer(snapshot),
+        )
         cache.start_background_sweep()
 
         refresh_task: "Optional[asyncio.Task[bool]]" = None

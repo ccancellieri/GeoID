@@ -145,6 +145,7 @@ class EngineInstanceCache:
         self,
         *,
         engine_resolver: Callable[[str], Optional[EngineConfig]],
+        engine_writer: Optional[Callable[[EngineConfig], None]] = None,
         sweep_interval_seconds: float = 60.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -155,11 +156,17 @@ class EngineInstanceCache:
             ``DBConfigModule.lifespan`` (F.6) wires this from a snapshot
             of platform engines (see ``engine_resolver.build_engine_snapshot``);
             tests inject a deterministic resolver directly.
+        :param engine_writer: optional callable that writes a fresh
+            :class:`EngineConfig` back into the resolver's snapshot under
+            both ``class_key()`` and ``engine_class`` keys.  Required for
+            :meth:`update_config` (#827 — apply-handler live reconfig);
+            tests that only exercise ``get`` / ``evict`` may omit it.
         :param sweep_interval_seconds: how often the background TTL
             sweep runs.
         :param clock: monotonic-clock callable, injectable for tests.
         """
         self._resolver = engine_resolver
+        self._writer = engine_writer
         self._sweep_interval = sweep_interval_seconds
         self._clock = clock
         self._entries: Dict[str, _Entry] = {}
@@ -247,6 +254,46 @@ class EngineInstanceCache:
                     engine_ref, exc,
                 )
         return True
+
+    async def update_config(self, config: EngineConfig) -> None:
+        """Swap a fresh ``EngineConfig`` into the snapshot and evict its instance.
+
+        Called by apply-handler callbacks (``register_apply_handler``) so a
+        ``PUT /configs/plugins/<engine>_engine_config`` takes effect on the
+        next ``get`` without a process restart.  Without this, the apply
+        handler invalidates the cached runtime instance but the next ``get``
+        re-instantiates against the stale boot-time config still sitting in
+        the resolver snapshot (#827).
+
+        Sequence:
+
+          1. Writes ``config`` into the resolver snapshot under both
+             ``class_key()`` and ``engine_class`` keys (via the writer
+             supplied at construction).
+          2. Evicts cached instances under both keys so the next ``get``
+             re-runs ``engine_init()`` against the new config.
+
+        Raises ``RuntimeError`` when no writer was supplied — that means
+        the cache is wired for read-only mode and live reconfig is not
+        supported (tests / admin tools).
+        """
+        if self._writer is None:
+            raise RuntimeError(
+                "EngineInstanceCache.update_config: no engine_writer "
+                "supplied at construction; cannot push config into the "
+                "snapshot.  Wire ``engine_writer=make_writer(snapshot)`` "
+                "alongside ``engine_resolver=make_resolver(snapshot)``."
+            )
+        # Evict BEFORE writing the new config — ``evict`` re-resolves the
+        # engine via the snapshot to call ``engine_release(instance)``,
+        # and the instance was built by the OLD config's ``engine_init``;
+        # if we wrote first, release would dispatch on the new (wrong)
+        # config object.
+        class_key = type(config).class_key()
+        await self.evict(class_key)
+        if config.engine_class and config.engine_class != class_key:
+            await self.evict(config.engine_class)
+        self._writer(config)
 
     async def sweep(self) -> int:
         """Run one TTL eviction pass.
