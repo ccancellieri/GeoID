@@ -719,6 +719,13 @@ class ValkeyCacheBackend:
         "end "
         "return {tonumber(nv), 1}"
     )
+    # SHA1 of the above script body, computed once at class load. We try
+    # EVALSHA first on every call (single round trip, ~50 bytes on the
+    # wire) and fall back to EVAL on NOSCRIPT — that path auto-loads the
+    # script into the server cache so subsequent calls hit the fast path.
+    import hashlib as _hashlib
+    _INCR_IF_BELOW_SHA = _hashlib.sha1(_INCR_IF_BELOW_SCRIPT.encode("utf-8")).hexdigest()
+    del _hashlib
 
     async def get_count(self, key: str) -> Optional[int]:
         full = self._key(key)
@@ -777,13 +784,21 @@ class ValkeyCacheBackend:
         full = self._key(key)
         ttl_ms = int(ttl * 1000) if ttl is not None else 0
         try:
-            # Server-side Lua via the EVAL command — single round trip,
-            # atomic check-and-increment. Avoid the client's ``eval``
-            # helper to dodge static-analysis false positives that
-            # confuse it with the unsafe Python builtin.
-            result = await self._client.execute_command(
-                "EVAL", self._INCR_IF_BELOW_SCRIPT, 1, full, limit, amount, ttl_ms
-            )
+            # EVALSHA dispatch — server holds the script bytes after the
+            # first EVAL; from there on we only ship the 40-char SHA1
+            # plus args. On NOSCRIPT (server forgot the script, e.g.
+            # after restart or SCRIPT FLUSH) fall back to EVAL which
+            # auto-loads it and runs in the same trip.
+            try:
+                result = await self._client.execute_command(
+                    "EVALSHA", self._INCR_IF_BELOW_SHA, 1, full, limit, amount, ttl_ms
+                )
+            except Exception as exc:
+                if "NOSCRIPT" not in str(exc):
+                    raise
+                result = await self._client.execute_command(
+                    "EVAL", self._INCR_IF_BELOW_SCRIPT, 1, full, limit, amount, ttl_ms
+                )
             self._record_success()
             new_value = int(result[0])
             allowed = bool(int(result[1]))
