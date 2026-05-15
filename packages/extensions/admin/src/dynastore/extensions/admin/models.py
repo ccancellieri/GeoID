@@ -9,9 +9,11 @@ from pydantic import BaseModel, Field
 
 class UserCreate(BaseModel):
     username: str
-    password: str
+    password: Optional[str] = None
     email: Optional[str] = None
     roles: List[str] = Field(default_factory=list)
+    provider: str = "local"
+    subject_id: Optional[str] = None
 
 
 class UserUpdate(BaseModel):

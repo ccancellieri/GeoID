@@ -150,27 +150,41 @@ class AdminService(ExtensionProtocol):
             ))
         return out
 
-    @router.post("/users", summary="Create a new local user", status_code=201)
+    @router.post("/users", summary="Create a principal (local user or raw)", status_code=201)
     async def create_user(body: UserCreate):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
-        providers = mgr.get_identity_providers()
-        local_provider = next(
-            (p for p in providers if getattr(p, "get_provider_id", lambda: None)() == "local"), None
-        )
 
-        if local_provider and hasattr(local_provider, "create_user"):
-            _create_user_fn = getattr(local_provider, "create_user")
-            user_uuid = await _create_user_fn(
-                username=body.username,
-                password=body.password,
-                email=body.email,
+        # Local-IdP user path: `provider="local"` + `password` set → go through
+        # the local provider's `create_user` so the credential gets persisted
+        # and the principal subject_id is the local user's UUID. This is the
+        # path the admin UI exercises.
+        #
+        # Raw-principal path: anything else (non-local provider, OR local
+        # provider without a password — used by test/notebook flows that bind
+        # a role to a synthetic identity that never logs in via password).
+        # Skip the local_provider hop and construct the Principal directly,
+        # honoring whatever subject_id the caller supplied (defaults to
+        # username when omitted).
+        if body.provider == "local" and body.password:
+            providers = mgr.get_identity_providers()
+            local_provider = next(
+                (p for p in providers if getattr(p, "get_provider_id", lambda: None)() == "local"),
+                None,
             )
-            subject_id = str(user_uuid)
+            if local_provider and hasattr(local_provider, "create_user"):
+                user_uuid = await getattr(local_provider, "create_user")(
+                    username=body.username,
+                    password=body.password,
+                    email=body.email,
+                )
+                subject_id = str(user_uuid)
+            else:
+                subject_id = body.subject_id or body.username
         else:
-            subject_id = body.username
+            subject_id = body.subject_id or body.username
 
         new_principal = Principal(
-            provider="local",
+            provider=body.provider,
             subject_id=subject_id,
             display_name=body.username,
             roles=body.roles or ["user"],

@@ -79,6 +79,38 @@ async def test_update_user_deactivation_persists(
 
 @MARKER
 @pytest.mark.asyncio
+async def test_create_user_raw_principal_path(
+    sysadmin_in_process_client: AsyncClient,
+):
+    """POST /admin/users without password — raw-principal create path.
+
+    Synthetic identities (vault test principals, integration-test fixtures)
+    must be creatable without going through the local-IdP password flow.
+    With `password` omitted, the handler skips the local_provider hop and
+    constructs the Principal directly using `subject_id` (defaulting to
+    `username`).
+    """
+    suffix = uuid.uuid4().hex[:8]
+    subject = f"raw-test-{suffix}"
+    body = {
+        "username": subject,
+        "subject_id": subject,
+        "roles": ["user"],
+    }
+    r = await sysadmin_in_process_client.post("/admin/users", json=body)
+    assert r.status_code == 201, r.text
+    out = r.json()
+    assert out["provider"] == "local"
+    assert out["subject_id"] == subject
+    assert out["display_name"] == subject
+
+    # Teardown so re-running the test stays clean.
+    pid = out["id"]
+    await sysadmin_in_process_client.delete(f"/admin/users/{pid}")
+
+
+@MARKER
+@pytest.mark.asyncio
 async def test_get_unknown_user_404(sysadmin_in_process_client: AsyncClient):
     """GET /admin/users/{id} — nonexistent user returns 404.
 
