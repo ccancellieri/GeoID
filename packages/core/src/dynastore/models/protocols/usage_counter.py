@@ -46,10 +46,32 @@ class UsageCounterProtocol(Protocol):
     """
 
     @property
-    def name(self) -> str: ...
+    def name(self) -> str:
+        """Stable driver identifier used by the layered composite.
+
+        Surfaced for the PR-A3 ``LayeredUsageCounter`` to log which
+        tier serviced a call and to break ties between equal-priority
+        drivers. Implementations return a short slug
+        (``"postgres"``, ``"valkey"``, …) — not a fully-qualified
+        class name.
+        """
+        ...
 
     @property
-    def priority(self) -> int: ...
+    def priority(self) -> int:
+        """Driver-selection rank in the layered composite.
+
+        Consumed by the PR-A3 ``LayeredUsageCounter`` when more than
+        one driver can service a call. **Lower wins** — the composite
+        tries drivers in ascending ``priority`` and falls through to
+        the next on failure. ``name`` breaks ties.
+
+        Convention: ``valkey`` ≪ ``postgres``. The Valkey driver is
+        the hot read path (in-memory, native TTL); the PG driver is
+        the durability tier and is picked only when the hot path is
+        unavailable or for write-through delta flushes.
+        """
+        ...
 
     async def incr(
         self,
@@ -96,7 +118,16 @@ class UsageCounterProtocol(Protocol):
         *,
         window_seconds: Optional[int] = None,
     ) -> None:
-        """Drop the counter row(s) for one (policy, principal) bucket."""
+        """Drop the counter row for one ``(policy, principal, bucket)``.
+
+        ``window_seconds=None`` targets the lifetime bucket (``count``
+        for the policy is wiped). Any other value targets the bucket
+        containing ``now()`` for that window size — earlier buckets
+        (already rolled over or expired) are left to the reap cron.
+
+        At most one row is removed; the SQL keys on the full primary
+        key. Use case is administrative reset, not bulk cleanup.
+        """
         ...
 
     async def reap_expired(self) -> int:

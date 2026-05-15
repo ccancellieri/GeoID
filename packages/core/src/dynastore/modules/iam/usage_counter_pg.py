@@ -161,6 +161,15 @@ class PostgresUsageCounter:
     Single-table store keyed by ``(policy_id, principal_key, window_start)``.
     All operations are single-round-trip and rely on the PK for atomicity;
     no row locks held outside the upsert statement.
+
+    ``name`` / ``priority``
+    -----------------------
+    Class attributes that satisfy the protocol's selection surface. Not
+    consumed by PR-A1 — the PR-A3 ``LayeredUsageCounter`` reads them to
+    rank drivers when both can serve a call (lower ``priority`` wins,
+    ``name`` breaks ties). The PG driver is the durability tier behind
+    the Valkey hot path, so its ``priority`` is the highest of the
+    in-tree drivers and ``name`` is the short slug ``"postgres"``.
     """
 
     name: str = "postgres"

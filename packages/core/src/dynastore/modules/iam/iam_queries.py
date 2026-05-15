@@ -193,6 +193,14 @@ CREATE_REFRESH_TOKENS_TABLE = DDLQuery("""
 # Designed so a Valkey-backed driver can later short-circuit reads
 # while flushing deltas here for durability (see
 # ``dynastore.models.protocols.usage_counter.UsageCounterProtocol``).
+#
+# ``last_seen_at`` is the last-write timestamp, refreshed on every
+# ``incr`` / ``incr_if_below``. Not read by PR-A1 — reserved for:
+#   * admin diagnostics ("stale lifetime quotas" — principals that
+#     have not hit their quota in N days);
+#   * soft-reaper criterion for lifetime rows (``expires_at IS NULL``)
+#     whose ``policy_id`` is no longer registered, since the windowed
+#     prune cron skips them.
 CREATE_USAGE_COUNTERS_TABLE = DDLQuery("""
     CREATE TABLE IF NOT EXISTS {schema}.usage_counters (
         policy_id      VARCHAR(128) NOT NULL,
