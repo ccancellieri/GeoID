@@ -331,6 +331,8 @@ tbody tr:hover td { background: rgba(180, 71, 43, 0.04); }
 
 .chip.effect-ALLOW { color: var(--olive); border-color: var(--olive); }
 .chip.effect-DENY { color: var(--terracotta-deep); border-color: var(--terracotta-deep); }
+.chip.limit-rate { color: #b8860b; border-color: #d4a017; background: rgba(212, 160, 23, 0.08); }
+.chip.limit-quota { color: var(--terracotta-deep); border-color: var(--terracotta-deep); background: rgba(176, 71, 48, 0.08); }
 
 .status {
   font-size: 0.8rem;

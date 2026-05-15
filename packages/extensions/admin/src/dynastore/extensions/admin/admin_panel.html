@@ -269,10 +269,11 @@
   </div>
 </div>
 
-<!-- New Policy Modal -->
+<!-- Policy Modal (create + edit) -->
 <div id="policy-modal" class="modal-bg hidden">
-  <div class="modal">
-    <h2><i class="fa-solid fa-file-shield" style="color:var(--primary);margin-right:8px"></i>Create Policy</h2>
+  <div class="modal" style="max-width:780px">
+    <h2><i class="fa-solid fa-file-shield" style="color:var(--primary);margin-right:8px"></i><span id="pm-title">Create Policy</span></h2>
+    <input type="hidden" id="pm-mode" value="create"/>
     <div class="form-row"><label>Policy ID *</label><input id="pm-id" placeholder="e.g. my_catalog_read"/></div>
     <div class="form-row"><label>Description</label><input id="pm-desc" placeholder="Brief description"/></div>
     <div class="form-row"><label>Effect</label>
@@ -282,9 +283,43 @@
     <div class="form-row"><label>Resources (regex patterns, one per line)</label>
       <textarea id="pm-resources" placeholder="/my/resource/.*&#10;/other/path">/my/resource/.*</textarea>
     </div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:12px 0"/>
+    <div class="form-row" style="display:flex;justify-content:space-between;align-items:center">
+      <label style="margin:0">Conditions</label>
+      <button class="btn btn-sm btn-primary" onclick="addPolicyCondition()"><i class="fa-solid fa-plus"></i> Add Condition</button>
+    </div>
+    <div id="pm-conditions" style="display:flex;flex-direction:column;gap:8px"></div>
     <div class="form-actions">
       <button class="btn" onclick="document.getElementById('policy-modal').classList.add('hidden')" style="color:var(--text-dim)">Cancel</button>
-      <button class="btn btn-primary" onclick="createPolicy()"><i class="fa-solid fa-check"></i> Create</button>
+      <button class="btn btn-primary" onclick="submitPolicy()"><i class="fa-solid fa-check"></i> <span id="pm-submit-label">Create</span></button>
+    </div>
+  </div>
+</div>
+
+<!-- Policy Usage Modal -->
+<div id="policy-usage-modal" class="modal-bg hidden">
+  <div class="modal" style="max-width:900px">
+    <h2><i class="fa-solid fa-gauge-high" style="color:var(--primary);margin-right:8px"></i>Usage — <span id="pu-policy-id" style="font-family:monospace"></span></h2>
+    <p style="color:var(--text-dim);font-size:13px;margin:4px 0 12px">
+      Rate-limit / quota counter rows tracked for this policy. <strong>Reset</strong> clears the counter
+      (renews an exhausted lifetime quota or zeroes a windowed limit).
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Principal key</th><th>Count</th><th>Window start</th><th>Expires</th><th>Last seen</th><th>Ops</th></tr></thead>
+        <tbody id="pu-tbody"><tr><td colspan="6" class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
+      <div id="pu-paging" style="color:var(--text-dim);font-size:13px"></div>
+      <div>
+        <button class="btn btn-sm" id="pu-prev" onclick="pageUsage(-1)" disabled>← Prev</button>
+        <button class="btn btn-sm" id="pu-next" onclick="pageUsage(1)" disabled>Next →</button>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn" onclick="document.getElementById('policy-usage-modal').classList.add('hidden')" style="color:var(--text-dim)">Close</button>
+      <button class="btn btn-primary" onclick="refreshPolicyUsage()"><i class="fa-solid fa-rotate"></i> Refresh</button>
     </div>
   </div>
 </div>
@@ -631,38 +666,263 @@ function renderPolicies(list) {
   const tb = document.getElementById('policies-tbody');
   const sys = new Set(['public_access','self_service_access','sysadmin_full_access']);
   if (!list.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No policies found.</td></tr>'; return; }
-  tb.innerHTML = list.map(p => `
+  // Builds row HTML. Every user-controlled value is escaped via escapeHtml();
+  // condition type checks read from a fixed allowlist (rate_limit, max_count).
+  tb.innerHTML = list.map(p => {
+    const conds = (p.conditions || []);
+    const hasRate = conds.some(c => c.type === 'rate_limit');
+    const hasQuota = conds.some(c => c.type === 'max_count');
+    const limitBadges = [
+      hasRate ? '<span class="badge" style="background:rgba(255,165,0,.15);color:#ffa500" title="Has rate_limit condition"><i class="fa-solid fa-gauge-high"></i> rate</span>' : '',
+      hasQuota ? '<span class="badge" style="background:rgba(220,53,69,.15);color:#dc3545" title="Has max_count condition"><i class="fa-solid fa-stop"></i> quota</span>' : '',
+    ].filter(Boolean).join(' ');
+    const ops = sys.has(p.id) ? '<span class="badge badge-sys">System</span>' : `
+        <button class="btn btn-sm" data-action="edit-policy" data-id="${escapeHtml(p.id)}" title="Edit"><i class="fa-solid fa-pen"></i></button>
+        ${(hasRate || hasQuota) ? `<button class="btn btn-sm" data-action="usage-policy" data-id="${escapeHtml(p.id)}" title="Usage"><i class="fa-solid fa-gauge-high"></i></button>` : ''}
+        <button class="btn btn-sm btn-danger" data-action="delete-policy" data-id="${escapeHtml(p.id)}" title="Delete"><i class="fa-solid fa-trash"></i></button>`;
+    return `
     <tr>
-      <td><strong style="font-family:monospace">${escapeHtml(p.id)}</strong></td>
+      <td><strong style="font-family:monospace">${escapeHtml(p.id)}</strong> ${limitBadges}</td>
       <td><span class="badge" style="background:${p.effect==='ALLOW'?'rgba(63,185,80,.15)':'rgba(248,81,73,.15)'};color:${p.effect==='ALLOW'?'var(--success)':'var(--danger)'}">${escapeHtml(p.effect)}</span></td>
       <td><div class="chip-list">${(p.actions||[]).map(a=>`<span class="badge badge-role">${escapeHtml(a)}</span>`).join('')}</div></td>
       <td style="font-family:monospace;font-size:0.75rem;max-width:260px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((p.resources||[]).join(', '))}</td>
       <td style="color:var(--text-dim)">${escapeHtml(p.description || '—')}</td>
-      <td>${sys.has(p.id) ? '<span class="badge badge-sys">System</span>' : `
-        <button class="btn btn-sm btn-danger" data-action="delete-policy" data-id="${escapeHtml(p.id)}"><i class="fa-solid fa-trash"></i></button>`}
-      </td>
-    </tr>`).join('');
+      <td>${ops}</td>
+    </tr>`;
+  }).join('');
   tb.querySelectorAll('[data-action="delete-policy"]').forEach(b => b.addEventListener('click', () => deletePolicy(b.dataset.id)));
+  tb.querySelectorAll('[data-action="edit-policy"]').forEach(b => b.addEventListener('click', () => openPolicyModal(b.dataset.id)));
+  tb.querySelectorAll('[data-action="usage-policy"]').forEach(b => b.addEventListener('click', () => openPolicyUsage(b.dataset.id)));
 }
-function openPolicyModal() { document.getElementById('policy-modal').classList.remove('hidden'); }
-async function createPolicy() {
+// ── POLICY MODAL (create + edit) ──
+//
+// Conditions sub-forms render via insertAdjacentHTML — all user-controlled
+// values pass through escapeHtml; type slugs come from a fixed allowlist
+// (CONDITION_TYPES).
+function openPolicyModal(editId) {
+  const modal = document.getElementById('policy-modal');
+  const isEdit = !!editId;
+  document.getElementById('pm-mode').value = isEdit ? 'edit' : 'create';
+  document.getElementById('pm-title').textContent = isEdit ? `Edit Policy — ${editId}` : 'Create Policy';
+  document.getElementById('pm-submit-label').textContent = isEdit ? 'Save' : 'Create';
+  const condWrap = document.getElementById('pm-conditions');
+  condWrap.replaceChildren();
+  if (isEdit) {
+    const p = (_allPolicies || []).find(x => x.id === editId);
+    if (!p) { toast(`Policy '${editId}' not in cache; refresh and retry.`, false); return; }
+    document.getElementById('pm-id').value = p.id;
+    document.getElementById('pm-id').disabled = true;
+    document.getElementById('pm-desc').value = p.description || '';
+    document.getElementById('pm-effect').value = p.effect;
+    document.getElementById('pm-actions').value = (p.actions || []).join(', ');
+    document.getElementById('pm-resources').value = (p.resources || []).join('\n');
+    (p.conditions || []).forEach(c => addPolicyCondition(c));
+  } else {
+    document.getElementById('pm-id').disabled = false;
+    document.getElementById('pm-id').value = '';
+    document.getElementById('pm-desc').value = '';
+    document.getElementById('pm-effect').value = 'ALLOW';
+    document.getElementById('pm-actions').value = '';
+    document.getElementById('pm-resources').value = '/my/resource/.*';
+  }
+  modal.classList.remove('hidden');
+}
+
+const CONDITION_TYPES = ['rate_limit', 'max_count', 'time_window', 'expiration', 'match', 'custom'];
+
+function _condBody(type, cfg) {
+  const c = cfg || {};
+  const v = (k, d) => escapeHtml(c[k] !== undefined && c[k] !== null ? String(c[k]) : (d ?? ''));
+  if (type === 'rate_limit') {
+    return `
+      <div class="form-row"><label>Limit *</label><input data-k="limit" type="number" min="1" value="${v('limit','60')}"/></div>
+      <div class="form-row"><label>Window (seconds) *</label><input data-k="window_seconds" type="number" min="1" value="${v('window_seconds','60')}"/></div>
+      <div class="form-row"><label>Scope</label>
+        <select data-k="scope">
+          ${['principal','role','client_ip','catalog'].map(s => `<option value="${s}"${(c.scope||'principal')===s?' selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>Path pattern (regex)</label><input data-k="path_pattern" placeholder="^/tiles/" value="${v('path_pattern')}"/></div>
+      <div class="form-row"><label>Methods (comma-separated, blank = any)</label><input data-k="methods" placeholder="GET, POST" value="${v('methods')}" data-array="csv"/></div>
+      <div class="form-row"><label>Mode</label>
+        <select data-k="mode">
+          ${['graceful','strict'].map(s => `<option value="${s}"${(c.mode||'graceful')===s?' selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>`;
+  }
+  if (type === 'max_count') {
+    return `
+      <div class="form-row"><label>Limit *</label><input data-k="limit" type="number" min="1" value="${v('limit','100')}"/></div>
+      <div class="form-row"><label>Scope</label>
+        <select data-k="scope">
+          ${['principal','role','client_ip','catalog'].map(s => `<option value="${s}"${(c.scope||'principal')===s?' selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>Path pattern (regex)</label><input data-k="path_pattern" placeholder="^/jobs/" value="${v('path_pattern')}"/></div>
+      <div class="form-row"><label>Methods (comma-separated, blank = any)</label><input data-k="methods" placeholder="POST" value="${v('methods')}" data-array="csv"/></div>
+      <div class="form-row"><label>Mode</label>
+        <select data-k="mode">
+          ${['graceful','strict'].map(s => `<option value="${s}"${(c.mode||'graceful')===s?' selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>
+      <p style="color:var(--text-dim);font-size:12px;margin:4px 0 0">Lifetime quota — does not auto-renew. Operators reset via the Usage panel.</p>`;
+  }
+  if (type === 'time_window') {
+    return `
+      <div class="form-row"><label>Start (ISO 8601, optional)</label><input data-k="start" placeholder="2026-01-01T00:00:00Z" value="${v('start')}"/></div>
+      <div class="form-row"><label>End (ISO 8601, optional)</label><input data-k="end" placeholder="2026-12-31T23:59:59Z" value="${v('end')}"/></div>`;
+  }
+  if (type === 'expiration') {
+    return `<div class="form-row"><label>Expires at (ISO 8601) *</label><input data-k="expires_at" placeholder="2026-12-31T23:59:59Z" value="${v('expires_at')}"/></div>`;
+  }
+  if (type === 'match') {
+    return `<div class="form-row"><label>Match config (JSON)</label><textarea data-k="__json" rows="4" placeholder='{"field": "subject.tier", "equals": "premium"}'>${escapeHtml(JSON.stringify(c, null, 2) === '{}' ? '' : JSON.stringify(c, null, 2))}</textarea></div>`;
+  }
+  return `<div class="form-row"><label>Config (JSON)</label><textarea data-k="__json" rows="5" placeholder='{}'>${escapeHtml(JSON.stringify(c, null, 2) === '{}' ? '' : JSON.stringify(c, null, 2))}</textarea></div>`;
+}
+
+function addPolicyCondition(preset) {
+  const wrap = document.getElementById('pm-conditions');
+  const card = document.createElement('div');
+  card.className = 'cond-card';
+  card.style.cssText = 'border:1px solid var(--border);border-radius:6px;padding:10px';
+  const initialType = (preset && preset.type) || 'rate_limit';
+  const initialCfg = (preset && preset.config) || {};
+  const header = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <select class="cond-type" style="max-width:200px">
+        ${CONDITION_TYPES.map(t => `<option value="${t}"${t===initialType?' selected':''}>${t}</option>`).join('')}
+      </select>
+      <button class="btn btn-sm btn-danger" data-action="remove-cond"><i class="fa-solid fa-trash"></i></button>
+    </div>
+    <div class="cond-body">${_condBody(initialType, initialCfg)}</div>`;
+  card.insertAdjacentHTML('beforeend', header);
+  wrap.appendChild(card);
+  card.querySelector('[data-action="remove-cond"]').addEventListener('click', () => card.remove());
+  card.querySelector('.cond-type').addEventListener('change', (e) => {
+    const body = card.querySelector('.cond-body');
+    body.replaceChildren();
+    body.insertAdjacentHTML('beforeend', _condBody(e.target.value, {}));
+  });
+}
+
+function _readCondition(card) {
+  const type = card.querySelector('.cond-type').value;
+  const body = card.querySelector('.cond-body');
+  const jsonField = body.querySelector('textarea[data-k="__json"]');
+  let config = {};
+  if (jsonField) {
+    const raw = jsonField.value.trim();
+    if (raw) {
+      try { config = JSON.parse(raw); }
+      catch (e) { throw new Error(`Invalid JSON in ${type} condition: ${e.message}`); }
+    }
+  } else {
+    body.querySelectorAll('[data-k]').forEach(el => {
+      const k = el.dataset.k;
+      let val = el.value;
+      if (el.dataset.array === 'csv') {
+        val = csvToList(val);
+        if (val.length) config[k] = val;
+      } else if (el.type === 'number') {
+        if (val !== '') config[k] = Number(val);
+      } else if (val !== '') {
+        config[k] = val;
+      }
+    });
+  }
+  return { type, config };
+}
+
+async function submitPolicy() {
+  const mode = document.getElementById('pm-mode').value;
   const id = document.getElementById('pm-id').value.trim();
   const description = document.getElementById('pm-desc').value.trim();
   const effect = document.getElementById('pm-effect').value;
   const actions = csvToList(document.getElementById('pm-actions').value);
   const resources = document.getElementById('pm-resources').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if (!id || !actions.length || !resources.length) { toast('ID, actions and resources are required.', false); return; }
+  let conditions;
   try {
-    await apiFetch('/policies', { method:'POST', body: JSON.stringify({id,description,effect,actions,resources}) });
-    toast('Policy created.'); document.getElementById('policy-modal').classList.add('hidden'); loadPolicies();
+    conditions = Array.from(document.querySelectorAll('#pm-conditions .cond-card')).map(_readCondition);
+  } catch (e) { toast(e.message, false); return; }
+  try {
+    if (mode === 'edit') {
+      await apiFetch(`/policies/${encodeURIComponent(id)}`, { method:'PUT', body: JSON.stringify({description, effect, actions, resources, conditions}) });
+      toast('Policy updated.');
+    } else {
+      await apiFetch('/policies', { method:'POST', body: JSON.stringify({id, description, effect, actions, resources, conditions}) });
+      toast('Policy created.');
+    }
+    document.getElementById('policy-modal').classList.add('hidden');
+    loadPolicies();
   } catch(e) { toast(e.message, false); }
 }
+
 async function deletePolicy(id) {
   if (!confirm(`Delete policy '${id}'?`)) return;
   try {
     await apiFetch(`/policies/${id}`, { method:'DELETE' });
     toast('Policy deleted.'); loadPolicies();
   } catch(e) { toast(e.message, false); }
+}
+
+// ── POLICY USAGE MODAL ──
+let _puState = { policyId: null, offset: 0, limit: 50, nextOffset: null };
+
+async function openPolicyUsage(policyId) {
+  _puState = { policyId, offset: 0, limit: 50, nextOffset: null };
+  document.getElementById('pu-policy-id').textContent = policyId;
+  document.getElementById('policy-usage-modal').classList.remove('hidden');
+  await refreshPolicyUsage();
+}
+
+async function refreshPolicyUsage() {
+  const tb = document.getElementById('pu-tbody');
+  tb.replaceChildren();
+  tb.insertAdjacentHTML('beforeend', '<tr><td colspan="6" class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading…</td></tr>');
+  try {
+    const qs = `?limit=${_puState.limit}&offset=${_puState.offset}`;
+    const page = await apiFetch(`/policies/${encodeURIComponent(_puState.policyId)}/usage${qs}`);
+    _puState.nextOffset = page.next_offset;
+    tb.replaceChildren();
+    if (!page.rows.length) {
+      tb.insertAdjacentHTML('beforeend', '<tr><td colspan="6" class="empty">No counter rows.</td></tr>');
+    } else {
+      const rows = page.rows.map(r => `
+        <tr>
+          <td style="font-family:monospace">${escapeHtml(r.principal_key)}</td>
+          <td><strong>${escapeHtml(String(r.count))}</strong></td>
+          <td style="color:var(--text-dim);font-size:12px">${escapeHtml(r.window_start || '—')}</td>
+          <td style="color:var(--text-dim);font-size:12px">${escapeHtml(r.expires_at || '—')}</td>
+          <td style="color:var(--text-dim);font-size:12px">${escapeHtml(r.last_seen_at || '—')}</td>
+          <td><button class="btn btn-sm btn-danger" data-action="reset-usage" data-key="${escapeHtml(r.principal_key)}"><i class="fa-solid fa-rotate-left"></i> Reset</button></td>
+        </tr>`).join('');
+      tb.insertAdjacentHTML('beforeend', rows);
+      tb.querySelectorAll('[data-action="reset-usage"]').forEach(b => b.addEventListener('click', () => resetPolicyUsage(b.dataset.key)));
+    }
+    document.getElementById('pu-prev').disabled = _puState.offset === 0;
+    document.getElementById('pu-next').disabled = _puState.nextOffset === null;
+    document.getElementById('pu-paging').textContent = `Offset ${_puState.offset}${_puState.nextOffset !== null ? ' — more available' : ''}`;
+  } catch (e) {
+    tb.replaceChildren();
+    tb.insertAdjacentHTML('beforeend', `<tr><td colspan="6" class="empty">Error: ${escapeHtml(e.message)}</td></tr>`);
+  }
+}
+
+function pageUsage(delta) {
+  if (delta > 0 && _puState.nextOffset !== null) _puState.offset = _puState.nextOffset;
+  else if (delta < 0) _puState.offset = Math.max(0, _puState.offset - _puState.limit);
+  refreshPolicyUsage();
+}
+
+async function resetPolicyUsage(principalKey) {
+  if (!confirm(`Reset counter for '${principalKey}' on policy '${_puState.policyId}'?\n\nThis renews the user's quota — the next request will land on a fresh bucket.`)) return;
+  try {
+    const r = await apiFetch(`/policies/${encodeURIComponent(_puState.policyId)}/usage/${encodeURIComponent(principalKey)}`, { method:'DELETE' });
+    toast(`Reset — previous count was ${r.reset_count}.`);
+    await refreshPolicyUsage();
+  } catch (e) { toast(e.message, false); }
 }
 
 // Initial load

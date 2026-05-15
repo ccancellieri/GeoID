@@ -263,6 +263,26 @@ function renderPolicies() {
     const tr = document.createElement("tr");
     const id = document.createElement("td");
     id.textContent = p.id;
+    // Surface rate_limit / max_count conditions inline so operators
+    // picking a policy for an ad-hoc role can see at-a-glance which
+    // policies gate traffic. Type slugs come from a fixed handler set.
+    const conds = p.conditions || [];
+    if (conds.some((c) => c.type === "rate_limit")) {
+      const b = document.createElement("span");
+      b.className = "chip limit-rate";
+      b.textContent = "rate";
+      b.title = "Has rate_limit condition";
+      b.style.marginLeft = "6px";
+      id.appendChild(b);
+    }
+    if (conds.some((c) => c.type === "max_count")) {
+      const b = document.createElement("span");
+      b.className = "chip limit-quota";
+      b.textContent = "quota";
+      b.title = "Has max_count condition";
+      b.style.marginLeft = "6px";
+      id.appendChild(b);
+    }
     const effect = document.createElement("td");
     const eChip = document.createElement("span");
     eChip.className = `chip effect-${p.effect}`;
