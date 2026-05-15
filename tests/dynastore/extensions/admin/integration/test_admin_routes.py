@@ -2,8 +2,7 @@
 Integration tests for the Admin extension.
 
 Covers read-only admin endpoints exercised by the sysadmin client:
-- GET /admin/users              — list local users
-- GET /admin/principals         — search principals
+- GET /admin/users              — list/search principals (q/role/catalog_id/provider)
 - GET /admin/roles              — list roles
 - GET /admin/policies           — list policies
 - GET /admin/catalogs/{id}/users           — list users assigned to a catalog
@@ -101,16 +100,24 @@ async def test_get_unknown_user_404(sysadmin_in_process_client: AsyncClient):
 @MARKER
 @pytest.mark.asyncio
 async def test_search_principals_returns_200(sysadmin_in_process_client: AsyncClient):
-    """GET /admin/principals — returns 200."""
-    r = await sysadmin_in_process_client.get("/admin/principals")
+    """GET /admin/users — returns 200 (list mode)."""
+    r = await sysadmin_in_process_client.get("/admin/users")
     assert r.status_code == 200
 
 
 @MARKER
 @pytest.mark.asyncio
 async def test_search_principals_with_query(sysadmin_in_process_client: AsyncClient):
-    """GET /admin/principals?q= — text search parameter accepted."""
-    r = await sysadmin_in_process_client.get("/admin/principals", params={"q": "admin"})
+    """GET /admin/users?q= — search mode accepts the identifier filter."""
+    r = await sysadmin_in_process_client.get("/admin/users", params={"q": "admin"})
+    assert r.status_code == 200
+
+
+@MARKER
+@pytest.mark.asyncio
+async def test_search_principals_role_filter(sysadmin_in_process_client: AsyncClient):
+    """GET /admin/users?role= — role filter routes through search_principals."""
+    r = await sysadmin_in_process_client.get("/admin/users", params={"role": "admin"})
     assert r.status_code == 200
 
 

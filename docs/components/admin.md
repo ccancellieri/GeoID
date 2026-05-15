@@ -8,15 +8,14 @@ The admin extension provides system administration endpoints and dashboard pages
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/admin/principals` | List all principals (paginated) |
-| POST | `/admin/principals` | Create a new principal |
-| GET | `/admin/principals/{id}` | Get principal details |
-| PUT | `/admin/principals/{id}` | Update principal (roles, attributes) |
-| DELETE | `/admin/principals/{id}` | Delete principal and all linked keys |
+| GET | `/admin/users` | List or search principals (filterable by `provider`, `q`, `role`, `catalog_id`, `limit`, `offset`) |
+| POST | `/admin/users` | Create a new local user (username/password login) |
+| GET | `/admin/users/{id}` | Get principal details |
+| PUT | `/admin/users/{id}` | Update principal (roles, attributes) |
+| DELETE | `/admin/users/{id}` | Delete principal and all linked keys |
 | GET | `/admin/keys` | Search API keys |
 | POST | `/admin/keys` | Create API key for a principal |
 | DELETE | `/admin/keys/{hash}` | Revoke an API key |
-| POST | `/admin/users` | Create a user (username/password login) |
 
 ### Roles & Policies
 

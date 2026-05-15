@@ -100,7 +100,10 @@ class AdminService(ExtensionProtocol):
     # User Management (/admin/users)
     # -------------------------------------------------------------------------
 
-    @router.get("/users", summary="List principals (optionally filtered by provider)")
+    @router.get(
+        "/users",
+        summary="List or search principals (filterable by provider, identifier, role, catalog)",
+    )
     async def list_users(
         limit: int = Query(50, ge=1, le=500),  # type: ignore[reportGeneralTypeIssues]
         offset: int = Query(0, ge=0),
@@ -109,9 +112,29 @@ class AdminService(ExtensionProtocol):
             description="Filter by identity provider (e.g. 'local', 'oidc', 'system'). "
             "Omit to list all principals.",
         ),
+        q: Optional[str] = Query(
+            None,
+            description="Free-text partial match on principal identifier "
+            "(OGC API - Records §7.7). When set, switches to search mode.",
+        ),
+        role: Optional[str] = Query(
+            None, description="Filter to principals that hold this role."
+        ),
+        catalog_id: Optional[str] = Query(
+            None, description="Resolve role membership within this catalog scope."
+        ),
     ):
         mgr = _iam()
-        principals = await mgr.list_principals(limit=limit, offset=offset)
+        if q is not None or role is not None or catalog_id is not None:
+            principals = await mgr.search_principals(
+                identifier=q,
+                role=role,
+                limit=limit,
+                offset=offset,
+                catalog_id=catalog_id,
+            )
+        else:
+            principals = await mgr.list_principals(limit=limit, offset=offset)
         if provider is not None:
             principals = [p for p in principals if p.provider == provider]
         out = []
@@ -200,31 +223,6 @@ class AdminService(ExtensionProtocol):
         deleted = await mgr.delete_principal(principal_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="User not found.")
-
-    # -------------------------------------------------------------------------
-    # Principal Management (/admin/principals)
-    # -------------------------------------------------------------------------
-
-    @router.get("/principals", summary="Search principals (all providers)")
-    async def search_principals(
-        q: Optional[str] = Query(None, description="Free-text partial match on principal identifier (OGC API - Records §7.7)"),  # type: ignore[reportGeneralTypeIssues]
-        role: Optional[str] = Query(None),
-        catalog_id: Optional[str] = Query(None),
-        limit: int = Query(50, ge=1, le=500),
-        offset: int = Query(0, ge=0),
-    ):
-        mgr = _iam()
-        results = await mgr.search_principals(
-            identifier=q, role=role, limit=limit, offset=offset, catalog_id=catalog_id
-        )
-        out = []
-        for p in results:
-            granted = await mgr.storage.list_platform_roles(principal_id=p.id)
-            out.append(PrincipalResponse(
-                id=str(p.id), provider=p.provider, subject_id=p.subject_id,
-                display_name=p.display_name, roles=list(granted), is_active=p.is_active,
-            ))
-        return out
 
     # ---- Platform-scope role grants (D6 — `iam.grants`) -----------------
 
