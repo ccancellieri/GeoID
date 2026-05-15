@@ -38,21 +38,13 @@ from dynastore.modules.db_config.query_executor import (
     DbResource,
     run_in_event_loop,
 )
-from dynastore.modules.db_config.locking_tools import check_table_exists
-from dynastore.modules.db_config.partition_tools import (
-    ensure_hierarchical_partitions_exist,
-    PartitionDefinition,
-)
-from dynastore.modules.db_config.maintenance_tools import (
-    ensure_schema_exists,
-    register_retention_policy,
-    ensure_future_partitions,
-)
 from dynastore.modules.db_config.locking_tools import (
-    acquire_lock_if_needed,
     check_table_exists,
     check_trigger_exists,
 )
+from dynastore.modules.db_config.maintenance_tools import ensure_schema_exists
+from dynastore.models.protocols.task_queue import TaskQueueProtocol
+from dynastore.modules.processes.protocols import ProcessRegistryProtocol
 
 from .models import Task, TaskCreate, TaskUpdate
 
@@ -342,12 +334,6 @@ def _build_tasks_ddl_batch(schema: str) -> DDLBatch:
 
 
 
-from dynastore.modules import ModuleProtocol
-from dynastore.models.protocols import TasksProtocol
-from dynastore.models.protocols.task_queue import TaskQueueProtocol
-from dynastore.modules.processes.protocols import ProcessRegistryProtocol
-
-
 class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
     priority: int = 15  # Must start before CatalogModule (20) to create global tables
 
@@ -505,14 +491,12 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
         from dynastore.modules.concurrency import get_background_executor
         from dynastore.modules.tasks.queue import start_queue_listener
         from dynastore.modules.tasks.dispatcher import run_dispatcher
-        from dynastore.tools.protocol_helpers import get_engine
         from dynastore.tasks import manage_tasks
 
         logger.info("TasksModule: Initialising task singletons …")
 
         from dynastore.tools.protocol_helpers import resolve
         from dynastore.models.protocols import DatabaseProtocol
-        from dynastore.tasks import manage_tasks
 
         shutdown_event = asyncio.Event()
 
