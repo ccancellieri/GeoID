@@ -186,8 +186,7 @@ async def _collection_is_materialized(
     catalogs = get_protocol(CatalogsProtocol)
     if catalogs is None:
         return False
-    catalog_manager = catalogs.catalog_manager  # type: ignore[attr-defined]
-    phys_schema = await catalog_manager.resolve_physical_schema(
+    phys_schema = await catalogs.resolve_physical_schema(
         catalog_id, ctx=DriverContext(db_resource=conn),
     )
     if not phys_schema:
@@ -234,8 +233,7 @@ async def _catalog_is_materialized(
     catalogs = get_protocol(CatalogsProtocol)
     if catalogs is None:
         return False
-    catalog_manager = catalogs.catalog_manager  # type: ignore[attr-defined]
-    phys_schema = await catalog_manager.resolve_physical_schema(
+    phys_schema = await catalogs.resolve_physical_schema(
         catalog_id, ctx=DriverContext(db_resource=conn),
     )
     if not phys_schema:
