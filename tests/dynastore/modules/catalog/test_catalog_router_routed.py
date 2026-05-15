@@ -86,3 +86,38 @@ async def test_catalog_write_fans_out_to_config_resolved_drivers(monkeypatch):
     monkeypatch.setattr(catalog_router, "_emit_catalog_metadata_changed", _noop_emit)
     await catalog_router.upsert_catalog_metadata("cat", {"id": "cat"})
     assert pg.calls == ["upsert"]
+
+
+@pytest.mark.asyncio
+async def test_catalog_write_filters_non_capable_config_resolved_driver(monkeypatch, caplog):
+    """A config-pinned CatalogStore driver lacking WRITE capability must be
+    dropped from the fan-out (parity with the discovery path)."""
+    import logging
+
+    from dynastore.modules.catalog import catalog_router
+    from dynastore.modules.storage.routing_config import Operation, OperationDriverEntry
+
+    class _ReadOnlyCatalogDriver(_RecordingCatalogDriver):
+        capabilities = frozenset({EntityStoreCapability.READ})
+
+    write = _RecordingCatalogDriver("write")
+    readonly = _ReadOnlyCatalogDriver("readonly")
+
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+        if operation == Operation.WRITE:
+            return [
+                (OperationDriverEntry(driver_ref="catalog_postgresql_driver"), write),
+                (OperationDriverEntry(driver_ref="catalog_readonly_driver"), readonly),
+            ]
+        return []
+
+    async def _noop_emit(**kw):
+        return None
+
+    monkeypatch.setattr(catalog_router, "resolve_routed", _fake_resolve)
+    monkeypatch.setattr(catalog_router, "_emit_catalog_metadata_changed", _noop_emit)
+    with caplog.at_level(logging.WARNING, logger=catalog_router.__name__):
+        await catalog_router.upsert_catalog_metadata("cat", {"id": "cat"})
+    assert write.calls == ["upsert"]
+    assert readonly.calls == []
+    assert any("capability" in r.message.lower() for r in caplog.records)

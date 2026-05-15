@@ -69,8 +69,18 @@ def _filter_capable(
     bug-catcher; routers MUST honour the capability contract before
     invocation.
     """
-    return [d for d in drivers
-            if capability in getattr(d, "capabilities", frozenset())]
+    kept: List[CollectionStore] = []
+    for d in drivers:
+        if capability in getattr(d, "capabilities", frozenset()):
+            kept.append(d)
+        else:
+            logger.warning(
+                "Driver %s lacks the %s capability — dropped from the "
+                "fan-out.  Check the routing config: a pinned driver_ref "
+                "must declare the capability for the operation it serves.",
+                type(d).__name__, capability,
+            )
+    return kept
 
 
 def _resolve_drivers() -> List[CollectionStore]:
@@ -120,21 +130,27 @@ def _get_index_dispatcher() -> Any:
 async def _dispatch_collection_index(
     catalog_id: str,
     collection_id: str,
-    metadata: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None,
     *,
+    op_type: str = "upsert",
     db_resource: Optional[Any] = None,
 ) -> None:
-    """Fan the collection envelope to every Indexer configured under
-    ``CollectionRoutingConfig.operations[INDEX]``.
+    """Fan a collection ``upsert`` / ``delete`` to every Indexer configured
+    under ``CollectionRoutingConfig.operations[INDEX]``.
 
     Mirrors :meth:`item_service.ItemService._dispatch_index_upsert` at the
     collection-envelope tier — the single dispatch call site that replaces
-    per-driver ES event listeners.  Failure handling is governed by each
-    routing entry's ``on_failure`` (OUTBOX enqueues a durable retry row,
-    WARN logs, FATAL raises out so the caller's TX rolls back).
+    per-driver ES event listeners.  ``op_type`` selects the verb: an
+    ``upsert`` carries the metadata envelope, a ``delete`` carries no
+    payload (``metadata`` is ``None``) and asks the Indexer to drop the
+    document so a deleted collection does not linger in
+    ``dynastore-collections`` until the next full reindex.
 
-    Non-FATAL failures are absorbed here: the PG WRITE has already
-    committed/queued and must stand.  ``IndexerFatal`` propagates.
+    Failure handling is governed by each routing entry's ``on_failure``
+    (OUTBOX enqueues a durable retry row, WARN logs, FATAL raises out so
+    the caller's TX rolls back).  Non-FATAL failures are absorbed here:
+    the PG mutation has already committed/queued and must stand.
+    ``IndexerFatal`` propagates.
     """
     from dynastore.models.protocols.indexer import IndexContext, IndexOp
     from dynastore.modules.storage.index_dispatcher import IndexerFatal
@@ -143,7 +159,7 @@ async def _dispatch_collection_index(
     dispatcher = _get_index_dispatcher()
     ops = [
         IndexOp(
-            op_type="upsert",
+            op_type=op_type,
             entity_type="collection",
             entity_id=collection_id,
             payload=metadata,
@@ -162,9 +178,9 @@ async def _dispatch_collection_index(
         raise
     except Exception as exc:  # noqa: BLE001 — non-FATAL paths absorb
         logger.warning(
-            "Collection INDEX-hop dispatch failed for %s/%s: %s — "
-            "PG write stands; ES may be stale until reindex",
-            catalog_id, collection_id, exc,
+            "Collection INDEX-hop %s dispatch failed for %s/%s: %s — "
+            "PG mutation stands; ES may be stale until reindex",
+            op_type, catalog_id, collection_id, exc,
         )
 
 
@@ -258,7 +274,10 @@ async def upsert_collection_metadata(
             Operation.WRITE, catalog_id, collection_id, db_resource=db_resource,
         )
         if routed is not None:
-            drivers = routed
+            # Parity with the discovery branch: a config-pinned driver that
+            # does not declare WRITE must be dropped, not invoked — invoking
+            # it would raise mid-fan-out instead of degrading cleanly.
+            drivers = _filter_capable(routed, EntityStoreCapability.WRITE)
         else:
             drivers = _filter_capable(_resolve_drivers(), EntityStoreCapability.WRITE)
     if not drivers:
@@ -316,7 +335,8 @@ async def delete_collection_metadata(
             Operation.WRITE, catalog_id, collection_id, db_resource=db_resource,
         )
         if routed is not None:
-            drivers = routed
+            # Parity with the discovery branch — see upsert_collection_metadata.
+            drivers = _filter_capable(routed, EntityStoreCapability.WRITE)
         else:
             drivers = _filter_capable(_resolve_drivers(), EntityStoreCapability.WRITE)
     if not drivers:
@@ -341,7 +361,16 @@ async def delete_collection_metadata(
             )
             if first_error is None:
                 first_error = exc
-    if first_error is not None:
+
+    if first_error is None:
+        # INDEX hop — propagate the delete so ES drops the document too.
+        # Mirrors the upsert path; fires only on a clean fan-out, because a
+        # partial-failure delete left the row in PG (system of record) and
+        # ES must keep its copy until a clean retry.
+        await _dispatch_collection_index(
+            catalog_id, collection_id, op_type="delete", db_resource=db_resource,
+        )
+    else:
         raise first_error
 
 

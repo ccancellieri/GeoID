@@ -128,8 +128,18 @@ def _filter_capable(
     bug-catcher; routers MUST honour the capability contract before
     invocation.
     """
-    return [d for d in drivers
-            if capability in getattr(d, "capabilities", frozenset())]
+    kept: List[CatalogStore] = []
+    for d in drivers:
+        if capability in getattr(d, "capabilities", frozenset()):
+            kept.append(d)
+        else:
+            logger.warning(
+                "Driver %s lacks the %s capability — dropped from the "
+                "fan-out.  Check the routing config: a pinned driver_ref "
+                "must declare the capability for the operation it serves.",
+                type(d).__name__, capability,
+            )
+    return kept
 
 
 def _resolve_catalog_store_drivers() -> List[CatalogStore]:
@@ -303,7 +313,9 @@ async def upsert_catalog_metadata(
             Operation.WRITE, catalog_id, db_resource=db_resource,
         )
         if routed is not None:
-            drivers = routed
+            # Parity with the discovery branch: a config-pinned driver that
+            # does not declare WRITE must be dropped, not invoked.
+            drivers = _filter_capable(routed, EntityStoreCapability.WRITE)
         else:
             drivers = _filter_capable(
                 _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,
@@ -354,7 +366,9 @@ async def delete_catalog_metadata(
             Operation.WRITE, catalog_id, db_resource=db_resource,
         )
         if routed is not None:
-            drivers = routed
+            # Parity with the discovery branch: a config-pinned driver that
+            # does not declare WRITE must be dropped, not invoked.
+            drivers = _filter_capable(routed, EntityStoreCapability.WRITE)
         else:
             drivers = _filter_capable(
                 _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,

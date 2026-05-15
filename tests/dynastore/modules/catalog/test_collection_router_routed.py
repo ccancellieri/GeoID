@@ -183,3 +183,102 @@ async def test_index_dispatch_failure_does_not_break_write(monkeypatch, caplog):
         await collection_router.upsert_collection_metadata("cat", "coll", {"id": "coll"})
     assert pg.calls == ["upsert"]
     assert any("index" in r.message.lower() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_delete_dispatches_index_hop(monkeypatch):
+    """After a clean DELETE fan-out, delete_collection_metadata must dispatch
+    a ``delete`` op to the INDEX hop so ES drops the doc too — without it a
+    deleted collection lingers in ``dynastore-collections`` until reindex."""
+    from dynastore.modules.catalog import collection_router
+    from dynastore.modules.storage.routing_config import Operation, OperationDriverEntry
+
+    pg = _RecordingDriver("pg")
+    dispatched: list[tuple] = []
+
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+        if operation == Operation.WRITE:
+            return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), pg)]
+        return []
+
+    class _FakeDispatcher:
+        async def fan_out_bulk(self, ctx, ops):
+            dispatched.append(
+                (ctx.catalog, ctx.collection, ops[0].op_type, ops[0].entity_type)
+            )
+
+    monkeypatch.setattr(collection_router, "resolve_routed", _fake_resolve)
+    monkeypatch.setattr(
+        collection_router, "_get_index_dispatcher", lambda: _FakeDispatcher(),
+    )
+    await collection_router.delete_collection_metadata("cat", "coll")
+    assert pg.calls == ["delete"]
+    assert dispatched == [("cat", "coll", "delete", "collection")]
+
+
+@pytest.mark.asyncio
+async def test_delete_skips_index_hop_when_driver_failed(monkeypatch):
+    """A failed DELETE fan-out must NOT dispatch the INDEX hop — the PG
+    delete didn't land, so ES must keep the doc until a clean retry."""
+    from dynastore.modules.catalog import collection_router
+    from dynastore.modules.storage.routing_config import Operation, OperationDriverEntry
+
+    class _BoomDriver(_RecordingDriver):
+        async def delete_metadata(self, catalog_id, collection_id, *, soft=False, db_resource=None):
+            raise RuntimeError("synthetic PG outage")
+
+    boom = _BoomDriver("boom")
+    dispatched: list = []
+
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+        if operation == Operation.WRITE:
+            return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), boom)]
+        return []
+
+    class _FakeDispatcher:
+        async def fan_out_bulk(self, ctx, ops):
+            dispatched.append(ops)
+
+    monkeypatch.setattr(collection_router, "resolve_routed", _fake_resolve)
+    monkeypatch.setattr(
+        collection_router, "_get_index_dispatcher", lambda: _FakeDispatcher(),
+    )
+    with pytest.raises(RuntimeError, match="synthetic PG outage"):
+        await collection_router.delete_collection_metadata("cat", "coll")
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_write_filters_non_capable_config_resolved_driver(monkeypatch, caplog):
+    """A config-pinned driver lacking WRITE capability must be dropped from
+    the fan-out (parity with the discovery path) — not invoked, which would
+    raise ``AttributeError``/``NotImplementedError`` mid-fan-out."""
+    import logging
+
+    from dynastore.modules.catalog import collection_router
+    from dynastore.modules.storage.routing_config import Operation, OperationDriverEntry
+
+    class _ReadOnlyDriver(_RecordingDriver):
+        capabilities = frozenset({EntityStoreCapability.READ})
+
+    write = _RecordingDriver("write")
+    readonly = _ReadOnlyDriver("readonly")
+
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+        if operation == Operation.WRITE:
+            return [
+                (OperationDriverEntry(driver_ref="collection_postgresql_driver"), write),
+                (OperationDriverEntry(driver_ref="collection_readonly_driver"), readonly),
+            ]
+        return []
+
+    async def _noop_dispatch(*a, **kw):
+        return None
+
+    monkeypatch.setattr(collection_router, "resolve_routed", _fake_resolve)
+    monkeypatch.setattr(collection_router, "_dispatch_collection_index", _noop_dispatch)
+    with caplog.at_level(logging.WARNING, logger=collection_router.__name__):
+        await collection_router.upsert_collection_metadata("cat", "coll", {"id": "coll"})
+    assert write.calls == ["upsert"]
+    assert readonly.calls == []
+    assert any("capability" in r.message.lower() for r in caplog.records)
