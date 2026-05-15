@@ -69,6 +69,40 @@ class ConditionHandler(abc.ABC):
 
 # --- Condition Handlers ---
 
+def _client_ip_from_request(request: Any) -> Optional[str]:
+    """Resolve the originating client IP for a ``scope=client_ip`` policy.
+
+    ``request.client.host`` is the proxy/LB address in any deployment
+    that doesn't run the app directly behind the public Internet — for
+    GeoID that's Cloud Run + the in-front Load Balancer (see
+    project_distributed_stateless_runtime). The LB sets
+    ``X-Forwarded-For`` to ``<original-client>, <intermediate>, ...`` so
+    the leftmost token is the real caller.
+
+    Trust model: XFF is honoured unconditionally. This assumes a trusted
+    proxy in front of the app — true for every documented GeoID
+    deployment topology. Deployments that don't have a trusted proxy
+    must not use ``scope=client_ip`` rate-limit policies (a direct
+    client can otherwise spoof the header).
+    """
+    if request is None:
+        return None
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        try:
+            xff = headers.get("x-forwarded-for")
+        except Exception:
+            xff = None
+        if xff:
+            # Leftmost token, stripped. Header is comma-separated.
+            first = xff.split(",", 1)[0].strip()
+            if first:
+                return first
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None) if client else None
+    return host or None
+
+
 def _policy_id_for(config: Dict[str, Any], ctx: EvaluationContext) -> Optional[str]:
     """Resolve the owning policy id for a condition's config dict.
 
@@ -104,9 +138,7 @@ def _principal_key_for(scope: str, ctx: EvaluationContext) -> Optional[str]:
         # Use the first role — multi-role principals fall back to a deterministic pick.
         return roles[0] if roles else None
     if scope == "client_ip":
-        request = ctx.request
-        client = getattr(request, "client", None) if request else None
-        host = getattr(client, "host", None) if client else None
+        host = _client_ip_from_request(ctx.request)
         return f"ip:{host}" if host else None
     if scope == "catalog":
         return ctx.catalog_id
