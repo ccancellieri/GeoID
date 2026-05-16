@@ -728,7 +728,7 @@ class TemplatingExtension(ExtensionProtocol):
         mm = request.mm
         stream = request.stream
 
-        return await interpolate_template_get(request=request, t=t, t_url=t_url, t_url_h=t_url_h, m=m, m_urls=m_urls, m_urls_h=m_urls_h, ru=ru, ru_h=ru_h, ae=ae, et=et, mm=mm, r_mt=r_mt, stream=stream)  # type: ignore[name-defined]
+        return await TemplatingExtension.interpolate_template_get(request=request, t=t, t_url=t_url, t_url_h=t_url_h, m=m, m_urls=m_urls, m_urls_h=m_urls_h, ru=ru, ru_h=ru_h, ae=ae, et=et, mm=mm, r_mt=r_mt, stream=stream)
     
     @router.post("/xml-to-json/stream")
     async def stream_parse_post(
