@@ -168,9 +168,9 @@ def _register_definition_only_placeholders(already_loaded: set) -> None:
             _process_definition = process_def
             is_placeholder = True
 
-            @staticmethod
-            def get_definition() -> Process:
-                return process_def  # type: ignore[return-value]
+            @classmethod
+            def get_definition(cls) -> Process:
+                return cls._process_definition  # type: ignore[return-value]
 
         _DYNASTORE_TASKS[ep.name] = TaskConfig(
             cls=cast(Type[TaskProtocol], DefinitionOnlyTask),
