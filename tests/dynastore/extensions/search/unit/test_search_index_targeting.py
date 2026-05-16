@@ -73,3 +73,17 @@ async def test_search_items_uses_ignore_unavailable(monkeypatch):
     await svc.search_items(SearchBody(catalog_id="missing-catalog", limit=10))
 
     assert captured["kwargs"].get("ignore_unavailable") is True
+
+
+async def test_search_items_uses_allow_no_indices(monkeypatch):
+    """``allow_no_indices=True`` is what protects a fresh-install ``/search``
+    from 404'ing — the public items alias only materialises after the first
+    catalog onboards (#803 remaining symptom).
+    """
+    svc = _service()
+    driver, captured = _capturing_driver()
+    monkeypatch.setattr(svc, "_resolve_items_driver", lambda: driver)
+
+    await svc.search_items(SearchBody(catalog_id=None, limit=10))
+
+    assert captured["kwargs"].get("allow_no_indices") is True

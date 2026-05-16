@@ -250,7 +250,20 @@ class SearchService(ExtensionProtocol):
                 logger.warning(f"Ignoring invalid search token: {body.token!r}")
 
         es = self._resolve_items_driver().es_client
-        resp = await es.search(index=index, body=es_body, ignore_unavailable=True)  # type: ignore[call-arg]
+        # ``ignore_unavailable`` covers missing concrete indexes inside an
+        # alias; ``allow_no_indices`` covers the alias itself not existing
+        # yet on a fresh deployment with zero catalogs onboarded (the public
+        # items alias only materialises on the first
+        # ``add_index_to_public_alias`` call, per
+        # ``ensure_public_alias_exists`` docstring). Together they make
+        # ``/search`` return an empty ``ItemCollection`` rather than a 404
+        # on a brand-new install — closes the remaining symptom of #803.
+        resp = await es.search(
+            index=index,
+            body=es_body,
+            ignore_unavailable=True,
+            allow_no_indices=True,
+        )  # type: ignore[call-arg]
 
         hits = resp.get("hits", {})
         total = hits.get("total", {}).get("value", 0)
