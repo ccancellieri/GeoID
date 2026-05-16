@@ -18,7 +18,7 @@ from dynastore.models.protocols.authorization import IamRolesConfig
 def admin_policies() -> List[Policy]:
     """Pure declaration of the admin extension's policies.
 
-    Two policies:
+    Three policies:
 
     - ``admin_access`` — broad ``/admin/.*`` ALLOW. Default role
       bindings (returned by ``admin_role_bindings``) carry SYSADMIN +
@@ -31,6 +31,14 @@ def admin_policies() -> List[Policy]:
       (either by editing the policy's condition or by binding a role to
       the policy via ``POST /admin/roles``). Behaves like a custom role
       end-to-end.
+
+    - ``admin_catalogs_list`` — narrow ALLOW for ``GET /admin/catalogs``
+      (the catalog picker, #723). Bound by default to the
+      ``catalog_admin`` sentinel role (auto-added by ``IamMiddleware``
+      to any principal who holds the catalog-tier admin role) so
+      catalog admins can list catalogs they administer.  The handler
+      filters the response per caller; sysadmin / platform-admin reach
+      this route via ``admin_access`` and get the unfiltered list.
     """
     return [
         Policy(
@@ -62,6 +70,19 @@ def admin_policies() -> List[Policy]:
                 )
             ],
         ),
+        Policy(
+            id="admin_catalogs_list",
+            description=(
+                "Lets catalog-tier admins reach GET /admin/catalogs. The "
+                "handler filters the response so each catalog admin only "
+                "sees the catalogs they actually administer; sysadmin / "
+                "platform-admin reach this route via admin_access and "
+                "see the full list."
+            ),
+            actions=["GET"],
+            resources=[r"^/admin/catalogs/?$"],
+            effect="ALLOW",
+        ),
     ]
 
 
@@ -71,10 +92,12 @@ def admin_role_bindings(
 ) -> List[Role]:
     """Pure declaration of the admin extension's role bindings.
 
-    Only ``admin_access`` gets default bindings (back-compat).
-    ``admin_catalog_access`` is intentionally unbound — operators wire
-    catalog-admin authority through the same DB-resident flow they use
-    for any custom role.
+    - ``admin_access`` is bound to sysadmin + admin (back-compat).
+    - ``admin_catalogs_list`` is bound to the ``catalog_admin`` sentinel
+      role so catalog-tier admins reach the catalog picker (#723).
+    - ``admin_catalog_access`` is intentionally unbound — operators wire
+      catalog-admin authority through the same DB-resident flow they
+      use for any custom role.
     """
     cfg = IamRolesConfig()
     sysadmin_role_name = sysadmin_role_name or cfg.sysadmin_role_name
@@ -82,4 +105,5 @@ def admin_role_bindings(
     return [
         Role(name=sysadmin_role_name, policies=["admin_access"]),
         Role(name=admin_role_name, policies=["admin_access"]),
+        Role(name="catalog_admin", policies=["admin_catalogs_list"]),
     ]

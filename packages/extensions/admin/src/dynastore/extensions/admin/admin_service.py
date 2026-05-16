@@ -69,6 +69,54 @@ def _iam() -> IamService:
     return mgr
 
 
+async def _catalog_admin_filter_ids(request: Request) -> Optional[set]:
+    """Return the set of catalog ids a non-platform-admin caller may see in
+    the admin catalog picker (#723), or ``None`` if no filter applies.
+
+    ``None`` means "return everything" — the caller is sysadmin, holds the
+    platform admin role, or has an explicit platform-scope grant. Returning
+    a set (possibly empty) means the response should be restricted to
+    catalogs in which the caller holds the catalog-tier admin role.
+
+    Anonymous calls (no principal) also return ``None``; the policy layer
+    has already gated the route, so anyone who reaches this code without a
+    principal carries an authoritative ALLOW (e.g. operator overrides).
+    """
+    from dynastore.models.protocols.authorization import IamRolesConfig
+    from dynastore.models.protocols.iam_query import IamQueryProtocol
+    from dynastore.extensions.iam.membership_cache import get_membership_cached
+
+    principal = getattr(request.state, "principal", None)
+    if principal is None:
+        return None
+
+    cfg = IamRolesConfig()
+    principal_roles = set(getattr(principal, "roles", None) or [])
+    if cfg.sysadmin_role_name in principal_roles or cfg.admin_role_name in principal_roles:
+        return None
+
+    provider = getattr(principal, "provider", None)
+    subject_id = getattr(principal, "subject_id", None)
+    if not provider or not subject_id:
+        return set()
+
+    iam_query = get_protocol(IamQueryProtocol)
+    if iam_query is None:
+        return set()
+
+    membership = await get_membership_cached(iam_query, provider, subject_id)
+    if membership.get("platform"):
+        return None
+
+    admin_role = cfg.admin_role_name
+    catalog_roles = membership.get("catalog_roles") or {}
+    return {
+        cat_id
+        for cat_id, roles in catalog_roles.items()
+        if admin_role in (roles or [])
+    }
+
+
 async def _assert_catalog_exists(catalog_id: str) -> None:
     """Raise 404 if ``catalog_id`` does not resolve to a known catalog.
 
@@ -346,6 +394,7 @@ class AdminService(ExtensionProtocol):
         summary="List catalogs (admin picker for catalog-scope role grants)",
     )
     async def list_catalogs_for_admin(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
         limit: int = Query(200, ge=1, le=1000),  # type: ignore[reportGeneralTypeIssues]
         offset: int = Query(0, ge=0),
         lang: str = Query("en"),
@@ -354,7 +403,11 @@ class AdminService(ExtensionProtocol):
         catalogs_svc = get_protocol(CatalogsProtocol)
         if catalogs_svc is None:
             raise HTTPException(status_code=503, detail="Catalogs service not available.")
+
+        admin_only_ids = await _catalog_admin_filter_ids(request)
         items = await catalogs_svc.list_catalogs(limit=limit, offset=offset, lang=lang, q=q)
+        if admin_only_ids is not None:
+            items = [c for c in items if c.id in admin_only_ids]
         out = []
         for c in items:
             title_raw = c.model_dump(mode="json").get("title")
