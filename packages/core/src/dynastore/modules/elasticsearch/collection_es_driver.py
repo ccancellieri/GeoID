@@ -319,6 +319,16 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             from dynastore.modules.elasticsearch._mapping_errors import (
                 maybe_raise_mapping_mismatch,
             )
+            # #728: surface the real reason. The opensearchpy transport
+            # logger only prints the status line (not the body), so 400s
+            # like document_parsing_exception were invisible. exc_info=True
+            # writes the response body / cause chain into structured logs.
+            logger.warning(
+                "CollectionElasticsearchDriver.upsert_metadata failed: "
+                "catalog=%r collection=%r index=%r",
+                catalog_id, collection_id, index_name,
+                exc_info=True,
+            )
             maybe_raise_mapping_mismatch(exc, index_name, doc.keys())
             raise
 
@@ -332,9 +342,46 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         ``op.entity_id`` is the collection id; ``ctx.catalog`` is the
         owning catalog. ``op.payload`` carries the collection metadata
         for upserts.
+
+        Tier guard (#728): non-collection ops are refused outright rather
+        than silently upserted into the singleton ``dynastore-collections``
+        index. A misconfigured ``ItemsRoutingConfig.operations[INDEX]``
+        pointing at the collection driver previously leaked 180 STAC
+        items into the collection index and poisoned its dynamic mapping;
+        the loud refusal here surfaces that misconfiguration immediately.
         """
+        op_entity_type = getattr(op, "entity_type", None)
+        if op_entity_type is not None and op_entity_type != "collection":
+            payload_type = (op.payload or {}).get("type") if op.op_type == "upsert" else None
+            logger.error(
+                "CollectionElasticsearchDriver refused non-collection op: "
+                "op_entity_type=%r op_type=%r entity_id=%r catalog=%r payload_type=%r — "
+                "check routing config for this tier (likely a stale "
+                "ItemsRoutingConfig pointing at this driver).",
+                op_entity_type, op.op_type, op.entity_id,
+                getattr(ctx, "catalog", None), payload_type,
+            )
+            raise ValueError(
+                f"CollectionElasticsearchDriver.index: refused op with "
+                f"entity_type={op_entity_type!r}; this driver only accepts "
+                f"collection-tier ops."
+            )
         if op.op_type == "upsert":
             payload = op.payload or {}
+            # Defence-in-depth: even when entity_type is unset (legacy
+            # pre-#810 callers fall back to CollectionRoutingConfig), a
+            # STAC Feature payload is unambiguously an item.
+            if payload.get("type") == "Feature":
+                logger.error(
+                    "CollectionElasticsearchDriver refused STAC Feature payload: "
+                    "entity_id=%r catalog=%r — leaked items pollute the "
+                    "singleton collection index's dynamic mapping.",
+                    op.entity_id, getattr(ctx, "catalog", None),
+                )
+                raise ValueError(
+                    "CollectionElasticsearchDriver.index: refused payload with "
+                    "type='Feature'; STAC items belong on the items-tier index."
+                )
             await self.upsert_metadata(ctx.catalog, op.entity_id, payload)
         elif op.op_type == "delete":
             await self.delete_metadata(ctx.catalog, op.entity_id)
@@ -361,6 +408,20 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 await self.index(ctx, op)
                 succeeded += 1
             except Exception as exc:
+                # #728: log per-op failure with exc_info so the real
+                # cause (e.g. document_parsing_exception body, refused
+                # tier guard) reaches structured logs. The downstream
+                # ``index_propagation`` task currently treats partial
+                # failures as a successful "partial" outcome — see #728
+                # follow-up to wire failures to the DLQ like the items
+                # adapter does.
+                logger.warning(
+                    "CollectionElasticsearchDriver.index_bulk op failed: "
+                    "catalog=%r entity_id=%r op_type=%r",
+                    getattr(ctx, "catalog", None),
+                    op.entity_id, op.op_type,
+                    exc_info=True,
+                )
                 failures.append({
                     "entity_id": op.entity_id,
                     "op_type": op.op_type,

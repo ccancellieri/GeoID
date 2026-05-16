@@ -147,10 +147,116 @@ async def test_collection_ensure_indexer_delegates_to_ensure_storage():
     assert d.ensured == ["cat-z"]
 
 
+# ---------------------------------------------------------------------------
+# Tier guards (#728) — drivers refuse off-tier ops rather than poison the
+# singleton ``dynastore-collections`` / ``dynastore-catalogs`` indexes.
+# ---------------------------------------------------------------------------
+
+
+def _item_op(payload: Dict[str, Any] | None = None) -> Any:
+    return SimpleNamespace(
+        op_type="upsert",
+        entity_type="item",
+        entity_id="item-1",
+        payload=payload if payload is not None else {"type": "Feature", "id": "item-1"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_collection_index_refuses_item_entity_type():
+    """An ItemsRoutingConfig misconfigured to point at the collection driver
+    leaks STAC items into ``dynastore-collections`` (#728). The guard turns
+    the silent leak into a loud refusal."""
+    d = _CollectionDriverStub()
+    with pytest.raises(ValueError, match="refused op with entity_type='item'"):
+        await d.index(_ctx(), _item_op())
+    # No upsert happened — guard fired before upsert_metadata.
+    assert d.upserts == []
+
+
+@pytest.mark.asyncio
+async def test_collection_index_refuses_feature_payload_legacy_ctx():
+    """Legacy pre-#810 callers may leave ``op.entity_type=None``. A
+    ``type='Feature'`` payload is unambiguously an item and must still be
+    refused (defence-in-depth)."""
+    d = _CollectionDriverStub()
+    legacy_op = SimpleNamespace(
+        op_type="upsert",
+        entity_type=None,
+        entity_id="leaked-item",
+        payload={"type": "Feature", "id": "leaked-item"},
+    )
+    with pytest.raises(ValueError, match="type='Feature'"):
+        await d.index(_ctx(), legacy_op)
+    assert d.upserts == []
+
+
+@pytest.mark.asyncio
+async def test_collection_index_accepts_collection_entity_type():
+    """Regression pin: the guard must NOT reject the happy path."""
+    d = _CollectionDriverStub()
+    await d.index(_ctx(), _op("upsert", "col-y", {"title": "Hello"}))
+    assert d.upserts == [("cat-x", "col-y", {"title": "Hello"})]
+
+
+@pytest.mark.asyncio
+async def test_catalog_index_refuses_collection_entity_type():
+    d = _CatalogDriverStub()
+    coll_op = SimpleNamespace(
+        op_type="upsert",
+        entity_type="collection",
+        entity_id="cat-1",
+        payload={"title": "T"},
+    )
+    with pytest.raises(ValueError, match="refused op with entity_type='collection'"):
+        await d.index(_ctx(), coll_op)
+    assert d.upserts == []
+
+
+@pytest.mark.asyncio
+async def test_catalog_index_refuses_feature_payload_legacy_ctx():
+    d = _CatalogDriverStub()
+    legacy_op = SimpleNamespace(
+        op_type="upsert",
+        entity_type=None,
+        entity_id="leaked-item",
+        payload={"type": "Feature", "id": "leaked-item"},
+    )
+    with pytest.raises(ValueError, match="type='Feature'"):
+        await d.index(_ctx(), legacy_op)
+    assert d.upserts == []
+
+
+@pytest.mark.asyncio
+async def test_catalog_index_accepts_catalog_entity_type():
+    d = _CatalogDriverStub()
+    cat_op = SimpleNamespace(
+        op_type="upsert",
+        entity_type="catalog",
+        entity_id="cat-1",
+        payload={"title": "Catalog 1"},
+    )
+    await d.index(_ctx(), cat_op)
+    assert d.upserts == [("cat-1", {"title": "Catalog 1"})]
+
+
+def _catalog_op(op_type: str = "upsert", entity_id: str = "cat-1",
+                payload: Dict[str, Any] | None = None) -> Any:
+    """Catalog-tier op fixture — separate from :func:`_op` which stamps
+    ``entity_type='collection'``. The driver-side tier guards (#728) now
+    enforce that ``entity_type`` matches the driver's tier."""
+    return SimpleNamespace(
+        op_type=op_type,
+        entity_type="catalog",
+        entity_id=entity_id,
+        payload=payload if payload is not None else {"title": "T"},
+    )
+
+
 @pytest.mark.asyncio
 async def test_catalog_index_upsert_routes_to_upsert_catalog_metadata():
     d = _CatalogDriverStub()
-    op = _op("upsert", "cat-x", {"title": "C"})
+    op = _catalog_op("upsert", "cat-x", {"title": "C"})
     await d.index(_ctx(), op)
     assert d.upserts == [("cat-x", {"title": "C"})]
     assert d.deletes == []
@@ -159,7 +265,7 @@ async def test_catalog_index_upsert_routes_to_upsert_catalog_metadata():
 @pytest.mark.asyncio
 async def test_catalog_index_delete_routes_to_delete_catalog_metadata():
     d = _CatalogDriverStub()
-    await d.index(_ctx(), _op("delete", "cat-x"))
+    await d.index(_ctx(), _catalog_op("delete", "cat-x"))
     assert d.deletes == ["cat-x"]
     assert d.upserts == []
 
@@ -168,8 +274,8 @@ async def test_catalog_index_delete_routes_to_delete_catalog_metadata():
 async def test_catalog_index_bulk_aggregates_per_op_results():
     d = _CatalogDriverStub()
     result = await d.index_bulk(_ctx(), [
-        _op("upsert", "cat-a"),
-        _op("upsert", "cat-b"),
+        _catalog_op("upsert", "cat-a"),
+        _catalog_op("upsert", "cat-b"),
     ])
     assert result.total == 2
     assert result.succeeded == 2

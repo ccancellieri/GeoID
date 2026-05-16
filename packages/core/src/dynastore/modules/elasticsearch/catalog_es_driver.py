@@ -265,12 +265,26 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
         doc["id"] = catalog_id
         doc["catalog_id"] = catalog_id
 
-        await client.index(
-            index=self._index_name(),
-            id=catalog_id,
-            body=doc,
-            params={"refresh": "wait_for"},
-        )
+        index_name = self._index_name()
+        try:
+            await client.index(
+                index=index_name,
+                id=catalog_id,
+                body=doc,
+                params={"refresh": "wait_for"},
+            )
+        except Exception:
+            # #728: structured 400-body logging — the opensearchpy
+            # transport logger drops response bodies, so parse-time
+            # failures (e.g. document_parsing_exception on a stale
+            # dynamic mapping) were invisible.
+            logger.warning(
+                "CatalogElasticsearchDriver.upsert_catalog_metadata failed: "
+                "catalog=%r index=%r",
+                catalog_id, index_name,
+                exc_info=True,
+            )
+            raise
 
     async def delete_catalog_metadata(
         self,
@@ -316,9 +330,38 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
 
         ``op.entity_id`` is the catalog id; ``op.payload`` carries the
         catalog metadata for upserts.
+
+        Tier guard (#728): refuses non-catalog ops outright so a
+        misconfigured ItemsRoutingConfig / CollectionRoutingConfig
+        pointing at this driver surfaces immediately rather than
+        poisoning the catalog index's dynamic mapping.
         """
+        op_entity_type = getattr(op, "entity_type", None)
+        if op_entity_type is not None and op_entity_type != "catalog":
+            payload_type = (op.payload or {}).get("type") if op.op_type == "upsert" else None
+            logger.error(
+                "CatalogElasticsearchDriver refused non-catalog op: "
+                "op_entity_type=%r op_type=%r entity_id=%r payload_type=%r — "
+                "check routing config for this tier.",
+                op_entity_type, op.op_type, op.entity_id, payload_type,
+            )
+            raise ValueError(
+                f"CatalogElasticsearchDriver.index: refused op with "
+                f"entity_type={op_entity_type!r}; this driver only accepts "
+                f"catalog-tier ops."
+            )
         if op.op_type == "upsert":
             payload = op.payload or {}
+            if payload.get("type") == "Feature":
+                logger.error(
+                    "CatalogElasticsearchDriver refused STAC Feature payload: "
+                    "entity_id=%r — items must not land on the catalog index.",
+                    op.entity_id,
+                )
+                raise ValueError(
+                    "CatalogElasticsearchDriver.index: refused payload with "
+                    "type='Feature'; STAC items belong on the items-tier index."
+                )
             await self.upsert_catalog_metadata(op.entity_id, payload)
         elif op.op_type == "delete":
             await self.delete_catalog_metadata(op.entity_id)
@@ -345,6 +388,15 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
                 await self.index(ctx, op)
                 succeeded += 1
             except Exception as exc:
+                # #728: log per-op failure with exc_info so the real
+                # cause (e.g. document_parsing_exception body, refused
+                # tier guard) reaches structured logs.
+                logger.warning(
+                    "CatalogElasticsearchDriver.index_bulk op failed: "
+                    "entity_id=%r op_type=%r",
+                    op.entity_id, op.op_type,
+                    exc_info=True,
+                )
                 failures.append({
                     "entity_id": op.entity_id,
                     "op_type": op.op_type,
