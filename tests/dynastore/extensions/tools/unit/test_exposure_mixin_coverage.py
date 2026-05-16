@@ -33,6 +33,7 @@ from dynastore.extensions.tools.exposure_mixin import (
     ExposableConfigMixin,
     KNOWN_EXTENSION_IDS,
     ALWAYS_ON_EXTENSIONS,
+    find_dead_exposable_configs,
 )
 from dynastore.modules.db_config.platform_config_service import list_registered_configs
 
@@ -64,3 +65,19 @@ def test_no_extension_redeclares_enabled_field():
         assert "enabled" not in own_fields, (
             f"{cls.__name__} shadows ExposableConfigMixin.enabled — remove the local field."
         )
+
+
+def test_no_dead_exposable_configs():
+    """Regression guard for #853/#854: every ExposableConfigMixin subclass
+    must be visible to ExposureMatrix at lifespan startup.
+
+    If this fails, a config has been added (or moved) such that its
+    `enabled` field appears in /configs/ responses but flipping it does
+    nothing. Either strip the mixin or register the extension name in
+    KNOWN_EXTENSION_IDS — see find_dead_exposable_configs() docstring.
+    """
+    dead = find_dead_exposable_configs()
+    assert not dead, "Dead ExposableConfigMixin uses:\n" + "\n".join(
+        f"  - {cls.__module__}.{cls.__name__}: {reason}"
+        for cls, reason in dead
+    )

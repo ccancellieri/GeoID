@@ -39,7 +39,10 @@ from dynastore.extensions.documentation import (
 )
 from dynastore.extensions.tools.exposure_matrix import ExposureMatrix
 from dynastore.extensions.tools.exposure_mixin import (
-    ALWAYS_ON_EXTENSIONS, KNOWN_EXTENSION_IDS, ExposableConfigMixin,
+    ALWAYS_ON_EXTENSIONS,
+    KNOWN_EXTENSION_IDS,
+    ExposableConfigMixin,
+    find_dead_exposable_configs,
 )
 from dynastore.extensions.tools.exposure_openapi import install_filtered_openapi
 from dynastore.extensions.tools.exposure_route import make_exposure_dependency
@@ -101,6 +104,16 @@ async def lifespan(app: FastAPI):
 
         # --- PHASE 3: Routers & Docs ---
         logger.info("--- Phase 3: Mounting all extension routers ---")
+
+        # Surface mixin misuses early so the next dead-toggle regression
+        # (#853 / #854) shows up at boot instead of as an operator report.
+        for dead_cls, reason in find_dead_exposable_configs():
+            logger.warning(
+                "ExposableConfigMixin is on %s but ExposureMatrix cannot "
+                "enforce its `enabled` field: %s",
+                dead_cls.__name__,
+                reason,
+            )
 
         # Build the exposure matrix + custom route class.
         # ConfigsProtocol is provided by the catalog module; services whose
