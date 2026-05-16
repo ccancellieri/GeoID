@@ -96,7 +96,7 @@ class TilePreseedTask(
             preseed_config = await config_manager.get_config(
                 TilesPreseedConfig, catalog_id, request.collection_id
             )
-            if not isinstance(preseed_config, TilesPreseedConfig) or not preseed_config.enabled:
+            if not isinstance(preseed_config, TilesPreseedConfig) or not preseed_config.preseed_enabled:
                 logger.info(f"Pre-seeding disabled for {catalog_id}:{request.collection_id}")
                 return None
 

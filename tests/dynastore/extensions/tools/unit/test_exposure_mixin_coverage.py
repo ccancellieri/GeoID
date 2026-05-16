@@ -27,6 +27,7 @@ import dynastore.extensions.edr  # noqa: F401
 import dynastore.extensions.joins  # noqa: F401
 import dynastore.extensions.moving_features  # noqa: F401
 import dynastore.extensions.connected_systems  # noqa: F401
+import dynastore.extensions.volumes  # noqa: F401
 
 import pytest
 from dynastore.extensions.tools.exposure_mixin import (

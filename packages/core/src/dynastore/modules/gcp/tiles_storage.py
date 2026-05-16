@@ -88,7 +88,7 @@ class TileBucketPreseedStorage(TileStorageProtocol):
         tile_identifier = f"{catalog_id}/{collection_id}/{tms_id}/{z}/{x}/{y}.{format}"
         try:
             cfg = await _load_caching_config()
-            if not cfg.enabled:
+            if not cfg.cache_enabled:
                 logger.debug(
                     "tile_cache event=skip reason=disabled action=save tile=%s",
                     tile_identifier,
@@ -129,7 +129,7 @@ class TileBucketPreseedStorage(TileStorageProtocol):
 
     async def get_tile(self, catalog_id: str, collection_id: str, tms_id: str, z: int, x: int, y: int, format: str) -> Optional[bytes]:
         cfg = await _load_caching_config()
-        if not cfg.enabled:
+        if not cfg.cache_enabled:
             return None
 
         storage_provider = self._get_storage_provider()
@@ -157,7 +157,7 @@ class TileBucketPreseedStorage(TileStorageProtocol):
     @cached(maxsize=2048, namespace="gcp_tile_exists")
     async def check_tile_exists(self, catalog_id: str, collection_id: str, tms_id: str, z: int, x: int, y: int, format: str) -> bool:
         cfg = await _load_caching_config()
-        if not cfg.enabled:
+        if not cfg.cache_enabled:
             return False
 
         storage_provider = self._get_storage_provider()
@@ -177,7 +177,7 @@ class TileBucketPreseedStorage(TileStorageProtocol):
 
     async def get_tile_url(self, catalog_id: str, collection_id: str, tms_id: str, z: int, x: int, y: int, format: str) -> Optional[str]:
         cfg = await _load_caching_config()
-        if not cfg.enabled:
+        if not cfg.cache_enabled:
             return None
 
         storage_provider = self._get_storage_provider()

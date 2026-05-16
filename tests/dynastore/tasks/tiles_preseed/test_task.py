@@ -73,7 +73,7 @@ async def test_tile_preseed_task_run_integration(app_lifespan, in_process_client
 
     # 4. Configure Preseed for 'pg' storage
     preseed_conf = TilesPreseedConfig(
-        enabled=True,
+        preseed_enabled=True,
         target_tms_ids=["WebMercatorQuad"],
         formats=["mvt"],
         storage_priority=["pg"],

@@ -10,11 +10,12 @@ from typing import ClassVar, List, Literal, Tuple
 
 from pydantic import Field
 
+from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 # Match the base-class import used by CoveragesConfig.
 from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
 
 
-class VolumesConfig(PluginConfig):
+class VolumesConfig(ExposableConfigMixin, PluginConfig):
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "volumes")
 
     max_features_per_tile: Mutable[int] = Field(default=10_000, ge=1)

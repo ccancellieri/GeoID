@@ -120,7 +120,7 @@ async def test_first_request_is_miss_second_request_is_hit(
 async def test_cache_disabled_via_config_flips_hit_back_to_miss(
     in_process_client: AsyncClient,
 ):
-    """F3 contract: with `TilesCachingConfig.enabled=False`, the second
+    """F3 contract: with `TilesCachingConfig.cache_enabled=False`, the second
     request reports `miss` even after the background populate runs."""
     catalog_id = f"c_dis_{generate_test_id()}"
     collection_id = "disabled_collection"
@@ -147,7 +147,7 @@ async def test_cache_disabled_via_config_flips_hit_back_to_miss(
     # F3: platform-tier kill switch for the L2 cache.
     r = await in_process_client.put(
         "/configs/plugins/tiles_caching_config",
-        json={"enabled": False},
+        json={"cache_enabled": False},
     )
     assert r.status_code == 200, r.text
 

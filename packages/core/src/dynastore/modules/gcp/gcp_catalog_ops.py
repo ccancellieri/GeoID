@@ -104,7 +104,7 @@ class GcpCatalogOpsMixin:
                 bucket_config = await config_mgr.get_config(GcpCatalogBucketConfig, catalog_id=catalog_id, ctx=DriverContext(db_resource=conn))
 
             # 2. Check if provisioning is enabled for this catalog
-            if not bucket_config.enabled:
+            if not bucket_config.provision_enabled:
                 logger.info(
                     f"GCP Module: Provisioning disabled for catalog '{catalog_id}' via configuration. Linking bucket name and marking ready."
                 )

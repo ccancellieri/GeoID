@@ -57,7 +57,7 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
     )
 
 
-class TilesCachingConfig(ExposableConfigMixin, PluginConfig):
+class TilesCachingConfig(PluginConfig):
     """Operator-tunable knobs for the bucket-backed tile cache.
 
     Bucket selection is intentionally NOT exposed here — buckets are
@@ -72,8 +72,8 @@ class TilesCachingConfig(ExposableConfigMixin, PluginConfig):
     Changing ``key_prefix`` orphans existing cached tiles (they remain
     under the old prefix until the bucket TTL evicts them).
 
-    ``enabled`` (inherited from ``ExposableConfigMixin``, default ``True``)
-    gates the *bucket-backed L2 cache only*.  When ``False``:
+    ``cache_enabled`` (default ``True``) gates the *bucket-backed L2
+    cache only*.  When ``False``:
 
     - ``get_tile`` / ``get_tile_url`` / ``check_tile_exists`` return as a
       miss without touching the bucket (every request falls through to
@@ -84,9 +84,18 @@ class TilesCachingConfig(ExposableConfigMixin, PluginConfig):
       the cache so operators can drop stale blobs).
 
     Disabling the L2 cache does NOT disable tile generation — for that
-    use ``TilesConfig.enabled`` (master switch on the tiles extension).
+    use ``TilesConfig.enabled`` (the canonical ``ExposableConfigMixin``
+    user in the tiles cluster; master switch on the tiles extension).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "tiles")
+
+    cache_enabled: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "Bucket-backed L2 cache toggle. NOT an extension exposure "
+            "toggle — see ``TilesConfig.enabled`` for that."
+        ),
+    )
 
     key_prefix: Mutable[str] = Field(
         default="tiles/collections",
@@ -113,14 +122,22 @@ class TilesCachingConfig(ExposableConfigMixin, PluginConfig):
     )
 
 
-class TilesPreseedConfig(ExposableConfigMixin, PluginConfig):
+class TilesPreseedConfig(PluginConfig):
     """
     Configuration for the Tiles Pre-seeding Process.
     This configures the background task that generates and stores tiles.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "tiles")
-    # ``enabled: bool`` provided by ExposableConfigMixin (Cycle F.0b — uniform).
-    
+
+    preseed_enabled: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "When False, the tile pre-seed task short-circuits and skips "
+            "generating/storing tiles. Per-task knob, NOT an extension "
+            "exposure toggle (see ``TilesConfig.enabled``)."
+        ),
+    )
+
     # What to seed
     target_tms_ids: Mutable[List[str]] = Field(
         default=["WebMercatorQuad"], 

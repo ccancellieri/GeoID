@@ -137,7 +137,7 @@ class GcpCorsRule(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-class GcpCatalogBucketConfig(ExposableConfigMixin, PluginConfig):
+class GcpCatalogBucketConfig(PluginConfig):
     """
     Defines bucket-level configurations for a catalog. These settings are applied
     when the bucket is first created.
@@ -151,12 +151,19 @@ class GcpCatalogBucketConfig(ExposableConfigMixin, PluginConfig):
     # Immutable fields: Once the bucket is created, these cannot be changed.
     location: Immutable[Optional[GcpLocation]] = Field(default=os.getenv("REGION", GcpLocation.EUROPE_WEST1), description="The GCP region where the bucket will be created (e.g., 'europe-west1'). If not set, defaults to the application's region.")  # type: ignore[assignment]
     storage_class: Immutable[GcsStorageClass] = Field(default=GcsStorageClass.STANDARD, description="The default storage class for objects in the bucket.")
-    
+
     # Mutable fields
-    # enabled is inherited from ExposableConfigMixin (default=True).
-    # When False, GCPModule.provision_storage_for_catalog skips bucket
-    # creation and the catalog is marked ready immediately — useful when
-    # a catalog reuses an externally-managed bucket.
+    provision_enabled: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "When False, ``GCPModule._on_sync_init_catalog`` skips bucket "
+            "creation and marks the catalog ready immediately — useful when "
+            "a catalog reuses an externally-managed bucket. This is a "
+            "per-catalog provisioning gate, NOT an extension exposure toggle "
+            "(the GCP module is always-on at the protocol layer; the canonical "
+            "toggle lives on ``GcpModuleConfig.enabled``)."
+        ),
+    )
     cdn_enabled: Mutable[bool] = Field(default=False, description="Whether Cloud CDN is enabled for this bucket.")
     lifecycle_rules: Mutable[List[LifecycleRule]] = Field(default_factory=list, description="Lifecycle rules for the bucket.")
     listen_catalog_events: Mutable[bool] = Field(default=True, description="If true, the bucket and pub/sub resources are synchronized with catalog/collection deletions.")
@@ -219,7 +226,7 @@ class TriggeredAction(BaseModel):
     execute_request_template: Dict[str, Any] = Field(..., description="A template for the 'inputs' of the OGC Process Execute request. Supports placeholder interpolation (e.g., {bucket}, {name}).")
 
 
-class GcpCollectionBucketConfig(ExposableConfigMixin, PluginConfig):
+class GcpCollectionBucketConfig(PluginConfig):
     """
     Defines object-level configurations for a specific collection within a bucket.
     These settings can override catalog-level defaults for objects belonging to this collection.
@@ -271,7 +278,7 @@ class ManagedBucketEventing(BaseModel):
         return self.blob_name_prefixes[0] if self.blob_name_prefixes else None
 
 
-class GcpEventingConfig(ExposableConfigMixin, PluginConfig):
+class GcpEventingConfig(PluginConfig):
     """
     Defines the complete, mutable eventing configuration for a catalog. This is
     stored independently from the bucket configuration.
