@@ -127,7 +127,10 @@ _ALL_OGC_STANDARDS = [
     "OGC API Routes",
     "OGC API Joins",
     "OGC API 3D GeoVolumes",
-    "SensorThings API",
+    # SensorThings API is a deliberate non-goal — superseded by OGC API
+    # Connected Systems for the IoT / observation domain (see
+    # docs/roadmap.md). Kept out of the roadmap pills so the home-page
+    # surface only advertises standards we may still implement.
     "STAC API",
 ]
 

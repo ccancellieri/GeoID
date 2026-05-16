@@ -37,8 +37,9 @@ Maps-service standards (port 8083 in dev compose):
 
 - Tiles · Maps · Styles
 
-The roadmap surface (EDR, Routes, Joins, 3D GeoVolumes, SensorThings) is
-listed in [Roadmap](roadmap.md).
+The roadmap surface (EDR, Routes, Joins, 3D GeoVolumes) is listed in
+[Roadmap](roadmap.md), alongside the SensorThings non-goal entry
+(superseded by OGC API – Connected Systems).
 
 ## Development
 

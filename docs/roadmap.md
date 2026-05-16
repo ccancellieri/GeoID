@@ -26,8 +26,9 @@ Connected Systems, Moving Features, Coverages, DGGS, Records) live in
   Not committed to a specific milestone.
 - **OGC API – Routes / Joins / 3D GeoVolumes** — exploratory; no immediate
   plans to implement.
-- **SensorThings API** — exploratory; the Connected Systems implementation
-  covers the most common observation use-cases today.
+- **SensorThings API** — **not planned**. OGC API – Connected Systems is the
+  successor standard for the IoT / observation domain and is already shipped,
+  so SensorThings is a deliberate non-goal rather than pending work.
 
 ## Research
 
