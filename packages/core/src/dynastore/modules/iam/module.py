@@ -20,7 +20,7 @@
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 # Top-level tenacity import — load-bearing for SCOPE gating.
 # `tools/discovery.py:159 discover_and_load_plugins` skips entry-points whose
@@ -79,7 +79,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
     async def lifespan(self, app_state: object) -> AsyncGenerator[None, None]:
         from .postgres_iam_storage import PostgresIamStorage
         from .postgres_policy_storage import PostgresPolicyStorage
-        from contextlib import AsyncExitStack
         from dynastore.modules.db_config.query_executor import managed_transaction
         from dynastore.models.protocols import DatabaseProtocol
 
