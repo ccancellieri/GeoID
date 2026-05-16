@@ -21,6 +21,7 @@ import os
 import datetime
 from dateutil.relativedelta import relativedelta
 from typing import Literal
+from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
     DQLQuery,
@@ -58,8 +59,28 @@ async def ensure_db_extension(conn: DbResource, extension_name: str):
 async def ensure_schema_exists(conn: DbResource, schema_name: str):
     """
     Ensures a database schema exists using centralized DDL coordination.
+
+    Defensive against a known cold-start race (un-fao/GeoID#821): on
+    multi-worker startup, ``DDLExecutor``'s advisory-lock coordination can
+    miss a peer's ``CREATE SCHEMA`` commit on the post-wait re-check
+    (suspected MVCC snapshot age inside the inner transaction). The loser
+    then issues ``CREATE SCHEMA`` and trips ``pg_namespace_nspname_index``.
+    Catching that specific UniqueViolation is safe — the schema already
+    exists, which is the function's post-condition.
     """
-    await DDLQuery(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"').execute(conn)
+    try:
+        await DDLQuery(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"').execute(conn)
+    except UniqueViolationError as e:
+        original = getattr(e, "original_exception", None)
+        constraint = getattr(original, "constraint_name", None)
+        if constraint != "pg_namespace_nspname_index":
+            raise
+        logger.warning(
+            "ensure_schema_exists: peer worker created schema '%s' after our "
+            "DDLExecutor re-check (cold-start advisory-lock race, "
+            "un-fao/GeoID#821); treating as success.",
+            schema_name,
+        )
     logger.info(f"Schema '{schema_name}' verified/ready.")
 
 
