@@ -412,6 +412,33 @@ DELETE_PRINCIPAL = DQLQuery(
 
 # --- Role & Hierarchy Queries ---
 
+# ON CONFLICT semantics are ADDITIVE on ``policies`` and ``parent_roles``
+# (closes geoid#902). The cold-boot path seeds the catalog-tier
+# ``unauthenticated`` role via this query with ``policies=["public_access"]``,
+# then the contributor lifespan loop (web, stac, records, maps, edr, …)
+# re-issues ``register_role(Role(name="unauthenticated", policies=[…])``
+# which buffers an in-memory union and ultimately calls ``update_role``
+# (REPLACE — operator intent). The merge logic in
+# ``IamModule.flush_pending_registrations`` reads-modifies-writes against
+# the DB so the buffered union is unioned with the seed before the
+# REPLACE — under nominal ordering that preserves ``public_access``.
+#
+# But ``create_role`` is reachable from multiple racing paths during cold
+# boot (per-service ``PolicyService.provision_default_policies`` for both
+# ``catalog_id=None`` and ``catalog_id="_system_"``, plus
+# ``IamModule.flush_pending_registrations`` itself when the role is absent
+# at read-time). If two of those paths race past the ``get_role`` check
+# concurrently, the second INSERT used to hit ON CONFLICT and replace
+# ``policies`` with EXCLUDED — silently dropping bindings the first path
+# already wrote. The replace-on-conflict semantics surfaced as the
+# ``/health`` 403 in geoid#902 (the seed-declared ``public_access`` was
+# the binding being clobbered).
+#
+# Fix: on conflict, ``policies`` and ``parent_roles`` are recomputed as
+# the UNION of the existing JSONB array and EXCLUDED's. Operator REPLACE
+# remains available via UPDATE_ROLE (used by ``PATCH /admin/roles`` and
+# the merge branch of ``flush_pending_registrations``); the additive
+# semantics only kick in when two callers ``create_role`` the same name.
 INSERT_ROLE = DQLQuery(
     """
     INSERT INTO {schema}.roles (id, name, description, level, metadata, parent_roles, policies)
@@ -421,8 +448,20 @@ INSERT_ROLE = DQLQuery(
         description = EXCLUDED.description,
         level = EXCLUDED.level,
         metadata = EXCLUDED.metadata,
-        parent_roles = EXCLUDED.parent_roles,
-        policies = EXCLUDED.policies
+        parent_roles = (
+            SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+            FROM jsonb_array_elements_text(
+                COALESCE(roles.parent_roles, '[]'::jsonb)
+                || COALESCE(EXCLUDED.parent_roles, '[]'::jsonb)
+            ) AS arr(value)
+        ),
+        policies = (
+            SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+            FROM jsonb_array_elements_text(
+                COALESCE(roles.policies, '[]'::jsonb)
+                || COALESCE(EXCLUDED.policies, '[]'::jsonb)
+            ) AS arr(value)
+        )
     RETURNING *;
     """,
     result_handler=ResultHandler.ONE_DICT,
