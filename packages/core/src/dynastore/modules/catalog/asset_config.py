@@ -25,7 +25,7 @@ operations) is handled by ``AssetRoutingConfig`` in
 ``dynastore.modules.storage.routing_config``.
 """
 
-from dynastore.modules.db_config.platform_config_service import PluginConfig
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from typing import ClassVar, Optional, Tuple
 
 class AssetPluginConfig(PluginConfig):

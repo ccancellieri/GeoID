@@ -36,7 +36,7 @@ from dynastore.extensions.tools.exposure_mixin import (
     ALWAYS_ON_EXTENSIONS,
     find_dead_exposable_configs,
 )
-from dynastore.modules.db_config.platform_config_service import list_registered_configs
+from dynastore.modules.db_config.plugin_config import list_registered_configs
 
 
 TOGGLABLE = KNOWN_EXTENSION_IDS - ALWAYS_ON_EXTENSIONS

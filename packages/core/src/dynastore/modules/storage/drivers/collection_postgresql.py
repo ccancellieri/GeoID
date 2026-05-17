@@ -80,7 +80,7 @@ from dynastore.models.protocols.typed_driver import (
     TypedDriver,
     _PluginDriverConfig,
 )
-from dynastore.modules.db_config.platform_config_service import Immutable
+from dynastore.models.mutability import Immutable
 from dynastore.modules.storage.routing_config import Operation
 from dynastore.tools.cache import cached
 

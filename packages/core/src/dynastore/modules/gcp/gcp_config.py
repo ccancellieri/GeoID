@@ -20,7 +20,8 @@ from pathlib import PurePosixPath
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Annotated, Any, Callable, ClassVar, Dict, List, Literal, Optional, TYPE_CHECKING, Tuple, Union
 from datetime import date
-from dynastore.modules.db_config.platform_config_service import Immutable, Mutable, PluginConfig
+from dynastore.models.mutability import Immutable, Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 import os
 if TYPE_CHECKING:

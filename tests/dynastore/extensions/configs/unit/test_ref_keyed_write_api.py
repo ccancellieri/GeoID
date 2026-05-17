@@ -64,9 +64,7 @@ def test_delete_config_by_ref_returns_bool():
 
 
 def test_platform_service_implements_set_and_delete_by_ref():
-    from dynastore.modules.db_config.platform_config_service import (
-        PlatformConfigService,
-    )
+    from dynastore.modules.db_config.platform_config_service import PlatformConfigService
 
     assert callable(getattr(PlatformConfigService, "set_config_by_ref", None))
     assert callable(getattr(PlatformConfigService, "delete_config_by_ref", None))

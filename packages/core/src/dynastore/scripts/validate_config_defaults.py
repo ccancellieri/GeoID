@@ -35,10 +35,7 @@ def _discover_plugin_configs() -> None:
 
 def _validate_file(path: Path) -> List[str]:
     """Return a list of human-readable problems for one file (empty = clean)."""
-    from dynastore.modules.db_config.platform_config_service import (
-        list_registered_configs,
-        resolve_config_class,
-    )
+    from dynastore.modules.db_config.plugin_config import list_registered_configs, resolve_config_class
 
     errs: List[str] = []
     try:

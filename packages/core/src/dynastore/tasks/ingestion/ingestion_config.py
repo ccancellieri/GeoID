@@ -18,7 +18,8 @@
 
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Type
 from pydantic import BaseModel, Field, model_validator
-from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
+from dynastore.models.mutability import Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.modules.storage.driver_config import WriteConflictPolicy
 
 # --- Main Ingestion Config ---

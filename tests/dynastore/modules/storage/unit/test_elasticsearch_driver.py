@@ -212,9 +212,7 @@ class TestItemsElasticsearchPrivateDriverMeta:
         """The wire identity is exposed in ``list_registered_configs()`` so
         the ``/configs/registry`` and tree-view endpoints surface the driver.
         """
-        from dynastore.modules.db_config.platform_config_service import (
-            list_registered_configs,
-        )
+        from dynastore.modules.db_config.plugin_config import list_registered_configs
         from dynastore.modules.storage.driver_config import (
             ItemsElasticsearchPrivateDriverConfig,
         )

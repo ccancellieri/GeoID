@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Dict, Generic, List, Optional, Protocol, Type,
 if TYPE_CHECKING:
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
     from dynastore.models.protocols.asset_driver import AssetStore
-    from dynastore.modules.db_config.platform_config_service import PluginConfig
+    from dynastore.modules.db_config.plugin_config import PluginConfig
     AnyDriver = Union["CollectionItemsStore", "AssetStore"]
 
 _D = TypeVar("_D")

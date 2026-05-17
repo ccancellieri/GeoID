@@ -33,7 +33,7 @@ from dynastore.modules.storage.drivers.pg_sidecars import _effective_sidecars
 
 
 def test_collection_type_is_a_plugin_config():
-    from dynastore.modules.db_config.platform_config_service import PluginConfig
+    from dynastore.modules.db_config.plugin_config import PluginConfig
 
     assert issubclass(CollectionInfo, PluginConfig)
 
@@ -61,9 +61,7 @@ def test_collection_type_in_registry():
     """The hoisted class must appear in ``list_registered_configs`` so
     the ``/configs/registry`` endpoint surfaces it.
     """
-    from dynastore.modules.db_config.platform_config_service import (
-        list_registered_configs,
-    )
+    from dynastore.modules.db_config.plugin_config import list_registered_configs
 
     configs = list_registered_configs()
     assert "collection_info" in configs

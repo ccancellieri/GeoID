@@ -25,7 +25,7 @@ from typing import ClassVar, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from dynastore.modules.db_config.platform_config_service import Mutable
+from dynastore.models.mutability import Mutable
 from dynastore.modules.storage.driver_config import CollectionDriverConfig
 from dynastore.tools.secrets import Secret
 

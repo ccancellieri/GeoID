@@ -217,9 +217,8 @@ def test_compose_tree_meta_mutability_map_rendered_on_leaf():
     """
     from typing import ClassVar, Optional, Tuple
     from pydantic import Field
-    from dynastore.modules.db_config.platform_config_service import (
-        Mutable, WriteOnce, Immutable, PluginConfig,
-    )
+    from dynastore.models.mutability import Immutable, Mutable, WriteOnce
+    from dynastore.modules.db_config.plugin_config import PluginConfig
 
     class _MutabilityFixture(PluginConfig):
         _address: ClassVar[Tuple[str, ...]] = ("platform", "_fixture")
@@ -258,9 +257,8 @@ def test_compose_tree_meta_schema_carries_x_mutability_on_properties():
     """
     from typing import ClassVar, Optional, Tuple
     from pydantic import Field
-    from dynastore.modules.db_config.platform_config_service import (
-        Mutable, WriteOnce, Immutable, PluginConfig,
-    )
+    from dynastore.models.mutability import Immutable, Mutable, WriteOnce
+    from dynastore.modules.db_config.plugin_config import PluginConfig
 
     class _SchemaMutabilityFixture(PluginConfig):
         _address: ClassVar[Tuple[str, ...]] = ("platform", "_schema_fixture")
@@ -290,9 +288,8 @@ def test_write_once_setter_guard_rejects_post_construction_assignment():
     from typing import ClassVar, Optional, Tuple
     import pytest
     from pydantic import Field
-    from dynastore.modules.db_config.platform_config_service import (
-        Mutable, WriteOnce, PluginConfig,
-    )
+    from dynastore.models.mutability import Mutable, WriteOnce
+    from dynastore.modules.db_config.plugin_config import PluginConfig
 
     class _WriteOnceFixture(PluginConfig):
         _address: ClassVar[Tuple[str, ...]] = ("platform", "_writeonce_fixture")
@@ -330,9 +327,8 @@ def test_write_once_setter_guard_absent_when_no_write_once_fields():
     """
     from typing import ClassVar, Tuple
     from pydantic import Field
-    from dynastore.modules.db_config.platform_config_service import (
-        Mutable, PluginConfig,
-    )
+    from dynastore.models.mutability import Mutable
+    from dynastore.modules.db_config.plugin_config import PluginConfig
 
     class _AllMutableFixture(PluginConfig):
         _address: ClassVar[Tuple[str, ...]] = ("platform", "_all_mutable_fixture")

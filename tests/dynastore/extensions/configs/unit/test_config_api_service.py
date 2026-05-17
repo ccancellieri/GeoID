@@ -22,9 +22,7 @@ from dynastore.extensions.configs.config_api_service import ConfigApiService
 
 def _default_config_side_effect(config_cls, catalog_id=None, collection_id=None, **_):
     if isinstance(config_cls, str):
-        from dynastore.modules.db_config.platform_config_service import (
-            resolve_config_class,
-        )
+        from dynastore.modules.db_config.plugin_config import resolve_config_class
         config_cls = resolve_config_class(config_cls)
     return config_cls() if config_cls else None
 
@@ -119,9 +117,7 @@ async def test_get_effective_configs_catalog_source(mock_config_service):
 
     async def get_side_effect(config_cls, catalog_id=None, collection_id=None, **_):
         if isinstance(config_cls, str):
-            from dynastore.modules.db_config.platform_config_service import (
-                resolve_config_class,
-            )
+            from dynastore.modules.db_config.plugin_config import resolve_config_class
             config_cls = resolve_config_class(config_cls)
         if config_cls is ItemsRoutingConfig and catalog_id and not collection_id:
             return ItemsRoutingConfig()
@@ -1503,7 +1499,7 @@ def test_concrete_subclass_without_address_raises():
     """``PluginConfig.__init_subclass__`` enforces ``_address`` on concrete subclasses."""
     from typing import ClassVar
 
-    from dynastore.modules.db_config.platform_config_service import PluginConfig
+    from dynastore.modules.db_config.plugin_config import PluginConfig
 
     with pytest.raises(TypeError, match=r"does not declare ``_address``"):
         class _BadConcreteConfig(PluginConfig):  # noqa: F841 — deliberate
@@ -1513,7 +1509,7 @@ def test_concrete_subclass_without_address_raises():
 def test_concrete_subclass_with_address_ok():
     from typing import ClassVar, Optional, Tuple
 
-    from dynastore.modules.db_config.platform_config_service import PluginConfig
+    from dynastore.modules.db_config.plugin_config import PluginConfig
 
     class _GoodConcreteConfig(PluginConfig):
         _address: ClassVar[Tuple[str, str, Optional[str]]] = ("platform", "misc", None)
@@ -1525,7 +1521,7 @@ def test_abstract_subclass_without_address_ok():
     """Abstract bases (``is_abstract_base = True``) opt out of the check."""
     from typing import ClassVar
 
-    from dynastore.modules.db_config.platform_config_service import PluginConfig
+    from dynastore.modules.db_config.plugin_config import PluginConfig
 
     class _AbstractIntermediate(PluginConfig):
         is_abstract_base: ClassVar[bool] = True

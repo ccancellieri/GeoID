@@ -21,7 +21,8 @@
 from enum import Enum
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
+from dynastore.models.mutability import Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 from dynastore.models.localization import LocalizedText, Language
 

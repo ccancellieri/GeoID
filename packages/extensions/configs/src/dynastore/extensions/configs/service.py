@@ -39,11 +39,7 @@ import dynastore.modules.catalog.catalog_module as catalog_manager
 from dynastore.modules import get_protocol
 from dynastore.models.protocols import WebModuleProtocol, ConfigsProtocol
 from dynastore.modules.db_config.engine_config import EngineConfig
-from dynastore.modules.db_config.platform_config_service import (
-    require_config_class,
-    resolve_config_class,
-    list_registered_configs,
-)
+from dynastore.modules.db_config.plugin_config import list_registered_configs, require_config_class, resolve_config_class
 from dynastore.modules.db_config.exceptions import (
     ImmutableConfigError,
     PluginNotRegisteredError,

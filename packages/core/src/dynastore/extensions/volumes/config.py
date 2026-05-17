@@ -12,7 +12,8 @@ from pydantic import Field
 
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 # Match the base-class import used by CoveragesConfig.
-from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
+from dynastore.models.mutability import Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 
 
 class VolumesConfig(ExposableConfigMixin, PluginConfig):

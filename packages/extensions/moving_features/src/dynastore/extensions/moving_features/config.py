@@ -13,7 +13,7 @@
 #    limitations under the License.
 
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
-from dynastore.modules.db_config.platform_config_service import PluginConfig
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from typing import ClassVar, Optional, Tuple
 
 

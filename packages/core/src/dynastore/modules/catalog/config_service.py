@@ -71,14 +71,12 @@ from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.json import CustomJSONEncoder
 
 # Class-as-identity config API.
+from dynastore.modules.db_config.plugin_config import PluginConfig, require_config_class, resolve_config_class
 from dynastore.modules.db_config.platform_config_service import (
-    PluginConfig,
+    _register_schema,
     enforce_config_immutability,
-    require_config_class,
-    resolve_config_class,
     run_apply_handlers,
     run_validate_handlers,
-    _register_schema,
 )
 from dynastore.modules.db_config.locking_tools import check_table_exists
 from dynastore.modules.db_config.typed_store.ddl import (

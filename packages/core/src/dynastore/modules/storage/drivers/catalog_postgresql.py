@@ -67,7 +67,7 @@ from dynastore.models.protocols.typed_driver import (
     TypedDriver,
     _PluginDriverConfig,
 )
-from dynastore.modules.db_config.platform_config_service import Immutable
+from dynastore.models.mutability import Immutable
 from dynastore.tools.cache import cached
 
 logger = logging.getLogger(__name__)

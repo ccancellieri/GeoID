@@ -1,6 +1,6 @@
 # dynastore/modules/tasks/tasks_config.py
 import os
-from typing import ClassVar, Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Tuple
 from pydantic import Field, model_validator
 from dynastore.models.mutability import Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig

@@ -14,7 +14,8 @@
 
 from typing import ClassVar, List, Optional, Tuple
 from pydantic import Field
-from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
+from dynastore.models.mutability import Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 
 class WFSPluginConfig(ExposableConfigMixin, PluginConfig):

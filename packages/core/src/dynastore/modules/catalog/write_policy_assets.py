@@ -35,7 +35,8 @@ from typing import ClassVar, List, Optional, Tuple
 
 from pydantic import Field, model_validator
 
-from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
+from dynastore.models.mutability import Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 
 
 class AssetWriteConflictPolicy(StrEnum):

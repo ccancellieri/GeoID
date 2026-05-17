@@ -22,11 +22,8 @@ from pydantic import (
     Field,
     model_validator,
 )
-from dynastore.modules.db_config.platform_config_service import (
-    Mutable,
-    Immutable,
-    PluginConfig,
-)
+from dynastore.models.mutability import Immutable, Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from typing import Any, ClassVar, List, Optional, Tuple
 
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig

@@ -279,7 +279,8 @@ WEB_CONFORMANCE_URIS = [
 from pydantic import Field
 from dynastore.models.protocols.web import WebModuleProtocol, WebPageProtocol, StaticFilesProtocol
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
-from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
+from dynastore.models.mutability import Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.routing import Match, Router

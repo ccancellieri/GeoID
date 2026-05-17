@@ -15,7 +15,7 @@ from typing import Optional, Type
 
 import pytest
 
-from dynastore.modules.db_config.platform_config_service import PluginConfig
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.modules.elasticsearch import client as es_client_mod
 from dynastore.modules.elasticsearch.client_config import (
     ElasticsearchClientConfig,

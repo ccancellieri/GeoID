@@ -48,9 +48,7 @@ from dynastore.modules.db_config.engine_config import EngineConfig
 from dynastore.modules.db_config.engine_registry import list_registered_engines
 
 if TYPE_CHECKING:
-    from dynastore.modules.db_config.platform_config_service import (
-        PlatformConfigService,
-    )
+    from dynastore.modules.db_config.platform_config_service import PlatformConfigService
 
 logger = logging.getLogger(__name__)
 

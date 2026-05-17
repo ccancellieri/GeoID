@@ -55,12 +55,13 @@ from dataclasses import dataclass, field as dc_field
 from dynastore.tools.cache import cached
 
 from dynastore.modules.db_config.query_executor import (
-    DQLQuery,
     DDLQuery,
-    ResultHandler,
     managed_transaction,
     DbResource,
 )
+from dynastore.modules.db_config.typed_store.ddl import PLATFORM_SCHEMAS_DDL
+from dynastore.modules.db_config.typed_store import config_queries as _cq
+from dynastore.tools.plugin import ProtocolPlugin
 from .maintenance_tools import ensure_schema_exists
 from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
 from dynastore.models.driver_context import DriverContext
@@ -72,35 +73,10 @@ from dynastore.modules.db_config.exceptions import (
 )
 from dynastore.tools.json import CustomJSONEncoder
 
-# --- Mutability framework + PluginConfig base (re-exported) ---
-#
-# The marker types and the ``PluginConfig`` base were extracted into
-# dependency-light leaf modules — ``dynastore.models.mutability`` and
-# ``dynastore.modules.db_config.plugin_config`` — so that a
-# Protocol-contracts file can subclass ``PluginConfig`` (e.g.
-# ``IamRolesConfig`` in ``models/protocols/authorization.py``) without
-# dragging this DB-facing service, and the ``models.protocols`` eager
-# hub it imports, into a load-order import cycle (#686).  They are
-# re-exported here so the existing call sites that import them from
-# ``platform_config_service`` keep working unchanged.
-from dynastore.models.mutability import (  # noqa: F401
-    Computed,
-    ComputedMarker,
-    Immutable,
-    ImmutableMarker,
-    Mutable,
-    MutableMarker,
-    WriteOnce,
-    WriteOnceMarker,
-    is_immutable_field,
-    is_write_once_field,
-)
-from dynastore.modules.db_config.plugin_config import (  # noqa: F401
-    _APPLY_HANDLERS,
-    _VALIDATE_HANDLERS,
+from dynastore.models.mutability import is_immutable_field, is_write_once_field
+from dynastore.modules.db_config.plugin_config import (
     PluginConfig,
     _collect_required_fields,
-    list_registered_configs,
     require_config_class,
     resolve_config_class,
 )
@@ -460,9 +436,6 @@ async def _platform_table_exists(conn: DbResource) -> bool:
 
 # --- Schema (Platform Level Only) ---
 
-from dynastore.modules.db_config.typed_store.ddl import PLATFORM_SCHEMAS_DDL
-from dynastore.modules.db_config.typed_store import config_queries as _cq
-
 # Aliases kept for call-site readability within this module.
 get_platform_config_query = _cq.get_platform_config
 upsert_platform_config_query = _cq.upsert_platform_config
@@ -504,9 +477,6 @@ def _post_commit_router_bust(cls: Type["PluginConfig"]) -> None:
         invalidate_router_cache(None, None)
     except Exception:
         pass
-
-
-from dynastore.tools.plugin import ProtocolPlugin
 
 
 class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):

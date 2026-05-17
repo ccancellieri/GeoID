@@ -28,9 +28,7 @@ from dynastore.modules.db_config.engine_config import (
     IcebergEngineConfig,
     PostgresqlEngineConfig,
 )
-from dynastore.modules.db_config.platform_config_service import (
-    list_registered_configs,
-)
+from dynastore.modules.db_config.plugin_config import list_registered_configs
 from dynastore.tools.secrets import Secret
 
 

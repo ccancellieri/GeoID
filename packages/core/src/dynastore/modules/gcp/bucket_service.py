@@ -619,9 +619,7 @@ class BucketService:
                 # Prefer the lifecycle snapshot — DO NOT query the DB here
                 # because the catalog row may not be visible yet.
                 if GcpCatalogBucketConfig.class_key() in context.config:
-                    from dynastore.modules.db_config.platform_config_service import (
-                        require_config_class,
-                    )
+                    from dynastore.modules.db_config.plugin_config import require_config_class
 
                     effective_config = require_config_class(
                         GcpCatalogBucketConfig.class_key()

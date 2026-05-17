@@ -45,10 +45,8 @@ from dynastore.models.protocols.typed_driver import (
     TypedDriver,
     _PluginDriverConfig,
 )
-from dynastore.modules.db_config.platform_config_service import (
-    Immutable,
-    PluginConfig,
-)
+from dynastore.models.mutability import Immutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 from pydantic import Field
 
 logger = logging.getLogger(__name__)

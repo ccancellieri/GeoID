@@ -29,9 +29,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from dynastore.modules.db_config.platform_config_service import (
-    PlatformConfigService,
-)
+from dynastore.modules.db_config.platform_config_service import PlatformConfigService
 from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.db_config.typed_store import config_queries as _cq
 from dynastore.modules.tiles.tiles_config import TilesConfig

@@ -50,12 +50,8 @@ from dynastore.tools.secrets import Secret
 from dynastore.tools.ui_hints import ui
 
 from dynastore.models.protocols.typed_driver import _PluginDriverConfig
-from dynastore.modules.db_config.platform_config_service import (
-    Immutable,
-    Mutable,
-    PluginConfig,
-    WriteOnce,
-)
+from dynastore.models.mutability import Immutable, Mutable, WriteOnce
+from dynastore.modules.db_config.plugin_config import PluginConfig
 
 # Sidecar machinery is PG-specific — the field type alias and its
 # registry-based coercion live in ``pg_sidecars/base.py`` so that other

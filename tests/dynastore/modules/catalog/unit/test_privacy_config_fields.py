@@ -23,10 +23,7 @@ from dynastore.modules.catalog.catalog_config import (
     CollectionPrivacy,
     CollectionPrivacyDefaults,
 )
-from dynastore.modules.db_config.platform_config_service import (
-    ImmutableConfigError,
-    enforce_config_immutability,
-)
+from dynastore.modules.db_config.platform_config_service import ImmutableConfigError, enforce_config_immutability
 
 # Patch target: the module-level ``is_materialized`` consumed by
 # ``enforce_config_immutability``.  Tests assert the *gated* enforcement —

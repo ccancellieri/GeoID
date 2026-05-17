@@ -41,10 +41,7 @@ from typing import Any, Dict, List, Optional
 
 from dynastore.modules.db_config.instance import DEFAULTS_DIR
 from dynastore.modules.db_config.locking_tools import acquire_startup_lock
-from dynastore.modules.db_config.platform_config_service import (
-    PluginConfig,
-    resolve_config_class,
-)
+from dynastore.modules.db_config.plugin_config import PluginConfig, resolve_config_class
 from dynastore.modules.db_config.query_executor import DbResource
 
 logger = logging.getLogger(__name__)

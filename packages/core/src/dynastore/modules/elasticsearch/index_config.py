@@ -20,7 +20,8 @@ from typing import Any, ClassVar, Dict, Tuple
 
 from pydantic import Field
 
-from dynastore.modules.db_config.platform_config_service import Mutable, PluginConfig
+from dynastore.models.mutability import Mutable
+from dynastore.modules.db_config.plugin_config import PluginConfig
 
 logger = logging.getLogger(__name__)
 

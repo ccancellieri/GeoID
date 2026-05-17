@@ -96,9 +96,7 @@ async def ensure_init_db(resource: DbResource):
     # --- Initialize Platform Config Storage ---
     # This ensures 'configs' schema and 'platform_configs' table exist.
     # Must be done early to support hierarchical configurations.
-    from dynastore.modules.db_config.platform_config_service import (
-        PlatformConfigService,
-    )
+    from dynastore.modules.db_config.platform_config_service import PlatformConfigService
 
     await PlatformConfigService.initialize_storage(resource)
 
