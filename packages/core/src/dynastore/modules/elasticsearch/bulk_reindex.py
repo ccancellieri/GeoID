@@ -127,7 +127,12 @@ async def reindex_collection_into_index(
     # via the public API even after a successful bulk reindex. Best-effort
     # and idempotent (helper handles repeats).
     from dynastore.modules.elasticsearch.aliases import add_index_to_public_alias
+    from dynastore.modules.elasticsearch.items_projection import (
+        project_item_for_es,
+        resolve_catalog_known_fields,
+    )
     await add_index_to_public_alias(index_name)
+    known_fields = await resolve_catalog_known_fields(catalog_id)
 
     total = 0
     offset = 0
@@ -157,6 +162,7 @@ async def reindex_collection_into_index(
                 doc = json.loads(json.dumps(dict(feature), default=_json_default))
             doc["catalog_id"] = catalog_id
             doc["collection"] = collection_id
+            doc = project_item_for_es(doc, known_fields)
 
             doc_id = f"{catalog_id}:{collection_id}:{item_id}"
             bulk_body.append(

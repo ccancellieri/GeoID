@@ -774,10 +774,18 @@ def _default_partitioning() -> Any:
 class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
     """Elasticsearch collection driver config.
 
-    Items land in the per-tenant index ``{index_prefix}-items-{catalog_id}``
-    (default prefix ``items_``) keyed by ``_routing=collection_id`` so a
-    single index hosts every collection of one catalog with shard locality
-    per collection.
+    Items land in the per-tenant index ``{prefix}-{catalog_id}-items``
+    (the prefix comes from the platform-wide
+    ``modules.elasticsearch.client.get_index_prefix`` — set once at boot
+    from ``ES_INDEX_PREFIX``, not per-catalog) keyed by
+    ``_routing=collection_id`` so a single index hosts every collection
+    of one catalog with shard locality per collection.
+
+    Per-catalog operator knob — :attr:`mapping` is the Tier-2 overlay on
+    top of the platform Tier-1 known-fields map (see
+    :mod:`dynastore.modules.elasticsearch.items_projection`). Additive
+    only: collisions with Tier 1 are rejected at config validate time
+    via :func:`validate_tier_2`.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
@@ -788,16 +796,16 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
     model_config = ConfigDict(extra="allow")
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({DriverCapability.ASYNC})
-    index_prefix: Mutable[str] = Field(
-        default="items_",
-        description=(
-            "Item index name prefix (default ``items_``), producing the "
-            "per-tenant index ``items_-items-{catalog_id}``."
-        ),
-    )
-    mapping: Mutable[Dict[str, Any]] = Field(
+    mapping: Mutable[Dict[str, Dict[str, Any]]] = Field(
         default_factory=dict,
-        description="ES index mapping overrides merged with the platform defaults.",
+        description=(
+            "Tier-2 known-fields overlay: ``{stac_field: {ES field-type "
+            "definition}}``. Merged with the platform Tier-1 set at "
+            "index-create time. Additive only — keys cannot collide with "
+            "Tier 1 at a different type (rejected by validate_tier_2). "
+            "Snapshot at index-create; live edits take effect on next "
+            "index rebuild (ES does not allow tightening a live mapping)."
+        ),
     )
 
 
@@ -1012,7 +1020,15 @@ class AssetPostgresqlDriverConfig(AssetDriverConfig):
 
 
 class AssetElasticsearchDriverConfig(AssetDriverConfig):
-    """Elasticsearch asset driver config."""
+    """Elasticsearch asset driver config.
+
+    The asset index name (``{prefix}-{catalog_id}-assets``) is composed
+    from the platform-wide prefix returned by
+    ``modules.elasticsearch.client.get_index_prefix`` (env
+    ``ES_INDEX_PREFIX``, set once at boot). No per-catalog override —
+    the dead ``index_prefix`` field was dropped per #756 Round 6 (it
+    had zero call sites; the actual prefix is module-global).
+    """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "assets", "drivers")
     _visibility: ClassVar[Optional[str]] = "collection"
 
@@ -1022,7 +1038,6 @@ class AssetElasticsearchDriverConfig(AssetDriverConfig):
     model_config = ConfigDict(extra="allow")
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({DriverCapability.ASYNC})
-    index_prefix: Mutable[str] = Field("assets_", description="Asset index name prefix.")
 
 
 # ---------------------------------------------------------------------------
@@ -1273,3 +1288,31 @@ async def _validate_items_schema(
 
 
 ItemsSchema.register_validate_handler(_validate_items_schema)
+
+
+# ---------------------------------------------------------------------------
+# Validate handler — ItemsElasticsearchDriverConfig.mapping Tier-2 overlay
+# ---------------------------------------------------------------------------
+
+
+async def _validate_items_es_driver_config(
+    config: PluginConfig,
+    catalog_id: "Optional[str]",
+    collection_id: "Optional[str]",
+    db_resource: "Optional[Any]",
+) -> None:
+    """Reject Tier-2 collisions before they corrupt the alias contract.
+
+    The platform-wide alias ``{prefix}-items`` only works as a single
+    queryable surface when every member index types the same field name
+    the same way. Tier-2 overlay must therefore be additive only — see
+    :func:`validate_tier_2` for the exact rule.
+    """
+    if not isinstance(config, ItemsElasticsearchDriverConfig):
+        return
+    from dynastore.modules.elasticsearch.items_projection import validate_tier_2
+
+    validate_tier_2(config.mapping)
+
+
+ItemsElasticsearchDriverConfig.register_validate_handler(_validate_items_es_driver_config)
