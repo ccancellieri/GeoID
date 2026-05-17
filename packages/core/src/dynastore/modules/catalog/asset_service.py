@@ -163,7 +163,6 @@ from dynastore.modules.db_config.query_executor import (
     DbConnection,
 )
 from dynastore.tools.json import CustomJSONEncoder
-from dynastore.tools.db import validate_sql_identifier
 from dynastore.modules.catalog.models import AssetReferenceType, CoreAssetReferenceType, EventType
 from dynastore.models.shared_models import Link
 from dynastore.models.protocols.assets import AssetsProtocol
@@ -767,64 +766,34 @@ class AssetService(AssetsProtocol):
         """
         Performs a granular search across assets using a list of filters.
 
-        EQ-only filters are routed through the hint="search" driver (ES when
-        configured).  Filters with other operators fall back to the default
-        driver (PG) which supports full operator coverage via SQL.
+        Only the ``EQ`` operator is supported today. The PG asset driver
+        (``pg_asset_driver.search_assets``) hardcodes ``"<field>" = :val``
+        in its WHERE clause and the ES asset driver consumes the same
+        equality-shaped ``{field: value}`` dict, so any non-EQ filter
+        passed here would silently collapse to EQ on either backend.
+        Raise loudly instead of returning rows that look right but
+        ignored the operator; full operator coverage is tracked
+        separately.
         """
         from dynastore.modules.storage.router import get_asset_driver
 
-        # Build simple field=value dict for EQ-only filters (ES-compatible)
-        eq_query: Dict[str, Any] = {}
-        has_complex_filter = False
-        for f in filters:
-            if f.op == FilterOperator.EQ:
-                eq_query[f.field] = f.value
-            else:
-                has_complex_filter = True
-                break
-
-        if not has_complex_filter:
-            driver = await get_asset_driver("READ", catalog_id, collection_id)
-            docs = await driver.search_assets(
-                catalog_id,
-                collection_id=collection_id,
-                query=eq_query or None,
-                limit=limit,
-                offset=offset,
-                db_resource=db_resource or self.engine,
+        unsupported = sorted({f.op.value for f in filters if f.op != FilterOperator.EQ})
+        if unsupported:
+            raise ValueError(
+                f"asset search supports only the EQ operator today; "
+                f"received unsupported operators: {unsupported}. "
+                f"The PG/ES drivers behind this endpoint do not yet "
+                f"encode non-EQ operators, so accepting them would "
+                f"silently return EQ-shaped results."
             )
-            return [Asset.model_validate(dict(doc)) for doc in docs]
 
-        # Complex filters: fall back to default driver (PG SQL with full operators)
+        eq_query: Dict[str, Any] = {f.field: f.value for f in filters}
+
         driver = await get_asset_driver("READ", catalog_id, collection_id)
-
-        op_map = {
-            FilterOperator.EQ: "=",
-            FilterOperator.NE: "!=",
-            FilterOperator.GT: ">",
-            FilterOperator.GTE: ">=",
-            FilterOperator.LT: "<",
-            FilterOperator.LTE: "<=",
-            FilterOperator.LIKE: "LIKE",
-            FilterOperator.ILIKE: "ILIKE",
-            FilterOperator.IN: "IN",
-        }
-
-        # Build PG-compatible query dict with operator encoding for pg_asset_driver
-        pg_query: Dict[str, Any] = {}
-        for i, f in enumerate(filters):
-            if f.field.startswith("metadata."):
-                pg_query[f.field] = f.value
-            elif f.field == "id":
-                pg_query["asset_id"] = f.value
-            else:
-                validate_sql_identifier(f.field)
-                pg_query[f.field] = f.value
-
         docs = await driver.search_assets(
             catalog_id,
             collection_id=collection_id,
-            query=pg_query,
+            query=eq_query or None,
             limit=limit,
             offset=offset,
             db_resource=db_resource or self.engine,
