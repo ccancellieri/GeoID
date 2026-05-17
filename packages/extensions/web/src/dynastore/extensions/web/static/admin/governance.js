@@ -242,10 +242,13 @@ function renderPolicies() {
   const queryInput = $("#policies-query");
   const q = queryInput ? queryInput.value.trim().toLowerCase() : "";
   const rows = q
-    ? state.policies.filter((p) =>
-        (p.id || "").toLowerCase().includes(q) ||
-        (p.description || "").toLowerCase().includes(q),
-      )
+    ? state.policies.filter((p) => {
+        const id = (p.id || "").toLowerCase();
+        const desc = (p.description || "").toLowerCase();
+        const acts = (p.actions || []).join(" ").toLowerCase();
+        const res = (p.resources || []).join(" ").toLowerCase();
+        return id.includes(q) || desc.includes(q) || acts.includes(q) || res.includes(q);
+      })
     : state.policies;
 
   if (!rows.length) {
@@ -632,8 +635,12 @@ async function boot() {
   $("#roles-refresh").addEventListener("click", refreshRoles);
   $("#policy-create").addEventListener("submit", onCreatePolicy);
   $("#policies-refresh").addEventListener("click", refreshPolicies);
-  $("#policies-query").addEventListener("input", () => {
-    if (state.policies.length) renderPolicies();
+  $("#policies-query").addEventListener("input", async () => {
+    if (!state.policies.length) {
+      await refreshPolicies();
+      return;
+    }
+    renderPolicies();
   });
   $("#principals-refresh").addEventListener("click", refreshPrincipals);
   $("#principals-query").addEventListener("keydown", (e) => {
