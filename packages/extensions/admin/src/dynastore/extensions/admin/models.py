@@ -35,27 +35,7 @@ class UserResponse(BaseModel):
     roles: List[str] = Field(default_factory=list)
 
 
-# --- Role models ---
-
-class RoleCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
-    policies: List[str] = Field(default_factory=list)
-    parent_roles: List[str] = Field(default_factory=list)
-
-
-class RoleUpdate(BaseModel):
-    description: Optional[str] = None
-    policies: Optional[List[str]] = None
-    parent_roles: Optional[List[str]] = None
-
-
-class RoleResponse(BaseModel):
-    name: str
-    description: Optional[str] = None
-    policies: List[str] = Field(default_factory=list)
-    parent_roles: List[str] = Field(default_factory=list)
-
+# --- Role wire DTOs live in dynastore.models.protocols.policies. ---
 
 # --- Policy models ---
 
@@ -111,23 +91,13 @@ class UsageResetResponse(BaseModel):
 
 
 # --- Principal / assignment models ---
-
-class AssignRoleRequest(BaseModel):
-    role: str
-
+# AssignRoleRequest and PrincipalResponse wire DTOs live in
+# dynastore.models.protocols.policies. CatalogRoleAssignment is admin-only
+# (no second consumer) and stays here.
 
 class CatalogRoleAssignment(BaseModel):
     catalog_id: str
     role: str
-
-
-class PrincipalResponse(BaseModel):
-    id: str
-    provider: Optional[str] = None
-    subject_id: Optional[str] = None
-    display_name: Optional[str] = None
-    roles: List[str] = Field(default_factory=list)
-    is_active: bool = True
 
 
 # --- Catalog provisioning view models ---

@@ -14,6 +14,8 @@
 
 from typing import Protocol, List, Optional, Tuple, Any, runtime_checkable
 
+from pydantic import BaseModel, Field
+
 # Re-export permission-related models so extensions only need ONE import:
 #   from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role, Principal
 from dynastore.models.auth import Policy, Principal          # Policy, Principal canonical home
@@ -24,7 +26,53 @@ __all__ = [
     "Policy",
     "Role",
     "Principal",
+    # Wire-schema DTOs for the role/principal management surface.
+    # Promoted from extensions/admin/models.py so a second consumer
+    # (admin SDK, IAM CLI, another extension) does not have to import
+    # through an extension package.
+    "RoleCreate",
+    "RoleUpdate",
+    "RoleResponse",
+    "AssignRoleRequest",
+    "PrincipalResponse",
 ]
+
+
+# --- Role wire DTOs ---
+
+class RoleCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    policies: List[str] = Field(default_factory=list)
+    parent_roles: List[str] = Field(default_factory=list)
+
+
+class RoleUpdate(BaseModel):
+    description: Optional[str] = None
+    policies: Optional[List[str]] = None
+    parent_roles: Optional[List[str]] = None
+
+
+class RoleResponse(BaseModel):
+    name: str
+    description: Optional[str] = None
+    policies: List[str] = Field(default_factory=list)
+    parent_roles: List[str] = Field(default_factory=list)
+
+
+# --- Principal / assignment wire DTOs ---
+
+class AssignRoleRequest(BaseModel):
+    role: str
+
+
+class PrincipalResponse(BaseModel):
+    id: str
+    provider: Optional[str] = None
+    subject_id: Optional[str] = None
+    display_name: Optional[str] = None
+    roles: List[str] = Field(default_factory=list)
+    is_active: bool = True
 
 
 @runtime_checkable

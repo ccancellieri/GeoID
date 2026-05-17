@@ -26,15 +26,17 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.modules import get_protocol
 from dynastore.modules.iam.iam_service import IamService
 from dynastore.models.protocols.catalogs import CatalogsProtocol
-from dynastore.models.protocols.policies import Policy, Role, Principal
+from dynastore.models.protocols.policies import (
+    Policy, Role, Principal,
+    RoleCreate, RoleUpdate, RoleResponse,
+    PrincipalResponse, AssignRoleRequest,
+)
 
 from dynastore.extensions.iam.guards import ensure_privileged_role_assignment
 
 from .models import (
     UserCreate, UserUpdate,
-    RoleCreate, RoleUpdate, RoleResponse,
     PolicyCreate, PolicyUpdate, PolicyResponse,
-    PrincipalResponse, AssignRoleRequest,
     UsagePage, UsageResetResponse, UsageRow,
     CatalogProvisioningView, ProvisioningTaskView,
 )
