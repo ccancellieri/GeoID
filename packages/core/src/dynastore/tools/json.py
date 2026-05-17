@@ -179,9 +179,23 @@ class CustomJSONDecoder(json.JSONDecoder):
     into richer Python types using an object hook.
     """
 
-    def __init__(self, *args, **kwargs):
-        # Pass the static method as the object_hook callable.
-        super().__init__(object_hook=CustomJSONDecoder._object_hook, *args, **kwargs)
+    def __init__(self, **kwargs):
+        # ``json.JSONDecoder.__init__`` is keyword-only — accepting ``*args``
+        # masked two latent runtime defects:
+        #   1. ``super().__init__(object_hook=..., *args, **kwargs)`` (B026)
+        #      collided when a caller used
+        #      ``json.loads(s, cls=CustomJSONDecoder, object_hook=fn)``
+        #      because stdlib ``json.loads`` forwards ``object_hook`` via
+        #      ``kwargs`` and the explicit kwarg above raised
+        #      ``TypeError: __init__() got multiple values for keyword
+        #      argument 'object_hook'``.
+        #   2. Any non-empty ``*args`` raised
+        #      ``TypeError: __init__() takes 1 positional argument``
+        #      because ``JSONDecoder`` has no positional params.
+        # The class enforces its own ``_object_hook``; drop any
+        # caller-supplied override silently.
+        kwargs.pop("object_hook", None)
+        super().__init__(object_hook=CustomJSONDecoder._object_hook, **kwargs)
 
     @staticmethod
     def _object_hook(obj: dict) -> dict:
