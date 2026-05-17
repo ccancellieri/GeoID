@@ -459,12 +459,21 @@ class LifecycleRegistry:
         return decorator
 
     # Synchronous transactional execution
-    async def _run_initializer_isolated(self, conn, label: str, coro, **_) -> bool:
+    async def _run_initializer_isolated(
+        self, conn, label: str, func, *args, **kwargs
+    ) -> bool:
         """
-        Run a coroutine inside its own SAVEPOINT so that if it fails,
-        only the SAVEPOINT is rolled back and the outer transaction remains healthy.
-        Returns True if successful, False if the initializer failed (non-fatal).
-        Raises if the outer transaction itself is already aborted (fatal).
+        Run an initializer inside its own SAVEPOINT so that if it fails,
+        only the SAVEPOINT is rolled back and the outer transaction
+        remains healthy. ``func`` is the un-called initializer; we invoke
+        it INSIDE the savepoint (and ``await`` it iff it returned a
+        coroutine) so sync initializers are isolated too — pre-calling
+        them at the call site would run their side effects outside the
+        savepoint, defeating the purpose.
+
+        Returns True if successful, False if the initializer failed
+        (non-fatal). Raises if the outer transaction itself is already
+        aborted (fatal).
         """
         from dynastore.modules.db_config.query_executor import is_async_resource
         from sqlalchemy.ext.asyncio import AsyncConnection
@@ -473,7 +482,7 @@ class LifecycleRegistry:
         if not isinstance(conn, AsyncConnection):
             # Sync connection or engine — call directly with try/except
             try:
-                result = coro
+                result = func(*args, **kwargs)
                 if inspect.isawaitable(result):
                     await result
                 return True
@@ -483,7 +492,7 @@ class LifecycleRegistry:
 
         try:
             async with conn.begin_nested():
-                result = coro
+                result = func(*args, **kwargs)
                 if inspect.isawaitable(result):
                     await result
             return True
@@ -526,13 +535,10 @@ class LifecycleRegistry:
                 f"Sync catalog initializer {initializer.__module__}.{initializer.__name__} "
                 f"for '{catalog_id}'"
             )
-            coro = (
-                initializer(conn, schema, catalog_id)
-                if inspect.iscoroutinefunction(initializer)
-                else initializer(conn, schema, catalog_id)
-            )
             try:
-                await self._run_initializer_isolated(conn, label, coro)
+                await self._run_initializer_isolated(
+                    conn, label, initializer, conn, schema, catalog_id,
+                )
             except Exception:
                 # Outer transaction is aborted — stop trying further initializers
                 logger.error(
@@ -586,13 +592,11 @@ class LifecycleRegistry:
                 f"Sync collection initializer {initializer.__module__}.{initializer.__name__} "
                 f"for '{catalog_id}:{collection_id}'"
             )
-            coro = (
-                initializer(conn, schema, catalog_id, collection_id, **kwargs)
-                if inspect.iscoroutinefunction(initializer)
-                else initializer(conn, schema, catalog_id, collection_id, **kwargs)
-            )
             try:
-                await self._run_initializer_isolated(conn, label, coro)
+                await self._run_initializer_isolated(
+                    conn, label, initializer, conn, schema, catalog_id, collection_id,
+                    **kwargs,
+                )
             except Exception:
                 # Outer transaction is aborted — stop trying further initializers
                 logger.error(
