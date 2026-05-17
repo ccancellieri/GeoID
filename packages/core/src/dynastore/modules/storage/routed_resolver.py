@@ -47,6 +47,14 @@ from dynastore.modules.storage.routing_config import OperationDriverEntry
 
 logger = logging.getLogger(__name__)
 
+# Soak-signal aid for #748 item 2 (discovery-fallback retirement gate).
+# The fallback path below logs at DEBUG, which is filtered out by default-INFO
+# Cloud Logging — making the "zero unavailable lines" retirement gate
+# unobservable in review env. Promote the first occurrence per process to
+# WARNING so operators can see it; subsequent occurrences stay at DEBUG to
+# avoid spam under sustained ConfigsProtocol unavailability.
+_FALLBACK_WARNED = False
+
 
 async def _load_routing_config(
     routing_plugin_cls: Type[Any],
@@ -134,11 +142,21 @@ async def resolve_routed(
             routing_plugin_cls, catalog_id, collection_id, db_resource,
         )
     except Exception as exc:  # noqa: BLE001 — degrade to discovery
-        logger.debug(
-            "routed-resolve unavailable for %s/%s op=%s (%s); "
-            "caller should fall back to discovery",
-            catalog_id, collection_id, operation, exc,
-        )
+        global _FALLBACK_WARNED
+        if not _FALLBACK_WARNED:
+            _FALLBACK_WARNED = True
+            logger.warning(
+                "routed-resolve unavailable for %s/%s op=%s (%s); "
+                "caller should fall back to discovery — further occurrences "
+                "in this process will be logged at DEBUG only",
+                catalog_id, collection_id, operation, exc,
+            )
+        else:
+            logger.debug(
+                "routed-resolve unavailable for %s/%s op=%s (%s); "
+                "caller should fall back to discovery",
+                catalog_id, collection_id, operation, exc,
+            )
         return []
 
     entries = _entries_for_operation(routing_config, routing_plugin_cls, operation)

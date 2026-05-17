@@ -120,3 +120,62 @@ async def test_resolve_routed_returns_empty_when_configs_unavailable(monkeypatch
         CollectionRoutingConfig, Operation.READ, "cat", "coll",
     )
     assert resolved == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_first_occurrence_warns_then_demotes_to_debug(
+    monkeypatch, caplog,
+):
+    """#748 item-2 soak signal: first ConfigsProtocol-unavailable per process
+    emits WARNING (so it survives default-INFO Cloud Logging); subsequent
+    occurrences demote to DEBUG to avoid spam."""
+    from dynastore.modules.storage import routed_resolver
+    from dynastore.modules.storage.routing_config import (
+        CollectionRoutingConfig, Operation,
+    )
+
+    monkeypatch.setattr(routed_resolver, "_FALLBACK_WARNED", False)
+
+    async def _raise(*a, **kw):
+        raise RuntimeError("ConfigsProtocol not available")
+
+    monkeypatch.setattr(routed_resolver, "_load_routing_config", _raise)
+
+    with caplog.at_level(logging.DEBUG, logger=routed_resolver.__name__):
+        await routed_resolver.resolve_routed(
+            CollectionRoutingConfig, Operation.READ, "cat", "coll",
+        )
+        await routed_resolver.resolve_routed(
+            CollectionRoutingConfig, Operation.WRITE, "cat", "coll",
+        )
+        await routed_resolver.resolve_routed(
+            CollectionRoutingConfig, Operation.WRITE, "cat2", "coll2",
+        )
+
+    fallback_records = [
+        r for r in caplog.records if "routed-resolve unavailable" in r.message
+    ]
+    assert len(fallback_records) == 3
+    levels = [r.levelname for r in fallback_records]
+    assert levels == ["WARNING", "DEBUG", "DEBUG"], (
+        f"first emission must be WARNING then demote: got {levels}"
+    )
+    assert routed_resolver._FALLBACK_WARNED is True
+
+
+@pytest.mark.asyncio
+async def test_fallback_warn_gate_is_module_level_not_per_call(monkeypatch):
+    """Guard against a regression that scopes the gate to a local variable —
+    the gate must persist across calls (module-level), otherwise every call
+    re-emits the WARNING."""
+    import inspect
+    from dynastore.modules.storage import routed_resolver
+
+    src = inspect.getsource(routed_resolver)
+    assert "_FALLBACK_WARNED = False" in src, (
+        "module-level _FALLBACK_WARNED gate must exist"
+    )
+    assert "global _FALLBACK_WARNED" in src, (
+        "resolve_routed must declare `global _FALLBACK_WARNED` so the first-"
+        "occurrence promotion to WARNING persists across calls"
+    )
