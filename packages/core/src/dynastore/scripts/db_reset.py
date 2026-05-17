@@ -9,9 +9,15 @@ Modes:
           configs schema with current DDL.  Default.
   configs Drop and recreate only the configs schema.
 
+Selective component reset (``--components``, mutually exclusive with ``--mode``):
+  Comma-separated set drawn from ``{configs, iam, tasks, catalog, cron}``.
+  Each component drops only the artefacts it owns, so tenant data can be
+  preserved when only IAM or only tasks have shifted shape. See dynastore#295.
+
 Usage:
   DATABASE_URL=postgresql://... python -m dynastore.scripts.db_reset \\
-      [--mode full|configs] [--dry-run]
+      [--mode full|configs | --components configs,iam,tasks,catalog,cron] \\
+      [--dry-run]
 
 Connection resolution (first match wins):
   1. DATABASE_URL env var
@@ -57,6 +63,17 @@ _DEFAULT_SYSTEM_CRON_JOBS = (
     "system_cleanup_orphaned_cron_jobs",
     "monthly_cleanup_system_logs",
 )
+
+# ── Component dispatch (dynastore#295) ─────────────────────────────────────────
+# Each entry maps a ``--components`` token to the fixed-name PG schema(s) it
+# owns. ``catalog`` is special — it targets the per-tenant ``s_<base36>``
+# schemas enumerated at runtime, not a fixed name.
+_COMPONENT_SCHEMAS: dict[str, tuple[str, ...]] = {
+    "iam": ("iam",),
+    "tasks": ("tasks",),
+}
+_TENANT_SCHEMA_PATTERN = r"^s_[0-9a-z]{8}$"  # mirrors tests/dynastore/test_utils/db_cleanup.TENANT_SCHEMA_PATTERN
+KNOWN_COMPONENTS: frozenset[str] = frozenset({"configs", "iam", "tasks", "catalog", "cron"})
 
 
 def _load_reset_policy(
@@ -338,14 +355,128 @@ async def _reset_full(conn, dry_run: bool) -> None:
     _log("Reset complete. Restart dynastore to rebuild schemas.")
 
 
+# ── Selective component reset (dynastore#295) ──────────────────────────────────
+
+async def _drop_named_schemas(
+    conn, schemas: tuple[str, ...], dry_run: bool, label: str
+) -> None:
+    """Drop fixed-name schemas (the ``iam`` / ``tasks`` cases).
+
+    Modules recreate their own schema via ``CREATE SCHEMA IF NOT EXISTS`` at
+    startup — no DDL needs to be re-applied here. Idempotent under partial
+    failure: each schema is dropped independently.
+    """
+    if dry_run:
+        _log(f"-- DRY RUN: {label} component — drop schemas {list(schemas)} --")
+        for s in schemas:
+            _log(f'DROP SCHEMA IF EXISTS "{s}" CASCADE;')
+        return
+    for s in schemas:
+        try:
+            await conn.execute(f'DROP SCHEMA IF EXISTS "{s}" CASCADE;')
+            _log(f"  dropped schema: {s}")
+        except Exception as e:
+            _log(f"  skipped schema {s!r}: {e}")
+
+
+async def _list_tenant_schemas(conn) -> list[str]:
+    rows = await conn.fetch(
+        "SELECT nspname FROM pg_namespace "
+        "WHERE nspname ~ $1 "
+        "ORDER BY nspname;",
+        _TENANT_SCHEMA_PATTERN,
+    )
+    return [r["nspname"] for r in rows]
+
+
+async def _drop_tenant_schemas(conn, dry_run: bool) -> None:
+    """Drop per-tenant ``s_<base36>`` schemas — the destructive piece
+    previously bundled in ``--mode full``. Configs, IAM, tasks schemas are
+    NOT touched (they have fixed names not matching the tenant pattern)."""
+    schemas = await _list_tenant_schemas(conn)
+    if not schemas:
+        _log("catalog: no tenant schemas to drop.")
+        return
+    if dry_run:
+        _log(f"-- DRY RUN: catalog component — drop {len(schemas)} tenant schema(s) --")
+        for s in schemas:
+            _log(f'DROP SCHEMA IF EXISTS "{s}" CASCADE;')
+        return
+    dropped = 0
+    for s in schemas:
+        try:
+            await conn.execute(f'DROP SCHEMA IF EXISTS "{s}" CASCADE;')
+            dropped += 1
+        except Exception as e:
+            _log(f"  skipped tenant {s!r}: {e}")
+    _log(f"catalog: dropped {dropped}/{len(schemas)} tenant schemas")
+
+
+def _parse_components(raw: str) -> tuple[str, ...]:
+    """Split ``--components`` value, validate, preserve declared order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in raw.split(","):
+        c = token.strip().lower()
+        if not c:
+            continue
+        if c not in KNOWN_COMPONENTS:
+            raise SystemExit(
+                f"ERROR: --components: unknown token {c!r}. Allowed: "
+                f"{sorted(KNOWN_COMPONENTS)}"
+            )
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    if not out:
+        raise SystemExit(
+            "ERROR: --components requires at least one of "
+            f"{sorted(KNOWN_COMPONENTS)}"
+        )
+    return tuple(out)
+
+
+async def _reset_components(
+    conn, components: tuple[str, ...], dry_run: bool
+) -> None:
+    """Dispatch each requested component in a fixed order independent of the
+    caller's CLI ordering. ``cron`` last so any module that re-registers a
+    cron job during a same-process reset is still wiped after."""
+    _log(f"Components selected: {list(components)}")
+    order = ("configs", "iam", "tasks", "catalog", "cron")
+    requested = set(components)
+    for c in order:
+        if c not in requested:
+            continue
+        _log(f"-- component: {c} --")
+        if c == "configs":
+            await _reset_configs(conn, dry_run)
+        elif c in _COMPONENT_SCHEMAS:
+            await _drop_named_schemas(conn, _COMPONENT_SCHEMAS[c], dry_run, c)
+        elif c == "catalog":
+            await _drop_tenant_schemas(conn, dry_run)
+        elif c == "cron":
+            await _wipe_cron_jobs(conn, dry_run)
+    if not dry_run:
+        _log("Selective reset complete. Restart dynastore to rebuild schemas.")
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-async def _run(url: str, mode: str, dry_run: bool) -> None:
+async def _run(
+    url: str,
+    mode: str,
+    dry_run: bool,
+    components: tuple[str, ...] | None = None,
+) -> None:
     import asyncpg
     kwargs = _parse_url(url)
     conn: asyncpg.Connection = await asyncpg.connect(**kwargs)
     try:
-        if mode == "configs":
+        if components:
+            await _reset_components(conn, components, dry_run)
+        elif mode == "configs":
             await _reset_configs(conn, dry_run)
         else:
             await _reset_full(conn, dry_run)
@@ -406,8 +537,21 @@ def _refuse_in_production() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["full", "configs"], default="full")
+    parser.add_argument(
+        "--components",
+        default="",
+        help=(
+            "Comma-separated subset of "
+            f"{sorted(KNOWN_COMPONENTS)}. When set, --mode is ignored. "
+            "Example: --components configs,iam"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    components: tuple[str, ...] | None = None
+    if args.components:
+        components = _parse_components(args.components)
 
     if not args.dry_run:
         _refuse_in_production()
@@ -417,7 +561,7 @@ def main() -> None:
         print("ERROR: DATABASE_URL is not set", file=sys.stderr, flush=True)
         sys.exit(1)
 
-    asyncio.run(_run(url, args.mode, args.dry_run))
+    asyncio.run(_run(url, args.mode, args.dry_run, components))
     print("Done.", flush=True)
 
 
