@@ -62,15 +62,57 @@ import pytest_asyncio
 from typing import Any, Union
 
 
+async def _create_db_template_with_retry(
+    execute, source_db: str, worker_db: str, *, attempts: int = 5, backoff: float = 0.2
+) -> None:
+    """Run pg_terminate_backend + CREATE DATABASE TEMPLATE in a bounded retry.
+
+    pg_terminate_backend is one-shot — any external client (dev stack, pgAdmin,
+    idle sessions) that reconnects between the terminate and the CREATE will
+    surface as asyncpg.ObjectInUseError. The retry loop re-terminates and
+    re-attempts up to ``attempts`` times. If external clients are persistently
+    connected the loop exhausts and raises a RuntimeError pointing the operator
+    at the resolution path (clear-db workflow + stop the local/review stack).
+    """
+    import asyncio
+    import asyncpg
+
+    last_exc: Exception | None = None
+    for _ in range(attempts):
+        await execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            source_db,
+        )
+        try:
+            await execute(f'CREATE DATABASE "{worker_db}" TEMPLATE "{source_db}"')
+            return
+        except asyncpg.exceptions.ObjectInUseError as exc:
+            last_exc = exc
+            await asyncio.sleep(backoff)
+    raise RuntimeError(
+        f"Failed to clone {source_db} -> {worker_db} after {attempts} attempts; "
+        f"last error: {last_exc}. External clients are connected to {source_db} "
+        f"(check pg_stat_activity). Resolution: stop the dev stack (docker compose "
+        f"down on the geoid app container) and/or reset the source DB before "
+        f"re-running the test session — local: tests/dynastore/test_utils/cleanup_db.py "
+        f"(application-aware Python cleanup), review env: "
+        f"packages/core/src/dynastore/scripts/db_reset.sh reset --yes (boot-tier wipe)."
+    )
+
+
 async def _ensure_worker_db():
     """
     Create the per-xdist-worker DB by cloning the master ``gis_dev`` TEMPLATE.
 
     Serialized across workers via a Postgres advisory lock so that simultaneous
-    clones don't fail with "source database is being accessed by other users".
-    Connections to the source are terminated before clone (workers themselves
-    do not connect to the source — only stragglers from a previous interrupted
-    run, the controller's cleanup_db, or pgAdmin sessions).
+    clones don't fail with "source database is being accessed by other users"
+    against each other. External clients (dev stack on docker-compose.dev.yml,
+    pgAdmin, leftover sessions from interrupted runs) connected to the source DB
+    are best-effort terminated; if they immediately reconnect, the bounded retry
+    in ``_create_db_template_with_retry`` covers the transient race. Persistent
+    external connections must be cleared by the operator before launching the
+    session — the helper does not mutate source-DB settings (#894).
     """
     worker = os.environ.get("PYTEST_XDIST_WORKER")
     if not worker:
@@ -97,13 +139,8 @@ async def _ensure_worker_db():
             await conn.execute(
                 f'DROP DATABASE IF EXISTS "{worker_db}" WITH (FORCE)'
             )
-            await conn.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = $1 AND pid <> pg_backend_pid()",
-                source_db,
-            )
-            await conn.execute(
-                f'CREATE DATABASE "{worker_db}" TEMPLATE "{source_db}"'
+            await _create_db_template_with_retry(
+                conn.execute, source_db, worker_db,
             )
         finally:
             await conn.execute("SELECT pg_advisory_unlock(8472001)")
