@@ -10,8 +10,36 @@ A significant component is the usage of the `JSONB` data type, allowing for unst
 
 ### Connection Pooling
 
-- **Asynchronous Pool**: The API application (`main.py`) uses `asyncpg`. This allows high-concurrency without blocking the primary event loop. 
-- **Synchronous Pool**: Background task workers use `psycopg2`. Single-threaded ingestion jobs do not benefit from async/await loops, and this separates resource pools completely from the high-throughput front-end application.
+DynaStore runs two **independent** database stacks. They share configuration (via `db_config`) but never share an engine, a pool, or a driver. A given process belongs to exactly one stack:
+
+| Tier         | Module                  | Driver       | Pool kind                | Resolves via SCOPE alias |
+|--------------|-------------------------|--------------|--------------------------|--------------------------|
+| API services | `db` (`DBService`)      | `asyncpg`    | async pool               | `db_async`               |
+| Worker jobs  | `datastore` (`DatastoreModule`) | `psycopg2` | sync engine              | `db_sync`                |
+| Shared layer | `db_config` (`DBConfigModule`) | n/a (config) | sets `app_state.db_config` for both | included by both aliases |
+
+- **Async pool (services).** The FastAPI application (`main.py`) uses `asyncpg`. Multi-tenant request fan-out runs on the primary event loop with high concurrency and zero per-request thread overhead.
+- **Sync engine (jobs).** Cloud Run Jobs (ingestion, gdal, dimensions_materialize, tiles_preseed, etc.) use `psycopg2`. A job is a one-shot, single-threaded process; a second async pool inside it gives no concurrency win and would double the pool footprint per execution. **Jobs intentionally do not install `asyncpg`.**
+
+### Import-time isolation (load-bearing invariant)
+
+The two stacks are isolated at *import time*, not only at runtime. The shared `db_config` module loads in **both** environments and is responsible for populating `app_state.db_config`, which the sync `DatastoreModule` reads on lifespan startup. Therefore:
+
+> **Nothing under `packages/core/src/dynastore/modules/db_config/` may top-level-`import asyncpg`, `from asyncpg import ...`, or `sqlalchemy.ext.asyncio`.**
+
+Any async-only symbol used inside this module tree (exception classes, type hints, connection-pool primitives) must be either:
+1. guarded with `try: import asyncpg / except ImportError:` at module scope and given an empty-tuple / `Any` fallback, or
+2. deferred to function-local imports that only async callers reach.
+
+This rule extends transitively: any module imported at top-level *from* `db_config/*` inherits the constraint.
+
+**Why this matters.** `dynastore.tools.discovery.register_plugin` wraps each entry-point load in `try/except ImportError`. On failure it emits `WARNING - Skipping dynastore.modules plugin '<name>': No module named '<dep>'` and **silently drops the entry-point**. The plugin never instantiates, its lifespan never runs, and downstream consumers crash later with an `AttributeError` masquerading as a startup failure of an unrelated module — typically surfaced in Cloud Run job logs as `RuntimeError: CRITICAL: Foundational module 'DatastoreModule' failed during startup. Aborting.`
+
+The same skip rule is correct for genuinely async-only modules (`db`, `catalog`, `tiles`) — they should be absent from sync-image module lists. The bug shape is when a **shared** module like `db_config` is dropped because a transitive import pulled in an async-only dependency.
+
+**Reviewer checklist.** When reviewing any PR that touches `packages/core/src/dynastore/modules/db_config/**`:
+- `git diff` for `import asyncpg`, `from asyncpg`, `from sqlalchemy.ext.asyncio` — any hit at module top-level is a blocker.
+- If the PR adds a new module under `db_config/`, confirm its top-level imports work in a venv without `asyncpg`.
 
 ## Partitioning and Multi-Tenancy
 

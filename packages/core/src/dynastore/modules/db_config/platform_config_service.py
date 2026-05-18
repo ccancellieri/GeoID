@@ -39,7 +39,6 @@ import typing
 import inspect
 from contextlib import asynccontextmanager
 
-import asyncpg
 from pydantic import ValidationError
 from typing import (
     Any,
@@ -96,13 +95,26 @@ logger = logging.getLogger(__name__)
 # DEBUG traceback. #796 narrows the catch + promotes the legitimate
 # fail-open log to WARNING with a structured payload so the same class
 # of regression cannot hide again.
+# Async-only exception types live behind a guarded import so this module
+# stays loadable in sync-only worker images (psycopg2 / SCOPE=db_sync) that
+# intentionally do not install asyncpg. Sync workers can never raise these
+# exceptions, so an empty tuple in their absence is the correct extension.
+# See docs/architecture/database.md "Import-time isolation" + #909.
+try:
+    import asyncpg as _asyncpg
+    _ASYNCPG_ABSENT_EXC: tuple = (
+        _asyncpg.UndefinedTableError,
+        _asyncpg.UndefinedColumnError,
+        _asyncpg.InvalidSchemaNameError,
+    )
+except ImportError:
+    _ASYNCPG_ABSENT_EXC = ()
+
 _EXPECTED_ABSENT_LAYER: tuple = (
     OSError,
     KeyError,
     ValidationError,
-    asyncpg.UndefinedTableError,
-    asyncpg.UndefinedColumnError,
-    asyncpg.InvalidSchemaNameError,
+    *_ASYNCPG_ABSENT_EXC,
 )
 
 
