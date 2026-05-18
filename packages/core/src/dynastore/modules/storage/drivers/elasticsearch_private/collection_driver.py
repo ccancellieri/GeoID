@@ -21,9 +21,10 @@ instead of the shared platform-wide ``{prefix}-collections``.
 
 Privacy semantics
 -----------------
-- Per-collection: the cascade rule (Cycle E.2.a) requires
-  ``CollectionPrivacy.is_private == True`` whenever this driver is
-  pinned in :class:`CollectionRoutingConfig`.
+- Per-collection: the cascade rule (#733) requires the sibling
+  :class:`ItemsRoutingConfig` to pin ``items_elasticsearch_private_driver``
+  in some operation whenever this driver is pinned in
+  :class:`CollectionRoutingConfig`.
 - DENY policy ownership stays with the items-tier private driver —
   ``items_elasticsearch_private_driver`` applies the catalog-wide
   ``private_deny_{catalog_id}`` covering ``/.../catalogs/{cat}/...``,

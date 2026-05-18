@@ -86,11 +86,12 @@ class ItemsElasticsearchPrivateDriver(
 
     # Opt out of items-tier auto-default routing.  The private variant is
     # tenant-isolated DENY-policy indexing; it must only run for collections
-    # whose ``CollectionPrivacy.is_private == True`` (Cycle E.2) — the
-    # privacy-cascade validator on ``ItemsRoutingConfig`` enforces that the
-    # routing pins this driver in some operation whenever the collection
-    # claims is_private.  Auto-injecting into every collection's INDEX/SEARCH
-    # would silently bypass that gate.
+    # whose ``ItemsRoutingConfig`` explicitly pins this driver (#733).
+    # The privacy-cascade validator on the routing configs guarantees the
+    # items-private driver is pinned whenever the sibling
+    # ``CollectionRoutingConfig`` pins the collection-private driver.
+    # Auto-injecting into every collection's INDEX/SEARCH would silently
+    # bypass that gate.
     auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
     priority: int = 51
@@ -609,10 +610,11 @@ class ItemsElasticsearchPrivateDriver(
         """Restore catalog-wide DENY policies at startup for any catalog
         that has at least one private collection.
 
-        Cycle E.2 / F.0d cutover: privacy is per-collection now
-        (``CollectionPrivacy.is_private``).  We scan all catalogs,
-        list each catalog's collections, and re-apply the DENY policy
-        idempotently for any catalog with at least one private collection.
+        #733 cutover: privacy is now expressed as the presence of the
+        private driver variants in a collection's routing configs.  We
+        scan all catalogs, list each catalog's collections, and re-apply
+        the DENY policy idempotently for any catalog with at least one
+        collection whose routing configs pin a private driver.
 
         The DENY pattern stays catalog-wide
         (``private_deny_{catalog_id}`` blocking
@@ -623,7 +625,6 @@ class ItemsElasticsearchPrivateDriver(
         try:
             from dynastore.models.protocols import CatalogsProtocol
             from dynastore.models.protocols.configs import ConfigsProtocol
-            from dynastore.modules.catalog.catalog_config import CollectionPrivacy
             from dynastore.tools.discovery import get_protocol
 
             catalogs_proto = get_protocol(CatalogsProtocol)
@@ -643,11 +644,11 @@ class ItemsElasticsearchPrivateDriver(
                     if not catalog_id:
                         continue
                     if await self._catalog_has_private_collection(
-                        catalogs_proto, configs, catalog_id, CollectionPrivacy,
+                        catalogs_proto, configs, catalog_id,
                     ):
                         await self._apply_deny_policy(catalog_id)
                         logger.info(
-                            "PrivateDriver: restored DENY for '%s' (cycle E.2 — at least one private collection).",
+                            "PrivateDriver: restored DENY for '%s' (#733 — at least one collection pins a private driver).",
                             catalog_id,
                         )
                 if len(catalog_list) < batch:
@@ -663,10 +664,23 @@ class ItemsElasticsearchPrivateDriver(
         catalogs_proto: Any,
         configs: Any,
         catalog_id: str,
-        collection_cls: type,
     ) -> bool:
-        """Return True iff any collection of the catalog has
-        ``is_private == True``.  Iterates collections in batches."""
+        """Return True iff any collection of the catalog has a routing
+        config pinning a private driver (#733).
+
+        A collection is considered private when EITHER its
+        ``ItemsRoutingConfig`` pins ``items_elasticsearch_private_driver``
+        OR its ``CollectionRoutingConfig`` pins
+        ``collection_elasticsearch_private_driver``.  Iterates collections
+        in batches.
+        """
+        from dynastore.modules.storage.routing_config import (
+            CollectionRoutingConfig,
+            ItemsRoutingConfig,
+            _collection_routing_has_private_driver,
+            _items_routing_has_private_driver,
+        )
+
         offset, batch = 0, 100
         while True:
             try:
@@ -682,12 +696,26 @@ class ItemsElasticsearchPrivateDriver(
                 if not col_id:
                     continue
                 try:
-                    cfg = await configs.get_config(
-                        collection_cls, catalog_id=catalog_id, collection_id=col_id,
+                    items_routing = await configs.get_config(
+                        ItemsRoutingConfig,
+                        catalog_id=catalog_id, collection_id=col_id,
                     )
                 except Exception:
-                    continue
-                if isinstance(cfg, collection_cls) and getattr(cfg, "is_private", False):
+                    items_routing = None
+                if isinstance(items_routing, ItemsRoutingConfig) and (
+                    _items_routing_has_private_driver(items_routing)
+                ):
+                    return True
+                try:
+                    coll_routing = await configs.get_config(
+                        CollectionRoutingConfig,
+                        catalog_id=catalog_id, collection_id=col_id,
+                    )
+                except Exception:
+                    coll_routing = None
+                if isinstance(coll_routing, CollectionRoutingConfig) and (
+                    _collection_routing_has_private_driver(coll_routing)
+                ):
                     return True
             if len(collections) < batch:
                 return False

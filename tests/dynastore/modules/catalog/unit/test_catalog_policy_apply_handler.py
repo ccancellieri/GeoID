@@ -1,22 +1,23 @@
-"""Cycle E.2.c slice 2 / F.0d — pin the catalog-tier lifecycle hook.
+"""#733 — pin the catalog-tier lifecycle hook on ``CatalogPrivacy``.
 
-When an operator writes a ``CatalogPrivacy`` with
-``collection_defaults.is_private=True``, the apply handler must
-proactively call ``ensure_storage(catalog_id)`` on both per-tenant
-private drivers (items + collection envelope) so the indexes exist
-before any write lands.
+When an operator writes a ``CatalogPrivacy`` whose
+``collection_defaults`` templates pin private driver variants, the apply
+handler must proactively call ``ensure_storage(catalog_id)`` on the
+relevant per-tenant private drivers (items + collection envelope) so the
+indexes exist before any write lands.
 
 These tests pin the handler's contract:
 
-- Public default → no-op (no ensure_storage calls).
-- Private default + missing catalog_id → no-op.
-- Private default + drivers discoverable → both drivers' ensure_storage
-  called with the catalog_id.
-- Private default + only one driver discoverable (deployment SCOPE
-  excludes one tier) → graceful no-op for the missing one, the
-  other still gets called.
-- Private default + ensure_storage raises on one driver → handler
-  swallows + logs, the other driver still gets called.
+- Both templates ``None`` → no-op.
+- Templates set but no private driver pinned → no-op.
+- Missing catalog_id → no-op.
+- items-routing template pins items-private + collection-routing template
+  pins collection-private → both drivers' ``ensure_storage`` get called.
+- Only one tier's template pins a private driver → only the matching
+  driver gets called.
+- Driver discovery returns nothing for a tier → graceful no-op on that tier.
+- ``ensure_storage`` raises → handler logs warning, the other tier still
+  gets its call.
 
 The handler itself is registered on ``CatalogPrivacy`` at module
 import time; we exercise it directly here rather than going through
@@ -30,34 +31,57 @@ import pytest
 
 from dynastore.modules.catalog.catalog_config import (
     CatalogPrivacy,
-    CollectionPrivacyDefaults,
+    _build_private_collection_routing,
+    _build_private_items_routing,
     _on_apply_catalog_privacy,
+)
+from dynastore.modules.storage.routing_config import (
+    CatalogRoutingDefaults,
+    CollectionRoutingConfig,
+    FailurePolicy,
+    ItemsRoutingConfig,
+    Operation,
+    OperationDriverEntry,
 )
 
 
-def _stub_drivers(*, items: object = None, coll: object = None) -> list[object]:
-    """Build the discovery-protocol return value the handler iterates.
+def _both_private_defaults() -> CatalogRoutingDefaults:
+    return CatalogRoutingDefaults(
+        items_routing=_build_private_items_routing(),
+        collection_routing=_build_private_collection_routing(),
+    )
 
-    Both ``CollectionItemsStore`` and ``CollectionStore`` queries are
-    expected to return iterables of registered drivers; the handler
-    isinstance-filters to find the private variants.  Tests pass the
-    relevant private-driver instance and any number of unrelated
-    drivers (always ignored by the isinstance filter).
-    """
-    out: list[object] = []
-    if items is not None:
-        out.append(items)
-    if coll is not None:
-        out.append(coll)
-    return out
+
+def _public_items_template() -> ItemsRoutingConfig:
+    return ItemsRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="items_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+        },
+    )
+
+
+def _public_collection_template() -> CollectionRoutingConfig:
+    return CollectionRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+        },
+    )
 
 
 @pytest.mark.asyncio
-async def test_handler_noop_when_policy_is_public():
-    """``collection_defaults.is_private=False`` (default) must NOT
-    trigger eager-create.  The catalog policy applies to NEW
-    collections only, and the existing per-tenant private indexes
-    (if any) must remain untouched."""
+async def test_handler_noop_when_both_templates_are_none():
+    """The default ``CatalogPrivacy()`` has both templates ``None`` —
+    no eager create."""
     items_driver = MagicMock()
     items_driver.ensure_storage = AsyncMock()
     coll_driver = MagicMock()
@@ -69,6 +93,32 @@ async def test_handler_noop_when_policy_is_public():
     ):
         await _on_apply_catalog_privacy(
             CatalogPrivacy(),
+            "cat-a", None, None,
+        )
+
+    items_driver.ensure_storage.assert_not_awaited()
+    coll_driver.ensure_storage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handler_noop_when_templates_pin_only_public_drivers():
+    """Templates set but no private driver in either — no eager create."""
+    items_driver = MagicMock()
+    items_driver.ensure_storage = AsyncMock()
+    coll_driver = MagicMock()
+    coll_driver.ensure_storage = AsyncMock()
+
+    with patch(
+        "dynastore.tools.discovery.get_protocols",
+        return_value=[items_driver, coll_driver],
+    ):
+        await _on_apply_catalog_privacy(
+            CatalogPrivacy(
+                collection_defaults=CatalogRoutingDefaults(
+                    items_routing=_public_items_template(),
+                    collection_routing=_public_collection_template(),
+                ),
+            ),
             "cat-a", None, None,
         )
 
@@ -89,9 +139,7 @@ async def test_handler_noop_when_catalog_id_missing():
         return_value=[items_driver, coll_driver],
     ):
         await _on_apply_catalog_privacy(
-            CatalogPrivacy(
-                collection_defaults=CollectionPrivacyDefaults(is_private=True),
-            ),
+            CatalogPrivacy(collection_defaults=_both_private_defaults()),
             None, None, None,
         )
 
@@ -100,9 +148,53 @@ async def test_handler_noop_when_catalog_id_missing():
 
 
 @pytest.mark.asyncio
-async def test_handler_calls_both_private_drivers_when_private_and_discoverable():
-    """The load-bearing happy path — both private drivers are discoverable
-    and both get ensure_storage(catalog_id) called."""
+async def test_handler_calls_both_private_drivers_when_both_tiers_private():
+    """The load-bearing happy path — both templates pin a private driver
+    and both per-tenant drivers get ensure_storage(catalog_id) called."""
+    from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
+        ItemsElasticsearchPrivateDriver,
+    )
+    from dynastore.modules.storage.drivers.elasticsearch_private.collection_driver import (
+        CollectionElasticsearchPrivateDriver,
+    )
+
+    from dynastore.models.protocols.entity_store import EntityStoreCapability
+    from dynastore.models.protocols.storage_driver import Capability
+
+    items_private = MagicMock(spec=ItemsElasticsearchPrivateDriver)
+    items_private.capabilities = frozenset({Capability.TENANT_ISOLATED})
+    items_private.ensure_storage = AsyncMock()
+    coll_private = MagicMock(spec=CollectionElasticsearchPrivateDriver)
+    coll_private.capabilities = frozenset({EntityStoreCapability.TENANT_ISOLATED})
+    coll_private.ensure_storage = AsyncMock()
+
+    def fake_get_protocols(proto):
+        from dynastore.models.protocols.entity_store import CollectionStore
+        from dynastore.models.protocols.storage_driver import CollectionItemsStore
+
+        if proto is CollectionItemsStore:
+            return [items_private]
+        if proto is CollectionStore:
+            return [coll_private]
+        return []
+
+    with patch(
+        "dynastore.tools.discovery.get_protocols",
+        side_effect=fake_get_protocols,
+    ):
+        await _on_apply_catalog_privacy(
+            CatalogPrivacy(collection_defaults=_both_private_defaults()),
+            "cat-a", None, None,
+        )
+
+    items_private.ensure_storage.assert_awaited_once_with("cat-a")
+    coll_private.ensure_storage.assert_awaited_once_with("cat-a")
+
+
+@pytest.mark.asyncio
+async def test_handler_calls_only_items_when_only_items_template_is_private():
+    """Asymmetric seed: items-routing template pins private, collection-
+    routing template is None → only the items-private driver gets called."""
     from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
         ItemsElasticsearchPrivateDriver,
     )
@@ -136,13 +228,16 @@ async def test_handler_calls_both_private_drivers_when_private_and_discoverable(
     ):
         await _on_apply_catalog_privacy(
             CatalogPrivacy(
-                collection_defaults=CollectionPrivacyDefaults(is_private=True),
+                collection_defaults=CatalogRoutingDefaults(
+                    items_routing=_build_private_items_routing(),
+                    collection_routing=None,
+                ),
             ),
             "cat-a", None, None,
         )
 
     items_private.ensure_storage.assert_awaited_once_with("cat-a")
-    coll_private.ensure_storage.assert_awaited_once_with("cat-a")
+    coll_private.ensure_storage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -175,9 +270,7 @@ async def test_handler_skips_missing_driver_gracefully():
     ):
         # Should not raise even though collection-private is missing.
         await _on_apply_catalog_privacy(
-            CatalogPrivacy(
-                collection_defaults=CollectionPrivacyDefaults(is_private=True),
-            ),
+            CatalogPrivacy(collection_defaults=_both_private_defaults()),
             "cat-a", None, None,
         )
 
@@ -223,9 +316,7 @@ async def test_handler_swallows_ensure_storage_exceptions(caplog):
     ):
         # Should not raise.
         await _on_apply_catalog_privacy(
-            CatalogPrivacy(
-                collection_defaults=CollectionPrivacyDefaults(is_private=True),
-            ),
+            CatalogPrivacy(collection_defaults=_both_private_defaults()),
             "cat-a", None, None,
         )
 
@@ -275,9 +366,7 @@ async def test_handler_picks_driver_with_tenant_isolated_capability():
         side_effect=fake_get_protocols,
     ):
         await _on_apply_catalog_privacy(
-            CatalogPrivacy(
-                collection_defaults=CollectionPrivacyDefaults(is_private=True),
-            ),
+            CatalogPrivacy(collection_defaults=_both_private_defaults()),
             "cat-a", None, None,
         )
 
@@ -317,9 +406,7 @@ async def test_handler_noop_when_no_driver_advertises_tenant_isolated():
         side_effect=fake_get_protocols,
     ):
         await _on_apply_catalog_privacy(
-            CatalogPrivacy(
-                collection_defaults=CollectionPrivacyDefaults(is_private=True),
-            ),
+            CatalogPrivacy(collection_defaults=_both_private_defaults()),
             "cat-a", None, None,
         )
 
@@ -353,6 +440,6 @@ async def test_handler_registered_on_catalog_privacy():
     module load time."""
     handlers = CatalogPrivacy.get_apply_handlers()
     assert _on_apply_catalog_privacy in handlers, (
-        "Cycle E.2.c slice 2: _on_apply_catalog_privacy must be "
-        "registered on CatalogPrivacy at module import time."
+        "#733: _on_apply_catalog_privacy must be registered on "
+        "CatalogPrivacy at module import time."
     )

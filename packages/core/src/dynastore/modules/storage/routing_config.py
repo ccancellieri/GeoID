@@ -49,7 +49,7 @@ from dynastore.models.protocols.indexer import (
     CatalogIndexer,
     CollectionIndexer,
 )
-from dynastore.models.mutability import Immutable
+from dynastore.models.mutability import Immutable, Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.modules.storage.hints import Hint
 from dynastore.tools.typed_store.base import _to_snake
@@ -1313,7 +1313,6 @@ async def _sync_deny_policy_for_catalog(
 
         from dynastore.models.protocols import CatalogsProtocol
         from dynastore.models.protocols.configs import ConfigsProtocol
-        from dynastore.modules.catalog.catalog_config import CollectionPrivacy
         from dynastore.tools.discovery import get_protocol
 
         catalogs_proto = get_protocol(CatalogsProtocol)
@@ -1321,7 +1320,7 @@ async def _sync_deny_policy_for_catalog(
         if catalogs_proto is None or configs_proto is None:
             return
         if not await ItemsElasticsearchPrivateDriver._catalog_has_private_collection(
-            catalogs_proto, configs_proto, catalog_id, CollectionPrivacy,
+            catalogs_proto, configs_proto, catalog_id,
         ):
             await ItemsElasticsearchPrivateDriver._revoke_deny_policy(catalog_id)
     except Exception as exc:
@@ -1554,32 +1553,35 @@ CatalogRoutingConfig.register_validate_handler(cast(_HandlerSig, _validate_catal
 
 
 # ---------------------------------------------------------------------------
-# Privacy cascade (Cycle E.2)
+# Privacy cascade (#733 — routing-config driven)
 # ---------------------------------------------------------------------------
 #
-# Cascade rule (resolved with user 2026-05-05):
+# Cascade rule:
 #   collection-private REQUIRES items-private.  Reverse direction allowed
 #   (items-private + collection-public is a real deployment shape — public
 #   collection list with private item geometry).  Items-public + collection-
-#   private is rejected: it leaks the items index unauthenticated while
-#   denying access to the collection envelope, which would surface item
-#   geometry on /search bypassing the per-collection DENY policy.
+#   private is rejected: it would leak item geometry on /search bypassing
+#   the per-collection DENY policy on the collection envelope index.
 #
-# Detection:
-#   - Collection privacy: ``CollectionPrivacy.is_private == True``.
-#   - Items privacy: presence of ``items_elasticsearch_private_driver`` in
-#     any operation of ``ItemsRoutingConfig.operations``.
+# Detection (privacy is now a property of routing configs — no more
+# ``CollectionPrivacy.is_private`` flag):
+#   - Items privacy:      presence of ``items_elasticsearch_private_driver``
+#                         in any operation of ``ItemsRoutingConfig.operations``.
+#   - Collection privacy: presence of ``collection_elasticsearch_private_driver``
+#                         in any operation of ``CollectionRoutingConfig.operations``.
 #
-# Enforcement points:
-#   1. Apply-time on ``CollectionPrivacy``: if the new ``is_private``
-#      is True, fetch the sibling ``ItemsRoutingConfig`` and require the
-#      private items driver be pinned somewhere.
-#   2. Apply-time on ``ItemsRoutingConfig``: if the new routing drops the
-#      private items driver, fetch the sibling ``CollectionPrivacy``
-#      and reject if the collection still claims ``is_private``.
+# Enforcement points (both registered as validate handlers on the
+# routing configs themselves — pure intra-routing invariant):
+#   1. On ``CollectionRoutingConfig``: if the new routing pins the
+#      collection-private driver, the sibling ``ItemsRoutingConfig`` MUST
+#      pin the items-private driver in some operation.
+#   2. On ``ItemsRoutingConfig``: if the new routing drops the items-private
+#      driver, the sibling ``CollectionRoutingConfig`` must not still pin
+#      the collection-private driver.
 
 
 _PRIVATE_ITEMS_DRIVER_ID = "items_elasticsearch_private_driver"
+_PRIVATE_COLLECTION_DRIVER_ID = "collection_elasticsearch_private_driver"
 
 
 def _items_routing_has_private_driver(routing: "ItemsRoutingConfig") -> bool:
@@ -1592,52 +1594,16 @@ def _items_routing_has_private_driver(routing: "ItemsRoutingConfig") -> bool:
     return False
 
 
-async def _enforce_collection_privacy_cascade(
-    config: PluginConfig,
-    catalog_id: Optional[str],
-    collection_id: Optional[str],
-    db_resource: Optional[Any],
-) -> None:
-    """Apply handler on ``CollectionPrivacy`` — enforce the cascade rule
-    that ``is_private=True`` requires an items routing pinning the
-    private items driver.
-
-    No-op when ``is_private=False`` (public collections impose no cascade
-    on items routing) and at platform/catalog scope (cascade is per-pair).
-    """
-    from dynastore.modules.catalog.catalog_config import CollectionPrivacy
-
-    if not isinstance(config, CollectionPrivacy):
-        return
-    if not config.is_private:
-        return
-    if not catalog_id or not collection_id:
-        return  # platform / catalog scope — N/A
-
-    from dynastore.models.protocols.configs import ConfigsProtocol
-    from dynastore.tools.discovery import get_protocol
-
-    configs = get_protocol(ConfigsProtocol)
-    if configs is None:
-        # Discovery not ready (early test fixture, partial deployment) —
-        # the apply handler on ItemsRoutingConfig will catch the cascade
-        # next time routing is written.
-        return
-    routing = await configs.get_config(
-        ItemsRoutingConfig,
-        catalog_id=catalog_id,
-        collection_id=collection_id,
-    )
-    if not isinstance(routing, ItemsRoutingConfig):
-        return
-    if not _items_routing_has_private_driver(routing):
-        raise ValueError(
-            f"Privacy cascade violation: CollectionPrivacy.is_private=True "
-            f"for {catalog_id!r}/{collection_id!r}, but the items routing "
-            f"does not pin {_PRIVATE_ITEMS_DRIVER_ID!r} in any operation. "
-            f"Add the private items driver to ItemsRoutingConfig (e.g. "
-            f"operations[INDEX]) or set is_private=False."
-        )
+def _collection_routing_has_private_driver(
+    routing: "CollectionRoutingConfig",
+) -> bool:
+    """Return True iff ``collection_elasticsearch_private_driver`` is pinned
+    in any operation of the given collection routing config."""
+    for entries in routing.operations.values():
+        for entry in entries:
+            if entry.driver_ref == _PRIVATE_COLLECTION_DRIVER_ID:
+                return True
+    return False
 
 
 async def _enforce_items_routing_privacy_cascade(
@@ -1646,53 +1612,142 @@ async def _enforce_items_routing_privacy_cascade(
     collection_id: Optional[str],
     db_resource: Optional[Any],
 ) -> None:
-    """Apply handler on ``ItemsRoutingConfig`` — enforce the cascade rule
-    that an items routing without the private driver is incompatible with
-    a collection that claims ``is_private=True``.
+    """Validate-handler on ``ItemsRoutingConfig`` — reject when items
+    routing drops the items-private driver while the sibling
+    ``CollectionRoutingConfig`` still pins the collection-private driver.
     """
     if not isinstance(config, ItemsRoutingConfig):
         return
     if not catalog_id or not collection_id:
-        return
+        return  # platform / catalog scope — N/A
     if _items_routing_has_private_driver(config):
         return  # routing keeps the private driver — cascade satisfied
 
-    from dynastore.modules.catalog.catalog_config import CollectionPrivacy
     from dynastore.models.protocols.configs import ConfigsProtocol
     from dynastore.tools.discovery import get_protocol
 
     configs = get_protocol(ConfigsProtocol)
     if configs is None:
         return
-    coll = await configs.get_config(
-        CollectionPrivacy,
+    coll_routing = await configs.get_config(
+        CollectionRoutingConfig,
         catalog_id=catalog_id,
         collection_id=collection_id,
     )
-    if not isinstance(coll, CollectionPrivacy):
+    if not isinstance(coll_routing, CollectionRoutingConfig):
         return
-    if coll.is_private:
+    if _collection_routing_has_private_driver(coll_routing):
         raise ValueError(
             f"Privacy cascade violation: collection {catalog_id!r}/{collection_id!r} "
-            f"has CollectionPrivacy.is_private=True, but the items "
-            f"routing being applied does not pin "
-            f"{_PRIVATE_ITEMS_DRIVER_ID!r}.  Re-add the private driver to "
-            f"operations[INDEX] (and SEARCH/READ as appropriate) or set "
-            f"the collection's is_private=False first."
+            f"pins {_PRIVATE_COLLECTION_DRIVER_ID!r} in its CollectionRoutingConfig, "
+            f"but the ItemsRoutingConfig being applied does not pin "
+            f"{_PRIVATE_ITEMS_DRIVER_ID!r}. Re-add the private items driver "
+            f"to operations[INDEX] (and SEARCH/READ as appropriate), or drop "
+            f"{_PRIVATE_COLLECTION_DRIVER_ID!r} from the CollectionRoutingConfig first."
         )
 
 
-# Items-side cascade registration — safe at module-load time because the
-# handler body lazy-imports ``CollectionPrivacy`` (avoids the
-# storage→catalog→storage cycle that triggers when a top-level import
-# pulls catalog/catalog_config.py via the pg_sidecars path).
-#
-# The collection-side cascade handler is registered from
-# ``modules/catalog/catalog_config.py`` after ``CollectionPrivacy``
-# is fully defined — see the bottom of that module.
+async def _enforce_collection_routing_privacy_cascade(
+    config: PluginConfig,
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    db_resource: Optional[Any],
+) -> None:
+    """Validate-handler on ``CollectionRoutingConfig`` — reject when a
+    collection routing pins the collection-private driver but the sibling
+    ``ItemsRoutingConfig`` does not pin the items-private driver.
+    """
+    if not isinstance(config, CollectionRoutingConfig):
+        return
+    if not catalog_id or not collection_id:
+        return  # platform / catalog scope — N/A
+    if not _collection_routing_has_private_driver(config):
+        return  # public collection routing — no constraint
+
+    from dynastore.models.protocols.configs import ConfigsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    configs = get_protocol(ConfigsProtocol)
+    if configs is None:
+        # Discovery not ready (early test fixture, partial deployment) —
+        # the items-routing cascade handler catches the violation next
+        # time items routing is written.
+        return
+    items_routing = await configs.get_config(
+        ItemsRoutingConfig,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+    if not isinstance(items_routing, ItemsRoutingConfig):
+        return
+    if not _items_routing_has_private_driver(items_routing):
+        raise ValueError(
+            f"Privacy cascade violation: CollectionRoutingConfig for "
+            f"{catalog_id!r}/{collection_id!r} pins "
+            f"{_PRIVATE_COLLECTION_DRIVER_ID!r}, but the sibling ItemsRoutingConfig "
+            f"does not pin {_PRIVATE_ITEMS_DRIVER_ID!r} in any operation. "
+            f"Pin the private items driver in operations[INDEX] (and SEARCH/READ "
+            f"as appropriate) first, or drop {_PRIVATE_COLLECTION_DRIVER_ID!r} "
+            f"from the CollectionRoutingConfig."
+        )
+
+
+# Cascade registrations — both safe at module-load time because each
+# handler refers only to classes defined in this module.
 ItemsRoutingConfig.register_validate_handler(
     cast(_HandlerSig, _enforce_items_routing_privacy_cascade),
 )
+CollectionRoutingConfig.register_validate_handler(
+    cast(_HandlerSig, _enforce_collection_routing_privacy_cascade),
+)
+
+
+# ---------------------------------------------------------------------------
+# Catalog-level routing defaults seeded onto new collections (#733)
+# ---------------------------------------------------------------------------
+
+
+class CatalogRoutingDefaults(BaseModel):
+    """Optional routing templates seeded onto newly-created collections.
+
+    Embedded inside :class:`CatalogPrivacy.collection_defaults` (see
+    ``modules/catalog/catalog_config.py``). When either template is set,
+    ``apply_catalog_default_routing_seed`` writes it as the per-collection
+    config at collection-create time.
+
+    Defined here (in ``routing_config.py``) rather than in
+    ``catalog_config.py`` to avoid the catalog→routing import cycle:
+    ``CatalogPrivacy`` imports this type from us, and our cascade
+    handlers don't need to know anything about catalog-tier configs.
+
+    Replaces the deleted ``CollectionPrivacyDefaults`` (whose only field
+    was ``is_private: bool``) — privacy is now expressed as the presence
+    of private drivers in the routing templates themselves.
+    """
+
+    items_routing: Mutable[Optional["ItemsRoutingConfig"]] = Field(
+        default=None,
+        description=(
+            "Template seeded as the per-collection ``ItemsRoutingConfig`` "
+            "when a new collection is created in this catalog. When the "
+            "template pins ``items_elasticsearch_private_driver`` in any "
+            "operation the collection is created as items-private."
+        ),
+    )
+
+    collection_routing: Mutable[Optional["CollectionRoutingConfig"]] = Field(
+        default=None,
+        description=(
+            "Template seeded as the per-collection ``CollectionRoutingConfig`` "
+            "when a new collection is created in this catalog. When the "
+            "template pins ``collection_elasticsearch_private_driver`` in any "
+            "operation the collection envelope is routed to the per-tenant "
+            "private collections index."
+        ),
+    )
+
+
+CatalogRoutingDefaults.model_rebuild()
 
 
 # ---------------------------------------------------------------------------

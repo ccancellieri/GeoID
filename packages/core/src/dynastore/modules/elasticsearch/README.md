@@ -6,7 +6,7 @@ This module automatically indexes DynaStore entities (Catalogs, Collections, Ite
 
 The module ships ES-backed driver implementations of the routing-config rails:
 - `catalog_elasticsearch_driver` (`CatalogStore`) — read/write for the platform-wide `{prefix}-catalogs` and `{prefix}-collections` indices.
-- `items_elasticsearch_driver` / `items_elasticsearch_private_driver` (`Indexer` + `ItemsSearchProtocol`) — per-tenant `{prefix}-{cat}-items` indices; the private variant is what `CollectionPrivacy.is_private` collections pin under `ItemsRoutingConfig.operations[INDEX]`.
+- `items_elasticsearch_driver` / `items_elasticsearch_private_driver` (`Indexer` + `ItemsSearchProtocol`) — per-tenant `{prefix}-{cat}-items` indices; the private variant is what "private" collections pin under `ItemsRoutingConfig.operations[INDEX]` (#733 made the private-driver pin the canonical expression of privacy — there is no separate `is_private` flag).
 
 The companion search extension implements `SearchProtocol` (`models/protocols/search.py`), discovered at runtime.
 
@@ -78,17 +78,29 @@ The Docker Compose files in this repository use
 
 ### Per-Catalog Config (runtime-mutable, stored in AlloyDB)
 
-Catalog-tier privacy default is governed by `CatalogPrivacy`
-(`modules/catalog/catalog_config.py`) via the standard configuration API:
+Catalog-tier routing-template defaults are governed by `CatalogPrivacy`
+(`modules/catalog/catalog_config.py`) via the standard configuration API.
+The embedded `CatalogRoutingDefaults` (`modules/storage/routing_config.py`)
+carries optional `items_routing` / `collection_routing` templates seeded
+onto each newly-created collection in the catalog. Setting them to
+private-driver templates auto-seeds new collections as private:
 
 ```
 PUT /configs/catalogs/{catalog_id}/plugins/catalog_privacy
-{ "collection_defaults": { "is_private": true } }
+{
+  "collection_defaults": {
+    "items_routing":      { "operations": { "index": [ { "driver_ref": "items_elasticsearch_private_driver" } ] } },
+    "collection_routing": { "operations": { "index": [ { "driver_ref": "collection_elasticsearch_private_driver" } ] } }
+  }
+}
 ```
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `collection_defaults.is_private` | `bool` | `false` | Seed default for newly-created collections (consumed at collection-create time). Pure data — flipping it does not retroactively re-flag existing collections. Per-collection privacy is governed by `CollectionPrivacy.is_private` at `(platform, catalog, collection, privacy)` (F.0d). |
+| `collection_defaults.items_routing` | `ItemsRoutingConfig?` | `null` | Template seeded as each new collection's `ItemsRoutingConfig`. Pure data — flipping it does not retroactively re-write existing collections. |
+| `collection_defaults.collection_routing` | `CollectionRoutingConfig?` | `null` | Template seeded as each new collection's `CollectionRoutingConfig`. |
+
+Per-collection privacy is expressed by the presence of `items_elasticsearch_private_driver` and/or `collection_elasticsearch_private_driver` in the collection's own routing configs (#733 retired the `CollectionPrivacy.is_private` flag).
 
 ## Index Design & Mappings
 
@@ -109,7 +121,7 @@ Privacy is owned by `items_elasticsearch_private_driver`
 
 1. Writes items as `{geoid, catalog_id, collection_id}` to `{prefix}-geoid-{catalog_id}` — no geometry, no STAC metadata.
 2. Manages its own DENY policies on its lifecycle (apply on `ensure_storage`, revoke on `drop_storage`, restore on lifespan-startup).
-3. Opts out of items-tier auto-default routing (`auto_register_for_routing = frozenset()`); collections turn on the private driver via explicit routing pin or, post-Cycle-E.2/F.0d, via `CollectionPrivacy.is_private = True`.
+3. Opts out of items-tier auto-default routing (`auto_register_for_routing = frozenset()`); collections turn on the private driver via an explicit `ItemsRoutingConfig` pin (#733 — pinning `items_elasticsearch_private_driver` IS the privacy signal).
 
 Geoid lookups remain available via `GET /search/geoid/{geoid}` and `POST /search/geoid` (batch).
 

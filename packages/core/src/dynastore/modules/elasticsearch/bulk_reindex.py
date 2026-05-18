@@ -54,10 +54,11 @@ async def is_es_active_for(catalog_id: str, collection_id: str) -> bool:
     this collection — i.e. ``items_elasticsearch_driver`` is pinned in
     some operation of ``ItemsRoutingConfig``.
 
-    **Privacy safety property** (Cycle E.2): a collection routed *only*
-    through ``items_elasticsearch_private_driver`` (per the privacy
-    cascade when ``CollectionPrivacy.is_private == True``) returns
-    False here.  Callers that gate bulk reindex on this guard therefore
+    **Privacy safety property** (#733): a collection routed *only*
+    through ``items_elasticsearch_private_driver`` (i.e. items routing
+    pins only the private driver — equivalent to the legacy
+    ``is_private=True`` state, now expressed by the routing config
+    itself) returns False here.  Callers that gate bulk reindex on this guard therefore
     cannot accidentally fan out private-collection items into the
     per-tenant *public* index ``{prefix}-{cat}-items`` — the private
     driver writes to ``{prefix}-{cat}-private-items`` via its own

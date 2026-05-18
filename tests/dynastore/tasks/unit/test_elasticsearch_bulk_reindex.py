@@ -307,10 +307,10 @@ async def test_is_es_active_for_matches_snake_case_driver_id():
 
 @pytest.mark.asyncio
 async def test_is_es_active_for_returns_false_for_private_only_routing():
-    """Cycle E.2 privacy safety: a collection whose items routing pins
-    ONLY ``items_elasticsearch_private_driver`` (per the cascade rule
-    when ``CollectionPrivacy.is_private == True``) must return
-    False from ``is_es_active_for``.
+    """#733 privacy safety: a collection whose items routing pins
+    ONLY ``items_elasticsearch_private_driver`` (the routing-config
+    expression of "this collection is private") must return False
+    from ``is_es_active_for``.
 
     Without this property, the catalog bulk-reindex pipeline
     (``BulkCatalogReindexTask``) would fan out the collection's items
@@ -483,10 +483,10 @@ async def test_bypass_matches_dispatcher_bulk_contract():
 async def test_is_es_active_for_returns_true_when_public_and_private_both_pinned():
     """A collection that pins BOTH the public and private items
     drivers (e.g. an operator transitioning OUT of private mode by
-    layering the public driver before flipping ``is_private``) is
-    "es-active" — the bulk-reindex into the public per-tenant index
-    is the right action.  The cascade validator allows this shape:
-    items-private + collection-public is OK.
+    layering the public driver before dropping the private driver)
+    is "es-active" — the bulk-reindex into the public per-tenant
+    index is the right action.  The cascade validator allows this
+    shape (#733): items-private + collection-public is OK.
     """
     from dynastore.modules.elasticsearch.bulk_reindex import is_es_active_for
     from dynastore.modules.storage.routing_config import (
