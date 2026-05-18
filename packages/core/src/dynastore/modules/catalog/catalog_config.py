@@ -26,8 +26,6 @@ from dynastore.models.mutability import Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from typing import Any, ClassVar, List, Optional, Tuple
 
-from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig
-from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import GeometriesSidecarConfig
 from dynastore.modules.storage.routing_config import CatalogRoutingDefaults
 
 
@@ -61,10 +59,6 @@ class CollectionInfo(PluginConfig):
             "image data)."
         ),
     )
-
-
-# Legacy alias
-GeometryStorageConfig = GeometriesSidecarConfig
 
 
 # --- Partitioning (Physical) ---

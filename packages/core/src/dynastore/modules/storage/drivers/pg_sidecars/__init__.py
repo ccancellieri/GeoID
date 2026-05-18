@@ -18,9 +18,6 @@ from .item_metadata_config import ItemMetadataSidecarConfig
 from .registry import SidecarRegistry
 from .resolver import _effective_sidecars
 
-# Deprecated alias — remove in next major version
-SidecarPipelineContext = FeaturePipelineContext
-
 
 def driver_sidecars(driver_or_config: Any) -> List[SidecarConfig]:
     """Return the PG-driver sidecar configs declared on ``driver_or_config``,
@@ -51,7 +48,6 @@ __all__ = [
     "SidecarProtocol",
     "SidecarConfig",
     "FeaturePipelineContext",
-    "SidecarPipelineContext",  # deprecated alias
     "ConsumerType",
     "ValidationResult",
     "FieldDefinition",

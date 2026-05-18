@@ -72,10 +72,6 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     SimplificationAlgorithm,
 )
 
-# Alias for backward compatibility if needed, though type hints should use the new config
-GeometryStorageConfig = GeometriesSidecarConfig
-
-
 # Issue #220: ``_calculate_geometry_hash`` was removed.  ``geometry_hash`` is
 # now a STORED GENERATED column on the geometries sidecar (PG-maintained via
 # ``encode(digest(ST_AsBinary(geom), 'sha256'), 'hex')``).  Application code
@@ -85,7 +81,7 @@ GeometryStorageConfig = GeometriesSidecarConfig
 
 def process_geometry(
     geom_wkb_hex: str,
-    storage_config: GeometryStorageConfig,
+    storage_config: GeometriesSidecarConfig,
     source_srid: Optional[int] = None,
     write_behavior: Optional["GeometriesWriteBehavior"] = None,
 ) -> Dict[str, Any]:
