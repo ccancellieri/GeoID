@@ -342,14 +342,24 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         priority=25,
     )
     async def provide_logs_dashboard_page(self, request: Request):
-        """Serve the embedded logs dashboard fragment."""
+        """Serve the embedded logs dashboard fragment.
+
+        Injects the active FastAPI ``root_path`` (e.g. ``/geospatial/v2/api``)
+        into the page so the in-browser probes (``/logs/_dashboards_health``
+        and ``_dashboards_config``) hit the correct mount instead of the
+        origin root. Without this the JSON fetches 404 and the page falsely
+        claims ES is unreachable (#935).
+        """
         html_path = os.path.join(
             os.path.dirname(__file__), "static", "logs-dashboard.html"
         )
         if not os.path.exists(html_path):
             raise HTTPException(status_code=404, detail="Logs dashboard template not found.")
         with open(html_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(f.read())
+            html = f.read()
+        prefix = (request.scope.get("root_path") or "").rstrip("/")
+        html = html.replace("__API_PREFIX__", prefix)
+        return HTMLResponse(html)
 
     @expose_web_page(
         page_id="catalog_logs",
