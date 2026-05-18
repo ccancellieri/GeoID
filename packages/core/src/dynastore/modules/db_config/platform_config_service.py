@@ -55,6 +55,8 @@ from dynastore.tools.cache import cached
 
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
+    DQLQuery,
+    ResultHandler,
     managed_transaction,
     DbResource,
 )
@@ -232,10 +234,11 @@ async def _collection_is_materialized(
         return False
     if not await check_table_exists(conn, phys_table, phys_schema):
         return False
-    row = await conn.fetchrow(
-        f'SELECT 1 FROM "{phys_schema}"."{phys_table}" LIMIT 1'
-    )
-    return row is not None
+    res = await DQLQuery(
+        f'SELECT 1 FROM "{phys_schema}"."{phys_table}" LIMIT 1',
+        result_handler=ResultHandler.SCALAR,
+    ).execute(conn)
+    return res is not None
 
 
 async def _catalog_is_materialized(
@@ -259,10 +262,11 @@ async def _catalog_is_materialized(
         return False
     if not await check_table_exists(conn, "collections", phys_schema):
         return False
-    row = await conn.fetchrow(
-        f'SELECT 1 FROM "{phys_schema}"."collections" LIMIT 1'
-    )
-    return row is not None
+    res = await DQLQuery(
+        f'SELECT 1 FROM "{phys_schema}"."collections" LIMIT 1',
+        result_handler=ResultHandler.SCALAR,
+    ).execute(conn)
+    return res is not None
 
 
 async def _platform_is_materialized(conn: Any) -> bool:
@@ -270,8 +274,11 @@ async def _platform_is_materialized(conn: Any) -> bool:
     from dynastore.modules.db_config.locking_tools import check_table_exists
     if not await check_table_exists(conn, "catalogs", "configs"):
         return False
-    row = await conn.fetchrow('SELECT 1 FROM "configs"."catalogs" LIMIT 1')
-    return row is not None
+    res = await DQLQuery(
+        'SELECT 1 FROM "configs"."catalogs" LIMIT 1',
+        result_handler=ResultHandler.SCALAR,
+    ).execute(conn)
+    return res is not None
 
 
 def __configs_protocol_ref():

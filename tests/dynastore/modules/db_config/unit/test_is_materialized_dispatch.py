@@ -241,3 +241,70 @@ def test_no_bare_except_exception_in_is_materialized():
         "is_materialized must not catch bare Exception — narrow the catch "
         "via _EXPECTED_ABSENT_LAYER so code bugs propagate (see #796)."
     )
+
+
+# ---------------------------------------------------------------------------
+# #917 — _collection/_catalog/_platform_is_materialized must route through
+# the DQLQuery/DDLQuery polymorphic dispatcher, never asyncpg-only conn API
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fn_name",
+    ["_collection_is_materialized", "_catalog_is_materialized", "_platform_is_materialized"],
+)
+def test_no_raw_asyncpg_conn_calls_in_is_materialized_helpers(fn_name):
+    """Issue #917: the three ``_*_is_materialized`` helpers used to call
+    ``await conn.fetchrow(...)`` directly. ``fetchrow`` / ``fetch`` /
+    ``fetchval`` are asyncpg-only — the HTTP service path passes a
+    SQLAlchemy ``AsyncConnection`` and sync tasks pass a SQLAlchemy
+    ``SAConnection``; both lack those attributes, so any direct call
+    500s with ``AttributeError`` on the very first immutable-config
+    update against a materialised resource.
+
+    The fix routes every PG query through ``DQLQuery(...).execute(conn)``
+    (the same abstraction ``check_table_exists`` uses one line above),
+    which dispatches on conn type and works for both runtimes.
+    """
+    import inspect
+
+    fn = getattr(svc, fn_name)
+    source = inspect.getsource(fn)
+    for forbidden in ("conn.fetchrow", "conn.fetch(", "conn.fetchval"):
+        assert forbidden not in source, (
+            f"{fn.__qualname__} contains `{forbidden}` — asyncpg-only API. "
+            f"Route through DQLQuery/DDLQuery so both async services "
+            f"(AsyncConnection) and sync tasks (SAConnection) work. "
+            f"See issue #917."
+        )
+
+
+@pytest.mark.asyncio
+async def test_platform_is_materialized_does_not_touch_fetchrow_attr():
+    """End-to-end exec proof: drive ``_platform_is_materialized`` against
+    a strict ``AsyncConnection``-spec mock (which raises AttributeError
+    on ``.fetchrow``) and assert it returns cleanly. The pre-#917 code
+    would AttributeError here; the DQLQuery rewrite goes through the
+    SQLAlchemy ``conn.execute()`` path."""
+    from sqlalchemy.engine.cursor import CursorResult
+
+    fake_conn = MagicMock(spec=AsyncConnection)
+
+    async def _fake_execute(*_a, **_kw):
+        cursor = MagicMock(spec=CursorResult)
+        cursor.scalar.return_value = 1
+        return cursor
+
+    fake_conn.execute = AsyncMock(side_effect=_fake_execute)
+    # check_table_exists must say "table exists" so we reach the SELECT-1.
+    # Patched at the import source — _platform_is_materialized does a
+    # lazy ``from .locking_tools import check_table_exists`` inside its body.
+    with patch(
+        "dynastore.modules.db_config.locking_tools.check_table_exists",
+        new=AsyncMock(return_value=True),
+    ):
+        result = await svc._platform_is_materialized(fake_conn)
+    assert result is True
+    assert not hasattr(fake_conn, "fetchrow") or not fake_conn.fetchrow.called, (
+        "_platform_is_materialized must not call asyncpg-only conn.fetchrow"
+    )
