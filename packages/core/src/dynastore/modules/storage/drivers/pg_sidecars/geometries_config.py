@@ -250,12 +250,18 @@ class GeometriesSidecarConfig(SidecarConfig):
     geohash_precision: Optional[int] = Field(
         default=8, ge=1, le=12,
         description=(
-            "If set, a STORED generated column `geohash CHAR(N)` (N=precision, 1-12) "
-            "is added to the geometry sidecar, populated by ST_GeoHash(geom, N), "
-            "with a B-tree index.  Used by ItemsWritePolicy.IdentityMatcher.GEOHASH "
-            "for spatial-locality-based deduplication on write. Default 8 (≈20 m, ≈38 bits) — "
-            "small storage cost, useful out-of-the-box for spatial dedup. Set to None to "
-            "opt out for collections where the column would be wasted."
+            "STORAGE-side precision: when set, a STORED generated column "
+            "``geohash CHAR(N)`` (N=precision, 1-12) is added to the geometry "
+            "sidecar, populated by ``ST_GeoHash(geom, N)``, with a B-tree index. "
+            "Useful as a coarse spatial-locality B-tree for ad-hoc queries. "
+            "Distinct from ``ItemsWritePolicy.geohash_precision`` — that knob "
+            "drives the runtime identity match (``ST_GeoHash(geom, M)`` computed "
+            "on-the-fly), this knob drives the persisted column. The two values "
+            "do NOT have to agree (and typically won't, e.g. policy M=9 for "
+            "5m-cell identity vs column N=8 for 20m-cell scan acceleration). "
+            "Default 8 (≈20 m, ≈38 bits) — small storage cost, useful "
+            "out-of-the-box for spatial dedup. Set to None to opt out for "
+            "collections where the column would be wasted."
         ),
     )
 

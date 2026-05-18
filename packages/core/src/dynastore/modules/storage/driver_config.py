@@ -444,10 +444,16 @@ class ItemsWritePolicy(PluginConfig):
         examples=[6, 9, 12],
         description=(
             "ST_GeoHash precision used when ``IdentityMatcher.GEOHASH`` is "
-            "active. Cell sizes (latitude-dependent at the equator): "
+            "active — the IDENTITY axis (what 'same place' means on write). "
+            "Cell sizes (latitude-dependent at the equator): "
             "1≈5000km, 4≈40km, 6≈1.2km, 9≈5m, 12≈4cm. Pick by what 'same place' "
             "means in your dataset: 6 for cities, 9 for parcels, 12 for points "
-            "of interest."
+            "of interest. "
+            "Distinct from ``GeometriesSidecarConfig.geohash_precision`` "
+            "(``CHAR(N)`` column width emitted by the geometry sidecar DDL) — "
+            "those control different layers (identity vs storage). Matching is "
+            "computed on-the-fly via ``ST_GeoHash(geom, N)`` from this value, "
+            "NOT read from the stored sidecar column."
         ),
     )
     skip_if_unchanged_geometry_hash: Mutable[bool] = Field(
