@@ -181,7 +181,7 @@ _PROCESSING_FIELDS: Dict[str, Dict[str, Any]] = {
     "processing:level":     {"type": "keyword"},
     "processing:datetime":  {"type": "date"},
     "processing:software":  {"type": "object", "enabled": False},
-    "processing:lineage":   {"type": "text", "index": False, "doc_values": False},
+    "processing:lineage":   {"type": "text", "index": False},
     "processing:facility":  {"type": "keyword"},
     "processing:expression": {"type": "keyword", "index": False, "doc_values": False},
 }

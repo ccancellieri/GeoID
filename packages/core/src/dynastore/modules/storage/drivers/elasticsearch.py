@@ -854,10 +854,12 @@ class ItemsElasticsearchDriver(
                     index_name, len(known_fields),
                 )
             except Exception as exc:
+                if "resource_already_exists" not in str(exc):
+                    raise
                 logger.warning(
                     "ItemsElasticsearchDriver.ensure_storage: create('%s') "
-                    "failed: %s — assuming concurrent create",
-                    index_name, exc,
+                    "lost race to a concurrent create — proceeding",
+                    index_name,
                 )
 
         # Idempotent — safe even if the index was already a member.

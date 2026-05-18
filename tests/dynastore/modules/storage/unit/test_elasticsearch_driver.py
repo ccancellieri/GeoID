@@ -409,6 +409,68 @@ class TestEnsureStorageTenantIndex:
         assert es.indices.create_calls == []
         assert added == ["dynastore-cat1-items"]
 
+    @pytest.mark.asyncio
+    async def test_propagates_mapper_parsing_exception(self):
+        # Regression for #913: ensure_storage previously swallowed every
+        # exception as "concurrent create", masking mapping bugs and leaving
+        # the tenant index missing while later writes silently no-oped.
+        es = _StubEs(exists=False)
+
+        async def _boom(*, index, body=None, **kwargs):
+            raise RuntimeError(
+                "RequestError(400, 'mapper_parsing_exception', "
+                "'unknown parameter [doc_values] on mapper [foo] of type [text]')"
+            )
+
+        es.indices.create = _boom  # type: ignore[method-assign]
+
+        async def _add(index_name):
+            pass
+
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch(
+            "dynastore.modules.elasticsearch.aliases.add_index_to_public_alias",
+            new=_add,
+        ):
+            driver = ItemsElasticsearchDriver()
+            with pytest.raises(RuntimeError, match="mapper_parsing_exception"):
+                await driver.ensure_storage("cat1")
+
+    @pytest.mark.asyncio
+    async def test_swallows_concurrent_create_race(self):
+        # The one benign case: a concurrent worker won the create race.
+        es = _StubEs(exists=False)
+
+        async def _race(*, index, body=None, **kwargs):
+            raise RuntimeError(
+                "RequestError(400, 'resource_already_exists_exception', "
+                "'index [dynastore-cat1-items/abc] already exists')"
+            )
+
+        es.indices.create = _race  # type: ignore[method-assign]
+        added: list = []
+
+        async def _add(index_name):
+            added.append(index_name)
+
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch(
+            "dynastore.modules.elasticsearch.aliases.add_index_to_public_alias",
+            new=_add,
+        ):
+            driver = ItemsElasticsearchDriver()
+            await driver.ensure_storage("cat1")
+
+        assert added == ["dynastore-cat1-items"]
+
 
 class TestDeleteEntitiesUsesRouting:
     @pytest.mark.asyncio
