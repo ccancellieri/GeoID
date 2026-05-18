@@ -465,15 +465,26 @@ class ItemsRoutingConfig(PluginConfig):
             # the historical rationale that produced the listener; the
             # outbox drain task supersedes it.
             #
-            # READ orders ES first for fast simplified-geometry search; PG
-            # carries the ``geometry_exact`` hint so a consumer can request
-            # exact geometries via ``get_driver(..., hint="geometry_exact")``.
+            # READ is **hint-selected**, not chained: ``get_driver``
+            # returns the FIRST entry whose ``hints`` match the caller's
+            # ``hint=`` (router.py:289 ``resolved[0]``). ES carries
+            # ``GEOMETRY_SIMPLIFIED`` (default fast path); PG carries
+            # ``GEOMETRY_EXACT`` / ``TILES`` and is only reached when the
+            # consumer asks for that hint. There is no runtime fallback
+            # from ES to PG on empty results — an empty ES response is
+            # treated as success-with-zero-rows (item_query.py
+            # ``_try_driver_dispatch`` returns a non-None ``QueryResponse``
+            # with an empty stream). #914 surfaces the consequence: silent
+            # upstream indexing failures are invisible at the read path.
             #
-            # SEARCH mirrors READ — ES first, PG fallback. The explicit
-            # default here overrides the auto-discovery dispatch in
+            # SEARCH lists ES then PG, but ``get_driver`` still picks the
+            # first registered match. The PG entry is a bootstrap-time
+            # tie-breaker for when ES driver registration is missing
+            # (operator misconfigured deployment), NOT a runtime fallback
+            # for ES returning empty. Keeping the explicit pair pins
+            # driver order against the auto-discovery dispatch in
             # ``_self_register_searchers_into``, which would otherwise
-            # register drivers in arbitrary order and could place PG
-            # ahead of ES at collection scope.
+            # register drivers in arbitrary order.
             Operation.WRITE: [
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",

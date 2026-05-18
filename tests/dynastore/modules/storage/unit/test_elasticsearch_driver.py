@@ -747,3 +747,230 @@ class TestLocationReportsTenantIndex:
         assert loc.identifiers["index"] == "dynastore-cat1-items"
         assert loc.identifiers["routing"] == "col1"
         assert loc.canonical_uri == "es://dynastore-cat1-items?routing=col1"
+
+
+# --- #914 — pin index_bulk response-shape parsing + silent no-op WARN ---
+
+class _StubEsBulk:
+    """Minimal ES client stub whose ``bulk`` returns a caller-provided shape."""
+
+    def __init__(self, bulk_response):
+        self._bulk_response = bulk_response
+        self.bulk_calls: list = []
+
+    async def bulk(self, *, body, params=None, **kwargs):
+        self.bulk_calls.append({"body": body, "params": params})
+        return self._bulk_response
+
+
+def _make_op(entity_id="f1", *, op_type="upsert", entity_type="item", payload=None):
+    from dynastore.models.protocols.indexer import IndexOp
+
+    return IndexOp(
+        op_type=op_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        payload=payload or {
+            "id": entity_id, "type": "Feature", "collection": "col1",
+            "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+            "properties": {},
+        },
+    )
+
+
+def _make_ctx():
+    from dynastore.models.protocols.indexer import IndexContext
+
+    return IndexContext(catalog="cat1", collection="col1", entity_type="item")
+
+
+def _patch_bulk_dependencies(es):
+    """Wire the module-level helpers used inside ``index_bulk``."""
+    return [
+        patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ),
+        patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ),
+        patch(
+            "dynastore.modules.storage.drivers.elasticsearch._ensure_in_public_alias_once",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "dynastore.modules.elasticsearch.items_projection.resolve_catalog_known_fields",
+            new=AsyncMock(return_value={}),
+        ),
+    ]
+
+
+class TestIndexBulkResponseShapes:
+    """Pin response-shape parsing for ``ItemsElasticsearchDriver.index_bulk``.
+
+    The dispatcher logs ``post_commit_inline`` whenever ``BulkResult.failed == 0``
+    (``index_dispatcher.py``), so a ``(total>0, succeeded=0, failed=0)`` result
+    is invisible without the #914 WARN. These tests pin:
+
+    * happy path → no WARN, succeeded matches op count
+    * per-item error → no WARN, failed matches
+    * silent no-op (resp.items empty) → WARN fires, BulkResult shape preserved
+    * resp is not a dict → WARN fires with ``resp_type`` reflecting actual type
+    """
+
+    @pytest.mark.asyncio
+    async def test_happy_path_succeeded_matches_ops(self, caplog):
+        es = _StubEsBulk({
+            "errors": False,
+            "items": [
+                {"index": {"_id": "f1", "result": "created", "status": 201}},
+                {"index": {"_id": "f2", "result": "created", "status": 201}},
+            ],
+        })
+        ops = [_make_op("f1"), _make_op("f2")]
+        ctx = _make_ctx()
+
+        with caplog.at_level("WARNING"):
+            patches = _patch_bulk_dependencies(es)
+            for p in patches:
+                p.start()
+            try:
+                driver = ItemsElasticsearchDriver()
+                result = await driver.index_bulk(ctx, ops)
+            finally:
+                for p in patches:
+                    p.stop()
+
+        assert result.total == 2
+        assert result.succeeded == 2
+        assert result.failed == 0
+        assert "ES bulk returned a shape" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_per_item_error_counted_as_failed(self, caplog):
+        es = _StubEsBulk({
+            "errors": True,
+            "items": [
+                {"index": {"_id": "f1", "result": "created", "status": 201}},
+                {"index": {
+                    "_id": "f2", "status": 400,
+                    "error": {"type": "mapper_parsing", "reason": "boom"},
+                }},
+            ],
+        })
+        ops = [_make_op("f1"), _make_op("f2")]
+        ctx = _make_ctx()
+
+        with caplog.at_level("WARNING"):
+            patches = _patch_bulk_dependencies(es)
+            for p in patches:
+                p.start()
+            try:
+                driver = ItemsElasticsearchDriver()
+                result = await driver.index_bulk(ctx, ops)
+            finally:
+                for p in patches:
+                    p.stop()
+
+        assert result.total == 2
+        assert result.succeeded == 1
+        assert result.failed == 1
+        assert result.failures[0]["id"] == "f2"
+        assert "boom" in result.failures[0]["reason"]
+        assert "ES bulk returned a shape" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_silent_noop_empty_items_triggers_warn(self, caplog):
+        """The #914 fingerprint: bulk responded but ``items`` is empty.
+
+        Either the request didn't reach ES (network shape bug) or ES
+        rejected every op at a layer that returns no per-item rows. The
+        WARN line dumps ``resp_type`` / ``resp_keys`` / ``items_len`` /
+        ``errors`` so an operator can disambiguate from the log.
+        """
+        es = _StubEsBulk({"errors": False, "items": []})
+        ops = [_make_op("f1"), _make_op("f2")]
+        ctx = _make_ctx()
+
+        with caplog.at_level("WARNING"):
+            patches = _patch_bulk_dependencies(es)
+            for p in patches:
+                p.start()
+            try:
+                driver = ItemsElasticsearchDriver()
+                result = await driver.index_bulk(ctx, ops)
+            finally:
+                for p in patches:
+                    p.stop()
+
+        assert result.total == 2
+        assert result.succeeded == 0
+        assert result.failed == 0
+        assert "ES bulk returned a shape" in caplog.text
+        assert "items_len=0" in caplog.text
+        assert "resp_type=dict" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_silent_noop_non_dict_response_triggers_warn(self, caplog):
+        """Defence-in-depth: if some future client returns a non-dict (e.g. an
+        ObjectApiResponse-like wrapper), the parser short-circuits ``items``
+        to ``[]`` and the WARN must surface the actual type."""
+
+        class _NotADict:
+            def __repr__(self):
+                return "<NotADict>"
+
+        es = _StubEsBulk(_NotADict())
+        ops = [_make_op("f1")]
+        ctx = _make_ctx()
+
+        with caplog.at_level("WARNING"):
+            patches = _patch_bulk_dependencies(es)
+            for p in patches:
+                p.start()
+            try:
+                driver = ItemsElasticsearchDriver()
+                result = await driver.index_bulk(ctx, ops)
+            finally:
+                for p in patches:
+                    p.stop()
+
+        assert result.total == 1
+        assert result.succeeded == 0
+        assert result.failed == 0
+        assert "ES bulk returned a shape" in caplog.text
+        assert "resp_type=_NotADict" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_all_ops_skipped_by_entity_type_filter_returns_early(self, caplog):
+        """When every op has ``entity_type != 'item'``, ``body`` stays empty
+        and the early ``return BulkResult(total=len(ops))`` at the
+        ``if not body:`` guard fires — BEFORE the silent-no-op WARN block.
+
+        Pinning this gap so a future refactor that swaps the early-return
+        for the parse path forces an explicit decision: should a misrouted
+        batch (no items reached ES) WARN or stay silent?
+        """
+        ops = [
+            _make_op("c1", entity_type="catalog"),
+            _make_op("co1", entity_type="collection"),
+        ]
+        ctx = _make_ctx()
+        es = _StubEsBulk({"errors": False, "items": []})  # would WARN if reached
+
+        with caplog.at_level("WARNING"):
+            patches = _patch_bulk_dependencies(es)
+            for p in patches:
+                p.start()
+            try:
+                driver = ItemsElasticsearchDriver()
+                result = await driver.index_bulk(ctx, ops)
+            finally:
+                for p in patches:
+                    p.stop()
+
+        assert result.total == 2
+        assert result.succeeded == 0
+        assert result.failed == 0
+        assert es.bulk_calls == []
+        assert "ES bulk returned a shape" not in caplog.text
