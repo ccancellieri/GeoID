@@ -562,7 +562,20 @@ class ItemQueryMixin:
                         break
 
             if not rows:
-                # Fallback: try direct geoid match (item_id may already be the geoid)
+                # Fallback: try direct geoid match (item_id may already be the geoid).
+                # geoid is UUID-typed; if the path id isn't a UUID it cannot match
+                # — return 0 instead of asking asyncpg to bind a non-UUID string
+                # (which raises DataError before the query reaches PG). See #942:
+                # this fires when the row's id surface == external_id but the
+                # sidecar lookup above missed (no sidecar, or feature_id_field_name
+                # unset for that sidecar).
+                import uuid as _uuid
+
+                try:
+                    _uuid.UUID(str(item_id))
+                except (ValueError, AttributeError, TypeError):
+                    return 0
+
                 from dynastore.modules.catalog.item_service import soft_delete_item_query
 
                 rows = await soft_delete_item_query.execute(
