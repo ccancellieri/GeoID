@@ -52,12 +52,42 @@ async def _pending_rows(task_app_state, monkeypatch):
     """Plant N PENDING/retry_count=0 rows targeting one dead capability,
     aged past the production minimum. Forces the oracle to ``not live``.
     Cleans up the rows it created on teardown.
+
+    Suppresses competing service tasks (dispatcher / queue_listener /
+    proactive sweep) launched by ``TasksModule.lifespan``. Without this,
+    the dispatcher CLAIMs a planted PENDING row, the patched oracle
+    reports ``not live``, ``reset_task_to_pending`` bumps ``retry_count``
+    to 1, and the bulk DLQ SQL (``WHERE retry_count = 0``) skips the
+    row — leaving one row in PENDING and failing the "all rows
+    DEAD_LETTER" assertion. The load-bearing invariant ("two concurrent
+    ``sweep_dead_capability_rows`` calls serialise to one winner via
+    ``pg_try_advisory_xact_lock``") is purely a property of the sweep
+    path; isolating it from the live dispatcher keeps the test
+    deterministic.
     """
+    from dynastore.modules.concurrency import _background_tasks
     from dynastore.modules.tasks import capability_oracle
 
     cap_id = f"dead-cap-{uuid.uuid4().hex[:10]}"
     engine = task_app_state.engine
     task_schema = tasks_module.get_task_schema()
+
+    # Cancel competing background services. ``BackgroundExecutor.submit``
+    # names tasks ``<executor>:service:<name>``; match by substring so we
+    # remain robust to the executor prefix.
+    _COMPETING = (
+        "service:dispatcher",
+        "service:queue_listener",
+        "service:proactive_capability_sweep",
+    )
+    competing = [
+        t for t in list(_background_tasks)
+        if not t.done() and any(s in (t.get_name() or "") for s in _COMPETING)
+    ]
+    for t in competing:
+        t.cancel()
+    if competing:
+        await asyncio.gather(*competing, return_exceptions=True)
 
     async def _fake_is_live(_cap_id: str) -> bool:  # noqa: D401
         return False
@@ -133,16 +163,13 @@ async def test_concurrent_sweep_advisory_lock_serialises_one_winner(_pending_row
     assert len(nonzero) == 1 and len(zero) == 1, (
         f"advisory lock must serialise to one winner + one loser; got {results}"
     )
-    # The live dispatcher's reactive reaper runs concurrently with our
-    # sweep against the same rows (TasksModule lifespan is active).
-    # Whichever path drains a given row first wins it; the union of
-    # both paths still drains every row. The sweep's nonzero count is
-    # therefore ``<= len(inserted)`` (some rows may have been beaten to
-    # DEAD_LETTER by the dispatcher's per-row CAS path before our sweep
-    # ran the bulk UPDATE).
-    assert 0 < nonzero[0] <= len(inserted), (
-        f"winner must DLQ at least one and at most {len(inserted)} rows; "
-        f"got {nonzero[0]}"
+    # With the dispatcher / queue-listener / proactive-sweep service
+    # tasks cancelled in the fixture, the winning sweep is the only
+    # path touching the planted rows — so it MUST DLQ every one of
+    # them in a single bulk UPDATE.
+    assert nonzero[0] == len(inserted), (
+        f"winner must DLQ all {len(inserted)} planted rows in one bulk "
+        f"UPDATE; got {nonzero[0]}"
     )
 
     # Verify in PG: all rows are DEAD_LETTER + carry the dead-cap error_message.
