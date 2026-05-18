@@ -23,7 +23,7 @@ OpenAPI tag (``Authentication``, ``IAM Governance``, ``Authorization
 Management``, ``Admin``, ...). Swagger UI groups operations by tag, so the
 auth/identity surface ended up scattered across many sections. The fix
 hoists a single shared tag — ``Authentication & Authorization`` — to every
-router under ``/auth``, ``/iam``, and ``/admin/users``, and adds a matching
+router under ``/auth``, ``/iam``, and ``/admin/principals``, and adds a matching
 top-level ``tags`` entry inside ``build_iam_openapi_schema``.
 """
 
@@ -40,7 +40,7 @@ from dynastore.extensions.admin.admin_service import AdminService
 
 
 _AUTHN_AUTHZ_TAG = "Authentication & Authorization"
-_AUTHN_AUTHZ_PATH_RE = re.compile(r"^/(auth|iam|admin/users)(/|$)")
+_AUTHN_AUTHZ_PATH_RE = re.compile(r"^/(auth|iam|admin/principals)(/|$)")
 
 
 def _build_app_with_auth_routers() -> FastAPI:
@@ -64,7 +64,7 @@ def _build_app_with_auth_routers() -> FastAPI:
     # IamExtension would otherwise mount it at.
     app.include_router(iam_me_router, prefix="/iam")
 
-    # Admin extension owns /admin (including /admin/users).
+    # Admin extension owns /admin (including /admin/principals).
     admin_ext = AdminService()
     app.include_router(admin_ext.router)
 
@@ -72,7 +72,7 @@ def _build_app_with_auth_routers() -> FastAPI:
 
 
 def test_auth_routes_carry_authn_tag(monkeypatch):
-    """Every operation under /auth, /iam, or /admin/users carries exactly
+    """Every operation under /auth, /iam, or /admin/principals carries exactly
     the shared tag — never the legacy per-extension tag, never two tags."""
     monkeypatch.delenv("IDP_ISSUER_URL", raising=False)
     monkeypatch.delenv("IDP_PUBLIC_URL", raising=False)
@@ -96,7 +96,7 @@ def test_auth_routes_carry_authn_tag(monkeypatch):
             )
 
     assert matched_any, (
-        "No paths matched /auth, /iam, or /admin/users — the test fixture "
+        "No paths matched /auth, /iam, or /admin/principals — the test fixture "
         "did not mount the routers correctly."
     )
 

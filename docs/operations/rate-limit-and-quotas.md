@@ -139,7 +139,7 @@ curl -X POST "$BASE/admin/roles" \
 ### 3. Assign the role to a user
 
 ```bash
-curl -X PUT "$BASE/admin/users/$PRINCIPAL_ID" \
+curl -X PUT "$BASE/admin/principals/$PRINCIPAL_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"roles": ["exports-tier-2"]}'

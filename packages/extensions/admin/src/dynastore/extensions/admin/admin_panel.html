@@ -474,7 +474,7 @@ async function loadCatalogUsers() {
   }
   tb.innerHTML = '<tr><td colspan="5" class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading…</td></tr>';
   try {
-    const users = await apiFetch(`/catalogs/${encodeURIComponent(cat)}/users`);
+    const users = await apiFetch(`/catalogs/${encodeURIComponent(cat)}/principals`);
     if (!users || !users.length) {
       tb.innerHTML = `<tr><td colspan="5" class="empty">No principals have access to <strong>${escapeHtml(cat)}</strong>. Click <em>Grant Access</em> to add one.</td></tr>`;
       return;

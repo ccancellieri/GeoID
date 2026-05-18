@@ -170,14 +170,14 @@ class AdminService(ExtensionProtocol):
         yield
 
     # -------------------------------------------------------------------------
-    # User Management (/admin/users)
+    # Principal Management (/admin/principals)
     # -------------------------------------------------------------------------
 
     @router.get(
-        "/users",
+        "/principals",
         summary="List or search principals (filterable by provider, identifier, role, catalog)",
     )
-    async def list_users(
+    async def list_principals(
         limit: int = Query(50, ge=1, le=500),  # type: ignore[reportGeneralTypeIssues]
         offset: int = Query(0, ge=0),
         provider: Optional[str] = Query(
@@ -223,8 +223,8 @@ class AdminService(ExtensionProtocol):
             ))
         return out
 
-    @router.post("/users", summary="Create a principal (local user or raw)", status_code=201)
-    async def create_user(request: Request, body: UserCreate):  # type: ignore[reportGeneralTypeIssues]
+    @router.post("/principals", summary="Create a principal (local user or raw)", status_code=201)
+    async def create_principal(request: Request, body: UserCreate):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
 
         # Privilege-escalation guard: only sysadmins can mint a principal
@@ -280,8 +280,8 @@ class AdminService(ExtensionProtocol):
             is_active=created.is_active,
         )
 
-    @router.get("/users/{principal_id}", summary="Get user details")
-    async def get_user(principal_id: UUID):  # type: ignore[reportGeneralTypeIssues]
+    @router.get("/principals/{principal_id}", summary="Get principal details")
+    async def get_principal(principal_id: UUID):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
         p = await mgr.get_principal(principal_id)
         if not p:
@@ -292,8 +292,8 @@ class AdminService(ExtensionProtocol):
             display_name=p.display_name, roles=list(granted), is_active=p.is_active,
         )
 
-    @router.put("/users/{principal_id}", summary="Update user")
-    async def update_user(request: Request, principal_id: UUID, body: UserUpdate):  # type: ignore[reportGeneralTypeIssues]
+    @router.put("/principals/{principal_id}", summary="Update principal")
+    async def update_principal(request: Request, principal_id: UUID, body: UserUpdate):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
         p = await mgr.get_principal(principal_id)
         if not p:
@@ -317,8 +317,8 @@ class AdminService(ExtensionProtocol):
             display_name=updated.display_name, roles=updated.roles, is_active=updated.is_active,
         )
 
-    @router.delete("/users/{principal_id}", status_code=204, summary="Delete user")
-    async def delete_user(request: Request, principal_id: UUID):  # type: ignore[reportGeneralTypeIssues]
+    @router.delete("/principals/{principal_id}", status_code=204, summary="Delete principal")
+    async def delete_principal(request: Request, principal_id: UUID):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
         p = await mgr.get_principal(principal_id)
         if p:
@@ -565,8 +565,11 @@ class AdminService(ExtensionProtocol):
             catalog_schema=await mgr.resolve_schema(catalog_id),
         )
 
-    @router.get("/catalogs/{catalog_id}/users", summary="List users assigned to a catalog")
-    async def list_catalog_users(catalog_id: str):  # type: ignore[reportGeneralTypeIssues]
+    @router.get(
+        "/catalogs/{catalog_id}/principals",
+        summary="List principals assigned to a catalog",
+    )
+    async def list_catalog_principals(catalog_id: str):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
         await _assert_catalog_exists(catalog_id)
         catalog_schema = await mgr.resolve_schema(catalog_id)

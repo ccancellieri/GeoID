@@ -1043,7 +1043,7 @@ class IamService:
         # than degrading to anonymous — degrading would let invalid-token
         # callers reach handlers gated only by ``role != anonymous`` and
         # bypass sysadmin checks on endpoints like POST /stac/catalogs,
-        # GET /admin/users, GET /logs/system. (issues #415/#416/#417)
+        # GET /admin/principals, GET /logs/system. (issues #415/#416/#417)
         raise InvalidAuthTokenError(
             "Authorization token present but could not be validated"
         )

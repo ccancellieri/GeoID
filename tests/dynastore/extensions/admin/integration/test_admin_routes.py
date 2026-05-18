@@ -2,10 +2,10 @@
 Integration tests for the Admin extension.
 
 Covers read-only admin endpoints exercised by the sysadmin client:
-- GET /admin/users              — list/search principals (q/role/catalog_id/provider)
+- GET /admin/principals              — list/search principals (q/role/catalog_id/provider)
 - GET /admin/roles              — list roles
 - GET /admin/policies           — list policies
-- GET /admin/catalogs/{id}/users           — list users assigned to a catalog
+- GET /admin/catalogs/{id}/principals           — list users assigned to a catalog
 
 Scope-first role-grant endpoints (Option B unified grants model):
 - POST /admin/platform/principals/{pid}/roles                   — grant platform role
@@ -39,8 +39,8 @@ MARKER = pytest.mark.enable_extensions("features")
 @MARKER
 @pytest.mark.asyncio
 async def test_list_users_returns_200(sysadmin_in_process_client: AsyncClient):
-    """GET /admin/users — returns 200 with a list."""
-    r = await sysadmin_in_process_client.get("/admin/users")
+    """GET /admin/principals — returns 200 with a list."""
+    r = await sysadmin_in_process_client.get("/admin/principals")
     assert r.status_code == 200
     data = r.json()
     assert isinstance(data, list)
@@ -49,8 +49,8 @@ async def test_list_users_returns_200(sysadmin_in_process_client: AsyncClient):
 @MARKER
 @pytest.mark.asyncio
 async def test_list_users_pagination(sysadmin_in_process_client: AsyncClient):
-    """GET /admin/users?limit=1 — pagination parameters accepted."""
-    r = await sysadmin_in_process_client.get("/admin/users", params={"limit": 1})
+    """GET /admin/principals?limit=1 — pagination parameters accepted."""
+    r = await sysadmin_in_process_client.get("/admin/principals", params={"limit": 1})
     assert r.status_code == 200
 
 
@@ -59,7 +59,7 @@ async def test_list_users_pagination(sysadmin_in_process_client: AsyncClient):
 async def test_update_user_deactivation_persists(
     sysadmin_in_process_client: AsyncClient, created_principal: "CreatedPrincipal"
 ):
-    """PUT /admin/users/{id} with {is_active: false} persists deactivation (issue #494).
+    """PUT /admin/principals/{id} with {is_active: false} persists deactivation (issue #494).
 
     Prior bug: ``UPDATE_PRINCIPAL`` SQL omitted ``is_active`` from the
     SET clause, so the response echoed ``is_active: true`` and the user
@@ -67,12 +67,12 @@ async def test_update_user_deactivation_persists(
     """
     pid = created_principal.principal_id
     r = await sysadmin_in_process_client.put(
-        f"/admin/users/{pid}", json={"is_active": False}
+        f"/admin/principals/{pid}", json={"is_active": False}
     )
     assert r.status_code == 200, r.text
     assert r.json()["is_active"] is False
     # Verify persistence: a fresh GET reflects the new state.
-    r2 = await sysadmin_in_process_client.get(f"/admin/users/{pid}")
+    r2 = await sysadmin_in_process_client.get(f"/admin/principals/{pid}")
     assert r2.status_code == 200
     assert r2.json()["is_active"] is False
 
@@ -82,7 +82,7 @@ async def test_update_user_deactivation_persists(
 async def test_create_user_raw_principal_path(
     sysadmin_in_process_client: AsyncClient,
 ):
-    """POST /admin/users without password — raw-principal create path.
+    """POST /admin/principals without password — raw-principal create path.
 
     Synthetic identities (vault test principals, integration-test fixtures)
     must be creatable without going through the local-IdP password flow.
@@ -97,7 +97,7 @@ async def test_create_user_raw_principal_path(
         "subject_id": subject,
         "roles": ["user"],
     }
-    r = await sysadmin_in_process_client.post("/admin/users", json=body)
+    r = await sysadmin_in_process_client.post("/admin/principals", json=body)
     assert r.status_code == 201, r.text
     out = r.json()
     assert out["provider"] == "local"
@@ -106,13 +106,13 @@ async def test_create_user_raw_principal_path(
 
     # Teardown so re-running the test stays clean.
     pid = out["id"]
-    await sysadmin_in_process_client.delete(f"/admin/users/{pid}")
+    await sysadmin_in_process_client.delete(f"/admin/principals/{pid}")
 
 
 @MARKER
 @pytest.mark.asyncio
 async def test_get_unknown_user_404(sysadmin_in_process_client: AsyncClient):
-    """GET /admin/users/{id} — nonexistent user returns 404.
+    """GET /admin/principals/{id} — nonexistent user returns 404.
 
     The route declares ``principal_id: UUID`` so a non-UUID path segment
     fails FastAPI path validation with 422 before reaching the handler.
@@ -120,7 +120,7 @@ async def test_get_unknown_user_404(sysadmin_in_process_client: AsyncClient):
     """
     import uuid
     nonexistent = str(uuid.uuid4())
-    r = await sysadmin_in_process_client.get(f"/admin/users/{nonexistent}")
+    r = await sysadmin_in_process_client.get(f"/admin/principals/{nonexistent}")
     assert r.status_code == 404
 
 
@@ -132,24 +132,24 @@ async def test_get_unknown_user_404(sysadmin_in_process_client: AsyncClient):
 @MARKER
 @pytest.mark.asyncio
 async def test_search_principals_returns_200(sysadmin_in_process_client: AsyncClient):
-    """GET /admin/users — returns 200 (list mode)."""
-    r = await sysadmin_in_process_client.get("/admin/users")
+    """GET /admin/principals — returns 200 (list mode)."""
+    r = await sysadmin_in_process_client.get("/admin/principals")
     assert r.status_code == 200
 
 
 @MARKER
 @pytest.mark.asyncio
 async def test_search_principals_with_query(sysadmin_in_process_client: AsyncClient):
-    """GET /admin/users?q= — search mode accepts the identifier filter."""
-    r = await sysadmin_in_process_client.get("/admin/users", params={"q": "admin"})
+    """GET /admin/principals?q= — search mode accepts the identifier filter."""
+    r = await sysadmin_in_process_client.get("/admin/principals", params={"q": "admin"})
     assert r.status_code == 200
 
 
 @MARKER
 @pytest.mark.asyncio
 async def test_search_principals_role_filter(sysadmin_in_process_client: AsyncClient):
-    """GET /admin/users?role= — role filter routes through search_principals."""
-    r = await sysadmin_in_process_client.get("/admin/users", params={"role": "admin"})
+    """GET /admin/principals?role= — role filter routes through search_principals."""
+    r = await sysadmin_in_process_client.get("/admin/principals", params={"role": "admin"})
     assert r.status_code == 200
 
 
@@ -221,7 +221,7 @@ async def test_list_policies_returns_200(sysadmin_in_process_client: AsyncClient
 # Behaviour pinned:
 #  - Unknown catalog ⇒ 404 (handler pre-checks via CatalogsProtocol).
 #  - Unknown principal ⇒ 404.
-#  - Round-trip: POST a catalog grant ⇒ 204; GET /admin/catalogs/{cid}/users
+#  - Round-trip: POST a catalog grant ⇒ 204; GET /admin/catalogs/{cid}/principals
 #    includes the principal; DELETE the grant ⇒ 204.
 #  - **Linchpin scoping**: a grant against catalog A is invisible from
 #    catalog B's role-list endpoint (the bug PR #65 left in place).
@@ -236,9 +236,9 @@ async def test_list_policies_returns_200(sysadmin_in_process_client: AsyncClient
 async def test_list_catalog_users_returns_200(
     sysadmin_in_process_client: AsyncClient, setup_catalogs
 ):
-    """GET /admin/catalogs/{catalog_id}/users — 200 with a list."""
+    """GET /admin/catalogs/{catalog_id}/principals — 200 with a list."""
     catalog_id = setup_catalogs[0]
-    r = await sysadmin_in_process_client.get(f"/admin/catalogs/{catalog_id}/users")
+    r = await sysadmin_in_process_client.get(f"/admin/catalogs/{catalog_id}/principals")
     assert r.status_code == 200, r.text
     assert isinstance(r.json(), list)
 
@@ -263,9 +263,9 @@ async def test_list_catalogs_for_admin_returns_200(
 async def test_list_catalog_users_unknown_catalog_404(
     sysadmin_in_process_client: AsyncClient,
 ):
-    """GET /admin/catalogs/{nonexistent}/users — 404."""
+    """GET /admin/catalogs/{nonexistent}/principals — 404."""
     bogus = f"nonexistent_{uuid.uuid4().hex[:8]}"
-    r = await sysadmin_in_process_client.get(f"/admin/catalogs/{bogus}/users")
+    r = await sysadmin_in_process_client.get(f"/admin/catalogs/{bogus}/principals")
     assert r.status_code == 404
 
 
@@ -345,7 +345,7 @@ async def test_grant_and_revoke_catalog_role_round_trip(
     assert r.status_code == 204, f"Grant failed: {r.status_code} {r.text}"
 
     # Listing should now include the principal
-    r = await sysadmin_in_process_client.get(f"/admin/catalogs/{catalog_id}/users")
+    r = await sysadmin_in_process_client.get(f"/admin/catalogs/{catalog_id}/principals")
     assert r.status_code == 200
     user_ids = [u.get("id") for u in r.json()]
     assert pid in user_ids, (
@@ -427,7 +427,7 @@ async def test_catalog_role_grant_does_not_leak_across_catalogs(
 
         # Catalog B's user listing also excludes the principal
         r_users_b = await sysadmin_in_process_client.get(
-            f"/admin/catalogs/{catalog_b}/users"
+            f"/admin/catalogs/{catalog_b}/principals"
         )
         assert r_users_b.status_code == 200
         user_ids_b = [u.get("id") for u in r_users_b.json()]

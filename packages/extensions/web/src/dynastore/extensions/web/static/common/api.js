@@ -192,11 +192,11 @@ export const deletePolicy = (id, catalogId) =>
 
 export const searchPrincipals = ({ q, role, catalogId, limit = 50, offset = 0 } = {}) =>
   getJSON(
-    `/admin/users${qs({ q, role, catalog_id: catalogId, limit, offset })}`,
+    `/admin/principals${qs({ q, role, catalog_id: catalogId, limit, offset })}`,
   );
 
-export const listCatalogUsers = (catalogId) =>
-  getJSON(`/admin/catalogs/${encodeURIComponent(catalogId)}/users`);
+export const listCatalogPrincipals = (catalogId) =>
+  getJSON(`/admin/catalogs/${encodeURIComponent(catalogId)}/principals`);
 
 export const assignGlobalRole = (principalId, role) =>
   postJSON(

@@ -128,7 +128,7 @@ async def user_token(
     }
 
     resp = await sysadmin_in_process_client.post(
-        "/admin/users", json=principal_payload
+        "/admin/principals", json=principal_payload
     )
     assert resp.status_code in [200, 201, 409]
 

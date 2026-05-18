@@ -35,15 +35,15 @@ Endpoint inventory:
 
 | Route                                                                 | Verb   |
 |-----------------------------------------------------------------------|--------|
-| `/admin/users`                                                        | GET, POST |
-| `/admin/users/{principal_id}`                                         | GET, PUT, DELETE |
+| `/admin/principals`                                                        | GET, POST |
+| `/admin/principals/{principal_id}`                                         | GET, PUT, DELETE |
 | `/admin/platform/principals/{principal_id}/roles`                     | POST |
 | `/admin/platform/principals/{principal_id}/roles/{role}`              | DELETE |
 | `/admin/platform/principals/{principal_id}/roles`                     | GET |
 | `/admin/catalogs/{catalog_id}/principals/{principal_id}/roles`        | POST, GET |
 | `/admin/catalogs/{catalog_id}/principals/{principal_id}/roles/{role}` | DELETE |
 | `/admin/catalogs/{catalog_id}`                                        | GET (provisioning view) |
-| `/admin/catalogs/{catalog_id}/users`                                  | GET |
+| `/admin/catalogs/{catalog_id}/principals`                                  | GET |
 | `/admin/roles`                                                        | GET, POST |
 | `/admin/roles/{role_name}`                                            | GET, PUT, DELETE |
 | `/admin/hierarchies`                                                  | POST, DELETE |
@@ -133,8 +133,8 @@ Calls observed:
 - `fetchMyCatalogs()` → `GET /iam/me/catalogs`
 - `listRoles / createRole / updateRole / deleteRole` → `/admin/roles[/{name}]`
 - `listPolicies / createPolicy / updatePolicy / deletePolicy` → `/admin/policies[/{id}]`
-- `searchPrincipals` → `GET /admin/users?q=&role=&catalog_id=&limit=&offset=`
-- `listCatalogUsers` → `GET /admin/catalogs/{cid}/users`
+- `searchPrincipals` → `GET /admin/principals?q=&role=&catalog_id=&limit=&offset=`
+- `listCatalogUsers` → `GET /admin/catalogs/{cid}/principals`
 - `assignGlobalRole / removeGlobalRole` → `/admin/platform/principals/{pid}/roles[/{role}]`
 - `assignCatalogRole / removeCatalogRole` → `/admin/catalogs/{cid}/principals/{pid}/roles[/{role}]`
 - `getCatalogProvisioning` → `GET /admin/catalogs/{cid}`
@@ -147,14 +147,14 @@ construct the requests themselves — those go through the helpers above.
 ### Notebooks (in-repo)
 
 - `packages/core/src/dynastore/modules/iam/notebooks/iam01_provision_tenant_and_assign_roles.ipynb`
-  — uses `/admin/users`, `/admin/users/{principal_id}`, `/admin/catalogs/{cid}/...`.
+  — uses `/admin/principals`, `/admin/principals/{principal_id}`, `/admin/catalogs/{cid}/...`.
 - `.../iam/notebooks/iam02_self_service_permission_introspection.ipynb`
   — uses `/iam/me/available-roles`, `/iam/me/catalogs`, `/iam/me/catalogs/{cid}`,
   `/iam/me/roles/catalogs/{cid}`, `/iam/me/roles/global`.
 - `.../iam/notebooks/iam03_custom_roles_and_policies.ipynb`
   — uses `/admin/{users,roles,roles/{name},policies,policies/{id},catalogs/{cid}/...}`.
 - `packages/core/src/dynastore/modules/catalog/notebooks/cat01_provision_tenant_catalog.ipynb`
-  — `/admin/catalogs/{cid}/...`, `/admin/users`.
+  — `/admin/catalogs/{cid}/...`, `/admin/principals`.
 - `packages/core/src/dynastore/modules/elasticsearch/notebooks/collection_vault_geoid_only.ipynb`
   — `/admin/{users,users/{pid},roles,roles/{name},policies,policies/{id}}`. Contains
   one prose mention of a long-removed `/iam/governance/hierarchies` endpoint

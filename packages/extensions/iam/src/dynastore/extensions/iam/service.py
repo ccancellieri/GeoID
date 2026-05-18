@@ -71,7 +71,7 @@ def iam_service_policies():
             id="admin_authorization_api",
             description="Allows admin users to manage user roles and permissions",
             actions=["GET", "POST", "PUT", "DELETE", "PATCH"],
-            resources=["/admin/users/.*", "/admin/roles/.*", "/admin/policies/.*"],
+            resources=["/admin/principals/.*", "/admin/roles/.*", "/admin/policies/.*"],
             effect="ALLOW",
             partition_key="global",
         ),
@@ -226,7 +226,7 @@ def build_iam_openapi_schema(app: FastAPI) -> Dict[str, Any]:
         "name": "Authentication & Authorization",
         "description": (
             "OIDC login, JWT validation, user/role/policy management. "
-            "All routes under /auth, /iam, and /admin/users."
+            "All routes under /auth, /iam, and /admin/principals."
         ),
     }
     legacy_tag_names = {
