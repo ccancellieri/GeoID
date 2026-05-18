@@ -87,11 +87,22 @@ def process_geometry(
     geom_wkb_hex: str,
     storage_config: GeometryStorageConfig,
     source_srid: Optional[int] = None,
+    write_behavior: Optional["GeometriesWriteBehavior"] = None,
 ) -> Dict[str, Any]:
     """
     Processes a geometry according to the storage configuration, ensuring it's
     ready for database insertion and returning its properties including a 4326 bbox.
+
+    ``storage_config`` carries DDL/storage-shape concerns (``target_srid``,
+    ``target_dimension``, ``write_bbox``); ``write_behavior`` carries per-row
+    runtime policy (``invalid_geom_policy``, ``srid_mismatch_policy``,
+    simplification, allow-list). When ``write_behavior`` is None a fresh
+    :class:`GeometriesWriteBehavior` with documented defaults is used —
+    matches the historical sidecar defaults (TRANSFORM / ATTEMPT_FIX / no
+    simplification / no allow-list).
     """
+    from dynastore.modules.storage.driver_config import GeometriesWriteBehavior
+    behavior = write_behavior or GeometriesWriteBehavior()
     import shapely
     from shapely import wkb
     from shapely.validation import make_valid
@@ -122,11 +133,11 @@ def process_geometry(
 
     # 1. Handle SRID Mismatch and Transformation
     if source_srid != storage_config.target_srid:
-        if storage_config.srid_mismatch_policy == SridMismatchPolicy.REJECT:
+        if behavior.srid_mismatch_policy == SridMismatchPolicy.REJECT:
             raise SridMismatchError(
                 f"SRID mismatch: Incoming SRID {source_srid} != target SRID {storage_config.target_srid}. Policy is REJECT."
             )
-        elif storage_config.srid_mismatch_policy == SridMismatchPolicy.TRANSFORM:
+        elif behavior.srid_mismatch_policy == SridMismatchPolicy.TRANSFORM:
             if Transformer is None or CRS is None:
                 raise GeometryProcessingError(
                     "CRS transformation requested but pyproj is not installed. "
@@ -149,9 +160,9 @@ def process_geometry(
 
     # 2. Handle Invalid Geometries
     if not processed_geom.is_valid:
-        if storage_config.invalid_geom_policy == InvalidGeometryPolicy.REJECT:
+        if behavior.invalid_geom_policy == InvalidGeometryPolicy.REJECT:
             raise InvalidGeometryError("Geometry is invalid and policy is REJECT.")
-        elif storage_config.invalid_geom_policy == InvalidGeometryPolicy.ATTEMPT_FIX:
+        elif behavior.invalid_geom_policy == InvalidGeometryPolicy.ATTEMPT_FIX:
             # Shapely's make_valid is not as robust as PostGIS ST_MakeValid,
             # but it's the best we can do in Python without PostGIS.
             processed_geom = make_valid(processed_geom)
@@ -168,35 +179,35 @@ def process_geometry(
 
     # 4. Simplification (if configured)
     if (
-        storage_config.simplification_algorithm
-        and storage_config.simplification_tolerance
+        behavior.simplification_algorithm
+        and behavior.simplification_tolerance
     ):
         if (
-            storage_config.simplification_algorithm
+            behavior.simplification_algorithm
             == SimplificationAlgorithm.DOUGLAS_PEUCKER
         ):
             processed_geom = processed_geom.simplify(
-                storage_config.simplification_tolerance, preserve_topology=False
+                behavior.simplification_tolerance, preserve_topology=False
             )
         elif (
-            storage_config.simplification_algorithm
+            behavior.simplification_algorithm
             == SimplificationAlgorithm.TOPOLOGY_PRESERVING
         ):
             processed_geom = processed_geom.simplify(
-                storage_config.simplification_tolerance, preserve_topology=True
+                behavior.simplification_tolerance, preserve_topology=True
             )
 
     # 5. Remove redundant vertices (normalize also handles winding order)
-    if storage_config.remove_redundant_vertices:
+    if behavior.remove_redundant_vertices:
         processed_geom = processed_geom.normalize()
 
     # 6. Validate allowed geometry types
     if (
-        storage_config.allowed_geometry_types
-        and processed_geom.geom_type not in storage_config.allowed_geometry_types
+        behavior.allowed_geometry_types
+        and processed_geom.geom_type not in behavior.allowed_geometry_types
     ):
         raise DisallowedGeometryTypeError(
-            f"Geometry type '{processed_geom.geom_type}' not allowed. Allowed types: {storage_config.allowed_geometry_types}"
+            f"Geometry type '{processed_geom.geom_type}' not allowed. Allowed types: {behavior.allowed_geometry_types}"
         )
 
     # geometry_hash is now PG-generated on the geometries sidecar (issue #220)

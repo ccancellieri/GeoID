@@ -11,8 +11,6 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import FieldDefinition, 
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     GeometriesSidecarConfig,
     TargetDimension,
-    InvalidGeometryPolicy,
-    SridMismatchPolicy,
 )
 from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
     FeatureAttributeSidecarConfig,
@@ -33,9 +31,6 @@ def mock_col_config():
                 sidecar_type="geometries",
                 target_srid=4326,
                 target_dimension=TargetDimension.FORCE_2D,
-                write_bbox=True,
-                invalid_geom_policy=InvalidGeometryPolicy.ATTEMPT_FIX,
-                srid_mismatch_policy=SridMismatchPolicy.TRANSFORM,
                 partition_strategy=None,
                 partition_resolution=0,
                 statistics=None,

@@ -240,14 +240,10 @@ class GeometriesSidecarConfig(SidecarConfig):
         """Legacy support for write_bbox toggle."""
         return self.bbox_column is not None
     
-    # Processing policies
-    invalid_geom_policy: InvalidGeometryPolicy = Field(default=InvalidGeometryPolicy.ATTEMPT_FIX)
-    allowed_geometry_types: List[str] = Field(default_factory=list)
-    srid_mismatch_policy: SridMismatchPolicy = Field(default=SridMismatchPolicy.TRANSFORM)
-    simplification_algorithm: Optional[SimplificationAlgorithm] = None
-    simplification_tolerance: Optional[float] = None
-    remove_redundant_vertices: bool = False
-    
+    # Processing policies are operator-tunable write-time behaviour and live
+    # on ``ItemsWritePolicy.geometries`` (``GeometriesWriteBehavior``) rather
+    # than this storage-shape config — see #941.
+
     # Spatial indexes configuration
     h3_resolutions: List[int] = Field(default_factory=list, description="H3 resolutions to index (0-15)")
     s2_resolutions: List[int] = Field(default_factory=list, description="S2 resolutions to index (0-30)")

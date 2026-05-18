@@ -40,6 +40,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from pydantic import (
+    BaseModel,
     ConfigDict,
     Field,
     field_validator,
@@ -65,6 +66,11 @@ from dynastore.modules.storage.drivers.pg_sidecars import (
     item_metadata_config as _item_metadata_config,  # noqa: F401 — registry side-effect
 )
 from dynastore.modules.storage.drivers.pg_sidecars.base import PgSidecarConfig
+from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+    InvalidGeometryPolicy,
+    SridMismatchPolicy,
+    SimplificationAlgorithm,
+)
 
 _PgSidecarConfig = PgSidecarConfig
 
@@ -213,6 +219,80 @@ class AssetConflictPolicy(StrEnum):
     """
 
     REFUSE = "refuse_asset"     # hard stop — reject the entire asset batch
+
+
+class GeometriesWriteBehavior(BaseModel):
+    """Per-row geometry transform and validation behaviour applied during
+    write.
+
+    Lives under :class:`ItemsWritePolicy` as the ``geometries`` sub-block so
+    operator-facing geometry write knobs sit alongside identity / conflict
+    knobs (single policy plugin, one waterfall lookup, one document to
+    teach). Storage-shape concerns (``target_srid``, ``target_dimension``,
+    column names, partitioning, statistics) remain on
+    :class:`~dynastore.modules.storage.drivers.pg_sidecars.geometries_config.GeometriesSidecarConfig`
+    because they affect DDL.
+
+    Consumed by :func:`dynastore.tools.geospatial.process_geometry`, which
+    receives both the sidecar config (storage shape) and this behaviour
+    block (per-row policy) and applies them in order: SRID transform,
+    invalid-geom fix/reject, dimension force, simplification,
+    vertex-normalisation, type allow-list.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    invalid_geom_policy: InvalidGeometryPolicy = Field(
+        default=InvalidGeometryPolicy.ATTEMPT_FIX,
+        description=(
+            "Action when an incoming geometry fails ``is_valid``. "
+            "``attempt_fix`` runs Shapely's ``make_valid``; rows that "
+            "remain invalid raise ``UnfixableGeometryError``. ``reject`` "
+            "raises ``InvalidGeometryError`` immediately."
+        ),
+    )
+    srid_mismatch_policy: SridMismatchPolicy = Field(
+        default=SridMismatchPolicy.TRANSFORM,
+        description=(
+            "Action when the incoming SRID differs from the sidecar's "
+            "``target_srid``. ``transform`` reprojects via pyproj (requires "
+            "the ``crs`` extra). ``reject`` raises ``SridMismatchError``."
+        ),
+    )
+    allowed_geometry_types: List[str] = Field(
+        default_factory=list,
+        examples=[[], ["Polygon", "MultiPolygon"], ["Point"]],
+        description=(
+            "If non-empty, rejects rows whose Shapely ``geom_type`` is not "
+            "in the list (after fix/transform). Empty list (default) "
+            "accepts any type."
+        ),
+    )
+    simplification_algorithm: Optional[SimplificationAlgorithm] = Field(
+        default=None,
+        description=(
+            "If set together with ``simplification_tolerance``, simplifies "
+            "the geometry on write. ``douglas_peucker`` is faster but can "
+            "break topology between adjacent features; "
+            "``topology_preserving`` is slower but safe for adjacent "
+            "polygons."
+        ),
+    )
+    simplification_tolerance: Optional[float] = Field(
+        default=None,
+        description=(
+            "Tolerance (in target_srid units, usually degrees for 4326 or "
+            "metres for projected) for the configured simplification "
+            "algorithm. Has no effect when ``simplification_algorithm`` "
+            "is None."
+        ),
+    )
+    remove_redundant_vertices: bool = Field(
+        default=False,
+        description=(
+            "When True, runs Shapely ``normalize()`` after simplification, "
+            "which also fixes winding order."
+        ),
+    )
 
 
 class ItemsWritePolicy(PluginConfig):
@@ -454,6 +534,17 @@ class ItemsWritePolicy(PluginConfig):
             "entity. Used only when ``enable_validity=True``. Validity END is "
             "either provided in ``write_context.valid_to`` or computed as "
             "``None`` (open-ended)."
+        ),
+    )
+    geometries: Mutable[GeometriesWriteBehavior] = Field(
+        default_factory=GeometriesWriteBehavior,
+        description=(
+            "Per-row geometry transform and validation behaviour. See "
+            ":class:`GeometriesWriteBehavior` — knobs were previously "
+            "co-located on ``GeometriesSidecarConfig`` next to DDL fields; "
+            "moved here so operators tune write behaviour from a single "
+            "policy plugin while the sidecar config remains "
+            "storage-shape-only."
         ),
     )
 

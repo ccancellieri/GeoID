@@ -998,11 +998,19 @@ class GeometriesSidecar(SidecarProtocol):
         return fields
 
     def prepare_geometry_for_upsert(
-        self, geometry: Any, source_srid: int = 4326
+        self,
+        geometry: Any,
+        source_srid: int = 4326,
+        write_behavior: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Public utility to prepare a geometry for storage.
         Handles SRID transforms, validation, and simplification.
+
+        ``write_behavior`` is the :class:`GeometriesWriteBehavior` block
+        from :class:`ItemsWritePolicy`. When None, ``process_geometry``
+        falls back to documented defaults (TRANSFORM / ATTEMPT_FIX / no
+        simplification / no allow-list).
         """
         try:
             # Convert GeoJSON/Mappings/Shapely to WKB Hex string if needed
@@ -1032,7 +1040,12 @@ class GeometriesSidecar(SidecarProtocol):
             # Process geometry (validation, fixing, transformation)
             from dynastore.tools.geospatial import process_geometry
 
-            return process_geometry(geom_wkb_hex, self.config, source_srid=source_srid)
+            return process_geometry(
+                geom_wkb_hex,
+                self.config,
+                source_srid=source_srid,
+                write_behavior=write_behavior,
+            )
         except Exception as e:
             raise ValueError(f"Geometry preparation failed: {e}")
 
@@ -1107,8 +1120,10 @@ class GeometriesSidecar(SidecarProtocol):
                 raise ValueError("Feature must have a geometry")
 
             logger.debug(f"GeometrySidecar Input Geom: {geometry}")
+            policy = context.get("_items_write_policy")
+            write_behavior = getattr(policy, "geometries", None) if policy else None
             geom_data = self.prepare_geometry_for_upsert(
-                geometry, source_srid=source_srid
+                geometry, source_srid=source_srid, write_behavior=write_behavior,
             )
             logger.debug(
                 f"GeometrySidecar Processed WKB: {geom_data['wkb_hex_processed']}"
