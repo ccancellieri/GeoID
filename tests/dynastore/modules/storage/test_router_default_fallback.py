@@ -84,8 +84,11 @@ async def test_collection_routing_falls_back_to_defaults_when_empty() -> None:
 
 @pytest.mark.asyncio
 async def test_asset_routing_falls_back_to_defaults_when_empty() -> None:
-    """Same fallback for AssetRoutingConfig — defaults mirror collection
-    routing: ES primary for READ, PG secondary (PR #185)."""
+    """Asset READ falls back to PG-first: asset_postgresql_driver
+    (FATAL + GEOMETRY_EXACT) primary, asset_elasticsearch_driver
+    (WARN + GEOMETRY_SIMPLIFIED) secondary. Items routing stays ES-first
+    (see sibling test); only asset routing was flipped to PG-first
+    (#620 — ingestion read miss when ES sidecar lagged write)."""
     empty_config = AssetRoutingConfig(operations={})
 
     with _patch_configs(empty_config):
@@ -99,13 +102,13 @@ async def test_asset_routing_falls_back_to_defaults_when_empty() -> None:
 
     assert result, "Expected fallback for AssetRoutingConfig empty operations."
     driver_ids = [entry[0] for entry in result]
-    assert driver_ids[0] == "asset_elasticsearch_driver", (
-        f"Expected first driver_ref to be asset_elasticsearch_driver, "
-        f"got {driver_ids[0]!r}."
+    assert driver_ids[0] == "asset_postgresql_driver", (
+        f"Expected first driver_ref to be asset_postgresql_driver "
+        f"(PG-first asset READ default), got {driver_ids[0]!r}."
     )
-    assert "asset_postgresql_driver" in driver_ids, (
-        f"Expected asset_postgresql_driver also in fallback list, "
-        f"got {driver_ids!r}."
+    assert "asset_elasticsearch_driver" in driver_ids, (
+        f"Expected asset_elasticsearch_driver also in fallback list "
+        f"(geometry_simplified secondary), got {driver_ids!r}."
     )
 
 
