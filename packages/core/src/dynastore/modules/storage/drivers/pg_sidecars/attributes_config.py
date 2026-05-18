@@ -203,16 +203,15 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
 
 
     # Identity Columns Configuration
+    #
+    # ``external_id_field`` and ``require_external_id`` are NOT declared here —
+    # they are behavior knobs and live exclusively on ``ItemsWritePolicy``
+    # (config key ``items_write_policy``). The sidecar reads them from the
+    # policy at write time via ``processing_context["_items_write_policy"]``.
+    # The flags below are storage/DDL concerns only.
     enable_external_id: bool = Field(default=True, description="Store external_id column")
-    external_id_field: str = Field(
-        default="id",
-        description="Input field to map to external_id (e.g. 'id', 'properties.code')",
-    )
     index_external_id: bool = Field(
         default=True, description="Create unique index on external_id"
-    )
-    require_external_id: bool = Field(
-        default=False, description="Refuse row if external_id missing during ingestion"
     )
     external_id_as_feature_id: bool = Field(
         default=True, description="Map external_id to feature id (geoid used by default)"

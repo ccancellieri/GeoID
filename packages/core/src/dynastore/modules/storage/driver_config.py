@@ -402,24 +402,39 @@ class ItemsWritePolicy(PluginConfig):
     )
     external_id_field: Mutable[Optional[str]] = Field(
         default=None,
-        examples=[None, "id", "properties.code", "properties.src_id"],
+        examples=[None, "id", "asset_id", "ADM2_PCODE", "properties.code"],
         description=(
-            "Dot-notation path to extract ``external_id`` from the entity "
-            "(e.g. ``id`` for Feature.id, ``properties.code`` for a domain "
-            "code). When ``None``, conflict detection uses the geoid directly. "
-            "When set, a fresh geoid is always generated on insert and conflict "
-            "resolution uses the extracted external_id — the geoid becomes a "
-            "stable internal handle while external_id is the operator-facing "
-            "natural key."
+            "Path to extract ``external_id`` from the incoming entity. This "
+            "is the single source of truth — sidecars and write drivers "
+            "consult this value, never their own duplicates.\n\n"
+            "Resolution order applied at extraction time:\n"
+            "  1. Top-level lookup: ``data[path]`` — works for ``id``, "
+            "``asset_id`` and any other first-level field (e.g. the dict "
+            "shape produced by ``Feature.model_dump`` or the CSV reader).\n"
+            "  2. Dot-walk: ``a.b.c`` traverses nested dicts (e.g. "
+            "``properties.code``, ``properties.iso3``).\n"
+            "  3. Properties fallback: when ``path`` has no dot AND "
+            "``data[path]`` is None, ``data['properties'][path]`` is "
+            "tried. This makes user-defined GeoJSON attributes "
+            "(``ADM2_PCODE``, ``feature_key``, ``parcel_id``…) reachable "
+            "without forcing operators to write ``properties.X``.\n\n"
+            "When ``None`` (default), no extraction is attempted and "
+            "conflict resolution uses the geoid directly. When set, a "
+            "fresh geoid is always generated on insert and conflict "
+            "resolution uses the extracted external_id — the geoid "
+            "becomes a stable internal handle while external_id is the "
+            "operator-facing natural key."
         ),
     )
     require_external_id: Mutable[bool] = Field(
         default=False,
         examples=[False, True],
         description=(
-            "If True, an entity whose ``external_id_field`` resolves to None "
-            "or empty is refused with a 422. Pair with ``external_id_field`` "
-            "to enforce that every row carries a domain key."
+            "If True, an entity whose ``external_id_field`` resolves to "
+            "None or empty is refused at ingestion. Pair with "
+            "``external_id_field`` to enforce that every row carries a "
+            "domain key. Has no effect when ``external_id_field`` is None "
+            "(there is nothing to extract)."
         ),
     )
     enable_validity: Mutable[bool] = Field(

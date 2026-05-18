@@ -37,8 +37,8 @@ a teardown cell that deletes its catalog so re-runs are idempotent.
 
 | # | Notebook | Scenario | Sidecars / drivers | Write policy / routing |
 |---|---|---|---|---|
-| 1 | `01_uc1_pg_full_sidecars_routing.ipynb` | PG with all 4 sidecars + 2D stats + dual-search (ES public + PG) | geometries (statistics ON), attributes (`external_id_field=properties.code`, `enable_asset_id`), item_metadata, stac_metadata | `on_conflict=new_version`, `enable_validity=true`, routing SEARCH = ES `geometry_simplified` + PG `geometry_exact` |
-| 2 | `02_uc2_schema_patch_multiversion.ipynb` | Schema enforcement → 207 IngestionReport + multi-version from 2 assets | geometries, attributes(`external_id_field=properties.code`) | ItemsSchema with `code`/`name` mandatory, `on_conflict=new_version` |
+| 1 | `01_uc1_pg_full_sidecars_routing.ipynb` | PG with all 4 sidecars + 2D stats + dual-search (ES public + PG) | geometries (statistics ON), attributes (`enable_asset_id`), item_metadata, stac_metadata | `external_id_field=properties.code` (on `items_write_policy`), `on_conflict=new_version`, `enable_validity=true`, routing SEARCH = ES `geometry_simplified` + PG `geometry_exact` |
+| 2 | `02_uc2_schema_patch_multiversion.ipynb` | Schema enforcement → 207 IngestionReport + multi-version from 2 assets | geometries, attributes | ItemsSchema with `code`/`name` mandatory, `external_id_field=properties.code` (on `items_write_policy`), `on_conflict=new_version` |
 | 3 | `03_uc3_private_es.ipynb` | PG + private ES; SEARCH dispatches to private ES + PG; privacy probe | geometries, attributes | routing SEARCH = `items_elasticsearch_private_driver` (simplified) + `items_postgresql_driver` (exact) |
 | 4 | `04_uc4_asset_refusal.ipynb` | Asset duplicate refusal config round-trip | n/a (asset tier) | `AssetsWritePolicy.on_conflict` toggled `refuse_return` → `refuse_fail`; verifies both behaviors |
 

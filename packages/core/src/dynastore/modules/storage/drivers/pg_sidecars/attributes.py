@@ -90,6 +90,24 @@ def _make_tstzrange(start: Any, end: Any, *, lower_inc: bool = True, upper_inc: 
     return f"{lo}{s_iso},{e_iso}{hi}"
 
 
+def _resolve_external_id_field(context: Dict[str, Any]) -> Optional[str]:
+    """Resolve the ``external_id`` extraction path from ``ItemsWritePolicy``.
+
+    The policy is the single source of truth for the field path. Returns
+    ``None`` when no policy is on the context or the policy's
+    ``external_id_field`` is unset — callers MUST treat ``None`` as
+    "skip extraction; conflict resolution falls back to geoid".
+    """
+    policy = context.get("_items_write_policy") if context else None
+    return getattr(policy, "external_id_field", None) if policy else None
+
+
+def _resolve_require_external_id(context: Dict[str, Any]) -> bool:
+    """Read ``require_external_id`` from the ``ItemsWritePolicy`` on context."""
+    policy = context.get("_items_write_policy") if context else None
+    return bool(getattr(policy, "require_external_id", False)) if policy else False
+
+
 class FeatureAttributeSidecar(SidecarProtocol):
     """
     Sidecar for feature attributes and identity.
@@ -97,6 +115,11 @@ class FeatureAttributeSidecar(SidecarProtocol):
     Manages:
     - Identity: external_id, asset_id (optional)
     - Attributes: Relational columns or JSONB document
+
+    Identity field-name binding and require-flag live on
+    ``ItemsWritePolicy`` and reach the sidecar via
+    ``processing_context["_items_write_policy"]`` — see the module-level
+    ``_resolve_external_id_field`` / ``_resolve_require_external_id`` helpers.
     """
 
     def __init__(self, config: FeatureAttributeSidecarConfig):
@@ -985,8 +1008,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         if isinstance(feature, Feature):
             ext_id = feature.id
         else:
-            field_path = getattr(self.config, "external_id_field", "id")
-            ext_id = self._extract_value(feature, field_path)
+            field_path = _resolve_external_id_field(context)
+            ext_id = self._extract_value(feature, field_path) if field_path else None
 
         # Fallback to context if not in feature
         if ext_id is None:
@@ -1115,12 +1138,12 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                             props_to_save[attr.name] = attr.default
 
             if self.config.enable_external_id:
-                field_path = getattr(self.config, "external_id_field", "id")
-                if "." not in field_path and field_path in props_to_save:
+                field_path = _resolve_external_id_field(context)
+                if field_path and "." not in field_path and field_path in props_to_save:
                     del props_to_save[field_path]
-                
+
                 ext_id = context.get("external_id")
-                if not ext_id:
+                if not ext_id and field_path:
                     ext_id = self._extract_value(feature_as_dict, field_path)
                 if ext_id:
                     payload["external_id"] = ext_id
@@ -1752,16 +1775,33 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
     ) -> ValidationResult:
         """
         Processes business rules for feature acceptance.
-        """
-        external_id = self._extract_value(feature, self.config.external_id_field)
 
-        if self.config.require_external_id and not external_id:
+        Identity field-name and require-flag come from the active
+        ``ItemsWritePolicy`` on the context. With no policy on context
+        (legacy / test paths) the row is accepted — extraction simply
+        won't happen at ``prepare_upsert_payload`` either.
+        """
+        field_path = _resolve_external_id_field(context)
+        if not _resolve_require_external_id(context):
+            return ValidationResult(valid=True)
+
+        if not field_path:
+            return ValidationResult(
+                valid=False,
+                error=(
+                    "ItemsWritePolicy.require_external_id is True but "
+                    "external_id_field is unset — nothing to extract"
+                ),
+            )
+
+        external_id = self._extract_value(feature, field_path)
+        if not external_id:
             logger.warning(
-                f"Feature rejected: external_id missing (required by config)"
+                "Feature rejected: external_id missing for field '%s'", field_path,
             )
             return ValidationResult(
                 valid=False,
-                error=f"Missing required external_id field: '{self.config.external_id_field}'",
+                error=f"Missing required external_id field: '{field_path}'",
             )
 
         return ValidationResult(valid=True)

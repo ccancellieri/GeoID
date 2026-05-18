@@ -36,6 +36,7 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.catalog.catalog_config import CollectionPluginConfig
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,
+    ItemsWritePolicy,
 )
 from dynastore.models.ogc import Feature
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
@@ -600,6 +601,22 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 sidecars, key=lambda s: (0 if s.sidecar_id in _PRUNE_FIRST else 1),
             )
 
+            # Resolve ItemsWritePolicy once for the whole batch. It's the
+            # single source of truth for ``external_id_field`` /
+            # ``require_external_id``; sidecars read it off the per-item
+            # context. ``None`` here means "no policy configured" — sidecars
+            # then skip extraction and conflict resolution falls back to geoid.
+            items_write_policy: Optional[ItemsWritePolicy] = None
+            if configs is not None:
+                wp = await configs.get_config(
+                    ItemsWritePolicy,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    ctx=DriverContext(db_resource=conn),
+                )
+                if isinstance(wp, ItemsWritePolicy):
+                    items_write_policy = wp
+
         # Phase 2 — prepare every item in memory; dedupe partition keys
         prepared: List[Dict[str, Any]] = []
         unique_partition_values: set = set()
@@ -616,6 +633,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 "geoid": geoid,
                 "operation": "insert",
                 "_raw_item": raw_item,
+                "_items_write_policy": items_write_policy,
                 **(processing_context or {}),
             }
             hub_payload: Dict[str, Any] = {
