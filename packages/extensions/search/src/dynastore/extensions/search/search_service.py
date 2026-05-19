@@ -127,18 +127,12 @@ def _build_item_query(body: SearchBody) -> Dict[str, Any]:
         filter_.append({"terms": {"id": body.ids}})
 
     if body.geoid:
-        # GeoID is conventionally stored under properties.geoid on item docs;
-        # the should-clause also matches a root-level mirror when present
-        # (defensive — keeps the filter behaving uniformly across migrations).
-        filter_.append({
-            "bool": {
-                "should": [
-                    {"terms": {"properties.geoid": body.geoid}},
-                    {"terms": {"geoid": body.geoid}},
-                ],
-                "minimum_should_match": 1,
-            }
-        })
+        # In this stack the STAC Item ``id`` IS the geoid — the canonical
+        # identifier the platform mints and the only field reliably indexed
+        # at the root for every item. Match on ``id``; ``properties.geoid``
+        # and root ``geoid`` are reserved-but-unwritten in the public items
+        # mapping, so targeting them silently misses every doc (#819).
+        filter_.append({"terms": {"id": body.geoid}})
 
     if body.external_id:
         # ``_external_id`` is the internal mirror written by the items driver
