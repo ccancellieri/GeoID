@@ -78,12 +78,15 @@ def normalize_db_url(url: str, is_async: bool = False) -> str:
 
 
 async def ensure_init_db(resource: DbResource):
-    """Initializes the database base extensions."""
-    # --- Bootstrap Critical Extensions ---
-    # We pass the resource (Engine) directly to maintenance tools.
-    # This allows their internal 'acquire_lock_if_needed' to manage its own connections
-    # and retries, ensuring that if one connection fails/closes, a fresh one can be acquired.
+    """Initializes the database base extensions.
 
+    Every step is wrapped in ``retry_on_invalidated_connection`` so a
+    transient DB drop during dev startup (db_entrypoint_dev.sh reset) does
+    not abort the foundational DatastoreModule lifespan.  ``ensure_db_extension``
+    embeds its own retry; the platform-config initializer (which issues raw
+    DDL directly) is wrapped here at the call site so the entire bootstrap
+    sequence is uniformly resilient.
+    """
     await maintenance_tools.ensure_db_extension(resource, "postgis")
     await maintenance_tools.ensure_db_extension(resource, "postgis_topology")
     await maintenance_tools.ensure_db_extension(resource, "btree_gist")
@@ -94,11 +97,12 @@ async def ensure_init_db(resource: DbResource):
     await maintenance_tools.ensure_db_extension(resource, "pgcrypto")
 
     # --- Initialize Platform Config Storage ---
-    # This ensures 'configs' schema and 'platform_configs' table exist.
-    # Must be done early to support hierarchical configurations.
     from dynastore.modules.db_config.platform_config_service import PlatformConfigService
 
-    await PlatformConfigService.initialize_storage(resource)
+    await maintenance_tools.retry_on_invalidated_connection(
+        lambda: PlatformConfigService.initialize_storage(resource),
+        label="PlatformConfigService.initialize_storage",
+    )
 
 
 def get_config(app_state) -> DBConfig:

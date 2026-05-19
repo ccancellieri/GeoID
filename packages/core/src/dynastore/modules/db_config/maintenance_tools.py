@@ -16,11 +16,15 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import asyncio
 import logging
 import os
 import datetime
 from dateutil.relativedelta import relativedelta
 from typing import Literal
+
+from sqlalchemy.exc import OperationalError as SAOperationalError
+
 from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
@@ -42,18 +46,56 @@ from dynastore.modules.db_config.locking_tools import (
 logger = logging.getLogger(__name__)
 
 
+async def retry_on_invalidated_connection(
+    coro_factory,
+    *,
+    label: str,
+    attempts: int = 3,
+    initial_delay: float = 0.5,
+):
+    """Run ``coro_factory()`` with a SQLAlchemy disconnect retry policy.
+
+    Scoped strictly to ``OperationalError.connection_invalidated == True`` —
+    the marker SQLAlchemy sets when its pool decides the connection is dead
+    (e.g. psycopg2's ``server closed the connection unexpectedly`` during a
+    dev DB bounce).  Other ``OperationalError``s and unrelated exceptions
+    fail fast so real bugs are not masked.
+
+    ``coro_factory`` is a *callable* returning a fresh awaitable on each
+    attempt — coroutine objects are single-shot and cannot be re-awaited.
+    """
+    delay = initial_delay
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_factory()
+        except SAOperationalError as e:
+            if not getattr(e, "connection_invalidated", False) or attempt == attempts:
+                logger.error(f"{label} failed: {e}")
+                raise
+            logger.warning(
+                f"{label}: connection invalidated (DB likely restarting); "
+                f"retrying in {delay:.1f}s ({attempt}/{attempts - 1})."
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
 async def ensure_db_extension(conn: DbResource, extension_name: str):
     """
     Ensures a database extension exists.
+
+    Foundational modules (DatastoreModule) call this in their lifespan before
+    accepting traffic.  Dev compositions reset the DB mid-startup
+    (db_entrypoint_dev.sh), which can drop the connection between Layer 2
+    pool warm-up and this DDL — see ``retry_on_invalidated_connection``.
     """
-    try:
-        logger.info(f"Ensuring extension '{extension_name}' exists...")
-        await DDLQuery(
+    logger.info(f"Ensuring extension '{extension_name}' exists...")
+    await retry_on_invalidated_connection(
+        lambda: DDLQuery(
             f'CREATE EXTENSION IF NOT EXISTS "{extension_name}" CASCADE;'
-        ).execute(conn)
-    except Exception as e:
-        logger.error(f"Failed to ensure extension '{extension_name}': {e}")
-        raise
+        ).execute(conn),
+        label=f"ensure_db_extension('{extension_name}')",
+    )
 
 
 async def ensure_schema_exists(conn: DbResource, schema_name: str):
