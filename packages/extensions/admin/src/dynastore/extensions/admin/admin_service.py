@@ -103,8 +103,7 @@ async def _is_catalog_only_admin(request: Request) -> bool:
     admins and the principal-lookup gate disappears.
     """
     from dynastore.models.protocols.authorization import IamRolesConfig
-    from dynastore.models.protocols.iam_query import IamQueryProtocol
-    from dynastore.extensions.iam.membership_cache import get_membership_cached
+    from dynastore.models.protocols.membership_cache import MembershipCacheProtocol
 
     principal = getattr(request.state, "principal", None)
     if principal is None:
@@ -120,11 +119,16 @@ async def _is_catalog_only_admin(request: Request) -> bool:
     if not provider or not subject_id:
         return False
 
-    iam_query = get_protocol(IamQueryProtocol)
-    if iam_query is None:
+    cache = get_protocol(MembershipCacheProtocol)
+    if cache is None:
+        # MembershipCacheProtocol unregistered (slim deploy without the
+        # IAM extension) — admin cannot make the platform-vs-catalog
+        # distinction so we conservatively report False (treat the caller
+        # as not a catalog-only admin). The caller's existing policy
+        # gate has already authorized them.
         return False
 
-    membership = await get_membership_cached(iam_query, provider, subject_id)
+    membership = await cache.get_membership(provider, subject_id)
     if membership.get("platform"):
         return False
     return True
@@ -155,8 +159,7 @@ async def _catalog_admin_filter_ids(request: Request) -> Optional[set]:
     full picker again.
     """
     from dynastore.models.protocols.authorization import IamRolesConfig
-    from dynastore.models.protocols.iam_query import IamQueryProtocol
-    from dynastore.extensions.iam.membership_cache import get_membership_cached
+    from dynastore.models.protocols.membership_cache import MembershipCacheProtocol
 
     principal = getattr(request.state, "principal", None)
     if principal is None:
@@ -172,11 +175,14 @@ async def _catalog_admin_filter_ids(request: Request) -> Optional[set]:
     if not provider or not subject_id:
         return set()
 
-    iam_query = get_protocol(IamQueryProtocol)
-    if iam_query is None:
+    cache = get_protocol(MembershipCacheProtocol)
+    if cache is None:
+        # MembershipCacheProtocol unregistered (no IAM extension loaded) —
+        # cannot derive a catalog filter; fail closed to an empty set so
+        # the picker shows nothing rather than the full directory.
         return set()
 
-    membership = await get_membership_cached(iam_query, provider, subject_id)
+    membership = await cache.get_membership(provider, subject_id)
     if membership.get("platform"):
         return None
 
