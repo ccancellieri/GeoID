@@ -39,14 +39,17 @@ from dynastore.modules.iam.audience_configs import (
     CatalogLookupAudience,
     CollectionWriteAudience,
 )
+from typing import ClassVar
+
 from dynastore.modules.storage.presets import get_preset, register_preset
-from dynastore.modules.storage.presets.protocol import PresetBundle
+from dynastore.modules.storage.presets.protocol import PresetBundle, PresetTier
 
 
 class GeoidPreset:
     """Flagship FAO GeoID profile: private storage + anonymous lookup + anonymous write."""
 
     name = "geoid"
+    tier: ClassVar[PresetTier] = PresetTier.CATALOG
     description = (
         "FAO GeoID flagship profile. Composes the private_catalog bundle "
         "(PG-first storage + per-tenant private ES indexers, IAM DENY on "

@@ -1109,12 +1109,19 @@ class AdminService(ExtensionProtocol):
     async def list_routing_presets(request: Request):  # type: ignore[reportGeneralTypeIssues]
         from dynastore.modules.storage.presets import get_preset, list_presets
 
-        return {
-            "presets": [
-                {"name": name, "description": get_preset(name).description}
-                for name in list_presets()
-            ]
-        }
+        out = []
+        for name in list_presets():
+            preset = get_preset(name)
+            entry = {"name": name, "description": preset.description}
+            # ``tier`` is the #972 PR-1 addition; emitted opportunistically
+            # so the response is forward-compatible with the URL families
+            # PR-2 will add — operators can already see which family a
+            # preset will route through.
+            tier = getattr(preset, "tier", None)
+            if tier is not None:
+                entry["tier"] = tier.value if hasattr(tier, "value") else str(tier)
+            out.append(entry)
+        return {"presets": out}
 
     @router.post(
         "/catalogs/{catalog_id}/presets/{preset_name}",
@@ -1137,11 +1144,6 @@ class AdminService(ExtensionProtocol):
         """
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.modules.storage.presets import get_preset
-        from dynastore.modules.storage.routing_config import (
-            CatalogRoutingConfig,
-            CollectionRoutingConfig,
-            ItemsRoutingConfig,
-        )
 
         await _assert_catalog_exists(catalog_id)
         try:
@@ -1156,27 +1158,15 @@ class AdminService(ExtensionProtocol):
         bundle = preset.build(catalog_id)
         applied: list[str] = []
 
-        if bundle.catalog_routing is not None:
-            await configs.set_config(
-                CatalogRoutingConfig, bundle.catalog_routing, catalog_id=catalog_id
-            )
-            applied.append("catalog_routing")
-        if bundle.collection_template is not None:
-            await configs.set_config(
-                CollectionRoutingConfig,
-                bundle.collection_template,
-                catalog_id=catalog_id,
-            )
-            applied.append("collection_template")
-        if bundle.items_template is not None:
-            await configs.set_config(
-                ItemsRoutingConfig, bundle.items_template, catalog_id=catalog_id
-            )
-            applied.append("items_template")
-
-        for plugin_name, cfg in bundle.audience_configs.items():
-            await configs.set_config(type(cfg), cfg, catalog_id=catalog_id)
-            applied.append(f"audience:{plugin_name}")
+        # Generic walker (#972 PR-1): each bundle entry carries its own
+        # config class, instance, and slot label. URL-derived scope
+        # (``catalog_id`` here) is layered on top of whatever scope the
+        # preset itself emitted so future tiers (PR-2+) compose without
+        # touching this endpoint.
+        for entry in bundle.iter_apply():
+            scope = {"catalog_id": catalog_id, **dict(entry.scope)}
+            await configs.set_config(entry.config_cls, entry.instance, **scope)
+            applied.append(entry.slot)
 
         return {
             "preset": preset_name,
@@ -1209,11 +1199,6 @@ class AdminService(ExtensionProtocol):
         """
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.modules.storage.presets import get_preset
-        from dynastore.modules.storage.routing_config import (
-            CatalogRoutingConfig,
-            CollectionRoutingConfig,
-            ItemsRoutingConfig,
-        )
 
         await _assert_catalog_exists(catalog_id)
         try:
@@ -1227,28 +1212,18 @@ class AdminService(ExtensionProtocol):
 
         bundle = preset.build(catalog_id)
 
-        # Leaf-first: items_template depends on collection_template which
-        # depends on catalog_routing; deleting items first keeps the cascade
-        # validators happy if the operation aborts partway. Audiences are
-        # independent and trail at the end.
-        slots: list[tuple[str, type, object]] = []
-        if bundle.items_template is not None:
-            slots.append(("items_template", ItemsRoutingConfig, bundle.items_template))
-        if bundle.collection_template is not None:
-            slots.append(
-                ("collection_template", CollectionRoutingConfig, bundle.collection_template)
-            )
-        if bundle.catalog_routing is not None:
-            slots.append(("catalog_routing", CatalogRoutingConfig, bundle.catalog_routing))
-        for plugin_name, cfg in bundle.audience_configs.items():
-            slots.append((f"audience:{plugin_name}", type(cfg), cfg))
-
+        # Generic leaf-first walker (#972 PR-1). The bundle's
+        # ``iter_rollback`` honours each entry's ``rollback_priority`` so
+        # items templates come off before collection templates / catalog
+        # routing (cascade-validator dependency) and audiences trail at
+        # the end, matching the pre-#972 hand-rolled ordering.
         diverged: list[dict] = []
-        to_delete: list[tuple[str, type]] = []
+        to_delete: list[tuple[str, type, dict]] = []
 
-        for slot_name, cfg_cls, expected in slots:
+        for entry in bundle.iter_rollback():
+            scope = {"catalog_id": catalog_id, **dict(entry.scope)}
             persisted = await configs.get_persisted_config(
-                cfg_cls, catalog_id=catalog_id
+                entry.config_cls, **scope
             )
             if persisted is None:
                 continue
@@ -1256,16 +1231,16 @@ class AdminService(ExtensionProtocol):
             # default-filling, datetime/enum serialization, and dict-key
             # ordering all match the on-disk JSON shape.
             try:
-                persisted_norm = cfg_cls.model_validate(persisted).model_dump(mode="json")
+                persisted_norm = entry.config_cls.model_validate(persisted).model_dump(mode="json")
             except Exception:  # noqa: BLE001 — surface the raw payload on validation failure
                 persisted_norm = persisted
-            expected_norm = expected.model_dump(mode="json")
+            expected_norm = entry.instance.model_dump(mode="json")
             if persisted_norm == expected_norm:
-                to_delete.append((slot_name, cfg_cls))
+                to_delete.append((entry.slot, entry.config_cls, scope))
             else:
                 diverged.append({
-                    "slot": slot_name,
-                    "class": cfg_cls.__name__,
+                    "slot": entry.slot,
+                    "class": entry.config_cls.__name__,
                     "persisted": persisted_norm,
                     "expected": expected_norm,
                 })
@@ -1283,8 +1258,8 @@ class AdminService(ExtensionProtocol):
             )
 
         deleted: list[str] = []
-        for slot_name, cfg_cls in to_delete:
-            await configs.delete_config(cfg_cls, catalog_id=catalog_id)
+        for slot_name, cfg_cls, scope in to_delete:
+            await configs.delete_config(cfg_cls, **scope)
             deleted.append(slot_name)
 
         return {

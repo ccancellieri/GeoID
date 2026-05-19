@@ -24,7 +24,12 @@ unapply path on the same resource URL.
 
 Built-in presets are auto-registered on import (see imports below).
 """
-from .protocol import PresetBundle, RoutingPreset  # noqa: F401
+from .protocol import (  # noqa: F401
+    PresetBundle,
+    PresetBundleEntry,
+    PresetTier,
+    RoutingPreset,
+)
 from .registry import get_preset, list_presets, register_preset  # noqa: F401
 
 # Built-in presets — auto-register on import.
@@ -36,6 +41,8 @@ register_preset(PrivateCatalogPreset())
 
 __all__ = [
     "PresetBundle",
+    "PresetBundleEntry",
+    "PresetTier",
     "PrivateCatalogPreset",
     "PublicCatalogPreset",
     "RoutingPreset",

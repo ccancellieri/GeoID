@@ -30,13 +30,16 @@ from dynastore.modules.catalog.catalog_config import (
     _build_private_items_routing,
 )
 
-from .protocol import PresetBundle
+from typing import ClassVar
+
+from .protocol import PresetBundle, PresetTier
 
 
 class PrivateCatalogPreset:
     """PG-first storage + per-tenant private ES indexers on every tier."""
 
     name = "private_catalog"
+    tier: ClassVar[PresetTier] = PresetTier.CATALOG
     description = (
         "PG-first storage + per-tenant private Elasticsearch indexers on "
         "catalog, collection, and items tiers. No anonymous read paths; "

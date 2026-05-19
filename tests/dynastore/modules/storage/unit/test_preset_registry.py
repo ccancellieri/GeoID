@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import pytest
 
+from typing import ClassVar
+
 from dynastore.modules.storage.presets import (
     PresetBundle,
+    PresetTier,
     RoutingPreset,
     get_preset,
     list_presets,
@@ -13,22 +16,19 @@ from dynastore.modules.storage.presets import (
 
 
 class _DummyPreset:
+    tier: ClassVar[PresetTier] = PresetTier.CATALOG
+
     def __init__(self, name: str = "demo-preset") -> None:
         self.name = name
         self.description = "demo"
 
     def build(self, catalog_id: str) -> PresetBundle:  # noqa: ARG002
-        return PresetBundle(
-            catalog_routing=None,
-            collection_template=None,
-            items_template=None,
-            audience_configs={},
-        )
+        return PresetBundle()
 
 
 def test_protocol_runtime_checkable_accepts_dummy():
-    """A class with ``name``, ``description``, ``build()`` satisfies the
-    structural ``RoutingPreset`` protocol."""
+    """A class with ``name``, ``description``, ``tier``, ``build()``
+    satisfies the structural ``RoutingPreset`` protocol."""
     assert isinstance(_DummyPreset(), RoutingPreset)
 
 

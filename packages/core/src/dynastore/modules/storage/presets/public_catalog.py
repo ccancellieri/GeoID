@@ -32,7 +32,9 @@ from dynastore.modules.storage.routing_config import (
     WriteMode,
 )
 
-from .protocol import PresetBundle
+from typing import ClassVar
+
+from .protocol import PresetBundle, PresetTier
 
 
 def _public_catalog_routing() -> CatalogRoutingConfig:
@@ -141,6 +143,7 @@ class PublicCatalogPreset:
     """PG-first storage + public ES indexers on every tier."""
 
     name = "public_catalog"
+    tier: ClassVar[PresetTier] = PresetTier.CATALOG
     description = (
         "PG-first storage + public Elasticsearch indexers across the "
         "catalog, collection, and items tiers. No IAM audience opt-ins; "
