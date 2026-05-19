@@ -47,6 +47,30 @@ if TYPE_CHECKING:
 _SPATIAL_CELL_KINDS: frozenset = frozenset()  # populated after ComputedKind
 
 
+class StatisticStorageMode(StrEnum):
+    """How a derived statistic is materialised on disk.
+
+    Distinct from per-row compute: a :class:`ComputedField` whose
+    ``storage_mode`` is ``None`` is computed but not stored as a
+    standalone column / JSONB key (e.g. used solely to feed an identity
+    rule's match_on). When set, the PG driver emits DDL according to the
+    mode:
+
+    - ``JSONB`` — the field's value lands as a key inside a single
+      ``geom_stats`` JSONB column; B-tree indexes on JSONB are functional
+      indexes on ``(geom_stats->>'<key>')::numeric``.
+    - ``COLUMNAR`` — the field gets its own typed column; B-tree indexes
+      are direct on that column.
+
+    Mixing modes per field is allowed (one field JSONB, another columnar
+    on the same sidecar) — the driver emits the JSONB column iff any
+    storage-bearing field uses ``JSONB``.
+    """
+
+    JSONB = "jsonb"
+    COLUMNAR = "columnar"
+
+
 class ComputedKind(StrEnum):
     """Every value a driver may derive from an incoming feature.
 
@@ -91,6 +115,25 @@ class ComputedKind(StrEnum):
     ASPECT_RATIO = "aspect_ratio"  # bbox width / bbox height
 
 
+# Kinds that may carry ``storage_mode != None``. Identity-style kinds
+# (hashes / spatial-cell keys / EXTERNAL_ID) materialise via their own
+# columns already managed by the sidecar; only geometry-derived
+# scalars/arrays opt into the JSONB-vs-columnar shape switch.
+_STATISTIC_STORAGE_KINDS: frozenset = frozenset({
+    ComputedKind.AREA,
+    ComputedKind.VOLUME,
+    ComputedKind.PERIMETER,
+    ComputedKind.LENGTH,
+    ComputedKind.CENTROID,
+    ComputedKind.BBOX,
+    ComputedKind.VERTEX_COUNT,
+    ComputedKind.HOLE_COUNT,
+    ComputedKind.CIRCULARITY,
+    ComputedKind.CONVEXITY,
+    ComputedKind.ASPECT_RATIO,
+})
+
+
 # Resolution-requiring kinds. Geohash 1..12; H3 0..15; S2 0..30.
 SPATIAL_CELL_KINDS: frozenset = frozenset(
     {ComputedKind.GEOHASH, ComputedKind.H3, ComputedKind.S2}
@@ -115,6 +158,21 @@ class ComputedField(BaseModel):
     appended for spatial cells (e.g. ``"h3_7"``, ``"s2_10"``,
     ``"geohash_8"``). Override ``name`` to control the column/field name
     a driver uses to materialise the value.
+
+    Storage-shape fields (only meaningful for the statistic kinds in
+    :data:`_STATISTIC_STORAGE_KINDS`):
+
+    - :attr:`storage_mode` — ``JSONB`` (key in a shared ``geom_stats``
+      column) or ``COLUMNAR`` (its own typed column). ``None`` means the
+      field is computed but not stored on the sidecar (e.g. used solely
+      by an :class:`IdentityRule`).
+    - :attr:`indexed` — emit a B-tree index on the resulting column.
+      Forbidden together with ``storage_mode == JSONB`` (use a functional
+      JSONB index by setting ``indexed=True`` with ``storage_mode=JSONB``
+      is rejected; emit two fields if you want both layouts).
+    - :attr:`centroid_type` — only consumed by ``ComputedKind.CENTROID``
+      to pick column type (``POINT`` 2D vs ``POINTZ`` 3D) and the WKB
+      output dimensionality.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -122,6 +180,9 @@ class ComputedField(BaseModel):
     kind: ComputedKind
     resolution: Optional[int] = None
     name: Optional[str] = None
+    storage_mode: Optional[StatisticStorageMode] = None
+    indexed: bool = False
+    centroid_type: Optional[Literal["POINT", "POINTZ"]] = None
 
     @model_validator(mode="after")
     def _check_resolution(self) -> "ComputedField":
@@ -141,6 +202,34 @@ class ComputedField(BaseModel):
                 raise ValueError(
                     f"ComputedField(kind={self.kind.value}) does not accept 'resolution'"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _check_storage_shape(self) -> "ComputedField":
+        if self.storage_mode is not None and self.kind not in _STATISTIC_STORAGE_KINDS:
+            raise ValueError(
+                f"ComputedField(kind={self.kind.value}) does not accept "
+                "'storage_mode' (only statistic kinds materialise to a "
+                "sidecar column)."
+            )
+        if self.indexed and self.storage_mode is None:
+            raise ValueError(
+                f"ComputedField(kind={self.kind.value}, indexed=True) "
+                "requires storage_mode to be set (cannot index a "
+                "non-materialised field)."
+            )
+        if self.indexed and self.storage_mode == StatisticStorageMode.JSONB:
+            raise ValueError(
+                f"ComputedField(kind={self.kind.value}) cannot combine "
+                "storage_mode=JSONB with indexed=True; switch to "
+                "storage_mode=COLUMNAR to get a direct B-tree, or declare "
+                "two separate fields."
+            )
+        if self.centroid_type is not None and self.kind != ComputedKind.CENTROID:
+            raise ValueError(
+                f"ComputedField(kind={self.kind.value}) does not accept "
+                "'centroid_type' (only ComputedKind.CENTROID uses it)."
+            )
         return self
 
     @property
@@ -208,6 +297,7 @@ __all__ = [
     "ComputedField",
     "IdentityRule",
     "FeatureType",
+    "StatisticStorageMode",
     "SPATIAL_CELL_KINDS",
     "PATH_EXTRACTED_KINDS",
 ]

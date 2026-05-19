@@ -687,7 +687,31 @@ def compute_derived_fields(
 
         elif kind == ComputedKind.CENTROID:
             c = geometry.centroid
-            out[key] = [float(c.x), float(c.y)]
+            # When ``centroid_type`` is set, the field is destined for a
+            # PostGIS ``GEOMETRY(POINT[Z], srid)`` column and the WKB hex
+            # is the canonical materialisation. ``POINTZ`` forces 3D
+            # output (Shapely centroid drops Z by default); ``POINT``
+            # emits 2D. With ``centroid_type=None`` the field is either
+            # not stored or stored as a JSONB array.
+            centroid_type = getattr(f, "centroid_type", None)
+            if centroid_type is not None:
+                from shapely import wkb as _wkb_mod
+                if centroid_type == "POINTZ":
+                    if not c.has_z:
+                        if geometry.has_z and geometry.geom_type == "Point":
+                            c = geometry
+                        else:
+                            import shapely as _sh
+                            c = _sh.force_3d(c)
+                    out[key] = _wkb_mod.dumps(c, hex=True, output_dimension=3)
+                else:
+                    # POINT: ensure 2D output even if input is 3D.
+                    if c.has_z:
+                        import shapely as _sh
+                        c = _sh.force_2d(c)
+                    out[key] = _wkb_mod.dumps(c, hex=True)
+            else:
+                out[key] = [float(c.x), float(c.y)]
 
         elif kind == ComputedKind.BBOX:
             minx, miny, maxx, maxy = geometry.bounds

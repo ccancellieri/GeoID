@@ -25,9 +25,13 @@ This module is extracted to avoid circular dependencies between:
 - tools/geospatial
 """
 
-from typing import List, Optional, Dict, Literal, Any
+from typing import List, Optional, Dict, Literal
 from enum import Enum
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
+from dynastore.modules.storage.computed_fields import (
+    ComputedField,
+    StatisticStorageMode,
+)
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, SidecarConfigRegistry
 
 # ============================================================================
@@ -66,83 +70,21 @@ class GeometryPartitionStrategyPreset(str, Enum):
 # ============================================================================
 # STATISTICS CONFIGURATION
 # ============================================================================
-
-class MorphologicalIndex(str, Enum):
-    """Supported morphological indices for geometry analysis."""
-    CIRCULARITY = "circularity"
-    CONVEXITY = "convexity"
-    ASPECT_RATIO = "aspect_ratio"
-    SPHERICITY = "sphericity"  # 3D only
-    FLATNESS = "flatness"      # 3D only
-
-
-class StatisticStorageMode(str, Enum):
-    """How to store computed statistics."""
-    JSONB = "jsonb"       # All stats in single JSONB column
-    COLUMNAR = "columnar" # Individual typed columns
-
+#
+# Geometry-statistic computation is governed by ``ItemsWritePolicy.compute``
+# entries with ``storage_mode != None``. The PG driver overlays the filtered
+# list onto :attr:`GeometriesSidecarConfig.compute_fields_overlay` at
+# ``ensure_storage`` time so DDL emission, projection, and FieldDefinition
+# exposure all consult the same snapshot — no second source of truth.
+#
+# JSON-FG ``place`` statistics (3D-only, lives in a separate ``_place``
+# sidecar table) retain their own structurally-distinct config below
+# because they own a table layout, not a per-row scalar set.
 
 class StatisticIndexConfig(BaseModel):
-    """Per-statistic configuration."""
+    """Per-statistic enable/index toggle used by :class:`PlaceStatisticsConfig`."""
     enabled: bool = Field(default=False, description="Compute this statistic")
     index: bool = Field(default=False, description="Create B-Tree index on this statistic")
-
-
-class GeometriesStatisticsConfig(BaseModel):
-    """
-    Configuration for geometry statistics computation and storage.
-    
-    Supports dual storage modes:
-    - JSONB: All stats in single column with functional B-Tree indexes
-    - Columnar: Individual typed columns with direct B-Tree indexes
-    """
-    enabled: bool = Field(default=False, description="Enable statistics computation")
-    storage_mode: StatisticStorageMode = Field(
-        default=StatisticStorageMode.JSONB,
-        description="Storage mode: JSONB or individual columns"
-    )
-    
-    # Basic geometric metrics with indexing control
-    area: StatisticIndexConfig = Field(
-        default_factory=lambda: StatisticIndexConfig(),
-        description="2D surface area or 3D surface area"
-    )
-    volume: StatisticIndexConfig = Field(
-        default_factory=lambda: StatisticIndexConfig(),
-        description="Volume (3D closed meshes only)"
-    )
-    length: StatisticIndexConfig = Field(
-        default_factory=lambda: StatisticIndexConfig(),
-        description="Perimeter or line length"
-    )
-    
-    # Centroid
-    centroid_type: Optional[Literal["geometric", "weighted", "median"]] = Field(default=None,
-        description="Type of centroid to compute"
-    )
-    index_centroid: bool = Field(default=False, description="Create index on centroid coordinates")
-    
-    # Morphological indices (map of index -> should_index)
-    morphological_indices: Dict[MorphologicalIndex, bool] = Field(
-        default_factory=dict,
-        description="Map of morphological index to whether it should be indexed"
-    )
-    
-    # Topology
-    vertex_count: StatisticIndexConfig = Field(
-        default_factory=lambda: StatisticIndexConfig(),
-        description="Number of vertices in geometry"
-    )
-    hole_count: StatisticIndexConfig = Field(
-        default_factory=lambda: StatisticIndexConfig(),
-        description="Number of holes (interior rings)"
-    )
-    
-    # Legacy GIN support (not recommended for large datasets)
-    create_gin_index: bool = Field(
-        default=False, 
-        description="Create GIN index on geom_stats JSONB (WARNING: Large at trillion-row scale)"
-    )
 
 
 class PlaceStatisticsConfig(BaseModel):
@@ -272,18 +214,23 @@ class GeometriesSidecarConfig(SidecarConfig):
         default=0, description="Resolution to use for partitioning (must be in h3_resolutions or s2_resolutions)."
     )
     
-    # Geometry Statistics
-    statistics: Optional[GeometriesStatisticsConfig] = Field(
-        default=GeometriesStatisticsConfig(
-            enabled= True,
-            storage_mode=StatisticStorageMode.COLUMNAR,
-            area=StatisticIndexConfig(enabled=True, index=True),
-            volume=StatisticIndexConfig(enabled=True, index=True),
-            length=StatisticIndexConfig(enabled=True, index=True),
-            centroid_type= "geometric",
-            index_centroid= True
+    # Geometry Statistics — storage-shape mirror of ``ItemsWritePolicy.compute``
+    #
+    # The PG driver populates this list at ``ensure_storage`` time with the
+    # subset of ``ItemsWritePolicy.compute`` whose entries declare a
+    # ``storage_mode`` (i.e. should land on disk via this sidecar). DDL
+    # emission, ``get_select_fields``, ``get_field_definitions``, and
+    # ``prepare_upsert_payload`` all read this single list — there is no
+    # second source for "which stats does this sidecar materialise". An
+    # empty list means the sidecar carries geometry + spatial-index columns
+    # only; no stats are materialised at all.
+    compute_fields_overlay: List[ComputedField] = Field(
+        default_factory=list,
+        description=(
+            "Storage-shape snapshot of the storage-bearing entries from "
+            "``ItemsWritePolicy.compute`` for this collection. Overwritten "
+            "by the PG driver at DDL time."
         ),
-        description="Geometry statistics configuration for computing and storing metrics"
     )
     
     # JSON-FG Place Statistics (3D geometry metrics)

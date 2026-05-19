@@ -25,6 +25,7 @@ from dynastore.modules.storage.computed_fields import (
     IdentityRule,
     PATH_EXTRACTED_KINDS,
     SPATIAL_CELL_KINDS,
+    StatisticStorageMode,
 )
 from dynastore.modules.storage.driver_config import WriteConflictPolicy
 from dynastore.tools.geospatial import compute_derived_fields
@@ -304,3 +305,267 @@ def test_spatial_cell_kinds_membership() -> None:
     assert SPATIAL_CELL_KINDS == frozenset(
         {ComputedKind.GEOHASH, ComputedKind.H3, ComputedKind.S2}
     )
+
+
+# ---------------------------------------------------------------------------
+# Storage-shape fields on ComputedField (issue #978 cutover).
+# ---------------------------------------------------------------------------
+
+
+class TestStorageShapeValidators:
+    def test_columnar_indexed_centroid_pointz_roundtrip(self) -> None:
+        f = ComputedField(
+            kind=ComputedKind.CENTROID,
+            storage_mode=StatisticStorageMode.COLUMNAR,
+            indexed=True,
+            centroid_type="POINTZ",
+        )
+        assert f.storage_mode == StatisticStorageMode.COLUMNAR
+        assert f.indexed is True
+        assert f.centroid_type == "POINTZ"
+        assert f.resolved_name == "centroid"
+
+    def test_jsonb_with_indexed_true_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ComputedField(
+                kind=ComputedKind.AREA,
+                storage_mode=StatisticStorageMode.JSONB,
+                indexed=True,
+            )
+
+    def test_indexed_without_storage_mode_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ComputedField(kind=ComputedKind.AREA, indexed=True)
+
+    def test_centroid_type_on_non_centroid_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ComputedField(
+                kind=ComputedKind.AREA,
+                storage_mode=StatisticStorageMode.COLUMNAR,
+                centroid_type="POINT",
+            )
+
+    def test_storage_mode_on_identity_kind_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ComputedField(
+                kind=ComputedKind.GEOMETRY_HASH,
+                storage_mode=StatisticStorageMode.COLUMNAR,
+            )
+        with pytest.raises(ValidationError):
+            ComputedField(
+                kind=ComputedKind.GEOHASH,
+                resolution=8,
+                storage_mode=StatisticStorageMode.JSONB,
+            )
+
+    def test_storage_mode_none_default(self) -> None:
+        f = ComputedField(kind=ComputedKind.AREA)
+        assert f.storage_mode is None
+        assert f.indexed is False
+        assert f.centroid_type is None
+
+
+class TestCentroidStorageMaterialisation:
+    def test_centroid_pointz_emits_wkb_hex(self) -> None:
+        from shapely.geometry import Polygon as _Poly
+
+        sq = _Poly([(0, 0), (0, 1), (1, 1), (1, 0)])
+        out = compute_derived_fields(
+            sq,
+            {},
+            [
+                ComputedField(
+                    kind=ComputedKind.CENTROID,
+                    storage_mode=StatisticStorageMode.COLUMNAR,
+                    centroid_type="POINTZ",
+                )
+            ],
+        )
+        assert isinstance(out["centroid"], str) and len(out["centroid"]) > 0
+
+    def test_centroid_without_type_returns_xy_array(self) -> None:
+        from shapely.geometry import Polygon as _Poly
+
+        sq = _Poly([(0, 0), (0, 1), (1, 1), (1, 0)])
+        out = compute_derived_fields(
+            sq,
+            {},
+            [ComputedField(kind=ComputedKind.CENTROID)],
+        )
+        assert out["centroid"] == [0.5, 0.5]
+
+
+class TestGeometriesSidecarOverlayDDL:
+    def test_columnar_area_emits_double_precision_column(self) -> None:
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries import (
+            GeometriesSidecar,
+        )
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        cfg = GeometriesSidecarConfig(
+            compute_fields_overlay=[
+                ComputedField(
+                    kind=ComputedKind.AREA,
+                    storage_mode=StatisticStorageMode.COLUMNAR,
+                )
+            ]
+        )
+        sc = GeometriesSidecar(cfg)
+        ddl = sc.get_ddl(
+            physical_table="t_test",
+            partition_keys=[],
+            partition_key_types={},
+            has_validity=False,
+        )
+        assert "area DOUBLE PRECISION" in ddl
+        # No JSONB column when no field uses JSONB storage.
+        assert "geom_stats JSONB" not in ddl
+
+    def test_columnar_indexed_emits_btree_index(self) -> None:
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries import (
+            GeometriesSidecar,
+        )
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        cfg = GeometriesSidecarConfig(
+            compute_fields_overlay=[
+                ComputedField(
+                    kind=ComputedKind.AREA,
+                    storage_mode=StatisticStorageMode.COLUMNAR,
+                    indexed=True,
+                ),
+                ComputedField(
+                    kind=ComputedKind.LENGTH,
+                    storage_mode=StatisticStorageMode.COLUMNAR,
+                    indexed=False,
+                ),
+            ]
+        )
+        sc = GeometriesSidecar(cfg)
+        ddl = sc.get_ddl(
+            physical_table="t_test",
+            partition_keys=[],
+            partition_key_types={},
+            has_validity=False,
+        )
+        assert 'idx_t_test_geometries_area' in ddl
+        # length is not indexed.
+        assert 'idx_t_test_geometries_length' not in ddl
+
+    def test_jsonb_field_emits_geom_stats_column_only(self) -> None:
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries import (
+            GeometriesSidecar,
+        )
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        cfg = GeometriesSidecarConfig(
+            compute_fields_overlay=[
+                ComputedField(
+                    kind=ComputedKind.CIRCULARITY,
+                    storage_mode=StatisticStorageMode.JSONB,
+                )
+            ]
+        )
+        sc = GeometriesSidecar(cfg)
+        ddl = sc.get_ddl(
+            physical_table="t_test",
+            partition_keys=[],
+            partition_key_types={},
+            has_validity=False,
+        )
+        assert "geom_stats JSONB" in ddl
+        # JSONB key does NOT emit a standalone column.
+        assert " circularity " not in ddl + " "
+        # No B-tree index emitted for JSONB-only fields.
+        assert "idx_t_test_geometries_circularity" not in ddl
+
+    def test_mixed_modes_coexist(self) -> None:
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries import (
+            GeometriesSidecar,
+        )
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        cfg = GeometriesSidecarConfig(
+            compute_fields_overlay=[
+                ComputedField(
+                    kind=ComputedKind.AREA,
+                    storage_mode=StatisticStorageMode.COLUMNAR,
+                    indexed=True,
+                ),
+                ComputedField(
+                    kind=ComputedKind.VERTEX_COUNT,
+                    storage_mode=StatisticStorageMode.JSONB,
+                ),
+                ComputedField(
+                    kind=ComputedKind.CENTROID,
+                    storage_mode=StatisticStorageMode.COLUMNAR,
+                    centroid_type="POINT",
+                ),
+            ]
+        )
+        sc = GeometriesSidecar(cfg)
+        ddl = sc.get_ddl(
+            physical_table="t_test",
+            partition_keys=[],
+            partition_key_types={},
+            has_validity=False,
+        )
+        assert "area DOUBLE PRECISION" in ddl
+        assert "geom_stats JSONB" in ddl
+        assert "centroid GEOMETRY(POINT, 4326)" in ddl
+        assert "idx_t_test_geometries_area" in ddl
+
+    def test_default_overlay_emits_no_stats(self) -> None:
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries import (
+            GeometriesSidecar,
+        )
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        # Default config carries an empty overlay → no stats columns,
+        # no geom_stats JSONB.
+        cfg = GeometriesSidecarConfig()
+        sc = GeometriesSidecar(cfg)
+        ddl = sc.get_ddl(
+            physical_table="t_test",
+            partition_keys=[],
+            partition_key_types={},
+            has_validity=False,
+        )
+        assert "geom_stats" not in ddl
+        assert "area DOUBLE PRECISION" not in ddl
+
+    def test_get_internal_columns_tracks_overlay(self) -> None:
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries import (
+            GeometriesSidecar,
+        )
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        cfg = GeometriesSidecarConfig(
+            compute_fields_overlay=[
+                ComputedField(
+                    kind=ComputedKind.CIRCULARITY,
+                    storage_mode=StatisticStorageMode.JSONB,
+                ),
+                ComputedField(
+                    kind=ComputedKind.CENTROID,
+                    storage_mode=StatisticStorageMode.COLUMNAR,
+                    centroid_type="POINT",
+                ),
+            ]
+        )
+        sc = GeometriesSidecar(cfg)
+        cols = sc.get_internal_columns()
+        assert "geom_stats" in cols
+        assert "centroid" in cols

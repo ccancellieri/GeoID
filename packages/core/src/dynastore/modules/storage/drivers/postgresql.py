@@ -514,6 +514,19 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         # item_service, …) then sees the policy-aligned value without
         # having to thread the policy itself.
         write_policy = await self._resolve_write_policy(catalog_id, collection_id)
+        # #978: storage-bearing entries of ``ItemsWritePolicy.compute`` are
+        # the SSOT for which statistic columns / JSONB keys the geometries
+        # sidecar materialises. Overlay them onto every
+        # ``GeometriesSidecarConfig.compute_fields_overlay`` so every read
+        # path that rehydrates the sidecar sees the same shape decision
+        # without round-tripping to the configs service.
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        policy_storage_fields = [
+            cf for cf in write_policy.compute if cf.storage_mode is not None
+        ]
         overlay_sidecars = []
         any_overlay = False
         for sc in col_config.sidecars:
@@ -522,6 +535,13 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             ):
                 overlay_sidecars.append(
                     sc.model_copy(update={"enable_validity": write_policy.enable_validity})
+                )
+                any_overlay = True
+            elif isinstance(sc, GeometriesSidecarConfig) and (
+                list(sc.compute_fields_overlay) != policy_storage_fields
+            ):
+                overlay_sidecars.append(
+                    sc.model_copy(update={"compute_fields_overlay": policy_storage_fields})
                 )
                 any_overlay = True
             else:

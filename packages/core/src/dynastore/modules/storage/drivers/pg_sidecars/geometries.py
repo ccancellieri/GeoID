@@ -47,6 +47,11 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import (
     FieldCapability,
 )
 from dynastore.modules.catalog.models import LocalizedText
+from dynastore.modules.storage.computed_fields import (
+    ComputedField,
+    ComputedKind,
+    StatisticStorageMode,
+)
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     GeometriesSidecarConfig,
     TargetDimension,
@@ -54,16 +59,13 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     SridMismatchPolicy,
     SimplificationAlgorithm,
     GeometryPartitionStrategyPreset,
-    GeometriesStatisticsConfig,
     PlaceStatisticsConfig,
-    StatisticStorageMode,
-    MorphologicalIndex,
 )
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
 from dynastore.tools.geospatial_exceptions import (
     GeometryProcessingError,
 )
-from dynastore.tools.geometry_stats import compute_geometry_statistics
+from dynastore.tools.geospatial import compute_derived_fields
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +91,91 @@ class GeometriesSidecar(SidecarProtocol):
     - S2 spatial indexes
     """
 
+    # Map of ``ComputedKind`` → SQL column type for COLUMNAR storage. ``CENTROID``
+    # is special-cased because it needs the active SRID + 2D/3D selection.
+    _COLUMNAR_SQL_TYPE: Dict[ComputedKind, str] = {
+        ComputedKind.AREA: "DOUBLE PRECISION",
+        ComputedKind.VOLUME: "DOUBLE PRECISION",
+        ComputedKind.PERIMETER: "DOUBLE PRECISION",
+        ComputedKind.LENGTH: "DOUBLE PRECISION",
+        ComputedKind.BBOX: "DOUBLE PRECISION[]",
+        ComputedKind.VERTEX_COUNT: "INTEGER",
+        ComputedKind.HOLE_COUNT: "INTEGER",
+        ComputedKind.CIRCULARITY: "DOUBLE PRECISION",
+        ComputedKind.CONVEXITY: "DOUBLE PRECISION",
+        ComputedKind.ASPECT_RATIO: "DOUBLE PRECISION",
+    }
+
+    _NUMERIC_KINDS: frozenset = frozenset({
+        ComputedKind.AREA,
+        ComputedKind.VOLUME,
+        ComputedKind.PERIMETER,
+        ComputedKind.LENGTH,
+        ComputedKind.CIRCULARITY,
+        ComputedKind.CONVEXITY,
+        ComputedKind.ASPECT_RATIO,
+    })
+
+    _INTEGER_KINDS: frozenset = frozenset({
+        ComputedKind.VERTEX_COUNT,
+        ComputedKind.HOLE_COUNT,
+    })
+
     def __init__(self, config: GeometriesSidecarConfig, **_kwargs: Any):
         self.config = config
+
+    # ------------------------------------------------------------------
+    # Storage-shape helpers (consume ``compute_fields_overlay``)
+    # ------------------------------------------------------------------
+
+    def _storage_fields(self) -> List[ComputedField]:
+        """Return the storage-bearing :class:`ComputedField` overlay.
+
+        The PG driver populates this list at ``ensure_storage`` time from
+        ``ItemsWritePolicy.compute`` (filtered to entries whose
+        ``storage_mode`` is set). Every DDL/projection/upsert site reads
+        from here so there is one shape decision per collection.
+        """
+        return [
+            f for f in self.config.compute_fields_overlay
+            if f.storage_mode is not None
+        ]
+
+    def _has_jsonb_stats(self) -> bool:
+        """Any storage-bearing field with ``storage_mode == JSONB``?"""
+        return any(
+            f.storage_mode == StatisticStorageMode.JSONB for f in self._storage_fields()
+        )
+
+    def _columnar_fields(self) -> List[ComputedField]:
+        return [
+            f for f in self._storage_fields()
+            if f.storage_mode == StatisticStorageMode.COLUMNAR
+        ]
+
+    def _centroid_sql_type(self, field: ComputedField, srid: int) -> str:
+        ct = field.centroid_type or "POINT"
+        return f"GEOMETRY({ct}, {srid})"
+
+    def _columnar_sql_type(self, field: ComputedField, srid: int) -> str:
+        if field.kind == ComputedKind.CENTROID:
+            return self._centroid_sql_type(field, srid)
+        return self._COLUMNAR_SQL_TYPE[field.kind]
+
+    def _field_data_type(self, field: ComputedField) -> str:
+        """``FieldDefinition.data_type`` for the read API."""
+        if field.kind == ComputedKind.CENTROID:
+            return "geometry"
+        if field.kind == ComputedKind.BBOX:
+            return "array"
+        if field.kind in self._INTEGER_KINDS:
+            return "integer"
+        return "numeric"
+
+    def _jsonb_cast_for(self, field: ComputedField) -> str:
+        if field.kind in self._INTEGER_KINDS:
+            return "integer"
+        return "numeric"
 
     @property
     def sidecar_id(self) -> str:
@@ -280,36 +365,15 @@ class GeometriesSidecar(SidecarProtocol):
         )
         known_columns.add("geometry_hash")
 
-        # Add Statistics Columns
-        if self.config.statistics and self.config.statistics.enabled:
-            stats_cfg = self.config.statistics
-            if stats_cfg.storage_mode == StatisticStorageMode.JSONB:
-                columns.append("geom_stats JSONB")
-                known_columns.add("geom_stats")
-            else:
-                # Columnar mode
-                if stats_cfg.area.enabled:
-                    columns.append("area NUMERIC")
-                if stats_cfg.volume.enabled:
-                    columns.append("volume NUMERIC")
-                if stats_cfg.length.enabled:
-                    columns.append("length NUMERIC")
-                if stats_cfg.centroid_type:
-                    geom_type = (
-                        "POINTZ"
-                        if self.config.target_dimension == TargetDimension.FORCE_3D
-                        else "POINT"
-                    )
-                    columns.append(f"centroid GEOMETRY({geom_type}, {srid})")
-
-                for idx, enabled in stats_cfg.morphological_indices.items():
-                    if enabled:
-                        columns.append(f"{idx.value} NUMERIC")
-
-                if stats_cfg.vertex_count.enabled:
-                    columns.append("vertex_count INTEGER")
-                if stats_cfg.hole_count.enabled:
-                    columns.append("hole_count INTEGER")
+        # Add Statistics Columns — derived from ``compute_fields_overlay``
+        if self._has_jsonb_stats():
+            columns.append("geom_stats JSONB")
+            known_columns.add("geom_stats")
+        for f in self._columnar_fields():
+            col_name = f.resolved_name
+            col_type = self._columnar_sql_type(f, srid)
+            columns.append(f"{col_name} {col_type}")
+            known_columns.add(col_name)
 
         # Composite PK Construction
         # Rule: Partition keys FIRST, then Hub identity (geoid, validity)
@@ -392,45 +456,19 @@ class GeometriesSidecar(SidecarProtocol):
         if "geometry_hash" in known_columns:
             ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_geometry_hash" ON {{schema}}."{table_name}" (geometry_hash);'
 
-        # Add Statistics Indexes
-        if self.config.statistics and self.config.statistics.enabled:
-            stats_cfg = self.config.statistics
-
-            if stats_cfg.storage_mode == StatisticStorageMode.JSONB:
-                # Functional B-Tree indexes on JSONB paths
-                if stats_cfg.area.index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_area" ON {{schema}}."{table_name}" (((geom_stats->>\'area\')::numeric));'
-                if stats_cfg.length.index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_length" ON {{schema}}."{table_name}" (((geom_stats->>\'length\')::numeric));'
-                if stats_cfg.volume.index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_volume" ON {{schema}}."{table_name}" (((geom_stats->>\'volume\')::numeric));'
-
-                for idx, index_it in stats_cfg.morphological_indices.items():
-                    if index_it:
-                        ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_{idx.value}" ON {{schema}}."{table_name}" (((geom_stats->>\'{idx.value}\')::numeric));'
-
-                if stats_cfg.vertex_count.index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_vcount" ON {{schema}}."{table_name}" (((geom_stats->>\'vertex_count\')::integer));'
-
-                # Optional GIN (not recommended for trillion-row scale)
-                if stats_cfg.create_gin_index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_stats_gin" ON {{schema}}."{table_name}" USING GIN(geom_stats);'
-
-            else:
-                # Direct B-Tree indexes on columns
-                if stats_cfg.area.index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_area" ON {{schema}}."{table_name}" (area);'
-                if stats_cfg.length.index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_length" ON {{schema}}."{table_name}" (length);'
-                if stats_cfg.volume.index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_volume" ON {{schema}}."{table_name}" (volume);'
-
-                for idx, index_it in stats_cfg.morphological_indices.items():
-                    if index_it:
-                        ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_{idx.value}" ON {{schema}}."{table_name}" ({idx.value});'
-
-                if stats_cfg.vertex_count.index:
-                    ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_vcount" ON {{schema}}."{table_name}" (vertex_count);'
+        # Add Statistics Indexes — derived from ``compute_fields_overlay``.
+        # COLUMNAR + indexed=True emits a direct B-tree; JSONB never
+        # combines with indexed=True (rejected at ComputedField
+        # construction — operators must declare a second COLUMNAR field
+        # to get a B-tree alongside the JSONB key).
+        for f in self._columnar_fields():
+            if not f.indexed:
+                continue
+            col_name = f.resolved_name
+            ddl += (
+                f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" '
+                f'ON {{schema}}."{table_name}" ({col_name});'
+            )
 
         # --- Place Statistics DDL (JSON-FG 'place' column) ---
         if self.config.place_statistics and self.config.place_statistics.enabled:
@@ -585,29 +623,21 @@ class GeometriesSidecar(SidecarProtocol):
                     if f"s2_res{res}" in all_needed or "*" in requested:
                         fields.append(f"{alias}.s2_res{res}")
                         
-            # Add Statistics if requested
-            if self.config.statistics and self.config.statistics.enabled:
-                stats_cfg = self.config.statistics
-                if stats_cfg.storage_mode == StatisticStorageMode.COLUMNAR:
-                    if stats_cfg.area.enabled and ("area" in all_needed or "*" in requested):
-                        fields.append(f"{alias}.area")
-                    if stats_cfg.volume.enabled and ("volume" in all_needed or "*" in requested):
-                        fields.append(f"{alias}.volume")
-                    if stats_cfg.length.enabled and ("length" in all_needed or "*" in requested):
-                        fields.append(f"{alias}.length")
-                    if stats_cfg.centroid_type and ("centroid" in all_needed or "*" in requested):
-                        fields.append(f"ST_AsEWKB({alias}.centroid) as centroid")
-
-                    for idx, enabled in stats_cfg.morphological_indices.items():
-                        if enabled and (idx.value in all_needed or "*" in requested):
-                            fields.append(f"{alias}.{idx.value}")
-
-                    if stats_cfg.vertex_count.enabled and ("vertex_count" in all_needed or "*" in requested):
-                        fields.append(f"{alias}.vertex_count")
-                    if stats_cfg.hole_count.enabled and ("hole_count" in all_needed or "*" in requested):
-                        fields.append(f"{alias}.hole_count")
-                elif "geom_stats" in all_needed or "*" in requested:
-                    fields.append(f"{alias}.geom_stats")
+            # Add Statistics if requested — overlay-driven, COLUMNAR fields
+            # surface per resolved name, JSONB stats project the shared
+            # ``geom_stats`` column.
+            for f in self._columnar_fields():
+                key = f.resolved_name
+                if key not in all_needed and "*" not in requested:
+                    continue
+                if f.kind == ComputedKind.CENTROID:
+                    fields.append(f"ST_AsEWKB({alias}.{key}) as {key}")
+                else:
+                    fields.append(f"{alias}.{key}")
+            if self._has_jsonb_stats() and (
+                "geom_stats" in all_needed or "*" in requested
+            ):
+                fields.append(f"{alias}.geom_stats")
 
         else:
             # Full mode (existing behavior)
@@ -626,29 +656,15 @@ class GeometriesSidecar(SidecarProtocol):
                 for res in self.config.s2_resolutions:
                     fields.append(f"{alias}.s2_res{res}")
 
-            # Add Statistics
-            if self.config.statistics and self.config.statistics.enabled:
-                stats_cfg = self.config.statistics
-                if stats_cfg.storage_mode == StatisticStorageMode.COLUMNAR:
-                    if stats_cfg.area.enabled:
-                        fields.append(f"{alias}.area")
-                    if stats_cfg.volume.enabled:
-                        fields.append(f"{alias}.volume")
-                    if stats_cfg.length.enabled:
-                        fields.append(f"{alias}.length")
-                    if stats_cfg.centroid_type:
-                        fields.append(f"ST_AsEWKB({alias}.centroid) as centroid")
-
-                    for idx, enabled in stats_cfg.morphological_indices.items():
-                        if enabled:
-                            fields.append(f"{alias}.{idx.value}")
-
-                    if stats_cfg.vertex_count.enabled:
-                        fields.append(f"{alias}.vertex_count")
-                    if stats_cfg.hole_count.enabled:
-                        fields.append(f"{alias}.hole_count")
+            # Add Statistics — full mode projects all storage-bearing fields.
+            for f in self._columnar_fields():
+                key = f.resolved_name
+                if f.kind == ComputedKind.CENTROID:
+                    fields.append(f"ST_AsEWKB({alias}.{key}) as {key}")
                 else:
-                    fields.append(f"{alias}.geom_stats")
+                    fields.append(f"{alias}.{key}")
+            if self._has_jsonb_stats():
+                fields.append(f"{alias}.geom_stats")
 
         return fields
 
@@ -851,98 +867,37 @@ class GeometriesSidecar(SidecarProtocol):
                 expose=True,
             )
 
-        # Statistics
-        if self.config.statistics and self.config.statistics.enabled:
-            stats_cfg = self.config.statistics
-            if stats_cfg.storage_mode == StatisticStorageMode.COLUMNAR:
-                if stats_cfg.area.enabled:
-                    fields["area"] = FieldDefinition(
-                        name="area",
-                        sql_expression=f"{alias}.area",
-                        capabilities=[
-                            FieldCapability.FILTERABLE,
-                            FieldCapability.SORTABLE,
-                            FieldCapability.AGGREGATABLE,
-                        ],
-                        data_type="numeric",
-                        aggregations=["sum", "avg", "min", "max", "count"],
-                    )
-                if stats_cfg.volume.enabled:
-                    fields["volume"] = FieldDefinition(
-                        name="volume",
-                        sql_expression=f"{alias}.volume",
-                        capabilities=[
-                            FieldCapability.FILTERABLE,
-                            FieldCapability.SORTABLE,
-                            FieldCapability.AGGREGATABLE,
-                        ],
-                        data_type="numeric",
-                        aggregations=["sum", "avg", "min", "max", "count"],
-                    )
-                if stats_cfg.length.enabled:
-                    fields["length"] = FieldDefinition(
-                        name="length",
-                        sql_expression=f"{alias}.length",
-                        capabilities=[
-                            FieldCapability.FILTERABLE,
-                            FieldCapability.SORTABLE,
-                            FieldCapability.AGGREGATABLE,
-                        ],
-                        data_type="numeric",
-                        aggregations=["sum", "avg", "min", "max", "count"],
-                    )
-                if stats_cfg.centroid_type:
-                    fields["centroid"] = FieldDefinition(
-                        name="centroid",
-                        sql_expression=f"{alias}.centroid",
-                        capabilities=[
-                            FieldCapability.FILTERABLE,
-                            FieldCapability.SPATIAL,
-                        ],
-                        data_type="geometry",
-                        aggregations=None,
-                        transformations=None,
-                    )
-
-                for idx, enabled in stats_cfg.morphological_indices.items():
-                    if enabled:
-                        fields[idx.value] = FieldDefinition(
-                            name=idx.value,
-                            sql_expression=f"{alias}.{idx.value}",
-                            capabilities=[
-                                FieldCapability.FILTERABLE,
-                                FieldCapability.SORTABLE,
-                                FieldCapability.AGGREGATABLE,
-                            ],
-                            data_type="numeric",
-                            aggregations=["sum", "avg", "min", "max", "count"],
-                        )
-
-                if stats_cfg.vertex_count.enabled:
-                    fields["vertex_count"] = FieldDefinition(
-                        name="vertex_count",
-                        sql_expression=f"{alias}.vertex_count",
-                        capabilities=[
-                            FieldCapability.FILTERABLE,
-                            FieldCapability.SORTABLE,
-                            FieldCapability.AGGREGATABLE,
-                        ],
-                        data_type="integer",
-                        aggregations=["sum", "avg", "min", "max", "count"],
-                    )
-
-                if stats_cfg.hole_count.enabled:
-                    fields["hole_count"] = FieldDefinition(
-                        name="hole_count",
-                        sql_expression=f"{alias}.hole_count",
-                        capabilities=[
-                            FieldCapability.FILTERABLE,
-                            FieldCapability.SORTABLE,
-                            FieldCapability.AGGREGATABLE,
-                        ],
-                        data_type="integer",
-                        aggregations=["sum", "avg", "min", "max", "count"],
-                    )
+        # Statistics — overlay-driven. COLUMNAR fields expose as queryable
+        # FieldDefinitions; JSONB fields land inside ``geom_stats`` and
+        # are not directly queryable through this surface (operators can
+        # still filter via JSONB path expressions outside the
+        # FieldDefinition surface).
+        for f in self._columnar_fields():
+            key = f.resolved_name
+            if f.kind == ComputedKind.CENTROID:
+                fields[key] = FieldDefinition(
+                    name=key,
+                    sql_expression=f"{alias}.{key}",
+                    capabilities=[
+                        FieldCapability.FILTERABLE,
+                        FieldCapability.SPATIAL,
+                    ],
+                    data_type="geometry",
+                    aggregations=None,
+                    transformations=None,
+                )
+            else:
+                fields[key] = FieldDefinition(
+                    name=key,
+                    sql_expression=f"{alias}.{key}",
+                    capabilities=[
+                        FieldCapability.FILTERABLE,
+                        FieldCapability.SORTABLE,
+                        FieldCapability.AGGREGATABLE,
+                    ],
+                    data_type=self._field_data_type(f),
+                    aggregations=["sum", "avg", "min", "max", "count"],
+                )
 
         # Virtual Bbox components for STAC - Optimised to use bbox_geom if available
         bbox_source = (
@@ -1092,8 +1047,10 @@ class GeometriesSidecar(SidecarProtocol):
                 "geom_type": self._get_val(feature, "geom_type", "UNKNOWN"),
                 "bbox_coords": self._get_val(feature, "bbox_coords"),
             }
-            # If we need shapely_geom for stats (and stats are enabled), we must re-parse
-            if self.config.statistics and self.config.statistics.enabled:
+            # If any storage-bearing computed field is configured we must
+            # re-parse the WKB to a Shapely geometry so the runner can
+            # derive the values.
+            if self._storage_fields():
                 from shapely import wkb
                 import binascii
 
@@ -1205,23 +1162,33 @@ class GeometriesSidecar(SidecarProtocol):
                 if key in indices:
                     payload[key] = indices[key]
 
-        # 3. Calculate Geometry Statistics
-        if self.config.statistics and self.config.statistics.enabled and shapely_geom:
-            stats = compute_geometry_statistics(shapely_geom, self.config.statistics)
-
-            if self.config.statistics.storage_mode == StatisticStorageMode.JSONB:
-                payload["geom_stats"] = stats
-            else:
-                # Columnar mode: flat addition
-                payload.update(stats)
-        elif (
-            self.config.statistics
-            and self.config.statistics.enabled
-            and not shapely_geom
-        ):
-            # Fail-fast: if statistics are enabled, we MUST have a valid geometry
+        # 3. Calculate storage-bearing Computed Fields
+        storage_fields = self._storage_fields()
+        if storage_fields and shapely_geom:
+            # ``compute_derived_fields`` handles centroid WKB conversion
+            # internally when ``centroid_type`` is set on the field.
+            props = {}
+            if isinstance(feature, Feature):
+                props = feature.properties or {}
+            elif isinstance(feature, dict):
+                props = feature.get("properties") or {}
+            derived = compute_derived_fields(shapely_geom, props, storage_fields)
+            jsonb_payload: Dict[str, Any] = {}
+            for f in storage_fields:
+                key = f.resolved_name
+                if key not in derived:
+                    continue
+                if f.storage_mode == StatisticStorageMode.JSONB:
+                    jsonb_payload[key] = derived[key]
+                else:
+                    payload[key] = derived[key]
+            if jsonb_payload:
+                payload["geom_stats"] = jsonb_payload
+        elif storage_fields and not shapely_geom:
+            # Fail-fast: if stats are declared we MUST have a valid geometry.
             raise ValueError(
-                f"GeometrySidecar: Statistics enabled but no valid geometry provided for geoid {geoid}. "
+                f"GeometrySidecar: storage-bearing computed fields declared but "
+                f"no valid geometry provided for geoid {geoid}. "
                 "Discarding feature to maintain data integrity."
             )
         return payload
@@ -1367,16 +1334,9 @@ class GeometriesSidecar(SidecarProtocol):
             feature.properties = {}
         props = feature.properties
 
-        # If stats are enabled and stored in JSONB, we might want to merge them
-        if self.config.statistics and self.config.statistics.enabled:
-            if self.config.statistics.storage_mode == StatisticStorageMode.JSONB:
-                if "geom_stats" in row and isinstance(row["geom_stats"], dict):
-                    # We usually don't want to leak all stats into standard properties
-                    # but maybe some fields like area_sqm are useful.
-                    pass
-            else:
-                # Columnar stats
-                pass
+        # Statistics are projected via ``get_select_fields`` and consumed
+        # by the read API as queryable fields (COLUMNAR) or remain inside
+        # the ``geom_stats`` JSONB column (no auto-merge into properties).
 
     async def expire_version(
         self,
@@ -1476,12 +1436,12 @@ class GeometriesSidecar(SidecarProtocol):
         Feature.properties.
         """
         cols = {"geom", "bbox_geom", "geohash"}
-        if self.config.statistics:
-            if self.config.statistics.storage_mode == StatisticStorageMode.JSONB:
-                cols.add("geom_stats")
-            if self.config.statistics.centroid_type:
-                cols.add("centroid")
-                
+        if self._has_jsonb_stats():
+            cols.add("geom_stats")
+        for f in self._columnar_fields():
+            if f.kind == ComputedKind.CENTROID:
+                cols.add(f.resolved_name)
+
         if self.config.place_statistics and self.config.place_statistics.enabled:
             cols.add(self.config.place_statistics.place_column)
             if self.config.place_statistics.storage_mode == StatisticStorageMode.JSONB:
