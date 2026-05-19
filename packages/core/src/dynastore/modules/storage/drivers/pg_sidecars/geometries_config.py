@@ -299,10 +299,9 @@ class GeometriesSidecarConfig(SidecarConfig):
     store_bbox: bool = Field(default=True, description="Store bounding box geometry")
     store_centroid: bool = Field(default=False, description="Store centroid point")
     
-    feature_type_schema: Optional[Dict[str, Any]] = Field(default=None,
-        description="JSON Schema override for geometry contribution to Feature. "
-                    "Can include 'bbox' in properties or customize geometry output."
-    )
+    # ``feature_type_schema`` was retired in #976: the wire shape of Feature
+    # ``properties`` is now the SSOT on ``ItemsWritePolicy.schema``. The
+    # geometry contribution stays auto-derived from this sidecar's columns.
 
     @property
     def partition_key_contributions(self) -> Dict[str, str]:

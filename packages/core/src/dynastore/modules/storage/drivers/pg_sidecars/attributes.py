@@ -269,17 +269,12 @@ class FeatureAttributeSidecar(SidecarProtocol):
         """
         Returns JSON Schema for Feature properties contribution.
 
-        Only includes fields where expose=True.
-        asset_id only included if explicitly in feature_type_schema config.
+        Auto-derived from this sidecar's ``attribute_schema``; the user-data
+        wire shape SSOT lives on ``ItemsWritePolicy.schema`` and overlays
+        this fragment at the service layer (#976).
         """
-        schema = {}
+        schema: Dict[str, Any] = {}
 
-        # Check if asset_id should be in output (explicit config override)
-        feature_type_config = getattr(self.config, "feature_type_schema", None)
-        if feature_type_config and "asset_id" in feature_type_config:
-            schema["asset_id"] = feature_type_config["asset_id"]
-
-        # Attributes (excluding storage_only_fields)
         if self.config.attribute_schema:
             storage_only = getattr(self.config, "storage_only_fields", None) or []
             for attr in self.config.attribute_schema:

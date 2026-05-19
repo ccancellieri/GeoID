@@ -1578,7 +1578,13 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
     ) -> Dict[str, Any]:
         """
         Returns the composed JSON Schema for the collection's Feature output.
-        Aggregated from all active sidecars via QueryOptimizer.
+
+        The user-data wire shape (``properties``) is sourced from
+        ``ItemsWritePolicy.schema`` when declared (#976). Sidecars contribute
+        cross-cutting fragments (``geometry``, STAC ``stac_extensions``/
+        ``assets``, item-metadata ``title``/``description``/``keywords``)
+        which are overlaid on the policy's ``properties``. When no policy
+        schema is declared the sidecar aggregation is the sole source.
         """
         col_config = await self._get_collection_config(
             catalog_id, collection_id, db_resource=db_resource
@@ -1588,7 +1594,46 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         from dynastore.modules.catalog.query_optimizer import QueryOptimizer
         optimizer = QueryOptimizer(col_config)
-        return optimizer.get_feature_type_schema()
+        sidecar_schema = optimizer.get_feature_type_schema()
+
+        configs = get_protocol(ConfigsProtocol)
+        policy_schema: Optional[Dict[str, Any]] = None
+        if configs is not None:
+            try:
+                wp = await configs.get_config(
+                    ItemsWritePolicy,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+            except Exception:
+                wp = None
+            if isinstance(wp, ItemsWritePolicy) and isinstance(wp.schema, dict) and wp.schema:
+                policy_schema = wp.schema
+
+        if policy_schema is None:
+            return sidecar_schema
+
+        # Overlay: policy.schema.properties is the SSOT for user data;
+        # sidecar contributions (stac_extensions, title, etc.) fill in
+        # any cross-cutting fields the policy doesn't declare.
+        policy_props = policy_schema.get("properties", {}) if isinstance(policy_schema.get("properties"), dict) else {}
+        sidecar_props = sidecar_schema.get("properties", {}) if isinstance(sidecar_schema.get("properties"), dict) else {}
+        merged_props = {**sidecar_props, **policy_props}
+
+        merged_required = list(
+            dict.fromkeys(
+                [*sidecar_schema.get("required", []), *policy_schema.get("required", [])]
+            )
+        )
+
+        return {
+            "type": "object",
+            "properties": merged_props,
+            "geometry": sidecar_schema.get(
+                "geometry", {"type": "object", "description": "GeoJSON geometry"}
+            ),
+            "required": merged_required or ["geometry", "properties"],
+        }
 
     # NOTE: map_row_to_feature is defined once at the top of this class.
     # The canonical implementation (using the sidecar pipeline) is the single

@@ -195,12 +195,10 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
                     "These fields have expose=False in get_queryable_fields().",
     )
 
-    feature_type_schema: Optional[Dict[str, Any]] = Field(default=None,
-        description="JSON Schema override for Feature properties. "
-                    "If None, defaults to all attributes except storage_only_fields. "
-                    "Can explicitly include asset_id or other fields in output.",
-    )
-
+    # ``feature_type_schema`` was retired in #976: the wire shape of Feature
+    # ``properties`` is now the SSOT on ``ItemsWritePolicy.schema`` (see PR
+    # #961 phase 2). Sidecars derive their schema fragments from their own
+    # storage columns and the policy overlays the user-data ``properties``.
 
     # Identity Columns Configuration
     #

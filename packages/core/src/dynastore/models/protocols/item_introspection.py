@@ -66,7 +66,12 @@ class ItemIntrospectionProtocol(Protocol):
         """
         Return the composed JSON Schema for the collection's Feature output.
 
-        Aggregated from all active sidecars via ``QueryOptimizer.get_feature_type_schema()``.
+        User-data ``properties`` are sourced from ``ItemsWritePolicy.schema``
+        when declared (#976); sidecars contribute cross-cutting fragments
+        (``geometry``, STAC ``stac_extensions``/``assets``, item-metadata
+        ``title``/``description``/``keywords``) which are overlaid on the
+        policy's ``properties``. Falls back to pure sidecar aggregation when
+        no policy schema is declared.
         """
         ...
 

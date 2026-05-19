@@ -133,7 +133,7 @@ class GeometriesSidecar(SidecarProtocol):
             sql_expression=f"{alias}.{self.config.geom_column}",
             capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
             data_type="geometry",
-            expose=True,  # Controlled by feature_type_schema
+            expose=True,
             title="Geometry",
             description="Primary geometry",
         )
@@ -145,7 +145,7 @@ class GeometriesSidecar(SidecarProtocol):
                 sql_expression=f"{alias}.{self.config.bbox_column}",
                 capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
                 data_type="box2d",
-                expose=False,  # Usually query-only unless explicitly in feature_type_schema
+                expose=False,  # Query-only by default
                 title="Bounding Box",
                 description="Geometry bounding box",
             )
@@ -175,13 +175,10 @@ class GeometriesSidecar(SidecarProtocol):
         """
         Returns JSON Schema for geometry contribution to Feature.
 
-        By default, includes main 'geometry' field.
-        Can be overridden via config.feature_type_schema.
+        Auto-derived to the well-known GeoJSON geometry shape; the
+        user-data wire shape SSOT lives on ``ItemsWritePolicy.schema``
+        and overlays sidecar fragments at the service layer (#976).
         """
-        if self.config.feature_type_schema:
-            return self.config.feature_type_schema
-
-        # Default: GeoJSON geometry field
         return {"geometry": {"type": "object", "description": "GeoJSON geometry"}}
 
     def get_main_geometry_field(self) -> Optional[str]:
