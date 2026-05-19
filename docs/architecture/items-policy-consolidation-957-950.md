@@ -1,9 +1,15 @@
 # Items policy consolidation — single SSOT for write/read shape, identity, and derived values
 
 **Date:** 2026-05-19
-**Status:** Draft
+**Status:** SHIPPED — phases 1–4 landed via PR #961 (`fa686764`); axis-2 follow-ups landed via PR #982 (#976 `feature_type_schema`), PR #987 (#977 `external_id_as_feature_id`), PR #991 (#974 `enable_validity`). Remaining sidecar residue (`compute_geometry_statistics`, h3/s2/`geohash_precision` relocation) tracked under #978.
 **Scope:** `ItemsWritePolicy`, new `ItemsReadPolicy`, removal of dead `WritePolicyDefaults` + `ItemsSchema.constraints` family, removal of sidecar-side spatial/statistics duplication. Touches `packages/core/src/dynastore/modules/storage/driver_config.py`, `packages/core/src/dynastore/modules/storage/schema_types.py`, `packages/core/src/dynastore/modules/storage/drivers/pg_sidecars/*_config.py`, `packages/core/src/dynastore/tools/geospatial.py`, the four item drivers (PG, ES, DuckDB, Iceberg), and the cross-sidecar `get_feature_type_schema()` aggregation pipeline.
-**Tracking issues:** #950 (ItemsReadPolicy SSOT), #957 (sidecar residue after #940/#943).
+**Tracking issues:** #950 (ItemsReadPolicy SSOT — closed by #961 phase 3 + #987), #957 (sidecar residue after #940/#943 — closed by #961/#982/#987/#991; remaining items tracked under #974/#977/#978), #978 (Phase 5d follow-up).
+
+> **Reader note (post-merge):** the body below is preserved as design history.
+> It describes the intended end-state at the time of the consolidation, not
+> the live code. For the live shape see `ItemsWritePolicy` / `ItemsReadPolicy`
+> in `packages/core/src/dynastore/modules/storage/driver_config.py` and the
+> follow-up PRs listed above.
 
 ## Problem
 

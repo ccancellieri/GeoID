@@ -416,8 +416,7 @@ class ItemsWritePolicy(PluginConfig):
             "EXTERNAL_ID entry's ``name`` doubles as the source path for "
             "extraction (e.g. ``properties.adm2_pcode``). A "
             ":class:`ComputedKind.GEOHASH` entry with a resolution is the "
-            "identity-axis successor to the legacy "
-            "``ItemsWritePolicy.geohash_precision`` knob; distinct from "
+            "identity-axis spatial-cell rule; distinct from "
             "``GeometriesSidecarConfig.geohash_precision`` which controls the "
             "stored ``CHAR(N)`` column width (storage layer, not identity)."
         ),

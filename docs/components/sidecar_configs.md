@@ -104,17 +104,17 @@ RECORDS (no spatial component).
 
   // Hub-level mirroring
   "store_bbox": true,                                   // mirror bbox_geom on hub for fast filters
-  "store_centroid": false,
-
-  // Optional schema for downstream feature-type validation
-  "feature_type_schema": null
+  "store_centroid": false
 }
 ```
+
+> User-supplied feature schema lives on `ItemsWritePolicy.schema`
+> (collection-tier), not on the sidecar. See PR #982 (#976).
 
 ## Feature Attributes (`sidecar_type="attributes"`)
 
 Owns `{schema}.{table}_attributes`.  Stores user-supplied feature
-properties off-hub: typed columns when a `feature_type_schema` is
+properties off-hub: typed columns when `ItemsWritePolicy.schema` is
 declared, or a JSONB blob when `storage_mode="automatic"`.  Drives
 the `external_id` ↔ `geoid` mapping and the `attributes_hash`
 write-policy gate (SHA256 of canonicalised attributes JSON).
@@ -128,23 +128,16 @@ write-policy gate (SHA256 of canonicalised attributes JSON).
   // Storage strategy
   "storage_mode": "automatic",                          // automatic (jsonb) | typed (columns from schema) | hybrid
   "storage_only_fields": [],                            // fields persisted but not indexed
-  "feature_type_schema": null,                          // null = automatic JSONB; provide a schema for typed columns
 
   // External ID handling
   "enable_external_id": true,
-  "external_id_field": "id",                            // source field on incoming feature
   "index_external_id": true,
-  "require_external_id": false,
-  "external_id_as_feature_id": true,                    // surface external_id as STAC `id` on read
   "expose_geoid": false,                                // surface internal geoid in API responses
 
   // Asset linkage
   "enable_asset_id": true,
   "asset_id_field": "asset_id",
   "index_asset_id": true,
-
-  // Validity window
-  "enable_validity": true,                              // when true, sidecar persists valid_from/valid_to
 
   // Attribute schema (drives indexed JSONB paths)
   "attribute_schema": null,
@@ -215,12 +208,17 @@ curl -X PATCH /configs/catalogs/{cat}/collections/{coll}/plugins/items_postgresq
     -d '{
         "sidecars": [
             {"sidecar_type": "geometries",  "geohash_precision": 6, "store_bbox": true},
-            {"sidecar_type": "attributes",  "external_id_field": "properties.id"},
+            {"sidecar_type": "attributes"},
             {"sidecar_type": "item_metadata"},
             {"sidecar_type": "stac_metadata"}
         ]
     }'
 ```
+
+`external_id_field`, `require_external_id`, and `enable_validity` are
+collection-tier policy knobs on `ItemsWritePolicy` (PRs #940, #991), not
+sidecar fields. PATCH `/configs/.../plugins/items_write_policy` to set
+them.
 
 GET round-trips the slim form back as the full default surface
 (every default field visible) so operators can copy-paste-modify a
