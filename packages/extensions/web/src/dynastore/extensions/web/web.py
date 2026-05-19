@@ -278,7 +278,6 @@ WEB_CONFORMANCE_URIS = [
 
 from pydantic import Field
 from dynastore.models.protocols.web import WebModuleProtocol, WebPageProtocol, StaticFilesProtocol
-from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 from dynastore.models.mutability import Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 
@@ -338,8 +337,14 @@ class RelativeSlashRedirectMiddleware:
         await self.app(scope, receive, send)
 
 
-class WebConfig(ExposableConfigMixin, PluginConfig):
-    """Configuration for the Web Platform interface."""
+class WebConfig(PluginConfig):
+    """Configuration for the Web Platform interface.
+
+    Web is ``always_on = True`` on the extension class — its routes are
+    mounted unconditionally and the per-scope ``enabled`` toggle from
+    ``ExposableConfigMixin`` has no effect.  See the dead-config audit in
+    ``find_dead_exposable_configs()`` for the framework invariant.
+    """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "web")
 
     brand_name: Mutable[str] = "Agro-Informatics Platform"

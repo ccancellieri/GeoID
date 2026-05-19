@@ -10,13 +10,26 @@ from typing import ClassVar, List, Literal, Tuple
 
 from pydantic import Field
 
-from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 # Match the base-class import used by CoveragesConfig.
 from dynastore.models.mutability import Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 
 
-class VolumesConfig(ExposableConfigMixin, PluginConfig):
+class VolumesConfig(PluginConfig):
+    """Volumes (3D tile hierarchy) guardrails.
+
+    ``volumes`` lives in ``packages/core`` and ships no
+    ``[project.entry-points."dynastore.extensions"]`` entry — i.e. the
+    framework does not discover a ``VolumesService`` extension at boot.
+    Inheriting ``ExposableConfigMixin`` would therefore expose an
+    ``enabled`` toggle that ``ExposureMatrix`` cannot enforce (the
+    dead-config audit guarded by ``find_dead_exposable_configs()``).
+
+    If/when ``volumes`` is split into its own ``packages/extensions/volumes``
+    distribution and registers a ``dynastore.extensions`` entry-point,
+    re-introduce the mixin.
+    """
+
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "volumes")
 
     max_features_per_tile: Mutable[int] = Field(default=10_000, ge=1)
