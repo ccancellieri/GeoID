@@ -166,6 +166,14 @@ def item_data_for_db(item_id):
     )
 
 
+_TEARDOWN_DELETE_TIMEOUT_S = 5.0
+"""Per-catalog teardown cap. Prior implicit cap was httpx's 60 s default on
+outbound calls fanned out from ``CATALOG_HARD_DELETION`` event listeners —
+~5 known offenders × ~60 s each added ~5 min to every nightly. Schemas
+leaked past this cap are reaped by the next session's ``db_reset_session``.
+See #1009."""
+
+
 @pytest_asyncio.fixture
 async def catalog_cleaner(app_lifespan):
     """
@@ -179,18 +187,29 @@ async def catalog_cleaner(app_lifespan):
     ids: list = []
     yield ids.append
 
+    import logging
     from dynastore.tools.discovery import get_protocol
     from dynastore.models.protocols import CatalogsProtocol
     from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
 
+    log = logging.getLogger(__name__)
     catalogs = get_protocol(CatalogsProtocol)
     if catalogs:
         for cid in ids:
             try:
-                await catalogs.delete_catalog(cid, force=True)
+                await asyncio.wait_for(
+                    catalogs.delete_catalog(cid, force=True),
+                    timeout=_TEARDOWN_DELETE_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "catalog_cleaner teardown: delete_catalog(%s) exceeded "
+                    "%.1fs cap; leaving schema for db_reset_session to reap (#1009)",
+                    cid, _TEARDOWN_DELETE_TIMEOUT_S,
+                )
             except Exception:
                 pass
-        await lifecycle_registry.wait_for_all_tasks()
+        await lifecycle_registry.wait_for_all_tasks(timeout=_TEARDOWN_DELETE_TIMEOUT_S)
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
@@ -240,7 +259,17 @@ async def shared_catalog(app_lifespan_module, worker_id):
     # Module teardown: hard-delete drops every collection, asset, and item
     # the file accumulated. force=True triggers schema removal.
     try:
-        await catalogs.delete_catalog(cat_id, force=True)
+        await asyncio.wait_for(
+            catalogs.delete_catalog(cat_id, force=True),
+            timeout=_TEARDOWN_DELETE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # Don't crash teardown. Cap hung deletes (#1009) — the next
+        # session's db_reset_session reaps any leaked schema regardless.
+        logging.getLogger(__name__).warning(
+            "shared_catalog teardown: delete_catalog(%s) exceeded %.1fs cap (#1009)",
+            cat_id, _TEARDOWN_DELETE_TIMEOUT_S,
+        )
     except Exception as e:
         # Don't crash teardown. Log so debugging isn't blind; the next
         # session's db_reset_session reaps any leaked schema regardless.
@@ -296,8 +325,16 @@ async def shared_collection_factory(shared_catalog, sysadmin_in_process_client_m
     log = logging.getLogger(__name__)
     for cat_id, col_id in created:
         try:
-            await sysadmin_in_process_client_module.delete(
-                f"/features/catalogs/{cat_id}/collections/{col_id}?force=true"
+            await asyncio.wait_for(
+                sysadmin_in_process_client_module.delete(
+                    f"/features/catalogs/{cat_id}/collections/{col_id}?force=true"
+                ),
+                timeout=_TEARDOWN_DELETE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "shared_collection_factory teardown: DELETE %s/%s exceeded %.1fs cap (#1009)",
+                cat_id, col_id, _TEARDOWN_DELETE_TIMEOUT_S,
             )
         except Exception as e:
             # Don't crash teardown. Log so debugging isn't blind; the
@@ -307,6 +344,12 @@ async def shared_collection_factory(shared_catalog, sysadmin_in_process_client_m
                 "shared_collection_factory teardown failed for %s/%s: %s",
                 cat_id, col_id, e,
             )
+
+
+_LIFECYCLE_TASK_WAIT_S = 5.0
+"""Per-test cap on ``wait_for_all_tasks``. Default of 30 s allowed each
+hung-task test to soak ~30 s in both setup and teardown — under #1009 we cap
+both at 5 s so the suite degrades gracefully instead of silently soaking."""
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -321,7 +364,7 @@ async def wait_for_lifecycle_tasks():
     from dynastore.models.protocols import CatalogsProtocol
     from dynastore.tasks import get_loaded_task_types
 
-    await lifecycle_registry.wait_for_all_tasks()
+    await lifecycle_registry.wait_for_all_tasks(timeout=_LIFECYCLE_TASK_WAIT_S)
     await await_all_background_tasks()
 
     # Only poll the DB task queue if this test instance has task types registered.
@@ -360,7 +403,7 @@ async def wait_for_lifecycle_tasks():
 
     yield
 
-    await lifecycle_registry.wait_for_all_tasks()
+    await lifecycle_registry.wait_for_all_tasks(timeout=_LIFECYCLE_TASK_WAIT_S)
     await await_all_background_tasks()
 
     # Invalidate catalog caches to ensure fresh state for next test

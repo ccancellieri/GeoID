@@ -53,10 +53,29 @@ from dynastore.modules.catalog.asset_service import (
     VirtualAssetCreate,
 )
 from dynastore.modules.catalog.write_policy_assets import (
-    AssetIdentityMatcher,
+    AssetIdentityField,
+    AssetIdentityKind,
+    AssetIdentityRule,
     AssetsWritePolicy,
     AssetWriteConflictPolicy,
 )
+
+
+def _rules(*kinds_with_paths: object) -> list:
+    """Build a chain of single-field rules.
+
+    Each arg is either a bare :class:`AssetIdentityKind` or a tuple
+    ``(kind, path)`` for METADATA_FIELD entries.
+    """
+    out = []
+    for item in kinds_with_paths:
+        if isinstance(item, tuple):
+            kind, path = item
+            field_spec = AssetIdentityField(kind=kind, path=path)
+        else:
+            field_spec = AssetIdentityField(kind=item)
+        out.append(AssetIdentityRule(match_on=[field_spec]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +270,7 @@ async def test_refuse_fail_on_filename_match(fake_dql: _Recorder) -> None:
 
     policy = AssetsWritePolicy(
         on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
-        identity_matchers=[AssetIdentityMatcher.ASSET_ID, AssetIdentityMatcher.FILENAME],
+        identity=_rules(AssetIdentityKind.ASSET_ID, AssetIdentityKind.FILENAME),
     )
     payload = physical(asset_id="brand_new", filename="alpha.tif")
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
@@ -279,7 +298,7 @@ async def test_update_on_asset_id_keeps_filename(fake_dql: _Recorder) -> None:
     result = await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
     assert result.action == "updated"
-    assert result.matcher_hit == AssetIdentityMatcher.ASSET_ID
+    assert result.matcher_hit == AssetIdentityKind.ASSET_ID
     # An UPDATE was issued, no INSERT.
     assert any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
     assert not any(is_insert(c["sql"]) for c in fake_dql.calls)
@@ -321,8 +340,9 @@ async def test_metadata_field_matcher(fake_dql: _Recorder) -> None:
 
     policy = AssetsWritePolicy(
         on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
-        identity_matchers=[AssetIdentityMatcher.METADATA_FIELD],
-        metadata_match_path="iso19115.fileIdentifier",
+        identity=_rules(
+            (AssetIdentityKind.METADATA_FIELD, "iso19115.fileIdentifier"),
+        ),
     )
     payload = physical(metadata={"iso19115": {"fileIdentifier": "URN:1"}})
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
@@ -351,12 +371,11 @@ async def test_chain_first_match_wins(fake_dql: _Recorder) -> None:
 
     policy = AssetsWritePolicy(
         on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
-        identity_matchers=[
-            AssetIdentityMatcher.ASSET_ID,
-            AssetIdentityMatcher.FILENAME,
-            AssetIdentityMatcher.METADATA_FIELD,
-        ],
-        metadata_match_path="iso19115.fileIdentifier",
+        identity=_rules(
+            AssetIdentityKind.ASSET_ID,
+            AssetIdentityKind.FILENAME,
+            (AssetIdentityKind.METADATA_FIELD, "iso19115.fileIdentifier"),
+        ),
     )
     payload = physical(
         asset_id="something_else",
@@ -524,7 +543,7 @@ async def test_race_filename_constraint_maps_to_filename_matcher(
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
     err = exc_info.value
-    assert err.matcher == AssetIdentityMatcher.FILENAME.value
+    assert err.matcher == AssetIdentityKind.FILENAME.value
     assert err.reason == "conflict"
     assert err.asset_id == "alpha"
     assert err.existing_id is None  # we don't query the winning row
@@ -543,7 +562,7 @@ async def test_race_href_constraint_maps_to_url_matcher(
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=virtual(), policy=policy)
 
-    assert exc_info.value.matcher == AssetIdentityMatcher.URL.value
+    assert exc_info.value.matcher == AssetIdentityKind.URL.value
     assert exc_info.value.reason == "conflict"
 
 
@@ -560,7 +579,7 @@ async def test_race_identity_constraint_maps_to_asset_id_matcher(
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
-    assert exc_info.value.matcher == AssetIdentityMatcher.ASSET_ID.value
+    assert exc_info.value.matcher == AssetIdentityKind.ASSET_ID.value
     assert exc_info.value.reason == "conflict"
 
 
@@ -607,7 +626,7 @@ async def test_race_via_message_scrape_when_constraint_attr_missing(
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
-    assert exc_info.value.matcher == AssetIdentityMatcher.FILENAME.value
+    assert exc_info.value.matcher == AssetIdentityKind.FILENAME.value
 
 
 # ---------------------------------------------------------------------------
@@ -647,56 +666,38 @@ async def test_new_version_archive_stamps_asset_references_valid_until(
 
 
 # ---------------------------------------------------------------------------
-# F2 — content_hash algo-prefix semantics
+# content_hash tagged-only contract
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_strips_algo_prefix() -> None:
-    assert ad._normalize_content_hash("md5:abc==") == "abc=="
-    assert ad._normalize_content_hash("sha256:0a1b") == "0a1b"
-    # Untagged values pass through.
-    assert ad._normalize_content_hash("legacyhex") == "legacyhex"
-    assert ad._normalize_content_hash(None) is None
-    assert ad._normalize_content_hash("") is None
-
-
-def test_split_returns_algo_and_value() -> None:
-    assert ad._split_content_hash("md5:abc==") == ("md5", "abc==")
-    assert ad._split_content_hash("sha256:01ff") == ("sha256", "01ff")
-    assert ad._split_content_hash("untagged") == (None, "untagged")
-    assert ad._split_content_hash(None) == (None, None)
-
-
 @pytest.mark.asyncio
-async def test_content_hash_probe_sends_both_tagged_and_raw_binds(
+async def test_content_hash_probe_sends_tagged_bind_only(
     fake_dql: _Recorder,
 ) -> None:
-    """The probe SQL OR-clauses on (tagged) and (raw) so legacy untagged
-    rows continue to match. Verify both binds are present."""
+    """The probe SQL matches the tagged form verbatim. Verify the tagged
+    bind is present and no legacy ``:raw`` bind leaks through."""
     fake_dql.when(is_select_by("content_hash"), EXISTING_ROW)
 
     payload = physical()
     object.__setattr__(payload, "content_hash", "md5:abc==")
     policy = AssetsWritePolicy(
-        identity_matchers=[AssetIdentityMatcher.CONTENT_HASH],
+        identity=_rules(AssetIdentityKind.CONTENT_HASH),
     )
     with pytest.raises(AssetSidecarRejectedError):
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
-    # Find the SELECT call hitting content_hash.
     probe_call = next(c for c in fake_dql.calls if "content_hash" in c["sql"])
     assert probe_call["params"]["tagged"] == "md5:abc=="
-    assert probe_call["params"]["raw"] == "abc=="
+    assert "raw" not in probe_call["params"]
 
 
 @pytest.mark.asyncio
-async def test_hash_gating_normalizes_across_tagged_and_untagged(
+async def test_hash_gating_requires_byte_for_byte_match(
     fake_dql: _Recorder,
 ) -> None:
-    """Existing row stores ``md5:abc==`` (post-Stage-F2 finalize); the
-    payload carries the bare ``abc==`` (e.g., a re-finalize or a legacy
-    caller). The gating compare must still treat them as equal and
-    short-circuit UPDATE → REFUSE_RETURN."""
+    """``skip_if_unchanged_content_hash`` compares stored and incoming
+    values as-is. Tagged-vs-untagged are NOT considered equal — both
+    sides MUST submit the tagged form."""
     tagged_existing = dict(EXISTING_ROW, content_hash="md5:abc==")
     fake_dql.when(is_select_by("asset_id"), tagged_existing)
 
@@ -705,13 +706,36 @@ async def test_hash_gating_normalizes_across_tagged_and_untagged(
         skip_if_unchanged_content_hash=True,
     )
     payload = physical()
-    object.__setattr__(payload, "content_hash", "abc==")  # untagged, raw
+    object.__setattr__(payload, "content_hash", "md5:abc==")
 
     result = await upsert_asset(
         conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
     )
     assert result.action == "returned_existing"
     assert not any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
+
+
+@pytest.mark.asyncio
+async def test_hash_gating_rejects_untagged_payload(
+    fake_dql: _Recorder,
+) -> None:
+    """Untagged ``abc==`` payload does NOT short-circuit against a tagged
+    ``md5:abc==`` row — the gating compare is byte-for-byte. The conflict
+    flow then falls through to the UPDATE branch."""
+    tagged_existing = dict(EXISTING_ROW, content_hash="md5:abc==")
+    fake_dql.when(is_select_by("asset_id"), tagged_existing)
+
+    policy = AssetsWritePolicy(
+        on_conflict=AssetWriteConflictPolicy.UPDATE,
+        skip_if_unchanged_content_hash=True,
+    )
+    payload = physical()
+    object.__setattr__(payload, "content_hash", "abc==")  # untagged — no match
+
+    result = await upsert_asset(
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
+    )
+    assert result.action != "returned_existing"
 
 
 @pytest.mark.asyncio
@@ -733,6 +757,188 @@ async def test_race_in_new_version_path_preserves_existing_id(
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy)
 
     err = exc_info.value
-    assert err.matcher == AssetIdentityMatcher.FILENAME.value
+    assert err.matcher == AssetIdentityKind.FILENAME.value
     assert err.existing_id == "alpha"  # the archived row's id is preserved
     assert err.reason == "conflict"
+
+
+# ---------------------------------------------------------------------------
+# New-shape pins — rule-level on_match override + AND-composition + posture
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rule_on_match_overrides_policy_level_action(
+    fake_dql: _Recorder,
+) -> None:
+    """A rule's ``on_match`` substitutes the policy-level ``on_conflict``.
+
+    Policy default is REFUSE_FAIL; the asset_id rule overrides to
+    REFUSE_RETURN — a hit on asset_id must echo the existing row instead
+    of raising.
+    """
+    fake_dql.when(is_select_by("asset_id"), EXISTING_ROW)
+
+    policy = AssetsWritePolicy(
+        on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
+        identity=[
+            AssetIdentityRule(
+                match_on=[AssetIdentityField(kind=AssetIdentityKind.ASSET_ID)],
+                on_match=AssetWriteConflictPolicy.REFUSE_RETURN,
+            ),
+        ],
+    )
+    result = await upsert_asset(
+        conn=_spec_conn(), scope=SCOPE, payload=physical(), policy=policy
+    )
+    assert result.action == "returned_existing"
+
+
+@pytest.mark.asyncio
+async def test_multi_field_rule_requires_all_fields_to_match_same_row(
+    fake_dql: _Recorder,
+) -> None:
+    """AND-composition: the FILENAME probe must also resolve the row that
+    the ASSET_ID probe already returned. When the probes report different
+    asset_ids, the rule misses and the chain falls through to a fresh
+    INSERT.
+    """
+    # asset_id probe → row A; filename probe → row B (different asset_id).
+    # The probes need disjoint predicates — both SQL statements list
+    # asset_id in their SELECT clause, so match on a more specific term.
+    row_a = dict(EXISTING_ROW, asset_id="alpha")
+    row_b = dict(EXISTING_ROW, asset_id="beta")
+
+    def is_select_asset_id_predicate(sql: str) -> bool:
+        return is_select(sql) and "AND asset_id = :asset_id" in sql
+
+    def is_select_filename_predicate(sql: str) -> bool:
+        return is_select(sql) and "AND filename = :filename" in sql
+
+    fake_dql.when(is_select_asset_id_predicate, row_a)
+    fake_dql.when(is_select_filename_predicate, row_b)
+    fake_dql.when(is_insert, dict(EXISTING_ROW, asset_id="gamma", status="active"))
+
+    policy = AssetsWritePolicy(
+        on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
+        identity=[
+            AssetIdentityRule(
+                match_on=[
+                    AssetIdentityField(kind=AssetIdentityKind.ASSET_ID),
+                    AssetIdentityField(kind=AssetIdentityKind.FILENAME),
+                ],
+            ),
+        ],
+    )
+    # No raise expected — AND fails, chain falls through to INSERT.
+    result = await upsert_asset(
+        conn=_spec_conn(),
+        scope=SCOPE,
+        payload=physical(asset_id="gamma"),
+        policy=policy,
+    )
+    assert result.action == "inserted_active"
+
+
+@pytest.mark.asyncio
+async def test_metadata_field_path_lives_on_field_not_policy(
+    fake_dql: _Recorder,
+) -> None:
+    """The dot-path is read off the :class:`AssetIdentityField`, not off a
+    policy-level slot. Multiple METADATA_FIELD rules with different paths
+    must all dispatch against their own path.
+    """
+    captured_paths: List[str] = []
+
+    def _capture(sql: str) -> bool:
+        # capture the path literal embedded in the SQL — '{a,b,c}'
+        if is_select(sql) and "#>>" in sql:
+            import re
+            m = re.search(r"#>> '\{([^}]+)\}'", sql)
+            if m:
+                captured_paths.append(m.group(1).replace(",", "."))
+        return False  # never match — we just want to capture & let probes miss
+
+    fake_dql.script.append((_capture, None))
+
+    policy = AssetsWritePolicy(
+        on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
+        identity=[
+            AssetIdentityRule(
+                match_on=[
+                    AssetIdentityField(
+                        kind=AssetIdentityKind.METADATA_FIELD,
+                        path="iso19115.fileIdentifier",
+                    ),
+                ],
+            ),
+            AssetIdentityRule(
+                match_on=[
+                    AssetIdentityField(
+                        kind=AssetIdentityKind.METADATA_FIELD,
+                        path="external.urn",
+                    ),
+                ],
+            ),
+        ],
+    )
+    payload = physical(
+        metadata={
+            "iso19115": {"fileIdentifier": "URN:1"},
+            "external": {"urn": "URN:2"},
+        },
+    )
+    fake_dql.when(is_insert, dict(EXISTING_ROW, status="active"))
+    await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
+    # Both rule paths got dispatched.
+    assert "iso19115.fileIdentifier" in captured_paths
+    assert "external.urn" in captured_paths
+
+
+@pytest.mark.asyncio
+async def test_content_hash_rule_short_circuits_to_miss_for_pending(
+    fake_dql: _Recorder,
+) -> None:
+    """The content_hash probe returns no hit when the incoming payload has
+    no content_hash — preserves the documented "PENDING short-circuit"
+    behaviour after the shape migration.
+    """
+    fake_dql.when(is_insert, dict(EXISTING_ROW, status="pending"))
+
+    policy = AssetsWritePolicy(
+        identity=_rules(AssetIdentityKind.CONTENT_HASH),
+    )
+    # AssetCreate has no content_hash field → probe miss → INSERT path.
+    result = await upsert_asset(
+        conn=_spec_conn(),
+        scope=SCOPE,
+        payload=physical(asset_id="fresh"),
+        policy=policy,
+        initial_status=AssetStatus.PENDING,
+    )
+    assert result.action == "inserted_pending"
+
+
+def test_default_policy_dump_yields_byte_for_byte_chain() -> None:
+    """The default identity chain dumps to a JSON shape that round-trips
+    through ``model_validate`` producing the exact same chain dispatch.
+    """
+    p1 = AssetsWritePolicy()
+    dumped = p1.model_dump(mode="json")
+    p2 = AssetsWritePolicy.model_validate(dumped)
+    # Two single-field rules in declared order: ASSET_ID, FILENAME.
+    assert [r.match_on[0].kind for r in p2.identity] == [
+        AssetIdentityKind.ASSET_ID,
+        AssetIdentityKind.FILENAME,
+    ]
+    # And the dump is stable.
+    assert p2.model_dump(mode="json") == dumped
+
+
+def test_require_filename_posture_stays_orthogonal_to_identity() -> None:
+    """``require_filename`` is a service-layer pre-check, not an identity
+    field. Toggling it must not change ``policy.identity`` at all.
+    """
+    strict = AssetsWritePolicy(require_filename=True)
+    loose = AssetsWritePolicy(require_filename=False)
+    assert strict.identity == loose.identity

@@ -16,8 +16,11 @@
 
 Mirrors :mod:`dynastore.modules.catalog.item_distributed` (items side):
 
-1. Walks the ``policy.identity_matchers`` chain in order, first match wins.
-2. Dispatches the configured :class:`AssetWriteConflictPolicy`:
+1. Walks the ``policy.identity`` rules in order. Each rule's ``match_on``
+   list is AND-composed over identity fields; the first rule whose
+   conjunction matches an existing row wins (OR across rules).
+2. Dispatches the rule's ``on_match`` action (or the policy-level
+   :class:`AssetWriteConflictPolicy` when the rule doesn't override):
    ``REFUSE_FAIL`` raises :class:`AssetSidecarRejectedError`, ``UPDATE`` /
    ``NEW_VERSION`` mutate / archive+insert, ``REFUSE`` / ``REFUSE_RETURN``
    short-circuit.
@@ -49,7 +52,9 @@ from dynastore.modules.catalog.asset_service import (
     VirtualAssetCreate,
 )
 from dynastore.modules.catalog.write_policy_assets import (
-    AssetIdentityMatcher,
+    AssetIdentityField,
+    AssetIdentityKind,
+    AssetIdentityRule,
     AssetsWritePolicy,
     AssetWriteConflictPolicy,
 )
@@ -99,12 +104,15 @@ class UpsertResult:
     """Outcome of :func:`upsert_asset`.
 
     Carries the row dict (post-insert / post-update / matched-existing) and
-    the matcher that triggered the conflict path, when any.
+    the identity kind that triggered the conflict path, when any. The kind
+    is taken from the first :class:`AssetIdentityField` of the winning
+    :class:`AssetIdentityRule` — single-field rules (the only shape Stage 1
+    emits) put the relevant kind there directly.
     """
 
     action: UpsertAction
     row: Dict[str, Any]
-    matcher_hit: Optional[AssetIdentityMatcher] = None
+    matcher_hit: Optional[AssetIdentityKind] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -276,15 +284,16 @@ async def _probe_by_metadata_field(
     scope: Scope,
     payload: AssetCreatePayload,
     policy: AssetsWritePolicy,
+    *,
+    path: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Match by a JSON-path lookup on ``metadata``.
 
-    The path comes from :attr:`AssetsWritePolicy.metadata_match_path` and is
-    a dot-notation expression (``"a.b.c"``).  We resolve the value from the
-    incoming payload's metadata dict and compare with the persisted column
-    via PostgreSQL's ``#>>`` operator.
+    The path comes from the :attr:`AssetIdentityField.path` of the field
+    being evaluated and is a dot-notation expression (``"a.b.c"``).  We
+    resolve the value from the incoming payload's metadata dict and compare
+    with the persisted column via PostgreSQL's ``#>>`` operator.
     """
-    path = policy.metadata_match_path
     if not path:
         return None
 
@@ -312,35 +321,6 @@ async def _probe_by_metadata_field(
     return _row_to_dict(row)
 
 
-def _normalize_content_hash(value: Optional[str]) -> Optional[str]:
-    """Strip the ``algo:`` prefix from a tagged content_hash for raw
-    comparison. Untagged values pass through unchanged so legacy rows
-    continue to match.
-
-    Tagged form: ``"md5:abc=="`` / ``"sha256:0a1b2c..."``. Cross-algo
-    comparisons return the same prefix-stripped value, but the matcher
-    SQL also enforces ``algo``-equality so a "sha256:X" payload never
-    matches an "md5:Y" row even if the bare bytes happen to coincide.
-    """
-    if not value:
-        return None
-    if ":" in value:
-        # Take only the value half; the algo half is enforced separately.
-        return value.split(":", 1)[1]
-    return value
-
-
-def _split_content_hash(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """Return ``(algo, raw_value)`` from a tagged content_hash. Untagged
-    values yield ``(None, value)``."""
-    if not value:
-        return (None, None)
-    if ":" in value:
-        algo, raw = value.split(":", 1)
-        return (algo, raw)
-    return (None, value)
-
-
 async def _probe_by_content_hash(
     conn: DbResource,
     scope: Scope,
@@ -350,54 +330,50 @@ async def _probe_by_content_hash(
     """Match by ``content_hash`` (physical assets only, post-finalize).
 
     Returns no hit for ``AssetCreate`` payloads at upload-create time —
-    the hash is set by the finalize event in Stage 4.2, so until then the
-    incoming payload has nothing to compare. The probe is still wired so
-    Stage 4.2's finalize-event path benefits from it directly.
+    the hash is set by the finalize event, so until then the incoming
+    payload has nothing to compare. The probe is still wired so the
+    finalize-event path benefits from it directly.
 
-    Tagged-hash semantics: the column stores values as ``"<algo>:<raw>"``
-    (e.g. ``"md5:abc=="``). The probe matches both the tagged form
-    (via direct equality) and the legacy untagged form (via raw-value
-    comparison) so rows written before Stage F2 keep working. A
-    ``"sha256:X"`` payload will never match an ``"md5:Y"`` row even if
-    raw bytes happen to coincide — the algo prefix is honored as part of
-    the match.
+    The ``content_hash`` column stores values as ``"<algo>:<raw>"`` (e.g.
+    ``"md5:abc=="``). Both sides of the comparison are tagged: the
+    incoming payload carries the tagged form, the row stores the tagged
+    form. A ``"sha256:X"`` payload never matches an ``"md5:Y"`` row even
+    if raw bytes coincide — the algo prefix is part of the equality.
     """
     incoming_hash = getattr(payload, "content_hash", None)
     if not incoming_hash:
         return None
-    algo, raw_value = _split_content_hash(incoming_hash)
-    # Match either the exact tagged value (algo-aware), or, for backwards
-    # compatibility, an untagged row with a raw-equal hash.
     sql = (
         f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
         "WHERE catalog_id = :catalog_id "
         "AND collection_id IS NOT DISTINCT FROM :collection_id "
         "AND kind = 'physical' "
         "AND status <> 'deleted' "
-        "AND (content_hash = :tagged OR content_hash = :raw) "
+        "AND content_hash = :tagged "
         "LIMIT 1"
     )
     row = await DQLQuery(sql, result_handler=ResultHandler.ONE_OR_NONE).execute(
         conn,
         catalog_id=scope.catalog_id,
         collection_id=scope.collection_id,
-        tagged=incoming_hash,  # already-tagged equality for new rows
-        raw=raw_value,         # legacy untagged rows
+        tagged=incoming_hash,
     )
     return _row_to_dict(row)
 
 
-# Probe lookup map: matcher → coroutine.
-ProbeFn = Callable[
-    [DbResource, Scope, AssetCreatePayload, AssetsWritePolicy],
-    Awaitable[Optional[Dict[str, Any]]],
-]
-PROBES: Dict[AssetIdentityMatcher, ProbeFn] = {
-    AssetIdentityMatcher.ASSET_ID: _probe_by_asset_id,
-    AssetIdentityMatcher.FILENAME: _probe_by_filename,
-    AssetIdentityMatcher.URL: _probe_by_url,
-    AssetIdentityMatcher.METADATA_FIELD: _probe_by_metadata_field,
-    AssetIdentityMatcher.CONTENT_HASH: _probe_by_content_hash,
+# Probe lookup map: identity kind → coroutine.
+#
+# Probes share a uniform (conn, scope, payload, policy) signature plus
+# kwargs the rule-walker may pass (e.g. ``path`` for METADATA_FIELD). The
+# **kwargs catch on the protocol keeps every probe trivially swappable from
+# the dispatcher.
+ProbeFn = Callable[..., Awaitable[Optional[Dict[str, Any]]]]
+PROBES: Dict[AssetIdentityKind, ProbeFn] = {
+    AssetIdentityKind.ASSET_ID: _probe_by_asset_id,
+    AssetIdentityKind.FILENAME: _probe_by_filename,
+    AssetIdentityKind.URL: _probe_by_url,
+    AssetIdentityKind.METADATA_FIELD: _probe_by_metadata_field,
+    AssetIdentityKind.CONTENT_HASH: _probe_by_content_hash,
 }
 
 
@@ -437,7 +413,7 @@ def _constraint_name_from_exc(exc: BaseException) -> Optional[str]:
 
 
 def _matcher_for_constraint(constraint_name: Optional[str]) -> str:
-    """Map a violated constraint name to the matcher value reported in
+    """Map a violated constraint name to the identity-kind value reported in
     :class:`AssetSidecarRejectedError`.
 
     Constraint names are namespaced by schema (e.g.
@@ -446,13 +422,13 @@ def _matcher_for_constraint(constraint_name: Optional[str]) -> str:
     if not constraint_name:
         return "unknown"
     if constraint_name.startswith("assets_uq_filename"):
-        return AssetIdentityMatcher.FILENAME.value
+        return AssetIdentityKind.FILENAME.value
     if constraint_name.startswith("assets_uq_href"):
-        return AssetIdentityMatcher.URL.value
+        return AssetIdentityKind.URL.value
     if constraint_name == "assets_identity_uq" or constraint_name.startswith(
         "assets_identity_uq"
     ):
-        return AssetIdentityMatcher.ASSET_ID.value
+        return AssetIdentityKind.ASSET_ID.value
     return "unknown"
 
 
@@ -461,24 +437,70 @@ def _matcher_for_constraint(constraint_name: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def _probe_field(
+    conn: DbResource,
+    scope: Scope,
+    payload: AssetCreatePayload,
+    policy: AssetsWritePolicy,
+    field_spec: AssetIdentityField,
+) -> Optional[Dict[str, Any]]:
+    """Dispatch a single :class:`AssetIdentityField` to its probe.
+
+    Kept as a thin shim so the rule walker stays focused on AND/OR
+    composition rather than on per-kind kwargs.
+    """
+    probe = PROBES.get(field_spec.kind)
+    if probe is None:
+        # Unknown kind: silently skip so a policy can opt into a kind that
+        # requires a backend not yet wired (mirrors items' forgiving stance
+        # for forward compat).
+        return None
+    if field_spec.kind == AssetIdentityKind.METADATA_FIELD:
+        return await probe(conn, scope, payload, policy, path=field_spec.path)
+    return await probe(conn, scope, payload, policy)
+
+
 async def _resolve(
     conn: DbResource,
     scope: Scope,
     payload: AssetCreatePayload,
     policy: AssetsWritePolicy,
-) -> Tuple[Optional[Dict[str, Any]], Optional[AssetIdentityMatcher]]:
-    """Walk the policy chain; first matcher returning a row wins."""
-    for matcher in policy.identity_matchers:
-        probe = PROBES.get(matcher)
-        if probe is None:
-            # Unknown matcher: silently skip so a policy can opt into a
-            # matcher that requires a backend not yet wired (mirrors items'
-            # forgiving stance for forward compat).
-            continue
-        row = await probe(conn, scope, payload, policy)
-        if row:
-            return row, matcher
-    return None, None
+) -> Tuple[
+    Optional[Dict[str, Any]],
+    Optional[AssetIdentityKind],
+    Optional[AssetIdentityRule],
+]:
+    """Walk ``policy.identity`` rules in order; first matching rule wins.
+
+    For each rule the ``match_on`` fields are evaluated as an AND: every
+    field must independently match the SAME existing row for the rule to
+    fire. Single-field rules (the only shape Stage 1 emits) trivially
+    satisfy AND with the field's own probe result.
+
+    Returns ``(row, winning_kind, winning_rule)``; the rule is forwarded so
+    its ``on_match`` override can substitute the policy-level action.
+    """
+    for rule in policy.identity:
+        winning_row: Optional[Dict[str, Any]] = None
+        all_matched = True
+        for field_spec in rule.match_on:
+            row = await _probe_field(conn, scope, payload, policy, field_spec)
+            if row is None:
+                all_matched = False
+                break
+            if winning_row is None:
+                winning_row = row
+            elif winning_row.get("asset_id") != row.get("asset_id"):
+                # AND-composition: every field must point at the same row.
+                all_matched = False
+                break
+        if all_matched and winning_row is not None:
+            # By convention the first field of the rule names the dispatch
+            # kind reported back to callers (single-field rules trivially,
+            # multi-field rules pick the lead).
+            lead_kind = rule.match_on[0].kind
+            return winning_row, lead_kind, rule
+    return None, None, None
 
 
 async def upsert_asset(
@@ -500,29 +522,33 @@ async def upsert_asset(
     versioning support — the caller decides how to surface that as a typed
     response).
     """
-    # 1. Resolve identity via the matcher chain (skipped entirely for
+    # 1. Resolve identity via the rule chain (skipped entirely for
     #    NEW_VERSION since we always want a fresh row in that mode).
     existing: Optional[Dict[str, Any]] = None
-    matcher_hit: Optional[AssetIdentityMatcher] = None
+    matcher_hit: Optional[AssetIdentityKind] = None
+    winning_rule: Optional[AssetIdentityRule] = None
     if policy.on_conflict != AssetWriteConflictPolicy.NEW_VERSION:
-        existing, matcher_hit = await _resolve(conn, scope, payload, policy)
+        existing, matcher_hit, winning_rule = await _resolve(
+            conn, scope, payload, policy
+        )
 
     # 2. Hash gating — when enabled and the existing row's content_hash
     #    matches the incoming one, short-circuit the conflict action so
-    #    re-finalising the same blob is a no-op.
-    on_conflict = policy.on_conflict
+    #    re-finalising the same blob is a no-op. The starting action is
+    #    the rule-level override when the rule provided one, otherwise the
+    #    policy default — so a rule that pins ``on_match=REFUSE_RETURN``
+    #    is honoured at this stage.
+    on_conflict = (
+        winning_rule.on_match
+        if (winning_rule is not None and winning_rule.on_match is not None)
+        else policy.on_conflict
+    )
     incoming_hash = getattr(payload, "content_hash", None)
-    # Normalise both sides for the gating compare — a Stage 4.2 finalize
-    # event writes "md5:abc==" while an in-flight upload-create payload
-    # may carry the raw form. A pre-Stage-F2 row may still hold an
-    # untagged value. All three should be considered equal when the bare
-    # bytes match.
     if (
         existing
         and policy.skip_if_unchanged_content_hash
         and incoming_hash
-        and _normalize_content_hash(existing.get("content_hash"))
-        == _normalize_content_hash(incoming_hash)
+        and existing.get("content_hash") == incoming_hash
     ):
         if on_conflict == AssetWriteConflictPolicy.NEW_VERSION:
             on_conflict = AssetWriteConflictPolicy.REFUSE_RETURN
@@ -535,7 +561,7 @@ async def upsert_asset(
     if policy.on_conflict == AssetWriteConflictPolicy.NEW_VERSION:
         existing = await _probe_by_asset_id(conn, scope, payload, policy)
         if existing:
-            matcher_hit = AssetIdentityMatcher.ASSET_ID
+            matcher_hit = AssetIdentityKind.ASSET_ID
 
     # 4. No match → fresh INSERT. The chain probe ran without a transaction
     #    barrier, so a concurrent caller can win the race and INSERT the same

@@ -181,8 +181,8 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
             -- content_hash is stored as a tagged scalar "<algo>:<value>"
             -- (e.g. "md5:abc==", "sha256:0a1b..."). Length budget covers
             -- algo prefix + base64-encoded MD5 (~24 chars) and hex-encoded
-            -- SHA-256 (64 chars). Untagged legacy values still match the
-            -- CONTENT_HASH probe via the OR-clause in _probe_by_content_hash.
+            -- SHA-256 (64 chars). The CONTENT_HASH probe matches the
+            -- tagged form verbatim — payloads MUST submit "<algo>:<raw>".
             content_hash  VARCHAR(96),
             size_bytes    BIGINT,
             metadata      JSONB        DEFAULT '{{}}'::jsonb,

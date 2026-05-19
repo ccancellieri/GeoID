@@ -91,6 +91,16 @@ async def _is_catalog_only_admin(request: Request) -> bool:
     layer cannot resolve to a stable identity. The membership lookup
     reuses the per-pod 60s cache, so this is a cheap secondary check on
     the same critical path that already evaluated the policy.
+
+    Load-bearing invariant: the role-name check on
+    ``principal.roles`` (line below) assumes the IAM layer publishes
+    *platform-tier* roles only on the principal object — catalog-tier
+    grants live on ``request.state.principal_role`` as sentinels (see
+    ``IamMiddleware._augment_with_catalog_sentinels`` and the contract
+    comment in ``packages/extensions/iam/.../middleware.py:287``). If a
+    future change ever lets catalog-scope role names appear in this
+    flat list, this helper silently regresses to ``False`` for catalog
+    admins and the principal-lookup gate disappears.
     """
     from dynastore.models.protocols.authorization import IamRolesConfig
     from dynastore.models.protocols.iam_query import IamQueryProtocol
@@ -132,6 +142,17 @@ async def _catalog_admin_filter_ids(request: Request) -> Optional[set]:
     Anonymous calls (no principal) also return ``None``; the policy layer
     has already gated the route, so anyone who reaches this code without a
     principal carries an authoritative ALLOW (e.g. operator overrides).
+
+    Load-bearing invariant: same as ``_is_catalog_only_admin`` — the
+    role-name check on ``principal.roles`` assumes the IAM layer
+    publishes *platform-tier* roles only on the principal object
+    (catalog-tier admin is exposed as a sentinel on
+    ``request.state.principal_role``; see ``IamMiddleware``'s
+    ``_augment_with_catalog_sentinels`` and the contract comment in
+    ``packages/extensions/iam/.../middleware.py:287``). If a future
+    change lets catalog-scope role names appear in this flat list, this
+    helper silently regresses to "no filter" and catalog admins see the
+    full picker again.
     """
     from dynastore.models.protocols.authorization import IamRolesConfig
     from dynastore.models.protocols.iam_query import IamQueryProtocol

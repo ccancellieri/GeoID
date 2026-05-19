@@ -52,7 +52,9 @@ from dynastore.modules.catalog.asset_service import (
     AssetUploadDefinition,
 )
 from dynastore.modules.catalog.write_policy_assets import (
-    AssetIdentityMatcher,
+    AssetIdentityField,
+    AssetIdentityKind,
+    AssetIdentityRule,
     AssetsWritePolicy,
     AssetWriteConflictPolicy,
 )
@@ -537,7 +539,11 @@ async def test_policy_loaded_at_collection_scope(
 
     custom_policy = AssetsWritePolicy(
         on_conflict=AssetWriteConflictPolicy.UPDATE,
-        identity_matchers=[AssetIdentityMatcher.ASSET_ID],
+        identity=[
+            AssetIdentityRule(
+                match_on=[AssetIdentityField(kind=AssetIdentityKind.ASSET_ID)],
+            ),
+        ],
     )
     patched_env["configs"].get_config.return_value = custom_policy
 
