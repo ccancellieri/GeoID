@@ -42,9 +42,10 @@ deals with belongs to exactly one of them.
     |               |                          | validation.              |
     +---------------+--------------------------+--------------------------+
     | ``Hint``      | Which entry inside       | ``Hint`` (this module).  |
-    |               | ``operations[Op]`` does  | Caller passes ``hint=``  |
-    |               | the caller want?         | to ``get_driver``;       |
-    |               | (per-request preference) | drivers self-declare via |
+    |               | ``operations[Op]`` does  | Caller passes            |
+    |               | the caller want?         | ``hints=frozenset({...})``|
+    |               | (per-request preference) | to ``get_driver``;       |
+    |               |                          | drivers self-declare via |
     |               |                          | ``supported_hints``;     |
     |               |                          | operators pin via        |
     |               |                          | ``OperationDriverEntry   |
@@ -80,12 +81,13 @@ driver's ``supported_hints`` ClassVar.  That meant:
 
 This module is the single source of truth.  The values mirror the
 existing string literals so that ``Hint.GEOMETRY_EXACT == "geometry_exact"``
-holds at runtime — code that already passes the bare string keeps
-working unchanged.  The read-variant flavours (``FULLTEXT``,
-``AGGREGATION``, ``COUNT``, ``STATISTICS``, ``SORT``, ``GROUP_BY``,
-``ATTRIBUTE_FILTER``, ``SPATIAL_FILTER``) were promoted from the
-``Capability`` enum once the structural/per-request axis split
-landed; drivers self-declare which flavours they serve via
+holds at runtime — equality and set membership both succeed against the
+enum member, which keeps comparisons against legacy persisted string
+hints (e.g. on ``OperationDriverEntry.hints``) cheap.  The read-variant
+flavours (``FULLTEXT``, ``AGGREGATION``, ``COUNT``, ``STATISTICS``,
+``SORT``, ``GROUP_BY``, ``ATTRIBUTE_FILTER``, ``SPATIAL_FILTER``) were
+promoted from the ``Capability`` enum once the structural/per-request
+axis split landed; drivers self-declare which flavours they serve via
 ``supported_hints``.
 """
 
@@ -95,10 +97,10 @@ from enum import StrEnum
 class Hint(StrEnum):
     """Canonical per-request routing hints.
 
-    A ``StrEnum`` so existing call sites that pass bare strings
-    (``hint="geometry_exact"``) keep working unchanged — equality and
-    set membership both succeed against the enum member.  Migrations to
-    typed ``FrozenSet[Hint]`` fields land in follow-up PRs.
+    A ``StrEnum`` so persisted ``OperationDriverEntry.hints`` strings and
+    driver-class ``supported_hints`` members interoperate transparently:
+    ``Hint.GEOMETRY_EXACT == "geometry_exact"`` holds, and the matcher
+    consumes a typed ``FrozenSet[Hint]`` end-to-end.
 
     Members are grouped by concern below; group order is editorial only.
     """
@@ -114,8 +116,8 @@ class Hint(StrEnum):
     # wraps in ``ST_AsMVT``.  Today only PG advertises this; future ES /
     # DuckDB drivers opt in by adding it to ``supported_hints`` and
     # implementing ``get_features_query(geom_format="MVT")``.  Tile reads
-    # MUST pass ``hint=Hint.TILES`` so first-match routing returns a
-    # tile-capable driver even when ES is listed first for READ.
+    # MUST pass ``hints=frozenset({Hint.TILES})`` so first-match routing
+    # returns a tile-capable driver even when ES is listed first for READ.
     TILES = "tiles"
 
     # ── Search / read-variant flavours ────────────────────────────────
@@ -126,8 +128,8 @@ class Hint(StrEnum):
     # from ``Capability`` once the read-variants stopped being treated
     # as structural facts about the driver and became per-request
     # preferences — callers route via
-    # ``get_driver(Operation.SEARCH, hint=Hint.AGGREGATION)`` and
-    # drivers self-declare which flavours they serve via
+    # ``get_driver(Operation.SEARCH, hints=frozenset({Hint.AGGREGATION}))``
+    # and drivers self-declare which flavours they serve via
     # ``supported_hints``.
     SEARCH = "search"
     FULLTEXT = "fulltext"

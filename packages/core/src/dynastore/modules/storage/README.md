@@ -5,7 +5,7 @@ Entity-level storage abstraction that routes catalog/collection/items/asset data
 ## Role
 
 The storage module sits between the REST API layer and the storage backends. It resolves which
-driver to dispatch for a given `(operation, catalog_id, collection_id, hint)` tuple via the
+driver to dispatch for a given `(operation, catalog_id, collection_id, hints)` tuple via the
 appropriate per-tier routing config (`ItemsRoutingConfig` / `CollectionRoutingConfig` /
 `AssetRoutingConfig` / `CatalogRoutingConfig`), then delegates the operation to that driver.
 
@@ -16,7 +16,7 @@ appropriate per-tier routing config (`ItemsRoutingConfig` / `CollectionRoutingCo
 | `routing_config.py` | `ItemsRoutingConfig` / `CollectionRoutingConfig` / `AssetRoutingConfig` / `CatalogRoutingConfig` — operation-based routing (post-PR-#261); `Operation`, `OperationDriverEntry`, `FailurePolicy`, `WriteMode` |
 | `hints.py` | `Hint` (closed `StrEnum`) — selectivity tags advertised by drivers and consumed by the router |
 | `driver_config.py` | `ItemsWritePolicy`, `ItemsSchema`, per-driver `*DriverConfig` classes (PluginConfig waterfall) |
-| `router.py` | `get_driver(operation, catalog_id, collection_id, hint=...)` — cached operation-based resolution |
+| `router.py` | `get_driver(operation, catalog_id, collection_id, hints=...)` — cached operation-based resolution |
 | `outbox_ddl.py` | Per-tenant `storage_outbox` DDL for async fan-out. Indexing failures are emitted as structured log events through `LogService`. |
 | `protocol.py` | Re-export convenience for `CollectionItemsStore` and friends |
 | `drivers/postgresql.py` | `ItemsPostgresqlDriver` — items-tier durability primary |
@@ -34,7 +34,7 @@ from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.hints import Hint
 
 # Read — Operation + Hint selects the right backend (first-match wins on hints)
-driver = await get_driver(Operation.READ, catalog_id, collection_id, hint=Hint.GEOMETRY_SIMPLIFIED)
+driver = await get_driver(Operation.READ, catalog_id, collection_id, hints=frozenset({Hint.GEOMETRY_SIMPLIFIED}))
 async for feature in driver.read_entities(catalog_id, collection_id, request=query):
     process(feature)
 

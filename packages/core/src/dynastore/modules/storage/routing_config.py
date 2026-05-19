@@ -467,7 +467,7 @@ class ItemsRoutingConfig(PluginConfig):
             #
             # READ is **hint-selected**, not chained: ``get_driver``
             # returns the FIRST entry whose ``hints`` match the caller's
-            # ``hint=`` (router.py:289 ``resolved[0]``). ES carries
+            # ``hints=`` (router.py ``resolved[0]``). ES carries
             # ``GEOMETRY_SIMPLIFIED`` (default fast path); PG carries
             # ``GEOMETRY_EXACT`` / ``TILES`` and is only reached when the
             # consumer asks for that hint. There is no runtime fallback
@@ -654,7 +654,7 @@ class CollectionRoutingConfig(PluginConfig):
                 # ES is the primary search backend (fast, simplified
                 # geometry). PG is the fallback AND the exact-geometry
                 # path: a consumer needing full-precision geometry passes
-                # hint=Hint.GEOMETRY_EXACT to route SEARCH to PG.
+                # hints=frozenset({Hint.GEOMETRY_EXACT}) to route SEARCH to PG.
                 OperationDriverEntry(
                     driver_ref="collection_elasticsearch_driver",
                     hints={Hint.GEOMETRY_SIMPLIFIED},
@@ -740,7 +740,7 @@ class AssetRoutingConfig(PluginConfig):
             # ES write failure into a fatal "Asset not found" ingestion
             # raise (#620). ES remains a secondary at WARN with
             # ``GEOMETRY_SIMPLIFIED`` so search-style consumers can opt
-            # in via ``get_driver(..., hint=...)``.
+            # in via ``get_driver(..., hints=...)``.
             Operation.WRITE: [
                 OperationDriverEntry(
                     driver_ref="asset_postgresql_driver",

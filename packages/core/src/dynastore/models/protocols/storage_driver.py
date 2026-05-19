@@ -94,7 +94,7 @@ class Capability:
     # and they've moved to the canonical ``Hint`` catalogue
     # (``modules/storage/hints.py``).  Drivers express which flavours
     # they serve via ``supported_hints``; routing dispatches via
-    # ``get_driver(Operation.SEARCH, hint=Hint.AGGREGATION)``.
+    # ``get_driver(Operation.SEARCH, hints=frozenset({Hint.AGGREGATION}))``.
 
     # --- Data management ---
     SOFT_DELETE = "soft_delete"

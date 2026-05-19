@@ -28,7 +28,7 @@ Two functions:
 Typical usage pattern (replaces hardwired BQ join logic):
 
     # 1. Resolve enrichment driver
-    enrichment_driver = await resolve_datasource(cat, coll, hint="enrichment")
+    enrichment_driver = await resolve_datasource(cat, coll, hints=frozenset({"enrichment"}))
 
     # 2. Materialize enrichment data (cached by caller when appropriate)
     enrichment = await get_enrichment_data(
@@ -41,7 +41,7 @@ Typical usage pattern (replaces hardwired BQ join logic):
     #    (existing QueryTransformProtocol pattern)
 
     # 4. Stream features from feature driver
-    feature_driver = await resolve_datasource(cat, coll, hint="features")
+    feature_driver = await resolve_datasource(cat, coll, hints=frozenset({Hint.FEATURES}))
     features = feature_driver.read_entities(cat, coll, request=query)
 
     # 5. Enrich (streaming, O(1) per feature)

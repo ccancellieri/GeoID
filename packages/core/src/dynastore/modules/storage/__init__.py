@@ -25,7 +25,7 @@ Public API::
         get_driver, resolve_drivers, Operation, FailurePolicy,
     )
 
-    driver = await get_driver("READ", catalog_id, collection_id, hint="search")
+    driver = await get_driver("READ", catalog_id, collection_id, hints=frozenset({Hint.SEARCH}))
     async for entity in driver.read_entities(catalog_id, collection_id):
         ...
 

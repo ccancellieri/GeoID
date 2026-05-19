@@ -9,10 +9,9 @@
 """Hint-set dispatch on ``resolve_drivers`` (issue #995).
 
 Pins the request-side composition rewrite that promotes the per-request
-preference axis from a single ``hint=`` string to a typed
-``hints=frozenset(Hint, ...)``. Covers the best-overlap matcher, the
-empty-entry-hints fallback to ``driver.supported_hints``, the longest-
-overlap + entry-order tiebreak, the legacy ``hint=`` back-compat shim,
+preference axis to a typed ``hints=frozenset(Hint, ...)``. Covers the
+best-overlap matcher, the empty-entry-hints fallback to
+``driver.supported_hints``, the longest-overlap + entry-order tiebreak,
 and the frozenset cache-key contract on the L4 request cache.
 """
 
@@ -22,7 +21,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from dynastore.modules.storage.driver_registry import DriverRegistry
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.router import (
-    _coerce_hints,
     _resolve_driver_ids_cached,
     get_driver,
     resolve_drivers,
@@ -61,38 +59,6 @@ def _mock_driver(driver_ref: str, supported_hints: frozenset = frozenset()):
     whose class-level ``supported_hints`` carries the requested set."""
     cls = type(driver_ref, (MagicMock,), {"supported_hints": supported_hints})
     return cls()
-
-
-# ---------------------------------------------------------------------------
-# _coerce_hints — back-compat shim
-# ---------------------------------------------------------------------------
-
-
-class TestCoerceHints:
-    def test_empty_passthrough(self):
-        assert _coerce_hints(frozenset(), None) == frozenset()
-
-    def test_hints_only_passthrough(self):
-        hs = frozenset({Hint.GEOMETRY_EXACT})
-        assert _coerce_hints(hs, None) is hs
-
-    def test_legacy_hint_string_promoted(self):
-        out = _coerce_hints(frozenset(), "geometry_exact")
-        assert out == frozenset({Hint.GEOMETRY_EXACT})
-
-    def test_legacy_hint_enum_promoted(self):
-        out = _coerce_hints(frozenset(), Hint.TILES.value)
-        assert out == frozenset({Hint.TILES})
-
-    def test_both_supplied_raises(self):
-        with pytest.raises(TypeError, match="either hints= .* or hint="):
-            _coerce_hints(frozenset({Hint.GEOMETRY_EXACT}), "geometry_exact")
-
-    def test_legacy_unknown_hint_raises(self):
-        # Hint(...) raises ValueError for an unknown member — the shim does
-        # not paper over typos, the StrEnum coerce is strict.
-        with pytest.raises(ValueError):
-            _coerce_hints(frozenset(), "absolutely_not_a_hint")
 
 
 # ---------------------------------------------------------------------------
@@ -252,40 +218,11 @@ class TestBestOverlapMatcher:
 
 
 # ---------------------------------------------------------------------------
-# resolve_drivers — public entry point + back-compat shim
+# resolve_drivers — public entry point
 # ---------------------------------------------------------------------------
 
 
 class TestResolveDriversHintSet:
-    @pytest.mark.asyncio
-    async def test_legacy_hint_string_matches_typed_hints(self):
-        pg = _mock_driver("postgresql")
-        with (
-            patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
-            patch(
-                "dynastore.modules.storage.router._resolve_driver_ids_cached",
-                new=AsyncMock(return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)]),
-            ) as mock_cached,
-        ):
-            legacy = await resolve_drivers("READ", "cat1", "col1", hint="geometry_exact")
-            typed = await resolve_drivers(
-                "READ", "cat1", "col1", hints=frozenset({Hint.GEOMETRY_EXACT}),
-            )
-            assert legacy[0].driver is typed[0].driver is pg
-            # Both calls coerce to the same frozenset → same cache key.
-            for call in mock_cached.await_args_list:
-                # positional sig: (cls, cat, col, op, hints)
-                assert call.args[4] == frozenset({Hint.GEOMETRY_EXACT})
-
-    @pytest.mark.asyncio
-    async def test_both_hint_and_hints_raises_typeerror(self):
-        with pytest.raises(TypeError, match="either hints= .* or hint="):
-            await resolve_drivers(
-                "READ", "cat1", "col1",
-                hints=frozenset({Hint.GEOMETRY_EXACT}),
-                hint="geometry_exact",
-            )
-
     @pytest.mark.asyncio
     async def test_l4_cache_key_uses_frozenset(self):
         # Regression pin: frozenset(...) must be hashable as a tuple member.

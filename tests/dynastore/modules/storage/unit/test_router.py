@@ -8,6 +8,7 @@ from dynastore.modules.storage.router import (
     resolve_drivers,
 )
 from dynastore.modules.storage.driver_registry import DriverRegistry
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import (
     AssetRoutingConfig,
     FailurePolicy,
@@ -298,7 +299,10 @@ class TestGetAssetDriver:
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
                 return_value=[("elasticsearch", FailurePolicy.FATAL, WriteMode.SYNC)])),
         ):
-            result = await get_asset_driver("SEARCH", "cat1", "col1", hint="search")
+            result = await get_asset_driver(
+                "SEARCH", "cat1", "col1",
+                hints=frozenset({Hint.SEARCH}),
+            )
             assert result is es
 
 

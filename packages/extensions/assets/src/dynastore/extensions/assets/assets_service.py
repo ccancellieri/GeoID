@@ -678,8 +678,6 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         self,
         catalog_id: str,
         collection_id: Optional[str] = None,
-        *,
-        hint: Optional[str] = None,
     ) -> Optional[AssetUploadProtocol]:
         """Resolve the upload backend for a given catalog/collection.
 
@@ -688,9 +686,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         fallback when no UPLOAD entries resolve.
         """
         from dynastore.modules.storage.router import get_asset_upload_driver
-        return await get_asset_upload_driver(
-            catalog_id, collection_id, hint=hint,
-        )
+        return await get_asset_upload_driver(catalog_id, collection_id)
 
     # =============================================================================
     #  CATALOG LEVEL OPERATIONS
