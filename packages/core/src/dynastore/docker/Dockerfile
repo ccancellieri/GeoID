@@ -49,13 +49,13 @@ ARG VENV_PATH=/opt/venv
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git build-essential libpq-dev python3-full python3-pip \
-    python3.13-venv python3.13-dev sudo curl && \
+    python3-venv python3-dev sudo curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR ${APP_DIR}
 
 # Virtual Env Setup
-RUN python3.13 -m venv ${VENV_PATH}
+RUN python3 -m venv ${VENV_PATH}
 ENV PATH="${VENV_PATH}/bin:$PATH"
 # No PYTHONPATH — `dynastore` and `dynastore.extensions` are PEP 420 namespace
 # packages, contributed to by dynastore-core (modules, tools, models, tasks)
