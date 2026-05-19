@@ -16,6 +16,16 @@
 # invoke `docker compose -f docker/docker-compose.test.yml ...` directly
 # instead of going through this script.
 #
+# WORKTREE FOOTGUN: if a stack was last started from a git worktree (or any
+# other path), Docker records that path in the container's compose-project
+# labels. Removing the worktree without first running
+# `docker compose -p $project down --remove-orphans` inside it leaves the
+# containers bound to a host path that no longer exists; on next start the
+# bind-mounts (e.g. `../scripts:/scripts:ro` from compose.db.dev.yml) resolve
+# to empty/missing dirs and the entrypoint fails with "No such file or
+# directory" in a restart loop. Recovery: re-run this script from the live
+# source — same project name will reconcile the labels.
+#
 # Repo root: resolved from (first match wins)
 #   1. $REPO_ROOT env var
 #   2. $PWD if it contains `${COMPOSE_SUBDIR}/docker-compose.dev.yml`
