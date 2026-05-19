@@ -36,7 +36,7 @@ from dynastore.models.protocols.policies import (
 from dynastore.extensions.iam.guards import ensure_privileged_role_assignment
 
 from .models import (
-    UserCreate, UserUpdate,
+    PrincipalCreate, PrincipalUpdate,
     PolicyCreate, PolicyUpdate, PolicyResponse,
     UsagePage, UsageResetResponse, UsageRow,
     CatalogProvisioningView, ProvisioningTaskView,
@@ -285,7 +285,7 @@ class AdminService(ExtensionProtocol):
         return out
 
     @router.post("/principals", summary="Create a principal (local user or raw)", status_code=201)
-    async def create_principal(request: Request, body: UserCreate):  # type: ignore[reportGeneralTypeIssues]
+    async def create_principal(request: Request, body: PrincipalCreate):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
 
         # Privilege-escalation guard: only sysadmins can mint a principal
@@ -354,7 +354,7 @@ class AdminService(ExtensionProtocol):
         )
 
     @router.put("/principals/{principal_id}", summary="Update principal")
-    async def update_principal(request: Request, principal_id: UUID, body: UserUpdate):  # type: ignore[reportGeneralTypeIssues]
+    async def update_principal(request: Request, principal_id: UUID, body: PrincipalUpdate):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()
         p = await mgr.get_principal(principal_id)
         if not p:

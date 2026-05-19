@@ -54,13 +54,19 @@ Endpoint inventory:
 | `/admin/reset-defaults`                                               | POST |
 | `/admin/rotate-jwt-secret`                                            | POST |
 
-DTOs (all in `extensions/admin/.../models.py`):
-`UserCreate`, `UserUpdate`, `UserResponse`,
-`RoleCreate`, `RoleUpdate`, `RoleResponse`,
-`PolicyCreate`, `PolicyUpdate`, `PolicyResponse`,
-`UsageRow`, `UsagePage`, `UsageResetResponse`,
-`AssignRoleRequest`, `CatalogRoleAssignment`, `PrincipalResponse`,
-`ProvisioningTaskView`, `CatalogProvisioningView`.
+DTOs split across two homes:
+
+- `dynastore.models.protocols.policies` (canonical IAM wire schemas):
+  `RoleCreate`, `RoleUpdate`, `RoleResponse`,
+  `AssignRoleRequest`, `PrincipalResponse`.
+- `extensions/admin/.../models.py` (admin extension):
+  `PrincipalCreate`, `PrincipalUpdate` (request bodies for the
+  `/admin/principals` POST + PUT — response shape is `PrincipalResponse`
+  from `models.protocols.policies`),
+  `PolicyCreate`, `PolicyUpdate`, `PolicyResponse`,
+  `UsageRow`, `UsagePage`, `UsageResetResponse`,
+  `CatalogRoleAssignment`,
+  `ProvisioningTaskView`, `CatalogProvisioningView`.
 
 ### `/iam/me/*` (self-service)
 
@@ -202,36 +208,26 @@ into `/admin/*` or `/iam/me/*` themselves.
 
 Ordered by blast radius — small, mergeable, reviewable.
 
-1. **DTO promotion to `models/protocols/policies.py`** *(refactor PR)*
-   Move `RoleCreate`, `RoleUpdate`, `RoleResponse`, `PolicyCreate`,
-   `PolicyUpdate`, `PolicyResponse`, `AssignRoleRequest`,
-   `CatalogRoleAssignment`, `PrincipalResponse` from
-   `extensions/admin/.../models.py` to `dynastore.models.protocols.policies`.
-   Keep the old import paths as thin re-exports for one cycle so external
-   consumers (if any wheels pin them) don't break. Tests:
-   `pytest packages/extensions/iam packages/extensions/admin`.
+1. **DTO promotion to `models/protocols/policies.py`** — partial.
+   `RoleCreate/Update/Response`, `AssignRoleRequest`, and
+   `PrincipalResponse` already live in `models.protocols.policies`.
+   `UserCreate/UserUpdate` were renamed `PrincipalCreate/PrincipalUpdate`
+   and `UserResponse` (dead) was dropped in **PR #981**.
+   Remaining: relocate `PolicyCreate/PolicyUpdate/PolicyResponse` +
+   `CatalogRoleAssignment` — tracked as **#980**.
 
-   Rationale: these are wire schemas for a permission management surface;
-   `models/protocols/policies.py` already exposes the `Policy` / `Role` /
-   `Principal` domain types alongside `PermissionProtocol`. The wire DTOs
-   belong in the same module so a future second consumer (an IAM CLI,
-   another extension, the planned admin SDK) doesn't have to re-import
-   from an extension package.
-
-2. **Delete `IamExtension.stats_router`** *(separate PR, refactor)*
+2. **Delete `IamExtension.stats_router`** — tracked as **#979**.
    `/iam/credentials/stats/summary` and `/iam/credentials/stats/logs`
    have no in-repo consumers and the underlying `get_stats_summary` /
    `get_access_logs` reach into `dynastore.modules.stats.storage` (the
    existing TODO comment in `service.py` flags this as a layer
-   violation). Audit external deployments first; if clean, remove the
-   router and the layer-violating import.
+   violation). Needs external-deployment consumer audit before merge.
 
-3. **OpenAPI deprecation pass** *(docs/OpenAPI PR)*
-   The issue body's phase 3 (deprecate duplicates in OpenAPI) is now a
-   no-op for routes — there are no duplicates to deprecate. The
-   remaining work is to annotate the DTOs renamed in step 1 with a
-   `deprecated` flag on the old import paths (or skip if step 1 is a
-   straight move with re-exports).
+3. **OpenAPI deprecation pass** — no longer needed. The issue body's
+   phase 3 (deprecate duplicates in OpenAPI) is a no-op for routes —
+   there are no duplicates to deprecate. PR #981 hard-renamed the
+   request DTOs (no compat shim, per the project's
+   no-backcompat-keep-code-current convention).
 
 4. **Notebook prose cleanup** *(docs PR)*
    `collection_vault_geoid_only.ipynb` cell at line 294 narrates a

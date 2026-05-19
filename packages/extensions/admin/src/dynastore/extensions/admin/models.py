@@ -10,9 +10,10 @@ from pydantic import BaseModel, Field
 from dynastore.models.auth import Condition
 
 
-# --- User models ---
+# --- Principal request DTOs ---
+# Response shape is `PrincipalResponse` in dynastore.models.protocols.policies.
 
-class UserCreate(BaseModel):
+class PrincipalCreate(BaseModel):
     username: str
     password: Optional[str] = None
     email: Optional[str] = None
@@ -21,18 +22,10 @@ class UserCreate(BaseModel):
     subject_id: Optional[str] = None
 
 
-class UserUpdate(BaseModel):
+class PrincipalUpdate(BaseModel):
     email: Optional[str] = None
     is_active: Optional[bool] = None
     roles: Optional[List[str]] = None
-
-
-class UserResponse(BaseModel):
-    id: str
-    username: str
-    email: Optional[str] = None
-    is_active: bool = True
-    roles: List[str] = Field(default_factory=list)
 
 
 # --- Role wire DTOs live in dynastore.models.protocols.policies. ---
