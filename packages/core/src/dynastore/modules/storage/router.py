@@ -35,7 +35,7 @@ allocation.  Routing resolution is cached (300 s TTL) keyed on
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Generic, List, Optional, Protocol, Type, TypeVar, Union, cast, runtime_checkable
+from typing import TYPE_CHECKING, Dict, FrozenSet, Generic, List, Optional, Protocol, Type, TypeVar, Union, cast, runtime_checkable
 
 if TYPE_CHECKING:
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 _D = TypeVar("_D")
 
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import (
     AssetRoutingConfig,
     FailurePolicy,
@@ -82,13 +83,37 @@ class ResolvedDriver(Generic[_D]):
 # ---------------------------------------------------------------------------
 
 
+def _coerce_hints(
+    hints: FrozenSet[Hint],
+    hint: Optional[str],
+) -> FrozenSet[Hint]:
+    """Reconcile legacy ``hint=`` and new ``hints=`` kwargs.
+
+    Back-compat shim active for one release cycle (removed in slice 8 of
+    the routing-rationalization track per #990). If both kwargs are
+    supplied raise ``TypeError`` — the caller must pick one form. When
+    only legacy ``hint=`` is supplied we coerce to a single-member
+    frozenset so the downstream pipeline only ever sees the typed form.
+    """
+    if hint is not None and hints:
+        raise TypeError(
+            "resolve_drivers / get_driver accept either hints= (preferred) "
+            "or hint= (legacy single-value shim), not both. Drop the legacy "
+            "kwarg — see issue #995."
+        )
+    if hint is not None:
+        logger.debug("deprecated: hint= kwarg → use hints=")
+        return frozenset({Hint(hint)})
+    return hints
+
+
 @cached(maxsize=4096, ttl=300, namespace="storage_router", distributed=True, l1_ttl=2)
 async def _resolve_driver_ids_cached(
     routing_plugin_cls: "Type[PluginConfig]",
     catalog_id: str,
     collection_id: Optional[str],
     operation: str,
-    hint: Optional[str],
+    hints: FrozenSet[Hint],
 ) -> List[tuple]:
     """Cached resolution: returns list of (driver_ref, on_failure, write_mode) tuples."""
     from dynastore.models.protocols.configs import ConfigsProtocol
@@ -139,31 +164,42 @@ async def _resolve_driver_ids_cached(
             # follow-up exception from the fallback path.
             pass
 
-    if hint:
-        # Strict match wins when entry.hints is populated. When the entry
-        # carries no explicit hints, defer to the driver's supported_hints
-        # — drivers self-declare what they serve, so an empty entry hints
-        # set means "this entry does not constrain the hint surface; match
-        # whatever the driver itself supports". This keeps zero-config
-        # routing working (the auto-augmentation helpers all create entries
-        # with empty hints) without sacrificing per-entry strict routing
-        # for operators who explicitly pin hints on a driver.
+    if hints:
+        # Best-overlap matcher: an entry matches iff the entry's effective
+        # hint surface is a SUPERSET of the requested hints (the entry can
+        # serve every preference the caller asked for). When ``entry.hints``
+        # is empty we defer to the driver class's ``supported_hints`` —
+        # drivers self-declare what they serve, so an empty entry-hints set
+        # means "this entry does not constrain the hint surface; match
+        # whatever the driver itself supports". Preserves zero-config
+        # routing while letting operators pin a stricter surface per-entry.
+        #
+        # Tie-break: on equal match, the entry whose effective hint surface
+        # is LONGEST wins (most specific). Final tiebreak is entry order
+        # in the configured list.
         if routing_plugin_cls is AssetRoutingConfig:
             driver_index = DriverRegistry.asset_index()
         else:
             driver_index = DriverRegistry.collection_index()
 
-        def _entry_matches(e: _ODE) -> bool:
+        def _effective_hints(e: _ODE) -> FrozenSet[Hint]:
             if e.hints:
-                return hint in e.hints
+                return frozenset(e.hints)
             drv = driver_index.get(e.driver_ref)
             if drv is None:
-                return False
-            return hint in getattr(
+                return frozenset()
+            return frozenset(getattr(
                 type(drv), "supported_hints", frozenset(),
-            )
+            ))
 
-        entries = [e for e in entries if _entry_matches(e)]
+        def _entry_matches(e: _ODE) -> bool:
+            return hints.issubset(_effective_hints(e))
+
+        matched = [(i, e, _effective_hints(e)) for i, e in enumerate(entries) if _entry_matches(e)]
+        # Sort by (-len(effective), entry_order) so longest-effective wins,
+        # with original-position as the deterministic final tiebreak.
+        matched.sort(key=lambda triple: (-len(triple[2]), triple[0]))
+        entries = [e for _, e, _eff in matched]
 
     return [(e.driver_ref, e.on_failure, e.write_mode) for e in entries]
 
@@ -173,6 +209,7 @@ async def resolve_drivers(
     catalog_id: str,
     collection_id: Optional[str] = None,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     hint: Optional[str] = None,
     routing_plugin_cls: "Type[PluginConfig]" = ItemsRoutingConfig,
 ) -> List[ResolvedDriver]:
@@ -191,23 +228,31 @@ async def resolve_drivers(
         operation: Required. ``WRITE``, ``READ``, ``SEARCH``, etc.
         catalog_id: Catalog context.
         collection_id: Optional collection context.
-        hint: Optional preference to select specific driver(s).
+        hints: Optional set of preferences. An empty set selects all entries
+            (preserves zero-config defaults). Non-empty: only entries whose
+            effective hints are a SUPERSET of the request are kept, longest
+            effective set wins on tie, then entry order.
+        hint: Legacy single-value shim. Converted to ``hints={Hint(hint)}``
+            when ``hints`` is empty. Mutually exclusive with ``hints``;
+            scheduled for removal in slice 8 (refs #990).
         routing_plugin_cls: PluginConfig class — ``ItemsRoutingConfig`` for
             collections, ``AssetRoutingConfig`` for assets.
 
     Returns:
-        Ordered list of :class:`ResolvedDriver`. Empty if hint is not
-        satisfiable by any configured driver.
+        Ordered list of :class:`ResolvedDriver`. Empty when the request
+        ``hints`` are not satisfiable by any configured driver.
     """
+    hints = _coerce_hints(hints, hint)
+
     # L4 — per-request memoisation: if the same resolution was already performed
     # earlier in this request, return the cached result without touching L1/L2/L3.
-    l4_key = (routing_plugin_cls, catalog_id, collection_id, operation, hint)
+    l4_key = (routing_plugin_cls, catalog_id, collection_id, operation, hints)
     l4 = get_request_driver_cache()
     if l4_key in l4:
         return l4[l4_key]
 
     resolved_ids = await _resolve_driver_ids_cached(
-        routing_plugin_cls, catalog_id, collection_id, operation, hint,
+        routing_plugin_cls, catalog_id, collection_id, operation, hints,
     )
 
     if routing_plugin_cls is AssetRoutingConfig:
@@ -228,12 +273,12 @@ async def resolve_drivers(
             )
 
     logger.debug(
-        "router-resolve %s op=%s catalog=%s collection=%s hint=%s -> [%s]",
+        "router-resolve %s op=%s catalog=%s collection=%s hints=%s -> [%s]",
         routing_plugin_cls.__name__,
         operation,
         catalog_id,
         collection_id,
-        hint,
+        sorted(hints),
         ", ".join(rd.driver_ref for rd in result) or "(none)",
     )
 
@@ -252,16 +297,17 @@ async def get_driver(
     catalog_id: str,
     collection_id: Optional[str] = None,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     hint: Optional[str] = None,
 ) -> "CollectionItemsStore":
     """Single-driver resolution for collection READ/SEARCH.
 
     Returns the first matching ``CollectionItemsStore`` or raises.
 
-    ``hint`` selects among multiple drivers configured for the same
+    ``hints`` selects among multiple drivers configured for the same
     operation. The default routing puts ES (public) first for READ with
-    ``hints={"geometry_simplified"}`` and PG second with
-    ``hints={"geometry_exact"}``. SDK consumers needing exact geometries
+    ``hints={Hint.GEOMETRY_SIMPLIFIED}`` and PG second with
+    ``hints={Hint.GEOMETRY_EXACT}``. SDK consumers needing exact geometries
     pass the corresponding hint::
 
         # Default (fast simplified-geom search via ES):
@@ -270,20 +316,24 @@ async def get_driver(
         # Exact geometries (falls through to PG):
         driver = await get_driver(
             Operation.READ, catalog_id, collection_id,
-            hint="geometry_exact",
+            hints=frozenset({Hint.GEOMETRY_EXACT}),
         )
 
-    Hint matching: an entry matches when ``hint in entry.hints`` (strict),
-    or — if ``entry.hints`` is empty — when ``hint`` is in the driver's
-    class-level ``supported_hints`` set. See ``router.py:_entry_matches``.
+    Hint matching: an entry's effective surface is ``entry.hints`` when
+    populated, else the driver class's ``supported_hints``. An entry
+    matches when its effective surface is a SUPERSET of the requested
+    ``hints``; ties broken by largest effective surface then entry order.
+
+    Legacy ``hint=`` kwarg accepted for one cycle (refs #995/#990).
     """
+    hints = _coerce_hints(hints, hint)
     resolved = await resolve_drivers(
-        operation, catalog_id, collection_id, hint=hint,
+        operation, catalog_id, collection_id, hints=hints,
     )
     if not resolved:
         raise ValueError(
             f"No collection driver found for operation='{operation}', "
-            f"hint='{hint}', catalog='{catalog_id}', collection='{collection_id}'"
+            f"hints={sorted(hints)}, catalog='{catalog_id}', collection='{collection_id}'"
         )
     from dynastore.models.protocols.storage_driver import CollectionItemsStore as _CSDP
     return cast(_CSDP, resolved[0].driver)
@@ -293,6 +343,7 @@ async def get_write_drivers(
     catalog_id: str,
     collection_id: Optional[str] = None,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     hint: Optional[str] = None,
 ) -> "List[ResolvedDriver[CollectionItemsStore]]":
     """Multi-driver resolution for collection WRITE fan-out.
@@ -302,9 +353,10 @@ async def get_write_drivers(
     [ItemsPostgresqlDriver]``), so an empty result indicates a deploy/ops
     misconfiguration and is raised as :class:`ConfigResolutionError`.
     """
+    hints = _coerce_hints(hints, hint)
     from dynastore.models.protocols.storage_driver import CollectionItemsStore as _CSDP
     result = await resolve_drivers(
-        Operation.WRITE, catalog_id, collection_id, hint=hint,
+        Operation.WRITE, catalog_id, collection_id, hints=hints,
     )
     if not result:
         from dynastore.modules.db_config.exceptions import ConfigResolutionError
@@ -338,23 +390,25 @@ async def get_asset_driver(
     catalog_id: str,
     collection_id: Optional[str] = None,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     hint: Optional[str] = None,
 ):
     """Single-driver resolution for asset READ/SEARCH.
 
     Returns the first matching ``AssetStore`` or raises.
     """
+    hints = _coerce_hints(hints, hint)
     resolved = await resolve_drivers(
         operation,
         catalog_id,
         collection_id,
-        hint=hint,
+        hints=hints,
         routing_plugin_cls=AssetRoutingConfig,
     )
     if not resolved:
         raise ValueError(
             f"No asset driver found for operation='{operation}', "
-            f"hint='{hint}', catalog='{catalog_id}', collection='{collection_id}'"
+            f"hints={sorted(hints)}, catalog='{catalog_id}', collection='{collection_id}'"
         )
     return resolved[0].driver
 
@@ -363,15 +417,17 @@ async def get_asset_write_drivers(
     catalog_id: str,
     collection_id: Optional[str] = None,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     hint: Optional[str] = None,
 ) -> "List[ResolvedDriver[AssetStore]]":
     """Multi-driver resolution for asset WRITE fan-out."""
+    hints = _coerce_hints(hints, hint)
     from dynastore.models.protocols.asset_driver import AssetStore as _ADP
     result = await resolve_drivers(
         Operation.WRITE,
         catalog_id,
         collection_id,
-        hint=hint,
+        hints=hints,
         routing_plugin_cls=AssetRoutingConfig,
     )
     return cast(List["ResolvedDriver[_ADP]"], result)
@@ -381,6 +437,7 @@ async def get_asset_index_drivers(
     catalog_id: str,
     collection_id: Optional[str] = None,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     hint: Optional[str] = None,
 ) -> "List[ResolvedDriver[AssetStore]]":
     """Multi-driver resolution for asset INDEX fan-out.
@@ -391,12 +448,13 @@ async def get_asset_index_drivers(
     fan secondary writes out to indexer-only drivers (those that opt into
     ``AssetIndexer`` but are not pinned under WRITE).
     """
+    hints = _coerce_hints(hints, hint)
     from dynastore.models.protocols.asset_driver import AssetStore as _ADP
     result = await resolve_drivers(
         Operation.INDEX,
         catalog_id,
         collection_id,
-        hint=hint,
+        hints=hints,
         routing_plugin_cls=AssetRoutingConfig,
     )
     return cast(List["ResolvedDriver[_ADP]"], result)
@@ -406,6 +464,7 @@ async def get_asset_upload_driver(
     catalog_id: str,
     collection_id: Optional[str] = None,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     hint: Optional[str] = None,
 ):
     """Single-driver resolution for asset UPLOAD.
@@ -419,6 +478,7 @@ async def get_asset_upload_driver(
 
     Returns ``None`` only when no backend is registered at all.
     """
+    hints = _coerce_hints(hints, hint)
     from dynastore.models.protocols.asset_upload import AssetUploadProtocol
     from dynastore.tools.discovery import get_protocol, get_protocols
 
@@ -426,7 +486,7 @@ async def get_asset_upload_driver(
     try:
         resolved_ids = await _resolve_driver_ids_cached(
             AssetRoutingConfig, catalog_id, collection_id,
-            Operation.UPLOAD, hint,
+            Operation.UPLOAD, hints,
         )
     except Exception as exc:
         logger.debug(
