@@ -79,3 +79,43 @@ def test_post_geoid_scoped_rejects_empty_body(app):
     with TestClient(app) as c:
         r = c.post("/search/catalogs/cat/geoid", json={})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# #975 — route-level pin: deterministic shape for malformed UUID inputs.
+# The contract chosen is 200 + empty GeoidCollection (symmetric with the batch
+# endpoint where a 400 would punish the whole batch for one bad element).
+# Operator visibility comes from the WARN log in lookup_service, not the HTTP
+# response. Exercises the real lookup_service short-circuit (no mock).
+# ---------------------------------------------------------------------------
+
+
+def test_get_geoid_scoped_with_non_uuid_returns_200_empty():
+    """GET /search/catalogs/{cat}/geoid/{not-a-uuid} → deterministic 200 + empty."""
+    from dynastore.extensions.geoid.lookup_router import router
+
+    a = FastAPI()
+    a.include_router(router)
+    with TestClient(a) as c:
+        r = c.get("/search/catalogs/cat/geoid/not-a-uuid")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["results"] == []
+    assert body["numberReturned"] == 0
+
+
+def test_post_geoid_scoped_with_all_non_uuid_geoids_returns_200_empty():
+    """POST with body.geoids that are all malformed → 200 + empty (not 400)."""
+    from dynastore.extensions.geoid.lookup_router import router
+
+    a = FastAPI()
+    a.include_router(router)
+    with TestClient(a) as c:
+        r = c.post(
+            "/search/catalogs/cat/geoid",
+            json={"geoids": ["not-a-uuid", "still-bogus"], "limit": 10},
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["results"] == []
+    assert body["numberReturned"] == 0

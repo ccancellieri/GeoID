@@ -23,10 +23,36 @@ Per-collection external_id lookup goes directly through
 
 import logging
 from typing import Any, Dict, List, Tuple
+from uuid import UUID
 
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
+
+
+def _partition_uuid_inputs(geoids: List[str]) -> Tuple[List[str], List[str]]:
+    """Split caller-supplied geoid strings into (valid_uuid, invalid) lists.
+
+    The hub query casts ``ANY(:geoids::uuid[])`` and asyncpg raises
+    ``InvalidTextRepresentation`` for any non-UUID element — which the
+    surrounding ``try/except`` swallows, producing a silent empty result
+    for the entire batch (#975). Pre-filtering here lets valid inputs
+    succeed while malformed inputs surface in a single WARN log.
+    """
+    valid: List[str] = []
+    invalid: List[str] = []
+    for g in geoids:
+        if g is None:
+            invalid.append("")
+            continue
+        s = str(g).strip()
+        try:
+            UUID(s)
+        except (ValueError, AttributeError, TypeError):
+            invalid.append(s)
+            continue
+        valid.append(s)
+    return valid, invalid
 
 
 def _feature_to_dict(feature: Any, catalog_id: str, collection_id: str) -> Dict[str, Any]:
@@ -162,6 +188,15 @@ async def lookup_by_geoids(
     if not geoids:
         return []
 
+    valid_geoids, invalid_geoids = _partition_uuid_inputs(list(geoids))
+    if invalid_geoids:
+        logger.warning(
+            "lookup_by_geoids: %d/%d input(s) are not valid UUIDs and will be skipped: %r",
+            len(invalid_geoids), len(geoids), invalid_geoids,
+        )
+    if not valid_geoids:
+        return []
+
     from dynastore.models.protocols import CatalogsProtocol, DatabaseProtocol
     from dynastore.models.query_builder import QueryRequest
     from dynastore.modules.db_config.query_executor import managed_transaction
@@ -186,7 +221,7 @@ async def lookup_by_geoids(
             logger.debug("lookup_by_geoids: no PG collection tables found in %s", schema)
             return []
 
-        remaining_geoids = set(geoids)
+        remaining_geoids = set(valid_geoids)
         hits: Dict[str, List[str]] = {}  # collection_id → list of geoids
 
         for collection_id, physical_table in collection_tables:
