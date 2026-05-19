@@ -8,17 +8,17 @@ literally contained ``id`` or ``asset_id``. GDAL features arrive as
 missed every user-defined field, and ``require_external_id`` silently passed
 because ``"" is None`` is false.
 
-Issue #488 follow-up: ``ItemsWritePolicy.external_id_field`` /
-``require_external_id`` (operator-facing knobs set via PUT
-``/configs/.../plugins/items_write_policy``) must override the sidecar's
-own defaults so the values the operator wrote actually drive extraction
-and validation. The sidecar receives the policy via
-``context["_items_write_policy"]``.
+Phase 2 of #957/#950: ``external_id_field`` / ``require_external_id`` were
+folded into :attr:`ItemsWritePolicy.compute` (a ComputedField of kind
+EXTERNAL_ID whose ``name`` is the source path) and the JSON Schema's
+``required`` list respectively. The sidecar still receives the policy on
+``context["_items_write_policy"]``; only the surface shape changed.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
+from dynastore.modules.storage import ComputedField, ComputedKind
 from dynastore.modules.storage.driver_config import ItemsWritePolicy
 from dynastore.modules.storage.drivers.pg_sidecars.attributes import (
     FeatureAttributeSidecar,
@@ -37,10 +37,30 @@ def _ctx(
     external_id_field: Optional[str] = None,
     require_external_id: bool = False,
 ) -> dict:
-    policy = ItemsWritePolicy(
-        external_id_field=external_id_field,
-        require_external_id=require_external_id,
-    )
+    """Build a sidecar context with a phase-2 ItemsWritePolicy.
+
+    ``external_id_field`` becomes ``ComputedField(kind=EXTERNAL_ID, name=path)``;
+    ``require_external_id`` is expressed via the JSON Schema's ``required``
+    list keyed on the leaf segment of the path.
+    """
+    kwargs: Dict[str, Any] = {}
+    if external_id_field is not None:
+        kwargs["compute"] = [
+            ComputedField(kind=ComputedKind.EXTERNAL_ID, name=external_id_field)
+        ]
+    if require_external_id and external_id_field is not None:
+        leaf = external_id_field.split(".")[-1]
+        kwargs["schema"] = {
+            "type": "object",
+            "required": [leaf],
+            "properties": {leaf: {"type": "string"}},
+        }
+    elif require_external_id:
+        # Path missing — still flag required so the validator sees the
+        # "required but no path" combination.
+        kwargs["schema"] = {"type": "object", "required": ["external_id"]}
+        kwargs["compute"] = [ComputedField(kind=ComputedKind.EXTERNAL_ID, name="external_id")]
+    policy = ItemsWritePolicy(**kwargs)
     return {"_items_write_policy": policy}
 
 

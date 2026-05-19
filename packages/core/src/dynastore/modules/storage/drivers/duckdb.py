@@ -471,14 +471,15 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                         f"valid_from VARCHAR, valid_to VARCHAR)"
                     )
                     for row in rows:
+                        ext_id_path = policy.external_id_path()
                         ext_id = (
                             ctx.get("external_id_override")
-                            or self._extract_external_id(row, policy.external_id_field)
+                            or self._extract_external_id(row, ext_id_path)
                         )
-                        if policy.require_external_id and not ext_id:
+                        if policy.external_id_required() and not ext_id:
                             raise ValueError(
                                 f"DuckDB write_entities: external_id required but missing "
-                                f"(field='{policy.external_id_field}')"
+                                f"(field='{ext_id_path}')"
                             )
 
                         on_conflict = policy.on_conflict

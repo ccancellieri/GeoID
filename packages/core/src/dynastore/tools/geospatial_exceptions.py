@@ -50,3 +50,14 @@ class SridMismatchError(GeometryProcessingError):
     """Raised when a geometry's SRID does not match the expected SRID."""
 
     pass
+
+
+class UnsupportedComputedKind(GeometryProcessingError):
+    """Raised when a :class:`ComputedKind` cannot be materialised at runtime.
+
+    Surfaced as a 422 by callers. Reasons include a missing optional
+    library (``h3``, ``s2sphere``) or a geometry whose type does not
+    support the requested statistic (e.g. ``HOLE_COUNT`` on a Point).
+    """
+
+    pass

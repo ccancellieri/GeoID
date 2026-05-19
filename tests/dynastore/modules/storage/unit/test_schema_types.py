@@ -1,13 +1,12 @@
 """Unit tests for schema_types.py — M8.
 
 Covers:
-- 5 FieldConstraint types (construct, constraint_type, frozen)
+- 2 FieldConstraint types (construct, constraint_type, frozen)
 - SchemaViolation model
 - SchemaExtension Protocol structural check
 - StacSchemaExtension.validate_schema
 - OgcFeaturesSchemaExtension.validate_schema
 - ConfigScopeMixin
-- WritePolicyDefaults (no external_id_field / validity_field / geohash_precision)
 - ItemsSchema with constraints field
 """
 import pytest
@@ -15,16 +14,13 @@ from pydantic import ValidationError
 
 from dynastore.modules.storage.schema_types import (
     ConfigScopeMixin,
-    GeometryHashConstraint,
     FieldConstraint,
-    IdentityKeyConstraint,
     OgcFeaturesSchemaExtension,
     RequiredConstraint,
     SchemaExtension,
     SchemaViolation,
     StacSchemaExtension,
     UniqueConstraint,
-    ValidityConstraint,
 )
 
 
@@ -56,57 +52,13 @@ class TestUniqueConstraint:
         assert c.constraint_type == "unique"
 
 
-class TestIdentityKeyConstraint:
-    def test_constraint_type(self):
-        assert IdentityKeyConstraint.constraint_type == "identity_key"
-
-    def test_default_geohash_precision(self):
-        c = IdentityKeyConstraint()
-        assert c.geohash_precision == 9
-
-    def test_custom_geohash_precision(self):
-        c = IdentityKeyConstraint(geohash_precision=6)
-        assert c.geohash_precision == 6
-
-    def test_geohash_precision_bounds(self):
-        with pytest.raises(ValidationError):
-            IdentityKeyConstraint(geohash_precision=0)
-        with pytest.raises(ValidationError):
-            IdentityKeyConstraint(geohash_precision=13)
-
-
-class TestValidityConstraint:
-    def test_constraint_type(self):
-        assert ValidityConstraint.constraint_type == "validity"
-
-    def test_field_required(self):
-        with pytest.raises(ValidationError):
-            ValidityConstraint()  # 'field' is required
-
-    def test_with_field(self):
-        c = ValidityConstraint(field="valid_time")
-        assert c.field == "valid_time"
-
-
-class TestGeometryHashConstraint:
-    def test_constraint_type(self):
-        assert GeometryHashConstraint.constraint_type == "geometry_hash"
-
-    def test_construction(self):
-        c = GeometryHashConstraint()
-        assert c.constraint_type == "geometry_hash"
-
-
 class TestAllConstraintTypesDistinct:
-    def test_five_distinct_types(self):
+    def test_constraint_types_distinct(self):
         types = {
             RequiredConstraint.constraint_type,
             UniqueConstraint.constraint_type,
-            IdentityKeyConstraint.constraint_type,
-            ValidityConstraint.constraint_type,
-            GeometryHashConstraint.constraint_type,
         }
-        assert len(types) == 5
+        assert len(types) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -245,49 +197,6 @@ class TestConfigScopeMixin:
 
 
 # ---------------------------------------------------------------------------
-# WritePolicyDefaults — posture-only, no field-name references
-# ---------------------------------------------------------------------------
-
-
-class TestWritePolicyDefaults:
-    def test_importable(self):
-        from dynastore.modules.storage.driver_config import WritePolicyDefaults
-        assert WritePolicyDefaults is not None
-
-    def test_class_key(self):
-        from dynastore.modules.storage.driver_config import WritePolicyDefaults
-        assert WritePolicyDefaults.class_key() == "write_policy_defaults"
-
-    def test_default_construction(self):
-        from dynastore.modules.storage.driver_config import WritePolicyDefaults
-        cfg = WritePolicyDefaults()
-        assert cfg is not None
-
-    def test_no_external_id_field(self):
-        from dynastore.modules.storage.driver_config import WritePolicyDefaults
-        schema = WritePolicyDefaults.model_json_schema()
-        properties = schema.get("properties", {})
-        assert "external_id_field" not in properties
-
-    def test_no_validity_field(self):
-        from dynastore.modules.storage.driver_config import WritePolicyDefaults
-        schema = WritePolicyDefaults.model_json_schema()
-        properties = schema.get("properties", {})
-        assert "validity_field" not in properties
-
-    def test_no_geohash_precision(self):
-        from dynastore.modules.storage.driver_config import WritePolicyDefaults
-        schema = WritePolicyDefaults.model_json_schema()
-        properties = schema.get("properties", {})
-        assert "geohash_precision" not in properties
-
-    def test_has_on_conflict(self):
-        from dynastore.modules.storage.driver_config import WritePolicyDefaults
-        schema = WritePolicyDefaults.model_json_schema()
-        assert "on_conflict" in schema.get("properties", {})
-
-
-# ---------------------------------------------------------------------------
 # ItemsSchema with constraints field
 # ---------------------------------------------------------------------------
 
@@ -302,7 +211,7 @@ class TestItemsSchemaConstraints:
         from dynastore.modules.storage.driver_config import ItemsSchema
         cfg = ItemsSchema(constraints=[
             RequiredConstraint(),
-            IdentityKeyConstraint(geohash_precision=7),
+            UniqueConstraint(),
         ])
         assert len(cfg.constraints) == 2
 

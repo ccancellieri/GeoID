@@ -41,12 +41,8 @@ import dynastore.modules.tiles        # noqa: F401  — populate plugin registry
 
 def test_items_write_policy_address_is_tier_first():
     """Items-tier write policy lives at ``storage.items.policy``."""
-    from dynastore.modules.storage.driver_config import (
-        ItemsWritePolicy,
-        WritePolicyDefaults,
-    )
+    from dynastore.modules.storage.driver_config import ItemsWritePolicy
     assert ItemsWritePolicy._address == ("platform", "catalog", "collection", "items", "policy")
-    assert WritePolicyDefaults._address == ("platform", "catalog", "collection", "items", "policy")
 
 
 def test_items_schema_address_is_tier_first():

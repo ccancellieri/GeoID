@@ -216,7 +216,7 @@ class GeometriesSidecarConfig(SidecarConfig):
     ``bbox_geom``), a STORED GENERATED ``geohash CHAR(N)`` driven by
     ``ST_GeoHash(geom, N)``, and a STORED GENERATED ``geometry_hash
     CHAR(64)`` (SHA256 of ``ST_AsBinary(geom)``) used by
-    ``IdentityMatcher.GEOMETRY_HASH`` and the
+    ``ComputedKind.GEOMETRY_HASH`` and the
     ``skip_if_unchanged_geometry_hash`` write-policy gate.
 
     Attached by default for VECTOR / RASTER collections; not attached
@@ -254,14 +254,14 @@ class GeometriesSidecarConfig(SidecarConfig):
             "``geohash CHAR(N)`` (N=precision, 1-12) is added to the geometry "
             "sidecar, populated by ``ST_GeoHash(geom, N)``, with a B-tree index. "
             "Useful as a coarse spatial-locality B-tree for ad-hoc queries. "
-            "Distinct from ``ItemsWritePolicy.geohash_precision`` — that knob "
-            "drives the runtime identity match (``ST_GeoHash(geom, M)`` computed "
-            "on-the-fly), this knob drives the persisted column. The two values "
-            "do NOT have to agree (and typically won't, e.g. policy M=9 for "
-            "5m-cell identity vs column N=8 for 20m-cell scan acceleration). "
-            "Default 8 (≈20 m, ≈38 bits) — small storage cost, useful "
-            "out-of-the-box for spatial dedup. Set to None to opt out for "
-            "collections where the column would be wasted."
+            "Distinct from the identity-axis :class:`ComputedKind.GEOHASH` entry "
+            "on ``ItemsWritePolicy.compute`` — that drives runtime identity match "
+            "(``ST_GeoHash(geom, M)`` computed on-the-fly), this drives the "
+            "persisted column. The two values do NOT have to agree (and typically "
+            "won't, e.g. policy M=9 for 5m-cell identity vs column N=8 for "
+            "20m-cell scan acceleration). Default 8 (≈20 m, ≈38 bits) — small "
+            "storage cost, useful out-of-the-box for spatial dedup. Set to None "
+            "to opt out for collections where the column would be wasted."
         ),
     )
 

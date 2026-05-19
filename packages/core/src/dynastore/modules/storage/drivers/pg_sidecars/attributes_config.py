@@ -167,7 +167,7 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
     * **JSONB (Mode B, default when no schema)** — single ``attributes
       JSONB`` column + STORED GENERATED ``attributes_hash CHAR(64)``
       (SHA256 of canonicalised JSONB) powering
-      ``IdentityMatcher.ATTRIBUTES_HASH``.  Schema-flexible; one column
+      ``ComputedKind.ATTRIBUTES_HASH``.  Schema-flexible; one column
       per item regardless of property count.
 
     * **Columnar (Mode A, when schema is supplied)** — one PG column
@@ -176,7 +176,7 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
 
     Identity columns (``external_id``, ``asset_id``) are gated by
     ``enable_external_id`` / ``enable_asset_id`` flags — used by
-    ``IdentityMatcher.EXTERNAL_ID`` and the asset-reference cascade.
+    ``ComputedKind.EXTERNAL_ID`` and the asset-reference cascade.
     """
 
     sidecar_type: Literal["attributes"] = "attributes"

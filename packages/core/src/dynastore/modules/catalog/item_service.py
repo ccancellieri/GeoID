@@ -618,6 +618,25 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     items_write_policy = wp
 
         # Phase 2 — prepare every item in memory; dedupe partition keys
+        # If the policy declares a JSON Schema, every feature's ``properties``
+        # is validated against it before sidecar work begins. Failure raises
+        # a 422-shaped ValueError naming the offending field; the bulk
+        # ingestion layer aggregates these into IngestionReport rejections.
+        policy_schema = (
+            items_write_policy.schema
+            if items_write_policy is not None
+            else None
+        )
+        schema_validator = None
+        if isinstance(policy_schema, dict) and policy_schema:
+            from jsonschema import Draft202012Validator
+            try:
+                schema_validator = Draft202012Validator(policy_schema)
+            except Exception as exc:
+                raise ValueError(
+                    f"ItemsWritePolicy.schema is not a valid JSON Schema: {exc}"
+                ) from exc
+
         prepared: List[Dict[str, Any]] = []
         unique_partition_values: set = set()
         for item_data in items_list:
@@ -627,6 +646,21 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 raw_item = item_data
             else:
                 raise ValueError(f"Unsupported item type: {type(item_data)}")
+
+            if schema_validator is not None:
+                props = raw_item.get("properties") or {}
+                violations = sorted(
+                    schema_validator.iter_errors(props),
+                    key=lambda e: list(e.absolute_path),
+                )
+                if violations:
+                    msg = "; ".join(
+                        f"{'.'.join(str(p) for p in v.absolute_path) or '<root>'}: {v.message}"
+                        for v in violations
+                    )
+                    raise ValueError(
+                        f"Feature properties violate ItemsWritePolicy.schema: {msg}"
+                    )
 
             geoid = generate_geoid()
             item_context: Dict[str, Any] = {

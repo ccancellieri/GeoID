@@ -19,11 +19,15 @@ from dynastore.modules.db_config.query_executor import (
     DbResource,
     ResultHandler,
 )
+from dynastore.modules.storage.computed_fields import (
+    ComputedField,
+    ComputedKind,
+    IdentityRule,
+)
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,
     ItemsWritePolicy,
     WriteConflictPolicy,
-    IdentityMatcher,
 )
 from dynastore.modules.storage.errors import ConflictError, SidecarRejectedError
 from dynastore.models.protocols import ConfigsProtocol
@@ -51,20 +55,67 @@ logger = logging.getLogger(__name__)
 
 def _select_effective_on_conflict(
     write_policy: Optional["ItemsWritePolicy"],
-    matched_matcher: "IdentityMatcher",
+    matched_rule: Optional["IdentityRule"],
 ) -> "WriteConflictPolicy":
-    """Resolve the conflict action for the matcher that won the chain.
+    """Resolve the conflict action for the rule that won identity resolution.
 
-    Falls back to ``write_policy.on_conflict`` (or ``UPDATE`` if no policy)
-    when ``matcher_actions`` is unset or has no entry for the winning matcher.
+    Per-rule ``on_match`` overrides the policy's ``on_conflict``. With no
+    policy at all the fallback is ``UPDATE`` (preserving prior semantics).
     """
     if write_policy is None:
         return WriteConflictPolicy.UPDATE
-    if write_policy.matcher_actions:
-        action = write_policy.matcher_actions.get(matched_matcher)
-        if action is not None:
-            return action
+    if matched_rule is not None and matched_rule.on_match is not None:
+        return matched_rule.on_match
     return write_policy.on_conflict
+
+
+async def _resolve_rule(
+    rule: "IdentityRule",
+    conn: Any,
+    phys_schema: str,
+    phys_table: str,
+    processing_context: Dict[str, Any],
+    sidecars: List["SidecarProtocol"],
+) -> Optional[Dict[str, Any]]:
+    """Resolve identity for a single :class:`IdentityRule`.
+
+    Semantics: every :class:`ComputedField` in ``rule.match_on`` must
+    resolve to the SAME existing row (AND within the rule). The rule
+    matches iff the geoid intersection across every match_on field is
+    non-empty; the first (canonical) row wins.
+
+    Single-field rules collapse to the prior linear matcher walk —
+    walking sidecars in order and returning the first match.
+    """
+    if not rule.match_on:
+        return None
+
+    field_hits: List[Dict[Any, Dict[str, Any]]] = []
+    for cf in rule.match_on:
+        matcher_str = str(cf.kind)
+        by_geoid: Dict[Any, Dict[str, Any]] = {}
+        for sidecar in sidecars:
+            rec = await sidecar.resolve_existing_item(
+                conn, phys_schema, phys_table, processing_context,
+                matcher=matcher_str,
+            )
+            if rec and "geoid" in rec:
+                by_geoid.setdefault(rec["geoid"], rec)
+        if not by_geoid:
+            return None  # rule cannot match: at least one ComputedField unresolved
+        field_hits.append(by_geoid)
+
+    # Intersect the geoid sets across every match_on field.
+    common = set(field_hits[0].keys())
+    for nxt in field_hits[1:]:
+        common &= set(nxt.keys())
+    if not common:
+        return None
+    # Pick the row by the first geoid in the first match (stable order).
+    for g in field_hits[0]:
+        if g in common:
+            return field_hits[0][g]
+    return None
 
 
 class ItemDistributedMixin(_Host):
@@ -133,37 +184,34 @@ class ItemDistributedMixin(_Host):
                     reason="sidecar_not_acceptable",
                 )
 
-        # Standardized Identity Resolution via Sidecar Protocol
-        # Iterate over the configured matcher chain in order; first match wins.
+        # Standardized Identity Resolution via Sidecar Protocol.
+        # Walk the policy's :class:`IdentityRule` chain in order. Each rule
+        # ANDs its ``match_on`` ComputedFields (every field must resolve to
+        # the same row); rules OR across the list. First rule that matches
+        # wins. Per-rule ``on_match`` overrides ``on_conflict``.
         active_rec = None
-        matched_via = None
-        matchers = (
-            list(write_policy.identity_matchers)
-            if write_policy and write_policy.identity_matchers
-            else [IdentityMatcher.EXTERNAL_ID]
+        matched_rule: Optional[IdentityRule] = None
+        rules = (
+            list(write_policy.identity)
+            if write_policy and write_policy.identity
+            else [IdentityRule(match_on=[ComputedField(kind=ComputedKind.EXTERNAL_ID)])]
         )
         if on_conflict != WriteConflictPolicy.NEW_VERSION:
-            for matcher in matchers:
-                for sidecar in sidecars:
-                    rec = await sidecar.resolve_existing_item(
-                        conn, phys_schema, phys_table, processing_context,
-                        matcher=str(matcher),
+            for rule in rules:
+                rec = await _resolve_rule(
+                    rule, conn, phys_schema, phys_table, processing_context, sidecars,
+                )
+                if rec:
+                    active_rec = rec
+                    matched_rule = rule
+                    kinds = ",".join(str(cf.kind) for cf in rule.match_on)
+                    logger.info(
+                        f"DISTRIBUTED UPSERT: found active record "
+                        f"geoid={rec.get('geoid')} (rule.match_on=[{kinds}])"
                     )
-                    if rec:
-                        active_rec = rec
-                        matched_via = (matcher, sidecar.sidecar_id)
-                        logger.info(
-                            f"DISTRIBUTED UPSERT: found active record "
-                            f"geoid={rec.get('geoid')} (matcher={matcher}, sidecar={sidecar.sidecar_id})"
-                        )
-                        break
-                if active_rec:
                     break
 
-        effective_on_conflict = _select_effective_on_conflict(
-            write_policy,
-            matched_via[0] if matched_via else IdentityMatcher.EXTERNAL_ID,
-        )
+        effective_on_conflict = _select_effective_on_conflict(write_policy, matched_rule)
 
         # 1.6 Asset-level (batch-level) collision guard.
         # Uses active_rec from identity resolution — if a duplicate was found
@@ -172,16 +220,19 @@ class ItemDistributedMixin(_Host):
         if active_rec and write_policy and write_policy.on_asset_conflict is not None:
             from dynastore.modules.storage.driver_config import AssetConflictPolicy
             if write_policy.on_asset_conflict == AssetConflictPolicy.REFUSE:
-                matcher_name = matched_via[0] if matched_via else "unknown"
+                rule_name = (
+                    ",".join(str(cf.kind) for cf in matched_rule.match_on)
+                    if matched_rule else "unknown"
+                )
                 logger.warning(
-                    "Feature rejected: batch-level collision (refuse_asset) via matcher=%s "
-                    "geoid=%s", matcher_name, active_rec.get("geoid")
+                    "Feature rejected: batch-level collision (refuse_asset) via rule=[%s] "
+                    "geoid=%s", rule_name, active_rec.get("geoid")
                 )
                 raise ConflictError(
-                    f"Write refused: duplicate detected via {matcher_name} "
+                    f"Write refused: duplicate detected via [{rule_name}] "
                     f"(geoid={active_rec.get('geoid')}); policy=refuse_asset",
                     geoid=active_rec.get("geoid"),
-                    matcher=str(matcher_name),
+                    matcher=rule_name,
                 )
 
         # 1.7 Hash gating: if enabled and an unchanged geometry_hash matches,
@@ -206,12 +257,15 @@ class ItemDistributedMixin(_Host):
 
         # 1.8 REFUSE_FAIL: raise immediately so the batch aborts.
         if active_rec and effective_on_conflict == WriteConflictPolicy.REFUSE_FAIL:
-            matcher_name = matched_via[0] if matched_via else "unknown"
+            rule_name = (
+                ",".join(str(cf.kind) for cf in matched_rule.match_on)
+                if matched_rule else "unknown"
+            )
             raise ConflictError(
-                f"Write refused: identity match via {matcher_name} "
+                f"Write refused: identity match via [{rule_name}] "
                 f"(geoid={active_rec.get('geoid')}); policy=REFUSE_FAIL",
                 geoid=active_rec.get("geoid"),
-                matcher=str(matcher_name),
+                matcher=rule_name,
             )
 
         # 1.9 REFUSE_RETURN: echo the existing record without writing. Caller

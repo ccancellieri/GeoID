@@ -425,9 +425,9 @@ class ItemsElasticsearchDriver(
         for item in items:
             stac_doc = self._feature_to_stac_item(item, catalog_id, collection_id)
 
-            # Resolve external_id from the configured field path.
-            external_id = self._extract_external_id_from_doc(stac_doc, policy.external_id_field)
-            if policy.require_external_id and not external_id:
+            # Resolve external_id from the configured ComputedField path.
+            external_id = self._extract_external_id_from_doc(stac_doc, policy.external_id_path())
+            if policy.external_id_required() and not external_id:
                 logger.warning(
                     "ES write_entities: external_id required but missing for item in %s/%s — skipped",
                     catalog_id, collection_id,

@@ -60,6 +60,7 @@ from .geospatial_exceptions import (
     UnfixableGeometryError,
     DisallowedGeometryTypeError,
     SridMismatchError,
+    UnsupportedComputedKind,
 )
 
 logger = logging.getLogger(__name__)
@@ -465,3 +466,264 @@ def get_spatial_indices_for_bbox(
             logger.error(f"S2 optimization failed (RegionCoverer): {e}")
 
     return indices
+
+# ---------------------------------------------------------------------------
+# compute_derived_fields — phase 1 of items-policy consolidation (#957/#950).
+#
+# Takes a Shapely geometry + the feature's properties dict + a list of
+# ``ComputedField`` entries and returns a dict keyed by each entry's
+# ``resolved_name``. Drivers consult this dict during ``write_entities`` to
+# materialise the declared values however the underlying store prefers
+# (PG column, ES numeric, DuckDB sort key, Iceberg partition).
+#
+# EXTERNAL_ID is intentionally NOT handled here — it is path-extracted from
+# the feature via ``ItemsWritePolicy.external_id_field`` upstream.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+# Base32 alphabet used by the standard geohash scheme.
+_GEOHASH_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def _encode_geohash(lat: float, lon: float, precision: int) -> str:
+    """Standard 32-character geohash encoder. Bisects lon/lat alternately."""
+    lat_lo, lat_hi = -90.0, 90.0
+    lon_lo, lon_hi = -180.0, 180.0
+    geohash: List[str] = []
+    bits = [16, 8, 4, 2, 1]
+    bit = 0
+    ch = 0
+    even = True
+    while len(geohash) < precision:
+        if even:
+            mid = (lon_lo + lon_hi) / 2
+            if lon >= mid:
+                ch |= bits[bit]
+                lon_lo = mid
+            else:
+                lon_hi = mid
+        else:
+            mid = (lat_lo + lat_hi) / 2
+            if lat >= mid:
+                ch |= bits[bit]
+                lat_lo = mid
+            else:
+                lat_hi = mid
+        even = not even
+        if bit < 4:
+            bit += 1
+        else:
+            geohash.append(_GEOHASH_BASE32[ch])
+            bit = 0
+            ch = 0
+    return "".join(geohash)
+
+
+def _canonical_attributes_hash(properties: Dict[str, Any]) -> str:
+    """sha256(canonical-json(properties)). Sort keys for determinism."""
+    payload = _json.dumps(
+        properties,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _geometry_hash(geom: "BaseGeometry") -> str:
+    """sha256(WKB) — mirrors the PG-side STORED GENERATED column (#220)."""
+    from shapely import wkb as _wkb
+
+    return hashlib.sha256(_wkb.dumps(geom)).hexdigest()
+
+
+def compute_derived_fields(
+    geometry: "BaseGeometry",
+    properties: Dict[str, Any],
+    fields: "List[Any]",
+) -> Dict[str, Any]:
+    """Materialise the declared :class:`ComputedField` entries for one feature.
+
+    Returns a dict keyed by each field's ``resolved_name``. Raises
+    :class:`UnsupportedComputedKind` if a kind cannot be materialised
+    (missing optional library, geometry type mismatch).
+
+    ``EXTERNAL_ID`` is dropped silently — callers strip it upstream since
+    it is path-extracted from the feature, not derived from geometry/
+    properties.
+    """
+    # Local import to avoid a cycle: computed_fields imports from
+    # driver_config, which is itself imported from many modules. Keeping
+    # the import local lets `geospatial.py` stay importable from
+    # ``computed_fields`` future direction without ordering pain.
+    from dynastore.modules.storage.computed_fields import (
+        ComputedKind,
+        SPATIAL_CELL_KINDS,
+    )
+
+    out: Dict[str, Any] = {}
+    centroid_lat: Optional[float] = None
+    centroid_lon: Optional[float] = None
+
+    def _centroid() -> Tuple[float, float]:
+        nonlocal centroid_lat, centroid_lon
+        if centroid_lat is None:
+            c = geometry.centroid
+            centroid_lat = float(c.y)
+            centroid_lon = float(c.x)
+        return centroid_lat, centroid_lon  # type: ignore[return-value]
+
+    def _extract_path(root_props: Dict[str, Any], path: str) -> Any:
+        """Resolve a dotted path against the feature.
+
+        ``"properties.adm2_pcode"`` walks the dict; the leading
+        ``"properties."`` segment is stripped because we are already
+        passing the properties dict. A bare attribute name
+        (e.g. ``"adm2_pcode"``) is read directly.
+        """
+        segments = path.split(".")
+        if segments and segments[0] == "properties":
+            segments = segments[1:]
+        current: Any = root_props
+        for seg in segments:
+            if isinstance(current, dict) and seg in current:
+                current = current[seg]
+            else:
+                return None
+        return current
+
+    for f in fields:
+        kind = f.kind
+        key = f.resolved_name
+
+        if kind == ComputedKind.EXTERNAL_ID:
+            # ``name`` is the dotted JSON path into the feature; no name
+            # means "external_id sits at properties.external_id".
+            path = f.name or "properties.external_id"
+            value = _extract_path(properties, path)
+            # ``resolved_name`` for EXTERNAL_ID falls back to ``"external_id"``
+            # so downstream code has a stable key regardless of path.
+            out["external_id"] = value
+            continue
+
+        if kind == ComputedKind.GEOMETRY_HASH:
+            out[key] = _geometry_hash(geometry)
+
+        elif kind == ComputedKind.ATTRIBUTES_HASH:
+            out[key] = _canonical_attributes_hash(properties)
+
+        elif kind == ComputedKind.GEOHASH:
+            lat, lon = _centroid()
+            out[key] = _encode_geohash(lat, lon, f.resolution)
+
+        elif kind == ComputedKind.H3:
+            if h3 is None:
+                raise UnsupportedComputedKind(
+                    "ComputedKind.H3 requires the optional 'h3' library"
+                )
+            lat, lon = _centroid()
+            try:
+                cell = h3.latlng_to_cell(lat, lon, f.resolution)
+            except AttributeError:
+                # h3 v3.x fallback
+                cell = h3.geo_to_h3(lat, lon, f.resolution)  # type: ignore[attr-defined]
+            out[key] = cell
+
+        elif kind == ComputedKind.S2:
+            if s2sphere is None:
+                raise UnsupportedComputedKind(
+                    "ComputedKind.S2 requires the optional 's2sphere' library"
+                )
+            lat, lon = _centroid()
+            latlng = s2sphere.LatLng.from_degrees(lat, lon)
+            cell = s2sphere.CellId.from_lat_lng(latlng).parent(f.resolution)
+            out[key] = cell.to_token()
+
+        elif kind == ComputedKind.AREA:
+            out[key] = float(geometry.area)
+
+        elif kind == ComputedKind.VOLUME:
+            # Shapely exposes .volume only on 3D closed types (Solid).
+            if hasattr(geometry, "volume"):
+                out[key] = float(geometry.volume)
+            else:
+                out[key] = 0.0
+
+        elif kind == ComputedKind.CIRCULARITY:
+            import math as _math
+            if geometry.length > 0:
+                out[key] = float(
+                    (4 * _math.pi * geometry.area) / (geometry.length ** 2)
+                )
+            else:
+                out[key] = 0.0
+
+        elif kind == ComputedKind.CONVEXITY:
+            hull_area = geometry.convex_hull.area
+            if hull_area > 0:
+                out[key] = float(geometry.area / hull_area)
+            else:
+                out[key] = 0.0
+
+        elif kind == ComputedKind.ASPECT_RATIO:
+            minx, miny, maxx, maxy = geometry.bounds
+            width = maxx - minx
+            height = maxy - miny
+            out[key] = float(width / height) if height > 0 else 0.0
+
+        elif kind == ComputedKind.PERIMETER:
+            # Perimeter is well-defined for polygons; for line/point we
+            # report 0 / 0 rather than raising — matches Shapely's
+            # ``.length`` on a Polygon returning the perimeter.
+            if geometry.geom_type in ("Polygon", "MultiPolygon"):
+                out[key] = float(geometry.length)
+            else:
+                out[key] = 0.0
+
+        elif kind == ComputedKind.LENGTH:
+            out[key] = float(geometry.length)
+
+        elif kind == ComputedKind.CENTROID:
+            c = geometry.centroid
+            out[key] = [float(c.x), float(c.y)]
+
+        elif kind == ComputedKind.BBOX:
+            minx, miny, maxx, maxy = geometry.bounds
+            out[key] = [float(minx), float(miny), float(maxx), float(maxy)]
+
+        elif kind == ComputedKind.VERTEX_COUNT:
+            if hasattr(geometry, "exterior") and geometry.exterior is not None:
+                out[key] = len(geometry.exterior.coords)
+            elif hasattr(geometry, "coords"):
+                out[key] = len(geometry.coords)
+            elif hasattr(geometry, "geoms"):
+                total = 0
+                for g in geometry.geoms:
+                    if hasattr(g, "exterior") and g.exterior is not None:
+                        total += len(g.exterior.coords)
+                    elif hasattr(g, "coords"):
+                        total += len(g.coords)
+                out[key] = total
+            else:
+                out[key] = 0
+
+        elif kind == ComputedKind.HOLE_COUNT:
+            if hasattr(geometry, "interiors"):
+                out[key] = len(list(geometry.interiors))
+            elif hasattr(geometry, "geoms"):
+                total = 0
+                for g in geometry.geoms:
+                    if hasattr(g, "interiors"):
+                        total += len(list(g.interiors))
+                out[key] = total
+            else:
+                out[key] = 0
+
+        else:
+            raise UnsupportedComputedKind(
+                f"ComputedKind.{kind.name} is not implemented in compute_derived_fields()"
+            )
+
+    return out

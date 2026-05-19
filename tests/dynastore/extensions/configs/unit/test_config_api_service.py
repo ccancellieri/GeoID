@@ -70,14 +70,14 @@ async def test_get_effective_configs_resolved_merges_tier_deltas():
     waterfall order (platform > catalog > collection, last wins) — no per-class
     ``get_config`` round-trip.
     """
-    from dynastore.modules.storage.driver_config import WritePolicyDefaults
+    from dynastore.modules.storage.driver_config import ItemsWritePolicy
 
     async def list_side_effect(catalog_id=None, collection_id=None, **_):
         if catalog_id and collection_id:
             return {
                 "results": [
-                    {"plugin_id": "write_policy_defaults",
-                     "config": {"require_identity_key": True}},
+                    {"plugin_id": "items_write_policy",
+                     "config": {"on_conflict": "refuse_fail"}},
                 ],
                 "total": 1,
             }
@@ -93,11 +93,11 @@ async def test_get_effective_configs_resolved_merges_tier_deltas():
     by_class, sources, _tier_data = await svc._get_effective_configs(
         catalog_id="cat-x", collection_id="coll-y", resolved=True,
     )
-    assert sources["write_policy_defaults"] == "collection"
-    assert by_class["write_policy_defaults"]["require_identity_key"] is True
+    assert sources["items_write_policy"] == "collection"
+    assert by_class["items_write_policy"]["on_conflict"] == "refuse_fail"
     # round-trips through the model so other defaults are present
-    default_keys = set(WritePolicyDefaults().model_dump().keys())
-    assert set(by_class["write_policy_defaults"].keys()) == default_keys
+    default_keys = set(ItemsWritePolicy().model_dump().keys())
+    assert set(by_class["items_write_policy"].keys()) == default_keys
 
 
 @pytest.mark.asyncio
@@ -147,15 +147,15 @@ async def test_get_effective_configs_consumes_real_list_configs_row_shape(resolv
     ``GET /configs/.../collections/{c}``. This test feeds the real wire shape
     and asserts the override survives the merge in both branches.
     """
-    from dynastore.modules.storage.driver_config import WritePolicyDefaults
+    from dynastore.modules.storage.driver_config import ItemsWritePolicy
 
     async def list_side_effect(catalog_id=None, collection_id=None, **_):
         if catalog_id and collection_id:
             return {
                 "total": 1,
                 "results": [
-                    {"plugin_id": "write_policy_defaults",
-                     "config": {"require_identity_key": True}},
+                    {"plugin_id": "items_write_policy",
+                     "config": {"on_conflict": "refuse_fail"}},
                 ],
             }
         return {"total": 0, "results": []}
@@ -168,18 +168,18 @@ async def test_get_effective_configs_consumes_real_list_configs_row_shape(resolv
         catalog_id="cat-x", collection_id="coll-y", resolved=resolved,
     )
 
-    assert sources["write_policy_defaults"] == "collection", (
+    assert sources["items_write_policy"] == "collection", (
         "stored collection-tier row must surface as source=collection; "
         "regression for items/results & config_data/config field-name drift"
     )
-    assert by_class["write_policy_defaults"]["require_identity_key"] is True
-    assert tier_data["collection"]["write_policy_defaults"] == {
-        "require_identity_key": True,
+    assert by_class["items_write_policy"]["on_conflict"] == "refuse_fail"
+    assert tier_data["collection"]["items_write_policy"] == {
+        "on_conflict": "refuse_fail",
     }
     if resolved:
         # resolved path round-trips through the model so other defaults appear
-        assert set(by_class["write_policy_defaults"].keys()) == set(
-            WritePolicyDefaults().model_dump().keys()
+        assert set(by_class["items_write_policy"].keys()) == set(
+            ItemsWritePolicy().model_dump().keys()
         )
 
 

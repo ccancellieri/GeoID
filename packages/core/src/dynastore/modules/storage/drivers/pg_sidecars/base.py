@@ -1048,7 +1048,8 @@ class SidecarProtocol(ABC):
             physical_schema: Physical schema name.
             physical_table: Physical table name (Hub).
             processing_context: Context containing resolved IDs / geometry.
-            matcher: IdentityMatcher string (EXTERNAL_ID | GEOHASH | GEOMETRY_HASH).
+            matcher: ``ComputedKind`` string (e.g. ``"external_id"``,
+                     ``"geohash"``, ``"geometry_hash"``, ``"attributes_hash"``).
                      Sidecars return None for matchers they do not own.
 
         Returns:

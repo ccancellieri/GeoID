@@ -6,7 +6,7 @@ Covers:
 - get_config_graph() — nodes + edges structure
 - list_storage_drivers() response keys use Protocol qualnames (M9 / §7)
 - ConfigScopeMixin scope annotation propagation
-- WritePolicyDefaults and ItemsSchema absent / present fields
+- ItemsWritePolicy and ItemsSchema absent / present fields
 """
 import pytest
 from fastapi import FastAPI
@@ -67,9 +67,9 @@ class TestGetConfigSchemas:
         assert "items_routing_config" in result
 
     @pytest.mark.asyncio
-    async def test_write_policy_defaults_present(self, service):
+    async def test_items_write_policy_present(self, service):
         result = await service.get_config_schemas()
-        assert "write_policy_defaults" in result
+        assert "items_write_policy" in result
 
     @pytest.mark.asyncio
     async def test_items_schema_present(self, service):
@@ -104,16 +104,22 @@ class TestGetConfigSchema:
         assert exc_info.value.problem.status == 404
 
     @pytest.mark.asyncio
-    async def test_write_policy_defaults_schema_no_external_id_field(self, service):
-        result = await service.get_config_schema("write_policy_defaults")
+    async def test_items_write_policy_schema_no_legacy_fields(self, service):
+        """Phase 2 rewrite collapses legacy field knobs into ComputedField/IdentityRule."""
+        result = await service.get_config_schema("items_write_policy")
         props = result["json_schema"].get("properties", {})
         assert "external_id_field" not in props
-        assert "validity_field" not in props
         assert "geohash_precision" not in props
+        assert "identity_matchers" not in props
+        assert "matcher_actions" not in props
+        assert "require_external_id" not in props
+        assert "compute" in props
+        assert "identity" in props
+        assert "schema" in props
 
     @pytest.mark.asyncio
-    async def test_write_policy_defaults_schema_has_on_conflict(self, service):
-        result = await service.get_config_schema("write_policy_defaults")
+    async def test_items_write_policy_schema_has_on_conflict(self, service):
+        result = await service.get_config_schema("items_write_policy")
         props = result["json_schema"].get("properties", {})
         assert "on_conflict" in props
 
@@ -152,7 +158,7 @@ class TestGetConfigSchema:
     async def test_meta_field_returns_docs_map(self, service):
         """``?meta=field`` returns the terse ``{field_name: description}``
         map only (the same shape ``_meta.docs`` carries on composed leaves)."""
-        result = await service.get_config_schema("write_policy_defaults", meta="field")
+        result = await service.get_config_schema("items_write_policy", meta="field")
         # Pure dict[str, str] — no wrapper, no nested schema.
         assert isinstance(result, dict)
         if result:  # only fields with non-empty descriptions appear
@@ -218,9 +224,9 @@ class TestConfigScopeMixinAnnotations:
         valid = {"platform_waterfall", "collection_intrinsic", "deployment_env"}
         assert scope in valid
 
-    def test_write_policy_defaults_scope_is_platform_waterfall(self):
-        from dynastore.modules.storage.driver_config import WritePolicyDefaults
-        scope = getattr(WritePolicyDefaults, "config_scope", "platform_waterfall")
+    def test_items_write_policy_scope_is_platform_waterfall(self):
+        from dynastore.modules.storage.driver_config import ItemsWritePolicy
+        scope = getattr(ItemsWritePolicy, "config_scope", "platform_waterfall")
         assert scope == "platform_waterfall"
 
 

@@ -93,19 +93,30 @@ def _make_tstzrange(start: Any, end: Any, *, lower_inc: bool = True, upper_inc: 
 def _resolve_external_id_field(context: Dict[str, Any]) -> Optional[str]:
     """Resolve the ``external_id`` extraction path from ``ItemsWritePolicy``.
 
-    The policy is the single source of truth for the field path. Returns
-    ``None`` when no policy is on the context or the policy's
-    ``external_id_field`` is unset — callers MUST treat ``None`` as
-    "skip extraction; conflict resolution falls back to geoid".
+    The policy is the single source of truth for the field path. Reads the
+    ``name`` override on the ``ComputedField(kind=EXTERNAL_ID)`` entry.
+    Returns ``None`` when no policy is on the context or no EXTERNAL_ID
+    ComputedField is configured — callers MUST treat ``None`` as "skip
+    extraction; conflict resolution falls back to geoid".
     """
     policy = context.get("_items_write_policy") if context else None
-    return getattr(policy, "external_id_field", None) if policy else None
+    if policy is None:
+        return None
+    getter = getattr(policy, "external_id_path", None)
+    return getter() if callable(getter) else None
 
 
 def _resolve_require_external_id(context: Dict[str, Any]) -> bool:
-    """Read ``require_external_id`` from the ``ItemsWritePolicy`` on context."""
+    """Read "external_id is required" from ``ItemsWritePolicy`` on context.
+
+    Sources from the policy's JSON Schema ``required`` list via
+    :meth:`ItemsWritePolicy.external_id_required`.
+    """
     policy = context.get("_items_write_policy") if context else None
-    return bool(getattr(policy, "require_external_id", False)) if policy else False
+    if policy is None:
+        return False
+    getter = getattr(policy, "external_id_required", None)
+    return bool(getter()) if callable(getter) else False
 
 
 class FeatureAttributeSidecar(SidecarProtocol):
@@ -359,7 +370,7 @@ class FeatureAttributeSidecar(SidecarProtocol):
             # attributes_hash STORED GENERATED column — SHA256 of the
             # canonicalised JSONB (PG keeps jsonb internally normalised so
             # ``jsonb::text`` is deterministic for a given value).  Powers
-            # ``IdentityMatcher.ATTRIBUTES_HASH`` for "same attribute
+            # ``ComputedKind.ATTRIBUTES_HASH`` for "same attribute
             # combination, regardless of geometry" deduplication. Requires
             # pgcrypto, which ``ensure_init_db`` enables at boot.
             columns.append(
@@ -1177,7 +1188,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 "transaction_period", "catalog_id", "collection_id"}
         if self.config.enable_asset_id:
             cols.add("asset_id")
-        # attributes_hash is write-policy plumbing for IdentityMatcher.ATTRIBUTES_HASH;
+        # attributes_hash is write-policy plumbing for ComputedKind.ATTRIBUTES_HASH;
         # never leak it into Feature.properties.  Only present in Mode B (JSONB).
         if self.resolved_storage_mode == AttributeStorageMode.JSONB:
             cols.add("attributes_hash")
@@ -1573,8 +1584,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
     ) -> Optional[Dict[str, Any]]:
         """Resolve by EXTERNAL_ID (default) or GEOMETRY_HASH matcher.
 
-        ``matcher`` is a :class:`IdentityMatcher` string.  Unknown matchers
-        and those owned by another sidecar return None.
+        ``matcher`` is a :class:`ComputedKind` string value.  Unknown
+        matchers and those owned by another sidecar return None.
         """
         if matcher is None:
             matcher = "external_id"
@@ -1695,7 +1706,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         'hex')``. Two items with byte-equal canonicalised JSONB attributes
         produce the same hash regardless of geometry.  Use case: "same
         attribute combination, different geometry" detection — pair with
-        ``IdentityMatcher.GEOMETRY_HASH`` to distinguish "duplicate" from
+        ``ComputedKind.GEOMETRY_HASH`` to distinguish "duplicate" from
         "moved" from "renamed".
 
         Returns ``None`` in Mode A (columnar storage) since the column
@@ -1789,8 +1800,9 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             return ValidationResult(
                 valid=False,
                 error=(
-                    "ItemsWritePolicy.require_external_id is True but "
-                    "external_id_field is unset — nothing to extract"
+                    "ItemsWritePolicy schema marks external_id required but no "
+                    "ComputedField(kind=EXTERNAL_ID, name=…) is configured — "
+                    "nothing to extract"
                 ),
             )
 
