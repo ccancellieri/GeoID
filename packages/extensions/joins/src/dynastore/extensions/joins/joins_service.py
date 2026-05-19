@@ -35,6 +35,7 @@ from dynastore.modules.joins.models import (
     NamedSecondarySpec,
     PrimaryFilterSpec,
 )
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.router import resolve_drivers
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ async def _resolve_primary_driver(catalog_id: str, collection_id: str):
     # resolves the platform-default items store via the empty-entry-hints
     # fallback in router._resolve_driver_ids_cached.
     drivers = await resolve_drivers(
-        "READ", catalog_id, collection_id, hint="join",
+        "READ", catalog_id, collection_id, hints=frozenset({Hint.JOIN}),
     )
     return drivers[0].driver if drivers else None
 

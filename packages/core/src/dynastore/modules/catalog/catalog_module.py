@@ -32,7 +32,7 @@ by delegating to its internal services.
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, List, Optional, Any, Dict, Union, Set
+from typing import TYPE_CHECKING, FrozenSet, List, Optional, Any, Dict, Union, Set
 
 if TYPE_CHECKING:
     from dynastore.models.shared_models import CatalogUpdate, CollectionUpdate
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from geojson_pydantic import Feature
     from dynastore.models.query_builder import QueryResponse
     from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
+    from dynastore.modules.storage.hints import Hint
 
 from dynastore.modules import ModuleProtocol
 from dynastore.modules.db_config.query_executor import (
@@ -701,10 +702,10 @@ class CatalogModule(ModuleProtocol):
         collection_id: str,
         *,
         operation: str = "READ",
-        hint: Optional[str] = None,
+        hints: Optional[FrozenSet["Hint"]] = None,
     ):
         return await self._cs.resolve_datasource(
-            catalog_id, collection_id, operation=operation, hint=hint
+            catalog_id, collection_id, operation=operation, hints=hints
         )
 
     async def resolve_physical_table(

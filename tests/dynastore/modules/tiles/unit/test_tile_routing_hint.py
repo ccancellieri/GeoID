@@ -93,10 +93,10 @@ async def test_get_tile_resolution_params_routes_with_tiles_hint():
 
         await tiles_module.get_tile_resolution_params("cat1", "col1")
 
-    # Assert the load-bearing call signature: hint=Hint.TILES
+    # Assert the load-bearing call signature: hints=frozenset({Hint.TILES})
     assert get_driver_mock.await_count == 1
     _args, kwargs = get_driver_mock.await_args
-    assert kwargs.get("hint") == Hint.TILES, (
-        f"get_tile_resolution_params must pass hint=Hint.TILES; "
+    assert kwargs.get("hints") == frozenset({Hint.TILES}), (
+        f"get_tile_resolution_params must pass hints=frozenset({{Hint.TILES}}); "
         f"got kwargs={kwargs}"
     )

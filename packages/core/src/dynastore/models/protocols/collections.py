@@ -23,6 +23,7 @@ Collection-related protocol definitions.
 from datetime import datetime
 from typing import (
     AsyncIterator,
+    FrozenSet,
     Protocol,
     Optional,
     Any,
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from dynastore.modules.catalog.catalog_config import CollectionPluginConfig
     from dynastore.models.otf import SchemaEvolution, SchemaVersion, SnapshotInfo
     from dynastore.models.driver_context import DriverContext  # noqa: F401
+    from dynastore.modules.storage.hints import Hint
 
 
 @runtime_checkable
@@ -131,19 +133,19 @@ class CollectionsProtocol(Protocol):
         collection_id: str,
         *,
         operation: str = "READ",
-        hint: Optional[str] = None,
+        hints: Optional[FrozenSet["Hint"]] = None,
     ) -> Any:
         """Resolve the best storage driver for a collection.
 
-        Uses ``ItemsRoutingConfig`` to resolve the operation → driver mapping.
-        For READ/SEARCH: returns the first matching driver.
+        Uses ``ItemsRoutingConfig`` to resolve the operation → driver
+        mapping. For READ/SEARCH: returns the first matching driver.
         For WRITE: returns the primary write driver.
-        3. Auto-select: driver whose preferred_for includes this hint
-        4. Fallback → primary/write driver
 
         Args:
-            hint: Read-intent hint (e.g. "search", "analytics", "metadata").
-            write: If True, always returns the write driver.
+            hints: Per-request routing preferences (e.g.
+                ``frozenset({Hint.FEATURES})``, ``frozenset({Hint.ANALYTICS})``).
+                An entry matches when its effective hint surface is a
+                superset of ``hints`` — see ``router.resolve_drivers``.
 
         Returns:
             A ``CollectionItemsStore`` instance.

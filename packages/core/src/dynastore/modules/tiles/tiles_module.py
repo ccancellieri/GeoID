@@ -900,7 +900,8 @@ async def get_tile_resolution_params(
             # Without it, default READ routing returns ES first when ES is
             # listed ahead of PG, and ES has no schema/table identifiers.
             driver = await get_driver(
-                Operation.READ, catalog_id, collection_id, hint=Hint.TILES
+                Operation.READ, catalog_id, collection_id,
+                hints=frozenset({Hint.TILES}),
             )
             location = await driver.location(catalog_id, collection_id)
         except Exception:

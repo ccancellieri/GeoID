@@ -34,6 +34,7 @@ from typing import List, Optional, Any, Dict, FrozenSet, Union, Set, Callable, T
 if TYPE_CHECKING:
     from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
     from dynastore.modules.db_config.query_executor import DDLBatch
+    from dynastore.modules.storage.hints import Hint
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 from sqlalchemy import text
@@ -521,7 +522,7 @@ class CatalogService(CatalogsProtocol):
         collection_id: str,
         *,
         operation: str = "READ",
-        hint: Optional[str] = None,
+        hints: Optional[FrozenSet["Hint"]] = None,
     ):
         """Resolve the best storage driver for a collection.
 
@@ -529,7 +530,9 @@ class CatalogService(CatalogsProtocol):
         ``ItemsRoutingConfig`` operation → ordered driver list.
         """
         from dynastore.modules.storage.router import get_driver
-        return await get_driver(operation, catalog_id, collection_id, hint=hint)
+        return await get_driver(
+            operation, catalog_id, collection_id, hints=hints,
+        )
 
     async def resolve_physical_table(
         self,
