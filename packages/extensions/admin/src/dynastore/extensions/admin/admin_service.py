@@ -35,9 +35,12 @@ from dynastore.models.protocols.policies import (
 
 from dynastore.extensions.iam.guards import ensure_privileged_role_assignment
 
+from dynastore.models.protocols.policies import (
+    PolicyCreate, PolicyUpdate, PolicyResponse,
+)
+
 from .models import (
     PrincipalCreate, PrincipalUpdate,
-    PolicyCreate, PolicyUpdate, PolicyResponse,
     UsagePage, UsageResetResponse, UsageRow,
     CatalogProvisioningView, ProvisioningTaskView,
 )

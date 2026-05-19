@@ -12,13 +12,13 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-from typing import Protocol, List, Optional, Tuple, Any, runtime_checkable
+from typing import Protocol, List, Literal, Optional, Tuple, Any, runtime_checkable
 
 from pydantic import BaseModel, Field
 
 # Re-export permission-related models so extensions only need ONE import:
 #   from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role, Principal
-from dynastore.models.auth import Policy, Principal          # Policy, Principal canonical home
+from dynastore.models.auth import Condition, Policy, Principal  # Policy, Principal, Condition canonical home
 from dynastore.models.auth_models import Role               # Role canonical home
 
 __all__ = [
@@ -26,15 +26,18 @@ __all__ = [
     "Policy",
     "Role",
     "Principal",
-    # Wire-schema DTOs for the role/principal management surface.
-    # Promoted from extensions/admin/models.py so a second consumer
-    # (admin SDK, IAM CLI, another extension) does not have to import
-    # through an extension package.
+    # Wire-schema DTOs for the role/principal/policy management surface.
+    # Single canonical home so non-admin consumers (SDK, IAM CLI, other
+    # extensions) do not have to import through the admin extension.
     "RoleCreate",
     "RoleUpdate",
     "RoleResponse",
     "AssignRoleRequest",
     "PrincipalResponse",
+    "PolicyCreate",
+    "PolicyUpdate",
+    "PolicyResponse",
+    "CatalogRoleAssignment",
 ]
 
 
@@ -73,6 +76,45 @@ class PrincipalResponse(BaseModel):
     display_name: Optional[str] = None
     roles: List[str] = Field(default_factory=list)
     is_active: bool = True
+
+
+# --- Policy wire DTOs ---
+
+class PolicyCreate(BaseModel):
+    id: str
+    description: Optional[str] = None
+    actions: List[str]
+    resources: List[str]
+    effect: Literal["ALLOW", "DENY"] = "ALLOW"
+    priority: int = Field(default=0, ge=-1000, le=1000)
+    conditions: List[Condition] = Field(default_factory=list)
+
+
+class PolicyUpdate(BaseModel):
+    description: Optional[str] = None
+    actions: Optional[List[str]] = None
+    resources: Optional[List[str]] = None
+    effect: Optional[Literal["ALLOW", "DENY"]] = None
+    priority: Optional[int] = Field(default=None, ge=-1000, le=1000)
+    conditions: Optional[List[Condition]] = None
+
+
+class PolicyResponse(BaseModel):
+    id: str
+    description: Optional[str] = None
+    actions: List[str]
+    resources: List[str]
+    effect: Literal["ALLOW", "DENY"]
+    priority: int = 0
+    partition_key: Optional[str] = None
+    conditions: List[Condition] = Field(default_factory=list)
+
+
+# --- Catalog role assignment wire DTO ---
+
+class CatalogRoleAssignment(BaseModel):
+    catalog_id: str
+    role: str
 
 
 @runtime_checkable
