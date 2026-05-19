@@ -23,7 +23,6 @@ from tests._repo_paths import CORE_SRC as _CORE_SRC
 # At least one must appear as a top-level ``import X`` or ``from X import …``
 # (i.e. not nested inside a function or try-block) for the test to pass.
 HEAVY_TASK_GATES = {
-    "dynastore/tasks/elasticsearch/tasks.py": ["opensearchpy"],
     "dynastore/tasks/elasticsearch_indexer/tasks.py": ["opensearchpy"],
     "dynastore/tasks/gcp_provision/task.py": ["google.cloud.storage"],
     "dynastore/tasks/gcp/gcp_catalog_cleanup_task.py": ["google.cloud.storage"],

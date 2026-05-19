@@ -25,8 +25,13 @@ def _write(dir_: Path, name: str, payload):
 
 @pytest.fixture(autouse=True)
 def _no_plugin_discovery():
-    # The TaskRoutingConfig class is loaded by the test runner already; skip
-    # entry-point discovery to keep the unit tests hermetic.
+    # The TaskRoutingConfig class must be registered for ``task_routing_config``
+    # to resolve. Importing the module is enough — PluginConfig subclasses
+    # auto-register via ``PersistentModel.__init_subclass__``. We stub out
+    # entry-point discovery to keep the unit tests hermetic, but still ensure
+    # the one class the suite exercises is present.
+    import dynastore.modules.tasks.tasks_config  # noqa: F401  (registration side-effect)
+
     with patch.object(v, "_discover_plugin_configs", lambda: None):
         yield
 
@@ -34,7 +39,7 @@ def _no_plugin_discovery():
 def test_clean_dir_returns_zero(tmp_path, capsys):
     _write(tmp_path, "task-routing.json", {
         "class_key": "task_routing_config",
-        "value": {"enabled": True},
+        "value": {"routing": {}},
     })
     rc = v.main([str(tmp_path)])
     assert rc == 0
