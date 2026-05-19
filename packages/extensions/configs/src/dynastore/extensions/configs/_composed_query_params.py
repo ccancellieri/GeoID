@@ -74,13 +74,20 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
         "default": "scope",
         "examples": ["scope", "upstream"],
         "description": (
-            "Body-rendering mode.  ``scope`` (default) — body lists only "
-            "configs owned by the active scope; upstream-tier configs are "
-            "filtered out (their provenance is recoverable from any "
-            "rendered leaf's ``_meta.source``).  ``upstream`` — every "
-            "visible class rendered with its waterfall-resolved value "
-            "(useful when you want the full payload).  At platform scope "
-            "this flag is a no-op since platform IS the top tier."
+            "Body-rendering mode.  ``scope`` (default) — at platform scope "
+            "(combined with ``strict=True``, the default) drop "
+            "``_visibility=catalog``/``collection`` templates so the body "
+            "lists only platform-intrinsic configs.  ``upstream`` — render "
+            "every visible class with its waterfall-resolved value (at "
+            "platform scope this also inlines catalog-/collection-tier "
+            "templates, mirroring ``strict=False``).  At catalog and "
+            "collection scope ``scope`` and ``upstream`` currently return "
+            "the same body — every config the tier can see is rendered "
+            "with ``_meta.source`` reporting the effective tier — to honour "
+            "the post-#761 'complete the configurable surface' contract "
+            "that the admin Configuration Hub relies on.  Explicit "
+            "delta / inherited rendering at sub-platform tiers is tracked "
+            "under #947 (proposed ``view=delta|effective|inherited``)."
         ),
     },
     "strict": {

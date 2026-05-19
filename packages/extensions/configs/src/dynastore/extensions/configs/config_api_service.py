@@ -467,6 +467,13 @@ class ConfigApiService:
             effective tier (``platform`` / ``catalog`` / ``collection`` /
             ``default``); ``_visibility`` continues to gate writability via
             the service layer but does not hide the leaf from the read view.
+
+            Side-effect: at catalog/collection scope ``include=scope`` and
+            ``include=upstream`` currently return the same body (#947).  An
+            explicit delta/inherited rendering knob is tracked there
+            (proposed ``view=delta|effective|inherited``) so callers that
+            want round-trip-into-PATCH semantics get a real filter rather
+            than relying on ``resolved=false`` to drop inherited fields.
             """
             visibility = getattr(cls, "_visibility", None)
             if active_scope == "platform":
@@ -590,14 +597,20 @@ class ConfigApiService:
             if placed is None:
                 continue
 
-            # Slim mode (default ``include=scope``): filter out upstream-
-            # tier configs.  Provenance for any rendered leaf is on its
-            # own ``_meta.source`` *when* ``meta_mode != "none"`` (#946);
-            # callers that need provenance and pass ``meta=none`` will
-            # find none — that's an intentional trade-off for clean
-            # round-trippable payloads.  The parallel ``inherited`` tree
-            # was retired in #665 slice 3.  Set ``include=upstream`` to
-            # see upstream tiers inline.
+            # Slim mode (default ``include=scope``): at platform scope
+            # combined with ``strict=True``, ``_is_in_scope`` drops
+            # ``_visibility=catalog``/``collection`` templates.  At
+            # catalog/collection scope ``_is_in_scope`` unconditionally
+            # returns True per the post-#761 'complete the configurable
+            # surface' contract — every config visible at the tier is
+            # rendered with ``_meta.source`` reporting the effective tier.
+            # Explicit delta/inherited rendering at sub-platform tiers is
+            # tracked under #947 (proposed ``view=delta|effective|inherited``).
+            # Provenance for any rendered leaf is on its own ``_meta.source``
+            # *when* ``meta_mode != "none"`` (#946); callers that need
+            # provenance and pass ``meta=none`` will find none — that's an
+            # intentional trade-off for clean round-trippable payloads.
+            # The parallel ``inherited`` tree was retired in #665 slice 3.
             if slim and not _is_in_scope(cls, class_key):
                 continue
 
