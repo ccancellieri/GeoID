@@ -321,35 +321,6 @@ async def _probe_by_metadata_field(
     return _row_to_dict(row)
 
 
-def _normalize_content_hash(value: Optional[str]) -> Optional[str]:
-    """Strip the ``algo:`` prefix from a tagged content_hash for raw
-    comparison. Untagged values pass through unchanged so legacy rows
-    continue to match.
-
-    Tagged form: ``"md5:abc=="`` / ``"sha256:0a1b2c..."``. Cross-algo
-    comparisons return the same prefix-stripped value, but the matcher
-    SQL also enforces ``algo``-equality so a "sha256:X" payload never
-    matches an "md5:Y" row even if the bare bytes happen to coincide.
-    """
-    if not value:
-        return None
-    if ":" in value:
-        # Take only the value half; the algo half is enforced separately.
-        return value.split(":", 1)[1]
-    return value
-
-
-def _split_content_hash(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """Return ``(algo, raw_value)`` from a tagged content_hash. Untagged
-    values yield ``(None, value)``."""
-    if not value:
-        return (None, None)
-    if ":" in value:
-        algo, raw = value.split(":", 1)
-        return (algo, raw)
-    return (None, value)
-
-
 async def _probe_by_content_hash(
     conn: DbResource,
     scope: Scope,
@@ -359,39 +330,33 @@ async def _probe_by_content_hash(
     """Match by ``content_hash`` (physical assets only, post-finalize).
 
     Returns no hit for ``AssetCreate`` payloads at upload-create time —
-    the hash is set by the finalize event in Stage 4.2, so until then the
-    incoming payload has nothing to compare. The probe is still wired so
-    Stage 4.2's finalize-event path benefits from it directly.
+    the hash is set by the finalize event, so until then the incoming
+    payload has nothing to compare. The probe is still wired so the
+    finalize-event path benefits from it directly.
 
-    Tagged-hash semantics: the column stores values as ``"<algo>:<raw>"``
-    (e.g. ``"md5:abc=="``). The probe matches both the tagged form
-    (via direct equality) and the legacy untagged form (via raw-value
-    comparison) so rows written before Stage F2 keep working. A
-    ``"sha256:X"`` payload will never match an ``"md5:Y"`` row even if
-    raw bytes happen to coincide — the algo prefix is honored as part of
-    the match.
+    The ``content_hash`` column stores values as ``"<algo>:<raw>"`` (e.g.
+    ``"md5:abc=="``). Both sides of the comparison are tagged: the
+    incoming payload carries the tagged form, the row stores the tagged
+    form. A ``"sha256:X"`` payload never matches an ``"md5:Y"`` row even
+    if raw bytes coincide — the algo prefix is part of the equality.
     """
     incoming_hash = getattr(payload, "content_hash", None)
     if not incoming_hash:
         return None
-    algo, raw_value = _split_content_hash(incoming_hash)
-    # Match either the exact tagged value (algo-aware), or, for backwards
-    # compatibility, an untagged row with a raw-equal hash.
     sql = (
         f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
         "WHERE catalog_id = :catalog_id "
         "AND collection_id IS NOT DISTINCT FROM :collection_id "
         "AND kind = 'physical' "
         "AND status <> 'deleted' "
-        "AND (content_hash = :tagged OR content_hash = :raw) "
+        "AND content_hash = :tagged "
         "LIMIT 1"
     )
     row = await DQLQuery(sql, result_handler=ResultHandler.ONE_OR_NONE).execute(
         conn,
         catalog_id=scope.catalog_id,
         collection_id=scope.collection_id,
-        tagged=incoming_hash,  # already-tagged equality for new rows
-        raw=raw_value,         # legacy untagged rows
+        tagged=incoming_hash,
     )
     return _row_to_dict(row)
 
@@ -579,17 +544,11 @@ async def upsert_asset(
         else policy.on_conflict
     )
     incoming_hash = getattr(payload, "content_hash", None)
-    # Normalise both sides for the gating compare — a Stage 4.2 finalize
-    # event writes "md5:abc==" while an in-flight upload-create payload
-    # may carry the raw form. A pre-Stage-F2 row may still hold an
-    # untagged value. All three should be considered equal when the bare
-    # bytes match.
     if (
         existing
         and policy.skip_if_unchanged_content_hash
         and incoming_hash
-        and _normalize_content_hash(existing.get("content_hash"))
-        == _normalize_content_hash(incoming_hash)
+        and existing.get("content_hash") == incoming_hash
     ):
         if on_conflict == AssetWriteConflictPolicy.NEW_VERSION:
             on_conflict = AssetWriteConflictPolicy.REFUSE_RETURN

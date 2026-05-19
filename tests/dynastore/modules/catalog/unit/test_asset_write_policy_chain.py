@@ -666,32 +666,16 @@ async def test_new_version_archive_stamps_asset_references_valid_until(
 
 
 # ---------------------------------------------------------------------------
-# F2 — content_hash algo-prefix semantics
+# content_hash tagged-only contract
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_strips_algo_prefix() -> None:
-    assert ad._normalize_content_hash("md5:abc==") == "abc=="
-    assert ad._normalize_content_hash("sha256:0a1b") == "0a1b"
-    # Untagged values pass through.
-    assert ad._normalize_content_hash("legacyhex") == "legacyhex"
-    assert ad._normalize_content_hash(None) is None
-    assert ad._normalize_content_hash("") is None
-
-
-def test_split_returns_algo_and_value() -> None:
-    assert ad._split_content_hash("md5:abc==") == ("md5", "abc==")
-    assert ad._split_content_hash("sha256:01ff") == ("sha256", "01ff")
-    assert ad._split_content_hash("untagged") == (None, "untagged")
-    assert ad._split_content_hash(None) == (None, None)
-
-
 @pytest.mark.asyncio
-async def test_content_hash_probe_sends_both_tagged_and_raw_binds(
+async def test_content_hash_probe_sends_tagged_bind_only(
     fake_dql: _Recorder,
 ) -> None:
-    """The probe SQL OR-clauses on (tagged) and (raw) so legacy untagged
-    rows continue to match. Verify both binds are present."""
+    """The probe SQL matches the tagged form verbatim. Verify the tagged
+    bind is present and no legacy ``:raw`` bind leaks through."""
     fake_dql.when(is_select_by("content_hash"), EXISTING_ROW)
 
     payload = physical()
@@ -702,20 +686,18 @@ async def test_content_hash_probe_sends_both_tagged_and_raw_binds(
     with pytest.raises(AssetSidecarRejectedError):
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
-    # Find the SELECT call hitting content_hash.
     probe_call = next(c for c in fake_dql.calls if "content_hash" in c["sql"])
     assert probe_call["params"]["tagged"] == "md5:abc=="
-    assert probe_call["params"]["raw"] == "abc=="
+    assert "raw" not in probe_call["params"]
 
 
 @pytest.mark.asyncio
-async def test_hash_gating_normalizes_across_tagged_and_untagged(
+async def test_hash_gating_requires_byte_for_byte_match(
     fake_dql: _Recorder,
 ) -> None:
-    """Existing row stores ``md5:abc==`` (post-Stage-F2 finalize); the
-    payload carries the bare ``abc==`` (e.g., a re-finalize or a legacy
-    caller). The gating compare must still treat them as equal and
-    short-circuit UPDATE → REFUSE_RETURN."""
+    """``skip_if_unchanged_content_hash`` compares stored and incoming
+    values as-is. Tagged-vs-untagged are NOT considered equal — both
+    sides MUST submit the tagged form."""
     tagged_existing = dict(EXISTING_ROW, content_hash="md5:abc==")
     fake_dql.when(is_select_by("asset_id"), tagged_existing)
 
@@ -724,13 +706,36 @@ async def test_hash_gating_normalizes_across_tagged_and_untagged(
         skip_if_unchanged_content_hash=True,
     )
     payload = physical()
-    object.__setattr__(payload, "content_hash", "abc==")  # untagged, raw
+    object.__setattr__(payload, "content_hash", "md5:abc==")
 
     result = await upsert_asset(
         conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
     )
     assert result.action == "returned_existing"
     assert not any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
+
+
+@pytest.mark.asyncio
+async def test_hash_gating_rejects_untagged_payload(
+    fake_dql: _Recorder,
+) -> None:
+    """Untagged ``abc==`` payload does NOT short-circuit against a tagged
+    ``md5:abc==`` row — the gating compare is byte-for-byte. The conflict
+    flow then falls through to the UPDATE branch."""
+    tagged_existing = dict(EXISTING_ROW, content_hash="md5:abc==")
+    fake_dql.when(is_select_by("asset_id"), tagged_existing)
+
+    policy = AssetsWritePolicy(
+        on_conflict=AssetWriteConflictPolicy.UPDATE,
+        skip_if_unchanged_content_hash=True,
+    )
+    payload = physical()
+    object.__setattr__(payload, "content_hash", "abc==")  # untagged — no match
+
+    result = await upsert_asset(
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
+    )
+    assert result.action != "returned_existing"
 
 
 @pytest.mark.asyncio
