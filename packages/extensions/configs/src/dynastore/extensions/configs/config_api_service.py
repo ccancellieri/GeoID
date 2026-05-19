@@ -586,6 +586,20 @@ class ConfigApiService:
                     mode=links_mode,
                     engine_ref=engine_ref,
                 )
+            # #1016: drop empty ``input_transformers`` / ``output_transformers``
+            # arrays from any leaf payload — they carry zero signal in the
+            # default state (Pydantic default factory yields an empty list).
+            # Catches ``ItemsReadPolicy.output_transformers`` and any future
+            # config that adopts the same field name; routing-entry leaks are
+            # handled separately in ``_build_routing_refs``.  Round-trip safe:
+            # PUTting the payload back rehydrates the field to its empty
+            # default — ``OperationDriverEntry`` and ``ItemsReadPolicy`` both
+            # default to empty.
+            if isinstance(payload, dict):
+                if payload.get("input_transformers") == []:
+                    payload.pop("input_transformers", None)
+                if payload.get("output_transformers") == []:
+                    payload.pop("output_transformers", None)
             return payload
 
         for class_key, payload in by_class.items():
@@ -866,6 +880,19 @@ class ConfigApiService:
                         dumped.pop("_meta", None)
                     if not dumped.get("_links"):
                         dumped.pop("_links", None)
+                    # #1016: drop empty transformer arrays and empty
+                    # ``hints`` on egress.  Empty list == none configured
+                    # (Pydantic default), so the field carries zero signal
+                    # in that state.  Round-trips remain safe because
+                    # ``OperationDriverEntry``'s defaults are the empty
+                    # tuple / empty frozenset — PUT bodies that omit the
+                    # keys rehydrate to the same state on the server side.
+                    if not dumped.get("input_transformers"):
+                        dumped.pop("input_transformers", None)
+                    if not dumped.get("output_transformers"):
+                        dumped.pop("output_transformers", None)
+                    if not dumped.get("hints"):
+                        dumped.pop("hints", None)
                     refs.append(dumped)
                 rewritten[op] = refs
             routing["operations"] = rewritten

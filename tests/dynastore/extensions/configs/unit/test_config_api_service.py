@@ -390,8 +390,11 @@ def test_build_routing_refs_replaces_entries_with_slim_refs():
     assert ref["write_mode"] == "sync"
     # Cycle F.7d.3-fixup: hints + source surface on the slim ref so
     # operators can distinguish hint-gated entries that share the same
-    # driver_ref under one operation.
-    assert ref["hints"] == []
+    # driver_ref under one operation.  #1016 — empty hints are stripped
+    # on egress (same class as input/output_transformers); non-empty
+    # values still surface verbatim (see
+    # ``test_build_routing_refs_forwards_hints_and_source``).
+    assert "hints" not in ref
     # ``sla`` is internal — must NOT appear on the slim ref.
     assert "sla" not in ref
 
@@ -563,15 +566,22 @@ def test_build_routing_refs_surfaces_transformer_attachments():
         )
     [idx] = by_class["items_routing_config"]["operations"]["INDEX"]
     [srch] = by_class["items_routing_config"]["operations"]["SEARCH"]
+    # Non-empty transformer chains are surfaced verbatim.
     assert idx["input_transformers"] == ["private_entity_transformer"]
-    assert idx["output_transformers"] == []
-    assert srch["input_transformers"] == []
     assert srch["output_transformers"] == ["private_entity_transformer"]
+    # #1016 — empty transformer arrays are dropped on egress (the
+    # complementary side of each operation here carries no attachment).
+    assert "output_transformers" not in idx
+    assert "input_transformers" not in srch
 
 
-def test_build_routing_refs_transformer_lists_default_empty():
-    """Entries without transformer attachment surface empty lists, not
-    missing keys — keeps the response shape stable across migrations."""
+def test_build_routing_refs_transformer_lists_dropped_when_empty():
+    """#1016 — entries without transformer attachment omit both keys entirely
+    on egress.  Empty == none configured == zero signal; pydantic defaults
+    refill the empty tuple on PUT round-trips so dropping the keys preserves
+    semantics without leaking the empty-default envelope across 20+ routing
+    entries per response.
+    """
     local = {"items_routing_config": {"operations": {
         "WRITE": [{"driver_ref": "items_postgresql_driver",
                    "on_failure": "fatal", "write_mode": "sync"}]
@@ -584,8 +594,68 @@ def test_build_routing_refs_transformer_lists_default_empty():
             local, base_url="http://h/configs",
         )
     ref = local["items_routing_config"]["operations"]["WRITE"][0]
-    assert ref["input_transformers"] == []
-    assert ref["output_transformers"] == []
+    assert "input_transformers" not in ref
+    assert "output_transformers" not in ref
+    # Empty ``hints`` is the same egress-leak class (frozenset() default
+    # serializes as []), so the strip covers it too.
+    assert "hints" not in ref
+
+
+def test_build_routing_refs_hints_dropped_when_empty():
+    """#1016 — empty ``hints`` is stripped on egress alongside the
+    transformer arrays.  Mirrors the transformer-strip pin so a future
+    refactor that splits the strip block can't silently regress hints.
+    """
+    local = {"items_routing_config": {"operations": {
+        "READ": [{"driver_ref": "items_postgresql_driver",
+                  "hints": [],
+                  "on_failure": "fatal", "write_mode": "sync"}]
+    }}}
+    with patch(
+        "dynastore.extensions.configs.config_api_service.list_registered_configs",
+        return_value=_stub_registry(items_postgresql_driver={"__module__": "m"}),
+    ):
+        ConfigApiService(config_service=MagicMock())._build_routing_refs(
+            local, base_url="http://h/configs",
+        )
+    ref = local["items_routing_config"]["operations"]["READ"][0]
+    assert "hints" not in ref
+    # Sanity: non-envelope keys still present.
+    assert ref["driver_ref"] == "items_postgresql_driver"
+    assert ref["write_mode"] == "sync"
+
+
+def test_build_routing_refs_transformer_round_trip_safe():
+    """#1016 — GETting an entry without transformers and PUTting the dumped
+    payload back through ``OperationDriverEntry`` must rehydrate to the same
+    empty tuple defaults.  Pins the round-trip safety the egress strip
+    relies on.
+    """
+    from dynastore.modules.storage.routing_config import OperationDriverEntry
+
+    by_class = {"items_routing_config": {"operations": {
+        "WRITE": [{"driver_ref": "items_postgresql_driver",
+                   "on_failure": "fatal", "write_mode": "sync"}]
+    }}}
+    with patch(
+        "dynastore.extensions.configs.config_api_service.list_registered_configs",
+        return_value=_stub_registry(items_postgresql_driver={"__module__": "m"}),
+    ):
+        ConfigApiService(config_service=MagicMock())._build_routing_refs(
+            by_class, base_url="http://h/configs",
+        )
+    ref = by_class["items_routing_config"]["operations"]["WRITE"][0]
+    # Strip response-only envelope keys (mirrors PUT body construction).
+    body = {k: v for k, v in ref.items() if not k.startswith("_")}
+    # OperationDriverEntry must accept the stripped body without 422 and the
+    # defaults must rehydrate to the empty tuples.
+    rehydrated = OperationDriverEntry.model_validate(body)
+    assert rehydrated.input_transformers == ()
+    assert rehydrated.output_transformers == ()
+    # #1016 — ``hints`` round-trips the same way: empty default refills
+    # to an empty frozenset on PUT so the stripped GET body is safe to
+    # send back without provoking a 422.
+    assert rehydrated.hints == frozenset()
 
 
 def test_build_routing_refs_unregistered_driver_emits_no_link():
@@ -614,6 +684,65 @@ def test_build_routing_refs_unregistered_driver_emits_no_link():
     assert ref["driver_ref"] == "UnknownDriver"
     assert "config_ref" not in ref
     assert "_links" not in ref
+
+
+def test_compose_tree_drops_empty_output_transformers_on_leaf():
+    """#1016 — ``ItemsReadPolicy.output_transformers`` (and any future
+    config field with the same name) is dropped from the leaf payload when
+    empty.  Mirrors the routing-entry strip; same rationale (empty == none
+    configured == zero signal).
+    """
+    by_class = {
+        "items_read_policy": {
+            "feature_type": {"schema_ref": None},
+            "output_transformers": [],
+        },
+    }
+    registry = _stub_registry(
+        items_read_policy={
+            "_address": ("platform", "catalog", "collection", "items", "read_policy"),
+            "_visibility": "collection",
+        },
+    )
+    with patch(
+        "dynastore.extensions.configs.config_api_service.list_registered_configs",
+        return_value=registry,
+    ):
+        tree = ConfigApiService._compose_tree(
+            by_class, sources={}, active_scope="collection",
+            meta_mode="field", include_mode="scope",
+        )
+    leaf = tree["platform"]["catalog"]["collection"]["items"]["read_policy"]["items_read_policy"]
+    assert "output_transformers" not in leaf
+    # Non-transformer payload survives, and ``_meta`` is still emitted.
+    assert leaf["feature_type"] == {"schema_ref": None}
+    assert leaf["_meta"]["tier"] == "collection"
+
+
+def test_compose_tree_preserves_non_empty_output_transformers():
+    """#1016 — strip only fires when the array is empty.  A configured
+    chain must survive verbatim."""
+    by_class = {
+        "items_read_policy": {
+            "output_transformers": ["some_transformer"],
+        },
+    }
+    registry = _stub_registry(
+        items_read_policy={
+            "_address": ("platform", "catalog", "collection", "items", "read_policy"),
+            "_visibility": "collection",
+        },
+    )
+    with patch(
+        "dynastore.extensions.configs.config_api_service.list_registered_configs",
+        return_value=registry,
+    ):
+        tree = ConfigApiService._compose_tree(
+            by_class, sources={}, active_scope="collection",
+            meta_mode="none", include_mode="scope",
+        )
+    leaf = tree["platform"]["catalog"]["collection"]["items"]["read_policy"]["items_read_policy"]
+    assert leaf["output_transformers"] == ["some_transformer"]
 
 
 def test_build_routing_refs_meta_none_omits_meta_block():
