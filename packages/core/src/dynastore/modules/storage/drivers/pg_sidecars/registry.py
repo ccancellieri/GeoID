@@ -87,6 +87,12 @@ class SidecarRegistry:
         Uses the config's sidecar_type field to look up the implementation.
 
         If lenient=True, returns None if implementation is not registered.
+
+        Note (#974): validity SSOT is ``ItemsWritePolicy.enable_validity``;
+        the PG driver mirrors it onto ``FeatureAttributeSidecarConfig.enable_validity``
+        at ``ensure_storage`` time, so the factory itself stays policy-agnostic.
+        Sidecar ctors accept ``**_kwargs`` to absorb forward-compatible
+        factory inputs.
         """
         cls._ensure_defaults()
 

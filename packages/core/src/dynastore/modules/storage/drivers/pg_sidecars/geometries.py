@@ -89,7 +89,7 @@ class GeometriesSidecar(SidecarProtocol):
     - S2 spatial indexes
     """
 
-    def __init__(self, config: GeometriesSidecarConfig):
+    def __init__(self, config: GeometriesSidecarConfig, **_kwargs: Any):
         self.config = config
 
     @property

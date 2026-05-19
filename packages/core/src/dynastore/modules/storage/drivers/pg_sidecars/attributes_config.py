@@ -227,8 +227,20 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
     index_asset_id: bool = Field(default=True, description="Create index on asset_id")
 
     # Validity Configuration
+    #
+    # ``enable_validity`` is a storage-shape mirror of the SSOT field
+    # ``ItemsWritePolicy.enable_validity``. The PG driver overlays the
+    # policy value onto this field at ``ensure_storage`` time and
+    # persists the result, so every read path that loads the
+    # collection's sidecar config sees the policy-aligned value (#974).
+    # Operators MUST set ``enable_validity`` on ``ItemsWritePolicy``;
+    # values set here are overwritten on the next ``ensure_storage``.
     enable_validity: bool = Field(
-        default=True, description="Extract and store validity (valid_from/valid_to)"
+        default=False,
+        description=(
+            "Storage-shape mirror of ItemsWritePolicy.enable_validity "
+            "(SSOT). Overwritten by the driver at DDL time."
+        ),
     )
 
     # Mode A: Relational schema
@@ -258,7 +270,12 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
 
     @property
     def has_validity(self) -> bool:
-        """Whether this sidecar is configured to manage validity."""
+        """Whether this sidecar is configured to manage validity.
+
+        Mirrors :attr:`ItemsWritePolicy.enable_validity`; the driver
+        overlays the policy onto :attr:`enable_validity` at DDL time
+        and persists the result so every read sees the same value.
+        """
         return self.enable_validity
 
     @property

@@ -67,7 +67,7 @@ class StacItemsSidecar(SidecarProtocol):
     fields into OGC Features responses.
     """
 
-    def __init__(self, config: StacItemsSidecarConfig):
+    def __init__(self, config: StacItemsSidecarConfig, **_kwargs: Any):
         self.config = config
 
     @property

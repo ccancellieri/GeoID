@@ -133,7 +133,16 @@ class FeatureAttributeSidecar(SidecarProtocol):
     ``_resolve_external_id_field`` / ``_resolve_require_external_id`` helpers.
     """
 
-    def __init__(self, config: FeatureAttributeSidecarConfig):
+    def __init__(
+        self,
+        config: FeatureAttributeSidecarConfig,
+        **_kwargs: Any,
+    ):
+        # ``**_kwargs`` absorbs forward-compatible factory inputs
+        # (e.g. ``policy=...``) reserved for future SSOT threading.
+        # ``config.enable_validity`` is already policy-aligned because
+        # the driver overlays ``ItemsWritePolicy.enable_validity`` onto
+        # the sidecar config at ``ensure_storage`` time (#974).
         self.config = config
 
     @property
@@ -309,7 +318,11 @@ class FeatureAttributeSidecar(SidecarProtocol):
         return self.config.partition_key_types
 
     def has_validity(self) -> bool:
-        """Returns True if this sidecar manages temporal validity."""
+        """Returns True if this sidecar manages temporal validity.
+
+        SSOT: ``ItemsWritePolicy.enable_validity`` — mirrored onto
+        ``self.config.enable_validity`` by the PG driver at DDL time.
+        """
         return self.config.has_validity
 
     def get_ddl(

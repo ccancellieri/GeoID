@@ -73,7 +73,7 @@ class ItemMetadataSidecar(SidecarProtocol):
     STAC-specific external content lives in :class:`StacItemsSidecar`.
     """
 
-    def __init__(self, config: ItemMetadataSidecarConfig):
+    def __init__(self, config: ItemMetadataSidecarConfig, **_kwargs: Any):
         self.config = config
 
     @property

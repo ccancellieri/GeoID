@@ -160,6 +160,37 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         )
         return config.model_copy(update={"sidecars": effective})
 
+    @staticmethod
+    async def _resolve_write_policy(
+        catalog_id: str,
+        collection_id: Optional[str],
+    ) -> "ItemsWritePolicy":
+        """Resolve ``ItemsWritePolicy`` from the config waterfall.
+
+        Used by ``ensure_storage`` and ``compute_extents`` to obtain the
+        SSOT for ``enable_validity`` (and any other policy-driven
+        sidecar shape decisions). Mirrors
+        ``IcebergItemsDriver._resolve_write_policy`` — falls back to
+        defaults if the configs service or config is missing.
+        """
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.storage.driver_config import ItemsWritePolicy
+        from dynastore.tools.discovery import get_protocol
+
+        try:
+            configs = get_protocol(ConfigsProtocol)
+            if configs:
+                cfg = await configs.get_config(
+                    ItemsWritePolicy,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+                if isinstance(cfg, ItemsWritePolicy):
+                    return cfg
+        except Exception:
+            pass
+        return ItemsWritePolicy()
+
     @asynccontextmanager
     async def lifespan(self, app_state: object):
         logger.info("ItemsPostgresqlDriver: started (wraps existing ItemsProtocol)")
@@ -438,12 +469,12 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         # Bridge ItemsSchema.fields → attributes sidecar so that
         # required=True / unique=True materialize as NOT NULL / UNIQUE in the
         # generated DDL (COLUMNAR mode).
+        from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+            FeatureAttributeSidecarConfig,
+        )
         try:
             from dynastore.modules.storage.driver_config import (
                 ItemsSchema,
-            )
-            from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
-                FeatureAttributeSidecarConfig,
             )
             from dynastore.modules.storage.field_constraints import (
                 bridge_schema_to_attribute_sidecar,
@@ -475,6 +506,28 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                 "schema → attribute_schema bridge skipped for %s/%s: %s",
                 catalog_id, collection_id, exc,
             )
+
+        # #974: ItemsWritePolicy.enable_validity is the SSOT. Overlay it
+        # onto every ``FeatureAttributeSidecarConfig`` so the persisted
+        # col_config matches the policy decision — every read path that
+        # rehydrates the sidecar (query_optimizer, item_query,
+        # item_service, …) then sees the policy-aligned value without
+        # having to thread the policy itself.
+        write_policy = await self._resolve_write_policy(catalog_id, collection_id)
+        overlay_sidecars = []
+        any_overlay = False
+        for sc in col_config.sidecars:
+            if isinstance(sc, FeatureAttributeSidecarConfig) and (
+                sc.enable_validity != write_policy.enable_validity
+            ):
+                overlay_sidecars.append(
+                    sc.model_copy(update={"enable_validity": write_policy.enable_validity})
+                )
+                any_overlay = True
+            else:
+                overlay_sidecars.append(sc)
+        if any_overlay:
+            col_config = col_config.model_copy(update={"sidecars": overlay_sidecars})
 
         if col_config.partitioning.enabled:
             partition_keys = col_config.partitioning.partition_keys
@@ -531,6 +584,8 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             await DDLQuery(create_hub_sql).execute(conn)
 
             # --- Create sidecar tables ---
+            # ``sidecar_config.enable_validity`` is already policy-aligned
+            # (overlay above), so the factory can stay policy-agnostic.
             for sidecar_config in col_config.sidecars:
                 try:
                     sidecar_impl = SidecarRegistry.get_sidecar(sidecar_config)
@@ -979,6 +1034,9 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     (sc for sc in layer_config.sidecars if isinstance(sc, FeatureAttributeSidecarConfig)),
                     None,
                 )
+                # ``attr_sc.enable_validity`` mirrors ``ItemsWritePolicy``
+                # (overlaid by ``ensure_storage`` at DDL time, #974) so
+                # reading the sidecar is the SSOT for this collection.
                 if attr_sc and attr_sc.enable_validity:
                     temporal_source = f"{table}_{attr_sc.sidecar_id}"
                     temporal_alias = "a"
