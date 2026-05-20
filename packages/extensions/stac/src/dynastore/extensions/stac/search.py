@@ -607,10 +607,35 @@ async def search_items(
             or "external_assets" in where_sql
         )
 
+        # Per-collection validity flag (#1083): when the attributes sidecar
+        # does not materialise a ``validity`` column (``enable_validity=False``,
+        # the post-#974 default), selecting ``validity`` mis-resolves to the
+        # JSONB text accessor ``attributes->>'validity'`` and the datetime
+        # filter 500s with a ``text >= timestamptz`` type error. Sort by the
+        # item's own ``datetime`` instead, and let the bare-``validity`` token
+        # in the WHERE rewrite to ``NULL::tstzrange`` (match-all).
+        from dynastore.modules.storage.drivers.pg_sidecars import (
+            driver_sidecars as _driver_sidecars,
+        )
+        coll_has_validity = any(
+            getattr(sc, "enable_validity", False)
+            for sc in _driver_sidecars(config)
+            if sc.enabled
+            and getattr(sc, "sidecar_type", "") in ("attributes", "feature_attributes")
+        )
+
         # Select & Sort Strategy
         if req_attributes:
-            # Standard Mode: Sort by Attributes (validity)
-            query_selects.append(FieldSelection(field="validity", alias="valid_from"))
+            if coll_has_validity:
+                # Standard Mode: Sort by Attributes (validity)
+                query_selects.append(
+                    FieldSelection(field="validity", alias="valid_from")
+                )
+            else:
+                # No validity column → sort by the item's datetime.
+                raw_selects.append(
+                    "(sc_attributes.attributes->>'datetime')::timestamptz as valid_from"
+                )
             # Use raw select for ID coalescence
             # QueryOptimizer uses sc_attributes for the attributes sidecar
             raw_selects.append(
