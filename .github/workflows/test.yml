@@ -116,7 +116,7 @@ jobs:
           context: .
           file: packages/core/src/dynastore/docker/Dockerfile
           target: tester
-          build-args: SCOPE=all
+          build-args: SCOPE=everything
           tags: geoid-test-runner:ci
           load: true
           cache-from: type=gha,scope=tester
@@ -168,6 +168,7 @@ jobs:
             -e DYNASTORE_DDL_LOCK_TIMEOUT=120s \
             -e LOG_LEVEL=INFO \
             -e PYTEST_CURRENT_TEST=true \
+            -e DYNASTORE_ASSERT_ALL_EXTENSIONS=true \
             geoid-test-runner:ci \
             /opt/venv/bin/pytest tests/ --ignore-glob="**/integration/*" \
               --durations=20 \
@@ -249,7 +250,7 @@ jobs:
           context: .
           file: packages/core/src/dynastore/docker/Dockerfile
           target: tester
-          build-args: SCOPE=all
+          build-args: SCOPE=everything
           tags: geoid-test-runner:ci
           load: true
           cache-from: type=gha,scope=tester
@@ -388,7 +389,7 @@ jobs:
           context: .
           file: packages/core/src/dynastore/docker/Dockerfile
           target: tester
-          build-args: SCOPE=all
+          build-args: SCOPE=everything
           tags: geoid-test-runner:ci
           load: true
           cache-from: type=gha,scope=tester

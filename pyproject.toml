@@ -448,11 +448,23 @@ scope_maps = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,m
 # DEVELOPMENT & TESTING
 # ==========================================================================
 all = ["dynastore[api_full,geoid_service,worker_service]"]
-# Superset of `all` that pulls in every optional driver / task-only dependency
-# referenced anywhere in src/. Pyright/mypy need these resolvable to clear
-# `reportMissingImports` on optional code paths (duckdb, pyiceberg, morecantile,
-# …). Not for runtime: keep service images on `all` to stay slim.
-typecheck = ["dynastore[all,drivers_grp,task_tiles_preseed_deps,extension_template]"]
+# `all` is the union of the three runtime services (api_full + geoid_service +
+# worker_service), NOT every extension — standalone OGC API extensions that no
+# standard service composes (edr, dggs, moving_features, connected_systems,
+# proxy, template, httpx, notebooks) are absent from it. The test image needs
+# EVERY extension installed so the whole suite collects: a test module that
+# `import`s an uninstalled extension fails at collection with ModuleNotFoundError,
+# cascading into mass per-job red (this was the nightly test.yml failure mode).
+# `everything` = `all` + every `extension_*` extra, so all 35 ext wheels resolve.
+# Build the CI test image with SCOPE=everything. Keep service images on the
+# narrow `scope_*` extras to stay slim.
+everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,extension_configs,extension_connected_systems,extension_coverages,extension_crs,extension_dggs,extension_dimensions,extension_dwh,extension_edr,extension_events,extension_features,extension_gcp_bucket,extension_gdal,extension_geoid,extension_httpx,extension_iam,extension_logs,extension_maps,extension_moving_features,extension_notebooks,extension_processes,extension_proxy,extension_records,extension_search,extension_stac,extension_stats,extension_styles,extension_tasks,extension_template,extension_tiles,extension_web,extension_wfs]"]
+# Superset of `everything` that pulls in every optional driver / task-only
+# dependency referenced anywhere in src/. Pyright/mypy need these resolvable to
+# clear `reportMissingImports` on optional code paths (duckdb, pyiceberg,
+# morecantile, …) AND every extension's source. Not for runtime: keep service
+# images on `scope_*` to stay slim.
+typecheck = ["dynastore[everything,drivers_grp,task_tiles_preseed_deps]"]
 test = ["pytest>=8.0.0", "pytest-asyncio>=0.23.5", "pytest-cov>=4.1.0", "pytest-xdist>=3.5.0", "pytest-timeout>=2.3.0", "requests>=2.31.0", "orjson>=3.9.15"]
 notebooks_test = ["dynastore[test]", "nbval>=0.11", "ipykernel>=6.29", "jupyter-client>=8.6", "httpx>=0.27", "python-dotenv>=1.0"]
 lite_build = ["jupyterlite-core>=0.4", "jupyterlite-pyodide-kernel>=0.4"]
