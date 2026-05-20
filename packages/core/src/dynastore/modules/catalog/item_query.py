@@ -601,6 +601,10 @@ class ItemQueryMixin:
 
             # ID Resolution Logic: delete ALL active rows for this external_id
             rows = 0
+            # geoid(s) actually soft-deleted — these are the ES document
+            # ``_id``s the upsert path indexed under, so index-delete
+            # propagation must key on them (not the external/path id).
+            deleted_geoids: List[str] = []
             if col_config and driver_sidecars(col_config):
                 from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
 
@@ -612,15 +616,19 @@ class ItemQueryMixin:
                         sc_table = f"{phys_table}_{sidecar.sidecar_id}"
                         # Soft-delete ALL hub rows linked to this external_id via the sidecar.
                         # DQLQuery handles both async/sync conns uniformly.
-                        rows = await DQLQuery(
-                            f'UPDATE "{phys_schema}"."{phys_table}" h '
-                            f"SET deleted_at = NOW() "
-                            f'FROM "{phys_schema}"."{sc_table}" s '
-                            f"WHERE s.{sc.feature_id_field_name} = :ext_id "
-                            f"AND h.deleted_at IS NULL "
-                            f"AND h.geoid = s.geoid",
-                            result_handler=ResultHandler.ROWCOUNT,
-                        ).execute(conn, ext_id=str(item_id))
+                        deleted_geoids = [
+                            str(g) for g in await DQLQuery(
+                                f'UPDATE "{phys_schema}"."{phys_table}" h '
+                                f"SET deleted_at = NOW() "
+                                f'FROM "{phys_schema}"."{sc_table}" s '
+                                f"WHERE s.{sc.feature_id_field_name} = :ext_id "
+                                f"AND h.deleted_at IS NULL "
+                                f"AND h.geoid = s.geoid "
+                                f"RETURNING h.geoid",
+                                result_handler=ResultHandler.ALL_SCALARS,
+                            ).execute(conn, ext_id=str(item_id))
+                        ]
+                        rows = len(deleted_geoids)
                         break
 
             if not rows:
@@ -646,47 +654,23 @@ class ItemQueryMixin:
                     collection_id=phys_table,
                     geoid=item_id,
                 )
+                # Here ``item_id`` is itself the geoid (UUID-validated above),
+                # so a non-zero rowcount means that geoid was soft-deleted.
+                if rows:
+                    deleted_geoids = [str(item_id)]
 
             if rows > 0:
                 await recalculate_and_update_extents(conn, catalog_id, collection_id)
 
-                # Dispatcher fan-out for delete propagation — single call
-                # site replacing the per-driver ``_on_item_delete`` event
-                # listeners.
-                try:
-                    from dynastore.models.protocols.indexer import (
-                        IndexContext, IndexOp,
-                    )
-                    from dynastore.modules.storage.index_dispatcher import (
-                        get_index_dispatcher,
-                    )
-                    from dynastore.tools.correlation import get_correlation_id
-
-                    dispatcher = get_index_dispatcher()
-                    # Phase 2f atomic OUTBOX: pass the live PG conn from
-                    # the delete TX so any OUTBOX enqueue lands in the
-                    # same TX as the soft-delete UPDATE — atomic with
-                    # the data change.
-                    await dispatcher.fan_out_bulk(
-                        IndexContext(
-                            catalog=catalog_id,
-                            collection=collection_id,
-                            correlation_id=get_correlation_id() or "",
-                            pg_conn=conn,
-                            entity_type="item",
-                        ),
-                        [IndexOp(
-                            op_type="delete",
-                            entity_type="item",
-                            entity_id=item_id,
-                            payload=None,
-                        )],
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Index dispatcher delete fan-out failed for %s/%s/%s: %s",
-                        catalog_id, collection_id, item_id, e,
-                    )
+                # Propagate the delete to async-OUTBOX index drivers
+                # (e.g. public ES) symmetrically with ``upsert_bulk``: one
+                # delete row per soft-deleted geoid, enqueued on THIS TX
+                # conn and keyed by the geoid — the same ES ``_id`` the
+                # upsert path indexed under. A failed enqueue rolls back
+                # the soft-delete, so PG and the index can't drift apart.
+                await self._enqueue_index_deletes(
+                    conn, catalog_id, collection_id, deleted_geoids,
+                )
 
                 # Emit event for non-indexer subscribers (audit, telemetry).
                 try:
@@ -705,6 +689,98 @@ class ItemQueryMixin:
                     logger.warning(f"Failed to emit item deletion event: {e}")
 
         return rows
+
+    async def _enqueue_index_deletes(
+        self,
+        conn: Any,
+        catalog_id: str,
+        collection_id: str,
+        geoids: List[str],
+    ) -> None:
+        """Enqueue one ES-delete OUTBOX row per soft-deleted geoid.
+
+        Symmetric counterpart to ``ItemService.upsert_bulk``'s async-OUTBOX
+        enqueue: resolve ``ItemsRoutingConfig.operations[INDEX]`` entries
+        that are ``write_mode=ASYNC`` + ``on_failure=OUTBOX`` and write one
+        ``OutboxRecord(op="delete")`` per (entry, geoid) onto the caller's
+        transaction, keyed by the geoid. The drain's delete branch keys the
+        ES ``_id`` on ``idempotency_key`` (the geoid), the same value the
+        upsert path indexed under, so the document is actually purged.
+
+        Honours the same test seams as ``upsert_bulk``
+        (``_test_routing_resolver`` / ``_test_outbox_store``) so this can be
+        unit-tested without a live ConfigsProtocol or dispatcher.
+        """
+        if not geoids:
+            return
+
+        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.modules.storage.driver_instance_id import (
+            compute_driver_instance_id,
+        )
+        from dynastore.modules.storage.routing_config import (
+            FailurePolicy, Operation, WriteMode,
+        )
+        from dynastore.tools.identifiers import generate_uuidv7
+
+        routing_resolver = getattr(self, "_test_routing_resolver", None)
+        if routing_resolver is not None:
+            routing = await routing_resolver(catalog_id, collection_id)
+        else:
+            from dynastore.modules.storage.routing_config import (
+                ItemsRoutingConfig,
+            )
+            configs = get_protocol(ConfigsProtocol)
+            if configs is None:
+                return
+            routing = await configs.get_config(
+                ItemsRoutingConfig,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+
+        ops_map = getattr(routing, "operations", {}) or {}
+        async_outbox_entries = [
+            e for e in ops_map.get(Operation.INDEX, [])
+            if e.write_mode == WriteMode.ASYNC
+            and e.on_failure == FailurePolicy.OUTBOX
+        ]
+        if not async_outbox_entries:
+            return
+
+        outbox = getattr(self, "_test_outbox_store", None)
+        if outbox is None:
+            from dynastore.modules.storage.index_dispatcher import (
+                get_index_dispatcher,
+            )
+            outbox = get_index_dispatcher()._outbox
+        if outbox is None:
+            return
+
+        records: List[OutboxRecord] = []
+        for entry in async_outbox_entries:
+            inst = compute_driver_instance_id(
+                entry.driver_ref, catalog_id, collection_id,
+            )
+            for geoid in geoids:
+                gid = str(geoid)
+                records.append(OutboxRecord(
+                    op_id=generate_uuidv7(),
+                    driver_id=entry.driver_ref,
+                    driver_instance_id=inst,
+                    collection_id=collection_id,
+                    op="delete",
+                    item_id=gid,
+                    # Delete actions carry no source document; the drain's
+                    # delete branch ignores ``payload`` and keys ES on
+                    # ``idempotency_key``.
+                    payload={},
+                    idempotency_key=gid,
+                ))
+        if records:
+            await outbox.enqueue_bulk(
+                conn, catalog_id=catalog_id, rows=records,
+            )
 
     async def stream_items(
         self,
