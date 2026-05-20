@@ -437,6 +437,51 @@ def test_catalog_search_route_scopes_to_catalog_tier(
     assert kwargs["collection_id"] is None
 
 
+def test_catalog_search_defaults_to_catalog_tier_not_all_collections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``?all_collections``, the catalog route stays catalog-tier
+    (all_collections=False) — preserves the pre-#1095 default."""
+    svc = _build_service()
+
+    fake_assets = AsyncMock()
+    fake_assets.search_assets = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        AssetService, "assets", property(lambda self: fake_assets)
+    )
+
+    client = TestClient(svc.app)
+    r = client.post("/assets/catalogs/cat/assets-search", json={"filters": [], "limit": 5})
+    assert r.status_code == 200, r.text
+    kwargs = fake_assets.search_assets.await_args.kwargs
+    assert kwargs["all_collections"] is False
+
+
+def test_catalog_search_all_collections_param_threads_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``?all_collections=true`` reaches ``search_assets`` so the driver can
+    drop the collection predicate and span the whole catalog."""
+    svc = _build_service()
+
+    fake_assets = AsyncMock()
+    fake_assets.search_assets = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        AssetService, "assets", property(lambda self: fake_assets)
+    )
+
+    client = TestClient(svc.app)
+    r = client.post(
+        "/assets/catalogs/cat/assets-search?all_collections=true",
+        json={"filters": [], "limit": 5},
+    )
+    assert r.status_code == 200, r.text
+    kwargs = fake_assets.search_assets.await_args.kwargs
+    assert kwargs["catalog_id"] == "cat"
+    assert kwargs["collection_id"] is None
+    assert kwargs["all_collections"] is True
+
+
 def test_search_query_rejects_collection_id_in_body() -> None:
     """The body ``collection_id`` field was dropped — scope comes from the
     path. ``extra='allow'`` means an unknown key is ignored, not honoured;

@@ -796,10 +796,16 @@ class AssetService(AssetsProtocol):
         collection_id: Optional[str] = None,
         limit: int = 10,
         offset: int = 0,
+        all_collections: bool = False,
         db_resource: Optional[DbResource] = None,
     ) -> List[Asset]:
         """
         Performs a granular search across assets using a list of filters.
+
+        Collection scope is tri-state: ``collection_id=None`` (the default)
+        scopes to catalog-tier assets, a value scopes to one collection, and
+        ``all_collections=True`` spans every collection plus the catalog tier
+        under the catalog (the ``collection_id`` predicate is dropped).
 
         Only the ``EQ`` operator is supported today. The PG asset driver
         (``pg_asset_driver.search_assets``) hardcodes ``"<field>" = :val``
@@ -831,6 +837,7 @@ class AssetService(AssetsProtocol):
             query=eq_query or None,
             limit=limit,
             offset=offset,
+            all_collections=all_collections,
             db_resource=db_resource or self.engine,
         )
         return [Asset.model_validate(dict(doc)) for doc in docs]

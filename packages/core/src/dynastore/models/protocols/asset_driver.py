@@ -132,17 +132,28 @@ class AssetStore(Protocol):
         query: Optional[Dict[str, Any]] = None,
         limit: int = 100,
         offset: int = 0,
+        all_collections: bool = False,
         db_resource: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """Return asset documents matching the query.
 
+        Collection scope is tri-state:
+        - ``collection_id=None`` and ``all_collections=False`` →
+          catalog-tier assets only (those bound to no collection).
+        - ``collection_id="<id>"`` → that single collection.
+        - ``all_collections=True`` → every asset under the catalog,
+          across all collections *and* the catalog tier; the
+          ``collection_id`` predicate is dropped entirely
+          (``collection_id`` is then ignored).
+
         Args:
-            catalog_id:    Catalog that owns the assets.
-            collection_id: Optional collection filter.
-            query:         Driver-specific query dict (ES query DSL, SQL filters, etc.).
-            limit:         Maximum number of results.
-            offset:        Skip this many results (for pagination).
-            db_resource:   Optional existing DB connection/session.
+            catalog_id:      Catalog that owns the assets.
+            collection_id:   Optional collection filter (catalog-tier when None).
+            query:           Driver-specific query dict (ES query DSL, SQL filters, etc.).
+            limit:           Maximum number of results.
+            offset:          Skip this many results (for pagination).
+            all_collections: Drop the collection predicate and span the whole catalog.
+            db_resource:     Optional existing DB connection/session.
 
         Returns:
             List of asset dicts (may be empty).

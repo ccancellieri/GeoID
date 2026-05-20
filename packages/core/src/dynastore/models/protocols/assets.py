@@ -236,6 +236,7 @@ class AssetsProtocol(Protocol):
         limit: int = 10,
         offset: int = 0,
         collection_id: Optional[str] = None,
+        all_collections: bool = False,
     ) -> List["Asset"]:
         """
         Searches for assets using a list of filters.
@@ -247,7 +248,11 @@ class AssetsProtocol(Protocol):
             filters: List of ``AssetFilter`` instances to apply.
             limit: Maximum number of assets to return.
             offset: Number of assets to skip.
-            collection_id: Optional collection ID for scoping.
+            collection_id: Optional collection ID for scoping (catalog-tier when None).
+            all_collections: When True, search every asset under the catalog
+                across all collections and the catalog tier; ``collection_id``
+                is ignored. When False (default), ``collection_id=None`` scopes
+                to catalog-tier assets only.
 
         Returns:
             List of matching Asset model instances.

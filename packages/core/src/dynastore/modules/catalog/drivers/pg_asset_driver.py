@@ -456,6 +456,7 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         query: Optional[Dict[str, Any]] = None,
         limit: int = 100,
         offset: int = 0,
+        all_collections: bool = False,
         db_resource: Optional[DbResource] = None,
     ) -> List[Dict[str, Any]]:
         """Return asset dicts matching the query.
@@ -470,6 +471,11 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         **type-strict**: ``{"metadata.size": 100}`` matches stored JSON
         number ``100``, not the string ``"100"``. Pass values in the
         type they're stored under.
+
+        Collection scope: ``collection_id IS NOT DISTINCT FROM :collection_id``
+        matches a single collection (or the catalog tier when ``None``).
+        When ``all_collections`` is True the predicate is dropped so the
+        search spans every collection plus the catalog tier under the catalog.
         """
         schema = await self._resolve_schema(catalog_id, db_resource)
         if not schema:
@@ -477,15 +483,16 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
 
         where_parts = [
             "catalog_id = :catalog_id",
-            "collection_id IS NOT DISTINCT FROM :collection_id",
             "status <> 'deleted'",
         ]
         params: Dict[str, Any] = {
             "catalog_id": catalog_id,
-            "collection_id": collection_id,
             "limit": limit,
             "offset": offset,
         }
+        if not all_collections:
+            where_parts.append("collection_id IS NOT DISTINCT FROM :collection_id")
+            params["collection_id"] = collection_id
 
         if query:
             metadata_container: Dict[str, Any] = {}

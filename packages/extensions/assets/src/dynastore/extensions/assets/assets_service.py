@@ -1260,6 +1260,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         query: SearchQuery,
         limit: Optional[int] = None,
         offset: int = 0,
+        all_collections: bool = False,
     ) -> List[Asset]:
         """Shared search impl for the catalog / collection / global routes.
 
@@ -1267,7 +1268,8 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         routed SEARCH driver (READ fallback) via ``get_asset_search_driver``.
         ``collection_id=None`` scopes to catalog-tier assets; a value scopes
         to that collection — symmetric with ``list_catalog_assets`` /
-        ``list_collection_assets``.
+        ``list_collection_assets``. ``all_collections=True`` spans every
+        collection plus the catalog tier under the catalog.
         """
         return await self.assets.search_assets(
             catalog_id=catalog_id,
@@ -1275,20 +1277,34 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             collection_id=collection_id,
             limit=limit if limit is not None else query.limit,
             offset=offset,
+            all_collections=all_collections,
         )
 
     async def advanced_search(
         self,
         catalog_id: str = Path(..., description="The catalog ID"),
         query: SearchQuery = Body(...),
+        all_collections: bool = Query(
+            False,
+            description=(
+                "When false (default) search only catalog-tier assets (those "
+                "bound to no collection). When true, search every asset under "
+                "the catalog across all its collections and the catalog tier."
+            ),
+        ),
     ):
-        """Granular POST-based search over catalog-tier assets."""
+        """Granular POST-based search over a catalog.
+
+        Defaults to catalog-tier assets; set ``all_collections=true`` to span
+        every collection under the catalog in one call.
+        """
         try:
             return await self._run_scoped_search(
                 catalog_id=catalog_id,
                 collection_id=None,
                 query=query,
                 offset=query.offset,
+                all_collections=all_collections,
             )
         except Exception as e:
             logger.error(f"Search failed: {e}")
@@ -1319,6 +1335,14 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         self,
         request: Request,
         query: SearchQuery = Body(...),
+        all_collections: bool = Query(
+            False,
+            description=(
+                "When false (default) each catalog contributes only its "
+                "catalog-tier assets. When true, span every collection plus "
+                "the catalog tier in each catalog."
+            ),
+        ),
     ):
         """Cross-catalog search. Iterates accessible catalogs and aggregates matches.
 
@@ -1352,6 +1376,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                     query=query,
                     limit=remaining,
                     offset=0,
+                    all_collections=all_collections,
                 )
             except Exception as e:
                 logger.warning(f"Global search: catalog={cat_id} failed: {e}")

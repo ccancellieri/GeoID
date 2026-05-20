@@ -191,3 +191,45 @@ async def test_typed_value_preserved_in_container(captured):
     params = captured["calls"][0]["params"]
     assert json.loads(params["metadata_container"]) == {"size": 100}
     assert isinstance(json.loads(params["metadata_container"])["size"], int)
+
+
+# ---------------------------------------------------------------------------
+# Collection scope (tri-state) — #1095
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_scopes_to_catalog_tier(captured):
+    """Default (all_collections=False, collection_id=None) keeps the
+    ``IS NOT DISTINCT FROM`` predicate with a NULL parameter → catalog tier."""
+    drv = _make_driver(None)
+    await drv.search_assets("cat-a")
+    sql = captured["calls"][0]["sql"]
+    params = captured["calls"][0]["params"]
+    assert "collection_id IS NOT DISTINCT FROM :collection_id" in sql
+    assert params["collection_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_single_collection_binds_predicate(captured):
+    drv = _make_driver(None)
+    await drv.search_assets("cat-a", collection_id="coll-1")
+    sql = captured["calls"][0]["sql"]
+    params = captured["calls"][0]["params"]
+    assert "collection_id IS NOT DISTINCT FROM :collection_id" in sql
+    assert params["collection_id"] == "coll-1"
+
+
+@pytest.mark.asyncio
+async def test_all_collections_drops_collection_predicate(captured):
+    """all_collections=True spans the whole catalog: no collection predicate,
+    and no collection_id bind param leaks into the query."""
+    drv = _make_driver(None)
+    await drv.search_assets("cat-a", collection_id="ignored", all_collections=True)
+    sql = captured["calls"][0]["sql"]
+    params = captured["calls"][0]["params"]
+    assert "collection_id IS NOT DISTINCT FROM" not in sql
+    assert "collection_id" not in params
+    # catalog scoping still applies
+    assert "catalog_id = :catalog_id" in sql
+    assert "status <> 'deleted'" in sql

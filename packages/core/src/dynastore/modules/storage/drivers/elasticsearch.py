@@ -1787,6 +1787,7 @@ class AssetElasticsearchDriver(
         query: Optional[Dict[str, Any]] = None,
         limit: int = 100,
         offset: int = 0,
+        all_collections: bool = False,
         db_resource=None,
     ) -> List[Dict[str, Any]]:
         """Search asset documents in ES.
@@ -1799,7 +1800,14 @@ class AssetElasticsearchDriver(
           supported natively by ES for dynamically mapped nested fields.
         - ``None`` → ``match_all``
 
-        ``collection_id`` is added as an extra ``term`` filter when provided.
+        Collection scope mirrors the PG asset driver (tri-state):
+        - ``collection_id="<id>"`` → ``term`` filter on that collection.
+        - ``collection_id=None`` and ``all_collections=False`` → catalog-tier
+          assets only, via a ``must_not exists collection_id`` clause (a doc
+          bound to no collection has the field absent/null). This keeps ES and
+          PG scoping identical for the default catalog-tier search.
+        - ``all_collections=True`` → no collection clause; spans every
+          collection plus the catalog tier under the catalog.
         """
         from dynastore.modules.elasticsearch.mappings import get_assets_index_name
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
@@ -1808,11 +1816,20 @@ class AssetElasticsearchDriver(
         es = self._get_client()
 
         base_query = self._to_es_query(query or {})
-        if collection_id:
+        if all_collections:
+            pass  # no collection clause — span the whole catalog
+        elif collection_id:
             base_query = {
                 "bool": {
                     "must": [base_query],
                     "filter": [{"term": {"collection_id": collection_id}}],
+                }
+            }
+        else:
+            base_query = {
+                "bool": {
+                    "must": [base_query],
+                    "must_not": [{"exists": {"field": "collection_id"}}],
                 }
             }
 
