@@ -38,11 +38,8 @@ def mock_col_config():
             FeatureAttributeSidecarConfig(
                 sidecar_type="attributes",
                 storage_mode=AttributeStorageMode.JSONB,
-                enable_external_id=True,
                 index_external_id=True,
                 expose_geoid=False,
-                enable_asset_id=True,
-                asset_id_field="asset_id",
                 index_asset_id=True,
                 enable_validity=True,
                 attribute_schema=None,

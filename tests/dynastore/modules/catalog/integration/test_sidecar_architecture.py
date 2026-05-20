@@ -68,7 +68,6 @@ async def test_columnar_attributes_sidecar(app_lifespan, catalog_id, collection_
                 nullable=False,
             ),
         ],
-        enable_external_id=True,
     )
 
     # 1. Setup Config

@@ -200,10 +200,11 @@ class FeatureAttributeSidecar(SidecarProtocol):
         fields = {}
 
         # ALWAYS include asset_id if enabled (even if not in attribute_schema)
-        if self.config.enable_asset_id:
-            fields["asset_id"] = FieldDefinition(
-                name="asset_id",
-                sql_expression=f"{alias}.asset_id",
+        if self.config.asset_id_field is not None:
+            asset_col = self.config.asset_id_field
+            fields[asset_col] = FieldDefinition(
+                name=asset_col,
+                sql_expression=f"{alias}.{asset_col}",
                 capabilities=[
                     FieldCapability.FILTERABLE,
                     FieldCapability.SORTABLE,
@@ -216,11 +217,12 @@ class FeatureAttributeSidecar(SidecarProtocol):
             )
 
         # external_id - always query-only, mapped to Feature.id
-        if self.config.enable_external_id:
-            fields["external_id"] = FieldDefinition(
-                name="external_id",
+        if self.config.external_id_field is not None:
+            ext_col = self.config.external_id_field
+            fields[ext_col] = FieldDefinition(
+                name=ext_col,
                 alias="id",
-                sql_expression=f"{alias}.external_id",
+                sql_expression=f"{alias}.{ext_col}",
                 capabilities=[
                     FieldCapability.FILTERABLE,
                     FieldCapability.SORTABLE,
@@ -337,14 +339,14 @@ class FeatureAttributeSidecar(SidecarProtocol):
         columns = ["geoid UUID NOT NULL"]
         known_columns = {"geoid"}
 
-        # Add Identity Columns
-        if self.config.enable_external_id:
-            columns.append("external_id VARCHAR(255)")
-            known_columns.add("external_id")
+        # Add Identity Columns (null-object: field name present → column enabled)
+        if self.config.external_id_field is not None:
+            columns.append(f"{self.config.external_id_field} VARCHAR(255)")
+            known_columns.add(self.config.external_id_field)
 
-        if self.config.enable_asset_id:
-            columns.append("asset_id VARCHAR(255)")
-            known_columns.add("asset_id")
+        if self.config.asset_id_field is not None:
+            columns.append(f"{self.config.asset_id_field} VARCHAR(255)")
+            known_columns.add(self.config.asset_id_field)
 
         # Add Attribute Storage
         indexes = []
@@ -488,17 +490,19 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         # Add Indices
         # Identity Indices
-        if self.config.enable_external_id and self.config.index_external_id:
+        if self.config.external_id_field is not None and self.config.index_external_id:
             # external_id is unique WITHIN a PK scope (e.g. per validity window
             # for versioned tables), not globally per geoid. Including the full
             # PK in the unique index keeps it compatible with the upsert's
             # ON CONFLICT target and allows re-materialization with a fresh
             # validity range to INSERT instead of colliding.
-            ext_id_cols = pk_columns + ["external_id"] if pk_columns else ["external_id"]
+            ext_col = self.config.external_id_field
+            ext_id_cols = pk_columns + [ext_col] if pk_columns else [ext_col]
             ddl += f'\nCREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_ext_id" ON {{schema}}."{table_name}" ({", ".join(ext_id_cols)});'
 
-        if self.config.enable_asset_id and self.config.index_asset_id:
-            ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_asset_id" ON {{schema}}."{table_name}" (asset_id);'
+        if self.config.asset_id_field is not None and self.config.index_asset_id:
+            asset_col = self.config.asset_id_field
+            ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_asset_id" ON {{schema}}."{table_name}" ({asset_col});'
             # Note: We cannot add a simple FK to assets(asset_id) because assets table is partitioned by collection_id
             # and thus PK is (collection_id, asset_id).
             # Integrity is enforced via trigger (trg_asset_cleanup).
@@ -518,8 +522,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 f"JSONB table {schema}.{table_name} configured with FILLFACTOR=80"
             )
 
-        # Setup Asset Cleanup Trigger if asset_id is enabled
-        if self.config.enable_asset_id:
+        # Setup Asset Cleanup Trigger if asset_id column is enabled
+        if self.config.asset_id_field is not None:
             logger.info(f"Setting up asset cleanup trigger for {schema}.{table_name}")
             am = get_protocol(AssetsProtocol)
             if am:
@@ -558,11 +562,11 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         if attr_name == "validity" and self.config.enable_validity:
             return (f"{alias}.validity", alias)
 
-        # Identity Columns
-        if self.config.enable_external_id and attr_name == "external_id":
-            return (f"{alias}.external_id", alias)
-        if self.config.enable_asset_id and attr_name == "asset_id":
-            return (f"{alias}.asset_id", alias)
+        # Identity Columns (null-object: field name present → column enabled)
+        if self.config.external_id_field is not None and attr_name == self.config.external_id_field:
+            return (f"{alias}.{self.config.external_id_field}", alias)
+        if self.config.asset_id_field is not None and attr_name == self.config.asset_id_field:
+            return (f"{alias}.{self.config.asset_id_field}", alias)
 
         # Columnar Mode
         if self.resolved_storage_mode == AttributeStorageMode.COLUMNAR:
@@ -618,16 +622,19 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             sort_fields = {s.field for s in (request.sort or [])} if hasattr(request, "sort") and request.sort else set()
             all_needed = requested | filter_fields | sort_fields
 
-            # 1. Identity Columns
-            if self.config.enable_external_id and (
-                "external_id" in all_needed or "id" in all_needed or "*" in requested or not requested
+            # 1. Identity Columns (null-object: field name present → column enabled)
+            if self.config.external_id_field is not None and (
+                self.config.external_id_field in all_needed
+                or "id" in all_needed
+                or "*" in requested
+                or not requested
             ):
-                fields.append(f"{alias}.external_id")
+                fields.append(f"{alias}.{self.config.external_id_field}")
 
-            if self.config.enable_asset_id and (
-                "asset_id" in all_needed or "*" in requested
+            if self.config.asset_id_field is not None and (
+                self.config.asset_id_field in all_needed or "*" in requested
             ):
-                fields.append(f"{alias}.asset_id")
+                fields.append(f"{alias}.{self.config.asset_id_field}")
 
             # 2. Attribute Columns
             storage_mode = self.resolved_storage_mode
@@ -641,11 +648,11 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                             fields.append(f'{alias}."{attr.name}"')
         else:
             # Full mode: return all fields (existing behavior)
-            if self.config.enable_external_id:
-                fields.append(f"{alias}.external_id")
+            if self.config.external_id_field is not None:
+                fields.append(f"{alias}.{self.config.external_id_field}")
 
-            if self.config.enable_asset_id:
-                fields.append(f"{alias}.asset_id")
+            if self.config.asset_id_field is not None:
+                fields.append(f"{alias}.{self.config.asset_id_field}")
 
             storage_mode = self.resolved_storage_mode
             if storage_mode == AttributeStorageMode.JSONB:
@@ -753,11 +760,11 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         alias = sidecar_alias or f"sc_{self.sidecar_id}"
         fields = []
 
-        if self.config.enable_external_id:
-            fields.append(f"{alias}.external_id")
+        if self.config.external_id_field is not None:
+            fields.append(f"{alias}.{self.config.external_id_field}")
 
-        if self.config.enable_asset_id:
-            fields.append(f"{alias}.asset_id")
+        if self.config.asset_id_field is not None:
+            fields.append(f"{alias}.{self.config.asset_id_field}")
 
         # Columnar mode attributes can be ordered
         if (
@@ -774,11 +781,11 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         alias = sidecar_alias or f"sc_{self.sidecar_id}"
         fields = []
 
-        if self.config.enable_external_id:
-            fields.append(f"{alias}.external_id")
+        if self.config.external_id_field is not None:
+            fields.append(f"{alias}.{self.config.external_id_field}")
 
-        if self.config.enable_asset_id:
-            fields.append(f"{alias}.asset_id")
+        if self.config.asset_id_field is not None:
+            fields.append(f"{alias}.{self.config.asset_id_field}")
 
         # Columnar mode attributes can be grouped
         if (
@@ -797,10 +804,11 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         alias = sidecar_alias or f"sc_{self.sidecar_id}"
         fields = {}
 
-        # 1. Identity Columns
-        if self.config.enable_external_id:
-            fields["external_id"] = FieldDefinition(
-                name="external_id",
+        # 1. Identity Columns (null-object: field name present → column enabled)
+        if self.config.external_id_field is not None:
+            ext_col = self.config.external_id_field
+            fields[ext_col] = FieldDefinition(
+                name=ext_col,
                 alias="id",  # Standard external name for STAC/OGC
                 title=LocalizedText(
                     en="External ID",
@@ -812,7 +820,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                     fr="L'identifiant unique de l'entité dans le système source.",
                     es="El identificador único de la entidad en el sistema de origen.",
                 ),
-                sql_expression=f"{alias}.external_id",
+                sql_expression=f"{alias}.{ext_col}",
                 capabilities=[
                     FieldCapability.FILTERABLE,
                     FieldCapability.SORTABLE,
@@ -824,10 +832,11 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 expose=True,
             )
 
-        if self.config.enable_asset_id:
-            fields["asset_id"] = FieldDefinition(
-                name="asset_id",
-                alias="asset_id",
+        if self.config.asset_id_field is not None:
+            asset_col = self.config.asset_id_field
+            fields[asset_col] = FieldDefinition(
+                name=asset_col,
+                alias=asset_col,
                 title=LocalizedText(
                     en="Asset ID",
                     fr="Identifiant de l'Actif",
@@ -838,7 +847,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                     fr="L'identifiant de l'actif physique associé.",
                     es="El identificador del activo físico asociado.",
                 ),
-                sql_expression=f"{alias}.asset_id",
+                sql_expression=f"{alias}.{asset_col}",
                 capabilities=[
                     FieldCapability.FILTERABLE,
                     FieldCapability.SORTABLE,
@@ -1018,9 +1027,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         )
 
     def get_default_sort(self) -> Optional[List[Tuple[str, str]]]:
-
-        if self.config.enable_external_id:
-            return [("external_id", "ASC")]
+        if self.config.external_id_field is not None:
+            return [(self.config.external_id_field, "ASC")]
         return None
 
     def prepare_upsert_payload(
@@ -1053,16 +1061,16 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         if context.get("partition_key_name"):
             payload[context["partition_key_name"]] = context["partition_key_value"]
 
-        # 4. Identity Column Storage
-        if self.config.enable_external_id and ext_id:
-            payload["external_id"] = str(ext_id)
+        # 4. Identity Column Storage (null-object: field name present → column enabled)
+        if self.config.external_id_field is not None and ext_id:
+            payload[self.config.external_id_field] = str(ext_id)
 
-        if self.config.enable_asset_id:
+        if self.config.asset_id_field is not None:
             # IMPORTANT: asset_id is ONLY extracted from context, not feature body.
             asset_id = context.get("asset_id")
             if asset_id:
                 asset_id_str = str(asset_id)
-                payload["asset_id"] = asset_id_str
+                payload[self.config.asset_id_field] = asset_id_str
                 context["asset_id"] = asset_id_str
 
         # 5. Temporal Fields extraction (Supports JSON-FG 'time' member)
@@ -1160,7 +1168,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                         if attr.default is not None:
                             props_to_save[attr.name] = attr.default
 
-            if self.config.enable_external_id:
+            if self.config.external_id_field is not None:
+                ext_col = self.config.external_id_field
                 field_path = _resolve_external_id_field(context)
                 if field_path and "." not in field_path and field_path in props_to_save:
                     del props_to_save[field_path]
@@ -1169,18 +1178,19 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 if not ext_id and field_path:
                     ext_id = self._extract_value(feature_as_dict, field_path)
                 if ext_id:
-                    payload["external_id"] = ext_id
+                    payload[ext_col] = ext_id
 
-            if self.config.enable_asset_id:
-                asset_id_field = getattr(self.config, "asset_id_field", "asset_id")
-                if "." not in asset_id_field and asset_id_field in props_to_save:
-                    del props_to_save[asset_id_field]
+            if self.config.asset_id_field is not None:
+                asset_col = self.config.asset_id_field
+                # Input property to extract from feature body uses the storage column name.
+                if asset_col in props_to_save:
+                    del props_to_save[asset_col]
 
                 asset_id = context.get("asset_id")
                 if not asset_id:
-                    asset_id = self._extract_value(feature_as_dict, asset_id_field)
+                    asset_id = self._extract_value(feature_as_dict, asset_col)
                 if asset_id:
-                    payload["asset_id"] = asset_id
+                    payload[asset_col] = asset_id
                     context["asset_id"] = asset_id
 
             import json
@@ -1198,8 +1208,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         """Columns owned by this sidecar that are never part of Feature properties."""
         cols = {"geoid", "external_id", "validity", "transaction_time", "deleted_at",
                 "transaction_period", "catalog_id", "collection_id"}
-        if self.config.enable_asset_id:
-            cols.add("asset_id")
+        if self.config.asset_id_field is not None:
+            cols.add(self.config.asset_id_field)
         # attributes_hash is write-policy plumbing for ComputedKind.ATTRIBUTES_HASH;
         # never leak it into Feature.properties.  Only present in Mode B (JSONB).
         if self.resolved_storage_mode == AttributeStorageMode.JSONB:
@@ -1240,16 +1250,17 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             if read_policy is not None
             else True
         )
-        if use_external_id:
-            ext_id = row.get("external_id")
+        if use_external_id and self.config.external_id_field is not None:
+            ext_id = row.get(self.config.external_id_field)
             if ext_id is not None:
                 feature.id = str(ext_id)
             # else: keep Hub's geoid-based id
 
         # 2. Publish asset_id into shared context for downstream sidecars.
-        asset_id = row.get("asset_id")
-        if asset_id is not None:
-            context["asset_id"] = asset_id
+        if self.config.asset_id_field is not None:
+            asset_id = row.get(self.config.asset_id_field)
+            if asset_id is not None:
+                context["asset_id"] = asset_id
 
         # 2. Attributes Mapping (STRICT MODE)
         storage_mode = self.resolved_storage_mode
@@ -1515,10 +1526,11 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         # Note: ItemService handles the check based on ItemsWritePolicy,
         # but here we provide the implementation for specific fields.
         asset_id = processing_context.get("asset_id")
-        if asset_id and self.config.enable_asset_id:
+        if asset_id and self.config.asset_id_field is not None:
+            asset_col = self.config.asset_id_field
             query = text(f"""
                 SELECT 1 FROM "{physical_schema}"."{table}"
-                WHERE asset_id = :asset_id
+                WHERE {asset_col} = :asset_id
                 {f"AND geoid != :exclude_geoid" if exclude_geoid else ""}
                 LIMIT 1
             """)
@@ -1537,10 +1549,10 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         Returns the subset of the context that identifies the feature for this sidecar.
         """
         identity = {}
-        if self.config.enable_external_id and "external_id" in context:
-            identity["external_id"] = context["external_id"]
-        if self.config.enable_asset_id and "asset_id" in context:
-            identity["asset_id"] = context["asset_id"]
+        if self.config.external_id_field is not None and "external_id" in context:
+            identity[self.config.external_id_field] = context["external_id"]
+        if self.config.asset_id_field is not None and "asset_id" in context:
+            identity[self.config.asset_id_field] = context["asset_id"]
         return identity
 
     async def check_collision(
@@ -1553,9 +1565,10 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         exclude_geoid: Optional[Any] = None,
     ) -> bool:
         """Check for value existence in external_id or asset_id columns."""
-        if field_name == "external_id" and not self.config.enable_external_id:
+        # Guard: reject lookups on disabled identity columns
+        if self.config.external_id_field is None and field_name == "external_id":
             return False
-        if field_name == "asset_id" and not self.config.enable_asset_id:
+        if self.config.asset_id_field is None and field_name == "asset_id":
             return False
 
         # We only support checks for identity fields or columnar attributes

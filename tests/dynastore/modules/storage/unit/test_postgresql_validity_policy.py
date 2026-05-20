@@ -202,6 +202,126 @@ class TestPolicyOverlay:
         overlaid = self._apply_overlay(col, policy)
         assert overlaid is col  # Same object — no overlay applied.
 
+    def test_overlay_sets_external_id_field_from_policy(self):
+        """Policy has EXTERNAL_ID compute rule → external_id_field="external_id"."""
+        from dynastore.modules.storage.driver_config import ComputedField, ComputedKind
+
+        sc = FeatureAttributeSidecarConfig(
+            storage_mode=AttributeStorageMode.JSONB,
+            external_id_field=None,  # disabled
+        )
+        col = ItemsPostgresqlDriverConfig(sidecars=[sc])
+        policy = ItemsWritePolicy(
+            compute=[ComputedField(kind=ComputedKind.EXTERNAL_ID, name="properties.code")]
+        )
+        policy_external_id_field = (
+            "external_id"
+            if policy.find_compute(ComputedKind.EXTERNAL_ID) is not None
+            else None
+        )
+        overlay_sidecars = []
+        any_overlay = False
+        for s in col.sidecars:
+            if isinstance(s, FeatureAttributeSidecarConfig):
+                updates = {}
+                if s.external_id_field != policy_external_id_field:
+                    updates["external_id_field"] = policy_external_id_field
+                if updates:
+                    overlay_sidecars.append(s.model_copy(update=updates))
+                    any_overlay = True
+                else:
+                    overlay_sidecars.append(s)
+            else:
+                overlay_sidecars.append(s)
+        if any_overlay:
+            col = col.model_copy(update={"sidecars": overlay_sidecars})
+        attr_sc = next(s for s in col.sidecars if isinstance(s, FeatureAttributeSidecarConfig))
+        assert attr_sc.external_id_field == "external_id"
+        assert attr_sc.enable_external_id is True  # property shim
+
+    def test_overlay_clears_external_id_field_when_policy_has_no_rule(self):
+        """Policy with empty identity list → no EXTERNAL_ID rule → external_id_field=None."""
+        from dynastore.modules.storage.driver_config import ComputedKind
+
+        sc = FeatureAttributeSidecarConfig(
+            storage_mode=AttributeStorageMode.JSONB,
+            external_id_field="external_id",  # enabled
+        )
+        col = ItemsPostgresqlDriverConfig(sidecars=[sc])
+        # identity=[] removes the default IdentityRule(match_on=[EXTERNAL_ID])
+        policy = ItemsWritePolicy(identity=[])
+        policy_external_id_field = (
+            "external_id"
+            if policy.find_compute(ComputedKind.EXTERNAL_ID) is not None
+            else None
+        )
+        overlay_sidecars = []
+        any_overlay = False
+        for s in col.sidecars:
+            if isinstance(s, FeatureAttributeSidecarConfig):
+                updates = {}
+                if s.external_id_field != policy_external_id_field:
+                    updates["external_id_field"] = policy_external_id_field
+                if updates:
+                    overlay_sidecars.append(s.model_copy(update=updates))
+                    any_overlay = True
+                else:
+                    overlay_sidecars.append(s)
+            else:
+                overlay_sidecars.append(s)
+        if any_overlay:
+            col = col.model_copy(update={"sidecars": overlay_sidecars})
+        attr_sc = next(s for s in col.sidecars if isinstance(s, FeatureAttributeSidecarConfig))
+        assert attr_sc.external_id_field is None
+        assert attr_sc.enable_external_id is False  # property shim
+
+    def test_overlay_sets_asset_id_field_from_policy(self):
+        """policy.track_asset_id=True → asset_id_field="asset_id"."""
+        sc = FeatureAttributeSidecarConfig(
+            storage_mode=AttributeStorageMode.JSONB,
+            asset_id_field=None,  # disabled
+        )
+        col = ItemsPostgresqlDriverConfig(sidecars=[sc])
+        policy = ItemsWritePolicy(track_asset_id=True)
+        policy_asset_id_field = "asset_id" if policy.track_asset_id else None
+        overlay_sidecars = []
+        any_overlay = False
+        for s in col.sidecars:
+            if isinstance(s, FeatureAttributeSidecarConfig):
+                updates = {}
+                if s.asset_id_field != policy_asset_id_field:
+                    updates["asset_id_field"] = policy_asset_id_field
+                if updates:
+                    overlay_sidecars.append(s.model_copy(update=updates))
+                    any_overlay = True
+                else:
+                    overlay_sidecars.append(s)
+            else:
+                overlay_sidecars.append(s)
+        if any_overlay:
+            col = col.model_copy(update={"sidecars": overlay_sidecars})
+        attr_sc = next(s for s in col.sidecars if isinstance(s, FeatureAttributeSidecarConfig))
+        assert attr_sc.asset_id_field == "asset_id"
+        assert attr_sc.enable_asset_id is True  # property shim
+
+    def test_null_object_defaults_both_fields_enabled(self):
+        """Default config has both fields enabled (backward-compatible defaults)."""
+        sc = FeatureAttributeSidecarConfig()
+        assert sc.external_id_field == "external_id"
+        assert sc.asset_id_field == "asset_id"
+        assert sc.enable_external_id is True
+        assert sc.enable_asset_id is True
+
+    def test_null_object_none_disables_columns(self):
+        """Setting field to None disables the column and the boolean property."""
+        sc = FeatureAttributeSidecarConfig(
+            external_id_field=None,
+            asset_id_field=None,
+        )
+        assert sc.enable_external_id is False
+        assert sc.enable_asset_id is False
+        assert sc.feature_id_field_name is None
+
     def test_overlay_leaves_non_attribute_sidecars_alone(self):
         """Geometries / item_metadata sidecars don't get touched."""
         from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
