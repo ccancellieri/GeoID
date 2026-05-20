@@ -146,6 +146,30 @@ async def lifespan(app: FastAPI):
             # Flush any pending policy/role registrations from extensions
             from dynastore.models.protocols.policies import PermissionProtocol
             pm = get_protocol(PermissionProtocol)
+            # Announce the authorization posture exactly once at startup. The
+            # IAM extension is always_on whenever its wheel is installed, so a
+            # service meant to be open (e.g. a SCOPE that excludes the iam
+            # extension) can silently flip to deny-by-default if it runs a
+            # stale or wrong-SCOPE image that still carries the wheel. Surfacing
+            # the posture here turns that into an obvious log line instead of
+            # mysterious "Deny by Default" 403s on every non-public route.
+            _scope = os.environ.get("SCOPE", "<unset>")
+            if pm is None:
+                logger.warning(
+                    "Authorization DISABLED - no PermissionProtocol registered; "
+                    "all requests run unauthenticated (open access) [SCOPE=%s]. "
+                    "Expected for open scopes built without the iam extension.",
+                    _scope,
+                )
+            else:
+                logger.warning(
+                    "Authorization ENFORCED (deny-by-default) via %s "
+                    "[SCOPE=%s, IdP=%s]. For an open/no-auth deployment, build "
+                    "WITHOUT the iam extension (e.g. a catalog-only scope).",
+                    type(pm).__name__,
+                    _scope,
+                    os.environ.get("IDP_ISSUER_URL") or "<none>",
+                )
             flush = getattr(pm, "flush_pending_registrations", None)
             if flush is not None:
                 await flush()
