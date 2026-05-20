@@ -313,6 +313,35 @@ def test_read_policy_disables_external_id_as_feature_id(mock_col_config, mock_re
     assert "h.geoid AS id" in sql_off
 
 
+def test_map_row_to_feature_forwards_read_policy(mock_col_config) -> None:
+    """The optimizer must thread its resolved ``read_policy`` into the items
+    service so the row mapper can honour ``feature_type.expose`` /
+    ``external_id_as_feature_id``. Without this the wire-shape contract is
+    silently dropped at read time."""
+    from dynastore.modules.storage.read_policy import ItemsReadPolicy
+    from dynastore.modules.storage.computed_fields import FeatureType
+
+    policy = ItemsReadPolicy(feature_type=FeatureType(expose=["area"]))
+    optimizer = QueryOptimizer(mock_col_config, read_policy=policy)
+
+    captured = {}
+
+    class _FakeItems:
+        def map_row_to_feature(self, row, col_config, lang="en", read_policy=None):
+            captured["read_policy"] = read_policy
+            captured["lang"] = lang
+            return MagicMock()
+
+    with patch(
+        "dynastore.modules.catalog.query_optimizer.get_protocol",
+        return_value=_FakeItems(),
+    ):
+        optimizer.map_row_to_feature({"geoid": "g1"}, mock_col_config, lang="fr")
+
+    assert captured["read_policy"] is policy
+    assert captured["lang"] == "fr"
+
+
 def test_attributes_sidecar_config_drops_external_id_as_feature_id() -> None:
     """Sidecar config must no longer accept ``external_id_as_feature_id`` —
     that knob moved to ItemsReadPolicy.feature_type."""

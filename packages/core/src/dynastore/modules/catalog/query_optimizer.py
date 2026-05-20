@@ -145,7 +145,12 @@ class QueryOptimizer:
         items_service = get_protocol(ItemsProtocol)
         if items_service is None:
             raise RuntimeError("ItemsProtocol implementation is not registered")
-        return items_service.map_row_to_feature(row, col_config, lang=lang)
+        # Thread the resolved wire-shape contract so the row mapper can honour
+        # ``feature_type.external_id_as_feature_id`` and merge the
+        # ``feature_type.expose`` computed values onto ``properties``.
+        return items_service.map_row_to_feature(
+            row, col_config, lang=lang, read_policy=self.read_policy
+        )
 
     def validate_query(self, query: QueryRequest) -> List[str]:
         """

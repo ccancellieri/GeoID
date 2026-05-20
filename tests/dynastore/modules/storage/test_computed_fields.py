@@ -119,9 +119,9 @@ class TestIdentityRule:
 class TestFeatureType:
     def test_defaults(self) -> None:
         ft = FeatureType()
-        assert ft.schema_ref == "items_write_policy.schema"
         assert ft.expose == []
         assert ft.failure_mode == "best_effort"
+        assert ft.external_id_as_feature_id is True
 
     def test_strict_failure_mode(self) -> None:
         ft = FeatureType(failure_mode="strict")

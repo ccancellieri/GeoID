@@ -67,6 +67,61 @@ async def _run_query(conn, stmt, params=None):
     return result
 
 
+def _build_write_validator(items_schema: Any) -> Any:
+    """Build a write-time value-constraint validator from an ``ItemsSchema``.
+
+    Returns a ``jsonschema.Draft202012Validator`` that checks feature
+    ``properties`` against the VALUE constraints declared on the items schema
+    (type, enum, minimum, maximum, maxLength, pattern, format), or ``None``
+    when the schema declares no fields (blob collection — nothing to validate).
+
+    The schema is derived with ``purpose="write"`` so it deliberately omits
+    the two structural constraints already enforced earlier on the write path
+    — ``additionalProperties`` (owned by the strict-unknown-fields check) and
+    ``required`` (owned by the ``NOT NULL`` sidecar columns / ``check_required``
+    app-level fallback). Re-asserting either here would raise a second,
+    conflicting 422 for the same input.
+    """
+    from dynastore.modules.storage.driver_config import ItemsSchema
+    from dynastore.modules.storage.schema_derive import derive_wire_schema
+
+    if not isinstance(items_schema, ItemsSchema):
+        return None
+    write_schema = derive_wire_schema(items_schema.fields, purpose="write")
+    if not (isinstance(write_schema, dict) and write_schema):
+        return None
+    from jsonschema import Draft202012Validator
+
+    try:
+        return Draft202012Validator(write_schema)
+    except Exception as exc:
+        raise ValueError(
+            f"Derived items-schema write validation is not a valid JSON Schema: {exc}"
+        ) from exc
+
+
+def _validate_feature_properties(validator: Any, raw_item: Dict[str, Any]) -> None:
+    """Validate one feature's ``properties`` against a write validator.
+
+    No-op when ``validator`` is ``None``. On a value-constraint violation,
+    raises a 422-shaped ``ValueError`` naming the offending field(s); the bulk
+    ingestion layer aggregates these into ``IngestionReport`` rejections.
+    """
+    if validator is None:
+        return
+    props = raw_item.get("properties") or {}
+    violations = sorted(
+        validator.iter_errors(props),
+        key=lambda e: list(e.absolute_path),
+    )
+    if violations:
+        msg = "; ".join(
+            f"{'.'.join(str(p) for p in v.absolute_path) or '<root>'}: {v.message}"
+            for v in violations
+        )
+        raise ValueError(f"Feature properties violate the items schema: {msg}")
+
+
 # --- Specialized Queries for ItemService ---
 
 
@@ -285,6 +340,9 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             SidecarRegistry,
             _effective_sidecars,
         )
+        from dynastore.modules.storage.drivers.pg_sidecars.base import (
+            SidecarProtocol,
+        )
         sidecar_configs = _effective_sidecars(
             col_config, catalog_id="", collection_id="",
         )
@@ -305,10 +363,20 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     all_internal.update(sidecar.get_internal_columns())
             context._all_internal_cols = all_internal
 
+            resolved_sidecars: List[SidecarProtocol] = []
             for sc_config in sidecar_configs:
                 sidecar = SidecarRegistry.get_sidecar(sc_config, lenient=True)
                 if sidecar:
+                    resolved_sidecars.append(sidecar)
                     sidecar.map_row_to_feature(row_dict, feature, context=context)
+
+            # Read-shape exposure: surface ItemsReadPolicy.feature_type.expose
+            # computed values onto properties once, after every sidecar has
+            # contributed — so failure_mode sees the full producible set and the
+            # loop is not duplicated per sidecar.
+            SidecarProtocol.apply_exposed_computed_values(
+                resolved_sidecars, row_dict, feature, context
+            )
 
             # Bridge context to feature model_extra for extension generators (e.g. STAC)
             if context:
@@ -627,24 +695,31 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     items_write_policy = wp
 
         # Phase 2 — prepare every item in memory; dedupe partition keys
-        # If the policy declares a JSON Schema, every feature's ``properties``
-        # is validated against it before sidecar work begins. Failure raises
-        # a 422-shaped ValueError naming the offending field; the bulk
+        # Value-constraint validation: every feature's ``properties`` is
+        # validated against a JSON Schema derived from ``ItemsSchema`` (the
+        # single source of truth) before sidecar work begins. A violation
+        # raises a 422-shaped ValueError naming the offending field; the bulk
         # ingestion layer aggregates these into IngestionReport rejections.
-        policy_schema = (
-            items_write_policy.schema
-            if items_write_policy is not None
-            else None
-        )
+        # See ``_build_write_validator`` for what the derived schema does and
+        # does not assert (value constraints only — unknown-key and required
+        # checks are owned by other write-path mechanisms). The validation
+        # schema is derived directly from ``ItemsSchema`` here, mirroring the
+        # read path in ``get_collection_schema``; ``ItemsWritePolicy.schema``
+        # is derived/read-only and forbidden from being authored.
         schema_validator = None
-        if isinstance(policy_schema, dict) and policy_schema:
-            from jsonschema import Draft202012Validator
+        validation_configs = get_protocol(ConfigsProtocol)
+        if validation_configs is not None:
+            from dynastore.modules.storage.driver_config import ItemsSchema
+
             try:
-                schema_validator = Draft202012Validator(policy_schema)
-            except Exception as exc:
-                raise ValueError(
-                    f"ItemsWritePolicy.schema is not a valid JSON Schema: {exc}"
-                ) from exc
+                _items_schema = await validation_configs.get_config(
+                    ItemsSchema,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+            except Exception:
+                _items_schema = None
+            schema_validator = _build_write_validator(_items_schema)
 
         prepared: List[Dict[str, Any]] = []
         unique_partition_values: set = set()
@@ -656,20 +731,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             else:
                 raise ValueError(f"Unsupported item type: {type(item_data)}")
 
-            if schema_validator is not None:
-                props = raw_item.get("properties") or {}
-                violations = sorted(
-                    schema_validator.iter_errors(props),
-                    key=lambda e: list(e.absolute_path),
-                )
-                if violations:
-                    msg = "; ".join(
-                        f"{'.'.join(str(p) for p in v.absolute_path) or '<root>'}: {v.message}"
-                        for v in violations
-                    )
-                    raise ValueError(
-                        f"Feature properties violate ItemsWritePolicy.schema: {msg}"
-                    )
+            _validate_feature_properties(schema_validator, raw_item)
 
             geoid = generate_geoid()
             item_context: Dict[str, Any] = {
@@ -1618,6 +1680,26 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 wp = None
             if isinstance(wp, ItemsWritePolicy) and isinstance(wp.schema, dict) and wp.schema:
                 policy_schema = wp.schema
+
+        if policy_schema is None and configs is not None:
+            # Derive the wire schema from items_schema (the SSOT). When the
+            # collection declares no fields (blob), the sidecar aggregation
+            # remains the sole source.
+            from dynastore.modules.storage.driver_config import ItemsSchema
+            from dynastore.modules.storage.schema_derive import derive_wire_schema
+
+            try:
+                its = await configs.get_config(
+                    ItemsSchema,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+            except Exception:
+                its = None
+            if isinstance(its, ItemsSchema):
+                policy_schema = derive_wire_schema(
+                    its.fields, strict=its.strict_unknown_fields
+                )
 
         if policy_schema is None:
             return sidecar_schema

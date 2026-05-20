@@ -207,12 +207,45 @@ class ItemQueryMixin:
     ) -> Any:
         raise NotImplementedError("ItemQueryMixin requires a concrete _get_collection_config")
 
+    async def _resolve_read_policy(
+        self,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Optional[Any]:
+        """Resolve the collection's :class:`ItemsReadPolicy` for read assembly.
+
+        Fetched once per query (not per row) so the row mapper can honour the
+        wire-shape contract — ``feature_type.expose`` value-merge and
+        ``external_id_as_feature_id``. Returns ``None`` when the configs
+        protocol is unavailable; callers then fall back to default wire shape.
+        """
+        try:
+            from dynastore.modules.storage.read_policy import ItemsReadPolicy
+
+            configs = get_protocol(ConfigsProtocol)
+            if configs is None:
+                return None
+            return await configs.get_config(
+                ItemsReadPolicy,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - read assembly must not break on config miss
+            logger.debug(
+                "read policy resolution skipped for %s/%s: %s",
+                catalog_id,
+                collection_id,
+                exc,
+            )
+            return None
+
     def map_row_to_feature(
         self,
         row: Dict[str, Any],
         col_config: Any,
         lang: str = "en",
         context: Any = None,
+        read_policy: Optional[Any] = None,
     ) -> Feature:
         raise NotImplementedError("ItemQueryMixin requires a concrete map_row_to_feature")
 
@@ -249,10 +282,16 @@ class ItemQueryMixin:
 
         if col_config is None or phys_schema is None or phys_table is None:
             return []
+        read_policy = await self._resolve_read_policy(catalog_id, collection_id)
         optimizer = QueryOptimizer(col_config)
         sql, params = optimizer.build_optimized_query(request, phys_schema, phys_table)
         rows = await _run_query(conn, text(sql), params)
-        return [self.map_row_to_feature(dict(row._mapping), col_config) for row in rows]
+        return [
+            self.map_row_to_feature(
+                dict(row._mapping), col_config, read_policy=read_policy
+            )
+            for row in rows
+        ]
 
     async def get_features_query(
         self,
@@ -515,8 +554,12 @@ class ItemQueryMixin:
             result = await _run_query(conn, text(sql), params)
             row = result.mappings().first()
 
+            read_policy = await self._resolve_read_policy(catalog_id, collection_id)
             return (
-                self.map_row_to_feature(dict(row), col_config, lang=lang, context=context)
+                self.map_row_to_feature(
+                    dict(row), col_config, lang=lang, context=context,
+                    read_policy=read_policy,
+                )
                 if row else None
             )
 
@@ -733,6 +776,7 @@ class ItemQueryMixin:
 
         # Stream Generator (O(1) Memory)
         lang = (request.raw_params or {}).get("lang", "en")
+        read_policy = await self._resolve_read_policy(catalog_id, collection_id)
         async def feature_stream():
             # Open a fresh connection/transaction for streaming to ensure isolation and avoid leaks
             async with managed_transaction(self.engine) as stream_conn:
@@ -742,6 +786,7 @@ class ItemQueryMixin:
                     feature_ctx = FeaturePipelineContext(lang=lang, consumer=consumer)
                     yield self.map_row_to_feature(
                         dict(row._mapping), col_config, context=feature_ctx,
+                        read_policy=read_policy,
                     )
 
         return QueryResponse(
@@ -835,7 +880,11 @@ class ItemQueryMixin:
         ) as (query, conn, params):
             rows = await query.execute(conn, **params)
             col_config = params.get("col_config")
-            return [self.map_row_to_feature(row, col_config) for row in rows]
+            read_policy = await self._resolve_read_policy(catalog_id, collection_id)
+            return [
+                self.map_row_to_feature(row, col_config, read_policy=read_policy)
+                for row in rows
+            ]
 
     async def stream_items_from_query(
         self,
@@ -924,6 +973,9 @@ class ItemQueryMixin:
                 query_string += " OFFSET :_qo_offset"
                 bind_params["_qo_offset"] = offset
 
+            read_policy = await self._resolve_read_policy(catalog_id, collection_id)
             query = GeoDQLQuery(text(query_string), result_handler=ResultHandler.ALL)
             async for item in await query.stream(conn, **bind_params):
-                yield self.map_row_to_feature(item, col_config)
+                yield self.map_row_to_feature(
+                    item, col_config, read_policy=read_policy
+                )

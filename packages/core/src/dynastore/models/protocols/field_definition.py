@@ -52,6 +52,14 @@ class FieldDefinition(BaseModel):
     unique: bool = False    # Value must be unique within the collection
     aggregations: Optional[List[str]] = None   # None or ["*"] = all, [] = none, ["count","sum"] = specific
     transformations: Optional[List[str]] = None
+    max_length: Optional[int] = None
+    minimum: Optional[float] = None
+    maximum: Optional[float] = None
+    enum: Optional[List[Any]] = None
+    pattern: Optional[str] = None
+    format: Optional[str] = None
+    # None = driver decides from capabilities; True = force a native column; False = force JSONB.
+    materialize: Optional[bool] = None
 
     def supports_aggregation(self, agg_func: str) -> bool:
         if self.aggregations is None or "*" in (self.aggregations or []):

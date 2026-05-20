@@ -1325,11 +1325,67 @@ class GeometriesSidecar(SidecarProtocol):
         # These are usually internal but can be exposed if needed.
         if feature.properties is None:
             feature.properties = {}
-        props = feature.properties
 
-        # Statistics are projected via ``get_select_fields`` and consumed
+        # 4. Statistics are projected via ``get_select_fields`` and consumed
         # by the read API as queryable fields (COLUMNAR) or remain inside
-        # the ``geom_stats`` JSONB column (no auto-merge into properties).
+        # the ``geom_stats`` JSONB column. They are NOT auto-merged into
+        # ``properties``: a collection opts each computed value into the wire
+        # output via ``ItemsReadPolicy.feature_type.expose``. The exposure loop
+        # runs once at the pipeline level
+        # (``SidecarProtocol.apply_exposed_computed_values``); this sidecar only
+        # declares which names it owns and how to read them — see
+        # ``producible_computed_names`` / ``resolve_computed_value`` below.
+
+    def producible_computed_names(self) -> set:
+        """Computed-field resolved names this sidecar can surface at read.
+
+        These are the storage-bearing statistics projected by
+        ``get_select_fields`` (COLUMNAR columns, ``geom_stats`` / ``place_stats``
+        JSONB entries). The pipeline-level exposure loop
+        (``SidecarProtocol.apply_exposed_computed_values``) intersects this with
+        ``ItemsReadPolicy.feature_type.expose``.
+        """
+        return {f.resolved_name for f in self._storage_fields()}
+
+    def resolve_computed_value(
+        self, row: Dict[str, Any], resolved_name: str
+    ) -> Tuple[bool, Any]:
+        """Locate a storage-bearing computed value in a read row.
+
+        Returns ``(found, value)``. Mirrors the storage layout decided by
+        ``get_select_fields``: COLUMNAR fields surface as a top-level row key;
+        JSONB fields live inside the shared ``geom_stats`` column; 3D place
+        statistics live in their own ``{table}_place`` projection (columnar
+        ``place_{name}`` keys or a ``place_stats`` JSONB blob). ``found`` is
+        ``False`` only when the layout has no slot for the value at all.
+        """
+        field = next(
+            (f for f in self._storage_fields() if f.resolved_name == resolved_name),
+            None,
+        )
+        if field is None:
+            return (False, None)
+
+        is_place = field.kind in _PLACE_TABLE_KINDS
+        if field.storage_mode == StatisticStorageMode.COLUMNAR:
+            key = f"place_{resolved_name}" if is_place else resolved_name
+            if key in row:
+                return (True, row[key])
+            return (False, None)
+
+        # JSONB: value nests inside the shared stats blob for this sidecar.
+        blob_key = "place_stats" if is_place else "geom_stats"
+        blob = row.get(blob_key)
+        if isinstance(blob, (str, bytes, bytearray)):
+            import json as _json
+
+            try:
+                blob = _json.loads(blob)
+            except Exception:
+                return (False, None)
+        if isinstance(blob, dict) and resolved_name in blob:
+            return (True, blob[resolved_name])
+        return (False, None)
 
     async def expire_version(
         self,

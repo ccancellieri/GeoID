@@ -6,12 +6,13 @@
 #
 #        http://www.apache.org/licenses/LICENSE-2.0
 
-"""Phase 3 of #957/#950 — pin :class:`ItemsReadPolicy` registration shape.
+"""Pin :class:`ItemsReadPolicy` registration shape (#957/#950, #1065).
 
 These tests guarantee the class loads, the PluginConfig metadata is
 correct (collection-scoped, correct address tuple), and the public
-attribute set matches the design doc. No driver consumes the policy yet
-— that's the read-path rewrite in a later PR.
+attribute set matches the design. The PG read path consumes
+``feature_type`` (expose merge + ``external_id_as_feature_id``); transformer
+wiring lives on the routing config, not here (#950).
 """
 
 import pytest
@@ -29,14 +30,20 @@ class TestItemsReadPolicyShape:
     def test_default_constructible(self) -> None:
         p = ItemsReadPolicy()
         assert isinstance(p.feature_type, FeatureType)
-        assert p.output_transformers == []
 
-    def test_default_feature_type_points_at_write_schema(self) -> None:
+    def test_default_feature_type(self) -> None:
         p = ItemsReadPolicy()
-        assert p.feature_type.schema_ref == "items_write_policy.schema"
         assert p.feature_type.failure_mode == "best_effort"
         assert p.feature_type.expose == []
         assert p.feature_type.external_id_as_feature_id is True
+
+    def test_output_transformers_not_a_field(self) -> None:
+        # Transformer wiring lives on the routing config (#950), not here.
+        assert "output_transformers" not in ItemsReadPolicy.model_fields
+
+    def test_schema_ref_not_a_field(self) -> None:
+        # The read shape derives from items_schema unconditionally (#1065).
+        assert "schema_ref" not in FeatureType.model_fields
 
     def test_external_id_as_feature_id_can_be_disabled(self) -> None:
         p = ItemsReadPolicy(
@@ -47,14 +54,20 @@ class TestItemsReadPolicyShape:
     def test_collection_scoped_only(self) -> None:
         assert ItemsReadPolicy._visibility == "collection"
 
-    def test_address_tuple_matches_design(self) -> None:
+    def test_address_grouped_under_items_policy(self) -> None:
+        # Grouped with ItemsWritePolicy under ``items.policy``; the composer
+        # keys each leaf by class_key, so this nests as
+        # ``items.policy.items_read_policy``. Storage/lookup is by class_key.
+        from dynastore.modules.storage import ItemsWritePolicy
+
         assert ItemsReadPolicy._address == (
             "platform",
             "catalog",
             "collection",
             "items",
-            "read_policy",
+            "policy",
         )
+        assert ItemsReadPolicy._address == ItemsWritePolicy._address
 
     def test_class_key_is_distinct_from_write_policy(self) -> None:
         from dynastore.modules.storage import ItemsWritePolicy
@@ -66,11 +79,9 @@ class TestItemsReadPolicyShape:
             feature_type=FeatureType(
                 expose=["area_m2", "h3_7"], failure_mode="strict"
             ),
-            output_transformers=["private_entity", "locale_resolver"],
         )
         assert p.feature_type.expose == ["area_m2", "h3_7"]
         assert p.feature_type.failure_mode == "strict"
-        assert p.output_transformers == ["private_entity", "locale_resolver"]
 
     def test_unknown_failure_mode_rejected(self) -> None:
         with pytest.raises(ValidationError):
@@ -97,6 +108,6 @@ def test_reexports_present() -> None:
     cf = ComputedField(kind=ComputedKind.AREA)
     assert cf.resolved_name == "area"
     ft = FeatureType()
-    assert ft.schema_ref
+    assert ft.expose == []
     rp = ItemsReadPolicy()
-    assert rp.output_transformers == []
+    assert isinstance(rp.feature_type, FeatureType)

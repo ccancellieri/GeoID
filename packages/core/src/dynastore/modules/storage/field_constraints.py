@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, Mapping, Optional
 
-from dynastore.models.protocols.field_definition import FieldDefinition
+from dynastore.models.protocols.field_definition import FieldCapability, FieldDefinition
 from dynastore.modules.storage.errors import (
     RequiredFieldMissingError,
     UniqueConstraintViolationError,
@@ -117,10 +117,47 @@ def bridge_schema_to_attribute_sidecar(
                 )
                 changed = True
             continue
-        # Synthesise a new entry when the field carries a constraint OR when
-        # the schema asks to materialise everything.
-        if not (has_constraint or materialize_all):
-            continue
+        # Decide whether to synthesise a native column for this field.
+        #
+        # Precedence (evaluated in order; first matching rule wins):
+        #
+        # Rule 1 — Hard DB constraint: unique=True or required=True forces a
+        #   column regardless of ``fd.materialize``.  A UNIQUE / NOT-NULL
+        #   constraint cannot be enforced inside a JSONB blob.
+        #
+        # Rule 2 — ``fd.materialize is True``: explicit opt-in → COLUMN.
+        #
+        # Rule 3 — ``fd.materialize is False``: explicit opt-out → JSONB.
+        #   This beats capability-driven lifting *and* the schema-level
+        #   ``materialize_fields_as_columns`` flag.  Rule 1 was already
+        #   checked above, so False here is only reached when there is no
+        #   hard constraint.
+        #
+        # Rule 4/5 — ``fd.materialize is None`` (driver decides):
+        #   COLUMN if the schema flag ``materialize_fields_as_columns`` is
+        #   set OR the field declares a capability that benefits from a
+        #   native column (FILTERABLE, SORTABLE, or INDEXED).
+        #   Otherwise the field stays in JSONB.
+        #
+        # Column-implying capabilities: FILTERABLE, SORTABLE, INDEXED.
+        # GROUPABLE / AGGREGATABLE / SPATIAL do not mandate a native column
+        # because each can be satisfied via functional JSONB indexes.
+        _COLUMN_CAPS = frozenset({
+            FieldCapability.FILTERABLE,
+            FieldCapability.SORTABLE,
+            FieldCapability.INDEXED,
+        })
+        if has_constraint:
+            pass  # Rule 1 — fall through to synthesis
+        elif fd.materialize is True:
+            pass  # Rule 2 — explicit opt-in
+        elif fd.materialize is False:
+            continue  # Rule 3 — explicit opt-out; skip column synthesis
+        else:
+            # Rule 4/5 — materialize is None; driver decides from context
+            has_column_cap = bool(set(fd.capabilities or []) & _COLUMN_CAPS)
+            if not (materialize_all or has_column_cap):
+                continue  # Rule 4 — no trigger; field stays in JSONB
         pg_name = _DATA_TYPE_TO_PG_NAME.get(
             (fd.data_type or "text").lower(), "TEXT"
         )

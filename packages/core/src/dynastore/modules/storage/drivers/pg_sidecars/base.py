@@ -829,6 +829,85 @@ class SidecarProtocol(ABC):
         """
         return set()
 
+    def producible_computed_names(self) -> Set[str]:
+        """Resolved names of computed fields this sidecar can surface at read.
+
+        Read-shape exposure (``ItemsReadPolicy.feature_type.expose``) consults
+        this to learn which sidecar owns a given computed value. Storage-layout
+        knowledge stays here, in the sidecar; the cross-sidecar exposure loop
+        lives once in :meth:`apply_exposed_computed_values`. Default: none — a
+        sidecar that materialises computed statistics overrides this.
+        """
+        return set()
+
+    def resolve_computed_value(
+        self, row: Dict[str, Any], resolved_name: str
+    ) -> Tuple[bool, Any]:
+        """Locate one producible computed value in a read row.
+
+        Returns ``(found, value)``; ``found`` is False when this sidecar's
+        storage layout has no slot for the value. Default: not found.
+        """
+        return (False, None)
+
+    @staticmethod
+    def apply_exposed_computed_values(
+        sidecars: List["SidecarProtocol"],
+        row: Dict[str, Any],
+        feature: Feature,
+        context: "FeaturePipelineContext",
+    ) -> None:
+        """Surface ``ItemsReadPolicy.feature_type.expose`` values onto properties.
+
+        Applied ONCE per row, after every sidecar has contributed, so the
+        ``failure_mode`` decision sees the complete producible set and no
+        sidecar re-implements the exposure loop (the attributes sidecar reuses
+        this verbatim for attribute-derived statistics). Each sidecar
+        contributes only its storage-layout knowledge via
+        :meth:`producible_computed_names` / :meth:`resolve_computed_value`.
+
+        - A name already present on ``properties`` (a declared schema field
+          surfaced by its sidecar) is left untouched.
+        - A producible computed name is copied from the row.
+        - Otherwise ``failure_mode`` decides: ``best_effort`` (default) omits it
+          silently; ``strict`` raises so a typo or mid-flight schema change
+          surfaces loudly.
+        """
+        policy = context.get("_items_read_policy") if context is not None else None
+        feature_type = getattr(policy, "feature_type", None)
+        if feature_type is None:
+            return
+        expose = list(getattr(feature_type, "expose", None) or [])
+        if not expose:
+            return
+        strict = getattr(feature_type, "failure_mode", "best_effort") == "strict"
+
+        if feature.properties is None:
+            feature.properties = {}
+        props = feature.properties
+
+        # Map each producible computed name to the sidecar that owns it
+        # (first registration wins; sidecars own disjoint name spaces).
+        producers: Dict[str, "SidecarProtocol"] = {}
+        for sidecar in sidecars:
+            for name in sidecar.producible_computed_names():
+                producers.setdefault(name, sidecar)
+
+        for name in expose:
+            if props.get(name) is not None:
+                continue  # declared field already surfaced by its sidecar
+            producer = producers.get(name)
+            if producer is not None:
+                found, value = producer.resolve_computed_value(row, name)
+                if found and value is not None:
+                    props[name] = value
+                    continue
+            if strict:
+                raise ValueError(
+                    "ItemsReadPolicy.feature_type.expose lists "
+                    f"'{name}' but the read row carries no value for it."
+                )
+
     # ── Pipeline context ---------------------------------------------------
     # Use FeaturePipelineContext (see module level) as the context type for
     # map_row_to_feature.  All sidecars should call:

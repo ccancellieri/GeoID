@@ -687,14 +687,14 @@ def test_build_routing_refs_unregistered_driver_emits_no_link():
 
 
 def test_compose_tree_drops_empty_output_transformers_on_leaf():
-    """#1016 — ``ItemsReadPolicy.output_transformers`` (and any future
-    config field with the same name) is dropped from the leaf payload when
-    empty.  Mirrors the routing-entry strip; same rationale (empty == none
+    """#1016 — an empty ``output_transformers`` array on any leaf payload is
+    dropped (the strip keys off the field name, generic across configs).
+    Mirrors the routing-entry strip; same rationale (empty == none
     configured == zero signal).
     """
     by_class = {
         "items_read_policy": {
-            "feature_type": {"schema_ref": None},
+            "feature_type": {"expose": ["area"]},
             "output_transformers": [],
         },
     }
@@ -715,7 +715,7 @@ def test_compose_tree_drops_empty_output_transformers_on_leaf():
     leaf = tree["platform"]["catalog"]["collection"]["items"]["read_policy"]["items_read_policy"]
     assert "output_transformers" not in leaf
     # Non-transformer payload survives, and ``_meta`` is still emitted.
-    assert leaf["feature_type"] == {"schema_ref": None}
+    assert leaf["feature_type"] == {"expose": ["area"]}
     assert leaf["_meta"]["tier"] == "collection"
 
 

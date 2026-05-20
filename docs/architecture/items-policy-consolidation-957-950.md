@@ -33,7 +33,7 @@ The result:
 - One config tree per concern. No silent duplication, no "posture vs binding" split.
 - All identity strategies (path-extracted, hash, spatial-cell) expressible under one model, composable via AND within a rule and OR across rules.
 - All derived values (statistics, spatial keys, content hashes) declared once. Drivers consult that list and each materialises it however suits the store.
-- Wire shape declared once. The write JSON Schema is the read shape's default (via `schema_ref`); the read policy declares additional exposed computed fields and an output-transformer chain.
+- Wire shape declared once. `items_schema` is the single source of truth; the wire JSON-Schema is **derived** from it (never authored) and the read shape derives from the same source. The read policy declares only additional exposed computed fields (`feature_type.expose`). Transformer wiring is not a read-policy concern — it lives on the routing config (#950).
 - Clean break per the no-backcompat invariant (#950 comment 4482694621): no "translate old shape" code paths, destructive schema migration, Pydantic field defaults supply the empty-state ergonomics.
 
 ## Non-goals
@@ -104,29 +104,36 @@ class ItemsWritePolicy(PluginConfig):
     geometries: GeometriesWriteBehavior = Field(default_factory=GeometriesWriteBehavior)
 
 class FeatureType(BaseModel):
-    schema_ref: str = "items_write_policy.schema"
-    expose: List[str] = []  # field names from policy.compute (or properties) to surface in responses
+    expose: List[str] = []  # computed-field resolved_names to surface beyond the declared schema
     failure_mode: Literal["strict", "best_effort"] = "best_effort"
+    external_id_as_feature_id: bool = True
 
 class ItemsReadPolicy(PluginConfig):
     _visibility: ClassVar[Optional[str]] = "collection"
 
     feature_type: FeatureType = Field(default_factory=FeatureType)
-    output_transformers: List[str] = []  # ordered chain of EntityTransformProtocol class keys
+    # No transformer chain here — transformer wiring lives on the routing
+    # config (OperationDriverEntry.output_transformers), per #950.
 ```
 
-### Schema is self-contained
+> **#1065 refinement (implemented).** `schema_ref` and `ItemsReadPolicy.output_transformers`
+> were dropped. The wire JSON-Schema is derived from `items_schema` unconditionally (no
+> selector), and the transformer chain belongs to the routing config (#950). `items.compute`
+> additionally accepts a **preset name** (e.g. `"geometry_stats"`) that expands to a deduped
+> `List[ComputedField]`.
 
-`ItemsWritePolicy.schema` is the only artefact describing the wire shape. It MUST carry, per property:
+### Schema is derived from `items_schema` (#1065)
 
-- `type` (JSON Schema scalar / object / array, plus `format` where useful — `date-time`, `uri`, etc.),
-- `description` (operator-facing help text, surfaced in the admin UI and OpenAPI),
-- `default` (used when the field is omitted on write; identical value echoed back on read for absent fields),
-- declared membership in the top-level `required` list (or omitted from it).
+`items_schema` (the collection's `FieldDefinition` map) is the single source of truth for the wire shape. The wire JSON-Schema (`ItemsWritePolicy.schema`) is **derived** from it (`derive_wire_schema` → `ItemService.get_collection_schema`) and is read-only: authoring a non-null `schema` is rejected at config-save. Each `FieldDefinition` carries:
 
-No second source of truth carries any of these — not the sidecar, not the driver, not the model docstring. The Admin UI form for write-creation, the OpenAPI body schema for `POST /items`, the response shape under `feature_type.schema_ref`, and the JSON-Schema validator step in `compute_derived_fields`-adjacent ingest code all read this one object. Computed fields (`policy.compute` + `feature_type.expose`) are surfaced as **additionalProperties** on the read shape — they don't need to appear in `schema` to be present in responses; they appear in the response under their `resolved_name`.
+- `data_type` (mapped to a JSON-Schema `type`/`format`),
+- validators (`max_length` / `minimum` / `maximum` / `enum` / `pattern` / `format`),
+- `required` (drives the schema's `required` list),
+- optional `materialize` (None = driver decides from capabilities; True = native column; False = JSONB).
 
-A collection without `schema` set is permissive (`additionalProperties: true`, no required fields, no defaults) — equivalent to `schema = {"type": "object"}`. Setting `additionalProperties: false` is the operator's lever for strict ingest.
+The Admin UI form, the OpenAPI body schema for `POST /items`, and write-time value validation all consult this one derived object. Computed fields (`policy.compute` + `feature_type.expose`) surface as additional read-only properties under their `resolved_name` — they need not appear in `items_schema` to appear in responses.
+
+A collection with no `items_schema` fields is permissive (a blob: no derived schema, no validation). `strict_unknown_fields` is the operator's lever for strict ingest (`additionalProperties: false`).
 
 ### Semantics
 
@@ -140,9 +147,9 @@ A collection without `schema` set is permissive (`additionalProperties: true`, n
 **Read path** — for an outgoing feature:
 
 1. Driver returns the row plus its full set of materialised computed values.
-2. Resolve `read_policy.feature_type.schema_ref`. The string literal `"items_write_policy.schema"` resolves at config-load time (not request-time) to the write JSON Schema. The response promises that `properties` conforms.
-3. Merge `feature_type.expose` (a list of field names from `policy.compute` results or any other read-time computed metadata) into the response as additional read-only fields. Names appearing in `expose` that are not in the available set are skipped under `best_effort` and 502 under `strict`.
-4. Run `output_transformers` in order. Each transformer implements `EntityTransformProtocol.transform_read(entity, ctx)` and may add, remove, or rewrite fields. Failure of any single transformer under `best_effort` omits the field it would have produced and notes via response header; under `strict` it raises.
+2. The response `properties` derive from `items_schema` (the declared fields). There is no `schema_ref` selector — the read shape always tracks the same source of truth as the write shape.
+3. Merge `feature_type.expose` (computed-field `resolved_name`s from `policy.compute`) into the response as additional read-only fields. The merge runs once at the read choke point (`SidecarProtocol.apply_exposed_computed_values`); each sidecar declares the names it can produce via `producible_computed_names` / `resolve_computed_value`. An exposed name with no produced value is skipped under `best_effort` and raises under `strict`.
+4. Transformer chains, when configured, run via the routing config's `output_transformers` (#950) — not the read policy.
 
 ### Driver responsibilities
 
@@ -273,11 +280,10 @@ That's all you need for "external_id at `properties.code`, validated shape, last
   },
   "items_read_policy": {
     "feature_type": {
-      "schema_ref": "items_write_policy.schema",
       "expose": ["area_m2", "perimeter_m", "vertex_count", "centroid", "bbox", "geohash", "h3", "s2"],
-      "failure_mode": "best_effort"
-    },
-    "output_transformers": ["area_unit_normalizer", "locale_name_resolver"]
+      "failure_mode": "best_effort",
+      "external_id_as_feature_id": true
+    }
   }
 }
 ```
@@ -300,10 +306,10 @@ That's all you need for "external_id at `properties.code`, validated shape, last
    - For each driver, with `compute=[h3@7, s2@10, area]`, write 5 features and assert: (a) per-driver column/field exists, (b) value matches `tools.geospatial.compute_derived_fields` reference, (c) read-back round-trip equal.
 
 4. **Read path**:
-   - `expose=[area_m2]` → response feature has `area_m2` at root.
-   - `expose=[nonexistent]` under `best_effort` → field omitted, response header notes; under `strict` → 502.
-   - `schema_ref="items_write_policy.schema"` → response `properties` validates against the declared schema (test fixture asserts both ways).
-   - Transformer chain: `["area_unit_normalizer", "locale_name_resolver"]` runs in order; mock transformers assert call sequence.
+   - `expose=[area]` → response feature has `area` on `properties`.
+   - `expose=[nonexistent]` under `best_effort` → field omitted; under `strict` → raises.
+   - Response `properties` validate against the schema derived from `items_schema`.
+   - `external_id_as_feature_id=false` → `feature.id` stays the `geoid`, not the external id.
 
 5. **Migration**:
    - Fresh database (per draft-schema invariant). No idempotent ALTERs, no shim code paths. Tests assume a clean schema; the dev-compose `db-reset` entrypoint runs unchanged.
