@@ -1220,7 +1220,17 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
     try:
         try:
             await conn.rollback()
-        except (PendingRollbackError, InvalidRequestError) as exc:
+        except (
+            PendingRollbackError,
+            InvalidRequestError,
+            # asyncpg raises its own exception hierarchy when a connection is
+            # dead at the wire level (server terminated, DB restart).  These
+            # errors bypass SQLAlchemy's wrapper so they are not caught by the
+            # SA-level exceptions above.  Treat them identically: invalidate
+            # the poisoned slot and acquire a fresh one.
+            AsyncpgConnectionDoesNotExistError,
+            AsyncpgInternalClientError,
+        ) as exc:
             wire_id = id(_get_wire_identity(conn))
             logger.warning(
                 "managed_transaction pool-hygiene: invalidating poisoned "
@@ -1319,6 +1329,20 @@ async def managed_transaction(db_resource: Optional[DbResource]):
                         "wire_id=%s exc=%s",
                         _wire_id, exc.__class__.__name__,
                     )
+                    # If the triggering exception is a dead-wire asyncpg
+                    # error (server terminated, DB restart), mark the
+                    # connection for eviction before attempting the drain.
+                    # This ensures that even if the drain rollback fails
+                    # (the wire is gone), conn.close() below removes the
+                    # slot from the pool instead of returning it dirty.
+                    # Detecting by cause-chain: SA wraps asyncpg errors
+                    # inside DBAPIError with .orig set to the asyncpg exc.
+                    _orig = getattr(exc, "orig", exc)
+                    if _is_transient_asyncpg_error(_orig) or _is_transient_asyncpg_error(exc):
+                        try:
+                            await conn.invalidate()
+                        except Exception:
+                            pass
                     drain_fut = asyncio.ensure_future(
                         _drain_rollback_exit(txn_cm, exc),
                     )
