@@ -131,7 +131,7 @@ class CollectionPluginConfig(BaseModel):
     {"name": "population", "type": "INTEGER", "index": "BTREE"},
     {"name": "category", "type": "TEXT"}
   ],
-  "enable_external_id": true
+  "external_id_field": "external_id"
 }
 ```
 *   *Note:* If `storage_mode` is `AUTOMATIC` and `attribute_schema` is present, it uses highly efficient **Columnar** storage. Otherwise, it defaults to flexible **JSONB**.

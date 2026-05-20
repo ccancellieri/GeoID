@@ -51,7 +51,7 @@ This is important when a collection uses `ALWAYS_ADD_NEW` versioning: a `PUT /it
 
 ### Fallback: delete-by-geoid
 
-If no sidecar exposes a `feature_id_field_name` (e.g. the sidecar has `enable_external_id = False`), the implementation falls back to a direct geoid match:
+If no sidecar exposes a `feature_id_field_name` (e.g. the sidecar has no `external_id_field` set), the implementation falls back to a direct geoid match:
 
 ```sql
 UPDATE "<schema>"."<table>"
