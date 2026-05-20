@@ -142,7 +142,10 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         """
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.modules.catalog.catalog_config import CollectionInfo
-        from dynastore.modules.storage.drivers.pg_sidecars import _effective_sidecars
+        from dynastore.modules.storage.drivers.pg_sidecars import (
+            _effective_sidecars,
+            resolve_stac_enabled,
+        )
         from dynastore.tools.discovery import get_protocol
 
         config = await self.get_driver_config(
@@ -153,11 +156,15 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         ct = await configs.get_config(
             CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
         ) if configs else CollectionInfo()
+        stac_enabled = await resolve_stac_enabled(
+            catalog_id, collection_id or "",
+        )
         effective = _effective_sidecars(
             config,
             catalog_id=catalog_id,
             collection_id=collection_id or "",
             collection_type=ct.kind.value,
+            context={"stac_enabled": stac_enabled},
         )
         return config.model_copy(update={"sidecars": effective})
 
@@ -452,9 +459,14 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         # sidecars (e.g. item_metadata from STAC).  The result is pinned on
         # col_config so downstream DDL, partition-key aggregation, and
         # introspection all see the same materialised list.
-        from dynastore.modules.storage.drivers.pg_sidecars import _effective_sidecars
+        from dynastore.modules.storage.drivers.pg_sidecars import (
+            _effective_sidecars,
+            resolve_stac_enabled,
+        )
+        stac_enabled = await resolve_stac_enabled(catalog_id, collection_id or "")
         effective_sidecars = _effective_sidecars(
             col_config, catalog_id=catalog_id, collection_id=collection_id,
+            context={"stac_enabled": stac_enabled},
         )
         col_config = col_config.model_copy(update={"sidecars": effective_sidecars})
 

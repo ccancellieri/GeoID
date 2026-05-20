@@ -101,7 +101,10 @@ def _effective_sidecars(
             PluginConfig and pass ``ct.kind.value`` here.
         context: Caller-supplied injection context dict.  Merged with
             the derived defaults (``catalog_id``, ``collection_id``,
-            ``collection_type``) before the registry call.
+            ``collection_type``) before the registry call.  Async callers
+            additionally pass ``stac_enabled`` (resolved via
+            :func:`resolve_stac_enabled`) so the STAC sidecar is dropped
+            for collections where STAC is disabled at this scope.
 
     Returns:
         Ordered list of concrete ``SidecarConfig`` subclass instances
@@ -152,3 +155,45 @@ def _effective_sidecars(
             existing_types.add(sc_type)
 
     return merged
+
+
+async def resolve_stac_enabled(
+    catalog_id: str,
+    collection_id: str = "",
+) -> bool:
+    """Resolve whether STAC is enabled for a collection.
+
+    Reads ``StacPluginConfig.enabled`` — the per-scope
+    ``ExposableConfigMixin`` toggle — from the config waterfall
+    (collection → catalog → platform → code default).  ``StacPluginConfig``
+    is a core config, so it is always resolvable; the gate is purely the
+    operator's ``enabled`` value, which defaults to ``True``.
+
+    Returns ``True`` on any resolution error or when no config service is
+    registered, matching the config's default-enabled posture so a
+    transient config-service hiccup never silently drops STAC sidecar
+    tables.
+
+    The boolean is plumbed into the sidecar-injection context as
+    ``stac_enabled`` so :meth:`StacItemsSidecar.get_default_config` can gate
+    on it without an async config fetch of its own.  (The ``stac_metadata``
+    sidecar is contributed by the STAC extension; when that extension is
+    not installed the sidecar is unregistered and never injected regardless
+    of this flag.)
+    """
+    from dynastore.models.protocols.configs import ConfigsProtocol
+    from dynastore.modules.stac.stac_config import StacPluginConfig
+    from dynastore.tools.discovery import get_protocol
+
+    try:
+        configs = get_protocol(ConfigsProtocol)
+        if configs is None:
+            return True
+        cfg = await configs.get_config(
+            StacPluginConfig,
+            catalog_id=catalog_id or None,
+            collection_id=collection_id or None,
+        )
+        return bool(getattr(cfg, "enabled", True))
+    except Exception:
+        return True

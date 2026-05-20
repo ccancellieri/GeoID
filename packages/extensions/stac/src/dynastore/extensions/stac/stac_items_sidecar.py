@@ -82,14 +82,25 @@ class StacItemsSidecar(SidecarProtocol):
     def get_default_config(
         cls, context: Dict[str, Any]
     ) -> Optional[StacItemsSidecarConfig]:
-        """Auto-inject STAC sidecar by default.
+        """Inject the STAC sidecar only when STAC is enabled for the collection.
 
-        Mirrors ``ItemMetadataSidecar``'s always-inject pattern (post
-        commit ``6530359``).  Skipped only for RECORDS collections,
-        which have no per-item descriptive layer.  Non-STAC deployments
-        that produce no STAC content pay only the empty-table cost.
+        Two gates:
+
+        - ``collection_type == "RECORDS"`` → skipped (RECORDS have no
+          per-item descriptive layer).
+        - ``stac_enabled is False`` → skipped.  The injection call site
+          resolves ``StacPluginConfig.enabled`` from the config waterfall
+          and plumbs it into the context as ``stac_enabled`` so a
+          collection whose STAC extension is disabled at this scope
+          carries no STAC sidecar in its composed/materialised config.
+
+        When ``stac_enabled`` is absent from the context (callers that
+        don't resolve it), the sidecar still injects — matching the
+        ``StacPluginConfig.enabled`` default of ``True``.
         """
         if context.get("collection_type") == "RECORDS":
+            return None
+        if context.get("stac_enabled") is False:
             return None
         return StacItemsSidecarConfig()
 

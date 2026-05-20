@@ -16,7 +16,7 @@ from .geometries_config import GeometriesSidecarConfig
 from .attributes_config import FeatureAttributeSidecarConfig
 from .item_metadata_config import ItemMetadataSidecarConfig
 from .registry import SidecarRegistry
-from .resolver import _effective_sidecars
+from .resolver import _effective_sidecars, resolve_stac_enabled
 
 
 def driver_sidecars(driver_or_config: Any) -> List[SidecarConfig]:
@@ -60,5 +60,6 @@ __all__ = [
     "ItemMetadataSidecarConfig",
     "SidecarRegistry",
     "_effective_sidecars",
+    "resolve_stac_enabled",
     "driver_sidecars",
 ]
