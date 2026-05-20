@@ -26,8 +26,6 @@ from dynastore.models.mutability import Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from typing import Any, ClassVar, List, Optional, Tuple
 
-from dynastore.modules.storage.routing_config import CatalogRoutingDefaults
-
 
 class CollectionKind(str, Enum):
     VECTOR = "VECTOR"
@@ -134,51 +132,12 @@ class CollectionPluginConfig(PluginConfig):
 CollectionPluginConfig.model_rebuild()
 
 
-class CatalogRoutingTemplates(PluginConfig):
-    """Catalog-tier defaults seeded onto newly-created collections.
-
-    Holds optional ``ItemsRoutingConfig`` / ``CollectionRoutingConfig``
-    templates (see :class:`CatalogRoutingDefaults` in
-    ``modules/storage/routing_config.py``) that
-    ``apply_catalog_default_routing_seed`` writes onto a freshly-created
-    collection. When either template pins the corresponding private driver
-    variant the new collection is created as a private collection.
-
-    Per-collection privacy is no longer a flag (#733 retired the
-    ``CollectionPrivacy.is_private`` field): a collection is "private"
-    iff its items routing config pins ``items_elasticsearch_private_driver``.
-    Collection envelopes are PG-only for private catalogs (#1047).
-    """
-    _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "routing", "templates")
-    _visibility: ClassVar[Optional[str]] = "catalog"
-
-    # ``CatalogRoutingDefaults`` lives in ``modules/storage/routing_config``
-    # so the storage module's cascade handlers don't have to import catalog
-    # configs (avoids the storage→catalog→storage cycle).
-    collection_defaults: Mutable[CatalogRoutingDefaults] = Field(
-        default_factory=CatalogRoutingDefaults,
-        description=(
-            "Optional routing templates seeded onto new collections in this "
-            "catalog. Set ``items_routing`` and/or ``collection_routing`` to "
-            "templates pinning the private driver variants to seed new "
-            "collections as private; leave both ``None`` (the default) for "
-            "no-op create-time behaviour."
-        ),
-    )
-
-
 # CatalogLookupAudience moved to packages/extensions/geoid/.../configs.py
-
-# ---------------------------------------------------------------------------
-# #733 — items-create routing seed flow
-# ---------------------------------------------------------------------------
-
 
 def _build_private_items_routing() -> Any:
     """Build the items-tier ``ItemsRoutingConfig`` template that pins
-    ``items_elasticsearch_private_driver``.  Default shape used by
-    ``CatalogRoutingDefaults`` when an operator opts into create-time
-    privacy seeding without supplying an explicit template.
+    ``items_elasticsearch_private_driver``.  Used by the ``private_catalog``
+    routing preset to seed catalog-scope items routing.
     """
     from dynastore.modules.storage.routing_config import (
         FailurePolicy,
@@ -229,147 +188,3 @@ def _build_private_items_routing() -> Any:
             ],
         },
     )
-
-
-
-async def apply_catalog_default_routing_seed(
-    catalog_id: str,
-    collection_id: str,
-    *,
-    configs: Any,
-    db_resource: Any = None,
-) -> bool:
-    """Seed a freshly-created collection's routing configs from the catalog's
-    :class:`CatalogRoutingTemplates.collection_defaults` templates (#733).
-
-    Returns ``True`` iff at least one routing template was written.  No-ops
-    when:
-
-    - The catalog has no ``CatalogRoutingTemplates`` row yet, or
-    - Both ``collection_defaults.items_routing`` and ``collection_routing``
-      are ``None`` (the default — no create-time routing override), or
-    - ``configs`` is ``None`` (early-fixture / partial-deployment path).
-
-    Apply ordering matters: items-routing template lands BEFORE the
-    collection-routing template so the cascade validator on the collection
-    routing finds the private items driver already pinned.
-    """
-    if configs is None:
-        return False
-
-    from dynastore.models.driver_context import DriverContext
-    from dynastore.modules.storage.routing_config import (
-        CollectionRoutingConfig,
-        ItemsRoutingConfig,
-    )
-
-    ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
-
-    try:
-        policy = await configs.get_config(
-            CatalogRoutingTemplates, catalog_id=catalog_id, ctx=ctx,
-        )
-    except Exception:
-        return False
-    if not isinstance(policy, CatalogRoutingTemplates):
-        return False
-
-    items_template = policy.collection_defaults.items_routing
-    coll_template = policy.collection_defaults.collection_routing
-    if items_template is None and coll_template is None:
-        return False
-
-    wrote_any = False
-    if items_template is not None:
-        await configs.set_config(
-            ItemsRoutingConfig,
-            items_template,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            ctx=ctx,
-        )
-        wrote_any = True
-    if coll_template is not None:
-        await configs.set_config(
-            CollectionRoutingConfig,
-            coll_template,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            ctx=ctx,
-        )
-        wrote_any = True
-    return wrote_any
-
-
-# ---------------------------------------------------------------------------
-# Catalog-tier lifecycle hook (#733 — routing-template driven)
-# ---------------------------------------------------------------------------
-
-
-def _items_template_has_private_driver(items_template: Any) -> bool:
-    """Return True iff the embedded items-routing template pins the
-    items-private driver in any operation."""
-    if items_template is None:
-        return False
-    from dynastore.modules.storage.routing_config import (
-        _PRIVATE_ITEMS_DRIVER_ID,
-    )
-    for entries in items_template.operations.values():
-        for entry in entries:
-            if entry.driver_ref == _PRIVATE_ITEMS_DRIVER_ID:
-                return True
-    return False
-
-
-async def _on_apply_catalog_routing_templates(
-    config: "CatalogRoutingTemplates",
-    catalog_id: Optional[str],
-    collection_id: Optional[str],
-    db_resource: Any,
-) -> None:
-    """Eagerly create per-tenant private items indexes when the catalog's
-    routing-seed template pins the items-private driver (#733).
-
-    When ``collection_defaults.items_routing`` pins
-    ``items_elasticsearch_private_driver``, call ``ensure_storage(catalog_id)``
-    on every tenant-isolated ``CollectionItemsStore`` (the items-private driver).
-
-    Idempotent — the driver's ``ensure_storage`` swallows
-    ``resource_already_exists`` so re-applying the same policy is a no-op
-    at the ES layer.
-
-    No-op when:
-
-    - The items template is not set or does not pin the private driver;
-    - ``catalog_id`` is ``None`` (platform-tier write — no tenant to bootstrap);
-    - The items-private driver isn't installed (deployment SCOPE excludes
-      ``elasticsearch_private``).
-    """
-    import logging
-    logger = logging.getLogger(__name__)
-
-    if not catalog_id:
-        return
-
-    if not _items_template_has_private_driver(config.collection_defaults.items_routing):
-        return
-
-    from dynastore.tools.discovery import get_protocols
-    from dynastore.models.protocols.storage_driver import (
-        Capability,
-        CollectionItemsStore,
-    )
-
-    for d in get_protocols(CollectionItemsStore):
-        if Capability.TENANT_ISOLATED not in getattr(d, "capabilities", frozenset()):
-            continue
-        try:
-            await d.ensure_storage(catalog_id)
-        except Exception as exc:
-            logger.warning(
-                "CatalogRoutingTemplates apply: items ensure_storage(%r) on %s failed: %s",
-                catalog_id, type(d).__name__, exc,
-            )
-
-
-CatalogRoutingTemplates.register_apply_handler(_on_apply_catalog_routing_templates)

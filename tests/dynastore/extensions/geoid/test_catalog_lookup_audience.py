@@ -1,4 +1,4 @@
-"""Unit tests for CatalogLookupAudience PluginConfig (mirror of CatalogRoutingTemplates)."""
+"""Unit tests for CatalogLookupAudience PluginConfig."""
 from dynastore.extensions.geoid.configs import CatalogLookupAudience
 
 

@@ -1588,53 +1588,6 @@ def _items_routing_has_private_driver(routing: "ItemsRoutingConfig") -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Catalog-level routing defaults seeded onto new collections (#733)
-# ---------------------------------------------------------------------------
-
-
-class CatalogRoutingDefaults(BaseModel):
-    """Optional routing templates seeded onto newly-created collections.
-
-    Embedded inside :class:`CatalogRoutingTemplates.collection_defaults` (see
-    ``modules/catalog/catalog_config.py``). When either template is set,
-    ``apply_catalog_default_routing_seed`` writes it as the per-collection
-    config at collection-create time.
-
-    Defined here (in ``routing_config.py``) rather than in
-    ``catalog_config.py`` to avoid the catalog→routing import cycle:
-    ``CatalogRoutingTemplates`` imports this type from us, and our cascade
-    handlers don't need to know anything about catalog-tier configs.
-
-    Replaces the deleted ``CollectionPrivacyDefaults`` (whose only field
-    was ``is_private: bool``) — privacy is now expressed as the presence
-    of private drivers in the routing templates themselves.
-    """
-
-    items_routing: Mutable[Optional["ItemsRoutingConfig"]] = Field(
-        default=None,
-        description=(
-            "Template seeded as the per-collection ``ItemsRoutingConfig`` "
-            "when a new collection is created in this catalog. When the "
-            "template pins ``items_elasticsearch_private_driver`` in any "
-            "operation the collection is created as items-private."
-        ),
-    )
-
-    collection_routing: Mutable[Optional["CollectionRoutingConfig"]] = Field(
-        default=None,
-        description=(
-            "Template seeded as the per-collection ``CollectionRoutingConfig`` "
-            "when a new collection is created in this catalog. Collection "
-            "envelopes for private catalogs are PG-only — no ES private index "
-            "at the collection tier (#1047)."
-        ),
-    )
-
-
-CatalogRoutingDefaults.model_rebuild()
-
-
-# ---------------------------------------------------------------------------
 # Generic routing-active query helpers — entity-agnostic discovery layer
 # ---------------------------------------------------------------------------
 #

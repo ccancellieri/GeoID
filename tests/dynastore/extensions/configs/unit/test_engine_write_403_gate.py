@@ -25,9 +25,6 @@ from dynastore.extensions.configs.problem_details import (
     engine_write_forbidden_at_tenant_scope,
 )
 from dynastore.extensions.configs.service import ConfigsService
-from dynastore.modules.catalog.catalog_config import (
-    CatalogRoutingTemplates,
-)
 from dynastore.modules.catalog.catalog_config import CollectionInfo
 from dynastore.modules.db_config.engine_config import (
     DuckdbEngineConfig,
@@ -92,9 +89,9 @@ def test_reject_engine_write_raises_403_for_each_engine_kind(engine_cls):
 def test_reject_engine_write_passes_for_non_engine_class():
     """Non-engine classes (regular PluginConfig subclasses) must pass
     through the gate without raising."""
-    # CatalogRoutingTemplates is a non-engine PluginConfig.
+    # CollectionInfo is a non-engine PluginConfig.
     ConfigsService._reject_engine_write_at_tenant_scope(
-        CatalogRoutingTemplates, "catalog_routing_templates", scope="catalog",
+        CollectionInfo, CollectionInfo.class_key(), scope="catalog",
     )  # No exception.
 
 

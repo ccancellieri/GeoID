@@ -1572,23 +1572,14 @@ def test_compose_tree_slim_at_platform_scope_is_a_noop():
 # heuristic; explicit `_address` fixes them.
 # ---------------------------------------------------------------------------
 
-def test_catalog_policy_config_lands_at_catalog_scope():
-    """``CatalogRoutingTemplates`` (Cycle E.1 — replaces
-    ``ElasticsearchCatalogConfig``) carries the catalog-tier privacy
-    default; address pins it under ``catalog.policy``.
-    """
-    from dynastore.modules.catalog.catalog_config import CatalogRoutingTemplates
-
-    assert CatalogRoutingTemplates._address == ("platform", "catalog", "routing", "templates")
-    assert CatalogRoutingTemplates._visibility == "catalog"
-
-
 # NOTE: ``ElasticsearchCollectionConfig`` was retired in Cycle C and
-# ``ElasticsearchCatalogConfig`` was retired in Cycle E.1.  Privacy is
-# expressed via the routing configs themselves (#733): catalog-tier
-# templates live on ``CatalogRoutingTemplates.collection_defaults.{items_routing,
-# collection_routing}``; per-collection privacy is the presence of the
-# private driver variants in the collection's routing configs.
+# ``ElasticsearchCatalogConfig`` was retired in Cycle E.1.  The
+# ``CatalogRoutingTemplates`` wrapper that briefly replaced it was itself
+# retired (#1043); privacy is expressed via the routing configs themselves
+# (#733): per-catalog privacy presets write catalog-scope routing configs
+# that cascade to new collections, and per-collection privacy is the
+# presence of ``items_elasticsearch_private_driver`` in the collection's
+# items routing config.
 
 
 def test_catalog_es_driver_lands_under_storage_drivers_catalog():

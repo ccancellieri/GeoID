@@ -564,31 +564,6 @@ class CollectionService:
                     ctx=DriverContext(db_resource=conn),
                 )
 
-            # 5c. #733 — seed the collection's routing configs from the
-            #     catalog's ``CatalogRoutingTemplates.collection_defaults`` templates.
-            #     The helper writes ``ItemsRoutingConfig`` (when an
-            #     ``items_routing`` template is set) BEFORE
-            #     ``CollectionRoutingConfig`` (when a ``collection_routing``
-            #     template is set) so the cascade validator on the second
-            #     write finds the items-private driver already pinned.
-            #     No-op when both templates are ``None`` (the default).
-            from dynastore.modules.catalog.catalog_config import (
-                apply_catalog_default_routing_seed,
-            )
-            _seed_configs = get_protocol(ConfigsProtocol)
-            try:
-                await apply_catalog_default_routing_seed(
-                    catalog_id,
-                    collection_model.id,
-                    configs=_seed_configs,
-                    db_resource=conn,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Could not apply CatalogRoutingTemplates.collection_defaults routing seed for %s/%s: %s",
-                    catalog_id, collection_model.id, e,
-                )
-
             # 6. (Lazy activation) Steps formerly responsible for
             #    `ensure_storage` + routing pin have moved to
             #    `_activate_collection`. A newly-created collection is

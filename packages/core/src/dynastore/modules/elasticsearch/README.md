@@ -78,28 +78,18 @@ The Docker Compose files in this repository use
 
 ### Per-Catalog Config (runtime-mutable, stored in AlloyDB)
 
-Catalog-tier routing-template defaults are governed by `CatalogRoutingTemplates`
-(`modules/catalog/catalog_config.py`) via the standard configuration API.
-The embedded `CatalogRoutingDefaults` (`modules/storage/routing_config.py`)
-carries optional `items_routing` / `collection_routing` templates seeded
-onto each newly-created collection in the catalog. Setting them to
-private-driver template auto-seeds new collections as private (items tier only):
+Per-collection privacy is configured by applying a routing preset via the admin API:
 
 ```
-PUT /configs/catalogs/{catalog_id}/plugins/catalog_routing_templates
-{
-  "collection_defaults": {
-    "items_routing": { "operations": { "index": [ { "driver_ref": "items_elasticsearch_private_driver" } ] } }
-  }
-}
+POST /admin/catalogs/{catalog_id}/presets/private_catalog
 ```
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `collection_defaults.items_routing` | `ItemsRoutingConfig?` | `null` | Template seeded as each new collection's `ItemsRoutingConfig`. Pure data — flipping it does not retroactively re-write existing collections. |
-| `collection_defaults.collection_routing` | `CollectionRoutingConfig?` | `null` | Template seeded as each new collection's `CollectionRoutingConfig`. Collection envelopes are PG-only for private catalogs — no ES collection-private index (#1047). |
-
-Per-collection privacy is expressed by the presence of `items_elasticsearch_private_driver` in the collection's items routing config (#733 retired the `CollectionPrivacy.is_private` flag; #1047 retired the collection-private ES driver).
+This writes `CatalogRoutingConfig`, `CollectionRoutingConfig`, and `ItemsRoutingConfig`
+at catalog scope. The configs cascade to each new collection created in that catalog.
+Privacy is expressed by the presence of `items_elasticsearch_private_driver` in a
+collection's items routing config (#733 retired the `CollectionPrivacy.is_private`
+flag; #1047 retired the collection-private ES driver — collection and catalog
+envelopes for private catalogs are PG-only).
 
 ## Index Design & Mappings
 

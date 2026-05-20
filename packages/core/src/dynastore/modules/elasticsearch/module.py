@@ -204,8 +204,8 @@ class ElasticsearchModule(ModuleProtocol):
     ``ItemsRoutingConfig``. The items-private driver owns its per-tenant
     index plus DENY policy management. Collection and catalog envelopes for
     private catalogs are PG-only — no ES private index at those tiers (#1047).
-    The catalog-tier ``CatalogRoutingTemplates.collection_defaults.items_routing``
-    template seeds items routing for newly-created collections.
+    Per-catalog privacy presets write catalog-scope routing configs that
+    cascade to newly-created collections.
     """
 
     priority: int = 50

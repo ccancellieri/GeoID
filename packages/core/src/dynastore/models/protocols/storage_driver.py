@@ -156,13 +156,11 @@ class Capability:
     # ensure_storage hook.
     #
     # KEEP IN SYNC: the string value is mirrored on
-    # ``entity_store.EntityStoreCapability.TENANT_ISOLATED``. The
-    # privacy-cascade handler reads one in each protocol loop
-    # (``catalog_config.py:_on_apply_catalog_routing_templates``); a rename here
-    # without the matching change there silently breaks the
-    # collection-tier branch. Test:
-    # ``tests/dynastore/modules/catalog/unit/test_catalog_policy_apply_handler.py
-    # ::test_tenant_isolated_string_matches_entity_store_mirror``.
+    # ``entity_store.EntityStoreCapability.TENANT_ISOLATED``. Both enum values
+    # are read when discovering per-tenant private drivers; a rename in only
+    # one place silently breaks the other branch. Test:
+    # ``tests/dynastore/modules/storage/unit/test_routing_privacy_cascade.py
+    # ::test_tenant_isolated_string_matches``.
 
 
 @runtime_checkable
