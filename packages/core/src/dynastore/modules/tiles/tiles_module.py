@@ -306,7 +306,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         from dynastore.modules.gcp.tiles_storage import _load_caching_config
 
         cfg = await _load_caching_config()
-        if not cfg.enabled:
+        if not cfg.cache_enabled:
             logger.debug(
                 "tile_cache event=skip reason=disabled action=save provider=pg "
                 "tile=%s/%s/%s/%s/%s/%s.%s",
@@ -352,7 +352,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         from dynastore.modules.gcp.tiles_storage import _load_caching_config
 
         cfg = await _load_caching_config()
-        if not cfg.enabled:
+        if not cfg.cache_enabled:
             return None
 
         # We assume storage exists if we are reading. If table missing -> error or None?
@@ -430,7 +430,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         from dynastore.modules.gcp.tiles_storage import _load_caching_config
 
         cfg = await _load_caching_config()
-        if not cfg.enabled:
+        if not cfg.cache_enabled:
             return False
 
         schema = await self._get_schema(catalog_id)
