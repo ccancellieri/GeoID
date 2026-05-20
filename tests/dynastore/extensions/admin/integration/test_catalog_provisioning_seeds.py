@@ -3,7 +3,7 @@ Catalog-provisioning seed assertions for the Option B unified-grants model.
 
 A freshly-provisioned catalog must arrive with:
   - ``{schema}.roles``     — table exists, contains the four seeded rows
-                             (admin / editor / allUsers / unauthenticated).
+                             (admin / editor / user / unauthenticated).
   - ``{schema}.grants``    — table exists, count(*) == 0.
   - ``{schema}.role_hierarchy`` — table exists with the seeded admin→editor edge.
 
@@ -28,7 +28,7 @@ from dynastore.modules.db_config.query_executor import managed_transaction
 
 MARKER = pytest.mark.enable_extensions("features")
 
-EXPECTED_SEED_ROLES = {"admin", "editor", "allUsers", "unauthenticated"}
+EXPECTED_SEED_ROLES = {"admin", "editor", "user", "unauthenticated"}
 
 
 async def _resolve_schema(catalog_id: str) -> str:

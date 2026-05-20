@@ -351,7 +351,6 @@ async def test_canonical_logs_events_catalog_admin_allowed_on_own_catalog(
     ("logs", lambda cat: f"/logs/catalogs/{cat}?limit=5"),
     ("events", lambda cat: f"/events/catalogs/{cat}/events?limit=5"),
 ])
-@pytest.mark.xfail(reason="#514 — catalog_admin scope or 403/200 expectation drifted post-IAM refactor.", strict=False)
 async def test_canonical_logs_events_catalog_admin_denied_on_other_catalog(
     catalog_admin_dashboard_ctx, endpoint: str, url_fn
 ):

@@ -897,15 +897,44 @@ class ConditionRegistry:
                     results.append(status)
         return results
 
-condition_registry = ConditionRegistry()
-
 # --- Legacy Aliases ---
 ConditionManager = ConditionRegistry
-condition_manager = condition_registry
+
+# Module-level singleton is instantiated lazily via PEP 562 ``__getattr__``
+# to break a circular import with ``dynastore.modules.iam.audience_handlers``:
+#   audience_handlers imports ``ConditionHandler`` / ``EvaluationContext`` from
+#   this module at import time. If this module also instantiates
+#   ``ConditionRegistry()`` at import time (which calls
+#   ``_register_default_handlers`` → re-imports ``audience_handlers``), Python
+#   re-enters a partially initialised ``audience_handlers`` module and
+#   ``CatalogLookupAudienceHandler`` / ``CollectionWriteAudienceHandler`` are
+#   not yet bound at the module level.
+#
+# Deferring the singleton until first attribute access (e.g. from middleware
+# at request time, or from ``evaluate_condition`` below) leaves ``conditions``
+# importable in isolation while still exposing ``condition_registry`` /
+# ``condition_manager`` as module-level attributes for legacy callers. Default
+# handler registration runs exactly once on first access, preserving the prior
+# registration order (built-ins → audience handlers → filter inspectors).
+_condition_registry_singleton: Optional["ConditionRegistry"] = None
+
+
+def _get_condition_registry() -> "ConditionRegistry":
+    global _condition_registry_singleton
+    if _condition_registry_singleton is None:
+        _condition_registry_singleton = ConditionRegistry()
+    return _condition_registry_singleton
+
+
+def __getattr__(name: str) -> Any:
+    if name in ("condition_registry", "condition_manager"):
+        return _get_condition_registry()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 async def evaluate_condition(condition: Condition, ctx: EvaluationContext) -> bool:
     """Helper to evaluate a single condition."""
-    return await condition_registry.evaluate_all([condition], ctx)
+    return await _get_condition_registry().evaluate_all([condition], ctx)
 
 async def evaluate_conditions(conditions: List[Condition], ctx: EvaluationContext) -> bool:
     """Helper to evaluate a list of conditions."""

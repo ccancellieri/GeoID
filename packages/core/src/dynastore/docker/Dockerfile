@@ -166,6 +166,14 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 # dynastore-core's source physically in site-packages where it shares one
 # directory with every dynastore-ext-* sub-package and the namespace
 # `dynastore.extensions` resolves correctly across all wheels.
+#
+# SCOPE invariant: the ext-wheel reinstall loop honors whatever Layer 2
+# selected via `.[${SCOPE}]`. We list the dynastore-ext-* distributions pip
+# already installed and only refresh those — re-installing every directory
+# under packages/extensions/ here would silently inject wheels that the
+# SCOPE chain explicitly excludes (e.g. ext-iam onto scope_catalog), making
+# entry-point discovery wire up middleware (PermissionProtocol) on services
+# that should not gate.
 COPY packages ./packages
 COPY tests ./tests
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
@@ -175,7 +183,16 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     rm -rf ${VENV_PATH}/lib/python*/site-packages/dynastore_core-0.0.0.dist-info && \
     SETUPTOOLS_SCM_PRETEND_VERSION="${APP_VERSION:-0.0.0+unknown}" \
     ${VENV_PATH}/bin/pip install --no-deps --force-reinstall --no-build-isolation packages/core && \
+    installed_exts=$(${VENV_PATH}/bin/pip list --format=freeze 2>/dev/null \
+        | awk -F'==' '/^dynastore-ext-/ {print $1}') && \
+    echo "Layer 3: SCOPE-installed extensions to refresh:" && echo "$installed_exts" && \
     for pkg in packages/extensions/*/; do \
+        dist=$(${VENV_PATH}/bin/python -c "import tomllib,sys;print(tomllib.load(open(sys.argv[1],'rb'))['project']['name'])" "$pkg/pyproject.toml" 2>/dev/null) || \
+            { echo "ERROR: cannot read project name from $pkg/pyproject.toml"; exit 1; }; \
+        if ! echo "$installed_exts" | grep -qx "$dist"; then \
+            echo "Layer 3: SCOPE skip $pkg (dist '$dist' not selected by .[${SCOPE}])"; \
+            continue; \
+        fi; \
         SETUPTOOLS_SCM_PRETEND_VERSION="${APP_VERSION:-0.0.0+unknown}" \
         ${VENV_PATH}/bin/pip install --no-deps --force-reinstall --no-build-isolation "$pkg" \
             || { echo "ERROR: re-install failed for $pkg"; exit 1; }; \

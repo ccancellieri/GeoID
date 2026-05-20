@@ -302,6 +302,13 @@ class IamMiddleware(BaseHTTPMiddleware):
             principal_role, principal_obj,
         )
 
+        # Publish the resolved principal into the evaluation extras so
+        # condition handlers (``catalog_membership_required``,
+        # ``catalog_admin_required``, audience handlers, …) read the
+        # post-authentication object rather than the ``None`` snapshot
+        # captured before ``authenticate_and_get_role`` ran.
+        context_extras["principal_obj"] = principal_obj
+
         request.state.principal_role = principal_role
         request.state.principal = principal_obj
 

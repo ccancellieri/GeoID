@@ -266,7 +266,7 @@ async def test_policy_priority_roundtrip(sysadmin_in_process_client: AsyncClient
 #  - **Linchpin scoping**: a grant against catalog A is invisible from
 #    catalog B's role-list endpoint (the bug PR #65 left in place).
 #    Tenants own their role definitions, so seed roles (admin/editor/
-#    allUsers/unauthenticated) are present in every fresh catalog and can
+#    user/unauthenticated) are present in every fresh catalog and can
 #    be granted directly without first POSTing a role definition.
 # ---------------------------------------------------------------------------
 

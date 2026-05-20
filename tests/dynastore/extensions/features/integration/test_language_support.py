@@ -283,7 +283,7 @@ async def test_update_collection_with_language(sysadmin_in_process_client):
         # Update with Spanish
         update = {"description": "Descripción en español"}
 
-        resp = await sysadmin_in_process_client.put(
+        resp = await sysadmin_in_process_client.patch(
             f"/features/catalogs/{catalog_id}/collections/{collection_id}",
             json=update,
             params={"lang": "es"},

@@ -1,9 +1,22 @@
 """Parametrised coverage test: every togglable extension must inherit ExposableConfigMixin."""
 
 # Importing each extension/module package (not the .config submodule directly) is
-# sufficient for registration: each __init__.py now carries `from . import config`
-# which triggers auto-registration via PersistentModel.__init_subclass__.
-import dynastore.extensions.features  # noqa: F401
+# sufficient for **PluginConfig** registration: each __init__.py carries
+# ``from . import config`` which triggers auto-registration via
+# ``PersistentModel.__init_subclass__``.
+#
+# The dead-config audit also needs the live **extension** registry to be
+# populated (``find_dead_exposable_configs`` checks
+# ``ext not in known``, where ``known`` is derived from
+# ``_DYNASTORE_EXTENSIONS``).  In production this is filled by
+# ``bootstrap_app`` → ``discover_extensions()``.  Unit tests don't bootstrap
+# the app, so call discovery directly at import time — it is idempotent
+# (#1003) and walks installed entry-points only.
+from dynastore.extensions.registry import discover_extensions
+
+discover_extensions()
+
+import dynastore.extensions.features  # noqa: F401, E402
 import dynastore.extensions.wfs  # noqa: F401
 import dynastore.modules.tiles  # noqa: F401
 import dynastore.modules.stac  # noqa: F401
@@ -27,7 +40,6 @@ import dynastore.extensions.edr  # noqa: F401
 import dynastore.extensions.joins  # noqa: F401
 import dynastore.extensions.moving_features  # noqa: F401
 import dynastore.extensions.connected_systems  # noqa: F401
-import dynastore.extensions.volumes  # noqa: F401
 
 import pytest
 from dynastore.extensions.tools.exposure_mixin import (
@@ -46,7 +58,12 @@ _TOGGLABLE = frozenset({
     "stac", "features", "wfs", "coverages", "edr", "records", "processes", "dggs",
     "tiles", "maps", "styles", "dimensions", "dwh", "joins", "search", "stats",
     "gcp", "logs", "notebooks", "crs", "gdal", "assets", "moving_features",
-    "connected_systems", "volumes",
+    "connected_systems",
+    # ``volumes`` lives in ``packages/core`` and registers no
+    # ``dynastore.extensions`` entry-point; until it is split into its own
+    # distribution, its config does not inherit ``ExposableConfigMixin``
+    # (the framework would flag it as a dead toggle — see
+    # ``find_dead_exposable_configs()``).
 })
 
 

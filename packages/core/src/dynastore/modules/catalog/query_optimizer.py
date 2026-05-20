@@ -501,6 +501,27 @@ class QueryOptimizer:
             # Special handling for Hub fields
             if filt.field in ["geoid", "deleted_at", "transaction_time"]:
                 expr = f"h.{filt.field}"
+            elif filt.field == "validity":
+                partition_keys = (
+                    getattr(
+                        getattr(self.col_config, "partitioning", None),
+                        "partition_keys",
+                        None,
+                    )
+                    or []
+                )
+                if "validity" in partition_keys:
+                    expr = "h.validity"
+                else:
+                    sidecar_with_validity = None
+                    for sc_config in driver_sidecars(self.col_config):
+                        sidecar = SidecarRegistry.get_sidecar(sc_config, lenient=True)
+                        if sidecar and sidecar.has_validity():
+                            sidecar_with_validity = sidecar
+                            break
+                    if sidecar_with_validity is None:
+                        continue
+                    expr = f"sc_{sidecar_with_validity.sidecar_id}.validity"
             else:
                 _, field_def = self.field_index[filt.field]
                 expr = field_def.sql_expression

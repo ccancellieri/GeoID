@@ -472,6 +472,20 @@ class IamExtension(ExtensionProtocol):
         except Exception as e:
             logger.error("IamExtension: failed to register PageVisibilityFilter: %s", e)
 
+        # Register the MembershipCacheProtocol provider so non-IAM
+        # extensions (e.g. admin) can resolve catalog memberships via
+        # ``get_protocol(MembershipCacheProtocol)`` without importing
+        # ``extensions.iam.*`` directly. Owns its own L1 cache; falls
+        # back to an empty mapping if ``IamQueryProtocol`` is absent.
+        try:
+            from dynastore.extensions.iam.membership_cache import get_provider
+            from dynastore.tools.discovery import register_plugin
+            register_plugin(get_provider())
+        except Exception as e:
+            logger.error(
+                "IamExtension: failed to register MembershipCacheProvider: %s", e
+            )
+
         # Discover plugin-declared policies via PolicyContributor. Plugins
         # never touch PermissionProtocol directly — they declare here and
         # IAM forwards centrally. Keeps IAM/auth concepts isolated from
