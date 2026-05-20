@@ -25,6 +25,7 @@ from pydantic import (
 from dynastore.models.mutability import Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from typing import Any, ClassVar, List, Optional, Tuple
+from dynastore.modules.storage.hints import Hint
 
 
 class CollectionKind(str, Enum):
@@ -153,6 +154,7 @@ def _build_private_items_routing() -> Any:
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
+                    write_mode=WriteMode.SYNC
                 ),
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_private_driver",
@@ -164,27 +166,19 @@ def _build_private_items_routing() -> Any:
             Operation.READ: [
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
             ],
-            Operation.INDEX: [
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_private_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    input_transformers=("private_entity_transformer",),
-                    source="auto",
-                ),
-            ],
+
             Operation.SEARCH: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_private_driver",
-                    output_transformers=("private_entity_transformer",),
+                    hints=[Hint.GEOMETRY_SIMPLIFIED],
                     source="auto",
                 ),
-            ],
-            Operation.TRANSFORM: [
                 OperationDriverEntry(
-                    driver_ref="private_entity_transformer",
+                    driver_ref="items_postgresql_driver",
+                    hints=[Hint.GEOMETRY_EXACT],
+                    write_mode=WriteMode.SYNC,
                     source="auto",
-                ),
-            ],
+                )
+            ]
         },
     )
