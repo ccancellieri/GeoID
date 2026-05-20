@@ -53,6 +53,10 @@ from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
     AttributeIndexType,
     AttributeSchemaEntry,
 )
+from dynastore.modules.storage.computed_fields import (
+    ComputedField,
+    StatisticStorageMode,
+)
 from dynastore.modules.db_config.locking_tools import (
     acquire_lock_if_needed,
     check_trigger_exists,
@@ -153,6 +157,35 @@ class FeatureAttributeSidecar(SidecarProtocol):
         if self.config.attribute_schema:
             return AttributeStorageMode.COLUMNAR
         return AttributeStorageMode.JSONB
+
+    # ------------------------------------------------------------------
+    # Attribute-statistics storage-shape helpers (consume the
+    # ``compute_fields_overlay``; mirror the geometries sidecar). #1074
+    # ------------------------------------------------------------------
+
+    # COLUMNAR attribute statistics materialise as a numeric column. A property
+    # whose value is non-numeric should declare ``storage_mode=JSONB`` instead —
+    # the shared ``attribute_stats`` blob preserves any JSON type.
+    _STAT_COLUMNAR_SQL_TYPE: str = "DOUBLE PRECISION"
+
+    def _stat_fields(self) -> List[ComputedField]:
+        """Storage-bearing attribute-derived computed fields for this sidecar."""
+        return [
+            f for f in self.config.compute_fields_overlay
+            if f.storage_mode is not None
+        ]
+
+    def _has_jsonb_stats(self) -> bool:
+        """Any storage-bearing attribute stat with ``storage_mode == JSONB``?"""
+        return any(
+            f.storage_mode == StatisticStorageMode.JSONB for f in self._stat_fields()
+        )
+
+    def _columnar_stat_fields(self) -> List[ComputedField]:
+        return [
+            f for f in self._stat_fields()
+            if f.storage_mode == StatisticStorageMode.COLUMNAR
+        ]
 
     @property
     def sidecar_id(self) -> str:
@@ -410,6 +443,25 @@ class FeatureAttributeSidecar(SidecarProtocol):
                     f"(({self.config.jsonb_column_name}->>'{path}')::{cast_type.value})"
                 )
 
+        # Attribute Statistics (ATTRIBUTE_STAT overlay) — independent of the
+        # COLUMNAR/JSONB *attribute* mode above. JSONB stats share an
+        # ``attribute_stats`` blob; COLUMNAR stats each get a numeric column
+        # (+ optional B-tree). Mirrors the geometries sidecar's geom_stats. #1074
+        if self._has_jsonb_stats() and "attribute_stats" not in known_columns:
+            columns.append("attribute_stats JSONB")
+            known_columns.add("attribute_stats")
+        for stat in self._columnar_stat_fields():
+            stat_col = stat.resolved_name
+            if stat_col in known_columns:
+                continue
+            columns.append(f'"{stat_col}" {self._STAT_COLUMNAR_SQL_TYPE}')
+            known_columns.add(stat_col)
+            if stat.indexed:
+                indexes.append(
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{stat_col}" '
+                    f'ON {{schema}}."{table_name}" ("{stat_col}")'
+                )
+
         # Prepare validity column
         validity_col = ""
         if has_validity or "validity" in partition_keys:
@@ -646,6 +698,19 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                     for attr in self.config.attribute_schema:
                         if attr.name in all_needed or "*" in requested or not requested:
                             fields.append(f'{alias}."{attr.name}"')
+
+            # 3. Attribute Statistics (ATTRIBUTE_STAT overlay) — COLUMNAR per
+            # resolved name, JSONB via the shared ``attribute_stats`` column.
+            # Gated like the geometries sidecar's geom_stats projection. #1074
+            for stat in self._columnar_stat_fields():
+                stat_key = stat.resolved_name
+                if stat_key not in all_needed and "*" not in requested:
+                    continue
+                fields.append(f'{alias}."{stat_key}"')
+            if self._has_jsonb_stats() and (
+                "attribute_stats" in all_needed or "*" in requested
+            ):
+                fields.append(f"{alias}.attribute_stats")
         else:
             # Full mode: return all fields (existing behavior)
             if self.config.external_id_field is not None:
@@ -661,6 +726,13 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 if self.config.attribute_schema:
                     for attr in self.config.attribute_schema:
                         fields.append(f'{alias}."{attr.name}"')
+
+            # Attribute Statistics — full mode projects all storage-bearing
+            # fields (COLUMNAR columns + the shared ``attribute_stats`` blob). #1074
+            for stat in self._columnar_stat_fields():
+                fields.append(f'{alias}."{stat.resolved_name}"')
+            if self._has_jsonb_stats():
+                fields.append(f"{alias}.attribute_stats")
 
         return fields
 
@@ -988,6 +1060,30 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                     expose=True,  # Standard attributes exposed by default
                 )
 
+        # 6. Attribute Statistics (ATTRIBUTE_STAT overlay) — COLUMNAR stats are
+        # queryable (filter/sort/aggregate); their values reach Feature output
+        # only via ``ItemsReadPolicy.feature_type.expose`` (expose=False here),
+        # never as default properties. JSONB stats live inside the shared
+        # ``attribute_stats`` blob and are not individually defined. #1074
+        for stat in self._columnar_stat_fields():
+            stat_key = stat.resolved_name
+            stat_caps = [
+                FieldCapability.FILTERABLE,
+                FieldCapability.SORTABLE,
+                FieldCapability.GROUPABLE,
+                FieldCapability.AGGREGATABLE,
+            ]
+            if stat.indexed:
+                stat_caps.append(FieldCapability.INDEXED)
+            fields[stat_key] = FieldDefinition(
+                name=stat_key,
+                sql_expression=f'{alias}."{stat_key}"',
+                capabilities=stat_caps,
+                data_type="numeric",
+                aggregations=["count", "sum", "avg", "min", "max"],
+                expose=False,
+            )
+
         return fields
 
     def get_dynamic_field_definition(
@@ -1217,6 +1313,31 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 props_to_save, cls=CustomJSONEncoder
             )
 
+        # Attribute-derived statistics (ATTRIBUTE_STAT overlay) — promote the
+        # configured ``properties.<field>`` values into their COLUMNAR column or
+        # the shared ``attribute_stats`` JSONB blob. Mirrors the geometries
+        # sidecar's geom_stats assignment. #1074
+        stat_fields = self._stat_fields()
+        if stat_fields:
+            from dynastore.tools.geospatial import compute_attribute_derived_fields
+
+            derived = compute_attribute_derived_fields(properties or {}, stat_fields)
+            jsonb_stats: Dict[str, Any] = {}
+            for stat in stat_fields:
+                key = stat.resolved_name
+                if key not in derived:
+                    continue
+                if stat.storage_mode == StatisticStorageMode.JSONB:
+                    jsonb_stats[key] = derived[key]
+                else:
+                    payload[key] = derived[key]
+            if jsonb_stats:
+                import json as _json_stats
+
+                payload["attribute_stats"] = _json_stats.dumps(
+                    jsonb_stats, cls=CustomJSONEncoder
+                )
+
         return payload
 
     def get_internal_columns(self) -> set:
@@ -1229,7 +1350,57 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         # never leak it into Feature.properties.  Only present in Mode B (JSONB).
         if self.resolved_storage_mode == AttributeStorageMode.JSONB:
             cols.add("attributes_hash")
+        # Attribute-statistics columns surface via the expose loop, never as raw
+        # Feature properties. #1074
+        if self._has_jsonb_stats():
+            cols.add("attribute_stats")
+        for stat in self._columnar_stat_fields():
+            cols.add(stat.resolved_name)
         return cols
+
+    def producible_computed_names(self) -> set:
+        """Attribute-derived computed names this sidecar surfaces at read.
+
+        Mirrors the geometries sidecar: the storage-bearing ATTRIBUTE_STAT
+        fields projected by ``get_select_fields`` (COLUMNAR columns or the shared
+        ``attribute_stats`` JSONB blob). The pipeline-level exposure loop
+        (``SidecarProtocol.apply_exposed_computed_values``) intersects this with
+        ``ItemsReadPolicy.feature_type.expose``. #1074
+        """
+        return {f.resolved_name for f in self._stat_fields()}
+
+    def resolve_computed_value(
+        self, row: Dict[str, Any], resolved_name: str
+    ) -> Tuple[bool, Any]:
+        """Locate an attribute-derived computed value in a read row.
+
+        Returns ``(found, value)``. Mirrors the storage layout decided by
+        ``get_select_fields``: COLUMNAR fields surface as a top-level row key;
+        JSONB fields live inside the shared ``attribute_stats`` column. ``found``
+        is ``False`` only when the layout has no slot for the value at all. #1074
+        """
+        field = next(
+            (f for f in self._stat_fields() if f.resolved_name == resolved_name),
+            None,
+        )
+        if field is None:
+            return (False, None)
+        if field.storage_mode == StatisticStorageMode.COLUMNAR:
+            if resolved_name in row:
+                return (True, row[resolved_name])
+            return (False, None)
+        # JSONB: value nests inside the shared attribute_stats blob.
+        blob = row.get("attribute_stats")
+        if isinstance(blob, (str, bytes, bytearray)):
+            import json as _json
+
+            try:
+                blob = _json.loads(blob)
+            except Exception:
+                return (False, None)
+        if isinstance(blob, dict) and resolved_name in blob:
+            return (True, blob[resolved_name])
+        return (False, None)
 
     def map_row_to_feature(
         self,

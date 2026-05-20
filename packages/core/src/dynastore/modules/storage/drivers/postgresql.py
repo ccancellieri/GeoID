@@ -526,6 +526,10 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             GeometriesSidecarConfig,
         )
         from dynastore.modules.storage.driver_config import ComputedKind
+        from dynastore.modules.storage.computed_fields import (
+            SidecarTarget,
+            target_sidecar,
+        )
 
         policy_external_id_field: Optional[str] = (
             "external_id"
@@ -535,8 +539,19 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         policy_asset_id_field: Optional[str] = (
             "asset_id" if write_policy.track_asset_id else None
         )
+        # Storage-bearing compute entries split by target sidecar: geometry/place
+        # statistics drive the geometries sidecar; attribute-derived statistics
+        # (ATTRIBUTE_STAT) drive the attributes sidecar. #1074
         policy_storage_fields = [
             cf for cf in write_policy.compute if cf.storage_mode is not None
+        ]
+        geom_storage_fields = [
+            cf for cf in policy_storage_fields
+            if target_sidecar(cf.kind) == SidecarTarget.GEOMETRY
+        ]
+        attr_storage_fields = [
+            cf for cf in policy_storage_fields
+            if target_sidecar(cf.kind) == SidecarTarget.ATTRIBUTES
         ]
         overlay_sidecars = []
         any_overlay = False
@@ -549,16 +564,18 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     updates["external_id_field"] = policy_external_id_field
                 if sc.asset_id_field != policy_asset_id_field:
                     updates["asset_id_field"] = policy_asset_id_field
+                if list(sc.compute_fields_overlay) != attr_storage_fields:
+                    updates["compute_fields_overlay"] = attr_storage_fields
                 if updates:
                     overlay_sidecars.append(sc.model_copy(update=updates))
                     any_overlay = True
                 else:
                     overlay_sidecars.append(sc)
             elif isinstance(sc, GeometriesSidecarConfig) and (
-                list(sc.compute_fields_overlay) != policy_storage_fields
+                list(sc.compute_fields_overlay) != geom_storage_fields
             ):
                 overlay_sidecars.append(
-                    sc.model_copy(update={"compute_fields_overlay": policy_storage_fields})
+                    sc.model_copy(update={"compute_fields_overlay": geom_storage_fields})
                 )
                 any_overlay = True
             else:

@@ -121,6 +121,12 @@ class ComputedKind(StrEnum):
     Z_RANGE = "z_range"
     VERTICAL_GRADIENT = "vertical_gradient"
     TEMPORAL_DURATION = "temporal_duration"  # non-geometry-derived: reads JSON-FG 'time' member
+    # Attribute-derived statistic (sourced from the feature's own ``properties``,
+    # not the geometry). v1 promotes a single property value — named by the
+    # ``source`` dotted path (e.g. ``"properties.population"``) — into the
+    # attributes sidecar as a stored, optionally-indexed column / JSONB key.
+    # Cross-field expressions are deferred.
+    ATTRIBUTE_STAT = "attribute_stat"
 
 
 # Kinds that may carry ``storage_mode != None``. Identity-style kinds
@@ -147,6 +153,9 @@ _STATISTIC_STORAGE_KINDS: frozenset = frozenset({
     ComputedKind.Z_RANGE,
     ComputedKind.VERTICAL_GRADIENT,
     ComputedKind.TEMPORAL_DURATION,
+    # Attribute-derived (sourced from ``properties``, materialised by the
+    # attributes sidecar rather than the geometries sidecar).
+    ComputedKind.ATTRIBUTE_STAT,
 })
 
 # Kinds that live in the JSON-FG ``_place`` sidecar table rather than the
@@ -179,6 +188,38 @@ _RESOLUTION_RANGES: dict = {
     ComputedKind.S2: (0, 30),
 }
 
+# Kinds materialised by the attributes sidecar (sourced from the feature's
+# ``properties``, not the geometry). The PG driver splits the storage-bearing
+# ``ItemsWritePolicy.compute`` entries by this set: members route to
+# ``FeatureAttributeSidecarConfig.compute_fields_overlay``; everything else
+# (geometry + JSON-FG place statistics) stays on the geometries sidecar.
+_ATTRIBUTE_SIDECAR_KINDS: frozenset = frozenset({ComputedKind.ATTRIBUTE_STAT})
+
+
+class SidecarTarget(StrEnum):
+    """Which PG sidecar materialises a given computed field at write time.
+
+    The PG driver splits ``ItemsWritePolicy.compute`` (storage-bearing entries)
+    by this classification: geometry/place statistics land on the geometries
+    sidecar, attribute-derived statistics on the attributes sidecar.
+    """
+
+    GEOMETRY = "geometry"
+    ATTRIBUTES = "attributes"
+
+
+def target_sidecar(kind: ComputedKind) -> SidecarTarget:
+    """Classify a :class:`ComputedKind` to the sidecar that stores it.
+
+    ``ATTRIBUTE_STAT`` (sourced from the feature's ``properties``) routes to the
+    attributes sidecar; every other storage-bearing kind — geometry statistics
+    and the JSON-FG 3D place statistics, which the geometries sidecar emits into
+    its own ``{table}_place`` table — routes to the geometries sidecar.
+    """
+    if kind in _ATTRIBUTE_SIDECAR_KINDS:
+        return SidecarTarget.ATTRIBUTES
+    return SidecarTarget.GEOMETRY
+
 
 class ComputedField(BaseModel):
     """One declared derivation.
@@ -203,6 +244,11 @@ class ComputedField(BaseModel):
     - :attr:`centroid_type` — only consumed by ``ComputedKind.CENTROID``
       to pick column type (``POINT`` 2D vs ``POINTZ`` 3D) and the WKB
       output dimensionality.
+    - :attr:`source` — only consumed by ``ComputedKind.ATTRIBUTE_STAT``: a
+      dotted path into the feature (e.g. ``"properties.population"``) whose
+      value is promoted into the attributes sidecar. Required for that kind,
+      forbidden for all others. When ``name`` is omitted the ``resolved_name``
+      defaults to the path's final segment (``"population"``).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -213,6 +259,7 @@ class ComputedField(BaseModel):
     storage_mode: Optional[StatisticStorageMode] = None
     indexed: bool = False
     centroid_type: Optional[Literal["POINT", "POINTZ"]] = None
+    source: Optional[str] = None
 
     @model_validator(mode="after")
     def _check_resolution(self) -> "ComputedField":
@@ -262,6 +309,21 @@ class ComputedField(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_source(self) -> "ComputedField":
+        if self.kind == ComputedKind.ATTRIBUTE_STAT:
+            if not self.source:
+                raise ValueError(
+                    "ComputedField(kind=attribute_stat) requires 'source' "
+                    "(a dotted feature path, e.g. 'properties.population')."
+                )
+        elif self.source is not None:
+            raise ValueError(
+                f"ComputedField(kind={self.kind.value}) does not accept "
+                "'source' (only ATTRIBUTE_STAT reads a property path)."
+            )
+        return self
+
     @property
     def resolved_name(self) -> str:
         """Stable identifier used as the dict key in computed-field output.
@@ -273,6 +335,10 @@ class ComputedField(BaseModel):
         """
         if self.kind == ComputedKind.EXTERNAL_ID:
             return "external_id"
+        if self.kind == ComputedKind.ATTRIBUTE_STAT and not self.name:
+            # Default to the source path's final segment
+            # (``"properties.population"`` -> ``"population"``).
+            return (self.source or "").rsplit(".", 1)[-1] or "attribute_stat"
         if self.name:
             return self.name
         if self.kind in SPATIAL_CELL_KINDS:
@@ -331,7 +397,10 @@ __all__ = [
     "IdentityRule",
     "FeatureType",
     "StatisticStorageMode",
+    "SidecarTarget",
+    "target_sidecar",
     "SPATIAL_CELL_KINDS",
     "PATH_EXTRACTED_KINDS",
     "_PLACE_TABLE_KINDS",
+    "_ATTRIBUTE_SIDECAR_KINDS",
 ]

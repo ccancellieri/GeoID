@@ -27,6 +27,7 @@ from typing import List, Optional, Dict, Any, Union, Literal
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, model_validator
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, SidecarConfigRegistry
+from dynastore.modules.storage.computed_fields import ComputedField
 from dynastore.tools.db import validate_column_identifier
 
 
@@ -300,6 +301,26 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
     jsonb_indexed_paths: Dict[str, PostgresType] = Field(
         default_factory=dict,
         description="Functional B-Tree indexes on specific JSONB paths for performance at scale",
+    )
+
+    # Attribute Statistics — storage-shape mirror of ``ItemsWritePolicy.compute``
+    #
+    # The PG driver populates this list at ``ensure_storage`` time with the
+    # subset of ``ItemsWritePolicy.compute`` whose entries target the attributes
+    # sidecar (``ComputedKind.ATTRIBUTE_STAT``) and declare a ``storage_mode``.
+    # DDL emission, ``get_select_fields``, ``get_field_definitions``,
+    # ``resolve_computed_value`` and ``prepare_upsert_payload`` all read this
+    # single list. COLUMNAR fields get their own ``DOUBLE PRECISION`` column;
+    # JSONB fields share an ``attribute_stats`` JSONB column. An empty list means
+    # no attribute-derived statistics are materialised. Mirrors the geometries
+    # sidecar's overlay (#1074).
+    compute_fields_overlay: List[ComputedField] = Field(
+        default_factory=list,
+        description=(
+            "Storage-shape snapshot of the attribute-derived (ATTRIBUTE_STAT) "
+            "entries from ``ItemsWritePolicy.compute`` for this collection. "
+            "Overwritten by the PG driver at DDL time."
+        ),
     )
 
     # Partitioning

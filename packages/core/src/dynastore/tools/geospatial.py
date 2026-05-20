@@ -539,6 +539,26 @@ def _geometry_hash(geom: "BaseGeometry") -> str:
     return hashlib.sha256(_wkb.dumps(geom)).hexdigest()
 
 
+def _extract_feature_property(root_props: Dict[str, Any], path: str) -> Any:
+    """Resolve a dotted path against a feature's ``properties`` dict.
+
+    ``"properties.adm2_pcode"`` walks the dict; the leading ``"properties."``
+    segment is stripped because the caller already passes the properties dict.
+    A bare attribute name (e.g. ``"adm2_pcode"``) is read directly. Returns
+    ``None`` when any segment is missing.
+    """
+    segments = path.split(".")
+    if segments and segments[0] == "properties":
+        segments = segments[1:]
+    current: Any = root_props
+    for seg in segments:
+        if isinstance(current, dict) and seg in current:
+            current = current[seg]
+        else:
+            return None
+    return current
+
+
 def compute_derived_fields(
     geometry: "BaseGeometry",
     properties: Dict[str, Any],
@@ -574,25 +594,6 @@ def compute_derived_fields(
             centroid_lon = float(c.x)
         return centroid_lat, centroid_lon  # type: ignore[return-value]
 
-    def _extract_path(root_props: Dict[str, Any], path: str) -> Any:
-        """Resolve a dotted path against the feature.
-
-        ``"properties.adm2_pcode"`` walks the dict; the leading
-        ``"properties."`` segment is stripped because we are already
-        passing the properties dict. A bare attribute name
-        (e.g. ``"adm2_pcode"``) is read directly.
-        """
-        segments = path.split(".")
-        if segments and segments[0] == "properties":
-            segments = segments[1:]
-        current: Any = root_props
-        for seg in segments:
-            if isinstance(current, dict) and seg in current:
-                current = current[seg]
-            else:
-                return None
-        return current
-
     for f in fields:
         kind = f.kind
         key = f.resolved_name
@@ -601,7 +602,7 @@ def compute_derived_fields(
             # ``name`` is the dotted JSON path into the feature; no name
             # means "external_id sits at properties.external_id".
             path = f.name or "properties.external_id"
-            value = _extract_path(properties, path)
+            value = _extract_feature_property(properties, path)
             # ``resolved_name`` for EXTERNAL_ID falls back to ``"external_id"``
             # so downstream code has a stable key regardless of path.
             out["external_id"] = value
@@ -751,6 +752,34 @@ def compute_derived_fields(
                 "computed from the JSON-FG 'place' member via compute_place_derived_fields()."
             )
 
+    return out
+
+
+def compute_attribute_derived_fields(
+    properties: Dict[str, Any],
+    fields: "List[Any]",
+) -> Dict[str, Any]:
+    """Materialise declared ``ATTRIBUTE_STAT`` :class:`ComputedField` entries.
+
+    Each field promotes a single value read from the feature's ``properties``
+    at the field's ``source`` dotted path (e.g. ``"properties.population"``)
+    into the attributes sidecar. Returns a dict keyed by each field's
+    ``resolved_name``; fields whose source path is absent are skipped (the
+    read-side ``failure_mode`` decides whether a missing value is fatal).
+
+    Mirrors :func:`compute_derived_fields` for the attribute axis. Cross-field
+    expressions are out of scope for v1 — a field reads exactly one path.
+    """
+    from dynastore.modules.storage.computed_fields import ComputedKind
+
+    out: Dict[str, Any] = {}
+    props = properties or {}
+    for f in fields:
+        if f.kind != ComputedKind.ATTRIBUTE_STAT:
+            continue
+        value = _extract_feature_property(props, f.source or "")
+        if value is not None:
+            out[f.resolved_name] = value
     return out
 
 
