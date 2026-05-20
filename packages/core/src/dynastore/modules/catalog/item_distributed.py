@@ -244,7 +244,7 @@ class ItemDistributedMixin(_Host):
         if (
             active_rec
             and write_policy
-            and write_policy.skip_if_unchanged_geometry_hash
+            and write_policy.geometries.skip_if_unchanged_geometry_hash
         ):
             incoming_ch = processing_context.get("geometry_hash")
             if incoming_ch and active_rec.get("geometry_hash") == incoming_ch:

@@ -91,8 +91,6 @@ class ItemsWritePolicy(PluginConfig):
     enable_validity: bool = False
     validity_field: str = "valid_from"
 
-    skip_if_unchanged_geometry_hash: bool = False
-
     schema: Optional[Dict[str, Any]] = None  # self-contained JSON Schema (see below); write-time validation
 
     # The external_id source path lives on the ComputedField itself:
@@ -226,7 +224,7 @@ That's all you need for "external_id at `properties.code`, validated shape, last
     "on_conflict": "new_version",
     "enable_validity": true,
     "validity_field": "properties.valid_from",
-    "skip_if_unchanged_geometry_hash": true,
+    "geometries": { "skip_if_unchanged_geometry_hash": true },
     "schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
@@ -319,9 +317,9 @@ Four concerns, each irreducible to the others:
 1. `schema` (self-contained JSON Schema) — *what the data looks like*.
 2. `compute: List[ComputedField]` — *what to derive from each feature*.
 3. `identity: List[IdentityRule]` — *how to decide "is this the same row"*.
-4. `geometries: GeometriesWriteBehavior` — *geometry-only pre-compute transforms* (SRID, fix, simplify, allow-list). Has to be a sub-config because it runs before `compute`.
+4. `geometries: GeometriesWriteBehavior` — *geometry-only pre-compute transforms* (SRID, fix, simplify, allow-list) plus the `skip_if_unchanged_geometry_hash` version gate. Has to be a sub-config because it runs before `compute`.
 
-Plus three small posture flags: `on_conflict`, `enable_validity`/`validity_field`, `skip_if_unchanged_geometry_hash`. That's it.
+Plus two small posture flags: `on_conflict`, `enable_validity`/`validity_field`. That's it.
 
 ### Simplifications already applied vs the first draft
 

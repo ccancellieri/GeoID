@@ -79,7 +79,7 @@ class GeometriesSidecarConfig(SidecarConfig):
     ``ST_GeoHash(geom, N)``, and a STORED GENERATED ``geometry_hash
     CHAR(64)`` (SHA256 of ``ST_AsBinary(geom)``) used by
     ``ComputedKind.GEOMETRY_HASH`` and the
-    ``skip_if_unchanged_geometry_hash`` write-policy gate.
+    ``geometries.skip_if_unchanged_geometry_hash`` write-policy gate.
 
     Attached by default for VECTOR / RASTER collections; not attached
     for RECORDS (no spatial component).

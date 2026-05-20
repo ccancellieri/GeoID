@@ -266,6 +266,17 @@ class GeometriesWriteBehavior(BaseModel):
             "which also fixes winding order."
         ),
     )
+    skip_if_unchanged_geometry_hash: bool = Field(
+        default=False,
+        examples=[False, True],
+        description=(
+            "If True, matched features whose ``geometry_hash`` equals the "
+            "incoming one bypass ``NEW_VERSION`` (treated as a no-op) and "
+            "collapse ``UPDATE`` to ``REFUSE_RETURN``. Enables 'new version "
+            "only when geometry differs'. Requires the geometries sidecar "
+            "to be enabled (it computes geometry_hash on write)."
+        ),
+    )
 
 
 def _default_identity_rules() -> List[IdentityRule]:
@@ -309,11 +320,11 @@ class ItemsWritePolicy(PluginConfig):
       ANDs its ``match_on`` ComputedFields; rules OR across the list (first
       match wins). Per-rule ``on_match`` overrides :attr:`on_conflict`.
     - :attr:`geometries` — per-row geometry transform / validation block
-      (SRID, fix, simplify, allow-list). Runs before :attr:`compute`.
+      (SRID, fix, simplify, allow-list, geometry-hash version gate). Runs
+      before :attr:`compute`.
 
     Posture flags: :attr:`on_conflict`, :attr:`on_asset_conflict`,
-    :attr:`enable_validity` / :attr:`validity_field`,
-    :attr:`skip_if_unchanged_geometry_hash`, :attr:`track_asset_id`.
+    :attr:`enable_validity` / :attr:`validity_field`, :attr:`track_asset_id`.
 
     The ``context`` dict passed to ``write_entities()`` carries runtime values
     that override config defaults:
@@ -324,7 +335,7 @@ class ItemsWritePolicy(PluginConfig):
     - ``valid_to``             — validity range end (None = open-ended)
 
     Hash-gated versioning:
-      When ``skip_if_unchanged_geometry_hash=True`` a match whose
+      When ``geometries.skip_if_unchanged_geometry_hash=True`` a match whose
       ``geometry_hash`` equals the incoming feature short-circuits the
       action: ``NEW_VERSION`` degrades to a no-op, ``UPDATE`` degrades to
       ``REFUSE_RETURN``. Enables "new version only when geometry differs".
@@ -336,7 +347,7 @@ class ItemsWritePolicy(PluginConfig):
            ItemsWritePolicy(
                on_conflict=WriteConflictPolicy.NEW_VERSION,
                compute=[ComputedField(kind=ComputedKind.EXTERNAL_ID, name="properties.code")],
-               skip_if_unchanged_geometry_hash=True,
+               geometries=GeometriesWriteBehavior(skip_if_unchanged_geometry_hash=True),
            )
 
        Each upsert keyed on ``properties.code`` versions the existing row
@@ -430,17 +441,6 @@ class ItemsWritePolicy(PluginConfig):
             ":attr:`on_conflict` for that branch. Default is a single rule "
             "matching on EXTERNAL_ID — operators replace the list to express "
             "geometry-hash dedup, composite identity, etc."
-        ),
-    )
-    skip_if_unchanged_geometry_hash: Mutable[bool] = Field(
-        default=False,
-        examples=[False, True],
-        description=(
-            "If True, matched features whose ``geometry_hash`` equals the "
-            "incoming one bypass ``NEW_VERSION`` (treated as a no-op) and "
-            "collapse ``UPDATE`` to ``REFUSE_RETURN``. Enables 'new version "
-            "only when geometry differs'. Requires the geometries sidecar "
-            "to be enabled (it computes geometry_hash on write)."
         ),
     )
     track_asset_id: Mutable[bool] = Field(
