@@ -131,6 +131,64 @@ async def test_recreate_live_collection_still_conflicts(
 
 
 @pytest.mark.asyncio
+async def test_catalog_soft_delete_then_recreate(
+    app_lifespan, catalogs_svc, catalog_obj, catalog_id
+):
+    """A soft-deleted catalog id can be recreated. Regression for #1082.
+
+    A plain (default, force=False) DELETE tombstones the catalog.catalogs
+    row (deleted_at set) but leaves the physical schema and metadata sidecars
+    intact. Recreating the same id must purge that residue and succeed rather
+    than failing with a catalogs_pkey unique-violation (HTTP 409).
+    """
+    # Ensure a clean starting state.
+    await catalogs_svc.delete_catalog(catalog_id, force=True)
+
+    try:
+        await catalogs_svc.create_catalog(catalog_obj)
+
+        # Soft delete (force defaults to False) — leaves a tombstone row with
+        # the physical schema and metadata sidecars retained.
+        assert await catalogs_svc.delete_catalog(catalog_id) is True
+
+        # Verify it is no longer visible.
+        assert await catalogs_svc.get_catalog_model(catalog_id) is None
+
+        # Recreate the SAME id — must succeed by reclaiming the tombstone,
+        # not raise a PK unique-violation.
+        recreated = await catalogs_svc.create_catalog(catalog_obj)
+        assert recreated.id == catalog_id
+
+        # It must be live and listable again.
+        retrieved = await catalogs_svc.get_catalog_model(catalog_id)
+        assert retrieved is not None
+        assert retrieved.id == catalog_id
+        catalogs = await catalogs_svc.list_catalogs(q=catalog_id)
+        assert any(c.id == catalog_id for c in catalogs)
+    finally:
+        await catalogs_svc.delete_catalog(catalog_id, force=True)
+
+
+@pytest.mark.asyncio
+async def test_recreate_live_catalog_still_conflicts(
+    app_lifespan, catalogs_svc, catalog_obj, catalog_id
+):
+    """Recreating a still-live catalog must still conflict (no silent resurrect).
+
+    The tombstone-reset path in create_catalog only reclaims soft-deleted rows;
+    a live catalog with the same id must keep raising.
+    """
+    await catalogs_svc.delete_catalog(catalog_id, force=True)
+
+    try:
+        await catalogs_svc.create_catalog(catalog_obj)
+        with pytest.raises(Exception):
+            await catalogs_svc.create_catalog(catalog_obj)
+    finally:
+        await catalogs_svc.delete_catalog(catalog_id, force=True)
+
+
+@pytest.mark.asyncio
 async def test_item_ops(
     app_lifespan,
     catalogs_svc,

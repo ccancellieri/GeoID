@@ -785,6 +785,24 @@ class CatalogService(CatalogsProtocol):
                 conn, physical_schema, catalog_id=catalog_model.id
             )
 
+            # Reclaim a soft-deleted (tombstoned) catalog id. A prior default
+            # (soft) DELETE leaves the catalog.catalogs row with deleted_at set,
+            # the physical schema intact, metadata sidecars in the router-
+            # managed tables, and cron jobs still registered. Purge that residue
+            # here so the id is reused as a clean, fresh catalog. A still-live
+            # row (deleted_at IS NULL) is left untouched, so the INSERT below
+            # raises the usual conflict.
+            tombstoned_row = await DQLQuery(
+                "SELECT id FROM catalog.catalogs WHERE id = :id AND deleted_at IS NOT NULL;",
+                result_handler=ResultHandler.ONE_OR_NONE,
+            ).execute(conn, id=catalog_model.id)
+            if tombstoned_row is not None:
+                logger.info(
+                    "[LIFECYCLE] Reclaiming soft-deleted catalog '%s' for reuse",
+                    catalog_model.id,
+                )
+                await self._purge_catalog_storage(conn, catalog_model.id)
+
             # The registry INSERT carries only technical columns.  Catalog
             # metadata (title, description, …, stac_extensions,
             # conforms_to, links, assets) flows into the domain-scoped
@@ -1390,6 +1408,56 @@ class CatalogService(CatalogsProtocol):
             catalog_id, collection_id, db_resource=db_resource
         )
 
+    async def _purge_catalog_storage(
+        self,
+        conn: DbResource,
+        catalog_id: str,
+    ) -> Optional[str]:
+        """Tear down a catalog's physical + metadata footprint within ``conn``.
+
+        Shared by hard delete (``force=True``) and ``create_catalog``'s
+        tombstone reset: resolves the physical schema from the registry row
+        (skipping the ``deleted_at IS NULL`` filter so it works on tombstoned
+        rows too), drops the physical schema CASCADE, removes cron jobs, and
+        hard-deletes the ``catalog.catalogs`` registry row. The registry-row
+        deletion cascades to ``catalog_core`` and ``catalog_stac`` via the
+        ``ON DELETE CASCADE`` FK so no explicit metadata fan-out is needed.
+
+        The caller owns any async external-resource destroy (e.g.
+        ``lifecycle_registry.destroy_async_catalog``). Returns the old
+        physical schema name (``None`` if the catalog had no schema recorded).
+        """
+        # Resolve physical schema without deleted_at filter — works for
+        # both live and tombstoned rows.
+        old_physical_schema = await DQLQuery(
+            "SELECT physical_schema FROM catalog.catalogs WHERE id = :catalog_id;",
+            result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+        ).execute(conn, catalog_id=catalog_id)
+
+        if old_physical_schema:
+            await _drop_schema_query.execute(conn, schema=old_physical_schema)
+            try:
+                async with managed_nested_transaction(conn) as nested:
+                    deleted_jobs = await _delete_tenant_cron_jobs_query.execute(
+                        nested, pattern=f"%{old_physical_schema}%"
+                    )
+                if deleted_jobs:
+                    logger.info(
+                        "Removed %d cron job(s) for schema %s",
+                        deleted_jobs, old_physical_schema,
+                    )
+            except Exception as cron_err:
+                logger.warning(
+                    "Could not remove cron jobs for %s (non-fatal): %s",
+                    old_physical_schema, cron_err,
+                )
+
+        # Deleting the registry row cascades to catalog_core and catalog_stac
+        # via their ON DELETE CASCADE FK, so no explicit metadata fan-out is
+        # needed here.
+        await _hard_delete_catalog_query.execute(conn, id=catalog_id)
+        return old_physical_schema
+
     async def delete_catalog(
         self,
         catalog_id: str,
@@ -1400,29 +1468,69 @@ class CatalogService(CatalogsProtocol):
         Delete a catalog.
 
         If force=True, triggers a hard deletion (removal of schema and data).
-        Otherwise, performs a soft delete (marks as deleted).
+        Otherwise, performs a soft delete (marks as deleted without touching
+        the physical schema, metadata sidecars, or catalog_configs so the id
+        can later be hard-deleted or reclaimed by create_catalog).
         """
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
 
+        config_snapshot: Dict[str, Any] = {}
+        physical_schema: Optional[str] = None
         async with managed_transaction(get_catalog_engine(db_resource)) as conn:
-            # 1. Soft Delete
-            rows = await _soft_delete_catalog_query.execute(conn, id=catalog_id)
-
-            # If not found/already deleted
-            if rows == 0:
-                # If we are not forcing, we can't delete what doesn't exist
-                # But if forcing, we might want to ensure cleanup even if soft-deleted previously?
-                # Legacy behavior was strict. Protocol -> bool.
-                # If we return False here, it means "not deleted" (maybe not found).
-
-                # Check existence to distinguish "not found" vs "already deleted" vs "soft delete failed"
-                # Optimization: just check if it exists in DB?
-                # For now, if rows=0 and not force, we return False.
-                if not force:
+            if force:
+                # Resolve the physical schema before purge (purge will delete
+                # the row so we capture it here for the post-txn async hook).
+                physical_schema = await DQLQuery(
+                    "SELECT physical_schema FROM catalog.catalogs WHERE id = :catalog_id;",
+                    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+                ).execute(conn, catalog_id=catalog_id)
+                if not physical_schema:
+                    # Catalog not found at all — nothing to delete.
                     return False
 
-            if not force:
+                # Snapshot the config BEFORE the purge removes it — the async
+                # external-resource destroy scheduled after the txn needs it.
+                from dynastore.models.protocols import ConfigsProtocol
+                config_manager = get_protocol(ConfigsProtocol)
+                if config_manager:
+                    try:
+                        config_snapshot = await config_manager.list_catalog_configs(
+                            catalog_id, ctx=DriverContext(db_resource=conn)
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "Could not list catalog configs before deletion: %s", e
+                        )
+
+                # 2. Hard Delete (Force)
+                # Lifecycle: BEFORE -> HARD_DELETE internal -> AFTER
+                await emit_event(
+                    CatalogEventType.BEFORE_CATALOG_HARD_DELETION,
+                    catalog_id=catalog_id,
+                    db_resource=conn,
+                )
+
+                logger.info(
+                    "[LIFECYCLE] Hard deleting catalog '%s'", catalog_id
+                )
+                await self._purge_catalog_storage(conn, catalog_id)
+                logger.info(
+                    "[LIFECYCLE] Hard deleted catalog '%s' successfully", catalog_id
+                )
+
+            else:
+                # Soft delete: tombstone the registry row only. The physical
+                # schema, metadata sidecars and catalog_configs are intentionally
+                # retained so the id can later be either hard-deleted or
+                # reclaimed by create_catalog — both of which purge the residue
+                # via _purge_catalog_storage for a clean reset. Retained
+                # configs are inert while the row is tombstoned (every read
+                # filters deleted_at IS NULL).
+                rows = await _soft_delete_catalog_query.execute(conn, id=catalog_id)
+                if rows == 0:
+                    return False
+
                 await emit_event(
                     CatalogEventType.CATALOG_DELETION,
                     catalog_id=catalog_id,
@@ -1440,84 +1548,17 @@ class CatalogService(CatalogsProtocol):
                 _invalidate_catalog_model_cache(catalog_id)
                 return True
 
-            # 2. Hard Delete (Force)
-            # Lifecycle: BEFORE -> HARD_DELETE internal -> AFTER
-            await emit_event(
-                CatalogEventType.BEFORE_CATALOG_HARD_DELETION,
-                catalog_id=catalog_id,
-                db_resource=conn,
-            )
-
-            # The actual hard deletion logic (dropping schema etc) matches what was in CatalogModule delegates
-            # We need to drop the schema and delete the row.
-
-            # Capture configuration before deletion to pass to async destroyers
-            from dynastore.models.protocols import ConfigsProtocol
-            config_manager = get_protocol(ConfigsProtocol)
-            config_snapshot = {}
-            if config_manager:
-                try:
-                    config_snapshot = await config_manager.list_catalog_configs(catalog_id, ctx=DriverContext(db_resource=conn))
-                except Exception as e:
-                    logger.debug(f"Could not list catalog configs before deletion: {e}")
-
-            # Resolve physical schema directly (ignoring soft-delete status)
-            physical_schema = await DQLQuery(
-                "SELECT physical_schema FROM catalog.catalogs WHERE id = :catalog_id;",
-                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-            ).execute(conn, catalog_id=catalog_id)
-
-            # Dropping schema
-            if physical_schema:
-                logger.warning(f"DEBUG: delete_catalog: Dropping schema {physical_schema}")
-                await _drop_schema_query.execute(conn, schema=physical_schema)
-                logger.warning(f"DEBUG: delete_catalog: Schema dropped")
-
-                # Remove all pg_cron jobs associated with this tenant schema.
-                # Jobs use the physical schema name as a suffix or infix, e.g.:
-                #   archive_catalog_events_s_abc12345
-                #   monthly_cleanup_logs_s_abc12345
-                #   prune_s_abc12345_events
-                #
-                # Wrap in a SAVEPOINT so a permission/visibility failure on
-                # ``cron.job`` (e.g. role lacks SELECT/DELETE on it) doesn't
-                # abort the outer delete transaction.  Without the savepoint
-                # the asyncpg connection enters InFailedSQLTransactionError
-                # and every subsequent statement (the actual catalogs DELETE,
-                # event emission) fails with HTTP 500 even though the cron
-                # cleanup is truly non-fatal.
-                try:
-                    async with managed_nested_transaction(conn) as nested:
-                        deleted_jobs = await _delete_tenant_cron_jobs_query.execute(
-                            nested, pattern=f"%{physical_schema}%"
-                        )
-                    if deleted_jobs:
-                        logger.info(
-                            f"Removed {deleted_jobs} cron job(s) for schema {physical_schema}"
-                        )
-                except Exception as cron_err:
-                    logger.warning(
-                        f"Could not remove cron jobs for {physical_schema} (non-fatal): {cron_err}"
-                    )
-
-            # Delete from catalogs table
-            await _hard_delete_catalog_query.execute(conn, id=catalog_id)
+            # Reached only on the force=True path.
 
             # Emit main HARD_DELETION event (triggers async destroyers)
-            logger.warning(f"DEBUG: delete_catalog: Emitting CATALOG_HARD_DELETION")
             await emit_event(
                 CatalogEventType.CATALOG_HARD_DELETION,
                 catalog_id=catalog_id,
                 db_resource=conn,
                 physical_schema=physical_schema,
             )
-            logger.warning(f"DEBUG: delete_catalog: Emitted CATALOG_HARD_DELETION")
 
-            # Fire the canonical INDEX-side cleanup signal: ReindexWorker
-            # picks this up and fans out to CatalogRoutingConfig.operations[INDEX]
-            # drivers (ES catalog doc gets dropped). Emitted inline rather
-            # than via catalog_router.delete_catalog_metadata so we don't
-            # fan-out into the tenant schema that was just dropped above.
+            # Fire the canonical INDEX-side cleanup signal.
             await emit_event(
                 CatalogEventType.CATALOG_METADATA_CHANGED,
                 catalog_id=catalog_id,
@@ -1529,27 +1570,18 @@ class CatalogService(CatalogsProtocol):
             )
 
             # Emit AFTER event
-            logger.warning(f"DEBUG: delete_catalog: Emitting AFTER_CATALOG_HARD_DELETION")
             await emit_event(
                 CatalogEventType.AFTER_CATALOG_HARD_DELETION,
                 catalog_id=catalog_id,
                 db_resource=conn,
                 physical_schema=physical_schema,
             )
-            logger.warning(f"DEBUG: delete_catalog: Emitted AFTER_CATALOG_HARD_DELETION")
+
         # Post-transaction cleanup
         _invalidate_catalog_model_cache(catalog_id)
 
-        # Trigger async cleanup (external resources) if needed
-        # The 'BEFORE_CATALOG_HARD_DELETION' event might have triggered async listeners?
-        # In legacy, hard delete triggered `lifecycle_registry.destroy_async_catalog`
-
-        if force and physical_schema:
+        if physical_schema:
             try:
-                # Capture config snapshot if possible (best effort since it's already deleted)
-                # In a real scenario, we should capture before delete.
-                # But here we just trigger the destroyer.
-
                 from dynastore.modules.catalog.lifecycle_manager import LifecycleContext
 
                 lifecycle_registry.destroy_async_catalog(
@@ -1558,7 +1590,8 @@ class CatalogService(CatalogsProtocol):
                 )
             except Exception as e:
                 logger.warning(
-                    f"Failed to trigger async destroy for catalog {catalog_id}: {e}"
+                    "Failed to trigger async destroy for catalog %s: %s",
+                    catalog_id, e,
                 )
 
         return True
