@@ -690,8 +690,12 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     async def delete_stac_catalog(
         self,
         catalog_id: str,
-        force=Query(
-            ..., description="Force hard deletion of the collection (can't be undone)"
+        force: bool = Query(
+            False,
+            description=(
+                "Force hard deletion (drops the schema and all data, can't be "
+                "undone). When false (default) the catalog is soft-deleted."
+            ),
         ),
     ):
         catalogs_svc = await self._get_catalogs_service()
@@ -795,9 +799,22 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         localized_data, _ = stac_localize(updated_collection_model, language)
         return JSONResponse(content=localized_data)
 
-    async def delete_stac_collection(self, catalog_id: str, collection_id: str):
+    async def delete_stac_collection(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        force: bool = Query(
+            False,
+            description=(
+                "Force hard deletion (drops the items table and metadata, "
+                "can't be undone). When false (default) the collection is "
+                "soft-deleted; the id can still be recreated, which resets it "
+                "to a fresh collection."
+            ),
+        ),
+    ):
         catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.delete_collection(catalog_id, collection_id):
+        if not await catalogs_svc.delete_collection(catalog_id, collection_id, force=force):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Collection '{catalog_id}:{collection_id}' not found.",

@@ -77,6 +77,60 @@ async def test_collection_ops(
 
 
 @pytest.mark.asyncio
+async def test_collection_soft_delete_then_recreate(
+    app_lifespan, catalogs_svc, catalog_obj, catalog_id, collection_obj, collection_id
+):
+    """A soft-deleted collection id can be recreated. Regression for #317.
+
+    A plain (default, force=False) DELETE leaves a tombstoned ``collections``
+    row (``deleted_at`` set). Recreating the same id must resurrect/reset it
+    instead of failing with a ``collections_pkey`` unique-violation (HTTP 409).
+    """
+    await catalogs_svc.delete_catalog(catalog_id, force=True)
+    await catalogs_svc.create_catalog(catalog_obj)
+
+    try:
+        await catalogs_svc.create_collection(catalog_id, collection_obj)
+
+        # Soft delete (force defaults to False) — leaves a tombstone row.
+        assert await catalogs_svc.delete_collection(catalog_id, collection_id) is True
+
+        # Recreate the SAME id — must succeed by resurrecting the tombstone,
+        # not raise a PK unique-violation.
+        recreated = await catalogs_svc.create_collection(catalog_id, collection_obj)
+        assert recreated.id == collection_id
+
+        # It must be live and listable again.
+        retrieved = await catalogs_svc.get_collection(catalog_id, collection_id)
+        assert retrieved is not None
+        assert retrieved.id == collection_id
+        collections = await catalogs_svc.list_collections(catalog_id)
+        assert any(c.id == collection_id for c in collections)
+    finally:
+        await catalogs_svc.delete_catalog(catalog_id, force=True)
+
+
+@pytest.mark.asyncio
+async def test_recreate_live_collection_still_conflicts(
+    app_lifespan, catalogs_svc, catalog_obj, catalog_id, collection_obj, collection_id
+):
+    """Recreating a still-live collection must still conflict (no silent resurrect).
+
+    The tombstone-reset path in ``create_collection`` only reclaims
+    soft-deleted rows; a live collection with the same id must keep raising.
+    """
+    await catalogs_svc.delete_catalog(catalog_id, force=True)
+    await catalogs_svc.create_catalog(catalog_obj)
+
+    try:
+        await catalogs_svc.create_collection(catalog_id, collection_obj)
+        with pytest.raises(Exception):
+            await catalogs_svc.create_collection(catalog_id, collection_obj)
+    finally:
+        await catalogs_svc.delete_catalog(catalog_id, force=True)
+
+
+@pytest.mark.asyncio
 async def test_item_ops(
     app_lifespan,
     catalogs_svc,

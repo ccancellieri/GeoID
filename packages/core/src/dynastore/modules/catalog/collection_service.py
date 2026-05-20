@@ -459,6 +459,25 @@ class CollectionService:
                 f"[LIFECYCLE] Creating collection '{catalog_id}:{collection_model.id}' in schema '{phys_schema}'"
             )
 
+            # #317: reclaim a soft-deleted (tombstoned) id. A prior default
+            # (soft) DELETE leaves the collections row with deleted_at set plus
+            # its physical table, metadata sidecars and configs intact. Purge
+            # that residue here so the id is reused as a clean, fresh
+            # collection. A still-live row (deleted_at IS NULL) is left
+            # untouched, so the INSERT below raises the usual conflict.
+            tombstoned = await DQLQuery(
+                f'SELECT 1 FROM "{phys_schema}".collections WHERE id = :id AND deleted_at IS NOT NULL;',
+                result_handler=ResultHandler.ONE_OR_NONE,
+            ).execute(conn, id=collection_model.id)
+            if tombstoned is not None:
+                logger.info(
+                    f"[LIFECYCLE] Reclaiming soft-deleted collection "
+                    f"'{catalog_id}:{collection_model.id}' for reuse (#317)"
+                )
+                await self._purge_collection_storage(
+                    conn, phys_schema, catalog_id, collection_model.id
+                )
+
             # Get driver config (default/platform config only - collection doesn't exist yet,
             # so we must NOT pass db_resource here; querying collection_configs in a nested
             # transaction before the table may be ready would poison the outer transaction).
@@ -843,6 +862,52 @@ class CollectionService:
 
         return fresh
 
+    async def _purge_collection_storage(
+        self,
+        conn: DbResource,
+        phys_schema: str,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Optional[str]:
+        """Tear down a collection's physical + metadata footprint within ``conn``.
+
+        Shared by hard delete (``force=True``) and ``create_collection``'s
+        tombstone reset (#317): resolves the physical items table from the
+        driver config, runs the lifecycle destroy hooks, drops the items
+        table, removes the registry row, fans out metadata-table deletion
+        (collection_core / collection_stac), and clears ``collection_configs``.
+
+        The caller owns any async external-resource destroy. Returns the
+        dropped physical table name (``None`` if the collection was never
+        activated, i.e. no storage had been provisioned).
+        """
+        phys_table = await self.resolve_physical_table(
+            catalog_id, collection_id, db_resource=conn
+        )
+        await lifecycle_registry.destroy_collection(
+            conn, phys_schema, catalog_id, collection_id
+        )
+        await lifecycle_registry.hard_destroy_collection(
+            conn, phys_schema, catalog_id, collection_id
+        )
+        if phys_table:
+            await shared_queries.delete_table_query.execute(
+                conn, schema=phys_schema, table=phys_table
+            )
+        await DDLQuery(
+            f'DELETE FROM "{phys_schema}".collections WHERE id = :id;'
+        ).execute(conn, id=collection_id)
+        from dynastore.modules.catalog.collection_router import (
+            delete_collection_metadata as _route_delete_metadata,
+        )
+
+        await _route_delete_metadata(catalog_id, collection_id, db_resource=conn)
+        await DQLQuery(
+            f'DELETE FROM "{phys_schema}".collection_configs WHERE collection_id = :id;',
+            result_handler=ResultHandler.NONE,
+        ).execute(conn, id=collection_id)
+        return phys_table
+
     async def delete_collection(
         self,
         catalog_id: str,
@@ -854,6 +919,8 @@ class CollectionService:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        config_snapshot: Dict[str, Any] = {}
+        phys_table: Optional[str] = None
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_physical_schema(
                 catalog_id, db_resource=conn
@@ -861,36 +928,12 @@ class CollectionService:
             if not phys_schema:
                 return False
 
-            soft_delete_sql = f'UPDATE "{phys_schema}".collections SET deleted_at = NOW() WHERE id = :id AND deleted_at IS NULL;'
-            await DQLQuery(
-                soft_delete_sql, result_handler=ResultHandler.ROWCOUNT
-            ).execute(conn, id=collection_id)
-
-            # Soft delete cascades to collection_configs — configs are bound to
-            # the logical collection identity, not the physical table. Keeping
-            # them behind a tombstoned collection would leak stale state if the
-            # id is later reused.
-            await DQLQuery(
-                f'DELETE FROM "{phys_schema}".collection_configs WHERE collection_id = :id;',
-                result_handler=ResultHandler.NONE,
-            ).execute(conn, id=collection_id)
-
-            logger.info(
-                f"[LIFECYCLE] Soft deleted collection '{catalog_id}:{collection_id}'"
-            )
-
-            config_snapshot = {}
             if force:
-                logger.info(
-                    f"[LIFECYCLE] Hard deleting collection '{catalog_id}:{collection_id}'"
-                )
-                phys_table = await self.resolve_physical_table(
-                    catalog_id, collection_id, db_resource=conn
-                )
-
+                # Snapshot the config BEFORE the purge removes it — the async
+                # external-resource destroy scheduled after the txn needs it.
                 try:
                     configs = get_protocol(ConfigsProtocol)
-                    config_snapshot: Dict[str, Any] = {
+                    config_snapshot = {
                         "catalog_id": catalog_id,
                         "collection_id": collection_id,
                     }
@@ -905,39 +948,32 @@ class CollectionService:
                             config_snapshot["collection_config"] = coll_config.model_dump()
                 except Exception as e:
                     logger.warning(
-                        f"Failed to capture config snapshot for '{catalog_id}:{collection_id}: {e}"
+                        f"Failed to capture config snapshot for '{catalog_id}:{collection_id}': {e}"
                     )
-
-                await lifecycle_registry.destroy_collection(
-                    conn, phys_schema, catalog_id, collection_id
-                )
-                await lifecycle_registry.hard_destroy_collection(
-                    conn, phys_schema, catalog_id, collection_id
-                )
-
-                if phys_table:
-                    await shared_queries.delete_table_query.execute(
-                        conn, schema=phys_schema, table=phys_table
-                    )
-
-                hard_delete_sql = (
-                    f'DELETE FROM "{phys_schema}".collections WHERE id = :id;'
-                )
-                await DDLQuery(hard_delete_sql).execute(conn, id=collection_id)
-                # Fan-out metadata deletion via the router.
-                from dynastore.modules.catalog.collection_router import (
-                    delete_collection_metadata as _route_delete_metadata,
-                )
-
-                await _route_delete_metadata(
-                    catalog_id, collection_id, db_resource=conn,
-                )
-                # Soft-delete already cleared collection_configs; hard-delete
-                # runs after soft-delete in the same txn, so no second DELETE
-                # is needed here.
 
                 logger.info(
+                    f"[LIFECYCLE] Hard deleting collection '{catalog_id}:{collection_id}'"
+                )
+                phys_table = await self._purge_collection_storage(
+                    conn, phys_schema, catalog_id, collection_id
+                )
+                logger.info(
                     f"[LIFECYCLE] Hard deleted collection '{catalog_id}:{collection_id}' successfully"
+                )
+            else:
+                # Soft delete: tombstone the registry row only. The physical
+                # table, metadata sidecars and collection_configs are
+                # intentionally retained so the id can later be either
+                # hard-deleted or reclaimed by create_collection — both of
+                # which purge the residue via _purge_collection_storage for a
+                # clean reset (#317). Retained configs are inert while the row
+                # is tombstoned (every read filters deleted_at IS NULL).
+                soft_delete_sql = f'UPDATE "{phys_schema}".collections SET deleted_at = NOW() WHERE id = :id AND deleted_at IS NULL;'
+                await DQLQuery(
+                    soft_delete_sql, result_handler=ResultHandler.ROWCOUNT
+                ).execute(conn, id=collection_id)
+                logger.info(
+                    f"[LIFECYCLE] Soft deleted collection '{catalog_id}:{collection_id}'"
                 )
 
         _invalidate_collection_model_cache(catalog_id, collection_id)
