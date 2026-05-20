@@ -168,7 +168,7 @@ from dynastore.models.shared_models import Link
 from dynastore.models.protocols.assets import AssetsProtocol
 from dynastore.models.protocols.asset_driver import AssetStore
 from dynastore.models.driver_context import DriverContext
-from dynastore.models.query_builder import FilterOperator
+from dynastore.models.query_builder import AssetFilter
 from enum import Enum
 from dynastore.models.driver_context import DriverContext
 
@@ -507,18 +507,10 @@ class Asset(AssetBase):
 
 
 # --- Dynamic Query Helpers ---
-
-
-
-
-class AssetFilter(BaseModel):
-    field: str  # asset_id, uri, metadata.path.to.key
-    op: FilterOperator = FilterOperator.EQ
-    value: Any
-
-
-# --- Dynamic Query Helpers ---
-# Moved inside methods to allow schema injection
+# ``AssetFilter`` lives in ``dynastore.models.query_builder`` (imported above)
+# so the driver protocol + drivers can consume it without importing this
+# service module.
+# Query helpers are kept inside methods to allow schema injection.
 
 # Obsolete global DDL removed.
 # Assets correspond to {schema}.assets in the tenant schema.
@@ -807,34 +799,18 @@ class AssetService(AssetsProtocol):
         ``all_collections=True`` spans every collection plus the catalog tier
         under the catalog (the ``collection_id`` predicate is dropped).
 
-        Only the ``EQ`` operator is supported today. The PG asset driver
-        (``pg_asset_driver.search_assets``) hardcodes ``"<field>" = :val``
-        in its WHERE clause and the ES asset driver consumes the same
-        equality-shaped ``{field: value}`` dict, so any non-EQ filter
-        passed here would silently collapse to EQ on either backend.
-        Raise loudly instead of returning rows that look right but
-        ignored the operator; full operator coverage is tracked
-        separately.
+        ``filters`` are forwarded to the routed driver, which translates them
+        via :mod:`dynastore.modules.tools.asset_filters` (one operator
+        vocabulary shared by the PG and ES backends). Unsupported operators
+        raise ``ValueError`` from that layer (mapped to HTTP 400).
         """
         from dynastore.modules.storage.router import get_asset_search_driver
-
-        unsupported = sorted({f.op.value for f in filters if f.op != FilterOperator.EQ})
-        if unsupported:
-            raise ValueError(
-                f"asset search supports only the EQ operator today; "
-                f"received unsupported operators: {unsupported}. "
-                f"The PG/ES drivers behind this endpoint do not yet "
-                f"encode non-EQ operators, so accepting them would "
-                f"silently return EQ-shaped results."
-            )
-
-        eq_query: Dict[str, Any] = {f.field: f.value for f in filters}
 
         driver = await get_asset_search_driver(catalog_id, collection_id)
         docs = await driver.search_assets(
             catalog_id,
             collection_id=collection_id,
-            query=eq_query or None,
+            filters=filters or None,
             limit=limit,
             offset=offset,
             all_collections=all_collections,

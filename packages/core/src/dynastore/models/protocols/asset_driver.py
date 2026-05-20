@@ -39,6 +39,8 @@ from typing import (
     runtime_checkable,
 )
 
+from dynastore.models.query_builder import AssetFilter
+
 if TYPE_CHECKING:
     from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -129,13 +131,13 @@ class AssetStore(Protocol):
         catalog_id: str,
         collection_id: Optional[str] = None,
         *,
-        query: Optional[Dict[str, Any]] = None,
+        filters: Optional[List[AssetFilter]] = None,
         limit: int = 100,
         offset: int = 0,
         all_collections: bool = False,
         db_resource: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
-        """Return asset documents matching the query.
+        """Return asset documents matching the filters.
 
         Collection scope is tri-state:
         - ``collection_id=None`` and ``all_collections=False`` →
@@ -149,7 +151,10 @@ class AssetStore(Protocol):
         Args:
             catalog_id:      Catalog that owns the assets.
             collection_id:   Optional collection filter (catalog-tier when None).
-            query:           Driver-specific query dict (ES query DSL, SQL filters, etc.).
+            filters:         Optional list of :class:`AssetFilter`. Operator
+                             support and predicate translation are shared across
+                             backends via
+                             :mod:`dynastore.modules.tools.asset_filters`.
             limit:           Maximum number of results.
             offset:          Skip this many results (for pagination).
             all_collections: Drop the collection predicate and span the whole catalog.

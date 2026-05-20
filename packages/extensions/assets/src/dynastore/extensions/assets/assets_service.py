@@ -63,10 +63,10 @@ from dynastore.extensions.tools.catalog_readiness import require_catalog_ready
 from dynastore.extensions.tools.exception_handlers import handle_exception
 from fastapi import Depends
 from dynastore.modules.catalog.catalog_module import CatalogModule
+from dynastore.models.query_builder import AssetFilter
 from dynastore.modules.catalog.asset_service import (
     Asset,
     AssetCreate,
-    AssetFilter,
     AssetKind,
     AssetStatus,
     AssetTypeEnum,

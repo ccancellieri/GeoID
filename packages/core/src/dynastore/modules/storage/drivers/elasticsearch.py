@@ -63,8 +63,9 @@ from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.storage_driver import Capability
 from dynastore.models.protocols.typed_driver import TypedDriver
-from dynastore.models.query_builder import QueryRequest
+from dynastore.models.query_builder import AssetFilter, QueryRequest
 from dynastore.modules.protocols import ModuleProtocol
+from dynastore.modules.tools.asset_filters import build_es_query
 from dynastore.modules.storage.driver_config import (
     AssetElasticsearchDriverConfig,
     ItemsElasticsearchDriverConfig,
@@ -1748,43 +1749,12 @@ class AssetElasticsearchDriver(
         except Exception:
             return None
 
-    # ES DSL top-level query keywords — used to distinguish raw ES DSL from
-    # simple {field: value} filter dicts passed by AssetService.
-    _ES_DSL_KEYWORDS = frozenset({
-        "match_all", "bool", "term", "terms", "match", "range",
-        "exists", "prefix", "wildcard", "regexp", "fuzzy",
-        "ids", "multi_match", "query_string", "nested",
-        "match_phrase", "match_phrase_prefix",
-    })
-
-    @classmethod
-    def _to_es_query(cls, query: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert a simple ``{field: value}`` dict to an ES bool/filter/term query.
-
-        If *query* already looks like ES DSL (contains a known ES keyword as a
-        top-level key), it is returned unchanged.  Otherwise each entry becomes
-        a ``term`` filter clause, supporting dot-notation for nested fields
-        (e.g. ``metadata.license_id``).
-        """
-        if not query:
-            return {"match_all": {}}
-
-        # Detect raw ES DSL — fast path
-        if query.keys() & cls._ES_DSL_KEYWORDS:
-            return query
-
-        # Convert field=value pairs to ES term filters
-        filters = [{"term": {field: value}} for field, value in query.items()]
-        if len(filters) == 1:
-            return filters[0]
-        return {"bool": {"filter": filters}}
-
     async def search_assets(
         self,
         catalog_id: str,
         collection_id: Optional[str] = None,
         *,
-        query: Optional[Dict[str, Any]] = None,
+        filters: Optional[List[AssetFilter]] = None,
         limit: int = 100,
         offset: int = 0,
         all_collections: bool = False,
@@ -1792,13 +1762,12 @@ class AssetElasticsearchDriver(
     ) -> List[Dict[str, Any]]:
         """Search asset documents in ES.
 
-        ``query`` may be:
-        - A raw ES query DSL dict (detected by presence of ES keywords like
-          ``bool``, ``term``, ``match``, etc.)
-        - A simple ``{field: value}`` dict — each entry is converted to a
-          ``term`` filter.  Dot-notation (e.g. ``metadata.license_id``) is
-          supported natively by ES for dynamically mapped nested fields.
-        - ``None`` → ``match_all``
+        ``filters`` is an optional list of :class:`AssetFilter`. The operator
+        set and ES-clause translation live in
+        :func:`dynastore.modules.tools.asset_filters.build_es_query`
+        (shared with the PG driver so both backends honour the same operators).
+        Dot-notation fields (``metadata.license_id``) resolve natively in ES.
+        ``None``/empty → ``match_all``.
 
         Collection scope mirrors the PG asset driver (tri-state):
         - ``collection_id="<id>"`` → ``term`` filter on that collection.
@@ -1815,7 +1784,7 @@ class AssetElasticsearchDriver(
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
 
-        base_query = self._to_es_query(query or {})
+        base_query = build_es_query(filters or [])
         if all_collections:
             pass  # no collection clause — span the whole catalog
         elif collection_id:

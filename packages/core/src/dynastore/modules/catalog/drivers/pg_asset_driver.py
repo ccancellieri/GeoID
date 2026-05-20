@@ -54,6 +54,8 @@ from sqlalchemy import text
 from dynastore.models.protocols.asset_driver import AssetStore
 from dynastore.models.protocols.storage_driver import Capability
 from dynastore.models.protocols.typed_driver import TypedDriver
+from dynastore.models.query_builder import AssetFilter
+from dynastore.modules.tools.asset_filters import build_pg_where
 from dynastore.modules.storage.driver_config import AssetPostgresqlDriverConfig
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.db_config.query_executor import (
@@ -453,24 +455,21 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         catalog_id: str,
         collection_id: Optional[str] = None,
         *,
-        query: Optional[Dict[str, Any]] = None,
+        filters: Optional[List[AssetFilter]] = None,
         limit: int = 100,
         offset: int = 0,
         all_collections: bool = False,
         db_resource: Optional[DbResource] = None,
     ) -> List[Dict[str, Any]]:
-        """Return asset dicts matching the query.
+        """Return asset dicts matching the filters.
 
-        ``query`` is an optional dict of ``{field: value}`` equality filters.
-        JSONB paths are supported via dot notation:
-        ``{"metadata.provider": "ESA"}``, ``{"metadata.sensor.name": "MSI"}``.
-
-        Multiple ``metadata.*`` filters are folded into a single JSONB
-        ``@>`` containment predicate so the planner can use the
-        ``idx_assets_metadata_gin_*`` GIN index. Containment is
-        **type-strict**: ``{"metadata.size": 100}`` matches stored JSON
-        number ``100``, not the string ``"100"``. Pass values in the
-        type they're stored under.
+        ``filters`` is an optional list of :class:`AssetFilter`. The supported
+        operator set and predicate translation live in
+        :func:`dynastore.modules.tools.asset_filters.build_pg_where`. JSONB paths
+        use dot notation (``metadata.provider``, ``metadata.sensor.name``);
+        ``eq`` filters on those paths fold into a single GIN-indexable ``@>``
+        containment predicate, while comparison/text operators use the ``#>>``
+        accessor.
 
         Collection scope: ``collection_id IS NOT DISTINCT FROM :collection_id``
         matches a single collection (or the catalog tier when ``None``).
@@ -494,45 +493,10 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
             where_parts.append("collection_id IS NOT DISTINCT FROM :collection_id")
             params["collection_id"] = collection_id
 
-        if query:
-            metadata_container: Dict[str, Any] = {}
-            for i, (field, value) in enumerate(query.items()):
-                if field.startswith("metadata."):
-                    parts = field.split(".")[1:]
-                    if not parts or any(not p for p in parts):
-                        raise ValueError(
-                            f"invalid metadata path {field!r}: empty segment"
-                        )
-                    d: Any = metadata_container
-                    for p in parts[:-1]:
-                        nxt = d.setdefault(p, {})
-                        if not isinstance(nxt, dict):
-                            raise ValueError(
-                                f"conflicting filter on metadata path "
-                                f"{field!r}: earlier filter set a scalar at "
-                                f"the same prefix"
-                            )
-                        d = nxt
-                    leaf = parts[-1]
-                    if leaf in d and isinstance(d[leaf], dict):
-                        raise ValueError(
-                            f"conflicting filter on metadata path "
-                            f"{field!r}: earlier filter set a sub-object "
-                            f"at the same key"
-                        )
-                    d[leaf] = value
-                else:
-                    from dynastore.tools.db import validate_sql_identifier
-                    validate_sql_identifier(field)
-                    key = f"qval_{i}"
-                    where_parts.append(f'"{field}" = :{key}')
-                    params[key] = value
-
-            if metadata_container:
-                where_parts.append(
-                    "metadata @> CAST(:metadata_container AS jsonb)"
-                )
-                params["metadata_container"] = json.dumps(metadata_container)
+        if filters:
+            filter_parts, filter_params = build_pg_where(filters)
+            where_parts.extend(filter_parts)
+            params.update(filter_params)
 
         sql = (
             f'SELECT asset_id, catalog_id, collection_id, asset_type, kind, status, '

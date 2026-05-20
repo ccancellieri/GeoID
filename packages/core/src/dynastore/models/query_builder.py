@@ -193,6 +193,19 @@ class FilterCondition(BaseModel):
     spatial_op: bool = False
 
 
+class AssetFilter(BaseModel):
+    """A single asset-search predicate: ``field <op> value``.
+
+    ``field`` is a top-level asset column (``asset_id``, ``asset_type`` …) or a
+    dotted ``metadata.*`` path. The supported operators and their per-backend
+    translation live in :mod:`dynastore.modules.tools.asset_filters`.
+    """
+
+    field: str  # asset_id, uri, metadata.path.to.key
+    op: FilterOperator = FilterOperator.EQ
+    value: Any = None
+
+
 class SortOrder(BaseModel):
     """Represents sort order."""
 

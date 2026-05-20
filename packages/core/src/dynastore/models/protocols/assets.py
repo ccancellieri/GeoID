@@ -81,10 +81,10 @@ if TYPE_CHECKING:
         AssetBase,
         AssetUploadDefinition,
         AssetUpdate,
-        AssetFilter,
         AssetReference,
         AssetReferenceType,
     )
+    from dynastore.models.query_builder import AssetFilter
     from dynastore.models.driver_context import DriverContext  # noqa: F401
 
 
