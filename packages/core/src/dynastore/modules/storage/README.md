@@ -47,7 +47,7 @@ written = await driver.write_entities(catalog_id, collection_id, feature_collect
 
 Routing is set via `ConfigsProtocol` at platform / catalog / collection level and resolved via the
 4-tier waterfall. **Operation-based** post-PR-#261: `operations: Dict[Operation, List[OperationDriverEntry]]`
-where each `Operation` (`WRITE` / `READ` / `SEARCH` / `INDEX` / `BACKUP` / `UPLOAD`) maps to an
+where each `Operation` (`WRITE` / `READ` / `SEARCH` / `INDEX` / `UPLOAD`) maps to an
 ordered list of drivers with per-entry `on_failure` / `write_mode` / `hints` / `source`.
 
 ```json

@@ -73,13 +73,6 @@ register_platform_notebook(
 
 # Routing showcases — migrated from notebook_showcase/routing/
 register_platform_notebook(
-    notebook_id="storage_routing_pg_primary_es_index_parquet_backup",
-    registered_by=_REG,
-    notebook_path=_HERE / "rt01_pg_primary_es_index_parquet_backup.ipynb",
-    title={"en": "Routing — PG Primary + ES Index + Parquet Backup"},
-    tags=["storage", "routing", "postgresql", "elasticsearch", "parquet"],
-)
-register_platform_notebook(
     notebook_id="storage_routing_corner_cases_failure_policies_and_hints",
     registered_by=_REG,
     notebook_path=_HERE / "rt02_corner_cases_failure_policies_and_hints.ipynb",

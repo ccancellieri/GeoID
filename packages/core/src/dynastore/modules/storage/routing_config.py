@@ -49,7 +49,7 @@ from dynastore.models.protocols.indexer import (
     CatalogIndexer,
     CollectionIndexer,
 )
-from dynastore.models.mutability import Immutable, Mutable
+from dynastore.models.mutability import Immutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.modules.storage.hints import Hint
 from dynastore.tools.typed_store.base import _to_snake
@@ -110,8 +110,6 @@ class Operation(StrEnum):
     - INDEX     : async post-write propagation to search sinks (ES, vector
                   DB, …).  Entries declare ``transformed: bool``; the
                   ReindexWorker feeds raw or transformed envelopes.
-    - BACKUP    : async post-write propagation to export sinks (Parquet via
-                  DuckDB, NDJSON, …).  Entries declare ``transformed`` + ``fmt``.
 
     Catalog routing (``CatalogRoutingConfig.operations``) — same shape on
     catalog rows.
@@ -131,7 +129,6 @@ class Operation(StrEnum):
     SEARCH = "SEARCH"
     TRANSFORM = "TRANSFORM"
     INDEX = "INDEX"
-    BACKUP = "BACKUP"
     UPLOAD = "UPLOAD"
 
 
@@ -173,8 +170,8 @@ def derive_supported_operations(capabilities: FrozenSet[str]) -> FrozenSet[str]:
     the driver discovery endpoint.
 
     Role-based driver plan additions (new ops): any driver with ``WRITE`` can
-    participate in ``INDEX`` or ``BACKUP`` as an async propagation sink — the
-    role is a config assignment, not a driver-internal contract.
+    participate in ``INDEX`` as an async propagation sink — the role is a
+    config assignment, not a driver-internal contract.
 
     ``Operation.TRANSFORM`` participation is determined by implementing
     :class:`EntityTransformProtocol` rather than via a Capability flag.
@@ -183,9 +180,8 @@ def derive_supported_operations(capabilities: FrozenSet[str]) -> FrozenSet[str]:
     from dynastore.models.protocols.storage_driver import Capability
 
     mapping: Dict[str, Set[str]] = {
-        Capability.WRITE: {Operation.WRITE, Operation.INDEX, Operation.BACKUP},
+        Capability.WRITE: {Operation.WRITE, Operation.INDEX},
         Capability.READ: {Operation.READ, Operation.SEARCH},
-        Capability.EXPORT: {Operation.BACKUP},
     }
     ops: Set[str] = set()
     for cap in capabilities:
@@ -220,14 +216,10 @@ class OperationDriverEntry(BaseModel):
                          class-level ``sla`` ClassVar (if any) is used.  On
                          TRANSFORM entries, either the entry or the class
                          must provide one; CI guard enforces.
-    - ``transformed`` — for INDEX / BACKUP entries: ``True`` means the
-                         ReindexWorker feeds this sink the transformed envelope
-                         (TRANSFORM chain applied); ``False`` means the raw
-                         Primary envelope.  Ignored on other operations.
-    - ``fmt``         — BACKUP only: container format the driver should emit
-                         (``parquet``, ``ndjson``, …).  A backup driver that
-                         supports multiple formats picks the entry matching
-                         the request's ``?format=`` query param.
+    - ``transformed`` — for INDEX entries: ``True`` means the ReindexWorker
+                         feeds this sink the transformed envelope (TRANSFORM
+                         chain applied); ``False`` means the raw Primary
+                         envelope.  Ignored on other operations.
     """
 
     driver_ref: Immutable[str] = Field(
@@ -285,17 +277,9 @@ class OperationDriverEntry(BaseModel):
     transformed: bool = Field(
         default=False,
         description=(
-            "For INDEX / BACKUP entries only: True → ReindexWorker feeds the "
+            "For INDEX entries only: True → ReindexWorker feeds the "
             "transformed envelope (TRANSFORM chain applied); False → raw "
             "Primary envelope.  Ignored on other operations."
-        ),
-    )
-    fmt: Optional[str] = Field(
-        default=None,
-        description=(
-            "BACKUP entries only: container format the driver emits "
-            "(e.g. 'parquet', 'ndjson').  The export endpoint picks the entry "
-            "whose ``fmt`` matches the request's ``?format=`` query param."
         ),
     )
     source: Literal["operator", "auto"] = Field(
@@ -592,7 +576,7 @@ class CollectionRoutingConfig(PluginConfig):
         Drivers that enrich collection metadata.  **Not** invoked on default
         read paths — only when an endpoint opts in (e.g. STAC derived fields)
         or when the async reindex pipeline is preparing an envelope for an
-        INDEX / BACKUP entry marked ``transformed=true``.  Each entry should
+        INDEX entry marked ``transformed=true``.  Each entry should
         carry an SLA; see role-based driver plan §Routing.
 
     ``INDEX`` (optional, async):
@@ -600,11 +584,6 @@ class CollectionRoutingConfig(PluginConfig):
         vector DBs).  Each entry declares ``transformed: bool`` to pick raw
         vs transformed envelopes.  When absent, search falls through to the
         Primary's ``SEARCH`` capability.
-
-    ``BACKUP`` (optional, async):
-        Post-write propagation targets for export sinks (Parquet via DuckDB,
-        NDJSON, …).  Each entry declares ``transformed: bool`` and ``fmt``.
-        Serves ``GET .../backup?format=<fmt>`` endpoints.
 
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
@@ -673,7 +652,7 @@ class CollectionRoutingConfig(PluginConfig):
             "INDEX = async OUTBOX-durable propagation to Elasticsearch. "
             "SEARCH = Elasticsearch primary (geometry_simplified), "
             "PostgreSQL fallback (geometry_exact). "
-            "TRANSFORM/BACKUP entries are auto-augmented at validation time."
+            "TRANSFORM entries are auto-augmented at validation time."
         ),
     )
 
@@ -815,7 +794,7 @@ class CatalogRoutingConfig(PluginConfig):
     explicit platform config.
 
     ``operations`` supports the same keys as :class:`CollectionRoutingConfig`:
-    ``WRITE``, ``READ``, ``SEARCH``, ``TRANSFORM``, ``INDEX``, ``BACKUP``.
+    ``WRITE``, ``READ``, ``SEARCH``, ``TRANSFORM``, ``INDEX``.
     See that class for per-key semantics, with one trigger difference:
     INDEX entries on this config are consumed by
     :class:`~dynastore.modules.catalog.reindex_worker.ReindexWorker` off
@@ -1388,22 +1367,14 @@ async def _validate_collection_routing_config(
                 f"Available: {sorted(driver_index)}"
             )
 
-    # Validate operations[INDEX] and [BACKUP] entries (CollectionStore
-    # search/export sinks — ES for INDEX, Parquet/DuckDB for BACKUP).
-    for op in (Operation.INDEX, Operation.BACKUP):
+    # Validate operations[INDEX] entries (CollectionStore search sinks — ES).
+    for op in (Operation.INDEX,):
         for entry in config.operations.get(op, []):
             if entry.driver_ref not in store_driver_index:
                 raise ValueError(
                     f"Collection metadata routing config: operations[{op}] driver "
                     f"'{entry.driver_ref}' is not registered. "
                     f"Available: {sorted(store_driver_index)}"
-                )
-            if op == Operation.BACKUP and not entry.fmt:
-                logger.info(
-                    "Collection metadata routing config: BACKUP entry '%s' "
-                    "has no fmt; endpoint ?format= query will not be able to "
-                    "target it.",
-                    entry.driver_ref,
                 )
 
     # Auto-register discoverable indexers + searchers — parity with the
@@ -1528,7 +1499,7 @@ async def _validate_catalog_routing_config(
     auto-registers installed store drivers + ``CatalogIndexer`` /
     SEARCH-capable ``CatalogStore`` drivers.  Runs PRE-PERSIST.
 
-    INDEX / BACKUP entries are validated against the same registry — role is a
+    INDEX entries are validated against the same registry — role is a
     config assignment, not a driver-internal contract (see role-based driver
     plan §Routing).
 
@@ -1788,7 +1759,7 @@ def supported_operations(driver: Any) -> FrozenSet[str]:
     1. **Capability-derived operations** — ``derive_supported_operations(
        driver.capabilities)`` translates the driver's ``Capability`` flag set
        into the operations those flags qualify it for (WRITE / READ / SEARCH
-       / INDEX / BACKUP).
+       / INDEX).
     2. **Protocol-derived operations** — operations whose participation is
        expressed by implementing a Protocol rather than by setting a flag.
        Currently only ``Operation.TRANSFORM`` (via

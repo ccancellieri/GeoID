@@ -82,7 +82,7 @@ class EntityStoreCapability:
     SPATIAL_FILTER = "spatial_filter"    # filter by extent bbox / geo_shape
     AGGREGATION = "aggregation"          # faceted counts, stats on metadata fields
     PHYSICAL_ADDRESSING = "physical_addressing"  # driver exposes location()
-    BULK_EXPORT = "bulk_export"          # driver can stream whole partitions (used by BACKUP role)
+    BULK_EXPORT = "bulk_export"          # driver can stream whole partitions
 
     # --- Query fallback ---
     QUERY_FALLBACK_SOURCE = "query_fallback_source"

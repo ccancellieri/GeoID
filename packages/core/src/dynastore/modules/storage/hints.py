@@ -32,8 +32,8 @@ deals with belongs to exactly one of them.
     +===============+==========================+==========================+
     | ``Operation`` | What KIND of work?       | ``Operation`` StrEnum    |
     |               | (verb)                   | (WRITE / READ / SEARCH / |
-    |               |                          | INDEX / BACKUP / UPLOAD  |
-    |               |                          | / TRANSFORM)             |
+    |               |                          | INDEX / UPLOAD /         |
+    |               |                          | TRANSFORM)               |
     +---------------+--------------------------+--------------------------+
     | ``Capability``| What can this driver DO? | ``Capability`` enums on  |
     |               | (structural fact about   | each driver — used by    |
