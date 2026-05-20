@@ -11,6 +11,10 @@
       },
       "pathMappings": [
         {
+          "localRoot": "${workspaceFolder}/.venv/lib/python3.12/site-packages",
+          "remoteRoot": "/opt/venv/lib/python3.12/site-packages"
+        },
+        {
           "localRoot": "${workspaceFolder}",
           "remoteRoot": "/dynastore"
         }
@@ -56,6 +60,22 @@
       "connect": {
         "host": "localhost",
         "port": 5681
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/dynastore"
+        }
+      ],
+      "justMyCode": false
+    },
+    {
+      "name": "GeoID Auth: Remote Attach",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 5682
       },
       "pathMappings": [
         {
