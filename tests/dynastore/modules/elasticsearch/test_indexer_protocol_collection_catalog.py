@@ -24,9 +24,6 @@ from dynastore.modules.elasticsearch.collection_es_driver import (
 from dynastore.modules.storage.drivers.elasticsearch import (
     AssetElasticsearchDriver,
 )
-from dynastore.modules.storage.drivers.elasticsearch_private.collection_driver import (
-    CollectionElasticsearchPrivateDriver,
-)
 
 
 def _ctx(catalog: str = "cat-x", collection: str | None = "col-y") -> Any:
@@ -282,85 +279,6 @@ async def test_catalog_index_bulk_aggregates_per_op_results():
     assert result.failed == 0
     assert {u[0] for u in d.upserts} == {"cat-a", "cat-b"}
 
-
-# ---------------------------------------------------------------------------
-# CollectionElasticsearchPrivateDriver — #559: assert dispatch through the
-# *inherited* index/index_bulk/ensure_indexer lands on the per-tenant
-# overrides (ensure_storage / upsert_metadata / delete_metadata).
-# ---------------------------------------------------------------------------
-
-
-class _CollectionPrivateDriverStub(CollectionElasticsearchPrivateDriver):
-    """Mirror of :class:`_CollectionDriverStub` for the private subclass.
-
-    Asserts the inherited Indexer Protocol methods reach the *private*
-    storage hooks rather than the public parent's, i.e. that the
-    subclass's per-tenant index resolution is what actually runs.
-    """
-
-    def __init__(self) -> None:
-        self.upserts: List[tuple] = []
-        self.deletes: List[tuple] = []
-        self.ensured: List[str] = []
-
-    async def ensure_storage(self, catalog_id: str) -> None:  # type: ignore[override]
-        self.ensured.append(catalog_id)
-
-    async def upsert_metadata(  # type: ignore[override]
-        self, catalog_id: str, collection_id: str,
-        metadata: Dict[str, Any], *, db_resource: Any = None,
-    ) -> None:
-        self.upserts.append((catalog_id, collection_id, metadata))
-
-    async def delete_metadata(  # type: ignore[override]
-        self, catalog_id: str, collection_id: str, *,
-        soft: bool = False, db_resource: Any = None,
-    ) -> None:
-        self.deletes.append((catalog_id, collection_id))
-
-
-@pytest.mark.asyncio
-async def test_collection_private_index_upsert_routes_via_inherited_dispatch():
-    d = _CollectionPrivateDriverStub()
-    await d.index(_ctx(), _op("upsert", "col-y", {"title": "Priv"}))
-    assert d.upserts == [("cat-x", "col-y", {"title": "Priv"})]
-    assert d.deletes == []
-
-
-@pytest.mark.asyncio
-async def test_collection_private_index_delete_routes_via_inherited_dispatch():
-    d = _CollectionPrivateDriverStub()
-    await d.index(_ctx(), _op("delete", "col-y"))
-    assert d.deletes == [("cat-x", "col-y")]
-    assert d.upserts == []
-
-
-@pytest.mark.asyncio
-async def test_collection_private_index_rejects_unknown_op_type():
-    d = _CollectionPrivateDriverStub()
-    with pytest.raises(ValueError, match="unsupported op_type"):
-        await d.index(_ctx(), _op("noop", "col-y"))
-
-
-@pytest.mark.asyncio
-async def test_collection_private_index_bulk_aggregates_per_op_results():
-    d = _CollectionPrivateDriverStub()
-    result = await d.index_bulk(_ctx(), [
-        _op("upsert", "col-a"),
-        _op("delete", "col-b"),
-    ])
-    assert result.total == 2
-    assert result.succeeded == 2
-    assert result.failed == 0
-    assert d.upserts == [("cat-x", "col-a", {"title": "T"})]
-    assert d.deletes == [("cat-x", "col-b")]
-
-
-@pytest.mark.asyncio
-async def test_collection_private_ensure_indexer_delegates_to_ensure_storage():
-    d = _CollectionPrivateDriverStub()
-    await d.ensure_indexer(_ctx("cat-z"))
-    assert d.ensured == ["cat-z"]
 
 
 # ---------------------------------------------------------------------------

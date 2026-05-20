@@ -311,24 +311,6 @@ def get_assets_index_name(prefix: str, catalog_id: str) -> str:
     return f"{prefix}-{catalog_id}-assets"
 
 
-def get_tenant_collections_private_index(prefix: str, catalog_id: str) -> str:
-    """Per-catalog private collection-envelope index (Cycle E.2.b)."""
-    return f"{prefix}-{catalog_id}-collections-private"
-
-
-def get_tenant_catalog_private_index(prefix: str, catalog_id: str) -> str:
-    """Per-catalog private catalog-envelope index (#960).
-
-    Each catalog gets its own private index containing its single catalog
-    document — keeps the catalog metadata out of the shared
-    ``{prefix}-catalogs`` index when the operator pins
-    ``catalog_elasticsearch_private_driver`` in
-    :class:`CatalogRoutingConfig`. The catalog-wide DENY policy applied
-    by the items-private driver covers reads against this index too
-    (URL pattern matches ``/.../catalogs/{cat}`` with optional suffix).
-    """
-    return f"{prefix}-{catalog_id}-catalog-private"
-
 
 def get_log_index_name(prefix: str) -> str:
     """Return the name of the logs index."""

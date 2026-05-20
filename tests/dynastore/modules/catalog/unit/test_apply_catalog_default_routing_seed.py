@@ -24,16 +24,38 @@ import pytest
 
 from dynastore.modules.catalog.catalog_config import (
     CatalogRoutingTemplates,
-    _build_private_collection_routing,
     _build_private_items_routing,
     apply_catalog_default_routing_seed,
 )
 from dynastore.modules.storage.routing_config import (
     CatalogRoutingDefaults,
     CollectionRoutingConfig,
+    FailurePolicy,
     ItemsRoutingConfig,
     Operation,
+    OperationDriverEntry,
 )
+
+
+def _pg_only_collection_routing() -> CollectionRoutingConfig:
+    """PG-only collection routing — used as the collection template for
+    private catalogs after #1047 dropped the collection-private ES driver."""
+    return CollectionRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+        },
+    )
 
 
 def _configs_returning(policy_or_none) -> MagicMock:
@@ -47,7 +69,7 @@ def _private_default_catalog_routing_templates() -> CatalogRoutingTemplates:
     return CatalogRoutingTemplates(
         collection_defaults=CatalogRoutingDefaults(
             items_routing=_build_private_items_routing(),
-            collection_routing=_build_private_collection_routing(),
+            collection_routing=_pg_only_collection_routing(),
         ),
     )
 
@@ -96,10 +118,8 @@ async def test_seed_noop_when_get_config_raises():
 
 
 @pytest.mark.asyncio
-async def test_seed_writes_both_routings_in_cascade_satisfying_order():
-    """Both templates set → both routings written.  Items first so the
-    cascade validator on the second write finds the items-private
-    driver already pinned."""
+async def test_seed_writes_both_routings_items_first():
+    """Both templates set → both routings written. Items first."""
     proto = _configs_returning(_private_default_catalog_routing_templates())
     applied = await apply_catalog_default_routing_seed(
         "cat-a", "col-a", configs=proto,
@@ -112,9 +132,7 @@ async def test_seed_writes_both_routings_in_cascade_satisfying_order():
         for i in range(2)
     ]
     assert classes_in_order[0] is ItemsRoutingConfig, (
-        "Items routing must land FIRST so the cascade validator on the "
-        "CollectionRoutingConfig apply finds the items-private driver "
-        "already pinned."
+        "Items routing must land FIRST."
     )
     assert classes_in_order[1] is CollectionRoutingConfig
 
@@ -128,11 +146,9 @@ async def test_seed_writes_both_routings_in_cascade_satisfying_order():
         for e in entries
     }
     assert "items_elasticsearch_private_driver" in items_pinned
-    # Public driver MUST NOT be pinned — privacy safety.
     assert "items_elasticsearch_driver" not in items_pinned
 
-    # The collection-routing payload must pin the collection-envelope
-    # private driver — same privacy-safety property.
+    # Collection routing is PG-only — no ES private index.
     coll_routing: CollectionRoutingConfig = (
         proto.set_config.await_args_list[1].args[1]
     )
@@ -141,12 +157,9 @@ async def test_seed_writes_both_routings_in_cascade_satisfying_order():
         for entries in coll_routing.operations.values()
         for e in entries
     }
-    assert "collection_elasticsearch_private_driver" in coll_pinned
-    assert "collection_elasticsearch_driver" not in coll_pinned, (
-        "Privacy safety: seed must NOT pin the PUBLIC collection ES "
-        "driver — that would put the envelope into the shared "
-        "{prefix}-collections index."
-    )
+    assert "collection_postgresql_driver" in coll_pinned
+    assert "collection_elasticsearch_private_driver" not in coll_pinned
+    assert "collection_elasticsearch_driver" not in coll_pinned
 
 
 @pytest.mark.asyncio
@@ -175,7 +188,7 @@ async def test_seed_writes_only_collection_when_only_collection_template_set():
     policy = CatalogRoutingTemplates(
         collection_defaults=CatalogRoutingDefaults(
             items_routing=None,
-            collection_routing=_build_private_collection_routing(),
+            collection_routing=_pg_only_collection_routing(),
         ),
     )
     proto = _configs_returning(policy)
@@ -201,7 +214,7 @@ async def test_seed_passes_catalog_and_collection_ids_through_to_set_config():
 
 @pytest.mark.asyncio
 async def test_seed_routing_payload_has_postgresql_in_write_for_durability():
-    """WRITE without PG = no SoR.  The default items template pins PG
+    """WRITE without PG = no SoR. The default items template pins PG
     WRITE (FATAL) + private ES (ASYNC + OUTBOX) so a private collection
     still has a durable write target."""
     proto = _configs_returning(_private_default_catalog_routing_templates())

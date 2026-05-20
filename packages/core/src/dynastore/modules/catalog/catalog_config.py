@@ -101,11 +101,10 @@ class CollectionPluginConfig(PluginConfig):
     (``plugin_id = "items_routing_config"``).
 
     Privacy is no longer expressed as a dedicated flag (#733). A collection
-    is "private" iff its routing configs pin the private driver variants:
-    ``items_elasticsearch_private_driver`` in ``ItemsRoutingConfig`` and/or
-    ``collection_elasticsearch_private_driver`` in ``CollectionRoutingConfig``.
-    The cascade rule (collection-private requires items-private) is enforced
-    by validate handlers registered on the two routing configs themselves.
+    is "private" iff its items routing config pins
+    ``items_elasticsearch_private_driver`` in ``ItemsRoutingConfig``.
+    Collection envelopes for private catalogs are stored in PostgreSQL only
+    — no ES collection-private index (#1047).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "envelope")
     _visibility: ClassVar[Optional[str]] = "collection"
@@ -147,11 +146,8 @@ class CatalogRoutingTemplates(PluginConfig):
 
     Per-collection privacy is no longer a flag (#733 retired the
     ``CollectionPrivacy.is_private`` field): a collection is "private"
-    iff its routing configs pin ``items_elasticsearch_private_driver``
-    and/or ``collection_elasticsearch_private_driver``. Mid-lifecycle
-    operators flip privacy by editing those routing configs directly —
-    the cascade validator on the routing configs guarantees a sound
-    combination.
+    iff its items routing config pins ``items_elasticsearch_private_driver``.
+    Collection envelopes are PG-only for private catalogs (#1047).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "routing", "templates")
     _visibility: ClassVar[Optional[str]] = "catalog"
@@ -174,66 +170,8 @@ class CatalogRoutingTemplates(PluginConfig):
 # CatalogLookupAudience moved to packages/extensions/geoid/.../configs.py
 
 # ---------------------------------------------------------------------------
-# #733 — collection-create routing seed flow
+# #733 — items-create routing seed flow
 # ---------------------------------------------------------------------------
-
-
-def _build_private_collection_routing() -> Any:
-    """Build the ``CollectionRoutingConfig`` seeded onto a private collection.
-
-    ``collection_router.py`` is config-driven: it resolves WRITE/READ/SEARCH
-    from ``CollectionRoutingConfig``, falling back to the model defaults
-    (public PG + public ES) when no explicit config is present.  All four
-    operations must therefore be pinned explicitly:
-
-    - WRITE / READ → ``collection_postgresql_driver`` (PG is the system of
-      record for collection envelopes; durable, strongly consistent).
-    - INDEX / SEARCH → ``collection_elasticsearch_private_driver`` (per-tenant
-      private index; DENY policy blocks ``all_users`` GET access).
-
-    Without an explicit SEARCH entry a private collection's
-    ``search_collection_metadata`` call would fall through to the model
-    default ``collection_elasticsearch_driver`` — the PUBLIC shared index —
-    leaking private collection envelopes into public search results.
-    """
-    from dynastore.modules.storage.routing_config import (
-        CollectionRoutingConfig,
-        FailurePolicy,
-        Operation,
-        OperationDriverEntry,
-        WriteMode,
-    )
-
-    return CollectionRoutingConfig(
-        operations={
-            Operation.WRITE: [
-                OperationDriverEntry(
-                    driver_ref="collection_postgresql_driver",
-                    on_failure=FailurePolicy.FATAL,
-                ),
-            ],
-            Operation.READ: [
-                OperationDriverEntry(
-                    driver_ref="collection_postgresql_driver",
-                    on_failure=FailurePolicy.FATAL,
-                ),
-            ],
-            Operation.INDEX: [
-                OperationDriverEntry(
-                    driver_ref="collection_elasticsearch_private_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    source="auto",
-                ),
-            ],
-            Operation.SEARCH: [
-                OperationDriverEntry(
-                    driver_ref="collection_elasticsearch_private_driver",
-                    source="auto",
-                ),
-            ],
-        },
-    )
 
 
 def _build_private_items_routing() -> Any:
@@ -292,65 +230,6 @@ def _build_private_items_routing() -> Any:
         },
     )
 
-
-def _build_private_catalog_routing() -> Any:
-    """Build the catalog-tier ``CatalogRoutingConfig`` that pins
-    ``catalog_elasticsearch_private_driver`` (#960).
-
-    Operators / seed JSONs use this helper to opt into per-tenant
-    catalog-envelope isolation: the catalog metadata document lands in
-    the per-tenant ``{prefix}-{catalog_id}-catalog-private`` index
-    instead of the shared ``{prefix}-catalogs``.
-
-    Mirror of :func:`_build_private_items_routing` /
-    :func:`_build_private_collection_routing`.  WRITE/READ remain pinned
-    on ``catalog_postgresql_driver`` (system of record); INDEX/SEARCH
-    flip to the private ES driver.
-
-    Note: DENY-policy ownership stays with
-    ``items_elasticsearch_private_driver``.  Pin catalog-private without
-    any items-private collection in the catalog and the catalog endpoint
-    is reachable publicly through other read paths — pair this template
-    with private items-or-collection routing for full read protection.
-    """
-    from dynastore.modules.storage.routing_config import (
-        CatalogRoutingConfig,
-        FailurePolicy,
-        Operation,
-        OperationDriverEntry,
-        WriteMode,
-    )
-
-    return CatalogRoutingConfig(
-        operations={
-            Operation.WRITE: [
-                OperationDriverEntry(
-                    driver_ref="catalog_postgresql_driver",
-                    on_failure=FailurePolicy.FATAL,
-                ),
-            ],
-            Operation.READ: [
-                OperationDriverEntry(
-                    driver_ref="catalog_postgresql_driver",
-                    on_failure=FailurePolicy.FATAL,
-                ),
-            ],
-            Operation.INDEX: [
-                OperationDriverEntry(
-                    driver_ref="catalog_elasticsearch_private_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    source="auto",
-                ),
-            ],
-            Operation.SEARCH: [
-                OperationDriverEntry(
-                    driver_ref="catalog_elasticsearch_private_driver",
-                    source="auto",
-                ),
-            ],
-        },
-    )
 
 
 async def apply_catalog_default_routing_seed(
@@ -442,46 +321,28 @@ def _items_template_has_private_driver(items_template: Any) -> bool:
     return False
 
 
-def _collection_template_has_private_driver(coll_template: Any) -> bool:
-    """Return True iff the embedded collection-routing template pins the
-    collection-private driver in any operation."""
-    if coll_template is None:
-        return False
-    from dynastore.modules.storage.routing_config import (
-        _PRIVATE_COLLECTION_DRIVER_ID,
-    )
-    for entries in coll_template.operations.values():
-        for entry in entries:
-            if entry.driver_ref == _PRIVATE_COLLECTION_DRIVER_ID:
-                return True
-    return False
-
-
 async def _on_apply_catalog_routing_templates(
     config: "CatalogRoutingTemplates",
     catalog_id: Optional[str],
     collection_id: Optional[str],
     db_resource: Any,
 ) -> None:
-    """Eagerly create per-tenant private indexes when the catalog's
-    routing-seed templates pin private driver variants (#733).
+    """Eagerly create per-tenant private items indexes when the catalog's
+    routing-seed template pins the items-private driver (#733).
 
     When ``collection_defaults.items_routing`` pins
     ``items_elasticsearch_private_driver``, call ``ensure_storage(catalog_id)``
-    on every tenant-isolated ``CollectionItemsStore`` (the items-private
-    driver). When ``collection_defaults.collection_routing`` pins
-    ``collection_elasticsearch_private_driver``, do the same on every
-    tenant-isolated ``CollectionStore`` (the collection-private driver).
+    on every tenant-isolated ``CollectionItemsStore`` (the items-private driver).
 
-    Idempotent — both drivers' ``ensure_storage`` swallow
+    Idempotent — the driver's ``ensure_storage`` swallows
     ``resource_already_exists`` so re-applying the same policy is a no-op
     at the ES layer.
 
     No-op when:
 
-    - Neither template is set, or neither template pins a private driver;
+    - The items template is not set or does not pin the private driver;
     - ``catalog_id`` is ``None`` (platform-tier write — no tenant to bootstrap);
-    - The relevant private driver isn't installed (deployment SCOPE excludes
+    - The items-private driver isn't installed (deployment SCOPE excludes
       ``elasticsearch_private``).
     """
     import logging
@@ -490,48 +351,25 @@ async def _on_apply_catalog_routing_templates(
     if not catalog_id:
         return
 
-    items_private = _items_template_has_private_driver(
-        config.collection_defaults.items_routing,
-    )
-    coll_private = _collection_template_has_private_driver(
-        config.collection_defaults.collection_routing,
-    )
-    if not (items_private or coll_private):
+    if not _items_template_has_private_driver(config.collection_defaults.items_routing):
         return
 
     from dynastore.tools.discovery import get_protocols
-    from dynastore.models.protocols.entity_store import (
-        CollectionStore,
-        EntityStoreCapability,
-    )
     from dynastore.models.protocols.storage_driver import (
         Capability,
         CollectionItemsStore,
     )
 
-    if items_private:
-        for d in get_protocols(CollectionItemsStore):
-            if Capability.TENANT_ISOLATED not in getattr(d, "capabilities", frozenset()):
-                continue
-            try:
-                await d.ensure_storage(catalog_id)
-            except Exception as exc:
-                logger.warning(
-                    "CatalogRoutingTemplates apply: items ensure_storage(%r) on %s failed: %s",
-                    catalog_id, type(d).__name__, exc,
-                )
-
-    if coll_private:
-        for d in get_protocols(CollectionStore):
-            if EntityStoreCapability.TENANT_ISOLATED not in getattr(d, "capabilities", frozenset()):
-                continue
-            try:
-                await d.ensure_storage(catalog_id)
-            except Exception as exc:
-                logger.warning(
-                    "CatalogRoutingTemplates apply: collection ensure_storage(%r) on %s failed: %s",
-                    catalog_id, type(d).__name__, exc,
-                )
+    for d in get_protocols(CollectionItemsStore):
+        if Capability.TENANT_ISOLATED not in getattr(d, "capabilities", frozenset()):
+            continue
+        try:
+            await d.ensure_storage(catalog_id)
+        except Exception as exc:
+            logger.warning(
+                "CatalogRoutingTemplates apply: items ensure_storage(%r) on %s failed: %s",
+                catalog_id, type(d).__name__, exc,
+            )
 
 
 CatalogRoutingTemplates.register_apply_handler(_on_apply_catalog_routing_templates)

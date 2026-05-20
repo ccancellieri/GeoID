@@ -269,8 +269,7 @@ class ElasticsearchEngineConfig(EngineConfig):
     Drivers (``items_elasticsearch_driver``,
     ``items_elasticsearch_private_driver``,
     ``catalog_elasticsearch_driver``,
-    ``collection_elasticsearch_driver``,
-    ``collection_elasticsearch_private_driver``) reference this engine
+    ``collection_elasticsearch_driver``) reference this engine
     via ``engine_ref`` (F.2).
     """
 

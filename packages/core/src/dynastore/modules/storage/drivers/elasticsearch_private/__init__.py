@@ -13,9 +13,12 @@
 #    limitations under the License.
 
 """
-Private Elasticsearch storage driver subpackage — self-contained.
+Private Elasticsearch storage driver subpackage — items-tier only.
 
-Exports the driver class plus its companion entity-transformer. The
+Private indexing applies to items only. Catalog and collection envelopes
+are PG-only for private catalogs — no ES private index at those tiers.
+
+Exports the items driver class plus its companion entity-transformer. The
 driver and the transformer are SEPARATE classes registered separately
 in routing-config so the transformer can be reused with non-ES indexers
 in the future.
@@ -25,12 +28,6 @@ Disabling the private-indexing feature in a deployment = removing the
 needs to change.
 """
 
-from dynastore.modules.storage.drivers.elasticsearch_private.catalog_driver import (
-    CatalogElasticsearchPrivateDriver,
-)
-from dynastore.modules.storage.drivers.elasticsearch_private.collection_driver import (
-    CollectionElasticsearchPrivateDriver,
-)
 from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
     ItemsElasticsearchPrivateDriver,
 )
@@ -39,8 +36,6 @@ from dynastore.modules.storage.drivers.elasticsearch_private.transformer import 
 )
 
 __all__ = [
-    "CatalogElasticsearchPrivateDriver",
-    "CollectionElasticsearchPrivateDriver",
     "ItemsElasticsearchPrivateDriver",
     "PrivateEntityTransformer",
 ]

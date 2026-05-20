@@ -1,13 +1,12 @@
-"""#733 — pin the cascade-aware ``_restore_deny_policies`` behaviour on
-the items-private driver.
+"""#733, #1047 — pin the cascade-aware ``_restore_deny_policies`` behaviour
+on the items-private driver.
 
-Privacy is now expressed via the routing configs themselves: a collection
-is "private" iff its ``ItemsRoutingConfig`` pins
-``items_elasticsearch_private_driver`` or its ``CollectionRoutingConfig``
-pins ``collection_elasticsearch_private_driver``.  The lifespan startup
-hook scans each catalog's collections and re-applies the catalog-wide
-DENY policy idempotently for any catalog with at least one such
-collection.
+After #1047 Phase 2, privacy is expressed solely via
+``items_elasticsearch_private_driver`` in ``ItemsRoutingConfig``.
+Collection-envelope privacy via a separate ES driver is removed.
+The lifespan startup hook scans each catalog's collections and
+re-applies the catalog-wide DENY policy idempotently for any catalog
+with at least one private-items collection.
 
 These tests exercise the static helper
 ``_catalog_has_private_collection`` directly (pure logic, fully
@@ -25,7 +24,6 @@ from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
     ItemsElasticsearchPrivateDriver,
 )
 from dynastore.modules.storage.routing_config import (
-    CollectionRoutingConfig,
     FailurePolicy,
     ItemsRoutingConfig,
     Operation,
@@ -77,32 +75,6 @@ def _items_public_routing() -> ItemsRoutingConfig:
         },
     )
 
-
-def _coll_private_routing() -> CollectionRoutingConfig:
-    return CollectionRoutingConfig(
-        operations={
-            Operation.INDEX: [
-                OperationDriverEntry(
-                    driver_ref="collection_elasticsearch_private_driver",
-                    on_failure=FailurePolicy.OUTBOX,
-                    write_mode=WriteMode.ASYNC,
-                ),
-            ],
-        },
-    )
-
-
-def _coll_public_routing() -> CollectionRoutingConfig:
-    return CollectionRoutingConfig(
-        operations={
-            Operation.WRITE: [
-                OperationDriverEntry(
-                    driver_ref="collection_postgresql_driver",
-                    on_failure=FailurePolicy.FATAL,
-                ),
-            ],
-        },
-    )
 
 
 def _catalogs_proto_with(
@@ -166,35 +138,16 @@ async def test_helper_returns_true_when_items_routing_pins_private_driver():
 
 
 @pytest.mark.asyncio
-async def test_helper_returns_true_when_only_collection_routing_pins_private_driver():
-    """A collection that pins the collection-private driver but leaves
-    items routing public is still "private" for DENY-scan purposes —
-    the catalog-wide DENY covers the envelope path."""
-    catalogs_proto = _catalogs_proto_with(
-        [_stub_catalog("cat-a")],
-        {"cat-a": [_stub_collection("col-envelope-private")]},
-    )
-    configs = _configs_proto_with_routing({
-        ("cat-a", "col-envelope-private", "ItemsRoutingConfig"): _items_public_routing(),
-        ("cat-a", "col-envelope-private", "CollectionRoutingConfig"): _coll_private_routing(),
-    })
-    result = await ItemsElasticsearchPrivateDriver._catalog_has_private_collection(
-        catalogs_proto, configs, "cat-a",
-    )
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_helper_returns_false_when_all_collections_public():
+async def test_helper_returns_false_when_all_collections_items_public():
+    """After #1047 Phase 2, only items routing is checked — collection
+    routing is not scanned for the DENY decision."""
     catalogs_proto = _catalogs_proto_with(
         [_stub_catalog("cat-a")],
         {"cat-a": [_stub_collection("col-1"), _stub_collection("col-2")]},
     )
     configs = _configs_proto_with_routing({
         ("cat-a", "col-1", "ItemsRoutingConfig"): _items_public_routing(),
-        ("cat-a", "col-1", "CollectionRoutingConfig"): _coll_public_routing(),
         ("cat-a", "col-2", "ItemsRoutingConfig"): _items_public_routing(),
-        ("cat-a", "col-2", "CollectionRoutingConfig"): _coll_public_routing(),
     })
     result = await ItemsElasticsearchPrivateDriver._catalog_has_private_collection(
         catalogs_proto, configs, "cat-a",
@@ -230,8 +183,7 @@ async def test_helper_returns_false_on_list_collections_exception():
 @pytest.mark.asyncio
 async def test_helper_skips_collection_when_get_config_raises():
     """A transient items-routing lookup failure must not stop the scan
-    — it should still check collection-routing for that same collection
-    AND the other collections."""
+    — it should still check the other collections."""
     catalogs_proto = _catalogs_proto_with(
         [_stub_catalog("cat-a")],
         {"cat-a": [_stub_collection("col-bad"), _stub_collection("col-good")]},
@@ -261,7 +213,6 @@ async def test_helper_paginates_through_collections():
     routing_map: Dict[tuple, object] = {}
     for c in cols:
         routing_map[("cat-big", c.id, "ItemsRoutingConfig")] = _items_public_routing()
-        routing_map[("cat-big", c.id, "CollectionRoutingConfig")] = _coll_public_routing()
     # Only the very last is private (via items routing).
     routing_map[("cat-big", "col-249", "ItemsRoutingConfig")] = _items_private_routing()
 
@@ -295,9 +246,7 @@ async def test_restore_applies_deny_only_for_catalogs_with_private_collections()
     configs = _configs_proto_with_routing({
         ("cat-private", "col-secret", "ItemsRoutingConfig"): _items_private_routing(),
         ("cat-public", "col-1", "ItemsRoutingConfig"): _items_public_routing(),
-        ("cat-public", "col-1", "CollectionRoutingConfig"): _coll_public_routing(),
         ("cat-public", "col-2", "ItemsRoutingConfig"): _items_public_routing(),
-        ("cat-public", "col-2", "CollectionRoutingConfig"): _coll_public_routing(),
     })
 
     # Patch get_protocol so the lifespan helper resolves both protos.

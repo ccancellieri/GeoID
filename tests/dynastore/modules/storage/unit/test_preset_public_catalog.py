@@ -6,8 +6,6 @@ from dynastore.modules.storage.routing_config import (
     CatalogRoutingConfig,
     CollectionRoutingConfig,
     ItemsRoutingConfig,
-    _catalog_routing_has_private_driver,
-    _collection_routing_has_private_driver,
     _items_routing_has_private_driver,
 )
 
@@ -26,10 +24,8 @@ def test_public_catalog_bundle_shape():
     assert bundle.audience_configs == {}
 
 
-def test_public_catalog_pins_only_public_drivers():
+def test_public_catalog_items_not_private():
     bundle = get_preset("public_catalog").build("cat-pub")
-    assert not _catalog_routing_has_private_driver(bundle.catalog_routing)
-    assert not _collection_routing_has_private_driver(bundle.collection_template)
     assert not _items_routing_has_private_driver(bundle.items_template)
 
 

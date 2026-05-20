@@ -21,7 +21,7 @@ appropriate per-tier routing config (`ItemsRoutingConfig` / `CollectionRoutingCo
 | `protocol.py` | Re-export convenience for `CollectionItemsStore` and friends |
 | `drivers/postgresql.py` | `ItemsPostgresqlDriver` — items-tier durability primary |
 | `drivers/elasticsearch.py` | `ItemsElasticsearchDriver` + `AssetElasticsearchDriver` — public per-tenant indexes |
-| `drivers/elasticsearch_private/` | `ItemsElasticsearchPrivateDriver` + `CollectionElasticsearchPrivateDriver` — DENY-policied per-tenant private indexes |
+| `drivers/elasticsearch_private/` | `ItemsElasticsearchPrivateDriver` — DENY-policied per-tenant private items index (items tier only; catalog/collection envelopes are PG-only for private catalogs) |
 | `drivers/iceberg.py` | `ItemsIcebergDriver` — OTF (snapshots, time-travel, schema evolution) |
 | `drivers/duckdb.py` | `ItemsDuckdbDriver` — file-based analytical reads |
 | `drivers/core_postgresql.py` / `collection_postgresql.py` / `catalog_postgresql.py` | per-tier PG drivers |
@@ -88,11 +88,11 @@ On `ensure_storage`, applies a catalog-wide DENY policy (`private_deny_{cat}`) b
 read access. `auto_register_for_routing = frozenset()` — pinning this driver in a routing config
 is itself the privacy switch (#733 retired the standalone `CollectionPrivacy.is_private` flag).
 
-### `collection_elasticsearch_driver` / `collection_elasticsearch_private_driver`
+### `collection_elasticsearch_driver`
 
-Public + private collection-envelope drivers. Mirror the items pair but write collection envelopes
-to `{prefix}-collections` (public, shared) or `{prefix}-{catalog_id}-collections-private` (private,
-per-tenant).
+Public collection-envelope driver. Writes collection envelopes to `{prefix}-collections` (shared
+global index). Private catalogs do not use ES for collection envelopes — their collections are
+PG-only (see #1047).
 
 ### `items_iceberg_driver` (`ItemsIcebergDriver`)
 
@@ -118,7 +118,7 @@ Built-in presets (in `presets/`):
 | Name | Composition |
 |------|-------------|
 | `public_catalog` | PG-first storage + public ES indexers on catalog/collection/items. No audience opt-ins; anonymous traffic is gated by the platform's default `public_access` policy. |
-| `private_catalog` | PG-first storage + per-tenant private ES indexers on all three tiers. No audience opt-ins; the `private_deny_{catalog_id}` policy blocks anonymous reads on the envelope + item URLs. |
+| `private_catalog` | PG-only catalog/collection envelopes + per-tenant private ES indexer on the items tier. No audience opt-ins; the `private_deny_{catalog_id}` policy blocks anonymous reads on item URL patterns. |
 | `geoid` (extension) | Composes `private_catalog` and adds `CatalogLookupAudience.is_public=True` + `CollectionWriteAudience.allow_anonymous_create=True` — flagship FAO GeoID profile: private storage, anonymous lookup + intake. Registered by `dynastore.extensions.geoid` on import. |
 
 Operator API:
@@ -130,9 +130,7 @@ DELETE /admin/catalogs/{catalog_id}/presets/{name}          # unapply (#971)
 ```
 
 Each `POST` call sets `CatalogRoutingConfig`, the collection + items
-templates, and any audience configs at the catalog tier. The catalog-tier
-cascade validator (#960 scope 4) and the existing items/collection cascade
-handlers catch mixed public/private combos before persistence.
+templates, and any audience configs at the catalog tier.
 
 Adding a preset: implement the `RoutingPreset` protocol (`name`,
 `description`, `build(catalog_id) -> PresetBundle`) and call

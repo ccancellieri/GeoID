@@ -11,11 +11,7 @@ from dynastore.modules.iam.audience_configs import (
     CollectionWriteAudience,
 )
 from dynastore.modules.storage.presets import get_preset
-from dynastore.modules.storage.routing_config import (
-    _catalog_routing_has_private_driver,
-    _collection_routing_has_private_driver,
-    _items_routing_has_private_driver,
-)
+from dynastore.modules.storage.routing_config import _items_routing_has_private_driver
 
 
 def test_geoid_preset_registered():
@@ -35,11 +31,28 @@ def test_geoid_bundle_inherits_private_catalog_routing():
     assert geoid.items_template == priv.items_template
 
 
-def test_geoid_routing_remains_private_on_all_tiers():
+def test_geoid_items_routing_is_private():
+    """Items tier must pin the private ES driver — catalog/collection envelopes
+    are PG-only (#1047)."""
     bundle = get_preset("geoid").build("cat-fao")
-    assert _catalog_routing_has_private_driver(bundle.catalog_routing)
-    assert _collection_routing_has_private_driver(bundle.collection_template)
     assert _items_routing_has_private_driver(bundle.items_template)
+
+
+def test_geoid_catalog_collection_routing_pg_only():
+    """Catalog and collection envelopes are PG-only for the geoid preset."""
+    bundle = get_preset("geoid").build("cat-fao")
+    cat_refs = [
+        e.driver_ref
+        for entries in bundle.catalog_routing.operations.values()
+        for e in entries
+    ]
+    assert "catalog_elasticsearch_private_driver" not in cat_refs
+    coll_refs = [
+        e.driver_ref
+        for entries in bundle.collection_template.operations.values()
+        for e in entries
+    ]
+    assert "collection_elasticsearch_private_driver" not in coll_refs
 
 
 def test_geoid_audience_configs_open_anonymous_lookup_and_write():

@@ -665,19 +665,15 @@ class ItemsElasticsearchPrivateDriver(
         configs: Any,
         catalog_id: str,
     ) -> bool:
-        """Return True iff any collection of the catalog has a routing
-        config pinning a private driver (#733).
+        """Return True iff any collection of the catalog has an items routing
+        config pinning ``items_elasticsearch_private_driver`` (#733, #1047).
 
-        A collection is considered private when EITHER its
-        ``ItemsRoutingConfig`` pins ``items_elasticsearch_private_driver``
-        OR its ``CollectionRoutingConfig`` pins
-        ``collection_elasticsearch_private_driver``.  Iterates collections
-        in batches.
+        Collection-envelope privacy via a separate ES driver is no longer
+        supported (#1047 Phase 2). Only items-level private routing is checked.
+        Iterates collections in batches.
         """
         from dynastore.modules.storage.routing_config import (
-            CollectionRoutingConfig,
             ItemsRoutingConfig,
-            _collection_routing_has_private_driver,
             _items_routing_has_private_driver,
         )
 
@@ -704,17 +700,6 @@ class ItemsElasticsearchPrivateDriver(
                     items_routing = None
                 if isinstance(items_routing, ItemsRoutingConfig) and (
                     _items_routing_has_private_driver(items_routing)
-                ):
-                    return True
-                try:
-                    coll_routing = await configs.get_config(
-                        CollectionRoutingConfig,
-                        catalog_id=catalog_id, collection_id=col_id,
-                    )
-                except Exception:
-                    coll_routing = None
-                if isinstance(coll_routing, CollectionRoutingConfig) and (
-                    _collection_routing_has_private_driver(coll_routing)
                 ):
                     return True
             if len(collections) < batch:

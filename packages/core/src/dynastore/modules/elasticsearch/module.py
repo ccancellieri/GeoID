@@ -199,15 +199,13 @@ class ElasticsearchModule(ModuleProtocol):
     in parallel to the canonical rails and was the source of the misleading
     "Indexing collection …" log line that surfaced #810.
 
-    Privacy is per-collection (#733) — expressed via the presence of
-    ``items_elasticsearch_private_driver`` /
-    ``collection_elasticsearch_private_driver`` in the per-collection
-    ``ItemsRoutingConfig`` / ``CollectionRoutingConfig``. Each private
-    driver owns its per-tenant index plus DENY policy management. This
-    module no longer carries catalog-wide private-mode toggles; the
-    catalog-tier ``CatalogRoutingTemplates.collection_defaults.{items_routing,
-    collection_routing}`` templates only seed routing for newly-created
-    collections.
+    Privacy is per-collection (#733, #1047) — expressed via the presence of
+    ``items_elasticsearch_private_driver`` in the per-collection
+    ``ItemsRoutingConfig``. The items-private driver owns its per-tenant
+    index plus DENY policy management. Collection and catalog envelopes for
+    private catalogs are PG-only — no ES private index at those tiers (#1047).
+    The catalog-tier ``CatalogRoutingTemplates.collection_defaults.items_routing``
+    template seeds items routing for newly-created collections.
     """
 
     priority: int = 50

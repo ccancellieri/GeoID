@@ -83,14 +83,13 @@ Catalog-tier routing-template defaults are governed by `CatalogRoutingTemplates`
 The embedded `CatalogRoutingDefaults` (`modules/storage/routing_config.py`)
 carries optional `items_routing` / `collection_routing` templates seeded
 onto each newly-created collection in the catalog. Setting them to
-private-driver templates auto-seeds new collections as private:
+private-driver template auto-seeds new collections as private (items tier only):
 
 ```
 PUT /configs/catalogs/{catalog_id}/plugins/catalog_routing_templates
 {
   "collection_defaults": {
-    "items_routing":      { "operations": { "index": [ { "driver_ref": "items_elasticsearch_private_driver" } ] } },
-    "collection_routing": { "operations": { "index": [ { "driver_ref": "collection_elasticsearch_private_driver" } ] } }
+    "items_routing": { "operations": { "index": [ { "driver_ref": "items_elasticsearch_private_driver" } ] } }
   }
 }
 ```
@@ -98,9 +97,9 @@ PUT /configs/catalogs/{catalog_id}/plugins/catalog_routing_templates
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `collection_defaults.items_routing` | `ItemsRoutingConfig?` | `null` | Template seeded as each new collection's `ItemsRoutingConfig`. Pure data — flipping it does not retroactively re-write existing collections. |
-| `collection_defaults.collection_routing` | `CollectionRoutingConfig?` | `null` | Template seeded as each new collection's `CollectionRoutingConfig`. |
+| `collection_defaults.collection_routing` | `CollectionRoutingConfig?` | `null` | Template seeded as each new collection's `CollectionRoutingConfig`. Collection envelopes are PG-only for private catalogs — no ES collection-private index (#1047). |
 
-Per-collection privacy is expressed by the presence of `items_elasticsearch_private_driver` and/or `collection_elasticsearch_private_driver` in the collection's own routing configs (#733 retired the `CollectionPrivacy.is_private` flag).
+Per-collection privacy is expressed by the presence of `items_elasticsearch_private_driver` in the collection's items routing config (#733 retired the `CollectionPrivacy.is_private` flag; #1047 retired the collection-private ES driver).
 
 ## Index Design & Mappings
 
