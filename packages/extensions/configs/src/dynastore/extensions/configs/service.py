@@ -29,6 +29,7 @@ from dynastore.extensions.configs._composed_query_params import (
     MetaQuery,
     ResolvedQuery,
     StrictQuery,
+    ViewQuery,
 )
 
 from dynastore.extensions.protocols import ExtensionProtocol
@@ -452,6 +453,7 @@ class ConfigsService(ExtensionProtocol):
         include: IncludeQuery = "scope",
         strict: StrictQuery = True,
         links: LinksQuery = "minimal",
+        view: ViewQuery = "effective",
     ) -> Any:
         base_url = str(request.url).split("?")[0]
         response = await self._config_api.compose_platform_config(
@@ -461,6 +463,7 @@ class ConfigsService(ExtensionProtocol):
             include=include,
             strict=strict,
             links=links,
+            view=view,
         )
         return JSONResponse(content=response.model_dump())
 
@@ -473,6 +476,7 @@ class ConfigsService(ExtensionProtocol):
         include: IncludeQuery = "scope",
         strict: StrictQuery = True,
         links: LinksQuery = "minimal",
+        view: ViewQuery = "effective",
     ) -> Any:
         base_url = str(request.url).split("?")[0]
         response = await self._config_api.compose_catalog_config(
@@ -483,6 +487,7 @@ class ConfigsService(ExtensionProtocol):
             include=include,
             strict=strict,
             links=links,
+            view=view,
         )
         return JSONResponse(content=response.model_dump())
 
@@ -496,6 +501,7 @@ class ConfigsService(ExtensionProtocol):
         include: IncludeQuery = "scope",
         strict: StrictQuery = True,
         links: LinksQuery = "minimal",
+        view: ViewQuery = "effective",
     ) -> Any:
         base_url = str(request.url).split("?")[0]
         response = await self._config_api.compose_collection_config(
@@ -507,6 +513,7 @@ class ConfigsService(ExtensionProtocol):
             include=include,
             strict=strict,
             links=links,
+            view=view,
         )
         return JSONResponse(content=response.model_dump())
 

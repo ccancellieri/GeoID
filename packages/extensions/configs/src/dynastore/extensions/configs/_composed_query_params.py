@@ -6,12 +6,12 @@
 #
 #        http://www.apache.org/licenses/LICENSE-2.0
 
-"""Single source of truth for the 5 composed-config GET query params.
+"""Single source of truth for the 6 composed-config GET query params.
 
 The 3 composed-config handlers (`get_platform_config_composed` /
 `get_catalog_config_composed` / `get_collection_config_composed`)
-expose the same five query knobs (`resolved`, `meta`, `include`,
-`strict`, `links`).  Two surfaces consume them:
+expose the same six query knobs (`resolved`, `meta`, `include`,
+`strict`, `links`, `view`).  Two surfaces consume them:
 
 1. **Handler signatures** — FastAPI validates + populates OpenAPI from
    `Annotated[py_type, Query(...)]` aliases below.
@@ -74,20 +74,53 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
         "default": "scope",
         "examples": ["scope", "upstream"],
         "description": (
-            "Body-rendering mode.  ``scope`` (default) — at platform scope "
-            "(combined with ``strict=True``, the default) drop "
-            "``_visibility=catalog``/``collection`` templates so the body "
-            "lists only platform-intrinsic configs.  ``upstream`` — render "
-            "every visible class with its waterfall-resolved value (at "
-            "platform scope this also inlines catalog-/collection-tier "
+            "Body-rendering mode.  Retained for backward compatibility; "
+            "prefer the ``view`` parameter for explicit delta/inherited "
+            "filtering at sub-platform tiers.  ``scope`` (default) — at "
+            "platform scope (combined with ``strict=True``, the default) "
+            "drops ``_visibility=catalog``/``collection`` templates so the "
+            "body lists only platform-intrinsic configs.  ``upstream`` — "
+            "renders every visible class with its waterfall-resolved value "
+            "(at platform scope this also inlines catalog-/collection-tier "
             "templates, mirroring ``strict=False``).  At catalog and "
-            "collection scope ``scope`` and ``upstream`` currently return "
-            "the same body — every config the tier can see is rendered "
-            "with ``_meta.source`` reporting the effective tier — to honour "
-            "the post-#761 'complete the configurable surface' contract "
-            "that the admin Configuration Hub relies on.  Explicit "
-            "delta / inherited rendering at sub-platform tiers is tracked "
-            "under #947 (proposed ``view=delta|effective|inherited``)."
+            "collection scope both values honour the post-#761 'complete "
+            "the configurable surface' contract — every config the tier "
+            "can see is rendered with ``_meta.source`` reporting the "
+            "effective tier.  Use ``view=delta`` or ``view=inherited`` "
+            "to filter the body by provenance at sub-platform tiers."
+        ),
+    },
+    "view": {
+        "py_type": str,
+        "type": "string",
+        "enum": ["effective", "delta", "inherited"],
+        "default": "effective",
+        "examples": ["effective", "delta", "inherited"],
+        "description": (
+            "Provenance-based leaf filter applied AFTER waterfall "
+            "resolution.  ``effective`` (default) — the full composed "
+            "surface, identical to today's default response; every leaf "
+            "placed by ``_place()`` is rendered regardless of which tier "
+            "provided its value.  ``delta`` — only leaves whose "
+            "``_meta.source`` equals the active scope (platform / catalog "
+            "/ collection); leaves inherited verbatim from upstream tiers "
+            "are suppressed.  Equivalent to 'show me what THIS scope "
+            "explicitly overrides', making the response safe to copy "
+            "verbatim into a PATCH body when combined with "
+            "``resolved=true`` (upstream defaults are not re-submitted).  "
+            "``inherited`` — only leaves whose ``_meta.source`` differs "
+            "from the active scope (platform / catalog / collection); the "
+            "active tier has not overridden them.  Useful for operators "
+            "who want to audit what they still inherit from upstream "
+            "tiers.  Note: at platform scope there is no upstream tier, "
+            "so ``delta`` returns every stored leaf and ``inherited`` "
+            "returns only leaves resolved from code defaults "
+            "(source='default').  The ``view`` param is independent of "
+            "``include`` and ``resolved``; combining ``view=delta`` with "
+            "``resolved=true`` yields 'local overrides rendered with "
+            "their effective values and upstream defaults applied to the "
+            "non-overridden fields' — the most useful read-modify-write "
+            "view."
         ),
     },
     "strict": {
@@ -154,6 +187,7 @@ MetaQuery = _alias("meta")
 IncludeQuery = _alias("include")
 StrictQuery = _alias("strict")
 LinksQuery = _alias("links")
+ViewQuery = _alias("view")
 
 
 QUERY_PARAM_SCHEMA: Dict[str, Any] = {

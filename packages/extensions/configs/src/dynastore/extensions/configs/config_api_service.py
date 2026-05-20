@@ -386,6 +386,7 @@ class ConfigApiService:
         strict: bool = True,
         extra_refs: Optional[Dict[str, Tuple[str, Dict[str, Any]]]] = None,
         *,
+        view_mode: str = "effective",
         links_mode: str = "none",
         base_url: str = "",
         configs_root_url: str = "",
@@ -457,9 +458,27 @@ class ConfigApiService:
         at catalog or collection scope (the per-tier ``_visibility``
         filter already runs there).
 
+        ``view_mode`` applies a provenance-based post-filter on the
+        decorated leaf set AFTER all placement and slim-mode filters:
+
+        - ``"effective"`` (default) — every leaf that passes placement
+          and slim-mode is rendered; behaviour is byte-for-byte identical
+          to the pre-#947 default.  No breaking change.
+        - ``"delta"`` — only leaves whose ``_meta.source`` equals the
+          active scope are included.  Equivalent to "what has THIS tier
+          explicitly overridden?"  At platform scope this returns leaves
+          whose source is ``"platform"`` (code-default leaves are
+          suppressed).  Useful for read-modify-write flows — combine
+          with ``resolved=true`` to see overrides rendered with their
+          full effective values.
+        - ``"inherited"`` — only leaves whose ``_meta.source`` differs
+          from the active scope are included.  Returns everything the
+          tier is inheriting from upstream tiers (plus ``"default"``
+          values at any scope).
+
         Returns the composed ``configs`` tree.  Provenance lives on each
         leaf as ``_meta.source`` (``"platform"`` / ``"catalog"`` /
-        ``"default"``) — no parallel tree.
+        ``"collection"`` / ``"default"``) — no parallel tree.
         """
         wants_links = links_mode in ("minimal", "full")
         slim = include_mode == "scope"
@@ -637,6 +656,29 @@ class ConfigApiService:
                     payload.pop("output_transformers", None)
             return payload
 
+        def _passes_view_filter(class_key: str) -> bool:
+            """Provenance-based leaf filter driven by ``view_mode``.
+
+            Applied after slim-mode and placement filters.  Uses the
+            ``sources`` map built by ``_get_effective_configs``.
+
+            - ``"effective"`` — every leaf passes; default, byte-for-byte
+              identical to the pre-#947 behaviour.
+            - ``"delta"`` — only leaves whose source equals the active
+              scope pass.  At platform scope "delta" keeps platform-
+              stored leaves and drops code defaults.
+            - ``"inherited"`` — only leaves whose source differs from the
+              active scope pass (includes ``"default"``-sourced leaves at
+              any scope).
+            """
+            if view_mode == "effective":
+                return True
+            leaf_source = sources.get(class_key, "default")
+            if view_mode == "delta":
+                return leaf_source == active_scope
+            # "inherited"
+            return leaf_source != active_scope
+
         for class_key, payload in by_class.items():
             cls = all_classes.get(class_key)
             if cls is None:
@@ -653,14 +695,18 @@ class ConfigApiService:
             # returns True per the post-#761 'complete the configurable
             # surface' contract — every config visible at the tier is
             # rendered with ``_meta.source`` reporting the effective tier.
-            # Explicit delta/inherited rendering at sub-platform tiers is
-            # tracked under #947 (proposed ``view=delta|effective|inherited``).
             # Provenance for any rendered leaf is on its own ``_meta.source``
             # *when* ``meta_mode != "none"`` (#946); callers that need
             # provenance and pass ``meta=none`` will find none — that's an
             # intentional trade-off for clean round-trippable payloads.
             # The parallel ``inherited`` tree was retired in #665 slice 3.
             if slim and not _is_in_scope(cls, class_key):
+                continue
+
+            # Provenance filter (#947): ``view=delta`` keeps only leaves
+            # the active scope owns; ``view=inherited`` keeps only upstream
+            # leaves.  ``view=effective`` (default) is a no-op.
+            if not _passes_view_filter(class_key):
                 continue
 
             _place_at(tree, placed, class_key, _decorate(payload, cls, class_key, class_key))
@@ -683,6 +729,8 @@ class ConfigApiService:
                 if placed is None:
                     continue
                 if slim and not _is_in_scope(cls, class_key):
+                    continue
+                if not _passes_view_filter(class_key):
                     continue
                 _place_at(tree, placed, ref_key, _decorate(payload, cls, class_key, ref_key))
         return tree
@@ -971,6 +1019,7 @@ class ConfigApiService:
         include: str = "scope",
         strict: bool = True,
         links: str = "minimal",
+        view: str = "effective",
     ) -> CollectionConfigResponse:
         by_class, sources, _tier_data = await self._get_effective_configs(
             catalog_id=catalog_id, collection_id=collection_id, resolved=resolved,
@@ -986,6 +1035,7 @@ class ConfigApiService:
             by_class, sources, "collection",
             meta_mode=meta, include_mode=include, strict=strict,
             extra_refs=extra_refs,
+            view_mode=view,
             links_mode=links, base_url=base_url,
             configs_root_url=configs_root_url,
             catalog_id=catalog_id, collection_id=collection_id,
@@ -1004,6 +1054,7 @@ class ConfigApiService:
         include: str = "scope",
         strict: bool = True,
         links: str = "minimal",
+        view: str = "effective",
     ) -> CatalogConfigResponse:
         by_class, sources, _tier_data = await self._get_effective_configs(
             catalog_id=catalog_id, collection_id=None, resolved=resolved,
@@ -1019,6 +1070,7 @@ class ConfigApiService:
             by_class, sources, "catalog",
             meta_mode=meta, include_mode=include, strict=strict,
             extra_refs=extra_refs,
+            view_mode=view,
             links_mode=links, base_url=base_url,
             configs_root_url=configs_root_url,
             catalog_id=catalog_id, collection_id=None,
@@ -1036,6 +1088,7 @@ class ConfigApiService:
         include: str = "scope",
         strict: bool = True,
         links: str = "minimal",
+        view: str = "effective",
     ) -> PlatformConfigResponse:
         by_class, sources, _tier_data = await self._get_effective_configs(
             catalog_id=None, collection_id=None, resolved=resolved,
@@ -1051,6 +1104,7 @@ class ConfigApiService:
             by_class, sources, "platform",
             meta_mode=meta, include_mode=include, strict=strict,
             extra_refs=extra_refs,
+            view_mode=view,
             links_mode=links, base_url=base_url,
             configs_root_url=configs_root_url,
             catalog_id=None, collection_id=None,
