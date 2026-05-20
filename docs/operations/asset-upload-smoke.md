@@ -60,8 +60,9 @@ curl -s "$REVIEW_BASE/assets/" -H "Authorization: Bearer $TOKEN" | jq '.links[] 
 # Expected: "self", "conformance", "data"
 
 curl -s "$REVIEW_BASE/assets/conformance" -H "Authorization: Bearer $TOKEN" \
-  | jq '.conformsTo[] | select(test("ogcapi-assets-1"))'
-# Expected: six URIs ending in /core /uploads /write-policies /versioning /virtual-assets /references
+  | jq '.conformsTo[] | select(test("asset-transactions"))'
+# Expected: ten URIs ending in /core /upload /processes /async /search /sync
+#           /write-policies /versioning /virtual-assets /references
 ```
 
 ### 3. Initiate upload — happy path

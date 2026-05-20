@@ -12,27 +12,62 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-"""OGC API - Assets conformance class URIs (draft).
+"""Asset Transactions conformance class URIs (draft STAC API extension).
 
-These URIs are PROPOSALS to the OGC SWG; the namespace path
-(``/spec/ogcapi-assets-1/1.0/conf/...``) is reserved-pending until the
-specification is accepted. Do not depend on these as immutable identifiers
-in external clients.
+The canonical framing is the **STAC API — Asset Transactions Extension**
+(``docs/proposals/asset-transactions-extension.md``); the pilot ships the STAC
+track first (proposal §6.3), with the conformance classes drafted to lift into
+an OGC API - Assets specification later without renaming the URIs.
+
+These URIs are PROPOSALS; the namespace path
+(``asset-transactions/1.0/conf/...``) is reserved-pending until the extension is
+accepted into the STAC registry. Do not depend on these as immutable
+identifiers in external clients.
+
+The class set unions the proposal's classes (``core / upload / processes /
+async / search / sync``) with the implementation-specific classes the pilot
+already enforces (``write-policies / versioning / virtual-assets /
+references``), so a client can probe every advertised capability deterministically.
 """
 from __future__ import annotations
 
-# Draft namespace
-_NS = "http://www.opengis.net/spec/ogcapi-assets-1/1.0/conf"
+# Draft STAC extension namespace — see module docstring + proposal §5.
+_NS = "https://stac-extensions.github.io/asset-transactions/1.0/conf"
 
 ASSETS_CORE = f"{_NS}/core"
-"""Core: GET /assets/, /assets/conformance, GET single asset, GET list.
-   Mirrors OGC API - Common requirements."""
+"""Core: GET /assets/, /assets/conformance, GET single asset, GET list, and
+   process discovery (GET .../assets/{id}/processes). Mirrors OGC API - Common
+   requirements."""
 
-ASSETS_UPLOADS = f"{_NS}/uploads"
+ASSETS_UPLOAD = f"{_NS}/upload"
 """Upload session lifecycle: POST /upload (born-claimed PENDING INSERT
    gated by AssetsWritePolicy) + GET /upload/{ticket_id}/status. The
    server backs the storage transaction, the client uploads bytes
    to the signed URL the server mints."""
+
+ASSETS_PROCESSES = f"{_NS}/processes"
+"""Asset-scoped process execution: GET/POST .../assets/{id}/{process_id} with a
+   ``parameters_schema``, dispatched through ``AssetProcessProtocol`` impls
+   discovered via ``get_protocols``. Idempotent processes use GET; state-changing
+   ones use POST. Returns the polymorphic ``AssetProcessOutput`` envelope."""
+
+ASSETS_ASYNC = f"{_NS}/async"
+"""Asynchronous process execution: ``AssetProcessOutput.type == "job"`` with a
+   ``job_id`` the client polls via the host's OGC Processes jobs surface."""
+
+ASSETS_SEARCH = f"{_NS}/search"
+"""Granular asset search via ``POST .../assets-search`` with an
+   ``AssetFilter`` list. Path-scoped (catalog-tier / collection /
+   cross-catalog), routing-aware (resolves the SEARCH-routed driver with a
+   READ fallback), and supports the scalar operator set
+   (eq/ne/gt/gte/lt/lte/like/ilike/in/nin/isnull/isnotnull) uniformly on the
+   PostgreSQL and Elasticsearch backends."""
+
+ASSETS_SYNC = f"{_NS}/sync"
+"""Asset CRUD emits a sync event via a single-writer outbox
+   (``AssetEntitySyncSubscriber`` and peers consume it); reverse cascade via
+   ``DELETE .../assets/{id}?force=true&propagate=true`` removes items linked
+   through the asset. Bucket-side metadata mirroring is advisory."""
 
 ASSETS_WRITE_POLICIES = f"{_NS}/write-policies"
 """Per-collection / per-catalog AssetsWritePolicy: identity matcher chain
@@ -54,30 +89,29 @@ ASSETS_REFERENCES = f"{_NS}/references"
    driver-owned referencing entities (collections, DuckDB tables,
    Iceberg tables, ...)."""
 
-ASSETS_SEARCH = f"{_NS}/search"
-"""Granular asset search via ``POST .../assets-search`` with an
-   ``AssetFilter`` list. Path-scoped (catalog-tier / collection /
-   cross-catalog) and routing-aware: resolves the SEARCH-routed driver
-   with a READ fallback. Maps to the ``Search`` class in the proposal
-   (``docs/proposals/asset-transactions-extension.md`` §5)."""
-
 ASSETS_CONFORMANCE_URIS = (
     ASSETS_CORE,
-    ASSETS_UPLOADS,
+    ASSETS_UPLOAD,
+    ASSETS_PROCESSES,
+    ASSETS_ASYNC,
+    ASSETS_SEARCH,
+    ASSETS_SYNC,
     ASSETS_WRITE_POLICIES,
     ASSETS_VERSIONING,
     ASSETS_VIRTUAL_ASSETS,
     ASSETS_REFERENCES,
-    ASSETS_SEARCH,
 )
 
 __all__ = (
     "ASSETS_CORE",
-    "ASSETS_UPLOADS",
+    "ASSETS_UPLOAD",
+    "ASSETS_PROCESSES",
+    "ASSETS_ASYNC",
+    "ASSETS_SEARCH",
+    "ASSETS_SYNC",
     "ASSETS_WRITE_POLICIES",
     "ASSETS_VERSIONING",
     "ASSETS_VIRTUAL_ASSETS",
     "ASSETS_REFERENCES",
-    "ASSETS_SEARCH",
     "ASSETS_CONFORMANCE_URIS",
 )

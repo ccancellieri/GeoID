@@ -190,6 +190,33 @@ def test_conformance_includes_search_uri() -> None:
     assert ASSETS_SEARCH.endswith("/search")
 
 
+def test_conformance_uses_asset_transactions_namespace() -> None:
+    """#1097: every advertised class lives under the STAC asset-transactions
+    namespace (the proposal §6.3 canonical framing), not the old OGC
+    ``ogcapi-assets-1`` one."""
+    base = "https://stac-extensions.github.io/asset-transactions/1.0/conf"
+    for uri in ASSETS_CONFORMANCE_URIS:
+        assert uri.startswith(base + "/"), f"{uri} not under {base}"
+        assert "ogcapi-assets-1" not in uri
+
+
+def test_conformance_advertises_proposal_classes() -> None:
+    """The proposal's process/async/sync classes are implemented and must be
+    advertised alongside the implementation-profile classes."""
+    svc = _build_service()
+    client = TestClient(svc.app)
+
+    r = client.get("/assets/conformance")
+    assert r.status_code == 200
+    advertised = set(r.json()["conformsTo"])
+    suffixes = {
+        "/core", "/upload", "/processes", "/async", "/search", "/sync",
+        "/write-policies", "/versioning", "/virtual-assets", "/references",
+    }
+    for suffix in suffixes:
+        assert any(u.endswith(suffix) for u in advertised), f"missing class {suffix}"
+
+
 # ---------------------------------------------------------------------------
 # HATEOAS links on single-asset GET
 # ---------------------------------------------------------------------------

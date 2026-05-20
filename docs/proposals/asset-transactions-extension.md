@@ -148,17 +148,38 @@ client-side code path as `download`.
 
 ## 5. Conformance classes
 
+The namespace base is
+`https://stac-extensions.github.io/asset-transactions/1.0/conf` (reserved-pending
+until the extension is accepted; see §6.3). The reference implementation emits
+these exact URIs from `extensions/assets/conformance.py`, so code and this
+document stay aligned.
+
+### 5.1 Core classes
+
 | Class | URI | Requires |
 |---|---|---|
-| Core | `.../asset-transactions/1.0/conf/core` | Process discovery + `download` |
-| Upload | `.../asset-transactions/1.0/conf/upload` | `POST .../upload` + ticket polling, OR `upload` AssetProcess at `/processes/upload/execution` |
-| Process execution | `.../asset-transactions/1.0/conf/processes` | Arbitrary `{process_id}` with `parameters_schema` |
-| Async | `.../asset-transactions/1.0/conf/async` | `type:job` + OGC Processes integration |
-| Search | `.../asset-transactions/1.0/conf/search` | `POST /assets-search` with `AssetFilter` |
-| Sync | `.../asset-transactions/1.0/conf/sync` | Asset CRUD MUST emit a sync-event consumable by downstream subscribers; reverse cascade via `DELETE .../assets/{id}?force=true&propagate=true` deletes items linked through the asset. Backends advertise per-event delivery semantics via `Asset.sync.delivery: at-least-once \| exactly-once`. Bucket-side metadata mirroring (e.g. `x-goog-meta-*`) is **advisory**, not part of this class. |
+| Core | `…/asset-transactions/1.0/conf/core` | Landing + `/conformance` + asset GET/list + process discovery |
+| Upload | `…/asset-transactions/1.0/conf/upload` | `POST .../upload` + ticket polling, OR `upload` AssetProcess at `/processes/upload/execution` |
+| Process execution | `…/asset-transactions/1.0/conf/processes` | Arbitrary `{process_id}` with `parameters_schema` |
+| Async | `…/asset-transactions/1.0/conf/async` | `type:job` + OGC Processes integration |
+| Search | `…/asset-transactions/1.0/conf/search` | `POST /assets-search` with `AssetFilter` (scalar operator set) |
+| Sync | `…/asset-transactions/1.0/conf/sync` | Asset CRUD MUST emit a sync-event consumable by downstream subscribers; reverse cascade via `DELETE .../assets/{id}?force=true&propagate=true` deletes items linked through the asset. Backends advertise per-event delivery semantics via `Asset.sync.delivery: at-least-once \| exactly-once`. Bucket-side metadata mirroring (e.g. `x-goog-meta-*`) is **advisory**, not part of this class. |
 
-A server advertises these in its `/conformance` document; clients can probe
-capability without trial-and-error.
+### 5.2 Implementation-profile classes
+
+The pilot enforces additional capabilities beyond the core set above and
+advertises them as separate classes so a client can probe each independently.
+These are candidates for inclusion in the core set as the proposal matures.
+
+| Class | URI | Requires |
+|---|---|---|
+| Write policies | `…/asset-transactions/1.0/conf/write-policies` | Per-collection/per-catalog `AssetsWritePolicy`: identity matcher chain + conflict-action vocabulary |
+| Versioning | `…/asset-transactions/1.0/conf/versioning` | `new_version` on conflict (driver-capability-gated) |
+| Virtual assets | `…/asset-transactions/1.0/conf/virtual-assets` | `kind=virtual` external-href registration without bucket presence |
+| References | `…/asset-transactions/1.0/conf/references` | `asset_references` cascade-delete safety across driver-owned referencing entities |
+
+A server advertises all of these in its `/conformance` document; clients can
+probe capability without trial-and-error.
 
 ### Sync conformance — semantics
 
