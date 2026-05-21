@@ -6,8 +6,9 @@
 The handler must surface the full catalog list to sysadmin / platform-admin
 callers (current behaviour) and a per-caller filtered list to catalog-tier
 admins (the bug-fix surface). Both behaviours are exercised here in
-isolation: ``CatalogsProtocol``, ``IamQueryProtocol``, and the per-pod
-membership cache are replaced with stubs so no database or registry runs.
+isolation: ``CatalogsProtocol`` and the membership cache
+(``MembershipCacheProtocol.get_membership``) are replaced with stubs so no
+database or registry runs.
 """
 from __future__ import annotations
 
@@ -25,7 +26,6 @@ from dynastore.extensions.admin.admin_service import (
 
 
 _GET_PROTOCOL = "dynastore.extensions.admin.admin_service.get_protocol"
-_MEMBERSHIP_CACHE = "dynastore.extensions.iam.membership_cache.get_membership_cached"
 
 
 def _make_request(principal: Optional[Any]) -> Any:
@@ -44,21 +44,35 @@ def _make_principal(
     )
 
 
+def _make_membership_cache(membership: Optional[Dict[str, Any]]) -> MagicMock:
+    """A stub ``MembershipCacheProtocol`` whose ``get_membership`` coroutine
+    returns the given membership mapping (or an empty one).
+    """
+    cache = MagicMock()
+    cache.get_membership = AsyncMock(return_value=membership or {})
+    return cache
+
+
 @contextmanager
-def _patched(
-    membership: Optional[Dict[str, Any]] = None,
-    iam_query: Any = MagicMock(),
-):
+def _patched(membership: Optional[Dict[str, Any]] = None):
+    """Patch ``get_protocol`` so that ``MembershipCacheProtocol`` resolves to a
+    stub returning ``membership``; every other protocol resolves to ``None``.
+
+    Mirrors the production path in ``_catalog_admin_filter_ids``, which calls
+    ``get_protocol(MembershipCacheProtocol).get_membership(...)``.
+    """
+    cache = _make_membership_cache(membership)
+
     def _get_proto(cls):
-        from dynastore.models.protocols.iam_query import IamQueryProtocol
-        if cls is IamQueryProtocol:
-            return iam_query
+        from dynastore.models.protocols.membership_cache import (
+            MembershipCacheProtocol,
+        )
+        if cls is MembershipCacheProtocol:
+            return cache
         return None
 
-    cache_mock = AsyncMock(return_value=membership or {})
-    with patch(_GET_PROTOCOL, side_effect=_get_proto), \
-         patch(_MEMBERSHIP_CACHE, new=cache_mock):
-        yield cache_mock
+    with patch(_GET_PROTOCOL, side_effect=_get_proto):
+        yield cache
 
 
 @pytest.mark.asyncio
@@ -135,14 +149,14 @@ async def test_principal_without_provider_or_subject_returns_empty_set():
 
 
 @pytest.mark.asyncio
-async def test_no_iam_query_protocol_returns_empty_set():
-    """Slim deployments without IamQueryProtocol can't resolve memberships;
-    the catalog admin sees nothing rather than the full list.
+async def test_no_membership_cache_protocol_returns_empty_set():
+    """Slim deployments without MembershipCacheProtocol can't resolve
+    memberships; the catalog admin sees nothing rather than the full list.
     """
     req = _make_request(principal=_make_principal(roles=["catalog_admin"]))
 
     def _get_proto(_cls):
-        return None  # IamQueryProtocol → None
+        return None  # MembershipCacheProtocol → None
 
     with patch(_GET_PROTOCOL, side_effect=_get_proto):
         assert await _catalog_admin_filter_ids(req) == set()
@@ -192,21 +206,23 @@ async def test_handler_filters_list_for_catalog_admin():
     catalogs_svc = _make_catalogs_svc(cats)
     req = _make_request(principal=_make_principal(roles=["catalog_admin"]))
 
-    def _get_proto(cls):
-        from dynastore.models.protocols.catalogs import CatalogsProtocol
-        from dynastore.models.protocols.iam_query import IamQueryProtocol
-        if cls is CatalogsProtocol:
-            return catalogs_svc
-        if cls is IamQueryProtocol:
-            return MagicMock()
-        return None
-
-    cache_mock = AsyncMock(return_value={
+    cache = _make_membership_cache({
         "platform": False,
         "catalog_roles": {"a": ["admin"], "c": ["viewer"]},
     })
-    with patch(_GET_PROTOCOL, side_effect=_get_proto), \
-         patch(_MEMBERSHIP_CACHE, new=cache_mock):
+
+    def _get_proto(cls):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols.membership_cache import (
+            MembershipCacheProtocol,
+        )
+        if cls is CatalogsProtocol:
+            return catalogs_svc
+        if cls is MembershipCacheProtocol:
+            return cache
+        return None
+
+    with patch(_GET_PROTOCOL, side_effect=_get_proto):
         result = await _handler(req, limit=200, offset=0, lang="en", q=None)
 
     assert [c["id"] for c in result] == ["a"]
@@ -222,21 +238,23 @@ async def test_handler_returns_empty_when_catalog_admin_has_no_admin_grants():
     catalogs_svc = _make_catalogs_svc(cats)
     req = _make_request(principal=_make_principal(roles=["catalog_admin"]))
 
-    def _get_proto(cls):
-        from dynastore.models.protocols.catalogs import CatalogsProtocol
-        from dynastore.models.protocols.iam_query import IamQueryProtocol
-        if cls is CatalogsProtocol:
-            return catalogs_svc
-        if cls is IamQueryProtocol:
-            return MagicMock()
-        return None
-
-    cache_mock = AsyncMock(return_value={
+    cache = _make_membership_cache({
         "platform": False,
         "catalog_roles": {"a": ["viewer"], "b": ["user"]},
     })
-    with patch(_GET_PROTOCOL, side_effect=_get_proto), \
-         patch(_MEMBERSHIP_CACHE, new=cache_mock):
+
+    def _get_proto(cls):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols.membership_cache import (
+            MembershipCacheProtocol,
+        )
+        if cls is CatalogsProtocol:
+            return catalogs_svc
+        if cls is MembershipCacheProtocol:
+            return cache
+        return None
+
+    with patch(_GET_PROTOCOL, side_effect=_get_proto):
         result = await _handler(req, limit=200, offset=0, lang="en", q=None)
 
     assert result == []
