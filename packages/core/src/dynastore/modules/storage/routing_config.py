@@ -455,7 +455,86 @@ def _validate_transformer_attachment(
         )
 
 
-class ItemsRoutingConfig(PluginConfig):
+class _RoutingConfigBase(PluginConfig):
+    """Shared base for the four tier routing configs (#990 P4).
+
+    Collapses what every tier had copied verbatim: the ``transformers``
+    registry field, the ``x-ui`` routing category, and the read-time
+    model_validator that self-registers discoverable drivers and validates
+    transformer attachments.  Each concrete tier supplies only what genuinely
+    differs:
+
+    - ``_address`` / ``_visibility`` / ``_view_scopes`` ClassVars (tree
+      placement + immutability/view scoping),
+    - the ``operations`` field with its tier-specific default driver wiring,
+    - :meth:`_self_register_drivers` — folds the tier's discoverable indexer /
+      searcher / upload drivers into ``operations`` (the sole behavioural
+      variation between tiers; each override does the tier's lazy protocol
+      imports to avoid an import cycle at module load).
+
+    A non-generic concrete base is intentional: no field or method signature is
+    typed by the tier's Store / Indexer protocols — they are resolved lazily as
+    runtime markers inside :meth:`_self_register_drivers` — so a
+    ``Generic[StoreT, IndexerT]`` parametrisation would be cosmetic and only
+    add Pydantic-generic / config-registry edge cases.
+    """
+
+    is_abstract_base: ClassVar[bool] = True
+
+    model_config = ConfigDict(json_schema_extra=ui(category="routing"))
+
+    operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
+        default_factory=dict,
+        description=(
+            "Operation -> ordered driver list.  Overridden per tier with the "
+            "tier's default driver wiring (position 0 = primary)."
+        ),
+    )
+    transformers: Immutable[List[TransformerEntry]] = Field(
+        default_factory=list,
+        description=(
+            "Registry of entity transformers available to this config. "
+            "Auto-populated from discoverable EntityTransformProtocol "
+            "implementers; WRITE/SEARCH entries reference these by "
+            "driver_ref via input_transformers/output_transformers."
+        ),
+    )
+
+    def _self_register_drivers(self) -> None:
+        """Tier hook — fold discoverable indexer / searcher / upload drivers
+        into ``self.operations``.
+
+        Overridden by each concrete tier (which does its own lazy protocol
+        imports).  The base is a no-op so a tier with no auto-discovery still
+        validates cleanly.
+        """
+        return None
+
+    @model_validator(mode="after")
+    def _augment_and_validate_routing(self) -> "_RoutingConfigBase":
+        """Self-register discoverable drivers + transformers, then validate
+        transformer attachments and warn on deferred hops.
+
+        Self-registration is best-effort: discovery may not be ready (early
+        bootstrap / fixtures that validate before plugins register), in which
+        case the apply-handler repopulates on the next write.  Attachment
+        validation always runs — a dangling transformer ref is a hard error.
+        """
+        label = type(self).__name__
+        try:
+            self._self_register_drivers()
+            _self_register_transformers_into(self.transformers)
+        except Exception as exc:
+            logger.debug(
+                "%s: read-time self-register skipped (%s); apply-handler "
+                "will populate on next write.", label, exc,
+            )
+        _validate_transformer_attachment(self.operations, self.transformers, label)
+        _warn_deferred_transformer_hops(self.operations, label)
+        return self
+
+
+class ItemsRoutingConfig(_RoutingConfigBase):
     """Operation-based routing for **items** storage drivers.
 
     Each operation maps to an ordered list of :class:`OperationDriverEntry`.
@@ -476,9 +555,6 @@ class ItemsRoutingConfig(PluginConfig):
     # default (e.g. a routing preset) must surface in the catalog view even
     # though the immutability gate stays collection-scoped (``_visibility``).
     _view_scopes: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
-
-
-    model_config = ConfigDict(json_schema_extra=ui(category="routing"))
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -575,50 +651,21 @@ class ItemsRoutingConfig(PluginConfig):
             "See un-fao/GeoID#810 (Option B)."
         ),
     )
-    transformers: Immutable[List[TransformerEntry]] = Field(
-        default_factory=list,
-        description=(
-            "Registry of entity transformers available to this config. "
-            "Auto-populated from discoverable EntityTransformProtocol "
-            "implementers; WRITE/SEARCH entries reference these by "
-            "driver_ref via input_transformers/output_transformers."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _augment_items_with_discoverable_indexers_searchers(
-        self,
-    ) -> "ItemsRoutingConfig":
-        """Auto-folds discoverable :class:`ItemIndexer` drivers into
+    def _self_register_drivers(self) -> None:
+        """Fold discoverable :class:`ItemIndexer` drivers into
         ``operations[WRITE]`` as secondary-index entries
-        (``secondary_index=True``) and :class:`CollectionItemsStore`
-        drivers declaring storage ``Capability.{FULLTEXT, SPATIAL_FILTER,
-        ATTRIBUTE_FILTER}`` into ``operations[SEARCH]`` — so a deployed
-        ``ItemsElasticsearchDriver`` shows up without operator PUT.
+        (``secondary_index=True``) and SEARCH-capable
+        :class:`CollectionItemsStore` drivers into ``operations[SEARCH]`` — so
+        a deployed ``ItemsElasticsearchDriver`` shows up without operator PUT.
         """
         from dynastore.models.protocols.indexer import ItemIndexer
-        from dynastore.models.protocols.storage_driver import (
-            CollectionItemsStore,
-        )
+        from dynastore.models.protocols.storage_driver import CollectionItemsStore
 
-        try:
-            _self_register_indexers_into(self.operations, ItemIndexer)
-            _self_register_searchers_into(self.operations, CollectionItemsStore)
-            _self_register_transformers_into(self.transformers)
-        except Exception as exc:
-            logger.debug(
-                "ItemsRoutingConfig: items-tier read-time self-"
-                "register skipped (%s); apply-handler will populate on "
-                "next write.", exc,
-            )
-        _validate_transformer_attachment(
-            self.operations, self.transformers, "ItemsRoutingConfig"
-        )
-        _warn_deferred_transformer_hops(self.operations, "ItemsRoutingConfig")
-        return self
+        _self_register_indexers_into(self.operations, ItemIndexer)
+        _self_register_searchers_into(self.operations, CollectionItemsStore)
 
 
-class CollectionRoutingConfig(PluginConfig):
+class CollectionRoutingConfig(_RoutingConfigBase):
     """Operation-based routing for **collection metadata** drivers.
 
     Dispatches ``CollectionStore`` drivers (PG metadata sidecars,
@@ -664,9 +711,6 @@ class CollectionRoutingConfig(PluginConfig):
     # catalog-tier default must surface in the catalog view while the
     # immutability gate stays collection-scoped (``_visibility``).
     _view_scopes: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
-
-
-    model_config = ConfigDict(json_schema_extra=ui(category="routing"))
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -732,51 +776,19 @@ class CollectionRoutingConfig(PluginConfig):
             "PostgreSQL fallback (geometry_exact)."
         ),
     )
-    transformers: Immutable[List[TransformerEntry]] = Field(
-        default_factory=list,
-        description=(
-            "Registry of entity transformers available to this config. "
-            "Auto-populated from discoverable EntityTransformProtocol "
-            "implementers; WRITE/SEARCH entries reference these by "
-            "driver_ref via input_transformers/output_transformers."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _augment_metadata_with_discoverable_indexers_searchers(
-        self,
-    ) -> "CollectionRoutingConfig":
-        """Auto-folds discoverable :class:`CollectionIndexer` drivers into
+    def _self_register_drivers(self) -> None:
+        """Fold discoverable :class:`CollectionIndexer` drivers into
         ``operations[WRITE]`` as secondary-index entries
-        (``secondary_index=True``) and ``CollectionStore`` SEARCH-capable
+        (``secondary_index=True``) and SEARCH-capable ``CollectionStore``
         drivers into ``operations[SEARCH]``.
         """
-        from dynastore.models.protocols.entity_store import (
-            CollectionStore,
-        )
+        from dynastore.models.protocols.entity_store import CollectionStore
 
-        try:
-            _self_register_indexers_into(
-                self.operations, CollectionIndexer,
-            )
-            _self_register_searchers_into(
-                self.operations, CollectionStore,
-            )
-            _self_register_transformers_into(self.transformers)
-        except Exception as exc:
-            logger.debug(
-                "CollectionRoutingConfig: read-time self-register "
-                "skipped (%s); apply-handler will populate on next write.",
-                exc,
-            )
-        _validate_transformer_attachment(
-            self.operations, self.transformers, "CollectionRoutingConfig"
-        )
-        _warn_deferred_transformer_hops(self.operations, "CollectionRoutingConfig")
-        return self
+        _self_register_indexers_into(self.operations, CollectionIndexer)
+        _self_register_searchers_into(self.operations, CollectionStore)
 
 
-class AssetRoutingConfig(PluginConfig):
+class AssetRoutingConfig(_RoutingConfigBase):
     """Operation-based routing for asset storage drivers.
 
     Same structure as :class:`ItemsRoutingConfig` but scoped to
@@ -790,9 +802,6 @@ class AssetRoutingConfig(PluginConfig):
     # default must surface in the catalog view while the immutability gate
     # stays collection-scoped (``_visibility``).
     _view_scopes: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
-
-
-    model_config = ConfigDict(json_schema_extra=ui(category="routing"))
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -852,18 +861,7 @@ class AssetRoutingConfig(PluginConfig):
             "with discoverable AssetUploadProtocol impls."
         ),
     )
-    transformers: Immutable[List[TransformerEntry]] = Field(
-        default_factory=list,
-        description=(
-            "Registry of entity transformers available to this config. "
-            "Auto-populated from discoverable EntityTransformProtocol "
-            "implementers; WRITE/SEARCH entries reference these by "
-            "driver_ref via input_transformers/output_transformers."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _augment_with_discoverable_indexers(self) -> "AssetRoutingConfig":
+    def _self_register_drivers(self) -> None:
         """Augment WRITE secondary indexes + UPLOAD with discoverable drivers.
 
         SEARCH is resolvable on the asset tier but carries no hardcoded
@@ -874,25 +872,15 @@ class AssetRoutingConfig(PluginConfig):
         keeps the zero-config default behaviour (PG-backed READ serves
         filtered queries) while letting an operator route SEARCH to an
         index driver (e.g. Elasticsearch) per catalog/collection without a
-        code change. Mirrors :meth:`CatalogRoutingConfig._augment_*`."""
-        try:
-            _self_register_indexers_into(self.operations, AssetIndexer)
-            from dynastore.models.protocols.asset_upload import AssetUploadProtocol
-            _self_register_upload_into(self.operations, AssetUploadProtocol)
-            _self_register_transformers_into(self.transformers)
-        except Exception as exc:
-            logger.debug(
-                "AssetRoutingConfig: read-time self-register skipped "
-                "(%s); apply-handler will populate on next write.", exc,
-            )
-        _validate_transformer_attachment(
-            self.operations, self.transformers, "AssetRoutingConfig"
-        )
-        _warn_deferred_transformer_hops(self.operations, "AssetRoutingConfig")
-        return self
+        code change.
+        """
+        from dynastore.models.protocols.asset_upload import AssetUploadProtocol
+
+        _self_register_indexers_into(self.operations, AssetIndexer)
+        _self_register_upload_into(self.operations, AssetUploadProtocol)
 
 
-class CatalogRoutingConfig(PluginConfig):
+class CatalogRoutingConfig(_RoutingConfigBase):
     """Operation-based routing for catalog-tier ``CatalogStore`` drivers.
 
     Parallels :class:`ItemsRoutingConfig` but scoped to catalog-tier
@@ -974,54 +962,22 @@ class CatalogRoutingConfig(PluginConfig):
             "augmentation is idempotent set-default."
         ),
     )
-    transformers: Immutable[List[TransformerEntry]] = Field(
-        default_factory=list,
-        description=(
-            "Registry of entity transformers available to this config. "
-            "Auto-populated from discoverable EntityTransformProtocol "
-            "implementers; WRITE/SEARCH entries reference these by "
-            "driver_ref via input_transformers/output_transformers."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _augment_with_discoverable_indexers_searchers(
-        self,
-    ) -> "CatalogRoutingConfig":
+    def _self_register_drivers(self) -> None:
         """Fold discoverable CatalogIndexer (as secondary-index WRITE
         entries, ``secondary_index=True``) + SEARCH-capable CatalogStore
-        drivers into ``operations[WRITE]`` and ``operations[SEARCH]`` after
-        model validation.
+        drivers into ``operations[WRITE]`` and ``operations[SEARCH]``.
 
-        Closes the gap where the default-state config (no operator
-        write) shows neither a secondary-index WRITE entry nor SEARCH
-        entries even when an ES catalog driver is installed.  Mirrors the
-        apply-handler
-        self-registration so default-state and apply-time configs
-        converge — ``_on_apply_catalog_routing_config`` calls the same
-        helpers, with the same idempotent semantics.
+        Closes the gap where the default-state config (no operator write)
+        shows neither a secondary-index WRITE entry nor SEARCH entries even
+        when an ES catalog driver is installed.  Mirrors the apply-handler
+        self-registration so default-state and apply-time configs converge —
+        ``_on_apply_catalog_routing_config`` calls the same helpers with the
+        same idempotent semantics.
         """
-        from dynastore.models.protocols.entity_store import (
-            CatalogStore,
-        )
+        from dynastore.models.protocols.entity_store import CatalogStore
 
-        try:
-            _self_register_indexers_into(self.operations, CatalogIndexer)
-            _self_register_searchers_into(self.operations, CatalogStore)
-            _self_register_transformers_into(self.transformers)
-        except Exception as exc:
-            # Discovery may not be ready (e.g. test fixtures that
-            # validate routing configs before plugins register).  The
-            # apply-handler path is the safety net for those cases.
-            logger.debug(
-                "CatalogRoutingConfig: read-time self-register skipped "
-                "(%s); apply-handler will populate on next write.", exc,
-            )
-        _validate_transformer_attachment(
-            self.operations, self.transformers, "CatalogRoutingConfig"
-        )
-        _warn_deferred_transformer_hops(self.operations, "CatalogRoutingConfig")
-        return self
+        _self_register_indexers_into(self.operations, CatalogIndexer)
+        _self_register_searchers_into(self.operations, CatalogStore)
 
 
 # ---------------------------------------------------------------------------
