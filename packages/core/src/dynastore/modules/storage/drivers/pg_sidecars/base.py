@@ -23,6 +23,7 @@ This module defines the contract for implementing specialized storage sidecars
 including methods for DDL generation, data transformation, and operation validation.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import (
@@ -44,6 +45,9 @@ from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.db_config.query_executor import DbResource
 
+
+
+logger = logging.getLogger(__name__)
 
 
 _SIDECAR_DATA_KEY = "_sidecar_data"
@@ -442,6 +446,25 @@ class SidecarConfig(BaseModel):
     model_config = {"extra": "allow"}
 
 
+# Canonical sidecar types contributed by *optional* extensions that are not
+# installed in every deployment SCOPE.  The slim ``maps``/``tiles`` service,
+# for example, ships without the STAC extension, yet it reads the same
+# DB-persisted ``ItemsPostgresqlDriverConfig`` rows authored by the
+# STAC-enabled catalog service — rows that legitimately carry a
+# ``stac_metadata`` sidecar.  When such a type can't be resolved to a concrete
+# config class in *this* process, it is retained as an opaque base
+# :class:`SidecarConfig` rather than rejected, so the shared config still
+# loads; the consuming pipeline (:class:`QueryOptimizer`) already skips
+# sidecars it can't instantiate (lenient) and consumer-gates extension-specific
+# ones, so an unusable sidecar is a no-op here (a tile read JOINs only the
+# geometry sidecar).  A ``sidecar_type`` that is neither registered nor listed
+# here is treated as a typo and rejected loudly.
+#
+# An extension that adds a new optional sidecar type MUST add its canonical
+# name here so slim services can round-trip configs that reference it.
+OPTIONAL_EXTENSION_SIDECAR_TYPES: frozenset = frozenset({"stac_metadata"})
+
+
 def _coerce_pg_sidecar(v: Any) -> Any:
     """Resolve a sidecar config dict → its concrete subclass via
     :class:`SidecarConfigRegistry`, dispatching on ``sidecar_type``.
@@ -453,12 +476,20 @@ def _coerce_pg_sidecar(v: Any) -> Any:
     config is shared code while the extension configs (e.g. STAC) live
     in their own modules.
 
-    Fail-loud on unknown / empty ``sidecar_type`` so configuration typos
-    surface at validation time rather than silently degrading to the
-    base :class:`SidecarConfig`.  Already-typed instances pass through
-    unchanged so model-instance round-tripping
-    (``model_dump(exclude_unset=True)`` → ``model_validate``) stays
-    lossless.
+    Resolution rules for a ``sidecar_type``:
+
+    - Registered → coerce to its concrete config subclass.
+    - Unregistered but in :data:`OPTIONAL_EXTENSION_SIDECAR_TYPES` → retain
+      as an opaque base :class:`SidecarConfig` (``extra="allow"`` keeps every
+      field; :meth:`SidecarConfig._retain_sidecar_type_on_dump` keeps the
+      discriminator), so a slim service can load a shared driver config that
+      references an extension it doesn't host.
+    - Unregistered and unknown (typo) → fail loud so configuration typos
+      surface at validation time instead of silently degrading.
+
+    Already-typed instances pass through unchanged so model-instance
+    round-tripping (``model_dump(exclude_unset=True)`` → ``model_validate``)
+    stays lossless.
     """
     if isinstance(v, SidecarConfig):
         return v
@@ -471,6 +502,14 @@ def _coerce_pg_sidecar(v: Any) -> Any:
             )
         cls = SidecarConfigRegistry.resolve_config_class(sc_type)
         if cls is SidecarConfig:
+            if sc_type in OPTIONAL_EXTENSION_SIDECAR_TYPES:
+                logger.debug(
+                    "sidecar_type %r not registered in this process; "
+                    "retaining as opaque config (its extension is not in "
+                    "this deployment's SCOPE)",
+                    sc_type,
+                )
+                return SidecarConfig.model_validate(v)
             registered = sorted(SidecarConfigRegistry._registry.keys())
             raise ValueError(
                 f"sidecar_type {sc_type!r} not registered; "

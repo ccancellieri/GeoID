@@ -60,3 +60,86 @@ class TestBackstopRecovers:
         out = _coerce_pg_sidecar({"sidecar_type": "stac_metadata"})
         assert isinstance(out, SidecarConfig)
         assert out.sidecar_type == "stac_metadata"
+
+
+class TestSlimServicePassthrough:
+    """A slim service (e.g. ``maps``/``tiles``) ships without the STAC
+    extension but reads the same DB-persisted ``ItemsPostgresqlDriverConfig``
+    rows authored by the STAC-enabled catalog service.  Loading such a config
+    must NOT fail just because ``stac_metadata`` can't be resolved here — it
+    is retained as an opaque base config so the config still loads and the
+    consuming pipeline skips the sidecar it can't use.
+    """
+
+    def _simulate_stac_not_installed(self, monkeypatch):
+        """Make ``stac_metadata`` unresolvable, as in a SCOPE without STAC."""
+        core_only = {
+            k: v
+            for k, v in SidecarConfigRegistry._registry.items()
+            if k != "stac_metadata"
+        }
+        monkeypatch.setattr(
+            SidecarConfigRegistry, "_registry", core_only, raising=False
+        )
+        # Neutralise the backstop import so it can't re-register stac_metadata
+        # (in the test env the extension *is* importable; production maps is
+        # not — this reproduces the not-installed path).
+        monkeypatch.setattr(
+            SidecarConfigRegistry, "_ensure_defaults", classmethod(lambda cls: None)
+        )
+
+    def test_unresolved_optional_type_is_retained_as_opaque_config(
+        self, monkeypatch
+    ):
+        self._simulate_stac_not_installed(monkeypatch)
+
+        raw = {
+            "sidecar_type": "stac_metadata",
+            "enabled": True,
+            "indexing": {"mode": "full"},
+            "external_assets_field": "assets",  # extension-specific extra field
+        }
+        out = _coerce_pg_sidecar(raw)
+
+        # Loaded, not rejected — and as the base type (no STAC class here).
+        assert type(out) is SidecarConfig
+        assert out.sidecar_type == "stac_metadata"
+        assert out.enabled is True
+        # extra="allow" preserves the extension-specific field for round-trip.
+        dumped = out.model_dump()
+        assert dumped["sidecar_type"] == "stac_metadata"
+        assert dumped["external_assets_field"] == "assets"
+
+    def test_unknown_typo_type_still_fails_loud(self, monkeypatch):
+        self._simulate_stac_not_installed(monkeypatch)
+
+        import pytest
+
+        # A near-miss typo is NOT in OPTIONAL_EXTENSION_SIDECAR_TYPES, so it
+        # must still raise — the passthrough only covers known optional types.
+        with pytest.raises(ValueError, match="stac_metdata.*not registered"):
+            _coerce_pg_sidecar({"sidecar_type": "stac_metdata"})
+
+    def test_full_driver_config_loads_with_unresolved_stac_sidecar(
+        self, monkeypatch
+    ):
+        """The end-to-end symptom: ItemsPostgresqlDriverConfig.model_validate
+        must succeed on a slim service even when a sidecar references STAC."""
+        self._simulate_stac_not_installed(monkeypatch)
+
+        from dynastore.modules.storage.driver_config import (
+            ItemsPostgresqlDriverConfig,
+        )
+
+        cfg = ItemsPostgresqlDriverConfig.model_validate(
+            {
+                "physical_table": "t_abc123",
+                "sidecars": [
+                    {"sidecar_type": "geometries"},
+                    {"sidecar_type": "stac_metadata", "enabled": True},
+                ],
+            }
+        )
+        types = [sc.sidecar_type for sc in cfg.sidecars]
+        assert "geometries" in types
+        assert "stac_metadata" in types
