@@ -124,7 +124,7 @@ class DatastoreModule(ModuleProtocol, DatabaseProtocol):
                 app_state.sync_engine = create_engine(
                     normalize_db_url(db_config.database_url, is_async=False),
                     pool_size=db_config.pool_min_size,
-                    max_overflow=db_config.pool_max_size - db_config.pool_min_size,
+                    max_overflow=db_config.pool_max_overflow,
                     pool_timeout=db_config.pool_command_timeout,
                     # Pool hygiene parity with the async engine
                     # (db_service.py): recycle stale slots and pre-ping so a

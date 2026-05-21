@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -52,8 +52,6 @@ from dynastore.modules.catalog.asset_service import (
     AssetUploadDefinition,
 )
 from dynastore.modules.catalog.write_policy_assets import (
-    AssetIdentityField,
-    AssetIdentityKind,
     AssetIdentityRule,
     AssetsWritePolicy,
     AssetWriteConflictPolicy,
@@ -540,9 +538,7 @@ async def test_policy_loaded_at_collection_scope(
     custom_policy = AssetsWritePolicy(
         on_conflict=AssetWriteConflictPolicy.UPDATE,
         identity=[
-            AssetIdentityRule(
-                match_on=[AssetIdentityField(kind=AssetIdentityKind.ASSET_ID)],
-            ),
+            AssetIdentityRule(match_on=["asset_id"]),
         ],
     )
     patched_env["configs"].get_config.return_value = custom_policy

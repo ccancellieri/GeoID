@@ -36,7 +36,7 @@ class CatalogLookupAudience(PluginConfig):
         {"is_public": true}
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "lookup_audience")
-    _visibility: ClassVar[Optional[str]] = "catalog"
+    _freeze_at: ClassVar[Optional[str]] = "catalog"
 
     is_public: Mutable[bool] = Field(
         default=False,
@@ -71,7 +71,7 @@ class CollectionWriteAudience(PluginConfig):
         {"allow_anonymous_create": true}
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "write_audience")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     allow_anonymous_create: Mutable[bool] = Field(
         default=False,

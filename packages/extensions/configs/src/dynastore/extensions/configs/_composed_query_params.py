@@ -78,7 +78,7 @@ _PARAMS: Dict[str, Dict[str, Any]] = {
             "prefer the ``view`` parameter for explicit delta/inherited "
             "filtering at sub-platform tiers.  ``scope`` (default) — at "
             "platform scope (combined with ``strict=True``, the default) "
-            "drops ``_visibility=catalog``/``collection`` templates so the "
+            "drops ``_freeze_at=catalog``/``collection`` templates so the "
             "body lists only platform-intrinsic configs.  ``upstream`` — "
             "renders every visible class with its waterfall-resolved value "
             "(at platform scope this also inlines catalog-/collection-tier "

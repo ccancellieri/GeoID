@@ -187,15 +187,31 @@ async def test_get_effective_configs_consumes_real_list_configs_row_shape(resolv
 # _compose_tree — scope/topic tree + optional meta in a single pass
 # ---------------------------------------------------------------------------
 
+def _effective_tiers(cls):
+    """Mirror ``PluginConfig.effective_tiers`` for synthetic stub classes.
+
+    Explicit ``_tiers`` wins (narrow / slim opt-in); otherwise the default is
+    the full tier stack ``(platform, catalog, collection)`` — a platform value
+    cascades down and any sub-tier may override it (#761 full-inherited-surface
+    contract). The data tier is ``_freeze_at``, not derived from ``_address``.
+    """
+    explicit = getattr(cls, "_tiers", None)
+    if explicit is not None:
+        return tuple(explicit)
+    return ("platform", "catalog", "collection")
+
+
 def _stub_registry(**classes):
     """Build a fake ``list_registered_configs()`` dict.
 
-    Each entry is ``name -> {"_address": (s,t,sub), "_visibility": str|None,
-                              "abstract": <bool>?, "__module__": "..."?}``.
-    Placement is now driven by the explicit ``_address`` ClassVar on each
+    Each entry is ``name -> {"_address": (s,t,sub), "_freeze_at": str|None,
+                              "_tiers": tuple|None, "abstract": <bool>?,
+                              "__module__": "..."?}``.
+    Placement is driven by the explicit ``_address`` ClassVar on each
     concrete config (mandatory in production, enforced by
-    ``PluginConfig.__init_subclass__``).  ``_visibility`` is the optional
-    scope filter; ``abstract=True`` flips ``is_abstract_base``.
+    ``PluginConfig.__init_subclass__``) and ``effective_tiers`` (explicit
+    ``_tiers`` else address-derived).  ``_freeze_at`` is the optional
+    immutability-gate tier; ``abstract=True`` flips ``is_abstract_base``.
     """
     out = {}
     for name, attrs in classes.items():
@@ -204,10 +220,13 @@ def _stub_registry(**classes):
             body["is_abstract_base"] = True
         if "_address" in attrs:
             body["_address"] = attrs["_address"]
-        if "_visibility" in attrs:
-            body["_visibility"] = attrs["_visibility"]
+        if "_freeze_at" in attrs:
+            body["_freeze_at"] = attrs["_freeze_at"]
+        if "_tiers" in attrs:
+            body["_tiers"] = attrs["_tiers"]
         cls = type(name, (), body)
         cls.__module__ = attrs.get("__module__", "test.stub")
+        cls.effective_tiers = classmethod(lambda c: _effective_tiers(c))
         out[name] = cls
     return out
 
@@ -218,10 +237,15 @@ def test_compose_tree_places_classes_by_address():
         "catalog_core_postgresql_driver": {"enabled": True},
     }
     registry = _stub_registry(
-        WebConfig={"_address": ("platform", "web")},
+        # Explicit ``_tiers`` opts this platform-addressed config into the
+        # catalog view (the address alone would derive platform-only).
+        WebConfig={
+            "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
+        },
         catalog_core_postgresql_driver={
             "_address": ("platform", "catalog", "drivers"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
     )
     with patch(
@@ -245,13 +269,17 @@ def test_compose_tree_places_classes_by_address():
     assert meta["source"] == "default"
 
 
-def test_compose_tree_filters_collection_only_from_catalog():
-    # ``_visibility = "collection"`` → hidden at non-collection scopes.
+def test_compose_tree_renders_collection_addressed_config_at_catalog():
+    # A collection-reaching ``_address`` is authorable platform→catalog→
+    # collection (``effective_tiers``), so a collection-tier policy now
+    # RENDERS at catalog scope (the catalog can set a default that cascades).
+    # ``_freeze_at="collection"`` still gates immutability at the collection
+    # tier; it no longer hides the leaf from the catalog read view.
     by_class = {"items_write_policy": {"on_conflict": "update"}}
     registry = _stub_registry(
         items_write_policy={
             "_address": ("platform", "catalog", "collection", "items", "policy"),
-            "_visibility": "collection",
+            "_freeze_at": "collection",
         },
     )
     with patch(
@@ -261,7 +289,8 @@ def test_compose_tree_filters_collection_only_from_catalog():
         tree = ConfigApiService._compose_tree(
             by_class, sources={}, active_scope="catalog",
         )
-    assert "storage" not in tree or "policy" not in tree.get("storage", {})
+    leaf = tree["platform"]["catalog"]["collection"]["items"]["policy"]["items_write_policy"]
+    assert {k: v for k, v in leaf.items() if not k.startswith("_")} == {"on_conflict": "update"}
 
 
 def test_compose_tree_includes_collection_only_at_collection_scope():
@@ -269,7 +298,7 @@ def test_compose_tree_includes_collection_only_at_collection_scope():
     registry = _stub_registry(
         items_write_policy={
             "_address": ("platform", "catalog", "collection", "items", "policy"),
-            "_visibility": "collection",
+            "_freeze_at": "collection",
         },
     )
     with patch(
@@ -287,9 +316,9 @@ def test_compose_tree_renders_catalog_tier_items_routing_at_catalog_scope():
 
     A catalog-applied items-routing default (e.g. a routing preset) is
     persisted + waterfall-resolved at the catalog tier, so it MUST appear
-    in the catalog composed tree.  Before the ``_view_scopes`` fix the
-    composer dropped it (``_visibility="collection"``) and operators saw
-    only the defaults.
+    in the catalog composed tree.  Before the scope-model fix the composer
+    dropped it (it was treated as a collection-only template) and operators
+    saw only the defaults.
     """
     from dynastore.modules.storage.routing_config import ItemsRoutingConfig
 
@@ -315,9 +344,9 @@ def test_compose_tree_renders_routing_config_at_platform_scope_strict():
     visible in the default ``GET /configs`` body (``include=scope``,
     ``strict=True``).
 
-    ``_place`` admits it (``_view_scopes`` includes "platform"), and the
+    ``_place`` admits it (``_tiers`` includes "platform"), and the
     slim-mode ``_is_in_scope`` must honour that explicit opt-in rather
-    than slimming it as a ``_visibility="collection"`` template — else a
+    than slimming it as a ``_freeze_at="collection"`` template — else a
     platform-applied routing default is invisible at the tier it was set,
     re-introducing the catalog-tier bug one level up.
     """
@@ -339,16 +368,16 @@ def test_compose_tree_renders_routing_config_at_platform_scope_strict():
     routing_node = tree["platform"]["catalog"]["collection"]["items"]["routing"]
     assert "items_routing_config" in routing_node, (
         "platform-tier routing default must survive strict slim-mode at "
-        "platform scope when _view_scopes opts it in"
+        "platform scope when _tiers opts it in"
     )
 
 
-def test_view_scopes_overrides_visibility_for_view_only():
-    """``_view_scopes`` decouples view placement from ``_visibility``.
+def test_tiers_overrides_freeze_at_for_view_only():
+    """``_tiers`` decouples view placement from ``_freeze_at``.
 
-    A class with ``_visibility="collection"`` (which keeps gating the
+    A class with ``_freeze_at="collection"`` (which keeps gating the
     immutability materialization check at the collection tier) but an
-    explicit ``_view_scopes`` covering catalog must RENDER at catalog
+    explicit ``_tiers`` covering catalog must RENDER at catalog
     scope.  This is the contract routing presets rely on: a routing
     default applied at the catalog tier is persisted + resolvable, so it
     must also be visible in the catalog composed view.
@@ -358,15 +387,14 @@ def test_view_scopes_overrides_visibility_for_view_only():
     cls = _stub_registry(
         widget_routing={
             "_address": ("platform", "catalog", "collection", "widget", "routing"),
-            "_visibility": "collection",
+            "_freeze_at": "collection",
+            "_tiers": ("platform", "catalog", "collection"),
         },
     )["widget_routing"]
-    # Inject the view-scope override the real routing configs declare.
-    cls._view_scopes = ("platform", "catalog", "collection")
 
     assert _place(cls, "platform") is not None
     assert _place(cls, "catalog") is not None, (
-        "_view_scopes must surface a collection-visibility config at catalog scope"
+        "_tiers must surface a collection-gated config at catalog scope"
     )
     assert _place(cls, "collection") is not None
 
@@ -401,12 +429,12 @@ def test_routing_configs_visible_at_catalog_scope():
     )
 
 
-def test_routing_view_scopes_do_not_disturb_immutability_visibility():
-    """The fix must leave ``_visibility`` (immutability gate) untouched.
+def test_routing_tiers_do_not_disturb_immutability_freeze_at():
+    """The fix must leave ``_freeze_at`` (immutability gate) untouched.
 
-    Decoupling means ``_view_scopes`` drives the view while ``_visibility``
+    Decoupling means ``_tiers`` drives the view while ``_freeze_at``
     keeps driving ``is_materialized`` granularity.  The collection-tier
-    routing configs must retain ``_visibility="collection"``.
+    routing configs must retain ``_freeze_at="collection"``.
     """
     from dynastore.modules.storage.routing_config import (
         AssetRoutingConfig,
@@ -415,8 +443,8 @@ def test_routing_view_scopes_do_not_disturb_immutability_visibility():
     )
 
     for cls in (ItemsRoutingConfig, CollectionRoutingConfig, AssetRoutingConfig):
-        assert cls._visibility == "collection", (
-            f"{cls.__name__}._visibility must stay 'collection' so the "
+        assert cls._freeze_at == "collection", (
+            f"{cls.__name__}._freeze_at must stay 'collection' so the "
             f"immutability materialization gate is unchanged"
         )
 
@@ -585,14 +613,6 @@ def test_build_routing_refs_link_title_reflects_active_scope():
     ``driver-config`` link from the API response see whether they're
     about to PATCH a platform default, a catalog override, or a
     collection override.  Title carries the scope label."""
-    by_class = {
-        "items_routing_config": {
-            "operations": {
-                "WRITE": [{"driver_ref": "items_postgresql_driver",
-                           "on_failure": "fatal", "write_mode": "sync"}]
-            },
-        },
-    }
     registry = _stub_registry(items_postgresql_driver={"__module__": "m"})
     cases = [
         ("http://h/configs", "platform"),
@@ -841,7 +861,7 @@ def test_compose_tree_drops_empty_output_transformers_on_leaf():
     registry = _stub_registry(
         items_read_policy={
             "_address": ("platform", "catalog", "collection", "items", "read_policy"),
-            "_visibility": "collection",
+            "_freeze_at": "collection",
         },
     )
     with patch(
@@ -870,7 +890,7 @@ def test_compose_tree_preserves_non_empty_output_transformers():
     registry = _stub_registry(
         items_read_policy={
             "_address": ("platform", "catalog", "collection", "items", "read_policy"),
-            "_visibility": "collection",
+            "_freeze_at": "collection",
         },
     )
     with patch(
@@ -981,7 +1001,7 @@ async def test_compose_catalog_meta_field_inlines_meta_on_leaf(mock_config_servi
 
     class FakeWebConfig:
         _address = ("platform", "web")
-        _visibility = None
+        _freeze_at = None
 
         @classmethod
         def model_json_schema(cls):
@@ -1022,7 +1042,7 @@ async def test_compose_catalog_meta_schema_inlines_full_json_schema(mock_config_
 
     class FakeWebConfig:
         _address = ("platform", "web")
-        _visibility = None
+        _freeze_at = None
 
         @classmethod
         def model_json_schema(cls):
@@ -1061,7 +1081,7 @@ async def test_compose_catalog_links_none_opt_out_suppresses_leaf_links(mock_con
 
     class FakeWebConfig:
         _address = ("platform", "web")
-        _visibility = None
+        _freeze_at = None
 
         @classmethod
         def model_json_schema(cls):
@@ -1098,7 +1118,7 @@ async def test_compose_catalog_links_minimal_emits_four_rels_no_titles(mock_conf
 
     class FakeWebConfig:
         _address = ("platform", "web")
-        _visibility = None
+        _freeze_at = None
 
         @classmethod
         def model_json_schema(cls):
@@ -1144,7 +1164,7 @@ async def test_compose_collection_links_full_titles_name_scope(mock_config_servi
 
     class FakeRoutingConfig:
         _address = ("storage", "routing")
-        _visibility = "collection"
+        _freeze_at = "collection"
 
         @classmethod
         def model_json_schema(cls):
@@ -1186,7 +1206,7 @@ async def test_compose_collection_links_full_adds_schema_and_engine_rels(mock_co
 
     class FakeDriverConfig:
         _address = ("platform", "catalog", "collection", "drivers")
-        _visibility = "collection"
+        _freeze_at = "collection"
 
         @classmethod
         def model_json_schema(cls):
@@ -1247,7 +1267,7 @@ async def test_compose_collection_links_minimal_skips_schema_and_engine(mock_con
 
     class FakeDriverConfig:
         _address = ("platform", "catalog", "collection", "drivers")
-        _visibility = "collection"
+        _freeze_at = "collection"
 
         @classmethod
         def model_json_schema(cls):
@@ -1297,17 +1317,17 @@ async def test_compose_platform_config_sets_platform_scope(mock_config_service):
     assert r.scope == "platform"
 
 
-def test_compose_tree_address_visibility_filters_correctly():
-    """``_visibility = "catalog"`` keeps the class out of the *main* tree
-    at collection scope under default slim mode — it surfaces in the
-    hierarchical ``inherited`` tree at its natural address with a
-    ``{source}`` leaf instead.
+def test_compose_tree_address_freeze_at_filters_correctly():
+    """A catalog-addressed config (``_freeze_at = "catalog"``, ``_tiers``
+    address-derived to platform+catalog) is slimmed out of the platform
+    strict body, renders at catalog scope, and is excluded at collection
+    scope (its address stops at catalog).
     """
     by_class = {"CatalogOnly": {"x": 1}}
     registry = _stub_registry(
         CatalogOnly={
             "_address": ("platform", "catalog", "drivers"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
     )
     with patch(
@@ -1315,7 +1335,7 @@ def test_compose_tree_address_visibility_filters_correctly():
         return_value=registry,
     ):
         # At platform scope under strict=True (default, Cycle F.7d.2):
-        # _visibility="catalog" routes to ``inherited`` instead of inlining.
+        # _freeze_at="catalog" template is slimmed out of the body.
         tree = ConfigApiService._compose_tree(
             by_class, sources={"CatalogOnly": "platform"}, active_scope="platform",
         )
@@ -1341,9 +1361,9 @@ def test_compose_tree_address_visibility_filters_correctly():
         assert "storage" not in tree
 
 
-def test_compose_tree_strict_at_platform_routes_catalog_visibility_to_inherited():
+def test_compose_tree_strict_at_platform_routes_catalog_freeze_at_to_inherited():
     """Cycle F.7d.2 — under ``strict=True`` (default), a catalog-tier
-    template (``_visibility="catalog"``) at platform scope drops out of
+    template (``_freeze_at="catalog"``) at platform scope drops out of
     the body and surfaces in ``inherited`` at its natural address.
 
     Pin against the user-mental-model: platform scope shows only
@@ -1357,11 +1377,11 @@ def test_compose_tree_strict_at_platform_routes_catalog_visibility_to_inherited(
     registry = _stub_registry(
         platform_intrinsic={
             "_address": ("platform", "modules", "web"),
-            "_visibility": None,
+            "_freeze_at": None,
         },
         catalog_template={
             "_address": ("platform", "catalog", "drivers"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
     )
     sources = {"platform_intrinsic": "platform", "catalog_template": "platform"}
@@ -1383,10 +1403,10 @@ def test_compose_tree_strict_at_platform_routes_catalog_visibility_to_inherited(
         )
 
 
-def test_compose_tree_strict_keeps_platform_visibility_in_body():
-    """Cycle F.7d.2-fixup — ``_visibility="platform"`` configs (engines,
+def test_compose_tree_strict_keeps_platform_freeze_at_in_body():
+    """Cycle F.7d.2-fixup — ``_freeze_at="platform"`` configs (engines,
     security, etc.) stay in body at platform scope under strict.  The
-    F.7d.2 cut only allowed ``_visibility=None`` and silently routed
+    F.7d.2 cut only allowed ``_freeze_at=None`` and silently routed
     engine configs to ``inherited``, which was a bug — engines ARE
     platform-tier resources by definition.
     """
@@ -1394,7 +1414,7 @@ def test_compose_tree_strict_keeps_platform_visibility_in_body():
     registry = _stub_registry(
         engine_a={
             "_address": ("platform", "protocols", "storage"),
-            "_visibility": "platform",
+            "_freeze_at": "platform",
         },
     )
     sources = {"engine_a": "platform"}
@@ -1417,7 +1437,7 @@ def test_compose_tree_strict_false_restores_inclusive_platform_behavior():
     registry = _stub_registry(
         catalog_template={
             "_address": ("platform", "catalog", "drivers"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
     )
     sources = {"catalog_template": "platform"}
@@ -1433,14 +1453,14 @@ def test_compose_tree_strict_false_restores_inclusive_platform_behavior():
 
 def test_compose_tree_strict_no_op_at_catalog_and_collection_scope():
     """Cycle F.7d.2 — ``strict`` only narrows platform scope.  At catalog
-    and collection scope, the per-tier ``_visibility`` filter already
+    and collection scope, the per-tier ``_tiers`` placement filter already
     runs; ``strict`` is accepted for API symmetry but doesn't change
     behavior there."""
     by_class = {"catalog_template": {"value": 2}}
     registry = _stub_registry(
         catalog_template={
             "_address": ("platform", "catalog", "drivers"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
     )
     sources = {"catalog_template": "catalog"}
@@ -1455,11 +1475,13 @@ def test_compose_tree_strict_no_op_at_catalog_and_collection_scope():
             assert "catalog_template" in tree["platform"]["catalog"]["drivers"]
 
 
-def test_compose_tree_collection_scope_surfaces_full_config_tree():
-    """At collection scope under the default mode the response surfaces every
-    leaf that ``_place()`` accepts — collection-vis, catalog-vis (read-only
-    context), and null-visibility (overrideable).  ``_meta.source`` on each
-    leaf reports the effective tier.  Issue #761.
+def test_compose_tree_collection_scope_surfaces_full_inherited_surface():
+    """At collection scope the response surfaces the full inherited surface
+    (#761): collection-tier configs in the body, plus catalog- and
+    platform-tier configs as inherited context (uniform-default tiers — a
+    config renders at every scope unless it explicitly narrows via ``_tiers``).
+    ``_meta.source`` on each leaf reports the tier the effective value
+    resolves from.
     """
     by_class = {
         "items_postgresql_driver":      {"sidecars": []},
@@ -1478,22 +1500,23 @@ def test_compose_tree_collection_scope_surfaces_full_config_tree():
     registry = _stub_registry(
         items_postgresql_driver={
             "_address": ("platform", "catalog", "collection", "items", "drivers"),
-            "_visibility": "collection",
+            "_freeze_at": "collection",
         },
         elasticsearch_catalog_config={
             "_address": ("platform", "catalog", "elasticsearch"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
         catalog_routing_config={
             "_address": ("platform", "catalog", "routing"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
         catalog_postgresql_driver={
             "_address": ("platform", "catalog", "drivers"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
         web_config={
             "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
         },
     )
     with patch(
@@ -1512,21 +1535,24 @@ def test_compose_tree_collection_scope_surfaces_full_config_tree():
     assert {k: v for k, v in coll_node["items_postgresql_driver"].items() if not k.startswith("_")} == {"sidecars": []}
     # No sibling ``inherited_from_catalog`` block (Cycle D.3 dropped it).
     assert "inherited_from_catalog" not in tree
-    # Null-visibility (web_config) included; source reports the effective tier.
+    # web_config renders here (explicit ``_tiers`` includes collection);
+    # source reports the effective tier.
     assert {k: v for k, v in tree["platform"]["web"]["web_config"].items() if not k.startswith("_")} == {"brand_name": "X"}
     assert tree["platform"]["web"]["web_config"]["_meta"]["source"] == "platform"
-    # Catalog-vis configs ARE included at collection scope (#761) — operators
-    # see the full waterfall.  Each leaf's _meta.source reports source="catalog".
+    # Uniform-default tiers (#761 full inherited surface): catalog-tier
+    # configs ALSO surface at collection scope as inherited context, with
+    # ``_meta.source`` reporting the catalog tier they resolve from.
+    assert "elasticsearch_catalog_config" in tree["platform"]["catalog"]["elasticsearch"]
     assert tree["platform"]["catalog"]["elasticsearch"]["elasticsearch_catalog_config"]["_meta"]["source"] == "catalog"
-    assert tree["platform"]["catalog"]["routing"]["catalog_routing_config"]["_meta"]["source"] == "catalog"
-    assert tree["platform"]["catalog"]["drivers"]["catalog_postgresql_driver"]["_meta"]["source"] == "catalog"
+    assert "catalog_routing_config" in tree["platform"]["catalog"]["routing"]
+    assert "catalog_postgresql_driver" in tree["platform"]["catalog"]["drivers"]
 
 
-def test_compose_tree_catalog_scope_slim_mode_visibility():
+def test_compose_tree_catalog_scope_slim_mode_freeze_at():
     """At catalog scope under slim mode:
 
-    - ``_visibility="catalog"`` configs stay in body.
-    - ``_visibility=None`` (universal) configs stay in body — null-visibility
+    - ``_freeze_at="catalog"`` configs stay in body.
+    - ``_freeze_at=None`` (universal) configs stay in body — null gate
       means "overrideable at any tier"; ``_meta.source`` reports where the
       effective value comes from.
     """
@@ -1541,9 +1567,12 @@ def test_compose_tree_catalog_scope_slim_mode_visibility():
     registry = _stub_registry(
         catalog_routing_config={
             "_address": ("platform", "catalog", "routing"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
         },
-        web_config={"_address": ("platform", "web")},
+        web_config={
+            "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
+        },
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -1567,7 +1596,7 @@ def test_compose_tree_catalog_vis_surfaces_at_collection_scope_with_docs():
     """
     class FakeESCatConfig:
         _address = ("platform", "catalog", "elasticsearch")
-        _visibility = "catalog"
+        _freeze_at = "catalog"
 
         @classmethod
         def model_json_schema(cls):
@@ -1597,25 +1626,28 @@ def test_compose_tree_catalog_vis_surfaces_at_collection_scope_with_docs():
 # ---------------------------------------------------------------------------
 
 
-def test_compose_tree_slim_null_visibility_included_at_non_platform_scopes():
-    """``_visibility=None`` (null / universal) configs appear in the body at
+def test_compose_tree_slim_null_freeze_at_included_at_non_platform_scopes():
+    """``_freeze_at=None`` (null / universal) configs appear in the body at
     catalog and collection scope under the default ``include="scope"`` mode.
 
-    Null-visibility means "overrideable at any tier."  Module, extension,
+    A null gate means "overrideable at any tier."  Module, extension,
     and task configs carry this default so catalog/collection admins can
     inspect and override them at their scope.  ``_meta.source`` on each
     leaf reports the effective tier.
     """
     by_class = {
-        "items_postgresql_driver": {"sidecars": []},  # _visibility=collection
-        "web_config": {"brand_name": "X"},            # _visibility=None (universal)
+        "items_postgresql_driver": {"sidecars": []},  # _freeze_at=collection
+        "web_config": {"brand_name": "X"},            # _freeze_at=None (universal)
     }
     registry = _stub_registry(
         items_postgresql_driver={
             "_address": ("platform", "catalog", "collection", "items", "drivers"),
-            "_visibility": "collection",
+            "_freeze_at": "collection",
         },
-        web_config={"_address": ("platform", "web")},
+        web_config={
+            "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
+        },
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -1640,7 +1672,10 @@ def test_compose_tree_slim_keeps_collection_overrides_in_body():
     row IS in-scope — it stays in the body."""
     by_class = {"web_config": {"brand_name": "Tenant Override"}}
     registry = _stub_registry(
-        web_config={"_address": ("platform", "web")},
+        web_config={
+            "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
+        },
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -1663,10 +1698,13 @@ def test_compose_tree_upstream_mode_renders_everything_in_body():
         "items_postgresql_driver": {"sidecars": []},
     }
     registry = _stub_registry(
-        web_config={"_address": ("platform", "web")},
+        web_config={
+            "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
+        },
         items_postgresql_driver={
             "_address": ("platform", "catalog", "collection", "items", "drivers"),
-            "_visibility": "collection",
+            "_freeze_at": "collection",
         },
     )
     with patch(
@@ -1695,7 +1733,10 @@ def test_compose_tree_slim_at_platform_scope_is_a_noop():
     tier, nothing is upstream."""
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry(
-        web_config={"_address": ("platform", "web")},
+        web_config={
+            "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
+        },
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -1729,7 +1770,7 @@ def test_catalog_es_driver_lands_under_storage_drivers_catalog():
     )
 
     assert CatalogElasticsearchDriverConfig._address == ("platform", "catalog", "drivers")
-    assert CatalogElasticsearchDriverConfig._visibility == "catalog"
+    assert CatalogElasticsearchDriverConfig._freeze_at == "catalog"
 
 
 def test_collection_es_driver_lands_under_storage_drivers_collection():
@@ -1739,7 +1780,7 @@ def test_collection_es_driver_lands_under_storage_drivers_collection():
     )
 
     assert CollectionElasticsearchDriverConfig._address == ("platform", "catalog", "collection", "drivers")
-    assert CollectionElasticsearchDriverConfig._visibility == "catalog"
+    assert CollectionElasticsearchDriverConfig._freeze_at == "catalog"
 
 
 def test_assets_plugin_config_visible_at_all_scopes():
@@ -1747,24 +1788,17 @@ def test_assets_plugin_config_visible_at_all_scopes():
     from dynastore.extensions.assets.config import AssetsPluginConfig
 
     assert AssetsPluginConfig._address == ("platform", "extensions", "assets")
-    assert AssetsPluginConfig._visibility is None  # visible everywhere
+    assert AssetsPluginConfig._freeze_at is None  # platform-intrinsic gate
 
 
-def test_761_full_config_surface_at_catalog_and_collection_scope():
-    """Regression for #761: the catalog and collection composed response
-    must surface the full configurable surface — modules, extensions,
-    tasks, engines, drivers — not just configs that explicitly carry
-    ``_visibility="catalog"``/``"collection"``.
+def test_platform_addressed_configs_render_at_all_scopes():
+    """Uniform-default tier placement (``effective_tiers``) + ``_freeze_at``.
 
-    Before the fix, ``_is_in_scope()`` at non-platform scopes filtered out
-    every leaf that lacked a stored row at the active scope AND didn't
-    match ``_visibility=active_scope``.  The ``gcp`` config was the only
-    leaf because it happened to declare ``_visibility="catalog"``;
-    engines, modules, extensions, tasks disappeared.
-
-    After the fix, every leaf placed by ``_place()`` appears.  ``_meta.source``
-    on each reports where the effective value comes from; ``_visibility``
-    continues to gate writability via the service layer.
+    Platform-addressed configs render at the platform scope AND, by the
+    uniform default, as inherited context at catalog/collection scope (#761).
+    Their ``effective_tiers`` is the full stack unless they explicitly narrow
+    via ``_tiers``.  ``_freeze_at`` (the immutability gate) is orthogonal:
+    ``None`` for null-gated module/task configs, ``"platform"`` for engines.
     """
     from dynastore.modules.tasks.tasks_config import TasksPluginConfig
     from dynastore.modules.web.models import WebPageSettingsConfig
@@ -1774,15 +1808,15 @@ def test_761_full_config_surface_at_catalog_and_collection_scope():
         ElasticsearchEngineConfig,
     )
 
-    null_vis = (TasksPluginConfig, WebPageSettingsConfig, CachePluginConfig)
-    platform_vis = (PostgresqlEngineConfig, ElasticsearchEngineConfig)
-    for cls in null_vis:
-        assert getattr(cls, "_visibility", None) is None, (
-            f"{cls.__name__} unexpectedly declares _visibility"
+    null_gate = (TasksPluginConfig, WebPageSettingsConfig, CachePluginConfig)
+    platform_gate = (PostgresqlEngineConfig, ElasticsearchEngineConfig)
+    for cls in null_gate:
+        assert getattr(cls, "_freeze_at", None) is None, (
+            f"{cls.__name__} unexpectedly declares a non-None _freeze_at"
         )
-    for cls in platform_vis:
-        assert getattr(cls, "_visibility", None) == "platform", (
-            f"{cls.__name__} expected _visibility='platform'"
+    for cls in platform_gate:
+        assert getattr(cls, "_freeze_at", None) == "platform", (
+            f"{cls.__name__} expected _freeze_at='platform'"
         )
 
     from dynastore.extensions.configs.config_api_service import (
@@ -1790,37 +1824,48 @@ def test_761_full_config_surface_at_catalog_and_collection_scope():
         _place,
     )
 
-    # Build a representative by_class with one of each kind.
-    representative = null_vis + platform_vis
+    representative = null_gate + platform_gate
+    # Uniform default: every config renders at the full tier stack.
+    for cls in representative:
+        assert cls.effective_tiers() == ("platform", "catalog", "collection"), (
+            f"{cls.__name__} expected full-stack effective_tiers"
+        )
+
     by_class = {cls.class_key(): cls().model_dump() for cls in representative}
     sources = {k: "default" for k in by_class}
 
-    for scope in ("catalog", "collection"):
-        tree = ConfigApiService._compose_tree(
-            by_class, sources=sources, active_scope=scope,
-            meta_mode="field",  # #946: opt into _meta for the source check below
+    # At platform scope every leaf is placed and rendered.
+    tree = ConfigApiService._compose_tree(
+        by_class, sources=sources, active_scope="platform",
+        meta_mode="field",  # #946: opt into _meta for the source check below
+    )
+    assert len(tree) > 0, "empty tree at platform scope"
+    for cls in representative:
+        address = _place(cls, "platform")
+        assert address is not None, f"{cls.__name__} dropped by _place at platform"
+        node = tree
+        for seg in address:
+            if seg is None:
+                continue
+            assert seg in node, (
+                f"{cls.__name__} address segment '{seg}' missing at platform; "
+                f"keys: {list(node.keys())}"
+            )
+            node = node[seg]
+        assert cls.class_key() in node, (
+            f"{cls.__name__} ({cls.class_key()}) missing from tree at platform"
         )
-        assert len(tree) > 0, f"empty tree at {scope} scope"
+        leaf = node[cls.class_key()]
+        assert "_meta" in leaf
+        assert leaf["_meta"]["source"] == "default"
+
+    # Uniform default: these configs ARE also placed at catalog/collection
+    # scope as inherited context (#761 full surface).
+    for scope in ("catalog", "collection"):
         for cls in representative:
-            address = _place(cls, scope)
-            assert address is not None, (
-                f"{cls.__name__} dropped by _place at scope={scope}"
+            assert _place(cls, scope) is not None, (
+                f"{cls.__name__} should render as inherited context at scope={scope}"
             )
-            node = tree
-            for seg in address:
-                if seg is None:
-                    continue
-                assert seg in node, (
-                    f"{cls.__name__} address segment '{seg}' missing at scope={scope}; "
-                    f"keys: {list(node.keys())}"
-                )
-                node = node[seg]
-            assert cls.class_key() in node, (
-                f"{cls.__name__} ({cls.class_key()}) missing from tree at scope={scope}"
-            )
-            leaf = node[cls.class_key()]
-            assert "_meta" in leaf
-            assert leaf["_meta"]["source"] == "default"
 
 
 # ---------------------------------------------------------------------------

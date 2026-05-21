@@ -128,7 +128,7 @@ async def is_materialized(
 ) -> bool:
     """True iff the physical resource the config governs has been materialized.
 
-    Per-tier dispatch on ``cls._visibility``:
+    Per-tier dispatch on ``cls._freeze_at``:
 
     - ``"collection"`` → at least one row in the collection's physical items table
     - ``"catalog"``    → at least one collection registered in the catalog
@@ -168,13 +168,13 @@ async def is_materialized(
             )
             return False
 
-    visibility = getattr(cls, "_visibility", None)
+    freeze_at = getattr(cls, "_freeze_at", None)
     try:
-        if visibility == "collection":
+        if freeze_at == "collection":
             # When set at the platform/catalog tier (no collection_id, or no
             # catalog_id at all), the "collection has rows" question doesn't
             # apply — fall up the tier. A platform-tier write to a
-            # collection-visibility class is effectively a default; gate it
+            # collection-gated class is effectively a default; gate it
             # on whether any catalog/collection has been provisioned so the
             # operator mental model (locked once anything depends on it)
             # still holds.
@@ -183,7 +183,7 @@ async def is_materialized(
             if catalog_id:
                 return await _catalog_is_materialized(catalog_id, conn)
             return await _platform_is_materialized(conn)
-        if visibility == "catalog":
+        if freeze_at == "catalog":
             if catalog_id:
                 return await _catalog_is_materialized(catalog_id, conn)
             return await _platform_is_materialized(conn)
@@ -192,8 +192,8 @@ async def is_materialized(
     except _EXPECTED_ABSENT_LAYER as exc:
         logger.warning(
             "is_materialized_fail_open site=dispatch cls=%s catalog_id=%s "
-            "collection_id=%s visibility=%s exception_type=%s",
-            cls.__qualname__, catalog_id, collection_id, visibility,
+            "collection_id=%s freeze_at=%s exception_type=%s",
+            cls.__qualname__, catalog_id, collection_id, freeze_at,
             type(exc).__name__, exc_info=True,
         )
         return False

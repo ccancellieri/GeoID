@@ -825,12 +825,11 @@ async def reset_dynastore_state(engine=None):
     except Exception as e:
         logger.debug(f"CollectionPgSidecarRegistry.clear() skipped: {e}")
     try:
-        from dynastore.modules.storage.drivers.catalog_postgresql import (
-            CatalogPgSidecarRegistry,
-        )
-        CatalogPgSidecarRegistry.clear()
+        # Phase 3: the catalog-tier slice registry is folded into the single
+        # SidecarRegistry; its test-isolation hook is clear_catalog_registry().
+        SidecarRegistry.clear_catalog_registry()
     except Exception as e:
-        logger.debug(f"CatalogPgSidecarRegistry.clear() skipped: {e}")
+        logger.debug(f"SidecarRegistry.clear_catalog_registry() skipped: {e}")
 
     # 11. Clear Caches safely
     from dynastore.modules.catalog import config_service

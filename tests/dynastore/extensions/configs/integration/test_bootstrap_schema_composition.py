@@ -246,21 +246,19 @@ def _attribute_schema_from_pr481_field_set() -> list[dict]:
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_step_0b_collection_scope_put_roundtrip(
+async def test_step_0b_collection_scope_put_stripped(
     shared_catalog: str,
     shared_collection_factory,
     sysadmin_in_process_client_module: AsyncClient,
 ) -> None:
-    """Surface 3+4 at COLLECTION scope — the path used in the walkthrough.
+    """Phase 3 — ``sidecars`` is Computed (non-authorable) at COLLECTION scope.
 
-    The PUT body shape (``sidecars`` list with a single
-    ``sidecar_type="attributes"`` row carrying ``attribute_schema``) is the
-    operator-visible contract Step-0b builds. Round-tripping it via GET
-    proves:
-      (a) PUT accepts the shape the notebook emits,
-      (b) GET reflects the persisted attribute_schema verbatim,
-      (c) every PR #481 OGR-type maps cleanly through the attribute-sidecar
-          validator (a regression here would show as a 400 on the PUT).
+    An external config PUT carrying a ``sidecars`` block is ACCEPTED (no 4xx)
+    but the caller-supplied sidecars are STRIPPED via
+    ``restore_system_assigned_fields`` — they never persist. Operators shape
+    the physical sidecar realization through ``items_schema`` /
+    ``items_write_policy``, not by authoring ``sidecars`` directly. This pins
+    the strip on the operator-facing config-API write path.
     """
     col_id = await shared_collection_factory()
     url = (
@@ -280,8 +278,8 @@ async def test_step_0b_collection_scope_put_roundtrip(
 
     put_resp = await sysadmin_in_process_client_module.put(url, json=body)
     assert put_resp.status_code in (200, 201, 204), (
-        f"Step-0b PUT failed at collection scope: "
-        f"{put_resp.status_code} {put_resp.text}"
+        f"Step-0b PUT should be accepted (sidecars stripped, not rejected) "
+        f"at collection scope: {put_resp.status_code} {put_resp.text}"
     )
 
     get_resp = await sysadmin_in_process_client_module.get(url)
@@ -291,33 +289,23 @@ async def test_step_0b_collection_scope_put_roundtrip(
     attr_sidecars = [
         sc for sc in sidecars if sc.get("sidecar_type") == "attributes"
     ]
-    assert attr_sidecars, (
-        f"attribute sidecar missing after PUT round-trip: {persisted!r}"
-    )
-    # The persisted schema must contain every field we PUT. The server may
-    # add defaults (e.g. ``index=none``, ``can_partition=false``); compare
-    # on the ``(name, type)`` projection to stay decoupled from those.
-    got_pairs = {
-        (e["name"], e["type"]) for e in (attr_sidecars[0].get("attribute_schema") or [])
-    }
-    want_pairs = {(e["name"], e["type"]) for e in schema}
-    missing = want_pairs - got_pairs
-    assert not missing, (
-        f"PUT/GET round-trip lost attribute rows {missing!r}; "
-        f"persisted={attr_sidecars[0].get('attribute_schema')!r}"
+    # Non-authorable: the caller's attributes sidecar must NOT have persisted.
+    assert not attr_sidecars, (
+        f"Phase 3: caller-supplied sidecars must be stripped on the external "
+        f"PUT path, but an attributes sidecar persisted: {persisted!r}"
     )
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_step_0b_catalog_scope_put_roundtrip(
+async def test_step_0b_catalog_scope_put_stripped(
     shared_catalog: str,
     sysadmin_in_process_client_module: AsyncClient,
 ) -> None:
-    """Surface 3+4 at CATALOG scope — the sysadmin alternative documented
-    alongside the collection-scope path. Same body shape, different URL —
-    a regression in the catalog-scope plumbing wouldn't surface from the
-    collection-scope test above because the routes call different service
-    methods (``update_catalog_config`` vs ``update_collection_config``)."""
+    """Phase 3 — ``sidecars`` is Computed (non-authorable) at CATALOG scope too.
+
+    Same shape, different URL/service method
+    (``update_catalog_config`` vs ``update_collection_config``) — both must
+    strip the caller-supplied ``sidecars`` rather than persist them."""
     url = (
         f"/configs/catalogs/{shared_catalog}"
         f"/plugins/items_postgresql_driver"
@@ -335,8 +323,8 @@ async def test_step_0b_catalog_scope_put_roundtrip(
 
     put_resp = await sysadmin_in_process_client_module.put(url, json=body)
     assert put_resp.status_code in (200, 201, 204), (
-        f"Step-0b PUT failed at catalog scope: "
-        f"{put_resp.status_code} {put_resp.text}"
+        f"Step-0b PUT should be accepted (sidecars stripped, not rejected) "
+        f"at catalog scope: {put_resp.status_code} {put_resp.text}"
     )
 
     get_resp = await sysadmin_in_process_client_module.get(url)
@@ -346,16 +334,7 @@ async def test_step_0b_catalog_scope_put_roundtrip(
     attr_sidecars = [
         sc for sc in sidecars if sc.get("sidecar_type") == "attributes"
     ]
-    assert attr_sidecars, (
-        f"attribute sidecar missing after catalog-scope PUT round-trip: "
-        f"{persisted!r}"
-    )
-    got_pairs = {
-        (e["name"], e["type"]) for e in (attr_sidecars[0].get("attribute_schema") or [])
-    }
-    want_pairs = {(e["name"], e["type"]) for e in schema}
-    missing = want_pairs - got_pairs
-    assert not missing, (
-        f"catalog-scope round-trip lost attribute rows {missing!r}; "
-        f"persisted={attr_sidecars[0].get('attribute_schema')!r}"
+    assert not attr_sidecars, (
+        f"catalog-scope PUT: caller-supplied sidecars must be stripped, "
+        f"but an attributes sidecar persisted: {persisted!r}"
     )

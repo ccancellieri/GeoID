@@ -241,7 +241,7 @@ class CollectionPostgresqlDriverConfig(_PluginDriverConfig):
     the same constraint the items-tier sidecar config already enforces.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "postgresql_engine"
 

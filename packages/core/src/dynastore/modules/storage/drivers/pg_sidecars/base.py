@@ -529,7 +529,7 @@ def _coerce_pg_sidecar(v: Any) -> Any:
 #
 # ``SerializeAsAny`` opts out of Pydantic v2's default type-narrowing on
 # serialisation: without it, ``List[SidecarConfig]`` dumps every entry as
-# the base class and drops every subclass field (geohash_precision,
+# the base class and drops every subclass field (spatial_cells_overlay,
 # attribute_schema, …).  The runtime instance is the concrete subclass; the
 # wrapper tells Pydantic to use that instance's serializer instead of the
 # declared base type's, so the operator-facing config API renders the full

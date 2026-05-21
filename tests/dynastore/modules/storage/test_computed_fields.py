@@ -19,17 +19,20 @@ from pydantic import ValidationError
 from shapely.geometry import Polygon, Point
 
 from dynastore.modules.storage.computed_fields import (
+    AttributeStat,
     ComputedField,
     ComputedKind,
+    DeriveSpec,
     FeatureType,
+    GeometryStat,
     IdentityRule,
     PATH_EXTRACTED_KINDS,
     SPATIAL_CELL_KINDS,
+    SpatialCell,
     StatisticStorageMode,
 )
 from dynastore.modules.storage.driver_config import WriteConflictPolicy
 from dynastore.tools.geospatial import compute_derived_fields
-from dynastore.tools.geospatial_exceptions import UnsupportedComputedKind
 
 
 class TestComputedFieldValidators:
@@ -94,25 +97,19 @@ class TestIdentityRule:
             IdentityRule(match_on=[])
 
     def test_on_match_optional(self) -> None:
-        r = IdentityRule(
-            match_on=[ComputedField(kind=ComputedKind.EXTERNAL_ID)]
-        )
+        r = IdentityRule(match_on=["external_id"])
         assert r.on_match is None
 
     def test_on_match_override(self) -> None:
         r = IdentityRule(
-            match_on=[ComputedField(kind=ComputedKind.GEOMETRY_HASH)],
+            match_on=["geometry_hash"],
             on_match=WriteConflictPolicy.REFUSE_FAIL,
         )
         assert r.on_match == WriteConflictPolicy.REFUSE_FAIL
 
     def test_and_composition(self) -> None:
-        r = IdentityRule(
-            match_on=[
-                ComputedField(kind=ComputedKind.EXTERNAL_ID),
-                ComputedField(kind=ComputedKind.GEOMETRY_HASH),
-            ]
-        )
+        r = IdentityRule(match_on=["external_id", "geometry_hash"])
+        assert r.match_on == ["external_id", "geometry_hash"]
         assert len(r.match_on) == 2
 
 
@@ -305,6 +302,92 @@ def test_spatial_cell_kinds_membership() -> None:
     assert SPATIAL_CELL_KINDS == frozenset(
         {ComputedKind.GEOHASH, ComputedKind.H3, ComputedKind.S2}
     )
+
+
+# ---------------------------------------------------------------------------
+# Authoring layer — DeriveSpec buckets bridge to ComputedField (#957/#950).
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveSpecBridge:
+    def test_every_kind_reachable_via_exactly_one_bucket(self) -> None:
+        """Partitioning invariant: each ComputedKind maps to exactly one
+        DeriveSpec bucket. Adding a kind without classifying it fails here
+        (and would otherwise be rejected by GeometryStat at runtime)."""
+        from dynastore.modules.storage.computed_fields import (
+            _GEOMETRY_STAT_KINDS,
+            _KIND_CONTENT_HASH,
+            _KIND_GRID,
+        )
+
+        for kind in ComputedKind:
+            buckets = []
+            if kind == ComputedKind.EXTERNAL_ID:
+                buckets.append("external_id")
+            if kind in _KIND_CONTENT_HASH:
+                buckets.append("content_hashes")
+            if kind in _KIND_GRID:
+                buckets.append("spatial_cells")
+            if kind == ComputedKind.ATTRIBUTE_STAT:
+                buckets.append("attribute_stats")
+            if kind in _GEOMETRY_STAT_KINDS:
+                buckets.append("geometry_stats")
+            assert len(buckets) == 1, f"{kind.value} -> {buckets}"
+
+    def test_buckets_flatten_to_computed_fields(self) -> None:
+        spec = DeriveSpec(
+            external_id="properties.code",
+            content_hashes=["geometry", "attributes"],
+            spatial_cells=[SpatialCell(grid="geohash", resolution=7)],
+            geometry_stats=[
+                GeometryStat(
+                    stat=ComputedKind.CENTROID,
+                    store=StatisticStorageMode.COLUMNAR,
+                    indexed=True,
+                    type="POINT",
+                )
+            ],
+            attribute_stats=[
+                AttributeStat(source="properties.pop", store=StatisticStorageMode.COLUMNAR)
+            ],
+        )
+        names = {cf.resolved_name for cf in spec.to_computed_fields()}
+        assert names == {
+            "external_id",
+            "geometry_hash",
+            "attributes_hash",
+            "geohash_7",
+            "centroid",
+            "pop",
+        }
+
+    def test_round_trip_classify_back(self) -> None:
+        spec = DeriveSpec(
+            external_id="properties.code",
+            content_hashes=["geometry"],
+            spatial_cells=[SpatialCell(grid="h3", resolution=9)],
+            geometry_stats=[GeometryStat(stat=ComputedKind.AREA)],
+            attribute_stats=[AttributeStat(source="properties.pop")],
+        )
+        back = DeriveSpec.from_computed_fields(spec.to_computed_fields())
+        assert back.external_id == "properties.code"
+        assert back.content_hashes == ["geometry"]
+        assert back.spatial_cells[0].grid == "h3"
+        assert back.spatial_cells[0].resolution == 9
+        assert back.geometry_stats[0].stat == ComputedKind.AREA
+        assert back.attribute_stats[0].source == "properties.pop"
+
+    def test_geometry_stat_rejects_non_stat_kind(self) -> None:
+        with pytest.raises(ValidationError):
+            GeometryStat(stat=ComputedKind.GEOHASH)
+
+    def test_geometry_stat_type_only_on_centroid(self) -> None:
+        with pytest.raises(ValidationError):
+            GeometryStat(stat=ComputedKind.AREA, type="POINT")
+
+    def test_spatial_cell_resolution_range(self) -> None:
+        with pytest.raises(ValidationError):
+            SpatialCell(grid="geohash", resolution=99)
 
 
 # ---------------------------------------------------------------------------

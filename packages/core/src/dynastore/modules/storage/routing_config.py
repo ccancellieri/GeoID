@@ -464,7 +464,7 @@ class _RoutingConfigBase(PluginConfig):
     transformer attachments.  Each concrete tier supplies only what genuinely
     differs:
 
-    - ``_address`` / ``_visibility`` / ``_view_scopes`` ClassVars (tree
+    - ``_address`` / ``_freeze_at`` / ``_tiers`` ClassVars (tree
       placement + immutability/view scoping),
     - the ``operations`` field with its tier-specific default driver wiring,
     - :meth:`_self_register_drivers` — folds the tier's discoverable indexer /
@@ -550,11 +550,11 @@ class ItemsRoutingConfig(_RoutingConfigBase):
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "routing")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
     # Items routing cascades platform → catalog → collection: a catalog-tier
     # default (e.g. a routing preset) must surface in the catalog view even
-    # though the immutability gate stays collection-scoped (``_visibility``).
-    _view_scopes: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
+    # though the immutability gate stays collection-scoped (``_freeze_at``).
+    _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -706,11 +706,11 @@ class CollectionRoutingConfig(_RoutingConfigBase):
     # so this routing config lands at ``storage.routing.{class_key}`` rather
     # than under an items/assets sibling.
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "routing")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
     # Collection routing cascades platform → catalog → collection: a
     # catalog-tier default must surface in the catalog view while the
-    # immutability gate stays collection-scoped (``_visibility``).
-    _view_scopes: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
+    # immutability gate stays collection-scoped (``_freeze_at``).
+    _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -797,11 +797,11 @@ class AssetRoutingConfig(_RoutingConfigBase):
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "assets", "routing")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
     # Asset routing cascades platform → catalog → collection: a catalog-tier
     # default must surface in the catalog view while the immutability gate
-    # stays collection-scoped (``_visibility``).
-    _view_scopes: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
+    # stays collection-scoped (``_freeze_at``).
+    _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -912,12 +912,12 @@ class CatalogRoutingConfig(_RoutingConfigBase):
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "routing")
-    _visibility: ClassVar[Optional[str]] = "catalog"
+    _freeze_at: ClassVar[Optional[str]] = "catalog"
     # Catalog routing applies at platform + catalog only (catalogs don't
     # nest); it must not leak into a collection view.  Explicit so the view
-    # no longer depends on the unimplemented ``_visibility="catalog"`` hide-
+    # no longer depends on the unimplemented ``_freeze_at="catalog"`` hide-
     # at-collection rule.
-    _view_scopes: ClassVar[Tuple[str, ...]] = ("platform", "catalog")
+    _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog")
 
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(

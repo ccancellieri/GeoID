@@ -210,7 +210,7 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
     )
 
     # ``feature_type_schema`` was retired in #976: the wire shape of Feature
-    # ``properties`` is now the SSOT on ``ItemsWritePolicy.schema`` (see PR
+    # ``properties`` is now the SSOT on ``ItemsWritePolicy.resolved_schema`` (see PR
     # #961 phase 2). Sidecars derive their schema fragments from their own
     # storage columns and the policy overlays the user-data ``properties``.
 
@@ -271,35 +271,60 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
 
     # Validity Configuration
     #
-    # ``validity_field`` is a null-object storage-shape mirror of the SSOT
-    # field ``ItemsWritePolicy.validity_field``. The field name IS the toggle:
-    # a non-None value names/enables the validity column, ``None`` disables it.
-    # The value is a column name, NOT a source path for extraction — the
-    # validity-start value comes from ``write_context.valid_from``. The PG driver
-    # overlays the policy value onto this field at ``ensure_storage`` time and
-    # persists the result, so every read path that loads the collection's
-    # sidecar config sees the policy-aligned value (#957/#974).
-    # Operators MUST set ``validity_field`` on ``ItemsWritePolicy``;
+    # ``validity_column`` is a null-object storage-shape mirror of the SSOT
+    # ``ItemsWritePolicy.validity`` (:class:`ValiditySpec`). The PG driver
+    # overlays ``policy.validity.column`` onto this field at ``ensure_storage``
+    # time. Its presence IS the toggle: a non-None value names/enables the
+    # validity column, ``None`` disables it. The value is a COLUMN NAME, NOT a
+    # source path for extraction. The PG driver persists the result, so every
+    # read path that loads the collection's sidecar config sees the
+    # policy-aligned value (#957/#974/#1126).
+    # Operators MUST set ``validity`` on ``ItemsWritePolicy``;
     # values set here are overwritten on the next ``ensure_storage``.
-    validity_field: Optional[str] = Field(
+    validity_column: Optional[str] = Field(
         default=None,
         description=(
-            "Null-object storage-shape mirror of ItemsWritePolicy.validity_field "
+            "Null-object storage-shape mirror of ItemsWritePolicy.validity.column "
             "(SSOT). Non-None names/enables the validity column; None → disabled. "
-            "Column name only, not a source path — the validity-start value comes "
-            "from write_context.valid_from. Overwritten by the driver at DDL time."
+            "Column name only, not a source path. Overwritten by the driver at "
+            "DDL time."
+        ),
+    )
+
+    # Validity VALUE sources — storage-shape mirror of
+    # ``ItemsWritePolicy.validity.start_from`` / ``end_from``. The PG driver
+    # overlays these at ``ensure_storage`` time so the ingestion path resolves
+    # the validity-range start/end without threading the policy itself.
+    # ``"context"`` (default for start) reads ``write_context.valid_from`` /
+    # ``valid_to``; any other string is a dotted source path walked into the
+    # feature; ``validity_end_from=None`` means open-ended.
+    validity_start_from: str = Field(
+        default="context",
+        description=(
+            "Storage-shape mirror of ItemsWritePolicy.validity.start_from. "
+            "'context' reads write_context.valid_from; otherwise a dotted source "
+            "path walked into the feature. Overwritten by the driver at DDL time."
+        ),
+    )
+    validity_end_from: Optional[str] = Field(
+        default=None,
+        description=(
+            "Storage-shape mirror of ItemsWritePolicy.validity.end_from. None → "
+            "open-ended; 'context' reads write_context.valid_to; otherwise a "
+            "dotted source path walked into the feature. Overwritten by the "
+            "driver at DDL time."
         ),
     )
 
     @property
     def enable_validity(self) -> bool:
-        """True when ``validity_field`` is set (null-object pattern).
+        """True when ``validity_column`` is set (null-object pattern).
 
         Bool shim over the null-object field so the ~13 DDL/SQL callsites in
         ``attributes.py`` keep reading a boolean. The field name is the single
-        toggle, so the bool can never diverge from the configured path.
+        toggle, so the bool can never diverge from the configured column.
         """
-        return self.validity_field is not None
+        return self.validity_column is not None
 
     # Mode A: Relational schema
     attribute_schema: Optional[List[AttributeSchemaEntry]] = Field(default=None, description="List of attribute definitions for relational mode"
@@ -350,8 +375,8 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
     def has_validity(self) -> bool:
         """Whether this sidecar is configured to manage validity.
 
-        Mirrors :attr:`ItemsWritePolicy.validity_field`; the driver
-        overlays the policy onto :attr:`validity_field` at DDL time
+        Mirrors :attr:`ItemsWritePolicy.validity`; the driver overlays
+        ``policy.validity.column`` onto :attr:`validity_column` at DDL time
         and persists the result so every read sees the same value.
         """
         return self.enable_validity
@@ -366,7 +391,7 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
         if self.partition_strategy == AttributePartitionStrategyPreset.BY_TIME:
             if not self.enable_validity:
                 raise ValueError(
-                    "BY_TIME partitioning requires validity_field to be set"
+                    "BY_TIME partitioning requires validity to be set on the policy"
                 )
             return {"validity": "TSTZRANGE"}
 

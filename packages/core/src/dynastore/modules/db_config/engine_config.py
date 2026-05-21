@@ -143,7 +143,7 @@ class EngineConfig(PluginConfig):
     # NOT a Pydantic field; subclasses re-declare the ClassVar.
     engine_class: ClassVar[str] = ""
 
-    _visibility: ClassVar[Optional[str]] = "platform"
+    _freeze_at: ClassVar[Optional[str]] = "platform"
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

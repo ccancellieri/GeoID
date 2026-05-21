@@ -27,9 +27,23 @@ def _stub_registry_with_schema(**classes):
 
         class _Cls:
             _address = attrs.get("_address")
-            _visibility = attrs.get("_visibility")
+            _freeze_at = attrs.get("_freeze_at")
+            _tiers = attrs.get("_tiers")
 
         _Cls.__name__ = name
+
+        @classmethod
+        def _effective_tiers(cls):
+            if cls._tiers is not None:
+                return tuple(cls._tiers)
+            addr = tuple(a for a in (cls._address or ()) if a)
+            if "collection" in addr:
+                return ("platform", "catalog", "collection")
+            if "catalog" in addr:
+                return ("platform", "catalog")
+            return ("platform",)
+
+        _Cls.effective_tiers = _effective_tiers  # type: ignore[assignment]
 
         @classmethod
         def _model_json_schema(cls, _s=schema):
@@ -116,16 +130,18 @@ def test_compose_tree_meta_schema_attaches_full_json_schema():
     assert "docs" not in leaf["_meta"]
 
 
-def test_compose_tree_default_mode_surfaces_full_config_tree():
-    """Post-#761: the default ``include=scope`` mode at catalog/collection
-    scope surfaces every leaf that ``_place()`` accepts (engines, modules,
-    extensions, tasks).  ``_meta.source`` on each leaf reports where the
-    effective value comes from so operators see what they inherit vs
-    override.
+def test_compose_tree_default_mode_renders_tiers_opt_in_at_collection():
+    """A config that opts into the collection tier via explicit ``_tiers``
+    surfaces at collection scope under the default ``include=scope`` mode.
+    ``_meta.source`` reports where the effective value comes from so
+    operators see what they inherit vs override.
     """
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry_with_schema(
-        web_config={"_address": ("platform", "web")},
+        web_config={
+            "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
+        },
     )
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -136,7 +152,7 @@ def test_compose_tree_default_mode_surfaces_full_config_tree():
             active_scope="collection", meta_mode="field",
             include_mode="scope",
         )
-    # Platform-tier null-visibility config now surfaces at collection scope
+    # Config opted into the collection tier surfaces at collection scope
     # with source="platform" so operators see what they inherit.
     leaf = tree["platform"]["web"]["web_config"]
     assert leaf["brand_name"] == "X"
@@ -144,17 +160,19 @@ def test_compose_tree_default_mode_surfaces_full_config_tree():
     assert leaf["_meta"]["tier"] == "collection"
 
 
-def test_compose_tree_catalog_tier_under_upstream_mode_gets_meta():
-    """Catalog-tier configs at collection scope are filtered out under
-    slim mode, but render inlined under ``include=upstream`` with
-    ``_meta = {tier=collection, source=catalog, docs={...}}``.
+def test_compose_tree_catalog_tier_renders_with_meta_at_catalog_scope():
+    """A catalog-addressed config (``_tiers`` derived to platform+catalog)
+    renders at catalog scope with ``_meta = {tier=catalog, source=catalog,
+    docs={...}}``.  Its address stops at catalog, so it is NOT placed at
+    collection scope (even under ``include=upstream`` — placement is
+    address-derived, independent of slim mode).
     """
     schema = {"properties": {"private": {"description": "Private mode."}}}
     by_class = {"elasticsearch_catalog_config": {"private": True}}
     registry = _stub_registry_with_schema(
         elasticsearch_catalog_config={
             "_address": ("platform", "catalog", "elasticsearch"),
-            "_visibility": "catalog",
+            "_freeze_at": "catalog",
             "schema": schema,
         },
     )
@@ -165,14 +183,27 @@ def test_compose_tree_catalog_tier_under_upstream_mode_gets_meta():
         ConfigApiService._extract_docs.cache_clear()
         tree = ConfigApiService._compose_tree(
             by_class, sources={"elasticsearch_catalog_config": "catalog"},
-            active_scope="collection", meta_mode="field",
+            active_scope="catalog", meta_mode="field",
             include_mode="upstream",
         )
     leaf = tree["platform"]["catalog"]["elasticsearch"]["elasticsearch_catalog_config"]
     assert leaf["private"] is True
-    assert leaf["_meta"]["tier"] == "collection"
+    assert leaf["_meta"]["tier"] == "catalog"
     assert leaf["_meta"]["source"] == "catalog"
     assert leaf["_meta"]["docs"] == {"private": "Private mode."}
+
+    # At collection scope the catalog-addressed config is not placed.
+    with patch(
+        "dynastore.extensions.configs.config_api_service.list_registered_configs",
+        return_value=registry,
+    ):
+        ConfigApiService._extract_docs.cache_clear()
+        coll_tree = ConfigApiService._compose_tree(
+            by_class, sources={"elasticsearch_catalog_config": "catalog"},
+            active_scope="collection", meta_mode="field",
+            include_mode="upstream",
+        )
+    assert "elasticsearch" not in coll_tree.get("platform", {}).get("catalog", {})
 
 
 def test_compose_tree_meta_envelope_gated_by_mode():
@@ -188,7 +219,11 @@ def test_compose_tree_meta_envelope_gated_by_mode():
     schema = {"properties": {"brand_name": {"description": "Brand label."}}}
     by_class = {"web_config": {"brand_name": "X"}}
     registry = _stub_registry_with_schema(
-        web_config={"_address": ("platform", "web"), "schema": schema},
+        web_config={
+            "_address": ("platform", "web"),
+            "_tiers": ("platform", "catalog", "collection"),
+            "schema": schema,
+        },
     )
     cases = [
         ("none",   None,            None),

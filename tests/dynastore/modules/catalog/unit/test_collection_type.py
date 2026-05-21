@@ -38,9 +38,9 @@ def test_collection_type_is_a_plugin_config():
     assert issubclass(CollectionInfo, PluginConfig)
 
 
-def test_collection_type_address_and_visibility():
+def test_collection_type_address_and_freeze_at():
     assert CollectionInfo._address == ("platform", "catalog", "collection", "info")
-    assert CollectionInfo._visibility == "collection"
+    assert CollectionInfo._freeze_at == "collection"
 
 
 def test_collection_type_class_key_is_snake_case():

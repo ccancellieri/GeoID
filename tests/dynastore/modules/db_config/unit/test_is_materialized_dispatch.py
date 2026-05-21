@@ -38,11 +38,11 @@ from dynastore.modules.db_config import platform_config_service as svc
 
 
 class _FakeCollectionConfig:
-    _visibility = "collection"
+    _freeze_at = "collection"
 
 
 class _FakeCatalogConfig:
-    _visibility = "catalog"
+    _freeze_at = "catalog"
 
 
 def _fake_conn() -> MagicMock:
@@ -109,14 +109,14 @@ async def test_no_catalog_manager_attribute_access():
 
 
 class _BoomDispatchConfig:
-    """Config class whose visibility forces the platform-tier dispatch.
+    """Config class whose freeze tier forces the platform-tier dispatch.
 
     Pairs with ``patch.object(svc, "_platform_is_materialized", side_effect=…)``
     to inject any exception class through the real except-clause without
     needing a live DB.
     """
 
-    _visibility = "platform"
+    _freeze_at = "platform"
 
 
 @pytest.mark.parametrize(

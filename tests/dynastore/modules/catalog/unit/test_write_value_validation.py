@@ -8,7 +8,7 @@
 
 """Write-time value-constraint validation derived from ``ItemsSchema``.
 
-At rest, ``ItemsWritePolicy.schema`` is derived/read-only and forbidden from
+At rest, ``ItemsWritePolicy.resolved_schema`` is derived/read-only and forbidden from
 being authored (``_forbid_authored_wire_schema``), so it is always ``None``.
 The write path therefore derives its value-constraint validator directly from
 ``ItemsSchema`` — the single source of truth — mirroring the read path in

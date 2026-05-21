@@ -151,7 +151,7 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                 app_state.engine = create_async_engine(
                     normalize_db_url(db_config.database_url, is_async=True),
                     pool_size=db_config.pool_min_size,
-                    max_overflow=db_config.pool_max_size - db_config.pool_min_size,
+                    max_overflow=db_config.pool_max_overflow,
                     pool_timeout=db_config.pool_command_timeout,
                     pool_pre_ping=True,
                     pool_recycle=db_config.pool_recycle,

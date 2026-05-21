@@ -96,7 +96,7 @@ class ItemsBigQueryDriverConfig(CollectionDriverConfig):
     config itself; per-request overrides remain deferred.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
 
     target: Mutable[BigQueryTarget] = Field(default_factory=BigQueryTarget)

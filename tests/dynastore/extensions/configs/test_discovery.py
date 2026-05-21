@@ -105,7 +105,8 @@ class TestGetConfigSchema:
 
     @pytest.mark.asyncio
     async def test_items_write_policy_schema_no_legacy_fields(self, service):
-        """Phase 2 rewrite collapses legacy field knobs into ComputedField/IdentityRule."""
+        """Phase 2 rewrite collapses legacy field knobs into the DeriveSpec
+        bucket model (``derive``) and reference-by-name ``identity`` rules."""
         result = await service.get_config_schema("items_write_policy")
         props = result["json_schema"].get("properties", {})
         assert "external_id_field" not in props
@@ -113,9 +114,15 @@ class TestGetConfigSchema:
         assert "identity_matchers" not in props
         assert "matcher_actions" not in props
         assert "require_external_id" not in props
-        assert "compute" in props
+        # ``compute`` is now a derived read-only property (not a field); the
+        # authored source of truth is the ``derive`` DeriveSpec bucket.
+        assert "compute" not in props
+        assert "derive" in props
         assert "identity" in props
-        assert "schema" in props
+        # ``schema`` was renamed to ``resolved_schema`` (it shadowed the
+        # inherited Pydantic ``BaseModel.schema``); still derived/read-only.
+        assert "schema" not in props
+        assert "resolved_schema" in props
 
     @pytest.mark.asyncio
     async def test_items_write_policy_schema_has_on_conflict(self, service):
@@ -217,7 +224,6 @@ class TestStorageDriversProtocolGrouping:
 class TestConfigScopeMixinAnnotations:
     def test_items_schema_has_collection_intrinsic_scope(self):
         from dynastore.modules.storage.driver_config import ItemsSchema
-        from dynastore.modules.storage.schema_types import ConfigScopeMixin
         # ItemsSchema is collection-intrinsic per plan §8
         scope = getattr(ItemsSchema, "config_scope", "platform_waterfall")
         # Either annotated or default — just verify it's a valid scope

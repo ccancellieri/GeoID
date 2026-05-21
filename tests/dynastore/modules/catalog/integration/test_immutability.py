@@ -18,22 +18,30 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
 from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
     FeatureAttributeSidecarConfig,
 )
+from dynastore.modules.storage.computed_fields import ComputedField, ComputedKind
+from dynastore.modules.storage.validity import ValiditySpec
 
 PG_DRIVER_PLUGIN_ID = ItemsPostgresqlDriverConfig
 from dynastore.modules.db_config.exceptions import ImmutableConfigError
 
 
 def _config_with_sidecars(h3_resolutions=None):
-    """Build a config with explicit sidecars.
+    """Build a config with an explicit (derived-shaped) sidecar list.
 
-    M1b.2 changed ItemsPostgresqlDriverConfig.sidecars default from
-    [geometries, attributes] to []; the PG driver now resolves defaults
-    lazily at first use. Tests that need to assert mutations against a
-    known sidecar set must populate it explicitly.
+    Phase 3: ``ItemsPostgresqlDriverConfig.sidecars`` is Computed (non-
+    authorable). It is stamped by the provisioner via
+    ``check_immutability=False``; an external write strips it. Tests seed a
+    known sidecar set through the trusted path. ``h3_resolutions`` is a
+    DERIVED property on the geometries sidecar — express it via the
+    ``spatial_cells_overlay`` (the policy-snapshot the driver overlays).
     """
+    cells = [
+        ComputedField(kind=ComputedKind.H3, resolution=r)
+        for r in (h3_resolutions or [10])
+    ]
     return ItemsPostgresqlDriverConfig(
         sidecars=[
-            GeometriesSidecarConfig(h3_resolutions=h3_resolutions or [10]),
+            GeometriesSidecarConfig(spatial_cells_overlay=cells),
             FeatureAttributeSidecarConfig(),
         ],
     )
@@ -111,40 +119,60 @@ async def test_collection_config_immutability(
     )
     initial_config = persisted
 
-    # 3. Try to modify attribute_schema (nested in sidecars, which is Immutable)
+    # 3. Phase 3: ``sidecars`` is Computed (non-authorable), not Immutable.
+    #    An external write that tries to change a nested sidecar field is
+    #    STRIPPED (restored to the persisted value) rather than rejected —
+    #    operators shape sidecars through the policy, never directly.
     invalid_config_schema = initial_config.model_copy(deep=True)
     for sidecar in invalid_config_schema.sidecars:
         if sidecar.sidecar_type == "attributes":
-            # Using the correct sidecar model for attributes
             sidecar.attribute_schema = [{"name": "test", "type": "TEXT"}]
 
-    with pytest.raises(ImmutableConfigError) as excinfo:
-        await config_manager.set_config(
-            PG_DRIVER_PLUGIN_ID,
-            _pin_all(invalid_config_schema),
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-        )
-    assert "sidecars" in str(excinfo.value)
+    # Must NOT raise — the caller-supplied sidecars are discarded.
+    await config_manager.set_config(
+        PG_DRIVER_PLUGIN_ID,
+        _pin_all(invalid_config_schema),
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+    after_schema = await config_manager.get_config(
+        PG_DRIVER_PLUGIN_ID, catalog_id, collection_id,
+    )
+    # The persisted attributes sidecar still has NO authored attribute_schema
+    # (the external override was stripped).
+    for sc in after_schema.sidecars:
+        if sc.sidecar_type == "attributes":
+            assert sc.attribute_schema is None
 
-    # 4. Try to modify h3_resolutions (nested in sidecars, which is Immutable)
+    # 4. Likewise an attempt to change the geometries spatial-cell shape is
+    #    stripped (h3_resolutions is derived from the policy-snapshot overlay).
     invalid_config = initial_config.model_copy(deep=True)
     for sidecar in invalid_config.sidecars:
         if sidecar.sidecar_type == "geometries":
-            sidecar.h3_resolutions = [10, 12]
+            sidecar.spatial_cells_overlay = [
+                ComputedField(kind=ComputedKind.H3, resolution=10),
+                ComputedField(kind=ComputedKind.H3, resolution=12),
+            ]
 
-    with pytest.raises(ImmutableConfigError) as excinfo:
-        await config_manager.set_config(
-            PG_DRIVER_PLUGIN_ID,
-            _pin_all(invalid_config),
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-        )
+    await config_manager.set_config(
+        PG_DRIVER_PLUGIN_ID,
+        _pin_all(invalid_config),
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+    after_geom = await config_manager.get_config(
+        PG_DRIVER_PLUGIN_ID, catalog_id, collection_id,
+    )
+    geom_h3 = next(
+        (s.h3_resolutions for s in after_geom.sidecars if s.sidecar_type == "geometries"),
+        [],
+    )
+    # The persisted value reflects the materialised plan (overlaid from the
+    # default policy), NOT the caller's attempted [10, 12] override.
+    assert geom_h3 != [10, 12]
 
-    assert "sidecars" in str(excinfo.value)
-    assert "Modification forbidden" in str(excinfo.value)
-
-    # 5. Try to modify partitioning (another immutable field)
+    # 5. ``partitioning`` is still Immutable (a genuinely-physical operator
+    #    choice — Phase 3 Decision 5) so changing it once materialised raises.
     invalid_config_partitioning = initial_config.model_copy(deep=True)
     invalid_config_partitioning.partitioning.enabled = True
     invalid_config_partitioning.partitioning.partition_keys = ["transaction_time"]
@@ -184,27 +212,29 @@ async def test_platform_config_immutability(app_lifespan, catalog_obj, catalog_i
 
         await platform_manager.set_config(plugin_id, _pin_all(initial_config))
 
-        # 2. Try to update immutable field (nested in sidecars)
+        # 2. Phase 3: ``sidecars`` is Computed (non-authorable). An external
+        #    write that changes a nested sidecar field is STRIPPED, not
+        #    rejected — so this must NOT raise.
         invalid_config = initial_config.model_copy(deep=True)
         for sidecar in invalid_config.sidecars:
             if sidecar.sidecar_type == "geometries":
-                sidecar.h3_resolutions = [10, 11]
+                sidecar.spatial_cells_overlay = [
+                    ComputedField(kind=ComputedKind.H3, resolution=11),
+                ]
 
-        with pytest.raises(ImmutableConfigError):
-            await platform_manager.set_config(
-                plugin_id, _pin_all(invalid_config), check_immutability=True
-            )
+        await platform_manager.set_config(
+            plugin_id, _pin_all(invalid_config), check_immutability=True
+        )
 
-        # 3. Modify attribute_schema (nested in sidecars)
+        # 3. Likewise an attribute_schema override is stripped (no raise).
         invalid_update = initial_config.model_copy(deep=True)
         for sidecar in invalid_update.sidecars:
             if sidecar.sidecar_type == "attributes":
                 sidecar.attribute_schema = [{"name": "test", "type": "INTEGER"}]
 
-        with pytest.raises(ImmutableConfigError):
-            await platform_manager.set_config(
-                plugin_id, _pin_all(invalid_update), check_immutability=True
-            )
+        await platform_manager.set_config(
+            plugin_id, _pin_all(invalid_update), check_immutability=True
+        )
 
     finally:
         await platform_manager.delete_config(plugin_id)
@@ -249,18 +279,18 @@ async def test_catalog_config_frozen_once_collection_exists(
         check_immutability=False,
     )
 
-    # 2. Immutable shape/identity field (validity_field names a physical
-    #    temporal column) cannot change at the catalog tier now that a
-    #    collection exists — the #1079 freeze.
+    # 2. Immutable shape/identity field (validity names a physical temporal
+    #    column via ValiditySpec.column) cannot change at the catalog tier now
+    #    that a collection exists — the #1079 freeze.
     changed_validity = baseline.model_copy(deep=True)
-    changed_validity.validity_field = "valid_from"
+    changed_validity.validity = ValiditySpec(column="valid_from")
     with pytest.raises(ImmutableConfigError) as excinfo:
         await config_manager.set_config(
             ItemsWritePolicy,
             _pin_all(changed_validity),
             catalog_id=catalog_id,
         )
-    assert "validity_field" in str(excinfo.value)
+    assert "validity" in str(excinfo.value)
 
     # 2b. A nested geometry-shape knob is likewise frozen.
     changed_geom = baseline.model_copy(deep=True)
@@ -313,12 +343,16 @@ async def test_config_deletion(
 
     col_config = _config_with_sidecars(h3_resolutions=[15])
 
-    # Partitioning is enabled if we want, but let's stick to resolutions for this test
+    # Phase 3: ``sidecars`` is Computed and stripped on the external write
+    # path. Seed through the trusted provisioner path
+    # (``check_immutability=False``) so the sidecar plan actually persists —
+    # this mirrors how ``ensure_storage`` stamps the resolved list.
     await config_manager.set_config(
         PG_DRIVER_PLUGIN_ID,
         _pin_all(col_config),
         catalog_id=catalog_id,
         collection_id=collection_id,
+        check_immutability=False,
     )
 
     # 2. Verify it's set

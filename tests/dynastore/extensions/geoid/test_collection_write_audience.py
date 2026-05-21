@@ -18,8 +18,8 @@ def test_address_is_platform_catalog_collection_write_audience():
     )
 
 
-def test_visibility_is_collection_tier():
-    assert CollectionWriteAudience._visibility == "collection"
+def test_freeze_at_is_collection_tier():
+    assert CollectionWriteAudience._freeze_at == "collection"
 
 
 def test_class_key_is_snake_case():

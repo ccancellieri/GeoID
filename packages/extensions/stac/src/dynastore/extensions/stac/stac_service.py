@@ -154,8 +154,8 @@ def _assert_stac_capable_collection_stack() -> None:
                 "stac_metadata_columns().  The default PG deployment "
                 "satisfies this via CatalogPostgresqlDriver once the "
                 "stac extra is installed (the wrapper composes the "
-                "STAC slice via CatalogPgSidecarRegistry's "
-                "try-import).  Install ``dynastore[module_stac]`` or "
+                "STAC slice via the unified SidecarRegistry's "
+                "catalog-tier try-import).  Install ``dynastore[module_stac]`` or "
                 "check the routing config."
             ),
         )

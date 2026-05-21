@@ -59,7 +59,7 @@ class CollectionElasticsearchDriverConfig(_PluginDriverConfig):
     change, because altering the prefix would orphan existing collections.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "drivers")
-    _visibility: ClassVar[Optional[str]] = "catalog"
+    _freeze_at: ClassVar[Optional[str]] = "catalog"
 
     required_engine_class: ClassVar[str] = "elasticsearch_engine"
 

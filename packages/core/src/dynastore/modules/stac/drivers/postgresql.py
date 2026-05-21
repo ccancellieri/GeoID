@@ -53,7 +53,7 @@ _CATALOG_STAC_COLUMNS: Tuple[str, ...] = (
 class CollectionStacPostgresqlDriverConfig(DriverPluginConfig):
     """Identity marker for CollectionStacPostgresqlDriver."""
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "postgresql_engine"
 
@@ -62,7 +62,7 @@ class CollectionStacPostgresqlDriverConfig(DriverPluginConfig):
 class CatalogStacPostgresqlDriverConfig(DriverPluginConfig):
     """Identity marker for CatalogStacPostgresqlDriver."""
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "drivers")
-    _visibility: ClassVar[Optional[str]] = "catalog"
+    _freeze_at: ClassVar[Optional[str]] = "catalog"
 
     required_engine_class: ClassVar[str] = "postgresql_engine"
 

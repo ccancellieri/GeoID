@@ -76,7 +76,7 @@ class ItemsReadPolicy(PluginConfig):
         "items",
         "policy",
     )
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     feature_type: Mutable[FeatureType] = Field(
         default_factory=FeatureType,

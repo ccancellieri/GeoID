@@ -16,8 +16,12 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import logging
 import os
 import dynastore.tools.class_tools as class_tools
+
+logger = logging.getLogger(__name__)
+
 
 class DBConfig:
     database_url: str = os.getenv(
@@ -45,6 +49,33 @@ class DBConfig:
     tcp_keepalives_idle: int = int(os.getenv("DB_TCP_KEEPALIVES_IDLE", "300"))
     tcp_keepalives_interval: int = int(os.getenv("DB_TCP_KEEPALIVES_INTERVAL", "30"))
     tcp_keepalives_count: int = int(os.getenv("DB_TCP_KEEPALIVES_COUNT", "5"))
+
+    @property
+    def pool_max_overflow(self) -> int:
+        """SQLAlchemy ``max_overflow`` derived from the min/max pool bounds.
+
+        Total connections an engine may open is ``pool_size + max_overflow``;
+        with ``pool_size = pool_min_size`` the overflow that caps the total at
+        ``pool_max_size`` is ``pool_max_size - pool_min_size``.
+
+        Floored at 0 on purpose: SQLAlchemy reads a *negative* ``max_overflow``
+        as **unbounded**, so a misconfigured env where the min exceeds the max
+        would silently flip the pool from "too small" to "unlimited" and
+        exhaust connections/memory (dynastore #320). Clamping keeps the total
+        bounded at ``pool_min_size`` and warns instead.
+        """
+        gap = self.pool_max_size - self.pool_min_size
+        if gap < 0:
+            logger.warning(
+                "DB_POOL_MAX_SIZE (%d) < DB_POOL_MIN_SIZE (%d); clamping pool "
+                "overflow to 0 (total connections capped at the min). A "
+                "negative overflow would make the pool unbounded — fix the "
+                "env so max >= min.",
+                self.pool_max_size,
+                self.pool_min_size,
+            )
+            return 0
+        return gap
 
     def __repr__(self) -> str:
         return class_tools.__repr__(self, sensitive_attrs=["database_url"])

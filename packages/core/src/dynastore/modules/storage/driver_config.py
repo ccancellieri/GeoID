@@ -36,6 +36,7 @@ etc.), not *what operation* it performs.  Operations are defined in
 
 import json
 import os
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
@@ -56,8 +57,10 @@ from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
     ComputedKind,
+    DeriveSpec,
     IdentityRule,
 )
+from dynastore.modules.storage.validity import ValiditySpec
 
 # Sidecar machinery is PG-specific — the field type alias and its
 # registry-based coercion live in ``pg_sidecars/base.py`` so that other
@@ -284,10 +287,26 @@ def _default_identity_rules() -> List[IdentityRule]:
 
     Operators who want different identity semantics replace the list; the
     default works for collections that bind ``external_id`` to a properties
-    path via a corresponding ``ComputedField(kind=EXTERNAL_ID, name="properties.X")``
-    in :attr:`ItemsWritePolicy.compute`.
+    path via ``DeriveSpec.external_id`` in :attr:`ItemsWritePolicy.derive`.
+    The ``"external_id"`` axis is always referenceable even without a path
+    (its value then comes from ``write_context.external_id_override`` or the
+    feature id).
     """
-    return [IdentityRule(match_on=[ComputedField(kind=ComputedKind.EXTERNAL_ID)])]
+    return [IdentityRule(match_on=["external_id"])]
+
+
+@dataclass(frozen=True)
+class ResolvedIdentityRule:
+    """An :class:`IdentityRule` with its ``match_on`` names resolved to the
+    engine's :class:`ComputedField` objects.
+
+    Produced by :meth:`ItemsWritePolicy.resolved_identity`; consumed by the
+    write-path identity matcher (``item_distributed``) which needs each
+    field's ``kind`` to drive sidecar lookups. Not an authored/config type.
+    """
+
+    match_on: List[ComputedField]
+    on_match: Optional[WriteConflictPolicy] = None
 
 
 class ItemsWritePolicy(PluginConfig):
@@ -307,29 +326,32 @@ class ItemsWritePolicy(PluginConfig):
     Four irreducible concerns, plus three posture flags. See
     ``docs/architecture/items-policy-consolidation-957-950.md``:
 
-    - :attr:`schema` — DERIVED, read-only wire JSON-Schema for ``properties``,
+    - :attr:`resolved_schema` — DERIVED, read-only wire JSON-Schema for ``properties``,
       built from ``items_schema`` at read time (see ``get_collection_schema``)
       and surfaced for the OpenAPI body schema and admin-UI form. Authoring a
       non-null value is rejected at config-save; ``items_schema`` is the single
       source of truth for field types/constraints.
-    - :attr:`compute` — ordered list of :class:`ComputedField` entries the
-      drivers materialise per row (geometry hash, attribute hash, geohash
-      cell, area, centroid, …). The :class:`ComputedKind.EXTERNAL_ID`
-      entry's ``name`` carries the source path (e.g. ``properties.code``).
+    - :attr:`derive` — the per-row derivations grouped into homogeneous
+      buckets (:class:`DeriveSpec`): ``external_id`` (a dotted source path),
+      ``content_hashes``, ``spatial_cells``, ``geometry_stats`` and
+      ``attribute_stats``. The engine-facing flat list is the read-only
+      :attr:`compute` property. Accepts compute-preset shorthand.
     - :attr:`identity` — ordered list of :class:`IdentityRule`. Each rule
-      ANDs its ``match_on`` ComputedFields; rules OR across the list (first
-      match wins). Per-rule ``on_match`` overrides :attr:`on_conflict`.
+      ANDs the derivation *names* in its ``match_on`` (referencing ``derive``
+      outputs); rules OR across the list (first match wins). Per-rule
+      ``on_match`` overrides :attr:`on_conflict`.
     - :attr:`geometries` — per-row geometry transform / validation block
       (SRID, fix, simplify, allow-list, geometry-hash version gate). Runs
-      before :attr:`compute`.
+      before the :attr:`derive` derivations.
 
     Posture flags: :attr:`on_conflict`, :attr:`on_asset_conflict`,
-    :attr:`validity_field` (null-object; :attr:`enable_validity` is a derived
-    read-only property), :attr:`track_asset_id`.
+    :attr:`validity` (null-object :class:`ValiditySpec`; :attr:`enable_validity`
+    is a derived read-only property, :attr:`validity_column` exposes the column
+    name), :attr:`track_asset_id`.
 
     Materialisation freeze (#1079): the fields that bake into a collection's
-    stored shape or identity — :attr:`compute`, :attr:`identity`,
-    :attr:`geometries`, :attr:`validity_field` — are ``Immutable``. The
+    stored shape or identity — :attr:`derive`, :attr:`identity`,
+    :attr:`geometries`, :attr:`validity` — are ``Immutable``. The
     materialization-gated enforcer leaves them freely editable until the first
     collection lands, then freezes them so a catalog-tier default change cannot
     silently re-resolve into (and diverge) already-materialised collections.
@@ -357,7 +379,7 @@ class ItemsWritePolicy(PluginConfig):
 
            ItemsWritePolicy(
                on_conflict=WriteConflictPolicy.NEW_VERSION,
-               compute=[ComputedField(kind=ComputedKind.EXTERNAL_ID, name="properties.code")],
+               derive=DeriveSpec(external_id="properties.code"),
                geometries=GeometriesWriteBehavior(skip_if_unchanged_geometry_hash=True),
            )
 
@@ -367,9 +389,9 @@ class ItemsWritePolicy(PluginConfig):
     2. **Geohash dedup at city precision**::
 
            ItemsWritePolicy(
-               compute=[ComputedField(kind=ComputedKind.GEOHASH, resolution=6)],
+               derive=DeriveSpec(spatial_cells=[SpatialCell(grid="geohash", resolution=6)]),
                identity=[IdentityRule(
-                   match_on=[ComputedField(kind=ComputedKind.GEOHASH, resolution=6)],
+                   match_on=["geohash_6"],
                    on_match=WriteConflictPolicy.REFUSE_RETURN,
                )],
            )
@@ -377,18 +399,15 @@ class ItemsWritePolicy(PluginConfig):
     3. **Composite identity** ("same geometry AND same attributes is a duplicate")::
 
            ItemsWritePolicy(
-               compute=[
-                   ComputedField(kind=ComputedKind.GEOMETRY_HASH),
-                   ComputedField(kind=ComputedKind.ATTRIBUTES_HASH),
-               ],
-               identity=[IdentityRule(match_on=[
-                   ComputedField(kind=ComputedKind.GEOMETRY_HASH),
-                   ComputedField(kind=ComputedKind.ATTRIBUTES_HASH),
-               ], on_match=WriteConflictPolicy.REFUSE_RETURN)],
+               derive=DeriveSpec(content_hashes=["geometry", "attributes"]),
+               identity=[IdentityRule(
+                   match_on=["geometry_hash", "attributes_hash"],
+                   on_match=WriteConflictPolicy.REFUSE_RETURN,
+               )],
            )
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "policy")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
 
     on_conflict: Mutable[WriteConflictPolicy] = Field(
@@ -417,30 +436,39 @@ class ItemsWritePolicy(PluginConfig):
             "overlap should fail the whole asset."
         ),
     )
-    schema: Mutable[Optional[Dict[str, Any]]] = Field(
+    resolved_schema: Computed[Optional[Dict[str, Any]]] = Field(
         default=None,
         description=(
             "DERIVED, read-only. The wire JSON-Schema (Draft 2020-12) for "
             "feature ``properties`` is derived from ``items_schema`` at read "
-            "time (see ``get_collection_schema``) and surfaced here; authoring "
-            "a non-null value is rejected at config-save. ``items_schema`` is "
-            "the single source of truth for field types/constraints, and "
-            "``strict_unknown_fields`` drives ``additionalProperties: false``."
+            "time (see ``get_collection_schema``) and surfaced here. ``Computed`` "
+            "marks it read-only on the wire AND opts it into the config-write "
+            "strip (``restore_system_assigned_fields``), so any caller value on "
+            "the external path is discarded; the ``_forbid_authored_wire_schema`` "
+            "validate handler additionally rejects an authored value as "
+            "defense-in-depth. ``items_schema`` is the single source of truth for "
+            "field types/constraints, and ``strict_unknown_fields`` drives "
+            "``additionalProperties: false``."
         ),
     )
-    compute: Immutable[List[ComputedField]] = Field(
-        default_factory=list,
+    derive: Immutable[DeriveSpec] = Field(
+        default_factory=DeriveSpec,
         description=(
-            "Per-row derived values materialised by every capable driver. "
-            "Each :class:`ComputedField` declares ``kind`` (EXTERNAL_ID, "
-            "GEOMETRY_HASH, ATTRIBUTES_HASH, GEOHASH/H3/S2 with resolution, "
-            "AREA, PERIMETER, …) and an optional ``name`` override. The "
-            "EXTERNAL_ID entry's ``name`` doubles as the source path for "
-            "extraction (e.g. ``properties.adm2_pcode``). A "
-            ":class:`ComputedKind.GEOHASH` entry with a resolution is the "
-            "identity-axis spatial-cell rule; distinct from "
-            "``GeometriesSidecarConfig.geohash_precision`` which controls the "
-            "stored ``CHAR(N)`` column width (storage layer, not identity). "
+            "Per-row derivations materialised by every capable driver, grouped "
+            "into homogeneous buckets (:class:`DeriveSpec`): ``external_id`` "
+            "(dotted source path), ``content_hashes`` "
+            "(``geometry``/``attributes``), ``spatial_cells`` "
+            "(geohash/h3/s2 + resolution), ``geometry_stats`` "
+            "(area/centroid/bbox/…) and ``attribute_stats`` (a property "
+            "promoted to the attributes sidecar). Accepts a compute-preset "
+            "name (or list of names) as shorthand — it is classified into the "
+            "canonical buckets at save. A spatial cell here is the "
+            "identity-axis key AND the source for the persisted geohash/h3/s2 "
+            "index columns: the stored ``geohash CHAR(N)`` column width is "
+            "DERIVED from the geohash cell's resolution (Phase 3 — the former "
+            "standalone ``GeometriesSidecarConfig.geohash_precision`` knob is "
+            "gone, so the stored precision can never diverge from the identity "
+            "axis). "
             "Immutable once a collection is materialised (#1079): the derived "
             "columns and identity axis are baked into existing rows, so "
             "changing this after data lands would silently diverge the shape "
@@ -448,15 +476,29 @@ class ItemsWritePolicy(PluginConfig):
             "collection is created."
         ),
     )
+
+    @property
+    def compute(self) -> List[ComputedField]:
+        """Engine view of :attr:`derive`: the flat :class:`ComputedField`
+        list every driver/sidecar consumes.
+
+        Derived, read-only — :attr:`derive` is the single authored source of
+        truth. Deduped by ``resolved_name`` (last wins).
+        """
+        return self.derive.to_computed_fields()
+
     identity: Immutable[List[IdentityRule]] = Field(
         default_factory=_default_identity_rules,
         description=(
-            "Ordered identity rules. Each rule ANDs every ComputedField in "
-            "its ``match_on``; rules OR across the list (first whose AND "
-            "conjunction matches wins). Per-rule ``on_match`` overrides "
-            ":attr:`on_conflict` for that branch. Default is a single rule "
-            "matching on EXTERNAL_ID — operators replace the list to express "
-            "geometry-hash dedup, composite identity, etc. Immutable once a "
+            "Ordered identity rules. Each rule ANDs the derivation **names** "
+            "in its ``match_on`` (referencing ``derive`` outputs such as "
+            "``external_id``, ``geometry_hash``, ``geohash_7``); rules OR "
+            "across the list (first whose AND conjunction matches wins). "
+            "Per-rule ``on_match`` overrides :attr:`on_conflict` for that "
+            "branch. Default is a single rule matching on ``external_id`` — "
+            "operators replace the list to express geometry-hash dedup, "
+            "composite identity, etc. Every name must resolve to a ``derive`` "
+            "output (``external_id`` is always available). Immutable once a "
             "collection is materialised (#1079): identity determines how new "
             "writes dedupe against existing rows, so changing it after data "
             "lands would apply different identity semantics to old vs new "
@@ -473,38 +515,48 @@ class ItemsWritePolicy(PluginConfig):
             "produced from a join)."
         ),
     )
-    validity_field: Immutable[Optional[str]] = Field(
+    validity: Immutable[Optional[ValiditySpec]] = Field(
         default=None,
-        examples=[None, "valid_from", "valid_time"],
         description=(
-            "Null-object SSOT for temporal validity. The field name IS the "
-            "toggle: any non-None string enables ``valid_from`` / ``valid_to`` "
-            "tracking per entity and NAMES the temporal storage column (the PG "
-            "driver overlays this value onto the attributes sidecar at "
-            "``ensure_storage`` to name and gate the column); ``None`` disables "
-            "validity entirely. The string is a column name, NOT a source path "
-            "for extraction — the validity-start VALUE comes from "
-            "``write_context.valid_from`` (DuckDB / Iceberg / PG all read the "
-            "runtime context, not the named field). Required (non-None) for "
-            "``NEW_VERSION`` semantics — when ``None``, ``on_conflict=NEW_VERSION`` "
-            "falls back to ``UPDATE``. Validity END is either provided in "
-            "``write_context.valid_to`` or computed as ``None`` (open-ended). "
-            "Immutable once a collection is materialised (#1079): this names a "
-            "physical temporal column, so changing it after the column exists "
-            "would orphan the old column and diverge existing collections. Set "
-            "it before the first collection is created."
+            "Null-object SSOT for temporal validity (:class:`ValiditySpec`). "
+            "Its presence IS the toggle: a non-None spec enables ``valid_from`` "
+            "/ ``valid_to`` tracking per entity; ``None`` disables validity "
+            "entirely. ``ValiditySpec.column`` NAMES the ``tstzrange`` storage "
+            "column (a COLUMN NAME, NOT a source path — the PG driver overlays "
+            "it onto the attributes sidecar at ``ensure_storage`` to name and "
+            "gate the column), resolving the #1126 confusion. The validity "
+            "VALUES come from ``ValiditySpec.start_from`` / ``end_from``: "
+            "``\"context\"`` reads ``write_context.valid_from`` / "
+            "``valid_to`` (the default for start), any other string is a dotted "
+            "source path walked into the feature, and ``end_from=None`` means "
+            "open-ended. Required (non-None) for ``NEW_VERSION`` semantics — "
+            "when ``None``, ``on_conflict=NEW_VERSION`` falls back to "
+            "``UPDATE``. Immutable once a collection is materialised (#1079): "
+            "the column is a physical temporal column, so changing it after the "
+            "column exists would orphan the old column and diverge existing "
+            "collections. Set it before the first collection is created."
         ),
     )
 
     @property
     def enable_validity(self) -> bool:
-        """True when ``validity_field`` is set (null-object pattern).
+        """True when a :class:`ValiditySpec` is set (null-object pattern).
 
-        Derived, read-only. ``validity_field`` is the single source of truth;
-        all drivers gate temporal-column emission on this property so the bool
-        and the path can never independently diverge.
+        Derived, read-only. ``validity`` is the single source of truth; all
+        drivers gate temporal-column emission on this property so the bool and
+        the spec can never independently diverge.
         """
-        return self.validity_field is not None
+        return self.validity is not None
+
+    @property
+    def validity_column(self) -> Optional[str]:
+        """The temporal column name, or ``None`` when validity is disabled.
+
+        Convenience for column-name-only consumers (the PG sidecar overlay, DDL
+        sites) so they churn minimally — equivalent to
+        ``self.validity.column if self.validity else None``.
+        """
+        return self.validity.column if self.validity is not None else None
 
     geometries: Immutable[GeometriesWriteBehavior] = Field(
         default_factory=GeometriesWriteBehavior,
@@ -526,18 +578,51 @@ class ItemsWritePolicy(PluginConfig):
     # Helpers — derive driver-facing values from compute / schema
     # ------------------------------------------------------------------
 
-    def _all_compute_fields(self) -> List[ComputedField]:
-        """Union of explicit ``compute`` entries plus every ``match_on``
-        field referenced by identity rules.
+    def _compute_by_name(self) -> Dict[str, ComputedField]:
+        """Map ``resolved_name`` -> :class:`ComputedField` over :attr:`compute`."""
+        return {cf.resolved_name: cf for cf in self.compute}
 
-        Drivers materialise this set — fields referenced for identity
-        resolution have to be present even if the operator forgot to
-        repeat them in ``compute``.
+    def resolved_identity(self) -> List["ResolvedIdentityRule"]:
+        """Resolve each identity rule's ``match_on`` names to ComputedField.
+
+        ``"external_id"`` resolves to the declared external-id derivation, or
+        to a path-less ``EXTERNAL_ID`` field when no extraction path is set
+        (the value then comes from the write context / feature id). Any other
+        name must already be a declared :attr:`derive` output — enforced at
+        config-save by :meth:`_validate_identity_refs`, re-checked here
+        defensively. Consumed by the write-path identity matcher.
+        """
+        cmap = self._compute_by_name()
+        rules: List[ResolvedIdentityRule] = []
+        for rule in self.identity:
+            fields: List[ComputedField] = []
+            for name in rule.match_on:
+                cf = cmap.get(name)
+                if cf is None:
+                    if name == "external_id":
+                        cf = ComputedField(kind=ComputedKind.EXTERNAL_ID)
+                    else:
+                        raise ValueError(
+                            "IdentityRule.match_on references unknown derived "
+                            f"field {name!r}; declared: {sorted(cmap)}"
+                        )
+                fields.append(cf)
+            rules.append(
+                ResolvedIdentityRule(match_on=fields, on_match=rule.on_match)
+            )
+        return rules
+
+    def _all_compute_fields(self) -> List[ComputedField]:
+        """Union of :attr:`compute` plus every identity ``match_on`` field.
+
+        Drivers materialise this set — an identity axis referenced by name
+        (e.g. a path-less ``external_id``) must be present even when it adds
+        no stored column of its own.
         """
         seen: Dict[str, ComputedField] = {}
         for cf in self.compute:
             seen.setdefault(cf.resolved_name, cf)
-        for rule in self.identity:
+        for rule in self.resolved_identity():
             for cf in rule.match_on:
                 seen.setdefault(cf.resolved_name, cf)
         return list(seen.values())
@@ -555,21 +640,42 @@ class ItemsWritePolicy(PluginConfig):
             return cf
         return None
 
-    @field_validator("compute", mode="before")
+    @field_validator("derive", mode="before")
     @classmethod
-    def _expand_compute_presets(cls, v: Any) -> Any:
-        """Accept a preset name, a mixed list, or explicit fields for ``compute``.
+    def _coerce_derive(cls, v: Any) -> Any:
+        """Accept a :class:`DeriveSpec`, a buckets dict, or compute-preset
+        shorthand (a preset name or list of names) for ``derive``.
 
-        ``"geometry_stats"`` / ``["geometry_stats", {...}]`` / a plain
-        ``List[ComputedField]`` all normalise to a deduped ``List[ComputedField]``
-        via the compute-preset registry. Preset entries leave storage modality
-        unset so the driver decides; an explicit entry overrides a preset one.
+        Preset shorthand expands via the compute-preset registry and is
+        classified into the canonical buckets, so ``"geometry_stats"`` and
+        ``["spatial_cells", "geometry_full"]`` both normalise to a
+        :class:`DeriveSpec`; a dict is validated as a :class:`DeriveSpec`
+        directly.
         """
         if v is None:
-            return []
-        from dynastore.modules.storage.compute_presets import resolve_compute
+            return DeriveSpec()
+        if isinstance(v, DeriveSpec):
+            return v
+        if isinstance(v, (str, list)):
+            from dynastore.modules.storage.compute_presets import resolve_compute
 
-        return resolve_compute(v)
+            return DeriveSpec.from_computed_fields(resolve_compute(v))
+        return v
+
+    @model_validator(mode="after")
+    def _validate_identity_refs(self) -> "ItemsWritePolicy":
+        """Fail-fast: every identity ``match_on`` name must resolve to a
+        ``derive`` output (``external_id`` is always available)."""
+        allowed = set(self._compute_by_name()) | {"external_id"}
+        for rule in self.identity:
+            unknown = [n for n in rule.match_on if n not in allowed]
+            if unknown:
+                raise ValueError(
+                    "IdentityRule.match_on references field(s) not produced by "
+                    f"ItemsWritePolicy.derive: {unknown}. "
+                    f"Available: {sorted(allowed)}."
+                )
+        return self
 
     def external_id_path(self) -> Optional[str]:
         """Dot-walk path used to extract the external_id from an incoming
@@ -595,14 +701,14 @@ class ItemsWritePolicy(PluginConfig):
         """True iff the JSON Schema declares the external-id property required.
 
         Reads the leaf segment of :meth:`external_id_path` and checks the
-        top-level ``required`` list on :attr:`schema`. With no schema or no
-        external_id_path, this returns False.
+        top-level ``required`` list on :attr:`resolved_schema`. With no schema
+        or no external_id_path, this returns False.
         """
         path = self.external_id_path()
-        if not path or not isinstance(self.schema, dict):
+        if not path or not isinstance(self.resolved_schema, dict):
             return False
         leaf = path.split(".")[-1]
-        required = self.schema.get("required") or []
+        required = self.resolved_schema.get("required") or []
         return leaf in required
 
 
@@ -678,11 +784,22 @@ class ItemsPostgresqlDriverConfig(CollectionDriverConfig):
     partitioning).  ``collection_type`` was hoisted out of this class in
     Phase 1.6 — see ``CollectionInfo`` PluginConfig at collection scope.
 
-    CRITICAL: ``sidecars`` and ``partitioning`` are **Immutable** — they
-    cannot be changed once the physical table exists.
+    Phase 3 (sidecars = pure-derived physical realization layer):
+
+    ``sidecars`` is **Computed** — NON-AUTHORABLE.  It is a read-only
+    physical projection derived entirely by ``_effective_sidecars(...)``
+    from ``(ItemsWritePolicy, ItemsSchema, collection_type, driver
+    capabilities)`` at ``ensure_storage()`` time.  An external caller can
+    never author it: the config-write path strips it via
+    ``restore_system_assigned_fields`` (it is a ``Computed`` field), and
+    the internal provisioner stamps the resolved list with
+    ``check_immutability=False``.  Operators SEE the resolved plan via the
+    composed-view ``physical`` projection (read-only); they SHAPE it
+    indirectly through the policy.  ``partitioning`` stays **Immutable** —
+    a genuinely-physical operator choice (Decision 5).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "postgresql_engine"
 
@@ -732,18 +849,27 @@ class ItemsPostgresqlDriverConfig(CollectionDriverConfig):
     # via ``storage.drivers.pg_sidecars.resolver._effective_sidecars(...)``.
     # A default-body ``POST /collections/{id}`` therefore persists zero
     # ``collection_configs`` rows (plan §Principle — default-fast).
-    sidecars: Immutable[List[_PgSidecarConfig]] = Field(
+    sidecars: Computed[List[_PgSidecarConfig]] = Field(
         default_factory=list,
         description=(
-            "Sidecar table configs — discriminated union on ``sidecar_type``. "
-            "Lifecycle: empty until the collection is materialised "
-            "(``ensure_storage()``).  At materialisation the PG driver runs "
-            "``_effective_sidecars(...)`` — core defaults for the "
-            "collection_type plus extension-registered sidecars (e.g. "
-            "``ItemMetadataSidecarConfig`` from STAC) — and persists the "
-            "resolved list onto this field, alongside ``physical_table``.  "
-            "After that point this list IS the snapshot of what runs; ``Immutable`` "
-            "blocks PATCH from changing it.  Discriminator values: "
+            "DERIVED, read-only physical realization (Phase 3). Sidecar table "
+            "configs — discriminated union on ``sidecar_type``. "
+            "NON-AUTHORABLE: ``_effective_sidecars(...)`` is the single source "
+            "of truth, deriving the plan from the items policy/schema, the "
+            "collection_type and the driver's capabilities. Lifecycle: empty "
+            "until the collection is materialised (``ensure_storage()``).  At "
+            "materialisation the PG driver runs ``_effective_sidecars(...)`` — "
+            "core defaults for the collection_type plus extension-registered "
+            "sidecars (e.g. ``ItemMetadataSidecarConfig`` from STAC) — overlays "
+            "the policy-derived storage shape, and persists the resolved list "
+            "onto this field, alongside ``physical_table``.  ``Computed`` marks "
+            "it read-only on the wire AND opts it into the config-write strip "
+            "(``restore_system_assigned_fields``): any caller value on the "
+            "external path is discarded (the provisioner stamps it with "
+            "``check_immutability=False``).  Operators see the resolved plan "
+            "via the composed-view read-only ``physical`` projection; they "
+            "shape it indirectly through ``items_write_policy``.  "
+            "Discriminator values: "
             "``geometries`` (GeometriesSidecarConfig — wkb/wkt + ST_GeoHash + "
             "GENERATED geometry_hash; VECTOR/RASTER only); ``attributes`` "
             "(FeatureAttributeSidecarConfig — JSONB or columnar attribute "
@@ -877,7 +1003,7 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
     via :func:`validate_tier_2`.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "elasticsearch_engine"
 
@@ -920,7 +1046,7 @@ class ItemsElasticsearchPrivateDriverConfig(CollectionDriverConfig):
     from the operator's deep view.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "elasticsearch_engine"
 
@@ -935,7 +1061,7 @@ class ItemsDuckdbDriverConfig(CollectionDriverConfig):
     Absorbs fields previously in ``FileStorageLocationConfig``.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "duckdb_engine"
 
@@ -965,7 +1091,7 @@ class ItemsIcebergDriverConfig(CollectionDriverConfig):
     to obtain the effective values at runtime.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "iceberg_engine"
 
@@ -1098,7 +1224,7 @@ class ItemsIcebergDriverConfig(CollectionDriverConfig):
 class AssetPostgresqlDriverConfig(AssetDriverConfig):
     """PostgreSQL asset driver config."""
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "assets", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "postgresql_engine"
 
@@ -1119,7 +1245,7 @@ class AssetElasticsearchDriverConfig(AssetDriverConfig):
     had zero call sites; the actual prefix is module-global).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "assets", "drivers")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     required_engine_class: ClassVar[str] = "elasticsearch_engine"
 
@@ -1163,7 +1289,7 @@ class ItemsSchema(PluginConfig):
         )
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "schema")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
 
     level: Mutable[_EntityLevel] = _EntityLevel.ITEM
@@ -1295,7 +1421,7 @@ async def _forbid_authored_wire_schema(
     collection_id: "Optional[str]",
     db_resource: "Optional[Any]",
 ) -> None:
-    """Reject an authored ``ItemsWritePolicy.schema``.
+    """Reject an authored ``ItemsWritePolicy.resolved_schema``.
 
     The wire JSON-Schema is derived from ``ItemsSchema`` at read time
     (see ``ItemService.get_collection_schema``); it must never be authored
@@ -1303,9 +1429,9 @@ async def _forbid_authored_wire_schema(
     """
     if not isinstance(config, ItemsWritePolicy):
         return
-    if config.schema is not None:
+    if config.resolved_schema is not None:
         raise ValueError(
-            "ItemsWritePolicy.schema is derived from the items schema and must "
+            "ItemsWritePolicy.resolved_schema is derived from the items schema and must "
             "not be authored; remove this field "
             f"({catalog_id or '-'}/{collection_id or '-'})."
         )

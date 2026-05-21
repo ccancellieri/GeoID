@@ -24,22 +24,45 @@ This module is the phase 1 deliverable of the items-policy consolidation
 It is intentionally additive: nothing here is wired into
 ``ItemsWritePolicy`` yet; that arrives in phase 2.
 
+Two layers live here:
+
+**Authoring layer (the wire/config shape).** :class:`DeriveSpec` groups
+declared derivations into homogeneous, purpose-named buckets
+(``external_id``, ``content_hashes``, ``spatial_cells``, ``geometry_stats``,
+``attribute_stats``). Each bucket entry carries only the fields its family
+needs — no per-kind ``null`` noise, and the registry JSON-Schema advertises
+exactly the legal fields per family. :class:`IdentityRule` references those
+declared outputs **by name** (``match_on: List[str]``) instead of
+re-declaring them. This is what an operator authors and what
+``ItemsWritePolicy`` persists.
+
+**Engine layer (the internal value type).** :class:`ComputedField` is the
+flat per-derivation value the drivers/sidecars consume. It is produced from
+:class:`DeriveSpec` via :meth:`DeriveSpec.to_computed_fields` (and classified
+back via :meth:`DeriveSpec.from_computed_fields`); ``ItemsWritePolicy.compute``
+is a derived view, not an authored field. Nothing outside this bridge needs
+to know the buckets exist.
+
 Public surface:
 
 - :class:`ComputedKind` — enum of every value a driver may derive from an
   incoming feature (identity hashes, spatial-cell keys, statistics).
-- :class:`ComputedField` — one declared derivation. Spatial-cell kinds
-  require a ``resolution``; all others must omit it.
-- :class:`IdentityRule` — an AND-composition over computed fields used to
-  resolve "is this incoming feature the same as one already stored".
-- :class:`FeatureType` — declarative wire-shape contract used by the
-  forthcoming ``ItemsReadPolicy``.
+- :class:`SpatialCell` / :class:`GeometryStat` / :class:`AttributeStat` —
+  the homogeneous bucket entries.
+- :class:`DeriveSpec` — the authored derivation buckets + the bridge to
+  :class:`ComputedField`.
+- :class:`ComputedField` — one engine-facing derivation (internal type).
+- :class:`IdentityRule` — an AND-composition over declared derivation
+  *names* used to resolve "is this incoming feature the same as one already
+  stored".
+- :class:`FeatureType` — declarative wire-shape contract used by
+  ``ItemsReadPolicy``.
 """
 
 from enum import StrEnum
-from typing import TYPE_CHECKING, List, Literal, Optional
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.driver_config import WriteConflictPolicy
@@ -346,14 +369,268 @@ class ComputedField(BaseModel):
         return self.kind.value
 
 
-class IdentityRule(BaseModel):
-    """One AND-composition over computed fields for identity resolution.
+# ---------------------------------------------------------------------------
+# Authoring layer — homogeneous derivation buckets
+# ---------------------------------------------------------------------------
+#
+# Each bucket maps to a slice of ``ComputedKind`` so the authored shape never
+# carries a discriminator or per-kind ``null`` slots. The maps below are the
+# single bridge between the bucket vocabulary and the engine enum; the
+# exhaustiveness test asserts every storage-bearing/identity kind is reachable
+# through exactly one bucket.
 
-    ``match_on`` lists the fields whose values together identify a
-    feature. All listed fields must match an existing row for the rule to
-    fire (AND). ``ItemsWritePolicy.identity`` is an ordered list of these
-    rules; the first one whose conjunction matches wins (OR across rules,
-    first-match-wins).
+SpatialGrid = Literal["geohash", "h3", "s2"]
+ContentHash = Literal["geometry", "attributes"]
+
+_GRID_KIND: dict[str, ComputedKind] = {
+    "geohash": ComputedKind.GEOHASH,
+    "h3": ComputedKind.H3,
+    "s2": ComputedKind.S2,
+}
+_KIND_GRID: dict[ComputedKind, str] = {v: k for k, v in _GRID_KIND.items()}
+
+_CONTENT_HASH_KIND: dict[str, ComputedKind] = {
+    "geometry": ComputedKind.GEOMETRY_HASH,
+    "attributes": ComputedKind.ATTRIBUTES_HASH,
+}
+_KIND_CONTENT_HASH: dict[ComputedKind, str] = {v: k for k, v in _CONTENT_HASH_KIND.items()}
+
+# Geometry/place statistics usable in :class:`GeometryStat` — every
+# storage-bearing kind except the attribute-sourced one (which has its own
+# bucket because it reads ``properties`` rather than the geometry).
+_GEOMETRY_STAT_KINDS: frozenset = _STATISTIC_STORAGE_KINDS - {ComputedKind.ATTRIBUTE_STAT}
+
+
+class SpatialCell(BaseModel):
+    """A discrete spatial-cell key derived from the geometry centroid.
+
+    ``grid`` selects the scheme; ``resolution`` is required and range-checked
+    per scheme (geohash 1..12, h3 0..15, s2 0..30). ``name`` overrides the
+    materialised column name (default ``"{grid}_{resolution}"``).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    grid: SpatialGrid
+    resolution: int
+    name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_resolution(self) -> "SpatialCell":
+        lo, hi = _RESOLUTION_RANGES[_GRID_KIND[self.grid]]
+        if not (lo <= self.resolution <= hi):
+            raise ValueError(
+                f"SpatialCell(grid={self.grid}) resolution {self.resolution} "
+                f"out of range [{lo}, {hi}]"
+            )
+        return self
+
+    def to_computed_field(self) -> ComputedField:
+        return ComputedField(
+            kind=_GRID_KIND[self.grid], resolution=self.resolution, name=self.name
+        )
+
+
+class GeometryStat(BaseModel):
+    """A scalar/array statistic derived from the geometry (or JSON-FG place).
+
+    ``stat`` is one of the geometry/place statistic kinds (area, perimeter,
+    centroid, bbox, …). ``store`` chooses the physical layout (``jsonb`` key
+    vs own ``columnar`` column); ``None`` computes the value without storing
+    it (e.g. to feed an identity rule). ``indexed`` emits a B-tree (requires
+    ``store``; rejected with ``store=jsonb`` — declare two stats for both
+    layouts). ``type`` picks ``POINT`` vs ``POINTZ`` and is only valid for
+    ``centroid``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    stat: ComputedKind
+    store: Optional[StatisticStorageMode] = None
+    indexed: bool = False
+    type: Optional[Literal["POINT", "POINTZ"]] = None
+    name: Optional[str] = None
+
+    @field_validator("stat")
+    @classmethod
+    def _check_stat(cls, v: ComputedKind) -> ComputedKind:
+        if v not in _GEOMETRY_STAT_KINDS:
+            raise ValueError(
+                f"GeometryStat.stat={v.value!r} is not a geometry statistic; "
+                f"valid kinds: {sorted(k.value for k in _GEOMETRY_STAT_KINDS)}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _check_type(self) -> "GeometryStat":
+        if self.type is not None and self.stat != ComputedKind.CENTROID:
+            raise ValueError(
+                f"GeometryStat(stat={self.stat.value}) does not accept 'type' "
+                "(only 'centroid' selects POINT vs POINTZ)."
+            )
+        return self
+
+    def to_computed_field(self) -> ComputedField:
+        # Delegates the store/indexed/centroid_type invariants to ComputedField.
+        return ComputedField(
+            kind=self.stat,
+            storage_mode=self.store,
+            indexed=self.indexed,
+            centroid_type=self.type,
+            name=self.name,
+        )
+
+
+class AttributeStat(BaseModel):
+    """A single feature ``properties`` value promoted into the attributes
+    sidecar as a stored, optionally-indexed column / JSONB key.
+
+    ``source`` is a dotted path into the feature (e.g.
+    ``"properties.population"``). ``store``/``indexed`` mirror
+    :class:`GeometryStat`. ``name`` overrides the column name (default: the
+    source path's final segment).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source: str
+    store: Optional[StatisticStorageMode] = None
+    indexed: bool = False
+    name: Optional[str] = None
+
+    def to_computed_field(self) -> ComputedField:
+        return ComputedField(
+            kind=ComputedKind.ATTRIBUTE_STAT,
+            source=self.source,
+            storage_mode=self.store,
+            indexed=self.indexed,
+            name=self.name,
+        )
+
+
+class DeriveSpec(BaseModel):
+    """Authored, homogeneous buckets of per-row derivations.
+
+    Replaces the old polymorphic ``compute: List[ComputedField]`` authoring
+    surface. Each bucket holds only the fields its family needs:
+
+    - :attr:`external_id` — dotted source path for the identity external id,
+      or ``None`` (the external-id axis still exists; its value then comes
+      from ``write_context.external_id_override`` or the feature id).
+    - :attr:`content_hashes` — which deterministic content fingerprints to
+      compute (``"geometry"`` / ``"attributes"``).
+    - :attr:`spatial_cells` — geohash/h3/s2 keys at a resolution.
+    - :attr:`geometry_stats` — geometry/place statistics (area, centroid, …).
+    - :attr:`attribute_stats` — feature ``properties`` values promoted to the
+      attributes sidecar.
+
+    :meth:`to_computed_fields` flattens these to the engine's
+    :class:`ComputedField` list (deduped by ``resolved_name``, last wins);
+    :meth:`from_computed_fields` classifies a flat list back into buckets
+    (used to accept compute-preset shorthand).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    external_id: Optional[str] = None
+    content_hashes: List[ContentHash] = Field(default_factory=list)
+    spatial_cells: List[SpatialCell] = Field(default_factory=list)
+    geometry_stats: List[GeometryStat] = Field(default_factory=list)
+    attribute_stats: List[AttributeStat] = Field(default_factory=list)
+
+    def to_computed_fields(self) -> List["ComputedField"]:
+        """Flatten the buckets to the engine's :class:`ComputedField` list.
+
+        Deduped by :attr:`ComputedField.resolved_name`, keeping the last
+        occurrence (parity with the compute-preset registry). The
+        ``external_id`` field is emitted only when a source path is set — the
+        identity axis without a path is materialised lazily by
+        :meth:`ItemsWritePolicy.resolved_identity`.
+        """
+        out: List[ComputedField] = []
+        if self.external_id is not None:
+            out.append(
+                ComputedField(kind=ComputedKind.EXTERNAL_ID, name=self.external_id)
+            )
+        for h in self.content_hashes:
+            out.append(ComputedField(kind=_CONTENT_HASH_KIND[h]))
+        for sc in self.spatial_cells:
+            out.append(sc.to_computed_field())
+        for gs in self.geometry_stats:
+            out.append(gs.to_computed_field())
+        for a in self.attribute_stats:
+            out.append(a.to_computed_field())
+        by_name: dict[str, ComputedField] = {}
+        for cf in out:
+            by_name[cf.resolved_name] = cf
+        return list(by_name.values())
+
+    @classmethod
+    def from_computed_fields(cls, fields: Iterable["ComputedField"]) -> "DeriveSpec":
+        """Classify a flat :class:`ComputedField` list into buckets.
+
+        Lets the policy accept compute-preset shorthand (a preset name or list
+        of names expands to a flat list, which this folds into the canonical
+        bucket shape).
+        """
+        external_id: Optional[str] = None
+        content_hashes: List[ContentHash] = []
+        spatial_cells: List[SpatialCell] = []
+        geometry_stats: List[GeometryStat] = []
+        attribute_stats: List[AttributeStat] = []
+        for cf in fields:
+            if cf.kind == ComputedKind.EXTERNAL_ID:
+                external_id = cf.name
+            elif cf.kind in _KIND_CONTENT_HASH:
+                content_hashes.append(_KIND_CONTENT_HASH[cf.kind])  # type: ignore[arg-type]
+            elif cf.kind in SPATIAL_CELL_KINDS:
+                spatial_cells.append(
+                    SpatialCell(
+                        grid=_KIND_GRID[cf.kind],  # type: ignore[arg-type]
+                        resolution=cf.resolution,  # type: ignore[arg-type]
+                        name=cf.name,
+                    )
+                )
+            elif cf.kind == ComputedKind.ATTRIBUTE_STAT:
+                attribute_stats.append(
+                    AttributeStat(
+                        source=cf.source or "",
+                        store=cf.storage_mode,
+                        indexed=cf.indexed,
+                        name=cf.name,
+                    )
+                )
+            else:
+                geometry_stats.append(
+                    GeometryStat(
+                        stat=cf.kind,
+                        store=cf.storage_mode,
+                        indexed=cf.indexed,
+                        type=cf.centroid_type,
+                        name=cf.name,
+                    )
+                )
+        return cls(
+            external_id=external_id,
+            content_hashes=content_hashes,
+            spatial_cells=spatial_cells,
+            geometry_stats=geometry_stats,
+            attribute_stats=attribute_stats,
+        )
+
+
+class IdentityRule(BaseModel):
+    """One AND-composition over declared derivations for identity resolution.
+
+    ``match_on`` lists derivation **names** (``ComputedField.resolved_name``
+    values produced by ``DeriveSpec`` — e.g. ``"external_id"``,
+    ``"geometry_hash"``, ``"geohash_7"``) whose values together identify a
+    feature. The fields are *referenced*, not re-declared: every name must
+    resolve to a ``DeriveSpec`` output (``"external_id"`` is always available
+    even without an extraction path). All listed names must match the same
+    existing row for the rule to fire (AND). ``ItemsWritePolicy.identity`` is
+    an ordered list of these rules; the first whose conjunction matches wins
+    (OR across rules, first-match-wins).
 
     ``on_match`` lets a rule override the policy-level
     :class:`WriteConflictPolicy` — useful for "match by external_id →
@@ -362,7 +639,7 @@ class IdentityRule(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    match_on: List[ComputedField] = Field(min_length=1)
+    match_on: List[str] = Field(min_length=1)
     on_match: Optional["WriteConflictPolicy"] = None
 
 
@@ -394,6 +671,12 @@ class FeatureType(BaseModel):
 __all__ = [
     "ComputedKind",
     "ComputedField",
+    "SpatialCell",
+    "GeometryStat",
+    "AttributeStat",
+    "DeriveSpec",
+    "SpatialGrid",
+    "ContentHash",
     "IdentityRule",
     "FeatureType",
     "StatisticStorageMode",
@@ -401,6 +684,7 @@ __all__ = [
     "target_sidecar",
     "SPATIAL_CELL_KINDS",
     "PATH_EXTRACTED_KINDS",
+    "_GEOMETRY_STAT_KINDS",
     "_PLACE_TABLE_KINDS",
     "_ATTRIBUTE_SIDECAR_KINDS",
 ]

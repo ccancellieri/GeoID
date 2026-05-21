@@ -48,7 +48,7 @@ class CollectionInfo(PluginConfig):
     (it's removed from the model entirely so Pydantic rejects on parse).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "info")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     kind: Mutable[CollectionKind] = Field(
         default=CollectionKind.VECTOR,
@@ -106,7 +106,7 @@ class CollectionPluginConfig(PluginConfig):
     — no ES collection-private index (#1047).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "envelope")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
 
     model_config = {"extra": "allow"}

@@ -52,7 +52,7 @@ class TestItemsReadPolicyShape:
         assert p.feature_type.external_id_as_feature_id is False
 
     def test_collection_scoped_only(self) -> None:
-        assert ItemsReadPolicy._visibility == "collection"
+        assert ItemsReadPolicy._freeze_at == "collection"
 
     def test_address_grouped_under_items_policy(self) -> None:
         # Grouped with ItemsWritePolicy under ``items.policy``; the composer

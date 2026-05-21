@@ -6,7 +6,7 @@ by default.  Drivers reference them via ``engine_ref`` (Cycle F.2).
 These tests pin:
 - Each concrete engine class registers in the TypedModelRegistry
   (``list_registered_configs``) under its ``engine_class`` snake_case key.
-- Each engine declares the right ``_address``, ``_visibility``, and
+- Each engine declares the right ``_address``, ``_freeze_at``, and
   ``engine_class`` discriminator.
 - ``EngineLifecycleConfig`` defaults are global / non-evicting.
 - ``policy="ttl_lru"`` requires ``ttl_seconds`` (model-validator).
@@ -139,7 +139,7 @@ def test_engine_classes_share_platform_engines_address(cls):
     """All four engines live at ``("platform", "protocols", "storage")``; the
     composer separates them by ``class_key()``."""
     assert cls._address == ("platform", "protocols", "storage")
-    assert cls._visibility == "platform"
+    assert cls._freeze_at == "platform"
 
 
 @pytest.mark.parametrize(

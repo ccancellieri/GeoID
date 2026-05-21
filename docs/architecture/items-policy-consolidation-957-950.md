@@ -73,13 +73,34 @@ class ComputedKind(StrEnum):
     ASPECT_RATIO = "aspect_ratio"    # bbox width / bbox height
     # SPHERICITY, FLATNESS — 3D mesh metrics, deferred (see geometry_stats.py TODO)
 
-class ComputedField(BaseModel):
+class ComputedField(BaseModel):                # ENGINE value type (internal)
     kind: ComputedKind
     resolution: Optional[int] = None  # required iff kind ∈ {geohash, h3, s2}
     name: Optional[str] = None        # column/field name; default = kind[_resolution]
 
+# AUTHORING layer: homogeneous buckets, no per-kind null noise. DeriveSpec is
+# what an operator authors and what the registry JSON-Schema advertises; the
+# engine flattens it to List[ComputedField] via DeriveSpec.to_computed_fields().
+class SpatialCell(BaseModel):
+    grid: Literal["geohash", "h3", "s2"]; resolution: int; name: Optional[str] = None
+class GeometryStat(BaseModel):
+    stat: ComputedKind                              # geometry/place stat kinds only
+    store: Optional[StatisticStorageMode] = None    # jsonb | columnar | None (compute-only)
+    indexed: bool = False
+    type: Optional[Literal["POINT", "POINTZ"]] = None  # centroid only
+    name: Optional[str] = None
+class AttributeStat(BaseModel):
+    source: str                                     # dotted property path
+    store: Optional[StatisticStorageMode] = None; indexed: bool = False; name: Optional[str] = None
+class DeriveSpec(BaseModel):
+    external_id: Optional[str] = None               # dotted source path (or None)
+    content_hashes: List[Literal["geometry", "attributes"]] = []
+    spatial_cells: List[SpatialCell] = []
+    geometry_stats: List[GeometryStat] = []
+    attribute_stats: List[AttributeStat] = []
+
 class IdentityRule(BaseModel):
-    match_on: List[ComputedField]                  # AND within rule
+    match_on: List[str]                            # names referencing derive outputs (AND within rule)
     on_match: Optional[WriteConflictPolicy] = None # overrides policy.on_conflict
 
 class ItemsWritePolicy(PluginConfig):
@@ -93,14 +114,14 @@ class ItemsWritePolicy(PluginConfig):
 
     schema: Optional[Dict[str, Any]] = None  # self-contained JSON Schema (see below); write-time validation
 
-    # The external_id source path lives on the ComputedField itself:
-    #   compute=[ComputedField(kind=EXTERNAL_ID, name="properties.adm2_pcode")]
+    # Derivations are authored as homogeneous buckets (DeriveSpec); the flat
+    # engine list is the read-only `compute` property (DeriveSpec.to_computed_fields()).
+    # The external_id source path lives on the bucket:
+    #   derive=DeriveSpec(external_id="properties.adm2_pcode")
     # "required external_id" is expressed via the JSON Schema's `required`
     # list — no separate require_external_id boolean needed.
-    compute: List[ComputedField] = []
-    identity: List[IdentityRule] = [
-        IdentityRule(match_on=[ComputedField(kind=ComputedKind.EXTERNAL_ID)])
-    ]
+    derive: DeriveSpec = Field(default_factory=DeriveSpec)
+    identity: List[IdentityRule] = [IdentityRule(match_on=["external_id"])]
     geometries: GeometriesWriteBehavior = Field(default_factory=GeometriesWriteBehavior)
 
 class FeatureType(BaseModel):

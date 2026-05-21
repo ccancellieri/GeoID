@@ -28,8 +28,10 @@ This module is extracted to avoid circular dependencies between:
 from typing import List, Optional, Dict, Literal
 from enum import Enum
 from pydantic import Field
+from dynastore.models.mutability import Computed
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
+    ComputedKind,
 )
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, SidecarConfigRegistry
 
@@ -106,32 +108,69 @@ class GeometriesSidecarConfig(SidecarConfig):
     # on ``ItemsWritePolicy.geometries`` (``GeometriesWriteBehavior``) rather
     # than this storage-shape config — see #941.
 
-    # Spatial indexes configuration
-    h3_resolutions: List[int] = Field(default_factory=list, description="H3 resolutions to index (0-15)")
-    s2_resolutions: List[int] = Field(default_factory=list, description="S2 resolutions to index (0-30)")
-    geohash_precision: Optional[int] = Field(
-        default=8, ge=1, le=12,
+    # Spatial-cell index columns are DERIVED from the items policy (Phase 3,
+    # Decision 2). The geohash/h3/s2 stored columns and their precisions are
+    # NOT an independent sidecar knob — they mirror
+    # ``ItemsWritePolicy.derive.spatial_cells`` so the persisted column width
+    # can never drift from the identity axis. The PG driver overlays the
+    # policy's spatial-cell ComputedFields onto ``spatial_cells_overlay`` at
+    # ``ensure_storage`` time; the precision/resolution accessors below read
+    # that overlay. (The old authorable ``geohash_precision`` /
+    # ``h3_resolutions`` / ``s2_resolutions`` fields are removed — a clean
+    # break, no shim.)
+    spatial_cells_overlay: Computed[List[ComputedField]] = Field(
+        default_factory=list,
         description=(
-            "STORAGE-side precision: when set, a STORED generated column "
-            "``geohash CHAR(N)`` (N=precision, 1-12) is added to the geometry "
-            "sidecar, populated by ``ST_GeoHash(geom, N)``, with a B-tree index. "
-            "Useful as a coarse spatial-locality B-tree for ad-hoc queries. "
-            "Distinct from the identity-axis :class:`ComputedKind.GEOHASH` entry "
-            "on ``ItemsWritePolicy.compute`` — that drives runtime identity match "
-            "(``ST_GeoHash(geom, M)`` computed on-the-fly), this drives the "
-            "persisted column. The two values do NOT have to agree (and typically "
-            "won't, e.g. policy M=9 for 5m-cell identity vs column N=8 for "
-            "20m-cell scan acceleration). Default 8 (≈20 m, ≈38 bits) — small "
-            "storage cost, useful out-of-the-box for spatial dedup. Set to None "
-            "to opt out for collections where the column would be wasted."
+            "DERIVED, read-only. Storage-shape snapshot of the spatial-cell "
+            "entries (geohash/h3/s2) from ``ItemsWritePolicy.derive."
+            "spatial_cells`` for this collection. Overwritten by the PG driver "
+            "at DDL time; drives the persisted geohash/h3/s2 index columns so "
+            "the stored precision can never diverge from the identity axis."
         ),
     )
 
-    # Partitioning
-    partition_strategy: Optional[GeometryPartitionStrategyPreset] = Field(default=None, description="Strategy to use for contributing to the global partition key."
+    @property
+    def geohash_precision(self) -> Optional[int]:
+        """DERIVED geohash column width (CHAR(N)) from the policy's geohash
+        spatial cell, or ``None`` when the policy declares no geohash cell.
+
+        Physical realization of ``ItemsWritePolicy.derive.spatial_cells`` —
+        the stored ``geohash CHAR(N)`` column uses the same N as the
+        identity-axis geohash so the two can never diverge (Phase 3
+        Decision 2; was a standalone authorable knob pre-Phase-3)."""
+        for cf in self.spatial_cells_overlay:
+            if cf.kind == ComputedKind.GEOHASH and cf.resolution is not None:
+                return cf.resolution
+        return None
+
+    @property
+    def h3_resolutions(self) -> List[int]:
+        """DERIVED H3 index resolutions from the policy's H3 spatial cells."""
+        return [
+            cf.resolution
+            for cf in self.spatial_cells_overlay
+            if cf.kind == ComputedKind.H3 and cf.resolution is not None
+        ]
+
+    @property
+    def s2_resolutions(self) -> List[int]:
+        """DERIVED S2 index resolutions from the policy's S2 spatial cells."""
+        return [
+            cf.resolution
+            for cf in self.spatial_cells_overlay
+            if cf.kind == ComputedKind.S2 and cf.resolution is not None
+        ]
+
+    # Partitioning — PHYSICAL realization, not policy (Phase 3 Decision 5):
+    # the partition strategy/resolution is a genuinely-physical operator
+    # choice that cannot be inferred from policy intent, so it stays an
+    # authorable knob on the driver config. ``partition_resolution`` must be
+    # one of the DERIVED ``h3_resolutions``/``s2_resolutions`` (which mirror
+    # the policy's spatial cells).
+    partition_strategy: Optional[GeometryPartitionStrategyPreset] = Field(default=None, description="PHYSICAL: strategy to use for contributing to the global partition key (operator-tunable, not policy)."
     )
     partition_resolution: int = Field(
-        default=0, description="Resolution to use for partitioning (must be in h3_resolutions or s2_resolutions)."
+        default=0, description="PHYSICAL: resolution to use for partitioning (must be one of the derived h3_resolutions or s2_resolutions, which mirror the policy spatial cells)."
     )
     
     # Geometry Statistics — storage-shape mirror of ``ItemsWritePolicy.compute``
@@ -159,7 +198,7 @@ class GeometriesSidecarConfig(SidecarConfig):
     )
     
     # ``feature_type_schema`` was retired in #976: the wire shape of Feature
-    # ``properties`` is now the SSOT on ``ItemsWritePolicy.schema``. The
+    # ``properties`` is now the SSOT on ``ItemsWritePolicy.resolved_schema``. The
     # geometry contribution stays auto-derived from this sidecar's columns.
 
     @property

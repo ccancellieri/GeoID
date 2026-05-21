@@ -24,11 +24,11 @@ from dynastore.models.protocols.entity_store import (
 )
 from dynastore.modules.storage.drivers.catalog_postgresql import (
     CatalogCoreSidecarConfig,
-    CatalogPgSidecarRegistry,
     CatalogStacSidecarConfig,
     CatalogPostgresqlDriver,
     CatalogPostgresqlDriverConfig,
 )
+from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +111,12 @@ class _FakeStacCls:
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    saved = dict(CatalogPgSidecarRegistry._registry)
-    saved_loaded = CatalogPgSidecarRegistry._defaults_loaded
-    CatalogPgSidecarRegistry.clear()
-    CatalogPgSidecarRegistry._registry["catalog_core"] = _FakeCoreCls  # type: ignore[assignment]
-    CatalogPgSidecarRegistry._registry["catalog_stac"] = _FakeStacCls  # type: ignore[assignment]
-    CatalogPgSidecarRegistry._defaults_loaded = True
+    saved = dict(SidecarRegistry._catalog_registry)
+    saved_loaded = SidecarRegistry._catalog_defaults_loaded
+    SidecarRegistry.clear_catalog_registry()
+    SidecarRegistry._catalog_registry["catalog_core"] = _FakeCoreCls  # type: ignore[assignment]
+    SidecarRegistry._catalog_registry["catalog_stac"] = _FakeStacCls  # type: ignore[assignment]
+    SidecarRegistry._catalog_defaults_loaded = True
     _FakeCoreCls._instance = None
     _FakeStacCls._instance = None
     # Flush per-catalog sidecar cache (PR 1e step 4) — the cache key
@@ -129,9 +129,9 @@ def _reset_registry():
     try:
         yield
     finally:
-        CatalogPgSidecarRegistry.clear()
-        CatalogPgSidecarRegistry._registry.update(saved)
-        CatalogPgSidecarRegistry._defaults_loaded = saved_loaded
+        SidecarRegistry.clear_catalog_registry()
+        SidecarRegistry._catalog_registry.update(saved)
+        SidecarRegistry._catalog_defaults_loaded = saved_loaded
         try:
             CatalogPostgresqlDriver._resolve_sidecars_for_catalog.cache_clear()  # type: ignore[attr-defined]
         except Exception:
@@ -175,15 +175,15 @@ def test_capabilities_union_covers_inner_capabilities():
 
 
 def test_default_sidecars_includes_core_and_stac_when_both_registered():
-    sidecars = CatalogPgSidecarRegistry.default_sidecars()
+    sidecars = SidecarRegistry.default_catalog_sidecars()
     assert [s.sidecar_type for s in sidecars] == [
         "catalog_core", "catalog_stac",
     ]
 
 
 def test_default_sidecars_omits_stac_when_unregistered():
-    CatalogPgSidecarRegistry._registry.pop("catalog_stac", None)
-    sidecars = CatalogPgSidecarRegistry.default_sidecars()
+    SidecarRegistry._catalog_registry.pop("catalog_stac", None)
+    sidecars = SidecarRegistry.default_catalog_sidecars()
     assert [s.sidecar_type for s in sidecars] == ["catalog_core"]
 
 
@@ -258,7 +258,7 @@ async def test_get_catalog_metadata_swallows_per_inner_failure_and_returns_other
         def __new__(cls):  # type: ignore[misc]
             return failing
 
-    CatalogPgSidecarRegistry._registry["catalog_core"] = _FailingCls  # type: ignore[assignment]
+    SidecarRegistry._catalog_registry["catalog_core"] = _FailingCls  # type: ignore[assignment]
     driver = CatalogPostgresqlDriver()
     out = await driver.get_catalog_metadata("cat-a")
     assert out is not None
@@ -325,7 +325,7 @@ def test_wrapper_returns_empty_columns_when_no_stac_inner_loaded():
     ``stac_service._has_stac`` correctly identifies STAC as unavailable
     and the catalog-tier hard-reject still fires.
     """
-    CatalogPgSidecarRegistry._registry.pop("catalog_stac", None)
+    SidecarRegistry._catalog_registry.pop("catalog_stac", None)
     driver = CatalogPostgresqlDriver()
     assert driver.stac_metadata_columns() == ()
 

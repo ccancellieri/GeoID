@@ -44,7 +44,7 @@ def is_snapshottable_config(cls: Type[PluginConfig]) -> bool:
     if cls.__dict__.get("is_abstract_base", False):
         return False
     # Platform-only configs never cascade to collections — nothing to freeze.
-    if getattr(cls, "_visibility", None) == "platform":
+    if getattr(cls, "_freeze_at", None) == "platform":
         return False
     if cls.__name__.endswith(_EXCLUDED_SUFFIXES):
         return False

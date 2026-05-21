@@ -133,8 +133,8 @@ class PluginConfig(PersistentModel):
     #        (collection drivers, asset drivers, items policy, routing,
     #        schema, info, envelope, privacy, write/lookup audience, ...)?
     #             → ``("platform", "catalog", ...)``.
-    #             ``_visibility`` narrows further to ``"collection"`` or
-    #             ``"catalog"`` scope.
+    #             ``_freeze_at`` narrows the immutability gate further to
+    #             ``"collection"`` or ``"catalog"`` tier.
     #
     #     2. Is it config for a ``modules/*`` subsystem (the default
     #        for a self-contained internal module)?
@@ -203,30 +203,36 @@ class PluginConfig(PersistentModel):
     # ---------------------------------------------------------------------
     _address: ClassVar[Tuple[Optional[str], ...]] = ()
 
-    # Optional scope-visibility filter.  Two roles:
-    #  1. Drives the immutability materialization gate (``is_materialized``
-    #     dispatches on it to pick the tier at which "the resource exists"
-    #     is evaluated).
-    #  2. Marks catalog-/collection-tier *templates* so the platform-scope
-    #     composed view can slim them out of the strict body.
-    # It NO LONGER drives tree placement in the composed view — that is
-    # ``_view_scopes`` (below), so a config can be gated at one tier yet
-    # rendered at others.
-    # - ``None`` (default) → gate at platform tier.
-    # - ``"collection"`` → gate at the collection's physical items table.
-    # - ``"catalog"`` → gate at the catalog (any collection registered).
-    _visibility: ClassVar[Optional[str]] = None
-
-    # Optional override for the scopes at which this config RENDERS in the
-    # composed-config view (``ConfigApiService._place``).  Decoupled from
-    # ``_visibility`` so a config can be gated for immutability at one tier
-    # yet be viewable/editable at others.  ``None`` (default) → derive the
-    # view scopes from ``_visibility`` for back-compat (``"collection"`` →
-    # collection only; everything else → all scopes).  Routing configs set
-    # this explicitly: a routing default applied at the catalog tier
-    # cascades to collections, so it must surface in the catalog view even
-    # though it stays ``_visibility="collection"`` for the gate.
-    _view_scopes: ClassVar[Optional[Tuple[str, ...]]] = None
+    # ------------------------------------------------------------------
+    # Scope model — two ORTHOGONAL declarations (see ``effective_tiers``):
+    #
+    #   ``_tiers``     — the scopes at which this config may be SET and
+    #                    RENDERED.  Single source of truth for composed-view
+    #                    placement (``ConfigApiService._place``) AND the
+    #                    write-authorization surface.  ``None`` (default) →
+    #                    the full stack ``(platform, catalog, collection)``: a
+    #                    platform value cascades down as the inherited default
+    #                    and any sub-tier may override it (the #761 full-
+    #                    inherited-surface contract).  Set it explicitly only
+    #                    to NARROW to fewer tiers, or as the platform-strict
+    #                    slim opt-in.  The DATA tier is ``_freeze_at``, NOT the
+    #                    address (the address encodes the config bucket).
+    #
+    #   ``_freeze_at`` — the materialization tier for the immutability gate
+    #                    (``is_materialized`` dispatches on it).  Also marks
+    #                    catalog-/collection-tier *templates* so the
+    #                    platform-scope composed view can slim them out of the
+    #                    strict body.  Decoupled from ``_tiers`` so a config
+    #                    can be gated at one tier yet rendered at several.
+    #                      - ``None`` (default) / ``"platform"`` → gate when
+    #                        any catalog is provisioned (platform-intrinsic).
+    #                      - ``"catalog"``    → gate when any collection is
+    #                        registered in the catalog.
+    #                      - ``"collection"`` → gate when the collection's
+    #                        physical items table has at least one row.
+    # ------------------------------------------------------------------
+    _tiers: ClassVar[Optional[Tuple[str, ...]]] = None
+    _freeze_at: ClassVar[Optional[str]] = None
 
     # NB: ``_on_apply: ClassVar`` declaration pattern retired in Phase 1.5.
     # Concrete subclasses register apply handlers imperatively at module-
@@ -267,6 +273,34 @@ class PluginConfig(PersistentModel):
                     f"call at module-import time (Phase 1.5 standardisation — "
                     f"single registration path, multi-handler support)."
                 )
+            for _legacy in ("_visibility", "_view_scopes"):
+                if _legacy in cls.__dict__:
+                    raise TypeError(
+                        f"{cls.__module__}.{cls.__qualname__} declares the "
+                        f"retired ``{_legacy}`` ClassVar. The scope model is "
+                        f"now ``_tiers`` (set/render scopes) + ``_freeze_at`` "
+                        f"(immutability-gate tier). Map ``_visibility=X`` → "
+                        f"``_freeze_at=X`` and ``_view_scopes=T`` → ``_tiers=T``."
+                    )
+
+    @classmethod
+    def effective_tiers(cls) -> Tuple[str, ...]:
+        """Scopes at which this config may be set and rendered.
+
+        Explicit ``_tiers`` wins — use it to NARROW a config to fewer tiers,
+        or as the platform-strict slim opt-in. Otherwise the default is the
+        full tier stack: a platform-tier value cascades down as the inherited
+        default and any sub-tier may override it, so every config is authorable
+        and rendered at all three scopes (the #761 "full inherited surface"
+        contract). The DATA tier (where the governed resource physically
+        lives) is carried by ``_freeze_at`` — NOT derived from ``_address``,
+        because the address encodes the config *bucket* (e.g. a per-catalog
+        GCP bucket config is addressed ``platform.modules.gcp`` yet is a
+        catalog-tier resource via ``_freeze_at="catalog"``).
+        """
+        if cls._tiers is not None:
+            return tuple(cls._tiers)
+        return ("platform", "catalog", "collection")
 
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:

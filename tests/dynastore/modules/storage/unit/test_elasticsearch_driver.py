@@ -671,10 +671,10 @@ class TestWriteEntitiesTenantIndex:
 
         es = _StubEs(exists=True)
         es.count_result = {"count": 1}
-        from dynastore.modules.storage import ComputedField, ComputedKind
+        from dynastore.modules.storage import DeriveSpec
         policy = ItemsWritePolicy(
             on_conflict=WriteConflictPolicy.REFUSE,
-            compute=[ComputedField(kind=ComputedKind.EXTERNAL_ID, name="properties.ext_id")],
+            derive=DeriveSpec(external_id="properties.ext_id"),
         )
         with patch(
             "dynastore.modules.elasticsearch.client.get_client", return_value=es,
@@ -703,12 +703,12 @@ class TestWriteEntitiesTenantIndex:
         from dynastore.modules.storage.driver_config import (
             ItemsWritePolicy, WriteConflictPolicy,
         )
-        from dynastore.modules.storage import ComputedField, ComputedKind
+        from dynastore.modules.storage import DeriveSpec
 
         es = _StubEs(exists=True)
         policy = ItemsWritePolicy(
             on_conflict=WriteConflictPolicy.NEW_VERSION,
-            compute=[ComputedField(kind=ComputedKind.EXTERNAL_ID, name="properties.ext_id")],
+            derive=DeriveSpec(external_id="properties.ext_id"),
         )
         with patch(
             "dynastore.modules.elasticsearch.client.get_client", return_value=es,

@@ -18,9 +18,9 @@ def test_address_is_platform_catalog_lookup_audience():
     assert CatalogLookupAudience._address == ("platform", "catalog", "lookup_audience")
 
 
-def test_visibility_is_catalog_tier():
-    """The PluginConfig is visible at the catalog tier."""
-    assert CatalogLookupAudience._visibility == "catalog"
+def test_freeze_at_is_catalog_tier():
+    """The PluginConfig's immutability gate fires at the catalog tier."""
+    assert CatalogLookupAudience._freeze_at == "catalog"
 
 
 def test_class_key_is_snake_case():

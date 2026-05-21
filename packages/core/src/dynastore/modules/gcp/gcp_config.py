@@ -144,7 +144,7 @@ class GcpCatalogBucketConfig(PluginConfig):
     when the bucket is first created.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "gcp")
-    _visibility: ClassVar[Optional[str]] = "catalog"
+    _freeze_at: ClassVar[Optional[str]] = "catalog"
 
     # Apply handler is registered imperatively at module-import time
     # (see ``GcpCatalogBucketConfig.register_apply_handler(...)`` below).
@@ -233,7 +233,7 @@ class GcpCollectionBucketConfig(PluginConfig):
     These settings can override catalog-level defaults for objects belonging to this collection.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "gcp")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
     custom_metadata_defaults: Mutable[Optional[Dict[str, str]]] = Field(default=None, description="Default metadata to apply to all objects uploaded to this collection.")
 
@@ -285,7 +285,7 @@ class GcpEventingConfig(PluginConfig):
     stored independently from the bucket configuration.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "gcp")
-    _visibility: ClassVar[Optional[str]] = "catalog"
+    _freeze_at: ClassVar[Optional[str]] = "catalog"
 
     # Apply handler is registered imperatively at module-import time
     # (see ``GcpEventingConfig.register_apply_handler(...)`` below).

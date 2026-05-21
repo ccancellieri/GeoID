@@ -23,14 +23,14 @@ Placement is read from each ``PluginConfig`` subclass's mandatory
 ``_address: ClassVar[Tuple[Optional[str], ...]]`` ClassVar (variable-length
 post Cycle D.0; subclass annotations may stay narrower as 3-tuples and
 migrate incrementally during D.2).
-Scope placement is read from the optional ``_view_scopes`` ClassVar
-(the set of scopes a config renders at), falling back to ``_visibility``
-when unset (``"collection"`` → collection only; everything else →
-everywhere).  ``_view_scopes`` is decoupled from ``_visibility`` so a
-config gated for immutability at one tier can still be viewed/edited at
-others — routing configs use this to surface catalog-tier defaults that
-cascade to collections.  The composer no longer owns a placement
-heuristic — there is exactly one source of truth per class.
+Scope placement is read from ``PluginConfig.effective_tiers()`` — the set
+of scopes a config renders at, taken from the explicit ``_tiers`` ClassVar
+when set and otherwise derived from ``_address``.  ``_tiers`` is decoupled
+from ``_freeze_at`` (the immutability-gate tier) so a config gated for
+immutability at one tier can still be viewed/edited at others — routing
+configs rely on this to surface catalog-tier defaults that cascade to
+collections.  The composer no longer owns a placement heuristic — there is
+exactly one source of truth per class.
 """
 
 from __future__ import annotations
@@ -75,19 +75,17 @@ def _routing_config_keys() -> frozenset[str]:
 def _view_scopes_for(cls: Type[PluginConfig]) -> frozenset[str]:
     """Effective scopes at which ``cls`` renders in the composed view.
 
-    Prefers the explicit ``_view_scopes`` override (decoupled from the
-    immutability gate that ``_visibility`` drives).  When unset, derives
-    the scopes from ``_visibility`` so existing configs behave exactly as
-    before: ``"collection"`` → collection only; every other value
-    (including ``None`` and ``"catalog"``) → all scopes.  Read via
-    ``getattr`` so synthetic test stubs (plain classes, not PluginConfig
-    subclasses) resolve too.
+    Single source: ``PluginConfig.effective_tiers()`` (explicit ``_tiers``
+    else address-derived). Read defensively so synthetic test stubs (plain
+    classes, not PluginConfig subclasses) still resolve.
     """
-    explicit = getattr(cls, "_view_scopes", None)
+    fn = getattr(cls, "effective_tiers", None)
+    if callable(fn):
+        tiers: Any = fn()
+        return frozenset(tiers)
+    explicit = getattr(cls, "_tiers", None)
     if explicit is not None:
         return frozenset(explicit)
-    if getattr(cls, "_visibility", None) == "collection":
-        return frozenset({"collection"})
     return frozenset({"platform", "catalog", "collection"})
 
 
@@ -105,7 +103,8 @@ def _place(
     Filters:
     - Abstract bases (``is_abstract_base = True``) → dropped.
     - ``active_scope`` not in the config's effective view scopes
-      (``_view_scopes`` override, else derived from ``_visibility``) → dropped.
+      (explicit ``_tiers``, else derived from ``_address`` via
+      ``effective_tiers``) → dropped.
     """
     if cls.__dict__.get("is_abstract_base", False):
         return None
@@ -377,6 +376,87 @@ class ConfigApiService:
             return {}
 
     @staticmethod
+    def _physical_projection(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build the read-only PHYSICAL projection for a PG items driver leaf.
+
+        ``sidecars`` is a Computed (derived, read-only) realization of the
+        items policy. This surfaces the resolved plan so operators can SEE
+        how their policy is physically realized — answering "where are the
+        sidecars / why is the list empty". Returns ``None`` for any leaf that
+        isn't the PG items driver (no ``sidecars`` key), so non-PG nodes are
+        untouched.
+
+        Read-only by construction (``readOnly: true`` envelope): the source
+        ``sidecars`` field is Computed, so PUTting the leaf back strips it and
+        this projection is never round-tripped.
+        """
+        sidecars = payload.get("sidecars")
+        if not sidecars or not isinstance(sidecars, list):
+            # Only the PG items driver carries ``sidecars``; an empty list is
+            # the unmaterialised default-fast state (nothing to project yet).
+            return None
+
+        resolved: List[Dict[str, Any]] = []
+        for sc in sidecars:
+            if not isinstance(sc, dict):
+                continue
+            sc_type = sc.get("sidecar_type")
+            entry: Dict[str, Any] = {"sidecar_type": sc_type}
+            # Surface the policy-derived storage shape per sidecar family so an
+            # operator sees the concrete physical realization, not just names.
+            if sc_type == "geometries":
+                cells = sc.get("spatial_cells_overlay") or []
+                geohash_prec = None
+                h3_res: List[int] = []
+                s2_res: List[int] = []
+                for cf in cells:
+                    if not isinstance(cf, dict):
+                        continue
+                    kind = cf.get("kind")
+                    res = cf.get("resolution")
+                    if kind == "geohash" and res is not None:
+                        geohash_prec = res
+                    elif kind == "h3" and res is not None:
+                        h3_res.append(res)
+                    elif kind == "s2" and res is not None:
+                        s2_res.append(res)
+                entry["derived"] = {
+                    "geohash_precision": geohash_prec,
+                    "h3_resolutions": h3_res,
+                    "s2_resolutions": s2_res,
+                    "geom_column": sc.get("geom_column"),
+                    "bbox_column": sc.get("bbox_column"),
+                    "statistics": [
+                        cf.get("name") or cf.get("kind")
+                        for cf in (sc.get("compute_fields_overlay") or [])
+                        if isinstance(cf, dict)
+                    ],
+                }
+            elif sc_type == "attributes":
+                entry["derived"] = {
+                    "storage_mode": sc.get("storage_mode"),
+                    "external_id_field": sc.get("external_id_field"),
+                    "asset_id_field": sc.get("asset_id_field"),
+                    "validity_column": sc.get("validity_column"),
+                    "statistics": [
+                        cf.get("name") or cf.get("kind")
+                        for cf in (sc.get("compute_fields_overlay") or [])
+                        if isinstance(cf, dict)
+                    ],
+                }
+            resolved.append(entry)
+
+        return {
+            "readOnly": True,
+            "description": (
+                "DERIVED physical realization of the items policy (read-only). "
+                "Sidecars are computed by the PG driver at materialization; "
+                "they cannot be authored — shape them via items_write_policy."
+            ),
+            "sidecars": resolved,
+        }
+
+    @staticmethod
     def _compose_tree(
         by_class: Dict[str, Dict[str, Any]],
         sources: Dict[str, str],
@@ -434,7 +514,7 @@ class ConfigApiService:
         the "complete the configuration" contract.
 
         - ``"scope"`` (default) — at PLATFORM scope under ``strict=True``
-          drops catalog-tier templates (``_visibility="catalog"``) from
+          drops catalog-tier templates (``_freeze_at="catalog"``) from
           the body.  At catalog and collection scope this mode is identical
           to ``"upstream"``: every leaf placed by ``_place()`` lands in
           the tree with its waterfall-resolved value.
@@ -443,19 +523,19 @@ class ConfigApiService:
 
         Each leaf's ``_meta.source`` reports the effective tier
         (``"platform"`` / ``"catalog"`` / ``"collection"`` / ``"default"``)
-        so operators see what they inherit vs override.  ``_visibility``
+        so operators see what they inherit vs override.  ``_freeze_at``
         still gates writability via the service layer; it no longer hides
         the leaf from a sub-platform read view.
 
         ``strict`` (default True, Cycle F.7d.2) tightens platform-scope
         visibility: when True, platform-scope view drops configs declared
-        with ``_visibility="catalog"`` from the body.  This matches the
+        with ``_freeze_at="catalog"`` from the body.  This matches the
         user-mental-model that platform scope shows only platform-
         intrinsic configs (modules / extensions / tasks / engines), with
         catalog-tier templates surfaced only on demand.  When False, the
         previous always-true platform-scope filter is restored —
         catalog-tier defaults appear inline in the body.  Has no effect
-        at catalog or collection scope (the per-tier ``_visibility``
+        at catalog or collection scope (the per-tier ``_tiers`` placement
         filter already runs there).
 
         ``view_mode`` applies a provenance-based post-filter on the
@@ -493,27 +573,27 @@ class ConfigApiService:
             """Slim-mode filter: keep only configs visible at ``active_scope``.
 
             At platform scope under ``strict=True`` (Cycle F.7d.2), drop
-            configs declared with ``_visibility="catalog"`` from the body
+            configs declared with ``_freeze_at="catalog"`` from the body
             (they're catalog-tier templates stored at platform scope —
             visible only via ``strict=False`` / ``include=upstream``).
 
-            ``_visibility="platform"`` (engine configs, etc.) is treated
+            ``_freeze_at="platform"`` (engine configs, etc.) is treated
             as platform-intrinsic — kept in body at platform scope strict
             mode.  Engines ARE platform-tier resources by definition.
 
-            An explicit ``_view_scopes`` is authoritative and overrides the
-            ``_visibility`` template-slim: a config that opts into the
+            An explicit ``_tiers`` is authoritative and overrides the
+            ``_freeze_at`` template-slim: a config that opts into the
             platform view (e.g. routing defaults, which cascade from the
             platform base tier) stays in the body even under strict mode,
             so it is visible at the tier it was applied at.  Configs without
-            ``_view_scopes`` keep the ``_visibility`` slimming behaviour.
+            ``_tiers`` keep the ``_freeze_at`` slimming behaviour.
 
             At catalog/collection scope: include every config that passed
             ``_place()`` — the resolved config response must surface the full
             configurable surface (modules, extensions, tasks, engines,
             drivers) per #761.  ``_meta.source`` on each leaf reports the
             effective tier (``platform`` / ``catalog`` / ``collection`` /
-            ``default``); ``_visibility`` continues to gate writability via
+            ``default``); ``_freeze_at`` continues to gate writability via
             the service layer but does not hide the leaf from the read view.
 
             Side-effect: at catalog/collection scope ``include=scope`` and
@@ -526,27 +606,22 @@ class ConfigApiService:
             if active_scope == "platform":
                 if not strict:
                     return True
-                # Explicit ``_view_scopes`` wins over the ``_visibility``
+                # Explicit ``_tiers`` wins over the ``_freeze_at``
                 # template-slim: a config that opts into the platform view
                 # is shown even under strict mode (consistent with
                 # ``_place``, which placed it here for the same reason).
-                explicit_scopes = getattr(cls, "_view_scopes", None)
-                if explicit_scopes is not None:
-                    return "platform" in explicit_scopes
+                explicit_tiers = getattr(cls, "_tiers", None)
+                if explicit_tiers is not None:
+                    return "platform" in explicit_tiers
                 # Strict fallback: platform-intrinsic configs stay in body.
-                # Both ``_visibility=None`` (default; visible everywhere —
-                # owned at platform when stored there) AND
-                # ``_visibility="platform"`` (engines + other platform-
-                # exclusive configs) qualify.  Catalog-/collection-tier
-                # templates (``_visibility="catalog"`` / ``"collection"``)
+                # Both ``_freeze_at=None`` (default; gated at the platform
+                # tier) AND ``_freeze_at="platform"`` (engines + other
+                # platform-exclusive configs) qualify.  Catalog-/collection-
+                # tier templates (``_freeze_at="catalog"`` / ``"collection"``)
                 # are filtered out.
-                visibility = getattr(cls, "_visibility", None)
-                return visibility is None or visibility == "platform"
-            # Non-platform scopes (catalog / collection): show everything
-            # that ``_place()`` accepts.  ``_place()`` already drops
-            # collection-vis configs at non-collection scopes; everything
-            # else is informative context at this tier.
-            del class_key  # unused at non-platform scopes
+                freeze_at = getattr(cls, "_freeze_at", None)
+                return freeze_at is None or freeze_at == "platform"
+            del class_key
             return True
 
         def _doc_extras(cls: Type[PluginConfig]) -> Dict[str, Any]:
@@ -654,6 +729,23 @@ class ConfigApiService:
                     payload.pop("input_transformers", None)
                 if payload.get("output_transformers") == []:
                     payload.pop("output_transformers", None)
+
+            # Phase 3 Decision 4 — PHYSICAL projection. ``sidecars`` is a
+            # Computed (read-only) field derived from the items policy at
+            # ensure_storage time. Surface the resolved plan + each sidecar's
+            # derived fields as a clearly read-only ``physical`` envelope under
+            # the PG driver node, so an operator can SEE how their policy is
+            # physically realized even though they cannot author it. This
+            # directly answers the "where are the sidecars / why is the list
+            # empty" confusion. The projection is read-only (no PUT round-trip):
+            # PUTting the leaf back strips ``sidecars`` (Computed) and the
+            # ``physical`` key is dropped by the config-write strip path.
+            # Skipped under ``meta=none`` so clean delta payloads stay
+            # byte-for-byte round-trippable into a PATCH body (#946).
+            if meta_mode != "none" and isinstance(payload, dict):
+                projection = ConfigApiService._physical_projection(payload)
+                if projection is not None:
+                    payload["physical"] = projection
             return payload
 
         def _passes_view_filter(class_key: str) -> bool:
@@ -690,7 +782,7 @@ class ConfigApiService:
 
             # Slim mode (default ``include=scope``): at platform scope
             # combined with ``strict=True``, ``_is_in_scope`` drops
-            # ``_visibility=catalog``/``collection`` templates.  At
+            # ``_freeze_at=catalog``/``collection`` templates.  At
             # catalog/collection scope ``_is_in_scope`` unconditionally
             # returns True per the post-#761 'complete the configurable
             # surface' contract — every config visible at the tier is

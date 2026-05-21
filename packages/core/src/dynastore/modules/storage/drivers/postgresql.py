@@ -176,7 +176,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         """Resolve ``ItemsWritePolicy`` from the config waterfall.
 
         Used by ``ensure_storage`` and ``compute_extents`` to obtain the
-        SSOT for ``validity_field`` (and any other policy-driven
+        SSOT for ``validity`` (and any other policy-driven
         sidecar shape decisions). Mirrors
         ``IcebergItemsDriver._resolve_write_policy`` — falls back to
         defaults if the configs service or config is missing.
@@ -544,8 +544,10 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         # (query_optimizer, item_query, item_service, …) then sees the correct
         # shape without threading the policy itself.
         #
-        # Null-object overlays applied from ItemsWritePolicy (#957, #974, #1043):
-        #   validity_field     ← policy.validity_field  (path or None)
+        # Null-object overlays applied from ItemsWritePolicy (#957, #974, #1043, #1126):
+        #   validity_column       ← policy.validity.column (column name or None)
+        #   validity_start_from   ← policy.validity.start_from ("context" or path)
+        #   validity_end_from     ← policy.validity.end_from   (None/"context"/path)
         #   external_id_field  ← "external_id" when policy has EXTERNAL_ID rule,
         #                        None when absent
         #   asset_id_field     ← "asset_id" when policy.track_asset_id, else None
@@ -583,13 +585,40 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             cf for cf in policy_storage_fields
             if target_sidecar(cf.kind) == SidecarTarget.ATTRIBUTES
         ]
+        # Phase 3 Decision 2: the persisted geohash/h3/s2 index columns are a
+        # pure physical realization of the policy's spatial-cell identity axis.
+        # Snapshot the policy's spatial-cell ComputedFields onto the geometries
+        # sidecar so its derived geohash_precision / h3_resolutions /
+        # s2_resolutions accessors yield the policy-aligned values (no
+        # independent sidecar knob can drift from the identity axis).
+        from dynastore.modules.storage.computed_fields import SPATIAL_CELL_KINDS
+        geom_spatial_cells = [
+            cf for cf in write_policy.compute if cf.kind in SPATIAL_CELL_KINDS
+        ]
         overlay_sidecars = []
         any_overlay = False
         for sc in col_config.sidecars:
             if isinstance(sc, FeatureAttributeSidecarConfig):
                 updates: dict = {}
-                if sc.validity_field != write_policy.validity_field:
-                    updates["validity_field"] = write_policy.validity_field
+                # Validity overlay (#1126): column NAME from policy.validity.column;
+                # value sources from policy.validity.start_from / end_from.
+                policy_validity_column = write_policy.validity_column
+                policy_validity_start = (
+                    write_policy.validity.start_from
+                    if write_policy.validity is not None
+                    else "context"
+                )
+                policy_validity_end = (
+                    write_policy.validity.end_from
+                    if write_policy.validity is not None
+                    else None
+                )
+                if sc.validity_column != policy_validity_column:
+                    updates["validity_column"] = policy_validity_column
+                if sc.validity_start_from != policy_validity_start:
+                    updates["validity_start_from"] = policy_validity_start
+                if sc.validity_end_from != policy_validity_end:
+                    updates["validity_end_from"] = policy_validity_end
                 if sc.external_id_field != policy_external_id_field:
                     updates["external_id_field"] = policy_external_id_field
                 if sc.asset_id_field != policy_asset_id_field:
@@ -601,13 +630,17 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     any_overlay = True
                 else:
                     overlay_sidecars.append(sc)
-            elif isinstance(sc, GeometriesSidecarConfig) and (
-                list(sc.compute_fields_overlay) != geom_storage_fields
-            ):
-                overlay_sidecars.append(
-                    sc.model_copy(update={"compute_fields_overlay": geom_storage_fields})
-                )
-                any_overlay = True
+            elif isinstance(sc, GeometriesSidecarConfig):
+                geom_updates: dict = {}
+                if list(sc.compute_fields_overlay) != geom_storage_fields:
+                    geom_updates["compute_fields_overlay"] = geom_storage_fields
+                if list(sc.spatial_cells_overlay) != geom_spatial_cells:
+                    geom_updates["spatial_cells_overlay"] = geom_spatial_cells
+                if geom_updates:
+                    overlay_sidecars.append(sc.model_copy(update=geom_updates))
+                    any_overlay = True
+                else:
+                    overlay_sidecars.append(sc)
             else:
                 overlay_sidecars.append(sc)
         if any_overlay:
@@ -668,7 +701,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             await DDLQuery(create_hub_sql).execute(conn)
 
             # --- Create sidecar tables ---
-            # ``sidecar_config.validity_field`` is already policy-aligned
+            # ``sidecar_config.validity_column`` is already policy-aligned
             # (overlay above), so the factory can stay policy-agnostic.
             for sidecar_config in col_config.sidecars:
                 try:
@@ -1118,7 +1151,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     (sc for sc in layer_config.sidecars if isinstance(sc, FeatureAttributeSidecarConfig)),
                     None,
                 )
-                # ``attr_sc.enable_validity`` (derived from ``validity_field``)
+                # ``attr_sc.enable_validity`` (derived from ``validity_column``)
                 # mirrors ``ItemsWritePolicy`` (overlaid by ``ensure_storage``
                 # at DDL time, #957/#974) so reading the sidecar is the SSOT
                 # for this collection.
@@ -1506,11 +1539,22 @@ async def _pg_driver_init_collection(
         # Silently skip — matches pre-refactor behaviour in CollectionService.
         return
 
+    # Phase 3: ``sidecars`` is a Computed field, so the external config-write
+    # path strips it (``restore_system_assigned_fields``). This hook is the
+    # trusted internal provisioner persisting the caller's initial PG physical
+    # layout at collection creation (analogous to ``ensure_storage`` stamping
+    # the resolved plan), so it writes with ``check_immutability=False`` to
+    # bypass the strip — otherwise a creation-time ``layer_config`` sidecar
+    # layout (e.g. a columnar ``attribute_schema``) would be discarded before
+    # ``ensure_storage`` ever reads it. The "non-authorable" guarantee still
+    # holds on the operator-facing PATCH path, which goes through the external
+    # (strip) path.
     await configs.set_config(
         ItemsPostgresqlDriverConfig,
         pg_config,
         catalog_id=catalog_id,
         collection_id=collection_id,
+        check_immutability=False,
         ctx=DriverContext(db_resource=conn),
     )
     logger.debug(

@@ -144,9 +144,9 @@ class FeatureAttributeSidecar(SidecarProtocol):
     ):
         # ``**_kwargs`` absorbs forward-compatible factory inputs
         # (e.g. ``policy=...``) reserved for future SSOT threading.
-        # ``config.validity_field`` is already policy-aligned because
-        # the driver overlays ``ItemsWritePolicy.validity_field`` onto
-        # the sidecar config at ``ensure_storage`` time (#957/#974).
+        # ``config.validity_column`` is already policy-aligned because
+        # the driver overlays ``ItemsWritePolicy.validity.column`` onto
+        # the sidecar config at ``ensure_storage`` time (#957/#974/#1126).
         self.config = config
 
     @property
@@ -318,7 +318,7 @@ class FeatureAttributeSidecar(SidecarProtocol):
         Returns JSON Schema for Feature properties contribution.
 
         Auto-derived from this sidecar's ``attribute_schema``; the user-data
-        wire shape SSOT lives on ``ItemsWritePolicy.schema`` and overlays
+        wire shape SSOT lives on ``ItemsWritePolicy.resolved_schema`` and overlays
         this fragment at the service layer (#976).
         """
         schema: Dict[str, Any] = {}
@@ -355,8 +355,9 @@ class FeatureAttributeSidecar(SidecarProtocol):
     def has_validity(self) -> bool:
         """Returns True if this sidecar manages temporal validity.
 
-        SSOT: ``ItemsWritePolicy.validity_field`` (null-object) — mirrored
-        onto ``self.config.validity_field`` by the PG driver at DDL time;
+        SSOT: ``ItemsWritePolicy.validity`` (null-object ValiditySpec) — its
+        ``column`` is mirrored onto ``self.config.validity_column`` by the PG
+        driver at DDL time;
         ``config.enable_validity`` is the derived bool over that field.
         """
         return self.config.has_validity
@@ -1223,6 +1224,23 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 valid_to = feature.get("valid_to") or feature.get("properties", {}).get(
                     "valid_to"
                 )
+
+        # 5b. Explicit value-source override (#1126 ValiditySpec.start_from /
+        # end_from). When the policy names a dotted source path (anything other
+        # than "context") the validity start/end VALUE is extracted from the
+        # feature at that path, overriding the heuristic resolution above.
+        # "context" preserves the default (write_context.valid_from / valid_to,
+        # injected downstream by finalize_payload).
+        start_from = getattr(self.config, "validity_start_from", "context")
+        end_from = getattr(self.config, "validity_end_from", None)
+        if start_from != "context" or (end_from is not None and end_from != "context"):
+            feature_dict_for_paths: Dict[str, Any] = (
+                feature.model_dump() if isinstance(feature, Feature) else feature
+            )
+            if start_from != "context":
+                valid_from = self._extract_value(feature_dict_for_paths, start_from)
+            if end_from is not None and end_from != "context":
+                valid_to = self._extract_value(feature_dict_for_paths, end_from)
 
         if valid_from:
             if isinstance(valid_from, str):

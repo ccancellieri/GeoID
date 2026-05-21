@@ -53,7 +53,7 @@ from dynastore.modules.catalog.asset_service import (
     VirtualAssetCreate,
 )
 from dynastore.modules.catalog.write_policy_assets import (
-    AssetIdentityField,
+    AssetDeriveSpec,
     AssetIdentityKind,
     AssetIdentityRule,
     AssetsWritePolicy,
@@ -61,21 +61,40 @@ from dynastore.modules.catalog.write_policy_assets import (
 )
 
 
-def _rules(*kinds_with_paths: object) -> list:
-    """Build a chain of single-field rules.
+def _policy(
+    *kinds_with_paths: object,
+    on_conflict: AssetWriteConflictPolicy = AssetWriteConflictPolicy.REFUSE_FAIL,
+) -> AssetsWritePolicy:
+    """Build a policy whose identity chain is single-name rules referencing the
+    given dimensions, with a matching :class:`AssetDeriveSpec` exposing them.
 
     Each arg is either a bare :class:`AssetIdentityKind` or a tuple
-    ``(kind, path)`` for METADATA_FIELD entries.
+    ``(AssetIdentityKind.METADATA_FIELD, path)`` for a metadata derivation. The
+    metadata derivation is referenced by its path's leaf segment.
     """
-    out = []
+    derive_kwargs: dict = {
+        "asset_id": False,
+        "filename": False,
+        "url": False,
+        "content_hash": False,
+        "metadata_fields": [],
+    }
+    rules: list = []
     for item in kinds_with_paths:
         if isinstance(item, tuple):
-            kind, path = item
-            field_spec = AssetIdentityField(kind=kind, path=path)
+            _kind, path = item
+            derive_kwargs["metadata_fields"].append(path)
+            name = path.rsplit(".", 1)[-1]
         else:
-            field_spec = AssetIdentityField(kind=item)
-        out.append(AssetIdentityRule(match_on=[field_spec]))
-    return out
+            kind: AssetIdentityKind = item  # type: ignore[assignment]
+            derive_kwargs[kind.value] = True
+            name = kind.value
+        rules.append(AssetIdentityRule(match_on=[name]))
+    return AssetsWritePolicy(
+        on_conflict=on_conflict,
+        derive=AssetDeriveSpec(**derive_kwargs),
+        identity=rules,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +287,7 @@ async def test_refuse_fail_on_filename_match(fake_dql: _Recorder) -> None:
     import dynastore.modules.catalog.asset_distributed as mod
     mod.DQLQuery = make_dql()
 
-    policy = AssetsWritePolicy(
-        on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
-        identity=_rules(AssetIdentityKind.ASSET_ID, AssetIdentityKind.FILENAME),
-    )
+    policy = _policy(AssetIdentityKind.ASSET_ID, AssetIdentityKind.FILENAME)
     payload = physical(asset_id="brand_new", filename="alpha.tif")
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
@@ -338,11 +354,8 @@ async def test_metadata_field_matcher(fake_dql: _Recorder) -> None:
 
     fake_dql.when(is_metadata_select, EXISTING_ROW)
 
-    policy = AssetsWritePolicy(
-        on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
-        identity=_rules(
-            (AssetIdentityKind.METADATA_FIELD, "iso19115.fileIdentifier"),
-        ),
+    policy = _policy(
+        (AssetIdentityKind.METADATA_FIELD, "iso19115.fileIdentifier"),
     )
     payload = physical(metadata={"iso19115": {"fileIdentifier": "URN:1"}})
     with pytest.raises(AssetSidecarRejectedError) as exc_info:
@@ -369,13 +382,10 @@ async def test_chain_first_match_wins(fake_dql: _Recorder) -> None:
         EXISTING_ROW,
     )
 
-    policy = AssetsWritePolicy(
-        on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
-        identity=_rules(
-            AssetIdentityKind.ASSET_ID,
-            AssetIdentityKind.FILENAME,
-            (AssetIdentityKind.METADATA_FIELD, "iso19115.fileIdentifier"),
-        ),
+    policy = _policy(
+        AssetIdentityKind.ASSET_ID,
+        AssetIdentityKind.FILENAME,
+        (AssetIdentityKind.METADATA_FIELD, "iso19115.fileIdentifier"),
     )
     payload = physical(
         asset_id="something_else",
@@ -680,9 +690,7 @@ async def test_content_hash_probe_sends_tagged_bind_only(
 
     payload = physical()
     object.__setattr__(payload, "content_hash", "md5:abc==")
-    policy = AssetsWritePolicy(
-        identity=_rules(AssetIdentityKind.CONTENT_HASH),
-    )
+    policy = _policy(AssetIdentityKind.CONTENT_HASH)
     with pytest.raises(AssetSidecarRejectedError):
         await upsert_asset(conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy)
 
@@ -783,7 +791,7 @@ async def test_rule_on_match_overrides_policy_level_action(
         on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
         identity=[
             AssetIdentityRule(
-                match_on=[AssetIdentityField(kind=AssetIdentityKind.ASSET_ID)],
+                match_on=["asset_id"],
                 on_match=AssetWriteConflictPolicy.REFUSE_RETURN,
             ),
         ],
@@ -822,12 +830,7 @@ async def test_multi_field_rule_requires_all_fields_to_match_same_row(
     policy = AssetsWritePolicy(
         on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
         identity=[
-            AssetIdentityRule(
-                match_on=[
-                    AssetIdentityField(kind=AssetIdentityKind.ASSET_ID),
-                    AssetIdentityField(kind=AssetIdentityKind.FILENAME),
-                ],
-            ),
+            AssetIdentityRule(match_on=["asset_id", "filename"]),
         ],
     )
     # No raise expected — AND fails, chain falls through to INSERT.
@@ -844,9 +847,9 @@ async def test_multi_field_rule_requires_all_fields_to_match_same_row(
 async def test_metadata_field_path_lives_on_field_not_policy(
     fake_dql: _Recorder,
 ) -> None:
-    """The dot-path is read off the :class:`AssetIdentityField`, not off a
-    policy-level slot. Multiple METADATA_FIELD rules with different paths
-    must all dispatch against their own path.
+    """The dot-path is carried by the resolved engine field, derived from the
+    authored ``derive.metadata_fields`` declaration. Multiple metadata
+    derivations with different paths must all dispatch against their own path.
     """
     captured_paths: List[str] = []
 
@@ -863,23 +866,14 @@ async def test_metadata_field_path_lives_on_field_not_policy(
 
     policy = AssetsWritePolicy(
         on_conflict=AssetWriteConflictPolicy.REFUSE_FAIL,
+        derive=AssetDeriveSpec(
+            asset_id=False,
+            filename=False,
+            metadata_fields=["iso19115.fileIdentifier", "external.urn"],
+        ),
         identity=[
-            AssetIdentityRule(
-                match_on=[
-                    AssetIdentityField(
-                        kind=AssetIdentityKind.METADATA_FIELD,
-                        path="iso19115.fileIdentifier",
-                    ),
-                ],
-            ),
-            AssetIdentityRule(
-                match_on=[
-                    AssetIdentityField(
-                        kind=AssetIdentityKind.METADATA_FIELD,
-                        path="external.urn",
-                    ),
-                ],
-            ),
+            AssetIdentityRule(match_on=["fileIdentifier"]),
+            AssetIdentityRule(match_on=["urn"]),
         ],
     )
     payload = physical(
@@ -905,9 +899,7 @@ async def test_content_hash_rule_short_circuits_to_miss_for_pending(
     """
     fake_dql.when(is_insert, dict(EXISTING_ROW, status="pending"))
 
-    policy = AssetsWritePolicy(
-        identity=_rules(AssetIdentityKind.CONTENT_HASH),
-    )
+    policy = _policy(AssetIdentityKind.CONTENT_HASH)
     # AssetCreate has no content_hash field → probe miss → INSERT path.
     result = await upsert_asset(
         conn=_spec_conn(),
@@ -926,11 +918,8 @@ def test_default_policy_dump_yields_byte_for_byte_chain() -> None:
     p1 = AssetsWritePolicy()
     dumped = p1.model_dump(mode="json")
     p2 = AssetsWritePolicy.model_validate(dumped)
-    # Two single-field rules in declared order: ASSET_ID, FILENAME.
-    assert [r.match_on[0].kind for r in p2.identity] == [
-        AssetIdentityKind.ASSET_ID,
-        AssetIdentityKind.FILENAME,
-    ]
+    # Two single-name rules in declared order: asset_id, filename.
+    assert [r.match_on for r in p2.identity] == [["asset_id"], ["filename"]]
     # And the dump is stable.
     assert p2.model_dump(mode="json") == dumped
 

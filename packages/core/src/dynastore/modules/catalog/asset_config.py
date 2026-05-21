@@ -35,7 +35,7 @@ class AssetPluginConfig(PluginConfig):
     (identity: ``AssetRoutingConfig.class_key()``).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "asset")
-    _visibility: ClassVar[Optional[str]] = "collection"
+    _freeze_at: ClassVar[Optional[str]] = "collection"
 
 
     model_config = {"extra": "allow"}

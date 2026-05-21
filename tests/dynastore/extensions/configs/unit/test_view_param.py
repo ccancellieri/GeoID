@@ -28,12 +28,16 @@ def _stub_registry(**classes):
         body = {}
         if "_address" in attrs:
             body["_address"] = attrs["_address"]
-        if "_visibility" in attrs:
-            body["_visibility"] = attrs["_visibility"]
+        if "_freeze_at" in attrs:
+            body["_freeze_at"] = attrs["_freeze_at"]
+        if "_tiers" in attrs:
+            body["_tiers"] = attrs["_tiers"]
         if attrs.get("abstract"):
             body["is_abstract_base"] = True
         cls = type(name, (), body)
         cls.__module__ = "test.stub"
+        _tiers = attrs.get("_tiers", ("platform", "catalog", "collection"))
+        cls.effective_tiers = classmethod(lambda c, _t=_tiers: tuple(_t))
         out[name] = cls
     return out
 
@@ -42,7 +46,11 @@ def _make_tree(by_class, sources, active_scope, view_mode, include_mode="upstrea
     """Call ``_compose_tree`` with a patched registry and return the tree."""
     keys = list(by_class.keys())
     registry = _stub_registry(**{
-        k: {"_address": ("platform", "settings"), "_visibility": None}
+        k: {
+            "_address": ("platform", "settings"),
+            "_freeze_at": None,
+            "_tiers": ("platform", "catalog", "collection"),
+        }
         for k in keys
     })
     with patch(

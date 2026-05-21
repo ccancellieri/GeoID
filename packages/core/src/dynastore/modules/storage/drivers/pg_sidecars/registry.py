@@ -16,7 +16,8 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import Any, Dict, Mapping, Optional, Type, Union
+import logging
+from typing import Any, Dict, List, Mapping, Optional, Type, Union
 
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarConfig,
@@ -24,17 +25,44 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarProtocol,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class SidecarRegistry:
     """
-    Registry for sidecar implementations.
-    Maps sidecar_type_id strings to their corresponding SidecarProtocol implementation classes.
-    
-    This enables protocol-driven discovery where sidecars are looked up by their
-    type identifier (e.g., 'attributes', 'geometries') rather than config class type.
+    The SINGLE sidecar registry (Phase 3 Decision 3 — one registry).
+
+    It serves two distinct sidecar families under one uniform
+    registration/resolution contract:
+
+    1. **Items-tier physical sidecars** (``geometries`` / ``attributes`` /
+       ``item_metadata`` / ``stac_metadata``) — each maps a ``sidecar_type``
+       to a :class:`SidecarProtocol` implementation. These own real per-
+       collection PG tables (Hub-FK, partition keys, per-feature DDL). Use
+       :meth:`register` / :meth:`get_sidecar`.
+
+    2. **Catalog-tier metadata domain slices** (``catalog_core`` /
+       ``catalog_stac``) — each maps a ``sidecar_type`` to a
+       :class:`~dynastore.models.protocols.entity_store.CatalogStore` driver
+       class. These route a metadata slice to an already-existing entity-store
+       driver whose own column filter slices the payload (no per-collection
+       DDL). Use :meth:`register_catalog_store` / :meth:`get_catalog_store_cls`
+       / :meth:`default_catalog_sidecars`.
+
+    The two families have DIFFERENT value types (``SidecarProtocol`` vs
+    ``CatalogStore``) and DIFFERENT lifecycles, so they live in separate
+    internal maps — but operators and extensions now reach BOTH through this
+    one class instead of the former separate catalog-tier registry (folded in
+    here). The items family looks sidecars up by their type identifier (e.g.
+    'attributes', 'geometries') rather than config class type.
     """
 
     _registry: Dict[str, Type[SidecarProtocol]] = {}
+
+    # Catalog-tier domain slices (folded in from the former separate
+    # catalog-tier registry). ``sidecar_type`` -> ``CatalogStore`` class.
+    _catalog_registry: Dict[str, Type[Any]] = {}
+    _catalog_defaults_loaded: bool = False
 
     @classmethod
     def _ensure_defaults(cls):
@@ -88,10 +116,10 @@ class SidecarRegistry:
 
         If lenient=True, returns None if implementation is not registered.
 
-        Note (#957/#974): validity SSOT is ``ItemsWritePolicy.validity_field``
-        (null-object); the PG driver mirrors it onto
-        ``FeatureAttributeSidecarConfig.validity_field`` at ``ensure_storage``
-        time, so the factory itself stays policy-agnostic.
+        Note (#957/#974/#1126): validity SSOT is ``ItemsWritePolicy.validity``
+        (null-object ValiditySpec); the PG driver mirrors ``validity.column``
+        onto ``FeatureAttributeSidecarConfig.validity_column`` at
+        ``ensure_storage`` time, so the factory itself stays policy-agnostic.
         Sidecar ctors accept ``**_kwargs`` to absorb forward-compatible
         factory inputs.
         """
@@ -158,9 +186,81 @@ class SidecarRegistry:
     @classmethod
     def clear_registry(cls) -> None:
         """Clears all registered sidecars. Useful for test isolation.
-        
+
         Note: defaults are re-registered lazily on next `_ensure_defaults()` call.
         """
-        import logging
-        logging.getLogger(__name__).debug("SidecarRegistry cleared.")
+        logger.debug("SidecarRegistry cleared.")
         cls._registry.clear()
+
+    # ------------------------------------------------------------------
+    # Catalog-tier domain slices (folded from the former catalog-tier registry)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _ensure_catalog_defaults(cls) -> None:
+        """Register the built-in catalog-tier metadata slices.
+
+        CORE is always available (same module tree); STAC uses try-import so
+        a deployment without the stac extra silently omits ``catalog_stac``
+        (mirrors the items ``stac_metadata`` opaque-fallback posture).
+        """
+        if cls._catalog_defaults_loaded:
+            return
+        cls._catalog_defaults_loaded = True
+
+        from dynastore.modules.storage.drivers.core_postgresql import (
+            CatalogCorePostgresqlDriver,
+        )
+        cls._catalog_registry.setdefault("catalog_core", CatalogCorePostgresqlDriver)
+
+        try:
+            from dynastore.modules.stac.drivers.postgresql import (
+                CatalogStacPostgresqlDriver,
+            )
+            cls._catalog_registry.setdefault(
+                "catalog_stac", CatalogStacPostgresqlDriver,
+            )
+        except ImportError as exc:
+            logger.debug(
+                "SidecarRegistry: catalog_stac sidecar unavailable (%s)", exc,
+            )
+
+    @classmethod
+    def register_catalog_store(cls, sidecar_type: str, driver_cls: Type[Any]) -> None:
+        """Register a catalog-tier metadata sidecar type (``sidecar_type`` ->
+        ``CatalogStore`` class) — used by extensions contributing a new
+        catalog-metadata domain slice.
+        """
+        cls._catalog_registry[sidecar_type] = driver_cls
+
+    @classmethod
+    def get_catalog_store_cls(cls, sidecar_type: str) -> Optional[Type[Any]]:
+        """Resolve a catalog-tier ``sidecar_type`` to its ``CatalogStore`` class."""
+        cls._ensure_catalog_defaults()
+        return cls._catalog_registry.get(sidecar_type)
+
+    @classmethod
+    def has_catalog_store(cls, sidecar_type: str) -> bool:
+        cls._ensure_catalog_defaults()
+        return sidecar_type in cls._catalog_registry
+
+    @classmethod
+    def default_catalog_sidecars(cls) -> List[Any]:
+        """Built-in default catalog-tier slice list — CORE always, STAC if the
+        extra is installed. Returns ``_PgCatalogSidecarConfigBase`` instances.
+        """
+        cls._ensure_catalog_defaults()
+        from dynastore.modules.storage.drivers.catalog_postgresql import (
+            CatalogCoreSidecarConfig,
+            CatalogStacSidecarConfig,
+        )
+        out: List[Any] = [CatalogCoreSidecarConfig()]
+        if "catalog_stac" in cls._catalog_registry:
+            out.append(CatalogStacSidecarConfig())
+        return out
+
+    @classmethod
+    def clear_catalog_registry(cls) -> None:
+        """Test-isolation hook for the catalog-tier slice registry."""
+        cls._catalog_registry.clear()
+        cls._catalog_defaults_loaded = False

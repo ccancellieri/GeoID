@@ -54,9 +54,9 @@ from dynastore.modules.catalog.asset_service import (
 from dynastore.modules.catalog.write_policy_assets import (
     AssetIdentityField,
     AssetIdentityKind,
-    AssetIdentityRule,
     AssetsWritePolicy,
     AssetWriteConflictPolicy,
+    ResolvedAssetIdentityRule,
 )
 from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import (
@@ -468,9 +468,15 @@ async def _resolve(
 ) -> Tuple[
     Optional[Dict[str, Any]],
     Optional[AssetIdentityKind],
-    Optional[AssetIdentityRule],
+    Optional[ResolvedAssetIdentityRule],
 ]:
-    """Walk ``policy.identity`` rules in order; first matching rule wins.
+    """Walk the resolved identity rules in order; first matching rule wins.
+
+    ``policy.identity`` rules reference derivations by name; we resolve them
+    via :meth:`AssetsWritePolicy.resolved_identity` to the engine
+    :class:`AssetIdentityField` objects (kind + optional metadata path) that
+    the probe dispatcher consumes — mirroring how ``item_distributed`` consumes
+    ``ItemsWritePolicy.resolved_identity()``.
 
     For each rule the ``match_on`` fields are evaluated as an AND: every
     field must independently match the SAME existing row for the rule to
@@ -480,7 +486,7 @@ async def _resolve(
     Returns ``(row, winning_kind, winning_rule)``; the rule is forwarded so
     its ``on_match`` override can substitute the policy-level action.
     """
-    for rule in policy.identity:
+    for rule in policy.resolved_identity():
         winning_row: Optional[Dict[str, Any]] = None
         all_matched = True
         for field_spec in rule.match_on:
@@ -526,7 +532,7 @@ async def upsert_asset(
     #    NEW_VERSION since we always want a fresh row in that mode).
     existing: Optional[Dict[str, Any]] = None
     matcher_hit: Optional[AssetIdentityKind] = None
-    winning_rule: Optional[AssetIdentityRule] = None
+    winning_rule: Optional[ResolvedAssetIdentityRule] = None
     if policy.on_conflict != AssetWriteConflictPolicy.NEW_VERSION:
         existing, matcher_hit, winning_rule = await _resolve(
             conn, scope, payload, policy

@@ -41,7 +41,7 @@ def mock_col_config():
                 index_external_id=True,
                 expose_geoid=False,
                 index_asset_id=True,
-                validity_field="valid_from",
+                validity_column="valid_from",
                 attribute_schema=None,
                 jsonb_column_name="attributes",
                 use_hot_updates=True,

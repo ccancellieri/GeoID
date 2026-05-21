@@ -53,7 +53,6 @@ from typing import (
     Literal,
     Optional,
     Tuple,
-    Type,
     Union,
 )
 
@@ -114,9 +113,10 @@ class CatalogStacSidecarConfig(_PgCatalogSidecarConfigBase):
     ``stac_extensions``, ``conforms_to``, ``links``, ``assets``) to
     :class:`CatalogStacPostgresqlDriver` from the stac module.
 
-    Resolved via try-import in :class:`CatalogPgSidecarRegistry` —
-    a deployment without the stac extra installed will see this entry's
-    resolution log a single warning and skip the slice (no crash).
+    Resolved via try-import in the unified :class:`SidecarRegistry`
+    (catalog-tier slice family) — a deployment without the stac extra
+    installed will see this entry's resolution log a single warning and skip
+    the slice (no crash).
     """
 
     sidecar_type: Literal["catalog_stac"] = "catalog_stac"
@@ -132,80 +132,14 @@ _PgCatalogSidecarConfig = Annotated[
 
 
 # ---------------------------------------------------------------------------
-# Sidecar registry — maps discriminator string → inner driver class
+# Catalog-tier slice registration (Phase 3 Decision 3 — ONE registry).
+#
+# The former separate catalog-tier registry is folded into the single
+# :class:`SidecarRegistry`; the catalog-tier slice family lives behind its
+# ``register_catalog_store`` / ``get_catalog_store_cls`` /
+# ``default_catalog_sidecars`` methods. Module-level access here goes through
+# that one registry.
 # ---------------------------------------------------------------------------
-
-
-class CatalogPgSidecarRegistry:
-    """Registry mapping ``sidecar_type`` to inner ``CatalogStore``
-    classes.  STAC entry uses try-import so the wrapper works in
-    deployments without the stac extra installed.
-    """
-
-    _registry: Dict[str, Type[CatalogStore]] = {}
-    _defaults_loaded: bool = False
-
-    @classmethod
-    def _ensure_defaults(cls) -> None:
-        if cls._defaults_loaded:
-            return
-        cls._defaults_loaded = True
-
-        # CORE — same module tree, no try-import needed.
-        from dynastore.modules.storage.drivers.core_postgresql import (
-            CatalogCorePostgresqlDriver,
-        )
-        cls._registry.setdefault(
-            "catalog_core", CatalogCorePostgresqlDriver,
-        )
-
-        # STAC — different module; deployments without the stac extra
-        # silently omit the entry.
-        try:
-            from dynastore.modules.stac.drivers.postgresql import (
-                CatalogStacPostgresqlDriver,
-            )
-            cls._registry.setdefault(
-                "catalog_stac", CatalogStacPostgresqlDriver,
-            )
-        except ImportError as exc:
-            logger.debug(
-                "CatalogPgSidecarRegistry: stac sidecar unavailable (%s)",
-                exc,
-            )
-
-    @classmethod
-    def get_driver_cls(
-        cls, sidecar_type: str,
-    ) -> Optional[Type[CatalogStore]]:
-        cls._ensure_defaults()
-        return cls._registry.get(sidecar_type)
-
-    @classmethod
-    def register(
-        cls, sidecar_type: str, driver_cls: Type[CatalogStore],
-    ) -> None:
-        """Register a new catalog metadata sidecar type — used by extensions
-        that contribute a new domain slice.
-        """
-        cls._registry[sidecar_type] = driver_cls
-
-    @classmethod
-    def default_sidecars(cls) -> List[_PgCatalogSidecarConfigBase]:
-        """Built-in default — CORE always, STAC if the extra is installed."""
-        cls._ensure_defaults()
-        out: List[_PgCatalogSidecarConfigBase] = [
-            CatalogCoreSidecarConfig(),
-        ]
-        if "catalog_stac" in cls._registry:
-            out.append(CatalogStacSidecarConfig())
-        return out
-
-    @classmethod
-    def clear(cls) -> None:
-        """Test-isolation hook."""
-        cls._registry.clear()
-        cls._defaults_loaded = False
 
 
 # ---------------------------------------------------------------------------
@@ -218,14 +152,14 @@ class CatalogPostgresqlDriverConfig(_PluginDriverConfig):
 
     ``sidecars`` is the typed list of catalog-tier domain slices the
     wrapper will fan CRUD across.  Empty list → wrapper falls back to
-    :meth:`CatalogPgSidecarRegistry.default_sidecars`
+    :meth:`SidecarRegistry.default_catalog_sidecars`
     (``[catalog_core, catalog_stac if installed]``).
 
     Marked ``Immutable`` because changing the active sidecar set after
     rows exist would orphan domain slices in ``catalog.catalog_metadata_*``.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "drivers")
-    _visibility: ClassVar[Optional[str]] = "catalog"
+    _freeze_at: ClassVar[Optional[str]] = "catalog"
 
     required_engine_class: ClassVar[str] = "postgresql_engine"
 
@@ -292,7 +226,7 @@ class CatalogPostgresqlDriver(TypedDriver[CatalogPostgresqlDriverConfig]):
     configured PG catalog-metadata sidecars (``catalog_core``,
     optionally ``catalog_stac``, plus any extension-contributed
     sidecar registered via
-    :meth:`CatalogPgSidecarRegistry.register`).
+    :meth:`SidecarRegistry.register_catalog_store`).
 
     The wrapper itself owns no SQL — every method delegates to the
     inner drivers, each of which already filters the payload to its
@@ -315,8 +249,11 @@ class CatalogPostgresqlDriver(TypedDriver[CatalogPostgresqlDriverConfig]):
         call this with ``sidecars=None`` and so go through
         :attr:`_default_inner_drivers`.
         """
+        from dynastore.modules.storage.drivers.pg_sidecars.registry import (
+            SidecarRegistry,
+        )
         if not sidecars:
-            sidecars = CatalogPgSidecarRegistry.default_sidecars()
+            sidecars = SidecarRegistry.default_catalog_sidecars()
         out: List[CatalogStore] = []
         for cfg in sidecars:
             sc_type = getattr(cfg, "sidecar_type", None)
@@ -326,7 +263,7 @@ class CatalogPostgresqlDriver(TypedDriver[CatalogPostgresqlDriverConfig]):
                     "`sidecar_type` discriminator — skipping",
                 )
                 continue
-            cls = CatalogPgSidecarRegistry.get_driver_cls(sc_type)
+            cls = SidecarRegistry.get_catalog_store_cls(sc_type)
             if cls is None:
                 logger.warning(
                     "CatalogPostgresqlDriver: sidecar %r not registered "

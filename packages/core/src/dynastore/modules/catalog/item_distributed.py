@@ -22,11 +22,11 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
     ComputedKind,
-    IdentityRule,
 )
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,
     ItemsWritePolicy,
+    ResolvedIdentityRule,
     WriteConflictPolicy,
 )
 from dynastore.modules.storage.errors import ConflictError, SidecarRejectedError
@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 def _select_effective_on_conflict(
     write_policy: Optional["ItemsWritePolicy"],
-    matched_rule: Optional["IdentityRule"],
+    matched_rule: Optional["ResolvedIdentityRule"],
 ) -> "WriteConflictPolicy":
     """Resolve the conflict action for the rule that won identity resolution.
 
@@ -76,14 +76,14 @@ def _select_effective_on_conflict(
 
 
 async def _resolve_rule(
-    rule: "IdentityRule",
+    rule: "ResolvedIdentityRule",
     conn: Any,
     phys_schema: str,
     phys_table: str,
     processing_context: Dict[str, Any],
     sidecars: List["SidecarProtocol"],
 ) -> Optional[Dict[str, Any]]:
-    """Resolve identity for a single :class:`IdentityRule`.
+    """Resolve identity for a single (resolved) identity rule.
 
     Semantics: every :class:`ComputedField` in ``rule.match_on`` must
     resolve to the SAME existing row (AND within the rule). The rule
@@ -196,11 +196,11 @@ class ItemDistributedMixin(_Host):
         # the same row); rules OR across the list. First rule that matches
         # wins. Per-rule ``on_match`` overrides ``on_conflict``.
         active_rec = None
-        matched_rule: Optional[IdentityRule] = None
+        matched_rule: Optional[ResolvedIdentityRule] = None
         rules = (
-            list(write_policy.identity)
-            if write_policy and write_policy.identity
-            else [IdentityRule(match_on=[ComputedField(kind=ComputedKind.EXTERNAL_ID)])]
+            write_policy.resolved_identity()
+            if write_policy
+            else [ResolvedIdentityRule(match_on=[ComputedField(kind=ComputedKind.EXTERNAL_ID)])]
         )
         if on_conflict != WriteConflictPolicy.NEW_VERSION:
             for rule in rules:

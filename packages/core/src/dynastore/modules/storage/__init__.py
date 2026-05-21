@@ -53,12 +53,17 @@ from dynastore.modules.storage.driver_config import (
     WriteConflictPolicy,
 )
 from dynastore.modules.storage.computed_fields import (
+    AttributeStat,
     ComputedField,
     ComputedKind,
+    DeriveSpec,
     FeatureType,
+    GeometryStat,
     IdentityRule,
+    SpatialCell,
 )
 from dynastore.modules.storage.read_policy import ItemsReadPolicy
+from dynastore.modules.storage.validity import ValiditySpec
 from dynastore.modules.storage.schema_types import (
     FieldConstraint,
     RequiredConstraint,
@@ -123,6 +128,8 @@ __all__ = [
     # Write policy
     "ItemsWritePolicy",
     "WriteConflictPolicy",
+    # Temporal validity spec
+    "ValiditySpec",
     # Read policy (#950 phase 3 — registered, not yet consumed by drivers)
     "ItemsReadPolicy",
     # Computed-field model (#957/#950 phase 1)
@@ -130,6 +137,11 @@ __all__ = [
     "ComputedKind",
     "FeatureType",
     "IdentityRule",
+    # Derivation buckets — the authored shape (engine flattens to ComputedField)
+    "DeriveSpec",
+    "SpatialCell",
+    "GeometryStat",
+    "AttributeStat",
     # Entity-transform chain runtime (operates on the ``transformers`` registry)
     "apply_transform_chain",
     "restore_transform_chain",
