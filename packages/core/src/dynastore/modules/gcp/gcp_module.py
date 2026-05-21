@@ -363,7 +363,10 @@ class GCPModule(
             # --- Register Lifecycle Hooks ---
             from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
 
-            lifecycle_registry.sync_catalog_initializer()(self._on_sync_init_catalog)
+            # Post-INSERT phase: GCP's provision_enabled=False work (mark-ready +
+            # bucket link) and the provision task enqueue must run after the
+            # catalog.catalogs row exists (#1131).
+            lifecycle_registry.sync_catalog_post_create()(self._on_post_create_catalog)
             # We keep these as async because they don't block the core creation flow
             # and don't cause race conditions in tests as easily as the creation one.
             lifecycle_registry.async_catalog_destroyer()(self._on_async_destroy_catalog)

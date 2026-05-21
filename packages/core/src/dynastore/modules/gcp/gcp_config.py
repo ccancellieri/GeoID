@@ -157,7 +157,7 @@ class GcpCatalogBucketConfig(PluginConfig):
     provision_enabled: Mutable[bool] = Field(
         default=True,
         description=(
-            "When False, ``GCPModule._on_sync_init_catalog`` skips bucket "
+            "When False, ``GCPModule._on_post_create_catalog`` skips bucket "
             "creation and marks the catalog ready immediately — useful when "
             "a catalog reuses an externally-managed bucket. This is a "
             "per-catalog provisioning gate, NOT an extension exposure toggle "

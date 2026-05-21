@@ -852,6 +852,15 @@ class CatalogService(CatalogsProtocol):
                     db_resource=conn,
                 )
 
+            # Post-INSERT sync lifecycle phase: runs after the catalog.catalogs
+            # row exists so module hooks may reference it (FK inserts, status
+            # UPDATEs). GCP's provision_enabled=False path (mark-ready + bucket
+            # link) runs here — it cannot run in init_catalog, which fires
+            # before the row is inserted (#1131).
+            await lifecycle_registry.post_create_catalog(
+                conn, physical_schema, catalog_id=catalog_model.id
+            )
+
             # #1079 (c): freeze the catalog's inherited config defaults now that
             # the registry row + tenant config tables exist. Captures the
             # resolved platform/code defaults for stable value-configs into a

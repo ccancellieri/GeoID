@@ -82,10 +82,17 @@ class GcpCatalogOpsMixin:
         @property
         def engine(self) -> DbResource: ...
 
-    async def _on_sync_init_catalog(self, conn: DbResource, physical_schema: str, catalog_id: str):
+    async def _on_post_create_catalog(self, conn: DbResource, physical_schema: str, catalog_id: str):
         """
-        Sync hook to initialize GCP resources (Bucket, Eventing) when a catalog is created.
-        Executed within the catalog creation transaction.
+        Post-INSERT hook to initialize GCP resources (Bucket, Eventing) for a new catalog.
+
+        Runs in the catalog creation transaction AFTER the ``catalog.catalogs``
+        row is inserted (registered on the ``sync_catalog_post_create`` phase).
+        The ``provision_enabled=False`` branch both UPDATEs the catalog row to
+        ``ready`` and INSERTs a ``catalog_buckets`` row whose FK references
+        ``catalog.catalogs(id)`` — neither works until that row exists, which is
+        why this is a post-create hook rather than a ``sync_catalog_initializer``
+        (#1131).
         """
         try:
             logger.info(
@@ -113,7 +120,19 @@ class GcpCatalogOpsMixin:
                 from dynastore.models.protocols import CatalogsProtocol
                 catalogs_svc = get_protocol(CatalogsProtocol)
                 if catalogs_svc:
-                    await catalogs_svc.update_provisioning_status(catalog_id, "ready", ctx=DriverContext(db_resource=conn))
+                    updated = await catalogs_svc.update_provisioning_status(
+                        catalog_id, "ready", ctx=DriverContext(db_resource=conn)
+                    )
+                    # A 0-row UPDATE means the catalog.catalogs row was not visible
+                    # to this hook — the historical #1131 failure mode. Fail loudly
+                    # (rolls back this hook's SAVEPOINT) instead of leaving the
+                    # catalog silently stuck in 'provisioning'.
+                    if not updated:
+                        raise RuntimeError(
+                            f"update_provisioning_status matched 0 rows for catalog "
+                            f"'{catalog_id}' — catalog row not present when GCP "
+                            f"post-create hook ran (expected post-INSERT)."
+                        )
 
                 # Link the deterministic bucket name in the DB to allow uploads
                 from dynastore.modules.gcp import gcp_db

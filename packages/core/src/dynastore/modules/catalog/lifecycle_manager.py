@@ -123,6 +123,11 @@ class LifecycleRegistry:
     def __init__(self):
         # Synchronous transactional hooks (tables)
         self._sync_catalog_initializers: List[HookWithPriority] = []
+        # Post-INSERT sync phase: runs in the creation transaction AFTER the
+        # ``catalog.catalogs`` row exists (see ``post_create_catalog``). For
+        # work that must reference the registry row — e.g. an FK into
+        # ``catalog.catalogs`` or an ``UPDATE`` that must match it (#1131).
+        self._sync_catalog_post_create: List[HookWithPriority] = []
         self._sync_catalog_destroyers: List[HookWithPriority] = []
         self._sync_collection_initializers: List[HookWithPriority] = []
         self._sync_collection_destroyers: List[HookWithPriority] = []
@@ -154,6 +159,7 @@ class LifecycleRegistry:
         to preserve module-level static hooks (decorators).
         """
         self._sync_catalog_initializers.clear()
+        self._sync_catalog_post_create.clear()
         self._sync_catalog_destroyers.clear()
         self._sync_collection_initializers.clear()
         self._sync_collection_destroyers.clear()
@@ -182,6 +188,7 @@ class LifecycleRegistry:
         """
         lists_to_process = [
             self._sync_catalog_initializers,
+            self._sync_catalog_post_create,
             self._sync_catalog_destroyers,
             self._sync_collection_initializers,
             self._sync_collection_destroyers,
@@ -303,6 +310,29 @@ class LifecycleRegistry:
             return self._register_hook(self._sync_catalog_initializers, priority, func)
 
         # Handle case where it's used without parentheses: @registry.sync_catalog_initializer
+        if callable(priority):
+            func = priority
+            priority = 0
+            return decorator(func)  # type: ignore[return-value]
+
+        return decorator
+
+    def sync_catalog_post_create(
+        self, priority: int = 0
+    ) -> Callable[[SyncCatalogInitializer], SyncCatalogInitializer]:
+        """Decorator to register a post-INSERT catalog hook.
+
+        Unlike ``sync_catalog_initializer`` (which runs *before* the
+        ``catalog.catalogs`` row is inserted, for physical-schema/table
+        setup), these hooks run in the same creation transaction *after* the
+        row exists — for work that must reference it (FK inserts, status
+        UPDATEs). Same signature as a sync initializer: ``(conn, schema,
+        catalog_id)``.
+        """
+
+        def decorator(func: SyncCatalogInitializer) -> SyncCatalogInitializer:
+            return self._register_hook(self._sync_catalog_post_create, priority, func)
+
         if callable(priority):
             func = priority
             priority = 0
@@ -544,6 +574,38 @@ class LifecycleRegistry:
                 logger.error(
                     f"Outer transaction aborted during catalog initialization for '{catalog_id}'. "
                     "Aborting remaining initializers."
+                )
+                raise
+
+    async def post_create_catalog(
+        self, conn: DbResource, schema: str, catalog_id: str
+    ) -> None:
+        """Execute all registered post-INSERT catalog hooks (transactional).
+
+        Runs in the creation transaction after ``INSERT INTO catalog.catalogs``,
+        so hooks may reference the registry row. Each hook runs in its own
+        SAVEPOINT so a failing hook cannot poison the outer transaction.
+        """
+        if not self._sync_catalog_post_create:
+            return
+        logger.info(
+            f"Running post-create catalog hooks for '{catalog_id}' (schema: {schema})"
+        )
+
+        for hook in self._sort_hooks(self._sync_catalog_post_create):
+            label = (
+                f"Post-create catalog hook {hook.__module__}.{hook.__name__} "
+                f"for '{catalog_id}'"
+            )
+            try:
+                await self._run_initializer_isolated(
+                    conn, label, hook, conn, schema, catalog_id,
+                )
+            except Exception:
+                # Outer transaction is aborted — stop trying further hooks
+                logger.error(
+                    f"Outer transaction aborted during post-create hooks for '{catalog_id}'. "
+                    "Aborting remaining hooks."
                 )
                 raise
 
@@ -1069,6 +1131,7 @@ lifecycle_registry = LifecycleRegistry()
 
 # Convenience decorator exports (using registry methods as decorators)
 sync_catalog_initializer = lifecycle_registry.sync_catalog_initializer
+sync_catalog_post_create = lifecycle_registry.sync_catalog_post_create
 sync_catalog_destroyer = lifecycle_registry.sync_catalog_destroyer
 sync_collection_initializer = lifecycle_registry.sync_collection_initializer
 sync_collection_destroyer = lifecycle_registry.sync_collection_destroyer
