@@ -597,6 +597,190 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
         from dynastore.modules.tasks.models import DEFERRED_COMPLETION
         return DEFERRED_COMPLETION
 
+# ---------------------------------------------------------------------------
+# Worker-routed task-type snapshot (sync read for can_handle)
+# ---------------------------------------------------------------------------
+#
+# ``WorkerQueueRunner.can_handle`` is a *sync* method but the operator intent
+# it consults (``TaskRoutingConfig.routing``) lives behind an async config
+# accessor. We mirror the pattern ``GcpJobRunner`` uses for its Cloud Run job
+# map (``get_job_map_sync`` / ``_JOB_MAP_SYNC``): keep a module-level snapshot
+# that an async warm refreshes, and read it synchronously from ``can_handle``.
+#
+# The snapshot holds the set of task types that *some* service is configured to
+# claim (any non-empty ``routing`` entry). Combined with the "no in-process
+# task instance here" gate, this bounds the runner to types the deployment
+# actually expects a remote worker to run — it never enqueues an unknown type.
+_WORKER_ROUTED_TYPES: set = set()
+
+
+async def refresh_worker_routed_types() -> None:
+    """Refresh :data:`_WORKER_ROUTED_TYPES` from ``TaskRoutingConfig``.
+
+    Best-effort: when the config registry is unavailable (early startup, tests)
+    the snapshot is left untouched and ``WorkerQueueRunner.can_handle`` falls
+    back to gating on the in-process task instance only. Never raises.
+    """
+    global _WORKER_ROUTED_TYPES
+    try:
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols.platform_configs import (
+            PlatformConfigsProtocol,
+        )
+        from dynastore.modules.tasks.tasks_config import TaskRoutingConfig
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is None:
+            return
+        cfg = await config_mgr.get_config(TaskRoutingConfig)
+        if isinstance(cfg, TaskRoutingConfig):
+            routing = cfg.routing or {}
+            _WORKER_ROUTED_TYPES = {
+                task_type
+                for task_type, targets in routing.items()
+                if targets
+            }
+            logger.debug(
+                "WorkerQueueRunner: routed-types snapshot refreshed: %s",
+                sorted(_WORKER_ROUTED_TYPES),
+            )
+    except Exception as exc:  # noqa: BLE001 — config is best-effort
+        logger.debug(
+            "WorkerQueueRunner: TaskRoutingConfig unavailable (%s) — "
+            "routed-types snapshot left unchanged.", exc,
+        )
+
+
+def get_worker_routed_types_sync() -> set:
+    """Sync accessor for the worker-routed task-type snapshot."""
+    return _WORKER_ROUTED_TYPES
+
+
+class WorkerQueueRunner(RunnerProtocol, ProtocolPlugin[Any]):
+    """Async fallback runner that enqueues onto the distributed task queue.
+
+    This is the local/on-prem analogue of :class:`GcpJobRunner`: an
+    ASYNCHRONOUS runner that hands work to an *external executor* instead of
+    running it in-process. Where ``GcpJobRunner`` launches a Cloud Run Job,
+    this runner inserts a ``PENDING`` row into the global ``tasks`` queue. The
+    INSERT fires the ``on_task_insert`` trigger
+    (``WHEN NEW.status = 'PENDING'``) → ``pg_notify('new_task_queued', ...)`` →
+    the worker service's dispatcher claims the row (filtered by
+    ``TaskRoutingConfig`` service-affinity, e.g. ``{"gdal": ["worker"]}``) and
+    runs the registered task instance (``worker_task_gdal``) via the standard
+    claim path. This is the canonical enqueue route already used by every
+    worker-routed task type (ingestion, indexers, …) — no second dispatch
+    mechanism is introduced.
+
+    **Why it exists.** On the dev/on-prem stack the API/catalog service carries
+    the osgeo runtime but not the ``worker_task_gdal`` task *instance* (excluded
+    from its SCOPE), and there is no Cloud Run locally. So nothing could
+    ``can_handle`` an async ``gdal`` execution and OGC process execution
+    returned 501. This runner closes that gap by routing async execution to the
+    worker over the queue.
+
+    **Priority (5).** Ranks below every in-process runner (``BackgroundRunner``
+    100, ``FastAPIBackgroundRunner`` 50) and below ``GcpJobRunner`` (10) so:
+
+    * A service that can run the task in-process always wins (no needless
+      cross-service hop).
+    * A Cloud Run deployment still prefers ``GcpJobRunner``.
+    * The queue hand-off is the last-resort fallback — exactly the dev/on-prem
+      case.
+
+    **Gating.** ``can_handle`` returns True only when *both*:
+
+    1. ``get_task_instance(task_type) is None`` — this process cannot run the
+       task in-process (so the runner never competes with, or double-runs
+       alongside, an in-process runner; in particular on the worker itself,
+       where the instance *is* loaded, this runner returns False and the
+       in-process ``BackgroundRunner`` claims the row).
+    2. ``task_type`` appears in :data:`_WORKER_ROUTED_TYPES` — some service is
+       configured to claim it (non-empty ``TaskRoutingConfig`` entry), so a
+       remote worker is actually expected to pick it up. This stops the runner
+       enqueueing rows that would sit forever unclaimed.
+    """
+
+    mode = TaskExecutionMode.ASYNCHRONOUS
+    priority = 5
+    runner_type = "worker_queue"
+
+    @property
+    def capabilities(self) -> Any:
+        from dynastore.modules.tasks.models import RunnerCapabilities
+        # Pure enqueue — no in-process work, no HTTP request context needed,
+        # so it is usable from both the REST path and a headless caller.
+        return RunnerCapabilities(requires_request_context=False)
+
+    async def setup(self, app_state: Any) -> None:
+        """Warm the worker-routed task-type snapshot at startup."""
+        await refresh_worker_routed_types()
+
+    def can_handle(self, task_type: str) -> bool:
+        # Never compete with an in-process runner: if this process can run the
+        # task itself, defer to the higher-priority in-process runners.
+        if get_task_instance(task_type) is not None:
+            return False
+        # Only enqueue types a worker is configured to claim.
+        return task_type in get_worker_routed_types_sync()
+
+    async def run(self, context: RunnerContext) -> Any:
+        from dynastore.tools.protocol_helpers import resolve
+        from dynastore.models.protocols.tasks import TasksProtocol
+
+        # Dispatcher path: a row was already claimed and handed to us. We must
+        # NOT re-enqueue (that would create an unbounded duplication loop —
+        # the same failure class #726 fixed for GcpJobRunner). On the worker
+        # the in-process BackgroundRunner outranks this runner and handles the
+        # claimed row, so this branch should never run; returning None makes
+        # the engine fall through without enqueuing a second row.
+        claimed_task_id = (
+            context.extra_context.get("task_id")
+            if context.extra_context
+            else None
+        )
+        if claimed_task_id is not None:
+            logger.warning(
+                "WorkerQueueRunner: reached on dispatcher path for already-"
+                "claimed task '%s' (%s) — refusing to re-enqueue.",
+                claimed_task_id, context.task_type,
+            )
+            return None
+
+        tasks_mgr = resolve(TasksProtocol)
+
+        # REST path: insert a PENDING row so the worker dispatcher claims it
+        # via the on_task_insert trigger + service-affinity routing. This is
+        # the same create_task(initial_status="PENDING") path every
+        # worker-routed task type already uses.
+        task_create_request = TaskCreate(
+            caller_id=context.caller_id,
+            task_type=str(context.task_type),
+            inputs=context.inputs,
+            dedup_key=context.dedup_key,
+        )
+        job = await tasks_mgr.create_task(
+            context.engine, task_create_request, schema=context.db_schema,
+            initial_status="PENDING",
+        )
+        if job is None:
+            # Dedup hit. Caller asked for idempotency; signal soft-success.
+            return None
+
+        logger.info(
+            "WorkerQueueRunner: enqueued PENDING task '%s' (%s) for the worker "
+            "dispatcher to claim (schema=%s).",
+            job.task_id, context.task_type, context.db_schema,
+        )
+        # Returning the Task (not a StatusInfo) makes the processes extension
+        # respond 201 Created + Location header pointing at the job-status URL,
+        # matching the GcpJobRunner REST-path contract. Job status is then
+        # served by GET .../jobs/{id}: the PENDING row maps to OGC "accepted",
+        # transitions to "running" when the worker claims it (ACTIVE), then
+        # "successful"/"failed" — see processes.models.task_to_status_info.
+        return job
+
+
 class CapabilityMap:
     """
     In-memory map of task_type to capable runners, grouped by execution mode.
@@ -651,6 +835,16 @@ class CapabilityMap:
                 if isinstance(cfg, TaskRoutingConfig):
                     routing = cfg.routing or {}
                     routing_disabled = cfg.routing_disabled
+                    # Keep WorkerQueueRunner's sync snapshot aligned with the
+                    # same config read — live PUT /configs routing changes
+                    # already trigger this refresh, so the fallback runner
+                    # picks them up without a separate config round-trip.
+                    global _WORKER_ROUTED_TYPES
+                    _WORKER_ROUTED_TYPES = {
+                        task_type
+                        for task_type, targets in routing.items()
+                        if targets
+                    }
         except Exception as exc:  # noqa: BLE001 — non-fatal, log and continue
             logger.debug(
                 "CapabilityMap: TaskRoutingConfig not yet available (%s) — "
@@ -715,6 +909,7 @@ def register_default_runners() -> None:
     """
     register_plugin(SyncRunner())
     register_plugin(BackgroundRunner())
+    register_plugin(WorkerQueueRunner())
 
 # Register default runners on module load
 register_default_runners()
