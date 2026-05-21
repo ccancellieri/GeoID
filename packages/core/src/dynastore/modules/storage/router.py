@@ -305,6 +305,48 @@ async def get_driver(
     return cast(_CSDP, resolved[0].driver)
 
 
+async def get_items_search_driver(
+    catalog_id: str,
+    collection_id: Optional[str] = None,
+    *,
+    hints: FrozenSet[Hint] = frozenset(),
+) -> "ResolvedDriver[CollectionItemsStore]":
+    """Routing-aware single-driver resolution for items SEARCH.
+
+    Resolution order, mirroring the asset tier
+    (:func:`get_asset_search_driver`) and the routing-aware lookup design
+    in issue #989:
+
+    1. ``ItemsRoutingConfig.operations[SEARCH]`` — if an operator pinned a
+       search-optimised driver for this catalog/collection (e.g. an
+       Elasticsearch index, or the tenant-scoped private ES index), use it.
+    2. Fall back to ``ItemsRoutingConfig.operations[READ]`` when no SEARCH
+       entry resolves. Any READ-capable driver advertises SEARCH via
+       :func:`derive_supported_operations` (Capability.READ → {READ, SEARCH}),
+       so the read primary (PG by default) serves filtered queries when no
+       dedicated search backend is configured.
+
+    Unlike :func:`get_driver` this returns the full :class:`ResolvedDriver`
+    so callers can inspect the driver instance (e.g. to decide between the
+    index-backed path and the PG hub-scan fallback). Raises ``ValueError``
+    when neither operation resolves a registered driver.
+    """
+    resolved = await resolve_drivers(
+        Operation.SEARCH, catalog_id, collection_id, hints=hints,
+    )
+    if not resolved:
+        resolved = await resolve_drivers(
+            Operation.READ, catalog_id, collection_id, hints=hints,
+        )
+    if not resolved:
+        raise ValueError(
+            f"No items SEARCH/READ driver found for "
+            f"hints={sorted(hints)}, catalog='{catalog_id}', collection='{collection_id}'"
+        )
+    from dynastore.models.protocols.storage_driver import CollectionItemsStore as _CSDP
+    return cast("ResolvedDriver[_CSDP]", resolved[0])
+
+
 async def get_write_drivers(
     catalog_id: str,
     collection_id: Optional[str] = None,

@@ -1,14 +1,31 @@
-"""PG-backed lookup helpers for the geoid extension.
+"""Routing-aware cross-collection geoid lookup for the geoid extension.
 
 Replaces the ES-backed SearchService.search_by_geoid implementation.
 
-Design:
+Driver resolution (issue #989) — the catalog's ``ItemsRoutingConfig`` decides
+how a geoid lookup is served, instead of hardcoding the PostgreSQL driver:
+
+  1. If the catalog pins the **private ES items driver**
+     (``items_elasticsearch_private_driver``, #966/#1047) it queries the
+     per-tenant private index directly (the GeoID private-catalog use case).
+  2. Else the driver routed to **SEARCH** is used (ES, PG, or any other).
+  3. Else the first **READ** driver advertising a search backend is used.
+     A READ-capable driver advertises SEARCH via
+     ``derive_supported_operations`` (Capability.READ → {READ, SEARCH}).
+  4. Else the lookup falls back to the PostgreSQL two-pass hub scan — which is
+     the special case of "first READ driver" when that driver is the
+     query-fallback PG store (``Capability.QUERY_FALLBACK_SOURCE``).
+
+Index-backed path (steps 1-3 when the resolved driver is a real search index):
+- List the catalog's collections and ask the driver to fetch the requested
+  geoids by id (``read_entities(entity_ids=...)``). The private/public ES
+  drivers fetch directly by document id from the per-tenant / public index.
+
+PostgreSQL fallback path (step 4) — the two-pass strategy:
 - Items are stored per-collection in the catalog's PG schema. There is no
   cross-collection hub table — each collection has its own physical table.
 - Hub table has only: geoid (UUID PK), transaction_time, deleted_at.
   All other fields (external_id, geometry, bbox, properties) are in sidecars.
-
-Cross-collection geoid lookup uses a two-pass strategy:
   1. Read ``{schema}.collection_configs`` to enumerate (collection_id,
      physical_table) pairs for the catalog's PG driver.
   2. For each hub table, issue a lightweight SELECT on just the hub (no sidecar
@@ -22,12 +39,16 @@ Per-collection external_id lookup goes directly through
 """
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
+
+# Driver ref of the tenant-scoped private ES items driver (#966/#1047). Kept
+# in sync with ``routing_config._PRIVATE_ITEMS_DRIVER_ID``.
+_PRIVATE_ITEMS_DRIVER_REF = "items_elasticsearch_private_driver"
 
 
 def _partition_uuid_inputs(geoids: List[str]) -> Tuple[List[str], List[str]]:
@@ -164,12 +185,180 @@ async def _hub_geoid_lookup(
     return [r["geoid"] for r in (rows or [])]
 
 
+async def _resolve_lookup_driver(catalog_id: str) -> Optional[Any]:
+    """Resolve the items storage driver that should serve a geoid lookup.
+
+    Implements the issue #989 resolution chain against the catalog's
+    ``ItemsRoutingConfig``:
+
+    1. Private ES items driver if it is pinned in any operation of the
+       catalog's routing config (tenant-scoped lookup) — this takes
+       precedence so a private catalog never leaks through a public path.
+    2. Otherwise the driver resolved for SEARCH, falling back to the first
+       READ driver (``get_items_search_driver``). A READ-capable driver
+       advertises search via ``derive_supported_operations``.
+
+    Returns the resolved driver instance, or ``None`` when no routing config
+    / driver can be resolved (the caller then uses the PG hub-scan fallback).
+    Resolution failures are logged deterministically so an operator can see
+    why a lookup landed on the fallback path.
+    """
+    # --- Step 1: private ES items driver wins if the catalog pins it ---
+    try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.storage.routing_config import (
+            ItemsRoutingConfig,
+            _items_routing_has_private_driver,
+        )
+
+        configs = get_protocol(ConfigsProtocol)
+        if configs is not None:
+            routing = await configs.get_config(ItemsRoutingConfig, catalog_id=catalog_id)
+            if isinstance(routing, ItemsRoutingConfig) and _items_routing_has_private_driver(routing):
+                from dynastore.modules.storage.driver_registry import DriverRegistry
+
+                driver = DriverRegistry.collection_index().get(_PRIVATE_ITEMS_DRIVER_REF)
+                if driver is not None:
+                    logger.debug(
+                        "lookup driver-resolve: catalog '%s' pins the private ES "
+                        "items driver — using tenant-scoped private index.",
+                        catalog_id,
+                    )
+                    return driver
+                logger.warning(
+                    "lookup driver-resolve: catalog '%s' routing pins '%s' but "
+                    "the driver is not registered in this scope; falling through "
+                    "to SEARCH/READ resolution.",
+                    catalog_id, _PRIVATE_ITEMS_DRIVER_REF,
+                )
+    except Exception as exc:
+        logger.debug(
+            "lookup driver-resolve: private-driver probe failed for '%s': %s; "
+            "falling through to SEARCH/READ resolution.",
+            catalog_id, exc,
+        )
+
+    # --- Steps 2-3: SEARCH driver, else first READ driver ---
+    try:
+        from dynastore.modules.storage.router import get_items_search_driver
+
+        resolved = await get_items_search_driver(catalog_id)
+        return resolved.driver
+    except Exception as exc:
+        logger.warning(
+            "lookup driver-resolve: no SEARCH/READ driver resolved for catalog "
+            "'%s' (%s); using the PostgreSQL hub-scan fallback.",
+            catalog_id, exc,
+        )
+        return None
+
+
+def _driver_is_pg_fallback(driver: Any) -> bool:
+    """True when the resolved driver is the query-fallback PostgreSQL store.
+
+    The PG items driver declares ``Capability.QUERY_FALLBACK_SOURCE`` — the
+    same marker ``item_query._try_driver_dispatch`` keys on to mean "this is
+    the PG path". When the routing chain lands on it (step 4 of #989) the
+    geoid lookup uses the PG two-pass hub scan rather than a driver dispatch.
+    """
+    try:
+        from dynastore.models.protocols.storage_driver import Capability
+
+        return Capability.QUERY_FALLBACK_SOURCE in getattr(driver, "capabilities", frozenset())
+    except Exception:
+        return False
+
+
+async def _driver_geoid_lookup(
+    driver: Any,
+    catalog_id: str,
+    geoids: List[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Cross-collection geoid lookup via an index-backed storage driver.
+
+    Lists the catalog's collections and asks the driver to fetch the requested
+    geoids by document id (``read_entities(entity_ids=...)``). The private and
+    public ES drivers resolve geoids directly from their per-tenant / public
+    index, so this serves the routing-config-pinned search path of #989.
+
+    Returns rows shaped like ``GeoidResult``. Missing geoids are skipped.
+    """
+    from dynastore.models.protocols import CatalogsProtocol
+
+    catalogs = get_protocol(CatalogsProtocol)
+    if catalogs is None:
+        logger.warning("_driver_geoid_lookup: CatalogsProtocol not available")
+        return []
+
+    out: List[Dict[str, Any]] = []
+    remaining = set(geoids)
+    offset, batch = 0, 100
+    while remaining and len(out) < limit:
+        try:
+            collections = await catalogs.list_collections(catalog_id, limit=batch, offset=offset)
+        except Exception as exc:
+            logger.warning(
+                "_driver_geoid_lookup: list_collections failed for '%s': %s",
+                catalog_id, exc,
+            )
+            break
+        if not collections:
+            break
+
+        for col in collections:
+            if not remaining or len(out) >= limit:
+                break
+            collection_id = getattr(col, "id", None) or (
+                col.get("id") if isinstance(col, dict) else None
+            )
+            if not collection_id:
+                continue
+            try:
+                features = driver.read_entities(
+                    catalog_id,
+                    collection_id,
+                    entity_ids=list(remaining),
+                    limit=limit - len(out),
+                )
+                async for f in features:
+                    row = _feature_to_dict(f, catalog_id, collection_id)
+                    gid = row.get("geoid")
+                    if gid:
+                        out.append(row)
+                        remaining.discard(str(gid))
+                    if len(out) >= limit:
+                        break
+            except Exception as exc:
+                logger.warning(
+                    "_driver_geoid_lookup: read_entities failed for %s/%s via %s: %s",
+                    catalog_id, collection_id, type(driver).__name__, exc,
+                )
+                continue
+
+        if len(collections) < batch:
+            break
+        offset += batch
+
+    return out[:limit]
+
+
 async def lookup_by_geoids(
     catalog_id: str,
     geoids: List[str],
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    """Cross-collection geoid lookup within one catalog (PG-backed, two-pass).
+    """Cross-collection geoid lookup within one catalog (routing-aware, #989).
+
+    The catalog's ``ItemsRoutingConfig`` decides how the lookup is served
+    (see the module docstring for the full resolution chain):
+
+    - **Index-backed path** — when the routing config pins the private ES
+      driver, or routes SEARCH/READ to a real search index: list the catalog's
+      collections and fetch the requested geoids by id through the resolved
+      driver's ``read_entities``.
+    - **PostgreSQL fallback path** — when the resolved driver is the
+      query-fallback PG store (or no driver resolves): the two-pass hub scan.
 
     Pass 1 – hub-only scan (no sidecar JOIN):
       For each collection's physical table, issue
@@ -197,6 +386,16 @@ async def lookup_by_geoids(
     if not valid_geoids:
         return []
 
+    # --- Driver resolution (#989): index-backed path vs PG fallback ---
+    driver = await _resolve_lookup_driver(catalog_id)
+    if driver is not None and not _driver_is_pg_fallback(driver):
+        logger.debug(
+            "lookup_by_geoids: serving catalog '%s' via index driver '%s'.",
+            catalog_id, type(driver).__name__,
+        )
+        return await _driver_geoid_lookup(driver, catalog_id, valid_geoids, limit)
+
+    # --- PostgreSQL fallback path: two-pass hub scan ---
     from dynastore.models.protocols import CatalogsProtocol, DatabaseProtocol
     from dynastore.models.query_builder import QueryRequest
     from dynastore.modules.db_config.query_executor import managed_transaction
