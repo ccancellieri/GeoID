@@ -282,3 +282,40 @@ async def test_write_filters_non_capable_config_resolved_driver(monkeypatch, cap
     assert write.calls == ["upsert"]
     assert readonly.calls == []
     assert any("capability" in r.message.lower() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_delete_filters_non_capable_config_resolved_driver(monkeypatch, caplog):
+    """The DELETE fan-out must apply ``_filter_capable`` on the config-resolved
+    branch too (item-3 parity) — a config-pinned driver lacking WRITE
+    capability is dropped, not invoked.  Without the filter ``delete_metadata``
+    would dispatch to a non-WRITE driver and raise mid-fan-out."""
+    import logging
+
+    from dynastore.modules.catalog import collection_router
+    from dynastore.modules.storage.routing_config import Operation, OperationDriverEntry
+
+    class _ReadOnlyDriver(_RecordingDriver):
+        capabilities = frozenset({EntityStoreCapability.READ})
+
+    write = _RecordingDriver("write")
+    readonly = _ReadOnlyDriver("readonly")
+
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+        if operation == Operation.WRITE:
+            return [
+                (OperationDriverEntry(driver_ref="collection_postgresql_driver"), write),
+                (OperationDriverEntry(driver_ref="collection_readonly_driver"), readonly),
+            ]
+        return []
+
+    async def _noop_dispatch(*a, **kw):
+        return None
+
+    monkeypatch.setattr(collection_router, "resolve_routed", _fake_resolve)
+    monkeypatch.setattr(collection_router, "_dispatch_collection_index", _noop_dispatch)
+    with caplog.at_level(logging.WARNING, logger=collection_router.__name__):
+        await collection_router.delete_collection_metadata("cat", "coll")
+    assert write.calls == ["delete"]
+    assert readonly.calls == []
+    assert any("capability" in r.message.lower() for r in caplog.records)
