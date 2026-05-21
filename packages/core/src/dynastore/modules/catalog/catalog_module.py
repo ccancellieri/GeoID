@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS catalog.catalogs (
     id VARCHAR PRIMARY KEY,
     physical_schema VARCHAR NOT NULL UNIQUE,
     provisioning_status VARCHAR(50) NOT NULL DEFAULT 'ready',
+    provisioning_checklist JSONB DEFAULT NULL,
     deleted_at TIMESTAMPTZ DEFAULT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -343,6 +344,20 @@ class CatalogModule(ModuleProtocol):
                     "AssetRoutingConfig purge aborted: %s. Stored overrides "
                     "may keep the old ES-first asset routing until next boot.",
                     exc,
+                )
+
+            # #1175: backfill the provisioning-checklist column on already-
+            # provisioned databases (fresh deployments get it from the DDL).
+            from dynastore.modules.db_config.provisioning_checklist_migration import (
+                migrate_provisioning_checklist_column,
+            )
+            try:
+                await migrate_provisioning_checklist_column(engine)
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "provisioning_checklist column backfill aborted: %s. "
+                    "Catalog provisioning will fall back to the legacy status "
+                    "path until next boot.", exc,
                 )
 
             # 5. Register Internal Observers

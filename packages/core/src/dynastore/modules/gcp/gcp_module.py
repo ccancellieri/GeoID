@@ -367,6 +367,16 @@ class GCPModule(
             # bucket link) and the provision task enqueue must run after the
             # catalog.catalogs row exists (#1131).
             lifecycle_registry.sync_catalog_post_create()(self._on_post_create_catalog)
+
+            # #1175: register GCP as a catalog provisioner so bucket setup is a
+            # checklist step the catalog waits on, instead of GCP directly owning
+            # ``provisioning_status``. The 'gcp_bucket' step is contributed only
+            # when provisioning is enabled (see ``provisioner_is_active``); the
+            # provision task marks it terminal (complete / skipped / failed).
+            from dynastore.modules.catalog.provisioning_registry import (
+                provisioning_registry,
+            )
+            provisioning_registry.register("gcp_bucket", self.provisioner_is_active)
             # We keep these as async because they don't block the core creation flow
             # and don't cause race conditions in tests as easily as the creation one.
             lifecycle_registry.async_catalog_destroyer()(self._on_async_destroy_catalog)

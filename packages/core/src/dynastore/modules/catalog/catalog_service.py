@@ -343,6 +343,24 @@ _create_catalog_strict_query = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
+# #1175: store the materialised provisioning checklist and flip the catalog to
+# 'provisioning' in one statement (called from create_catalog when at least one
+# provisioner is active for the new catalog).
+_set_provisioning_checklist_query = DQLQuery(
+    "UPDATE catalog.catalogs "
+    "SET provisioning_status = :status, "
+    "provisioning_checklist = CAST(:checklist AS jsonb) "
+    "WHERE id = :id;",
+    result_handler=ResultHandler.NONE,
+)
+
+# #1175: read the current checklist for a step update (row-locked so concurrent
+# provisioner completions serialise on the same catalog).
+_get_provisioning_checklist_query = DQLQuery(
+    "SELECT provisioning_checklist FROM catalog.catalogs WHERE id = :id FOR UPDATE;",
+    result_handler=ResultHandler.ONE_DICT,
+)
+
 _get_catalog_query = DQLQuery(
     "SELECT * FROM catalog.catalogs WHERE id = :id AND deleted_at IS NULL;",
     result_handler=ResultHandler.ONE_DICT,
@@ -688,7 +706,6 @@ class CatalogService(CatalogsProtocol):
     ) -> Catalog:
         """Create a new catalog."""
         db_resource = ctx.db_resource if ctx else None
-        from dynastore.models.protocols import StorageProtocol
         from dynastore.modules.tasks.tasks_module import create_task
         from dynastore.modules.tasks.models import TaskCreate
 
@@ -704,14 +721,13 @@ class CatalogService(CatalogsProtocol):
         )
         validate_sql_identifier(catalog_model.id)
 
-        # Determine initial provisioning status based on Storage availability
-        from dynastore.tools.discovery import get_protocol
-        storage_protocol = get_protocol(StorageProtocol)
-        
-        # If Storage is active, we start as 'provisioning'. 
-        # On-premise (no Storage module) starts as 'ready'.
-        initial_status = "provisioning" if storage_protocol is not None else "ready"
-        catalog_model.provisioning_status = initial_status
+        # #1175: provisioning readiness is driven by the provisioning checklist
+        # built from the registered provisioners (see provisioning_registry),
+        # not by a single provider. Start 'ready'; the checklist build below
+        # (after the catalog.catalogs row exists) flips the catalog to
+        # 'provisioning' when at least one provisioner is active for it. On-prem
+        # with no active provisioner stays 'ready' immediately.
+        catalog_model.provisioning_status = "ready"
 
         async with managed_transaction(get_catalog_engine(db_resource)) as conn:
             # Lifecycle Phase 1: BEFORE
@@ -852,11 +868,35 @@ class CatalogService(CatalogsProtocol):
                     db_resource=conn,
                 )
 
+            # #1175: materialise the provisioning checklist from the registered
+            # provisioners now that the row exists. Built BEFORE the post-create
+            # hooks so the full barrier is in place before any provisioner marks
+            # its step — a step that completes early can't flip the catalog ready
+            # while a slower step is still pending. An empty checklist (on-prem /
+            # no active provider) leaves the catalog 'ready'; otherwise it becomes
+            # 'provisioning' until every step is terminal.
+            from dynastore.modules.catalog.provisioning_registry import (
+                provisioning_registry,
+                STATUS_PROVISIONING,
+            )
+            checklist = await provisioning_registry.build_checklist(
+                catalog_model.id, conn
+            )
+            if checklist:
+                await _set_provisioning_checklist_query.execute(
+                    conn,
+                    id=catalog_model.id,
+                    status=STATUS_PROVISIONING,
+                    checklist=json.dumps(checklist),
+                )
+                catalog_model.provisioning_status = STATUS_PROVISIONING
+                _invalidate_catalog_model_cache(catalog_model.id)
+
             # Post-INSERT sync lifecycle phase: runs after the catalog.catalogs
             # row exists so module hooks may reference it (FK inserts, status
-            # UPDATEs). GCP's provision_enabled=False path (mark-ready + bucket
-            # link) runs here — it cannot run in init_catalog, which fires
-            # before the row is inserted (#1131).
+            # UPDATEs). A provisioner's post-create hook does its synchronous
+            # work and/or enqueues an async task that later calls
+            # ``mark_provisioning_step`` for its checklist key (#1131 / #1175).
             await lifecycle_registry.post_create_catalog(
                 conn, physical_schema, catalog_id=catalog_model.id
             )
@@ -978,6 +1018,12 @@ class CatalogService(CatalogsProtocol):
 
         # Convert to dict
         data = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+
+        # #1175: the provisioning checklist is internal control-plane state
+        # (read directly by ``mark_provisioning_step``); keep it out of the
+        # Catalog model / API representation. ``provisioning_status`` remains the
+        # public-facing field.
+        data.pop("provisioning_checklist", None)
 
         # Unpack STAC dedicated columns if present
         if "conforms_to" in data and data["conforms_to"]:
@@ -1975,6 +2021,82 @@ class CatalogService(CatalogsProtocol):
                     await upsert_catalog_metadata(
                         catalog_id, metadata, db_resource=conn,
                     )
+            return True
+
+    async def mark_provisioning_step(
+        self,
+        catalog_id: str,
+        key: str,
+        step_status: str = "complete",
+        ctx: Optional["DriverContext"] = None,
+    ) -> bool:
+        """Mark one provisioning-checklist step terminal and re-evaluate readiness (#1175).
+
+        Sets ``provisioning_checklist[key] = step_status`` and, when the whole
+        checklist is terminal, flips ``provisioning_status`` — ``ready`` when
+        every step is ``complete``/``skipped`` (the terminal "default last"
+        step), or ``failed`` when any step is ``failed``. A catalog with no
+        checklist (legacy / on-prem, created already ``ready``) is a no-op
+        returning ``False``.
+
+        The row is ``SELECT … FOR UPDATE`` so concurrent provisioner completions
+        on the same catalog serialise instead of racing on the JSONB blob. A
+        status change fans out to the metadata drivers, mirroring
+        :meth:`update_provisioning_status`.
+        """
+        from dynastore.modules.catalog.provisioning_registry import (
+            evaluate_checklist,
+        )
+
+        db_resource = ctx.db_resource if ctx else None
+        async with managed_transaction(get_catalog_engine(db_resource)) as conn:
+            row = await _get_provisioning_checklist_query.execute(conn, id=catalog_id)
+            if not row:
+                logger.warning(
+                    "mark_provisioning_step: catalog '%s' not found.", catalog_id
+                )
+                return False
+            raw = row.get("provisioning_checklist")
+            if raw is None:
+                logger.debug(
+                    "mark_provisioning_step: catalog '%s' has no checklist; "
+                    "step '%s' ignored.", catalog_id, key,
+                )
+                return False
+            checklist = json.loads(raw) if isinstance(raw, str) else dict(raw)
+
+            checklist[key] = step_status
+            new_status = evaluate_checklist(checklist)
+
+            if new_status is not None:
+                await DQLQuery(
+                    "UPDATE catalog.catalogs "
+                    "SET provisioning_checklist = CAST(:cl AS jsonb), "
+                    "provisioning_status = :st WHERE id = :id;",
+                    result_handler=ResultHandler.NONE,
+                ).execute(conn, id=catalog_id, cl=json.dumps(checklist), st=new_status)
+            else:
+                await DQLQuery(
+                    "UPDATE catalog.catalogs "
+                    "SET provisioning_checklist = CAST(:cl AS jsonb) "
+                    "WHERE id = :id;",
+                    result_handler=ResultHandler.NONE,
+                ).execute(conn, id=catalog_id, cl=json.dumps(checklist))
+
+            _invalidate_catalog_model_cache(catalog_id)
+
+            if new_status is not None:
+                inner_ctx = DriverContext(db_resource=conn)
+                catalog_model = await self.get_catalog_model(catalog_id, ctx=inner_ctx)
+                if catalog_model is not None:
+                    metadata = _build_catalog_metadata_payload(catalog_model)
+                    if metadata:
+                        from dynastore.modules.catalog.catalog_router import (
+                            upsert_catalog_metadata,
+                        )
+                        await upsert_catalog_metadata(
+                            catalog_id, metadata, db_resource=conn,
+                        )
             return True
 
 

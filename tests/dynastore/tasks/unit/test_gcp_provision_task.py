@@ -72,8 +72,10 @@ def _make_payload(catalog_id: str = "test_cat"):
 
 
 @pytest.mark.asyncio
-async def test_credentials_error_is_permanent():
-    """RuntimeError containing 'credentials' → PermanentTaskFailure + _mark_failed."""
+async def test_credentials_error_skips_step_and_is_permanent():
+    """RuntimeError containing 'credentials' → PermanentTaskFailure, and the
+    gcp_bucket step is marked 'skipped' so the catalog still becomes ready
+    (on-prem / unauthorized is not a provisioning failure — #1175)."""
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
 
@@ -90,12 +92,14 @@ async def test_credentials_error_is_permanent():
         with pytest.raises(PermanentTaskFailure):
             await task.run(_make_payload("c1"))
 
-    mock_catalogs.update_provisioning_status.assert_awaited_once_with("c1", "failed")
+    mock_catalogs.mark_provisioning_step.assert_awaited_once_with("c1", "gcp_bucket", "skipped")
 
 
 @pytest.mark.asyncio
-async def test_client_init_error_is_permanent():
-    """'failed to create a storage client' → PermanentTaskFailure + _mark_failed."""
+async def test_client_init_error_skips_step_and_is_permanent():
+    """'failed to create a storage client' → PermanentTaskFailure, and the
+    gcp_bucket step is marked 'skipped' (GCP not usable on this host → catalog
+    still ready, not wedged in 'failed' — #1175)."""
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
 
@@ -114,7 +118,7 @@ async def test_client_init_error_is_permanent():
         with pytest.raises(PermanentTaskFailure):
             await task.run(_make_payload("c1"))
 
-    mock_catalogs.update_provisioning_status.assert_awaited_once_with("c1", "failed")
+    mock_catalogs.mark_provisioning_step.assert_awaited_once_with("c1", "gcp_bucket", "skipped")
 
 
 @pytest.mark.asyncio
@@ -194,8 +198,9 @@ async def test_lifespan_not_ready_is_retryable():
 
 
 @pytest.mark.asyncio
-async def test_successful_provision_marks_ready():
-    """Happy path: bucket provisioned → catalog marked 'ready'."""
+async def test_successful_provision_completes_step():
+    """Happy path: bucket provisioned → gcp_bucket step marked 'complete'
+    (which flips the catalog ready once it's the last outstanding step — #1175)."""
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
     mock_storage = MagicMock()
@@ -217,7 +222,7 @@ async def test_successful_provision_marks_ready():
 
     assert result["status"] == "ready"
     assert result["bucket_name"] == "d88971-test-catalog-ok"
-    mock_catalogs.update_provisioning_status.assert_awaited_once_with("c1", "ready")
+    mock_catalogs.mark_provisioning_step.assert_awaited_once_with("c1", "gcp_bucket", "complete")
 
 
 @pytest.mark.asyncio

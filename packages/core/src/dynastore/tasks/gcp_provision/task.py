@@ -137,11 +137,12 @@ class ProvisioningTask(TaskProtocol):
 
             logger.info(f"GcpProvisionCatalogTask: Bucket '{bucket_name}' ensured for catalog '{catalog_id}'.")
 
-            # 4. Mark catalog as ready
+            # 4. Mark the GCP provisioning-checklist step complete (#1175). When
+            # this is the last outstanding step the catalog flips to 'ready'.
             catalogs = _get_catalog_protocol()
-            await catalogs.update_provisioning_status(catalog_id, "ready")
-            
-            logger.info(f"GcpProvisionCatalogTask: Catalog '{catalog_id}' marked as READY.")
+            await catalogs.mark_provisioning_step(catalog_id, "gcp_bucket", "complete")
+
+            logger.info(f"GcpProvisionCatalogTask: Catalog '{catalog_id}' gcp_bucket step COMPLETE.")
             
             return {
                 "catalog_id": catalog_id,
@@ -177,7 +178,13 @@ class ProvisioningTask(TaskProtocol):
                 "credentials",
             )
             if any(indicator in msg for indicator in _permanent_indicators):
-                await self._mark_failed(catalog_id)
+                # On-prem / unauthorized: GCP cannot authenticate or init a
+                # client. This is not a provisioning *failure* — the deployment
+                # simply has no usable GCP. Mark the step 'skipped' so the
+                # catalog still becomes ready instead of being wedged in
+                # 'failed' (#1175). The task itself still dead-letters below so
+                # the misconfiguration is surfaced to operators.
+                await self._mark_step("skipped", catalog_id)
                 raise PermanentTaskFailure(
                     f"GCP unavailable, cannot provision '{catalog_id}': {e}"
                 ) from e
@@ -191,36 +198,36 @@ class ProvisioningTask(TaskProtocol):
             await self._mark_failed(catalog_id)
             raise
 
-    async def _mark_failed(self, catalog_id: Optional[str]) -> None:
-        """Flip ``catalog.catalogs.provisioning_status`` → ``'failed'``.
+    async def _mark_step(self, step_status: str, catalog_id: Optional[str]) -> None:
+        """Mark the ``gcp_bucket`` provisioning-checklist step terminal (#1175).
 
-        Called from every failure path in :meth:`run` so the fail-fast
-        guard at the API layer
-        (``OGCServiceMixin._require_catalog_ready``) can reject
-        subsequent write operations with a 409 instead of letting them
-        500 deep inside a driver.
+        ``failed`` flips the catalog to ``failed`` (the fail-fast guard then
+        rejects writes with 409); ``skipped`` lets the catalog become ready
+        anyway (on-prem / unauthorized, where GCP simply does not apply).
 
-        Best-effort: if the update itself raises (DB down, protocol
-        unavailable), we swallow — the task's own FAILED status lands
-        via ``fail_task`` in the runner, and the pg_cron reaper / a
-        later ``gcp.init.*`` log line will still surface the problem.
-        Silently proceeding is preferable to masking the original
-        exception that is about to be re-raised.
+        Best-effort: if the call raises (DB down, protocol unavailable) we
+        swallow — the task's own terminal status still lands via the runner,
+        and a later ``gcp.init.*`` log line surfaces the problem. Silently
+        proceeding beats masking the original exception about to be re-raised.
         """
         if not catalog_id:
             return
         try:
             catalogs = _get_catalog_protocol()
-            await catalogs.update_provisioning_status(catalog_id, "failed")
+            await catalogs.mark_provisioning_step(catalog_id, "gcp_bucket", step_status)
             logger.info(
-                f"GcpProvisionCatalogTask: catalog '{catalog_id}' marked FAILED "
-                f"(API writes will 409 via fail-fast guard)."
+                "GcpProvisionCatalogTask: catalog '%s' gcp_bucket step → %s.",
+                catalog_id, step_status,
             )
         except Exception as mark_err:  # pragma: no cover — diagnostic best-effort
             logger.error(
-                f"GcpProvisionCatalogTask: failed to mark catalog '{catalog_id}' "
-                f"provisioning_status='failed': {mark_err}"
+                "GcpProvisionCatalogTask: failed to mark catalog '%s' gcp_bucket "
+                "step '%s': %s", catalog_id, step_status, mark_err,
             )
+
+    async def _mark_failed(self, catalog_id: Optional[str]) -> None:
+        """Mark the ``gcp_bucket`` step ``failed`` (→ catalog ``failed``)."""
+        await self._mark_step("failed", catalog_id)
 
     async def _mark_conflict(self, catalog_id: Optional[str]) -> None:
         """Flip ``catalog.catalogs.provisioning_status`` → ``'conflict'``.

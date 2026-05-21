@@ -199,6 +199,23 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         """
         ...
 
+    async def mark_provisioning_step(
+        self,
+        catalog_id: str,
+        key: str,
+        step_status: str = "complete",
+        ctx: Optional["DriverContext"] = None,
+    ) -> bool:
+        """Mark one provisioning-checklist step terminal and re-evaluate readiness (#1175).
+
+        Provisioners call this when their work finishes (``complete``), is not
+        applicable for this deployment (``skipped``), or genuinely failed
+        (``failed``). When the whole checklist is terminal the catalog flips to
+        ``ready`` (all complete/skipped) or ``failed`` (any failed). A catalog
+        with no checklist is a no-op returning ``False``.
+        """
+        ...
+
     async def get_catalog_config(
         self, catalog_id: str, ctx: Optional["DriverContext"] = None,
     ) ->Any:

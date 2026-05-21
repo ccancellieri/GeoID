@@ -82,6 +82,39 @@ class GcpCatalogOpsMixin:
         @property
         def engine(self) -> DbResource: ...
 
+    async def provisioner_is_active(
+        self, catalog_id: str, conn: Optional[Any] = None
+    ) -> bool:
+        """Provisioning-checklist predicate (#1175): does GCP have async setup
+        work the new catalog must wait for?
+
+        GCP contributes the ``gcp_bucket`` checklist item only when bucket
+        provisioning is enabled for this catalog (``provision_enabled``). Whether
+        the host can actually authenticate to GCP is resolved later, in the
+        provision task: if credentials are missing the task marks the step
+        ``skipped`` (→ catalog becomes ready) rather than ``failed``, so a
+        config-enabled-but-unauthorized on-prem deployment is never wedged.
+
+        A read failure is treated as inactive so a config glitch can't block
+        catalog readiness.
+        """
+        try:
+            config_mgr = get_protocol(ConfigsProtocol)
+            bucket_config = GcpCatalogBucketConfig()
+            if config_mgr:
+                bucket_config = await config_mgr.get_config(
+                    GcpCatalogBucketConfig,
+                    catalog_id=catalog_id,
+                    ctx=DriverContext(db_resource=conn),
+                )
+            return bool(bucket_config.provision_enabled)
+        except Exception:  # noqa: BLE001 — never block readiness on a config glitch
+            logger.warning(
+                "GCP Module: provisioner_is_active check failed for catalog '%s'; "
+                "treating GCP as inactive.", catalog_id, exc_info=True,
+            )
+            return False
+
     async def _on_post_create_catalog(self, conn: DbResource, physical_schema: str, catalog_id: str):
         """
         Post-INSERT hook to initialize GCP resources (Bucket, Eventing) for a new catalog.
