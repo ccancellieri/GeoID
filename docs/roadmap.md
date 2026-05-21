@@ -20,6 +20,20 @@ Connected Systems, Moving Features, Coverages, DGGS, Records) live in
   cache invalidation under Valkey, principal-id migration) are tracked
   in the issue queue.
 
+## Storage & multi-tenancy
+
+- **Tenant storage workspace** — today each Catalog (tenant) is backed by an
+  isolated PostgreSQL schema, recorded in the `catalog.catalogs` registry and
+  resolved through a single seam. The roadmap generalises this into a
+  driver-agnostic *tenant storage workspace* so a tenant could be realised by a
+  PostgreSQL schema, a disseminated Iceberg tenant catalog, or an object-store
+  prefix, with plugins writing through storage drivers transparently. The design,
+  invariants (bootstrap key, transient cache, tenant isolation), and a phased,
+  non-breaking migration are in
+  [`docs/architecture/tenant-storage-workspace.md`](architecture/tenant-storage-workspace.md).
+  Later phases are gated on real demand for a second tenant-isolating backend and
+  a coordinated storage migration.
+
 ## OGC API surface
 
 - **OGC API – EDR (Environmental Data Retrieval)** — not yet implemented.

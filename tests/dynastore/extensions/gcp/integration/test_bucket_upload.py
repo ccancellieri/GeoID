@@ -113,9 +113,9 @@ async def test_init_upload_acl_enum(sysadmin_in_process_client, app_lifespan, ca
             # B. Force catalog into "ready" state with a linked (fake) bucket.
             # The catalog creation puts it in "provisioning" when GCP module is active,
             # but these tests focus on upload behavior — not provisioning.
-            db_cat = await catalogs_proto.get_catalog(catalog_id)
+            phys_schema = await catalogs_proto.resolve_physical_schema(catalog_id)
             bucket_name = gcp_module.get_bucket_service().generate_bucket_name(
-                catalog_id, physical_schema=db_cat.physical_schema
+                catalog_id, physical_schema=phys_schema
             )
             async with _mt(app_lifespan.engine) as db_conn:
                 await gcp_db.link_bucket_to_catalog_query.execute(
@@ -268,9 +268,9 @@ async def test_init_upload_precondition_failed(
 
             # Force catalog into "ready" state with a linked (fake) bucket.
             assert gcp_module is not None
-            db_cat = await catalogs_proto.get_catalog(catalog_id)
+            phys_schema = await catalogs_proto.resolve_physical_schema(catalog_id)
             bucket_name = gcp_module.get_bucket_service().generate_bucket_name(
-                catalog_id, physical_schema=db_cat.physical_schema
+                catalog_id, physical_schema=phys_schema
             )
             async with _mt(app_lifespan.engine) as db_conn:
                 await gcp_db.link_bucket_to_catalog_query.execute(

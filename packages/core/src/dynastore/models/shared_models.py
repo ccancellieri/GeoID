@@ -375,7 +375,16 @@ class BaseMetadata(LocalizedFieldsBase):
     )
 
     id: str = Field(..., description="A unique logical identifier.")
-    physical_schema: Optional[str] = Field(None, description="The physical schema name in the database.", exclude=True)
+    # ``physical_schema`` (the per-tenant PostgreSQL schema) is deliberately NOT a
+    # field on this model. It is a storage-driver / provisioning detail that must be
+    # resolved from the authoritative ``catalog.catalogs`` registry via
+    # ``CatalogsProtocol.resolve_physical_schema`` — never carried on the public
+    # metadata model. Carrying it here leaked an internal identifier into API output
+    # and (because it was ``exclude=True``) was silently dropped whenever the model
+    # crossed the distributed cache, breaking schema resolution on slim read-only
+    # services. ``get_internal_columns()`` still lists it so any stray copy that
+    # arrives as an ``extra`` field is filtered out of external metadata.
+    # See docs/architecture/tenant-storage-workspace.md.
 
     @field_validator("id")
     @classmethod

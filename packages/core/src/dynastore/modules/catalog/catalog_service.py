@@ -435,13 +435,41 @@ async def _catalog_model_cache(service: "CatalogService", catalog_id: str):
     return await service._get_catalog_model_db(catalog_id)
 
 
+@cached(
+    maxsize=2048,
+    ttl=300,
+    namespace="catalog_physical_schema",
+    ignore=["service"],
+    condition=lambda v: v is not None,
+)
+async def _physical_schema_cache(
+    service: "CatalogService", catalog_id: str
+) -> Optional[str]:
+    """Resolve a catalog's physical PG schema as a plain string.
+
+    Read straight from the authoritative ``catalog.catalogs`` registry — NOT
+    derived from the cached ``Catalog`` model. ``physical_schema`` does not
+    survive the distributed (L2) cache round-trip (the Valkey encoder serializes
+    models via ``model_dump_json()``, which historically dropped the
+    ``exclude=True`` field; the field is now off the model entirely), so a
+    process reading the model cold from L2 would resolve ``None`` and fail. A
+    plain string round-trips losslessly; ``condition`` keeps misses out of the
+    cache so a just-provisioned catalog resolves immediately. The cache is a
+    pure accelerator — on any miss (L1 or L2) the registry SELECT is the source
+    of truth.
+    """
+    return await service._get_physical_schema_db(catalog_id)
+
+
 def _invalidate_catalog_model_cache(catalog_id: str) -> None:
     """Drop the shared catalog-model cache entry for a catalog.
 
-    ``service`` is part of the cache signature but ignored for keying, so any
-    sentinel is fine here.
+    Also drops the physical-schema string cache so a delete / tombstone-reclaim
+    can't leave a stale schema pointer behind. ``service`` is part of the cache
+    signature but ignored for keying, so any sentinel is fine here.
     """
     _catalog_model_cache.cache_invalidate(None, catalog_id)
+    _physical_schema_cache.cache_invalidate(None, catalog_id)
 
 
 from dynastore.modules.catalog.collection_service import CollectionService
@@ -530,14 +558,17 @@ class CatalogService(CatalogsProtocol):
 
     # --- Schema Resolution ---
 
-    # async def _resolve_physical_schema_db(self, catalog_id: str) -> Optional[str]:
-    #     """Resolve physical schema from catalog_id."""
-    #     async with managed_transaction(self.engine) as conn:
-    #         result = await DQLQuery(
-    #             "SELECT physical_schema FROM catalog.catalogs WHERE id = :catalog_id AND deleted_at IS NULL;",
-    #             result_handler=ResultHandler.SCALAR_ONE_OR_NONE
-    #         ).execute(conn, catalog_id=catalog_id)
-    #         return result
+    async def _get_physical_schema_db(self, catalog_id: str) -> Optional[str]:
+        """Authoritative physical-schema lookup against ``catalog.catalogs``.
+
+        The registry column is the single source of truth; this is the cold-miss
+        fallback behind ``_physical_schema_cache``.
+        """
+        async with managed_transaction(self.engine) as conn:
+            return await DQLQuery(
+                "SELECT physical_schema FROM catalog.catalogs WHERE id = :catalog_id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, catalog_id=catalog_id)
 
     async def resolve_physical_schema(
         self,
@@ -545,7 +576,15 @@ class CatalogService(CatalogsProtocol):
         ctx: Optional["DriverContext"] = None,
         allow_missing: bool = False,
     ) -> Optional[str]:
-        """Resolve physical schema for a catalog."""
+        """Resolve the per-tenant physical PG schema for a catalog.
+
+        Authoritative source: the ``catalog.catalogs`` registry. When a caller
+        supplies a connection (``ctx.db_resource``) the lookup joins that
+        transaction directly; otherwise it goes through ``_physical_schema_cache``
+        — a lossless *string* cache. Resolution is never derived from the cached
+        ``Catalog`` model (which cannot carry ``physical_schema`` across the
+        distributed cache — see ``_physical_schema_cache``).
+        """
         db_resource = ctx.db_resource if ctx else None
         if db_resource:
             async with managed_transaction(db_resource) as conn:
@@ -556,13 +595,9 @@ class CatalogService(CatalogsProtocol):
                 if not res and not allow_missing:
                     raise ValueError(f"Catalog '{catalog_id}' not found.")
                 return res
-        # Use cached catalog model to get physical schema
-        catalog_model = await _catalog_model_cache(self, catalog_id)
-        if not catalog_model and not allow_missing:
+        ps = await _physical_schema_cache(self, catalog_id)
+        if not ps and not allow_missing:
             raise ValueError(f"Catalog '{catalog_id}' not found.")
-        
-        ps = catalog_model.physical_schema if catalog_model else None
-        # logger.warning(f"Resolved physical schema for '{catalog_id}': {ps}")
         return ps
 
     # --- Collection Resolution ---
@@ -1058,6 +1093,11 @@ class CatalogService(CatalogsProtocol):
                 # spelling resolves after validation.
                 data["conformsTo"] = router_metadata["conforms_to"]
 
+        # ``physical_schema`` is resolved via the registry, never carried on the
+        # public model. ``SELECT *`` includes the column and ``extra="allow"``
+        # would otherwise re-attach (and serialize / leak) it — drop it here so
+        # the model stays clean.
+        data.pop("physical_schema", None)
         return Catalog.model_validate(data)
 
     def _list_catalog_store_driver_types(self) -> List[type]:
