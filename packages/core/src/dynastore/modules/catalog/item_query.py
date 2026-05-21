@@ -850,17 +850,36 @@ class ItemQueryMixin:
                 "col_config": col_config,
                 **(request.raw_params or {}),
             }
+            # Snapshot a pagination-free copy BEFORE the data transformation
+            # runs: _apply_query_transformations mutates the request in place
+            # (it folds the parsed CQL filter into raw_where/raw_params), so a
+            # copy taken afterwards would re-parse the filter and double the
+            # predicate. deep=True isolates the shared raw_params dict.
+            count_request = (
+                request.model_copy(deep=True, update={"limit": None, "offset": None})
+                if request.include_total_count
+                else None
+            )
             sql, params = await self._apply_query_transformations(
                 request, context, catalog_id, collection_id, col_config,
                 db_resource=conn, consumer=consumer,
             )
 
             total_count = None
-            if request.include_total_count:
-                count_wrapper = f"SELECT count(*) FROM ({sql}) AS sub"
+            if count_request is not None:
+                # numberMatched must reflect the full filtered result set, not
+                # the current page. Wrapping the limit-bearing data SQL in
+                # count(*) caps the total at the page size; build the count from
+                # the pagination-free request so the same filters apply without
+                # LIMIT/OFFSET.
+                count_sql, count_params = await self._apply_query_transformations(
+                    count_request, context, catalog_id, collection_id, col_config,
+                    db_resource=conn, consumer=consumer,
+                )
+                count_wrapper = f"SELECT count(*) FROM ({count_sql}) AS sub"
                 total_count = await DQLQuery(
                     count_wrapper, result_handler=ResultHandler.SCALAR
-                ).execute(conn, **(params or {}))
+                ).execute(conn, **(count_params or {}))
 
         # Stream Generator (O(1) Memory)
         lang = (request.raw_params or {}).get("lang", "en")

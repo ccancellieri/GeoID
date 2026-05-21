@@ -14,17 +14,14 @@ to cover the issue's four assertions:
 2. An unknown property -> HTTP 400 (not 500, not silently ignored).
 3. Values are parameter-bound: a value containing a single quote does not break
    the query and is not injectable (no 500, no full-table leak).
-4. Pagination links on a filtered STAC response preserve the filter params.
+4. Pagination links on a filtered STAC response preserve the filter params, and
+   ``numberMatched`` reports the full filtered total (not the page size).
 
 This is a live-DB integration test: like every test in this directory it
 requires a reachable PostgreSQL service (provided by the Docker/CI test path).
 
-Matching (STAC + Features), validation, and injection-safety all pass against
-the fixed filter pipeline. One assertion — filtered pagination — remains
-``xfail(strict=True)`` for a separate, narrower defect (``numberMatched`` does
-not reflect the active filter under pagination). The strict marker keeps the
-suite green today and flips to a hard failure the moment that count path is
-fixed, prompting its removal.
+Matching (STAC + Features), validation, injection-safety, and filtered
+pagination all pass against the fixed filter pipeline.
 """
 
 import pytest
@@ -213,17 +210,6 @@ async def test_stac_attribute_filter_validation_and_injection(
 
 @MARKER
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Separate filtered-pagination count defect. With the attribute filter "
-        "now matching, a `limit=1` request over two matching items returns the "
-        "page correctly but `numberMatched` reports 1 instead of the full "
-        "filtered total (2): the total-count path does not reflect the CQL "
-        "filter under pagination. The links and matching themselves are fine — "
-        "remove this marker once `numberMatched` honours the active filter."
-    ),
-)
 async def test_stac_attribute_filter_pagination_preserves_filter(
     sysadmin_in_process_client: AsyncClient, catalog_id, collection_id
 ):
