@@ -24,10 +24,12 @@ These URIs are PROPOSALS; the namespace path
 accepted into the STAC registry. Do not depend on these as immutable
 identifiers in external clients.
 
-The class set unions the proposal's classes (``core / upload / processes /
-async / search / sync``) with the implementation-specific classes the pilot
-already enforces (``write-policies / versioning / virtual-assets /
-references``), so a client can probe every advertised capability deterministically.
+The class set unions the proposal's classes (``core / upload / download /
+search / sync``) with the implementation-specific classes the pilot already
+enforces (``write-policies / versioning / virtual-assets / references``), so a
+client can probe every advertised capability deterministically. Asset-scoped
+*processing* is delegated to OGC API - Processes at the asset mount, not this
+asset surface.
 """
 from __future__ import annotations
 
@@ -35,9 +37,8 @@ from __future__ import annotations
 _NS = "https://stac-extensions.github.io/asset-transactions/1.0/conf"
 
 ASSETS_CORE = f"{_NS}/core"
-"""Core: GET /assets/, /assets/conformance, GET single asset, GET list, and
-   process discovery (GET .../assets/{id}/processes). Mirrors OGC API - Common
-   requirements."""
+"""Core: GET /assets/, /assets/conformance, GET single asset, GET list.
+   Mirrors OGC API - Common requirements."""
 
 ASSETS_UPLOAD = f"{_NS}/upload"
 """Upload session lifecycle: POST /upload (born-claimed PENDING INSERT
@@ -45,15 +46,12 @@ ASSETS_UPLOAD = f"{_NS}/upload"
    server backs the storage transaction, the client uploads bytes
    to the signed URL the server mints."""
 
-ASSETS_PROCESSES = f"{_NS}/processes"
-"""Asset-scoped process execution: GET/POST .../assets/{id}/{process_id} with a
-   ``parameters_schema``, dispatched through ``AssetProcessProtocol`` impls
-   discovered via ``get_protocols``. Idempotent processes use GET; state-changing
-   ones use POST. Returns the polymorphic ``AssetProcessOutput`` envelope."""
-
-ASSETS_ASYNC = f"{_NS}/async"
-"""Asynchronous process execution: ``AssetProcessOutput.type == "job"`` with a
-   ``job_id`` the client polls via the host's OGC Processes jobs surface."""
+ASSETS_DOWNLOAD = f"{_NS}/download"
+"""Asset download: GET .../assets/{id}/download 302-redirects to a
+   backend-resolved URL (GCS signed URL, local bearer-auth route, or the
+   asset's external URL). Optional ``ttl`` tunes signed-URL lifetime. Asset
+   *processing* (e.g. gdalinfo) is delegated to OGC API - Processes at the asset
+   mount, not this surface."""
 
 ASSETS_SEARCH = f"{_NS}/search"
 """Granular asset search via ``POST .../assets-search`` with an
@@ -92,8 +90,7 @@ ASSETS_REFERENCES = f"{_NS}/references"
 ASSETS_CONFORMANCE_URIS = (
     ASSETS_CORE,
     ASSETS_UPLOAD,
-    ASSETS_PROCESSES,
-    ASSETS_ASYNC,
+    ASSETS_DOWNLOAD,
     ASSETS_SEARCH,
     ASSETS_SYNC,
     ASSETS_WRITE_POLICIES,
@@ -105,8 +102,7 @@ ASSETS_CONFORMANCE_URIS = (
 __all__ = (
     "ASSETS_CORE",
     "ASSETS_UPLOAD",
-    "ASSETS_PROCESSES",
-    "ASSETS_ASYNC",
+    "ASSETS_DOWNLOAD",
     "ASSETS_SEARCH",
     "ASSETS_SYNC",
     "ASSETS_WRITE_POLICIES",

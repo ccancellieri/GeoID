@@ -391,10 +391,10 @@ class GCPModule(
             register_plugin(self._bq_service)
             register_plugin(self._bq_collection_enricher)
 
-            # Register GCS-backed asset processes (``download``).
-            from dynastore.modules.gcp.asset_processes import GcsDownloadAssetProcess
+            # Register the GCS asset-download backend (signed-URL resolver).
+            from dynastore.modules.gcp.asset_downloads import GcsAssetDownload
 
-            self._asset_download_process = GcsDownloadAssetProcess(
+            self._asset_download_process = GcsAssetDownload(
                 client_provider=self,
                 identity_provider=self if hasattr(self, "get_fresh_token") else None,
             )

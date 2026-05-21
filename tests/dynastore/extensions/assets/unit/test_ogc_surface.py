@@ -78,9 +78,8 @@ def _build_service() -> AssetService:
     """Return a real AssetService bound to a fresh FastAPI app.
 
     We use ``__new__`` and manually wire ``router`` / ``app`` so the
-    constructor's plugin-registration side effects (UploadAssetProcess,
-    write_policy_assets import) are exercised once at module import time
-    by Pyright but not duplicated per test.
+    constructor's side effects (write_policy_assets import) are exercised once
+    at module import time by Pyright but not duplicated per test.
     """
     app = FastAPI()
     svc = AssetService.__new__(AssetService)
@@ -210,7 +209,7 @@ def test_conformance_advertises_proposal_classes() -> None:
     assert r.status_code == 200
     advertised = set(r.json()["conformsTo"])
     suffixes = {
-        "/core", "/upload", "/processes", "/async", "/search", "/sync",
+        "/core", "/upload", "/download", "/search", "/sync",
         "/write-policies", "/versioning", "/virtual-assets", "/references",
     }
     for suffix in suffixes:
@@ -256,7 +255,7 @@ def test_single_asset_get_includes_self_link(monkeypatch: pytest.MonkeyPatch) ->
     )
     # active physical → alternate download link present
     assert "alternate" in rels
-    assert "/processes/download/execution" in rels["alternate"]["href"]
+    assert rels["alternate"]["href"].endswith("/download")
 
 
 # ---------------------------------------------------------------------------

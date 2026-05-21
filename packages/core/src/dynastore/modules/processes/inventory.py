@@ -19,10 +19,6 @@ from typing import Dict, Iterable, List, Literal, Optional, Set
 
 from fastapi import Request
 
-from dynastore.models.protocols.asset_process import (
-    AssetProcessProtocol,
-    describe_asset_process_static,
-)
 from dynastore.models.tasks import TaskExecutionMode
 from dynastore.modules.processes import models
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
@@ -46,13 +42,6 @@ _SCOPE_TEMPLATES = {
         "/catalogs/{catalog_id}/collections/{collection_id}"
         "/assets/{asset_id}/processes/{process_id}/execution",
 }
-
-_ASSET_PROCESS_TYPOLOGY = models.ProcessTypology(
-    runner_type="asset_process",
-    mode=TaskExecutionMode.SYNCHRONOUS,
-    priority=0,
-    location="in_process",
-)
 
 # Runner -> execution location. Anything not listed defaults to "in_process".
 _RUNNER_LOCATIONS: Dict[str, Literal["in_process", "cloud_run"]] = {
@@ -136,29 +125,6 @@ def _safe_can_handle(runner: RunnerProtocol, task_type: str) -> bool:
         return False
 
 
-def _asset_process_as_process(process: AssetProcessProtocol) -> models.Process:
-    """Synthesise a ``Process`` entry from an ``AssetProcessProtocol``.
-
-    Asset processes don't register OGC-style ``Process`` definitions because
-    they execute through the parametric asset surface. Building an ephemeral
-    ``Process`` lets the inventory merge them into the same listing without
-    touching the OGC registry.
-    """
-    descriptor = describe_asset_process_static(process)
-    return models.Process(
-        id=descriptor.process_id,
-        title=descriptor.title or descriptor.process_id,
-        description=descriptor.description,
-        version="1.0.0",
-        scopes=[models.ProcessScope.ASSET],
-        jobControlOptions=[models.JobControlOptions.SYNC_EXECUTE],
-        outputTransmission=[models.TransmissionMode.VALUE],
-        inputs={},
-        outputs={},
-        links=[],
-    )
-
-
 def _matches_scope_filter(
     scopes: Iterable[models.ProcessScope],
     scope_filter: Optional[Set[models.ProcessScope]],
@@ -214,9 +180,8 @@ async def build_process_inventory_entries(
 ) -> List[models.ProcessSummary]:
     """Build the enriched process list used by ``GET /processes`` + siblings.
 
-    - Queries all ``ProcessRegistryProtocol`` implementations (dedup by id).
-    - When ``scope=asset`` / ``scope=all``, also includes
-      ``AssetProcessProtocol`` implementations as synthetic entries.
+    - Queries all ``ProcessRegistryProtocol`` implementations (dedup by id),
+      including ASSET-scoped processes such as ``gdal``.
     - Applies scope + runner filters.
     - Sets ``typologies`` / ``url_templates`` when ``include_typology=True``;
       leaves them empty otherwise (strict-OGC payload).
@@ -229,26 +194,12 @@ async def build_process_inventory_entries(
                 processes.append(p)
                 seen_ids.add(p.id)
 
-    asset_wanted = scope_filter is None or models.ProcessScope.ASSET in scope_filter
-    if asset_wanted:
-        for ap in get_protocols(AssetProcessProtocol):
-            try:
-                processes.append(_asset_process_as_process(ap))
-            except Exception as e:
-                logger.warning(
-                    f"Skipping AssetProcessProtocol {type(ap).__name__}: {e}"
-                )
-
     entries: List[models.ProcessSummary] = []
     for process in processes:
         if not _matches_scope_filter(process.scopes, scope_filter):
             continue
 
-        is_asset_process = process.scopes == [models.ProcessScope.ASSET]
-        if is_asset_process:
-            typologies = [_ASSET_PROCESS_TYPOLOGY]
-        else:
-            typologies = resolve_typologies(process.id)
+        typologies = resolve_typologies(process.id)
 
         if not _matches_runner_filter(typologies, runner_filter):
             continue

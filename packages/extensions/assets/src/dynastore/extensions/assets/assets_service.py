@@ -51,11 +51,7 @@ from dynastore.models.protocols import (
     UploadStatusResponse,
 )
 from dynastore.models.shared_models import Link
-from dynastore.models.protocols.asset_process import (
-    AssetProcessDescriptor,
-    AssetProcessOutput,
-    AssetProcessProtocol,
-)
+from dynastore.models.protocols.asset_download import AssetDownloadProtocol
 from dynastore.tools.protocol_helpers import get_engine
 from dynastore.extensions.tools.catalog_readiness import require_catalog_ready
 from dynastore.extensions.tools.exception_handlers import handle_exception
@@ -178,13 +174,6 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         self.app = app
         self.router = APIRouter(prefix="/assets", tags=["Assets"])
         self._setup_routes()
-        # Register the backend-agnostic UploadAssetProcess so the parametric
-        # /processes/{id}/execution dispatch surface picks it up alongside
-        # the backend-owned ``download`` processes from modules/{gcp,local}.
-        from dynastore.extensions.assets.asset_processes import UploadAssetProcess
-        from dynastore.tools.discovery import register_plugin
-        self._upload_process = UploadAssetProcess()
-        register_plugin(self._upload_process)
         # Surface the asset write-policy PluginConfigs to the Configs API.
         # Importing the module triggers ``TypedModelRegistry.register(cls)``
         # in :class:`PluginConfig.__init_subclass__` — no explicit register
@@ -551,55 +540,33 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             },
         )
         # -----------------------------------------------------------------
-        # Parametric asset-process dispatch (see models/protocols/asset_process.py).
-        # Registered AFTER all specific routes so ``{process_id}`` does not shadow
-        # ``references`` / ``tasks`` / ``upload``. FastAPI matches in declaration order.
+        # Asset download (backend-resolved 302 redirect; see
+        # models/protocols/asset_download.py). Registered AFTER specific routes
+        # so ``download`` does not shadow ``references`` / ``upload``.
         # -----------------------------------------------------------------
         self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}/processes",
-            self.list_catalog_asset_processes,
+            "/catalogs/{catalog_id}/assets/{asset_id}/download",
+            self.download_catalog_asset,
             methods=["GET"],
-            response_model=List[AssetProcessDescriptor],
-            summary="List Asset Processes",
+            status_code=status.HTTP_302_FOUND,
+            summary="Download Asset",
             description=(
-                "Enumerates processes that can be invoked on this asset "
-                "(e.g. ``download``, ``ingest``, ``validate``). Each entry "
-                "reports ``applicable=false`` with a ``reason`` when the "
-                "process is registered but cannot run on this specific asset."
-            ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}/processes",
-            self.list_collection_asset_processes,
-            methods=["GET"],
-            response_model=List[AssetProcessDescriptor],
-            summary="List Collection Asset Processes",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}/processes/{process_id}/execution",
-            self.invoke_catalog_asset_process,
-            methods=["POST"],
-            response_model=AssetProcessOutput,
-            summary="Invoke Asset Process",
-            description=(
-                "Executes a registered asset process (``download``, ``ingest``, "
-                "``validate``, etc.) on this asset. OGC API - Processes "
-                "style URL: parameters go in the JSON body. A ``302`` "
-                "redirect is returned when the process yields ``type=redirect``."
+                "Redirects (302) to a backend-resolved download URL for the "
+                "asset bytes: a short-lived GCS signed URL, the bearer-auth "
+                "local-download route, or the asset's external URL. Optional "
+                "``ttl`` (seconds) tunes signed-URL lifetime where supported."
             ),
             responses={
-                200: {"description": "Process executed; returns ``AssetProcessOutput``."},
-                302: {"description": "Redirect to the asset's external URL."},
-                404: {"description": "Asset or process not found."},
-                409: {"description": "Process not applicable to this asset."},
+                302: {"description": "Redirect to the download URL."},
+                404: {"description": "Asset not found or no download backend."},
             },
         )
         self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}/processes/{process_id}/execution",
-            self.invoke_collection_asset_process,
-            methods=["POST"],
-            response_model=AssetProcessOutput,
-            summary="Invoke Collection Asset Process",
+            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}/download",
+            self.download_collection_asset,
+            methods=["GET"],
+            status_code=status.HTTP_302_FOUND,
+            summary="Download Collection Asset",
         )
         # ---------------------------------------------------------------
         # Bucket↔DB drift endpoints (Stage 6 reconcile surface).
@@ -1197,7 +1164,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                 dl_base = f"{base}/assets/{asset.asset_id}"
             links.append(
                 Link(
-                    href=f"{dl_base}/processes/download/execution",
+                    href=f"{dl_base}/download",
                     rel="alternate",
                     type="application/octet-stream",
                     title="Download asset bytes",  # type: ignore[arg-type]
@@ -1834,7 +1801,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         )
 
     # =============================================================================
-    #  PARAMETRIC ASSET-PROCESS DISPATCH
+    #  ASSET DOWNLOAD
     # =============================================================================
 
     async def _load_asset(
@@ -1850,103 +1817,57 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             raise HTTPException(status_code=404, detail="Asset not found")
         return asset
 
-    def _find_process(self, process_id: str) -> Optional[AssetProcessProtocol]:
-        for p in get_protocols(AssetProcessProtocol):
-            if getattr(p, "process_id", None) == process_id:
-                return p
-        return None
-
-    async def list_catalog_asset_processes(
+    async def _download_asset(
         self,
-        catalog_id: str = Path(..., description="The catalog ID"),
-        asset_id: str = Path(..., description="The asset ID"),
-    ) -> List[AssetProcessDescriptor]:
-        """Enumerates processes applicable to the asset (catalog scope)."""
-        asset = await self._load_asset(catalog_id, asset_id, None)
-        return [await p.describe(asset) for p in get_protocols(AssetProcessProtocol)]
-
-    async def list_collection_asset_processes(
-        self,
-        catalog_id: str = Path(..., description="The catalog ID"),
-        collection_id: str = Path(..., description="The collection ID"),
-        asset_id: str = Path(..., description="The asset ID"),
-    ) -> List[AssetProcessDescriptor]:
-        """Enumerates processes applicable to the asset (collection scope)."""
-        asset = await self._load_asset(catalog_id, asset_id, collection_id)
-        return [await p.describe(asset) for p in get_protocols(AssetProcessProtocol)]
-
-    async def _invoke_process(
-        self,
-        request: Request,
         catalog_id: str,
         asset_id: str,
-        process_id: str,
         collection_id: Optional[str],
+        ttl: Optional[int],
     ):
+        from fastapi.responses import RedirectResponse
+
         asset = await self._load_asset(catalog_id, asset_id, collection_id)
 
-        # Fallback for external-URL assets with no registered process: redirect to the URI/href.
-        process = self._find_process(process_id)
-        if process is None:
-            target = asset.href or asset.uri
-            if process_id == "download" and target and target.startswith(("http://", "https://")):
-                from fastapi.responses import RedirectResponse
+        # Backend-resolved download (GCS signed URL, local bearer-auth route).
+        for provider in get_protocols(AssetDownloadProtocol):
+            if provider.applies_to(asset):
+                url = await provider.resolve_download_url(asset, ttl)
+                return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
 
-                return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Asset process {process_id!r} is not registered.",
-            )
+        # Externally-hosted assets: redirect straight to the public URL.
+        target = asset.href or asset.uri
+        if target and target.startswith(("http://", "https://")):
+            return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
 
-        try:
-            params = await request.json()
-        except Exception:
-            params = {}
-        if not isinstance(params, dict):
-            raise HTTPException(
-                status_code=400, detail="Request body must be a JSON object."
-            )
-
-        result = await process.execute(asset, params)
-
-        if result.type == "redirect" and result.url:
-            from fastapi.responses import RedirectResponse
-
-            return RedirectResponse(result.url, status_code=status.HTTP_302_FOUND)
-        return result
-
-    async def invoke_catalog_asset_process(
-        self,
-        request: Request,
-        catalog_id: str = Path(..., description="The catalog ID"),
-        asset_id: str = Path(..., description="The asset ID"),
-        process_id: str = Path(
-            ...,
-            description="The asset process ID (e.g. ``download``, ``ingest``).",
-            examples=["download"],
-        ),
-    ):
-        """Dispatches to the registered ``AssetProcessProtocol`` implementor."""
-        return await self._invoke_process(
-            request, catalog_id, asset_id, process_id, collection_id=None
+        raise HTTPException(
+            status_code=404,
+            detail="No download backend available for this asset.",
         )
 
-    async def invoke_collection_asset_process(
+    async def download_catalog_asset(
         self,
-        request: Request,
+        catalog_id: str = Path(..., description="The catalog ID"),
+        asset_id: str = Path(..., description="The asset ID"),
+        ttl: Optional[int] = Query(
+            default=None,
+            description="Signed-URL lifetime in seconds (backends that mint one).",
+        ),
+    ):
+        """Redirects to a backend-resolved download URL for a catalog asset."""
+        return await self._download_asset(catalog_id, asset_id, None, ttl)
+
+    async def download_collection_asset(
+        self,
         catalog_id: str = Path(..., description="The catalog ID"),
         collection_id: str = Path(..., description="The collection ID"),
         asset_id: str = Path(..., description="The asset ID"),
-        process_id: str = Path(
-            ...,
-            description="The asset process ID (e.g. ``download``, ``ingest``).",
-            examples=["download"],
+        ttl: Optional[int] = Query(
+            default=None,
+            description="Signed-URL lifetime in seconds (backends that mint one).",
         ),
     ):
-        """Dispatches to the registered ``AssetProcessProtocol`` implementor."""
-        return await self._invoke_process(
-            request, catalog_id, asset_id, process_id, collection_id=collection_id
-        )
+        """Redirects to a backend-resolved download URL for a collection asset."""
+        return await self._download_asset(catalog_id, asset_id, collection_id, ttl)
 
     # =============================================================================
     #  BUCKET↔DB DRIFT (Stage 6)

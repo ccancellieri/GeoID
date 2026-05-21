@@ -110,7 +110,7 @@ class LocalUploadModule(ModuleProtocol):
     @asynccontextmanager
     async def lifespan(self, app_state: Any) -> AsyncIterator[None]:
         from dynastore.tools.discovery import register_plugin, unregister_plugin
-        from dynastore.modules.local.asset_processes import LocalDownloadAssetProcess
+        from dynastore.modules.local.asset_downloads import LocalAssetDownload
 
         self._staging_root.mkdir(parents=True, exist_ok=True)
         self._asset_root.mkdir(parents=True, exist_ok=True)
@@ -134,9 +134,9 @@ class LocalUploadModule(ModuleProtocol):
                 "route registration (worker context?)."
             )
 
-        # Register the local download asset process so the parametric asset
-        # router discovers it via get_protocols(AssetProcessProtocol).
-        self._download_process = LocalDownloadAssetProcess()
+        # Register the local asset-download backend so the asset router
+        # discovers it via get_protocols(AssetDownloadProtocol).
+        self._download_process = LocalAssetDownload()
         register_plugin(self)
         register_plugin(self._download_process)
         try:
@@ -314,7 +314,7 @@ class LocalUploadModule(ModuleProtocol):
             summary="Serve Local Asset",
             description=(
                 "Streams the local file backing the asset. Used as the redirect "
-                "target of ``LocalDownloadAssetProcess.execute()``. Auth is "
+                "target of ``LocalAssetDownload``. Auth is "
                 "provided by the global ``auth`` middleware."
             ),
             tags=["Assets"],
