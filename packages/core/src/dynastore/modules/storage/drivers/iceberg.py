@@ -968,7 +968,9 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         def _export_to_file():
             if format == "csv":
                 import pyarrow.csv as pcsv
-                pcsv.write_csv(pa_table, target_path)
+                # pyarrow re-exports write_csv from pyarrow._csv without an
+                # __all__ entry, so pyright>=stubs flag it as a private import.
+                pcsv.write_csv(pa_table, target_path)  # pyright: ignore[reportPrivateImportUsage]
             elif format == "json":
                 _rows = pa_table.to_pylist()
                 import builtins

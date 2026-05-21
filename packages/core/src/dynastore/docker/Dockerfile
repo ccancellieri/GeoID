@@ -1,18 +1,18 @@
-# GDAL version is pinned in 5 places that MUST stay in lockstep:
+# GDAL version is pinned in 6 places that MUST stay in lockstep:
 #   1-2. this Dockerfile — two `FROM ghcr.io/osgeo/gdal:ubuntu-full-<X>` stages
 #   3.   pyproject.toml (root) — `module_gdal` extra `GDAL==<X>`
 #   4.   pyproject.toml (root) — `extension_maps` extra `GDAL==<X>`
-#   5.   packages/extensions/gdal/pyproject.toml + packages/extensions/maps/pyproject.toml — `GDAL==<X>`
-# Bump all 5 together; CI guards drift via scripts/check_gdal_pin_consistency.py.
+#   5-6. packages/extensions/gdal/pyproject.toml + packages/extensions/maps/pyproject.toml — `GDAL==<X>`
+# Bump all 6 together; CI guards drift via scripts/check_gdal_pin_consistency.py.
 #
 # The base image is pinned by DIGEST, not just by the ubuntu-full-<X> tag.
-# osgeo rebuilds those tags in place onto newer Ubuntu releases: the
-# `ubuntu-full-3.12.4` tag was rebased onto Ubuntu 26.04 / Python 3.14, for
-# which the pinned geospatial+columnar stack (numpy 1.26.4, pyarrow<19, fiona,
-# geopandas, shapely) has no cp314 wheels, so the tester build fails compiling
-# them from source. Pinning the digest freezes Python at 3.12 until the stack
-# is migrated to numpy 2 / Python 3.14 deliberately. Current digest resolves
-# `ubuntu-full-3.11.5` = GDAL 3.11.5 on Ubuntu 24.04 / Python 3.12.3.
+# osgeo rebuilds those tags in place onto newer Ubuntu releases, so the digest
+# freezes the exact OS/Python/GDAL triple regardless of later tag rebases.
+# Current digest resolves `ubuntu-full-3.13.0` = GDAL 3.13.0 on Ubuntu 26.04 /
+# Python 3.14. The full geospatial+columnar stack now ships cp314 wheels
+# (numpy 2, pyarrow 24, shapely, rasterio, pyproj; fiona was retired in favour
+# of pyogrio) so the build no longer falls back to compiling from source.
+# GDAL 3.13.0 also carries the CVE-2026-8087/8088 fixes (no 3.11/3.12 backport).
 
 # STAGE 0: JupyterLite Builder — pre-builds browser-based Python kernel (Pyodide)
 # Skipped cheaply when BUILD_JUPYTERLITE=false (Cloud Run jobs/workers that
@@ -54,7 +54,7 @@ RUN if [ "${BUILD_JUPYTERLITE}" = "true" ]; then \
     fi
 
 # STAGE 1: Builder (Production dependencies)
-FROM ghcr.io/osgeo/gdal:ubuntu-full-3.11.5@sha256:c43777f16389c514fff84cf1cb7e9ab1f275ff3ea015673f727517c400bdb1e6 AS builder
+FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.0@sha256:83d114a6891ae18aa175d81a14c92a96d23944667b36fde9c15c4a10215d8939 AS builder
 
 LABEL maintainer="carlo.cancellieri@fao.org"
 
@@ -152,19 +152,20 @@ ARG SCOPE=all
 ARG BUILD_JUPYTERLITE=false
 # Use buildkit cache for pip
 #
-# fiona ships a manylinux wheel with its own bundled libgdal — that bundled
-# build does NOT include the Arrow/Parquet driver.  Reading GeoParquet over
-# /vsigs/ from the ingestion task therefore failed with
-# ``CPLE_OpenFailedError: not recognized as being in a supported file format``
-# even though the system GDAL from ``ghcr.io/osgeo/gdal:ubuntu-full-3.11.5``
-# has the Parquet driver (the maps service confirms via /maps/gdal/vector/info
-# → driverShortName='Parquet').  Force fiona to rebuild from sdist against
-# the system libgdal so it inherits every driver the base image ships.
+# pyogrio ships a manylinux wheel with its own bundled libgdal. Two problems
+# with the bundled build: (1) it may lag the system GDAL and omit drivers the
+# base image carries, and (2) loading pyogrio's libgdal alongside the osgeo
+# bindings' system libgdal puts two libgdal copies in one process — a known
+# crash hazard in the ingestion worker, which imports both the osgeo reader
+# and PyogrioReader. Force pyogrio to rebuild from sdist against the system
+# libgdal (the ubuntu-full image ships GDAL dev headers) so it links the one
+# system libgdal — inheriting every driver and eliminating the dual-libgdal
+# conflict. (Previously applied to fiona, retired in favour of pyogrio.)
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     ${VENV_PATH}/bin/pip install --upgrade pip setuptools setuptools-scm wheel uv && \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    ${VENV_PATH}/bin/uv pip install --no-binary fiona ".[${SCOPE}]" uvicorn gunicorn
+    ${VENV_PATH}/bin/uv pip install --no-binary pyogrio ".[${SCOPE}]" uvicorn gunicorn
 
 # Layer 3: real source overlay. Fast layer — busts when packages/ or
 # APP_VERSION change. Re-installs dynastore-core + every workspace ext wheel
@@ -305,7 +306,7 @@ WORKDIR ${APP_DIR}
 EXPOSE 5678 5679
 
 # STAGE 4: Runtime (Production image)
-FROM ghcr.io/osgeo/gdal:ubuntu-full-3.11.5@sha256:c43777f16389c514fff84cf1cb7e9ab1f275ff3ea015673f727517c400bdb1e6 AS runtime
+FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.0@sha256:83d114a6891ae18aa175d81a14c92a96d23944667b36fde9c15c4a10215d8939 AS runtime
 
 ARG APP_USER=dynastore
 ARG APP_UID=1001
