@@ -895,21 +895,37 @@ async def get_tile_resolution_params(
         from dynastore.modules.storage.routing_config import Operation
         from dynastore.modules.storage.hints import Hint
 
+        # Hint.TILES forces routing to a tile-capable driver (today: PG).
+        # Without it, default READ routing returns ES first when ES is
+        # listed ahead of PG, and ES has no schema/table identifiers.
         try:
-            # Hint.TILES forces routing to a tile-capable driver (today: PG).
-            # Without it, default READ routing returns ES first when ES is
-            # listed ahead of PG, and ES has no schema/table identifiers.
             driver = await get_driver(
                 Operation.READ, catalog_id, collection_id,
                 hints=frozenset({Hint.TILES}),
             )
-            location = await driver.location(catalog_id, collection_id)
         except Exception:
             logger.warning(
                 "tile metadata: no tile-capable driver for %s/%s — "
                 "add Hint.TILES to a driver's supported_hints or to the "
                 "items READ routing entry",
                 catalog_id, collection_id,
+                exc_info=True,
+            )
+            return {}
+
+        # The driver resolved fine — routing is NOT the problem here. It still
+        # has to map catalog/collection to a physical location (PG schema +
+        # table), which fails for reasons unrelated to hints, most commonly a
+        # catalog with no ``physical_schema`` recorded in ``catalog.catalogs``.
+        # Give it a distinct message that carries the real exception so this
+        # path is never misread as a routing/hint misconfiguration.
+        try:
+            location = await driver.location(catalog_id, collection_id)
+        except Exception as exc:
+            logger.warning(
+                "tile metadata: driver %s resolved for %s/%s but could not "
+                "resolve a physical location: %s",
+                type(driver).__name__, catalog_id, collection_id, exc,
                 exc_info=True,
             )
             return {}
