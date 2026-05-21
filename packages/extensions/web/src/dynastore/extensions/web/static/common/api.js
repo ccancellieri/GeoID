@@ -76,13 +76,48 @@ export function scopeBasePath(scope) {
 // GET the composed/resolved or explicit config set at a scope.
 // resolved=true returns inherited + overrides; resolved=false returns only
 // overrides set at this scope.
-export function fetchConfigSet(scope, { resolved = true, meta = false } = {}) {
-  const base = scopeBasePath(scope);
-  const qs = new URLSearchParams({
+//
+// `meta` accepts the server's three-valued projection ("none" | "field" |
+// "schema") OR a boolean for back-compat (true → "field", false → "none").
+// `view` is the #947/#1112 provenance filter ("effective" | "delta" |
+// "inherited"); omitted unless explicitly passed so older callers keep the
+// server default. The returned querystring is exposed verbatim on the
+// response under a non-enumerable `__qs` marker so the Wire tab can echo
+// the exact GET it issued.
+export function configSetQuery({ resolved = true, meta = false, view } = {}) {
+  const metaVal = typeof meta === "string"
+    ? meta
+    : (meta ? "field" : "none");
+  const params = {
     resolved: resolved ? "true" : "false",
-    meta: meta ? "true" : "false",
-  });
-  return getJSON(`${base}?${qs.toString()}`);
+    meta: metaVal,
+  };
+  if (view) params.view = view;
+  return new URLSearchParams(params);
+}
+
+export async function fetchConfigSet(scope, opts = {}) {
+  const base = scopeBasePath(scope);
+  const qs = configSetQuery(opts);
+  const path = `${base}?${qs.toString()}`;
+  const body = await getJSON(path);
+  if (body && typeof body === "object") {
+    try {
+      Object.defineProperty(body, "__path", {
+        value: path, enumerable: false, configurable: true,
+      });
+    } catch { /* frozen response — ignore */ }
+  }
+  return body;
+}
+
+// Registry entry for one plugin class (snake_case plugin_id).
+//   meta="none"  → { plugin_id, json_schema, description, scope }
+//   meta="schema"→ raw JSON Schema 2020-12
+//   meta="field" → { field_name: description } docs map
+export function fetchSchema(pluginId, { meta = "none" } = {}) {
+  const qs = meta && meta !== "none" ? `?meta=${encodeURIComponent(meta)}` : "";
+  return getJSON(`/configs/registry/${encodeURIComponent(pluginId)}${qs}`);
 }
 
 // PATCH the composed endpoint at a scope. body is a shallow

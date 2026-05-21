@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="../static/common/admin.css">
 </head>
-<body>
+<body class="page-config-hub">
   <main>
     <header class="masthead">
       <div class="folio">I.</div>
@@ -52,12 +52,22 @@
 
       <aside class="plate preview-plate">
         <div class="plate-header">
-          <h3>Resolved</h3>
-          <div class="plate-meta">READ-ONLY</div>
+          <h3>Insight</h3>
+          <div class="plate-meta">PROVENANCE · WIRE · DIFF</div>
         </div>
-        <pre id="preview-json" class="preview-json"></pre>
+        <div id="config-tabs"></div>
       </aside>
     </div>
+
+    <p class="footnote">
+      <strong>No “Asset” scope.</strong> Configuration tiers are
+      <code>platform → catalog → collection</code> only. Asset behaviour is
+      configured through plugin classes such as <code>AssetRoutingConfig</code>
+      at one of those three tiers — there is no separate asset radio.
+      Each field’s <em>from</em> badge shows which tier supplied its effective
+      value; the <strong>Diff</strong> and <strong>Wire</strong> tabs preview
+      and explain the exact <code>PATCH</code> Save will send.
+    </p>
   </main>
 
   <script>

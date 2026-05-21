@@ -1,5 +1,10 @@
 // Configuration Hub — page glue.
 // Wires the reusable common/ modules together. No plugin-specific code.
+//
+// Teaching-grade layer (#948): the right pane is no longer a single resolved
+// blob. It shows a per-field tier stack with provenance badges plus
+// Effective / Wire / Diff / Docs tabs, all driven by REAL composed-config
+// endpoints (resolved / meta=field / view=delta) — no backend change.
 
 import {
   fetchSchemas,
@@ -10,6 +15,17 @@ import {
 import { mountContextBar } from "../common/context-bar.js";
 import { mountSchemaList } from "../common/schema-list.js";
 import { mountSchemaForm } from "../common/schema-form.js";
+import { mountConfigTabs } from "../common/config-tabs.js";
+import {
+  fetchTierStack,
+  flattenComposed,
+  defaultsFromSchema,
+  lineageForClass,
+  diffPatch,
+  curlForPatch,
+  curlForGet,
+  tiersForScope,
+} from "../common/config-insight.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -17,9 +33,12 @@ const state = {
   schemas: {},            // class_key -> { json_schema, description, scope }
   scope: { kind: "platform" },
   selectedClassKey: null,
-  resolvedSet: {},        // class_key -> config dict (inherited)
-  explicitSet: {},        // class_key -> config dict (overrides only)
+  resolvedSet: {},        // class_key -> resolved (inherited) config dict
+  explicitSet: {},        // class_key -> explicit (active-scope delta) dict
+  tierStack: { default: {}, platform: {}, catalog: {}, collection: {} },
+  tiers: ["default", "platform"],
   form: null,
+  tabs: null,
 };
 
 function setStatus(msg, cls = "") {
@@ -28,61 +47,119 @@ function setStatus(msg, cls = "") {
   s.className = "status " + cls;
 }
 
-// Flatten the composed response's nested scope→topic→[sub→]ClassName→payload
-// tree into a plain { ClassName -> payload } map. Class names are globally
-// unique so the flatten is lossless.
-function normalizeConfigSet(payload) {
-  if (!payload) return {};
-  const tree = payload.configs && typeof payload.configs === "object"
-    ? payload.configs
-    : payload;
-  const out = {};
-  function looksLikeClass(name, node) {
-    // Class names are PascalCase and their direct payload is always an object
-    // that is NOT shaped like a topic container (which itself contains only
-    // PascalCase or sub-topic-named children).
-    return typeof name === "string" && /^[A-Z]/.test(name)
-      && node && typeof node === "object" && !Array.isArray(node);
-  }
-  function walk(node) {
-    if (!node || typeof node !== "object" || Array.isArray(node)) return;
-    for (const [k, v] of Object.entries(node)) {
-      if (looksLikeClass(k, v)) {
-        out[k] = v;
-      } else {
-        walk(v);
+async function refreshConfigsForScope() {
+  // Effective (waterfall) set with provenance, the active-scope delta, and
+  // the per-tier stack — three reads composed client-side. meta=field is
+  // what surfaces `_meta.source` provenance and `_meta.docs` per leaf.
+  const [resolved, explicit, tierData] = await Promise.all([
+    fetchConfigSet(state.scope, { resolved: true, meta: "field" }),
+    fetchConfigSet(state.scope, { resolved: false, meta: "field", view: "delta" }),
+    fetchTierStack(state.scope, state.schemas),
+  ]);
+  state.resolvedSet = flattenComposed(resolved, state.schemas);
+  state.explicitSet = flattenComposed(explicit, state.schemas);
+  state.tierStack = tierData.stack;
+  state.tiers = tierData.tiers;
+}
+
+// The merged value of everything BELOW the active scope (what the active
+// scope inherits). Used by the Diff tab to show resolved before/after.
+function inheritedForClass(classKey) {
+  const scopeTier = state.scope.kind;
+  const order = tiersForScope(state.scope);
+  const merged = { ...defaultsFromSchema(state.schemas[classKey]?.json_schema) };
+  for (const tier of order) {
+    if (tier === "default" || tier === scopeTier) continue;
+    const delta = (state.tierStack[tier] || {})[classKey];
+    if (delta) {
+      for (const [k, v] of Object.entries(delta)) {
+        if (k === "_meta" || k === "_links") continue;
+        merged[k] = v;
       }
     }
   }
-  walk(tree);
+  return merged;
+}
+
+function updateTabs() {
+  if (!state.tabs) return;
+  const classKey = state.selectedClassKey;
+  if (!classKey) {
+    state.tabs.update({ classKey: null, tiers: state.tiers });
+    return;
+  }
+  const schema = state.schemas[classKey]?.json_schema || {};
+  const defaults = defaultsFromSchema(schema);
+  const lineage = lineageForClass(
+    classKey, defaults, state.tierStack, state.tiers,
+  );
+  const resolved = state.resolvedSet[classKey] || {};
+  const explicit = state.explicitSet[classKey] || {};
+
+  const patch = state.form ? state.form.getPatch() : {};
+  const body = Object.keys(patch).length ? { [classKey]: patch } : {};
+  const inherited = inheritedForClass(classKey);
+  const diff = diffPatch({ patch, explicitBefore: explicit, inherited });
+
+  const knobs = state.tabs.getKnobs();
+  state.tabs.update({
+    classKey,
+    lineage,
+    tiers: state.tiers,
+    resolved,
+    explicit,
+    inherited,
+    patch,
+    diff,
+    curlPatch: Object.keys(body).length
+      ? curlForPatch(state.scope, body)
+      : "# Edit a field to populate the PATCH body.",
+    curlGet: curlForGet(state.scope, knobs),
+    docs: docsForClass(classKey),
+    registryUrl: registryUrlFor(classKey),
+  });
+}
+
+function docsForClass(classKey) {
+  // Provenance meta=field carries _meta.docs on each leaf. Fall back to the
+  // schema's per-field descriptions when absent.
+  const leaf = state.resolvedSet[classKey] || {};
+  const metaDocs = leaf._meta && leaf._meta.docs;
+  if (metaDocs && Object.keys(metaDocs).length) return metaDocs;
+  const props = state.schemas[classKey]?.json_schema?.properties || {};
+  const out = {};
+  for (const [field, spec] of Object.entries(props)) {
+    if (spec && spec.description) out[field] = spec.description;
+  }
   return out;
 }
 
-async function refreshConfigsForScope() {
-  const [resolved, explicit] = await Promise.all([
-    fetchConfigSet(state.scope, { resolved: true }),
-    fetchConfigSet(state.scope, { resolved: false }),
-  ]);
-  state.resolvedSet = normalizeConfigSet(resolved);
-  state.explicitSet = normalizeConfigSet(explicit);
+function registryUrlFor(classKey) {
+  try {
+    return new URL(
+      `../../configs/registry/${encodeURIComponent(classKey)}`,
+      window.location.href,
+    ).href;
+  } catch {
+    return `/configs/registry/${encodeURIComponent(classKey)}`;
+  }
 }
 
 function renderForm() {
   const host = $("#schema-form");
   const hdr = $("#form-header");
-  const preview = $("#preview-json");
   $("#apply").disabled = true;
   $("#revert").disabled = true;
   setStatus("");
 
   if (!state.selectedClassKey) {
     host.replaceChildren();
-    preview.textContent = "";
     hdr.textContent = "Editor";
     const p = document.createElement("div");
     p.className = "empty-hint";
     p.textContent = "Select a plugin from the list to edit its configuration.";
     host.appendChild(p);
+    updateTabs();
     return;
   }
 
@@ -95,7 +172,6 @@ function renderForm() {
 
   const resolved = state.resolvedSet[state.selectedClassKey] || {};
   const explicit = state.explicitSet[state.selectedClassKey] || {};
-  preview.textContent = JSON.stringify(resolved, null, 2);
 
   state.form = mountSchemaForm(host, {
     schema: entry.json_schema,
@@ -105,7 +181,42 @@ function renderForm() {
     onDirty: (dirty) => {
       $("#apply").disabled = !dirty;
       $("#revert").disabled = !dirty;
+      // Live-refresh Wire + Diff as the operator edits.
+      updateTabs();
     },
+  });
+
+  decorateFormProvenance();
+  updateTabs();
+}
+
+// Inject a "from: <tier>" badge next to each top-level field label, derived
+// from the per-field lineage. Progressive enhancement — the form still works
+// without it.
+function decorateFormProvenance() {
+  const classKey = state.selectedClassKey;
+  if (!classKey || !state.form) return;
+  const schema = state.schemas[classKey]?.json_schema || {};
+  const lineage = lineageForClass(
+    classKey, defaultsFromSchema(schema), state.tierStack, state.tiers,
+  );
+  const host = $("#schema-form");
+  const rows = host.querySelectorAll(".field-row");
+  rows.forEach((row) => {
+    const label = row.querySelector("label");
+    if (!label) return;
+    // Field name is the label text minus a trailing " *" required marker and
+    // any appended inherit-pill text.
+    const raw = (label.childNodes[0] && label.childNodes[0].textContent) || "";
+    const name = raw.replace(/\s*\*$/, "").trim();
+    const f = lineage.fields[name];
+    if (!f) return;
+    if (label.querySelector(".ci-badge")) return;
+    const badge = document.createElement("span");
+    badge.className = `ci-badge ci-from-${f.source}`;
+    badge.textContent = `from: ${f.source}`;
+    badge.title = `Effective value supplied by the ${f.source} tier`;
+    label.appendChild(badge);
   });
 }
 
@@ -154,6 +265,10 @@ async function boot() {
     setStatus(`Could not load schemas: ${e.message}`, "err");
     return;
   }
+
+  state.tabs = mountConfigTabs($("#config-tabs"), {
+    onKnobs: () => updateTabs(),  // re-render the GET curl when knobs change
+  });
 
   mountSchemaList($("#schema-list"), {
     schemas: state.schemas,

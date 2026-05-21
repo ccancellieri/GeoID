@@ -449,6 +449,18 @@ tbody tr:hover td { background: rgba(180, 71, 43, 0.04); }
 
 .layout-3 > .plate { margin-bottom: 0; }
 
+/* Config Hub: the Insight pane is load-bearing teaching content (#948), not
+ * an optional preview — give it more width and, when the grid collapses,
+ * drop it to a full-width row below instead of hiding it. */
+.page-config-hub .layout-3 { grid-template-columns: 260px 1fr 360px; }
+@media (max-width: 1080px) {
+  .page-config-hub .layout-3 { grid-template-columns: 240px 1fr; }
+  .page-config-hub .layout-3 .preview-plate {
+    display: block;
+    grid-column: 1 / -1;
+  }
+}
+
 /* --- Drop zone for ingest page --------------------------------------- */
 
 .dropzone {
@@ -551,6 +563,154 @@ tbody tr:hover td { background: rgba(180, 71, 43, 0.04); }
 }
 .field-pill.override { color: var(--terracotta); border-color: var(--terracotta); }
 .field-pill.delete { color: var(--terracotta-deep); border-color: var(--terracotta-deep); }
+
+/* --- Configuration Hub: provenance + tier stack + tabs (#948) --------- */
+
+/* Provenance "from: <tier>" badge — one colour per tier of origin. */
+.ci-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink-dim);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.ci-from-default    { color: var(--ink-dim); border-color: var(--rule); }
+.ci-from-platform   { color: var(--prussian); border-color: var(--prussian); }
+.ci-from-catalog    { color: var(--olive); border-color: var(--olive); }
+.ci-from-collection { color: var(--terracotta); border-color: var(--terracotta); }
+
+.ci-subhead {
+  font-family: var(--font-ui);
+  font-size: 0.64rem;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  margin: 14px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--rule-hair);
+}
+.ci-cap {
+  font-size: 0.76rem;
+  color: var(--ink-dim);
+  font-style: italic;
+  margin: 6px 0 8px;
+  line-height: 1.5;
+}
+
+/* Tier-stack table — field rows, tier columns, effective cell highlighted. */
+.ci-stack-wrap { margin-bottom: 14px; }
+.ci-stack {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+}
+.ci-stack th {
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink-dim);
+  font-weight: 600;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ci-stack td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--rule-hair);
+  color: var(--ink-soft);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ci-stack .ci-field-name { color: var(--ink); font-weight: 500; }
+.ci-stack .ci-unset { color: var(--rule); text-align: center; }
+.ci-stack .ci-set { color: var(--ink-soft); }
+.ci-stack .ci-effective {
+  background: rgba(180, 71, 43, 0.10);
+  color: var(--terracotta-deep);
+  font-weight: 500;
+}
+.ci-stack tbody tr:hover td { background: rgba(30, 58, 95, 0.05); }
+.ci-stack tbody tr:hover .ci-effective { background: rgba(180, 71, 43, 0.14); }
+
+/* Wire-tab read knobs. */
+.ci-knobs { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 10px; }
+.ci-knob {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+.ci-knob select {
+  width: auto;
+  min-width: 92px;
+  padding: 3px 6px;
+  font-size: 0.74rem;
+}
+
+.ci-panels .btn { margin: 8px 0 4px; }
+
+/* Diff tab. */
+.ci-diff-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+.ci-diff-list li {
+  padding: 3px 0;
+  border-bottom: 1px solid var(--rule-hair);
+  color: var(--ink-soft);
+  word-break: break-word;
+}
+.ci-diff-list strong { color: var(--terracotta-deep); font-weight: 600; }
+.ci-diff-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+@media (max-width: 480px) { .ci-diff-grid { grid-template-columns: 1fr; } }
+
+/* Docs tab. */
+.ci-docs { margin: 4px 0 12px; }
+.ci-docs dt {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--ink);
+  margin-top: 8px;
+}
+.ci-docs dd {
+  margin: 2px 0 0;
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
+.ci-reg-link {
+  display: inline-block;
+  margin-top: 10px;
+  font-size: 0.76rem;
+  color: var(--prussian);
+  text-decoration: none;
+  border-bottom: 1px solid var(--prussian);
+}
+.ci-reg-link:hover { color: var(--terracotta); border-bottom-color: var(--terracotta); }
 
 /* --- Utilities -------------------------------------------------------- */
 
