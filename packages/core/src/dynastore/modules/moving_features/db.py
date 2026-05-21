@@ -101,7 +101,7 @@ _list_tg_from_query = DQLQuery(
     WHERE catalog_id = :catalog_id AND mf_id = :mf_id
       AND EXISTS (
             SELECT 1 FROM unnest(datetimes) AS t
-            WHERE t >= :dt_start::timestamptz
+            WHERE t >= CAST(:dt_start AS timestamptz)
           )
     ORDER BY created_at ASC;
     """,
@@ -114,7 +114,7 @@ _list_tg_until_query = DQLQuery(
     WHERE catalog_id = :catalog_id AND mf_id = :mf_id
       AND EXISTS (
             SELECT 1 FROM unnest(datetimes) AS t
-            WHERE t <= :dt_end::timestamptz
+            WHERE t <= CAST(:dt_end AS timestamptz)
           )
     ORDER BY created_at ASC;
     """,
@@ -127,7 +127,7 @@ _list_tg_between_query = DQLQuery(
     WHERE catalog_id = :catalog_id AND mf_id = :mf_id
       AND EXISTS (
             SELECT 1 FROM unnest(datetimes) AS t
-            WHERE t >= :dt_start::timestamptz AND t <= :dt_end::timestamptz
+            WHERE t >= CAST(:dt_start AS timestamptz) AND t <= CAST(:dt_end AS timestamptz)
           )
     ORDER BY created_at ASC;
     """,

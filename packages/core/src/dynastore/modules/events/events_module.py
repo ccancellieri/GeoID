@@ -353,7 +353,7 @@ _nack_query = DQLQuery(
         retry_count   = retry_count + 1,
         error_message = :error,
         processed_at  = NOW()
-    WHERE event_id = :event_id::uuid;
+    WHERE event_id = CAST(:event_id AS uuid);
     """,
     result_handler=ResultHandler.NONE,
 )

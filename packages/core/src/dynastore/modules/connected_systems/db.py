@@ -58,7 +58,7 @@ _create_system_query = DQLQuery(
     VALUES
         (:catalog_id, :system_id, :name, :description, :type,
          ST_GeomFromGeoJSON(:geometry),
-         :properties::jsonb, :stac_collection_id)
+         CAST(:properties AS jsonb), :stac_collection_id)
     RETURNING id, catalog_id, system_id, name, description, type,
               ST_AsGeoJSON(geometry)::jsonb AS geometry,
               properties, stac_collection_id, created_at, updated_at;
@@ -107,7 +107,7 @@ _create_deployment_query = DQLQuery(
         (:catalog_id, :system_id, :name, :description,
          :time_start, :time_end,
          ST_GeomFromGeoJSON(:geometry),
-         :properties::jsonb)
+         CAST(:properties AS jsonb))
     RETURNING id, catalog_id, system_id, name, description, time_start, time_end,
               ST_AsGeoJSON(geometry)::jsonb AS geometry,
               properties, created_at;
@@ -141,7 +141,7 @@ _create_datastream_query = DQLQuery(
          observed_property, unit_of_measurement, properties)
     VALUES
         (:catalog_id, :datastream_id, :system_id, :name, :description,
-         :observed_property, :unit_of_measurement, :properties::jsonb)
+         :observed_property, :unit_of_measurement, CAST(:properties AS jsonb))
     RETURNING id, catalog_id, datastream_id, system_id, name, description,
               observed_property, unit_of_measurement, properties, created_at, updated_at;
     """,
@@ -194,7 +194,7 @@ _create_observation_query = DQLQuery(
         (catalog_id, datastream_id, phenomenon_time, result_value, result_quality, parameters)
     VALUES
         (:catalog_id, :datastream_id, :phenomenon_time,
-         :result_value, :result_quality, :parameters::jsonb)
+         :result_value, :result_quality, CAST(:parameters AS jsonb))
     RETURNING id, catalog_id, datastream_id, phenomenon_time, result_time,
               result_value, result_quality, parameters;
     """,
@@ -319,7 +319,7 @@ async def update_system(
             if k == "geometry":
                 set_parts.append("geometry = ST_GeomFromGeoJSON(:geometry)")
             elif k == "properties":
-                set_parts.append(f'"properties" = :properties::jsonb')
+                set_parts.append(f'"properties" = CAST(:properties AS jsonb)')
             else:
                 set_parts.append(f'"{k}" = :{k}')
         set_clause = ", ".join(set_parts)

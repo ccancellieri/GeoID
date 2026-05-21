@@ -54,7 +54,7 @@ _PRIVATE_ITEMS_DRIVER_REF = "items_elasticsearch_private_driver"
 def _partition_uuid_inputs(geoids: List[str]) -> Tuple[List[str], List[str]]:
     """Split caller-supplied geoid strings into (valid_uuid, invalid) lists.
 
-    The hub query casts ``ANY(:geoids::uuid[])`` and asyncpg raises
+    The hub query casts ``ANY(CAST(:geoids AS uuid[]))`` and asyncpg raises
     ``InvalidTextRepresentation`` for any non-UUID element — which the
     surrounding ``try/except`` swallows, producing a silent empty result
     for the entire batch (#975). Pre-filtering here lets valid inputs
@@ -170,7 +170,7 @@ async def _hub_geoid_lookup(
     sql = f"""
         SELECT geoid::text AS geoid
         FROM   "{schema}"."{physical_table}"
-        WHERE  geoid = ANY(:geoids::uuid[])
+        WHERE  geoid = ANY(CAST(:geoids AS uuid[]))
           AND  deleted_at IS NULL
     """
     try:

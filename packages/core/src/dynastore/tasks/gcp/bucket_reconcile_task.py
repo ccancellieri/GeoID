@@ -196,7 +196,7 @@ INSERT INTO "{schema}".assets
      filename, uri, owned_by, created_at, updated_at, metadata)
 VALUES
     (:asset_id, :catalog_id, :collection_id, :asset_type, :kind, :status,
-     :filename, :uri, :owned_by, :created_at, :updated_at, :metadata::jsonb)
+     :filename, :uri, :owned_by, :created_at, :updated_at, CAST(:metadata AS jsonb))
 """.strip()
 
 
@@ -204,7 +204,7 @@ _UPDATE_GHOST_SQL = """
 UPDATE "{schema}".assets
 SET status = 'failed',
     updated_at = NOW(),
-    metadata = COALESCE(metadata, '{{}}'::jsonb) || :patch::jsonb
+    metadata = COALESCE(metadata, '{{}}'::jsonb) || CAST(:patch AS jsonb)
 WHERE catalog_id = :catalog_id
   AND collection_id IS NOT DISTINCT FROM :collection_id
   AND asset_id = :asset_id
@@ -215,7 +215,7 @@ _UPDATE_STUCK_PENDING_SQL = """
 UPDATE "{schema}".assets
 SET status = 'failed',
     updated_at = NOW(),
-    metadata = COALESCE(metadata, '{{}}'::jsonb) || :patch::jsonb
+    metadata = COALESCE(metadata, '{{}}'::jsonb) || CAST(:patch AS jsonb)
 WHERE catalog_id = :catalog_id
   AND collection_id IS NOT DISTINCT FROM :collection_id
   AND asset_id = :asset_id

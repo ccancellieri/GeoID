@@ -1632,7 +1632,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     ) -> None:
         """JSON-merge the ticket fields into ``metadata._upload`` post-commit.
 
-        ``metadata = metadata || :upload_meta::jsonb`` is the standard PG
+        ``metadata = metadata || CAST(:upload_meta AS jsonb)`` is the standard PG
         idiom for shallow merging — the existing keys are preserved and only
         the ``_upload`` slot is overwritten. Uses :class:`DQLQuery` so the
         same code path serves async (production) and sync (tests) engines.
