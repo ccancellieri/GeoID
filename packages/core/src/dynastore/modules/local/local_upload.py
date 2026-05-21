@@ -53,8 +53,12 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, ClassVar, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
+from dynastore.modules.local.local_upload_store import (
+    LocalUploadTicketStore,
+    ensure_local_upload_tickets_table,
+)
 from dynastore.modules.protocols import ModuleProtocol
 
 logger = logging.getLogger(__name__)
@@ -87,21 +91,6 @@ class LocalUploadModule(ModuleProtocol):
     # should disable local upload but never abort the catalog.
     priority: int = 50
 
-    # ticket_id → {asset_id, catalog_id, collection_id, filename, expires_at, status, asset_id_result}
-    #
-    # Class-level (process-wide) on purpose. The module is instantiated more
-    # than once during startup (e.g. once per lifespan registration pass). Each
-    # instance registers the ``POST /local-upload/{ticket_id}`` route, but
-    # FastAPI serves the FIRST instance's closure while ``register_plugin``
-    # makes the LAST instance the resolved ``AssetUploadProtocol`` driver. With
-    # a per-instance dict, ``initiate_upload`` would stamp the ticket on the
-    # driver instance and the receive route would read a different instance's
-    # empty dict → 404 on every upload. A single shared registry keeps the
-    # initiate and receive paths consistent regardless of which instance owns
-    # each one. (Multi-worker / multi-replica correctness still needs a
-    # persistent store — tracked as a follow-up.)
-    _upload_tickets: ClassVar[Dict[str, Dict[str, Any]]] = {}
-
     def __init__(
         self,
         staging_dir: Optional[str] = None,
@@ -115,8 +104,25 @@ class LocalUploadModule(ModuleProtocol):
             asset_dir
             or os.environ.get("LOCAL_ASSET_DIR", "/tmp/dynastore/assets")
         )
-        # ``_upload_tickets`` is class-level (see the ClassVar above); no
-        # per-instance assignment so all instances in this process share it.
+
+    # The ticket registry is PostgreSQL-backed (see ``local_upload_store``).
+    # Tickets MUST survive across uvicorn workers and Cloud Run replicas: an
+    # ``initiate_upload`` handled by one process stamps a ticket the
+    # ``POST /local-upload/{ticket_id}`` receive — which may land on a
+    # different process — has to resolve. A process-local dict 404s those
+    # cross-replica receives. The store is keyed by ``ticket_id`` in the
+    # global ``tasks`` schema so any process resolves any ticket.
+    @property
+    def _tickets(self) -> LocalUploadTicketStore:
+        from dynastore.tools.protocol_helpers import get_engine
+
+        engine = get_engine()
+        if engine is None:
+            raise RuntimeError(
+                "LocalUploadModule: database engine unavailable; the upload "
+                "ticket store requires PostgreSQL."
+            )
+        return LocalUploadTicketStore(engine)
 
     # -------------------------------------------------------------------------
     # Lifespan
@@ -132,6 +138,28 @@ class LocalUploadModule(ModuleProtocol):
         logger.info(
             f"LocalUploadModule: staging={self._staging_root}, assets={self._asset_root}"
         )
+
+        # Provision the shared ticket table. The DB module (priority 10) has
+        # already installed the engine by the time this module (priority 50)
+        # runs its lifespan. Table creation lives in a dedicated DDL helper —
+        # never inlined here — and is idempotent (IF NOT EXISTS).
+        from dynastore.tools.protocol_helpers import get_engine
+
+        engine = get_engine()
+        if engine is not None:
+            try:
+                await ensure_local_upload_tickets_table(engine)
+            except Exception as exc:  # noqa: BLE001 — never abort the catalog
+                logger.error(
+                    "LocalUploadModule: failed to provision the upload ticket "
+                    "table: %s. Local upload will be unavailable until the next "
+                    "boot.", exc,
+                )
+        else:
+            logger.warning(
+                "LocalUploadModule: database engine unavailable at lifespan; "
+                "skipping ticket-table provisioning (worker context?)."
+            )
 
         # Modules receive ``app.state`` (a starlette State / SimpleNamespace),
         # not the FastAPI app itself. ``main.py`` exposes the app via
@@ -193,20 +221,18 @@ class LocalUploadModule(ModuleProtocol):
             Streams the bytes to staging, registers the asset synchronously, and
             returns ``UploadStatusResponse(status=completed)`` immediately.
             """
-            ticket = self._upload_tickets.get(ticket_id)
+            store = self._tickets
+            ticket = await store.get(ticket_id)
             if not ticket:
+                # ``get`` already prunes an expired row and returns None, so a
+                # missing-or-expired ticket collapses to a single 404 here.
                 raise HTTPException(
                     status_code=http_status.HTTP_404_NOT_FOUND,
                     detail=f"Upload ticket '{ticket_id}' not found or expired.",
                 )
-            if datetime.now(timezone.utc) > ticket["expires_at"]:
-                self._upload_tickets.pop(ticket_id, None)
-                raise HTTPException(
-                    status_code=http_status.HTTP_404_NOT_FOUND,
-                    detail=f"Upload ticket '{ticket_id}' has expired.",
-                )
 
             ticket["status"] = UploadStatus.UPLOADING
+            await store.update(ticket_id, {"status": UploadStatus.UPLOADING})
 
             # 1. Stream to staging
             staging_path = self._staging_root / ticket_id / ticket["filename"]
@@ -216,7 +242,10 @@ class LocalUploadModule(ModuleProtocol):
                     while chunk := await file.read(1 << 20):  # 1 MiB chunks
                         fh.write(chunk)
             except Exception as exc:
-                ticket["status"] = UploadStatus.FAILED
+                await store.update(
+                    ticket_id,
+                    {"status": UploadStatus.FAILED, "error": str(exc)},
+                )
                 logger.error(f"LocalUploadModule: write to staging failed: {exc}")
                 raise HTTPException(
                     status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -227,7 +256,10 @@ class LocalUploadModule(ModuleProtocol):
             try:
                 asset = await self._complete_upload(ticket_id, staging_path, ticket)
             except Exception as exc:
-                ticket["status"] = UploadStatus.FAILED
+                await store.update(
+                    ticket_id,
+                    {"status": UploadStatus.FAILED, "error": str(exc)},
+                )
                 logger.error(f"LocalUploadModule: complete_upload failed: {exc}")
                 raise HTTPException(
                     status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -378,16 +410,19 @@ class LocalUploadModule(ModuleProtocol):
 
         from dynastore.models.protocols import UploadStatus
 
-        self._upload_tickets[ticket_id] = {
-            "asset_id": asset_def.asset_id,
-            "catalog_id": catalog_id,
-            "collection_id": collection_id,
-            "filename": filename,
-            "content_type": content_type or "application/octet-stream",
-            "asset_def": asset_def,
-            "expires_at": expires_at,
-            "status": UploadStatus.PENDING,
-        }
+        await self._tickets.put(
+            ticket_id,
+            {
+                "asset_id": asset_def.asset_id,
+                "catalog_id": catalog_id,
+                "collection_id": collection_id,
+                "filename": filename,
+                "content_type": content_type or "application/octet-stream",
+                "asset_def": asset_def,
+                "expires_at": expires_at,
+                "status": UploadStatus.PENDING,
+            },
+        )
 
         logger.info(
             f"LocalUploadModule.initiate_upload: ticket '{ticket_id}' created "
@@ -422,18 +457,14 @@ class LocalUploadModule(ModuleProtocol):
         from fastapi import HTTPException, status as http_status
         from dynastore.models.protocols import UploadStatus, UploadStatusResponse
 
-        ticket = self._upload_tickets.get(ticket_id)
+        store = self._tickets
+        ticket = await store.get(ticket_id)
         if not ticket:
+            # ``get`` prunes an expired row before returning None, so missing
+            # and expired both collapse to this single 404.
             raise HTTPException(
                 status_code=http_status.HTTP_404_NOT_FOUND,
                 detail=f"Upload ticket '{ticket_id}' not found or expired.",
-            )
-
-        if datetime.now(timezone.utc) > ticket["expires_at"]:
-            self._upload_tickets.pop(ticket_id, None)
-            raise HTTPException(
-                status_code=http_status.HTTP_404_NOT_FOUND,
-                detail=f"Upload ticket '{ticket_id}' has expired.",
             )
 
         if ticket["catalog_id"] != catalog_id:
@@ -446,7 +477,7 @@ class LocalUploadModule(ModuleProtocol):
 
         if current_status == UploadStatus.COMPLETED:
             asset_id = ticket.get("asset_id_result") or ticket["asset_id"]
-            self._upload_tickets.pop(ticket_id, None)
+            await store.delete(ticket_id)
             return UploadStatusResponse(
                 ticket_id=ticket_id,
                 status=UploadStatus.COMPLETED,
@@ -558,6 +589,13 @@ class LocalUploadModule(ModuleProtocol):
 
         ticket["status"] = UploadStatus.COMPLETED
         ticket["asset_id_result"] = asset.asset_id
+        await self._tickets.update(
+            ticket_id,
+            {
+                "status": UploadStatus.COMPLETED,
+                "asset_id_result": asset.asset_id,
+            },
+        )
         logger.info(
             f"LocalUploadModule: asset '{asset.asset_id}' registered at {uri} "
             f"(catalog={catalog_id}, collection={collection_id})."

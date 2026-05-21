@@ -1551,13 +1551,11 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             )
 
         # 6. Idempotent paths: if the policy short-circuited to an existing
-        #    row, look up its previously-issued ticket (when any) and return
-        #    it instead of minting a new one. The driver's _upload_tickets
-        #    dict is the source of truth for live sessions; if the existing
-        #    row pre-dates this driver instance (e.g. process restart) the
-        #    cached ticket is gone and we surface the row as already-active
-        #    via UploadStatus completion semantics — the client should
-        #    re-poll status rather than expect a fresh URL.
+        #    row, reconstruct its previously-issued ticket from the row's
+        #    persisted ``metadata._upload`` blob (stamped at initiate time)
+        #    and return it instead of minting a new one. The blob survives
+        #    process restarts and is visible to every replica, so a resumed
+        #    upload resolves regardless of which process initiated it.
         if result.action in {"refused", "returned_existing", "updated"}:
             existing_ticket = self._extract_existing_ticket(result.row)
             if existing_ticket:

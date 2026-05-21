@@ -17,22 +17,74 @@ Unit tests for LocalUploadModule.
 
 Covers (no DB, no filesystem side-effects via tmp_path):
 - AssetUploadProtocol isinstance compliance
-- initiate_upload: ticket shape, staging dir created, ticket stored
-- get_upload_status: PENDING, COMPLETED (cleans up), FAILED, 404 (unknown), expiry, catalog mismatch
-- _complete_upload: moves file, calls create_asset, sets ticket COMPLETED
-- Ticket expiry logic in both get_upload_status and receive endpoint path
+- initiate_upload: ticket shape, staging dir created, ticket persisted
+- get_upload_status: PENDING, COMPLETED (cleans up), FAILED, 404 (unknown),
+  expiry, catalog mismatch
+- _complete_upload: moves file, finalize/create_asset, persists COMPLETED
+- Cross-replica visibility: a ticket written via one module instance's store
+  resolves through a *different* instance's store (the multi-worker /
+  multi-replica fix — the registry is no longer process-local).
+
+The PostgreSQL-backed :class:`LocalUploadTicketStore` is replaced by an
+in-memory fake (``FakeTicketStore``) patched onto ``LocalUploadModule._tickets``
+so these stay pure unit tests; the SQL store itself is exercised in
+``test_local_upload_store.py``.
 """
 
-import asyncio
-import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from dynastore.modules.local.local_upload import LocalUploadModule
-from dynastore.models.protocols import AssetUploadProtocol, UploadStatus, UploadStatusResponse
+from dynastore.models.protocols import (
+    AssetUploadProtocol,
+    UploadStatus,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fake shared store — in-memory stand-in for the PG-backed registry
+# ---------------------------------------------------------------------------
+
+
+class FakeTicketStore:
+    """In-memory async stand-in for ``LocalUploadTicketStore``.
+
+    Mirrors the persistent store's public surface (put/get/update/delete) and
+    its TTL-on-read semantics. A single instance is shared across module
+    instances in a test so the cross-replica behaviour can be asserted.
+    """
+
+    def __init__(self) -> None:
+        self.rows: Dict[str, Dict[str, Any]] = {}
+
+    async def put(self, ticket_id: str, ticket: Dict[str, Any]) -> None:
+        self.rows[ticket_id] = dict(ticket)
+
+    async def get(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+        row = self.rows.get(ticket_id)
+        if row is None:
+            return None
+        if datetime.now(timezone.utc) > row["expires_at"]:
+            self.rows.pop(ticket_id, None)
+            return None
+        return dict(row)
+
+    async def update(self, ticket_id: str, fields: Dict[str, Any]) -> None:
+        row = self.rows.get(ticket_id)
+        if row is not None:
+            row.update(fields)
+
+    async def delete(self, ticket_id: str) -> None:
+        self.rows.pop(ticket_id, None)
+
+    async def prune_expired(self) -> None:
+        now = datetime.now(timezone.utc)
+        for tid in [t for t, r in self.rows.items() if r["expires_at"] < now]:
+            self.rows.pop(tid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +92,34 @@ from dynastore.models.protocols import AssetUploadProtocol, UploadStatus, Upload
 # ---------------------------------------------------------------------------
 
 
-def _make_module(tmp_path: Path) -> LocalUploadModule:
+def _make_module(tmp_path: Path, store: FakeTicketStore) -> LocalUploadModule:
     staging = tmp_path / "staging"
     assets = tmp_path / "assets"
-    return LocalUploadModule(staging_dir=str(staging), asset_dir=str(assets))
+    m = LocalUploadModule(staging_dir=str(staging), asset_dir=str(assets))
+    # The autouse fixture routes ``self._tickets`` to ``self._fake_store``.
+    object.__setattr__(m, "_fake_store", store)
+    return m
+
+
+@pytest.fixture(autouse=True)
+def _route_property_to_fake(monkeypatch):
+    """Route ``self._tickets`` to a per-instance fake store when one is set.
+
+    ``LocalUploadModule._tickets`` is a property that resolves a fresh
+    PG-backed store from the live engine. Tests set ``self._fake_store`` (an
+    in-memory ``FakeTicketStore``); when absent the property falls through to
+    the real engine resolver (exercised by ``TestEngineGuard``).
+    """
+    real_prop = LocalUploadModule._tickets
+
+    def _tickets(self):
+        fake = getattr(self, "_fake_store", None)
+        if fake is not None:
+            return fake
+        return real_prop.fget(self)
+
+    monkeypatch.setattr(LocalUploadModule, "_tickets", property(_tickets))
+    yield
 
 
 def _make_asset_def(asset_id: str = "asset_001") -> MagicMock:
@@ -61,15 +137,15 @@ def _make_asset_def(asset_id: str = "asset_001") -> MagicMock:
 
 class TestProtocolCompliance:
     def test_isinstance_asset_upload_protocol(self, tmp_path):
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         assert isinstance(m, AssetUploadProtocol)
 
     def test_has_initiate_upload(self, tmp_path):
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         assert callable(getattr(m, "initiate_upload", None))
 
     def test_has_get_upload_status(self, tmp_path):
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         assert callable(getattr(m, "get_upload_status", None))
 
 
@@ -81,7 +157,7 @@ class TestProtocolCompliance:
 class TestInitiateUpload:
     @pytest.mark.asyncio
     async def test_returns_upload_ticket(self, tmp_path):
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         ticket = await m.initiate_upload(
             catalog_id="cat1",
             asset_def=_make_asset_def(),
@@ -94,7 +170,7 @@ class TestInitiateUpload:
 
     @pytest.mark.asyncio
     async def test_ticket_id_in_url(self, tmp_path):
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         ticket = await m.initiate_upload(
             catalog_id="cat1",
             asset_def=_make_asset_def(),
@@ -104,7 +180,7 @@ class TestInitiateUpload:
 
     @pytest.mark.asyncio
     async def test_staging_dir_created(self, tmp_path):
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         ticket = await m.initiate_upload(
             catalog_id="cat1",
             asset_def=_make_asset_def(),
@@ -114,22 +190,23 @@ class TestInitiateUpload:
         assert staging_dir.is_dir()
 
     @pytest.mark.asyncio
-    async def test_ticket_stored_in_memory(self, tmp_path):
-        m = _make_module(tmp_path)
+    async def test_ticket_persisted_in_store(self, tmp_path):
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
         ticket = await m.initiate_upload(
             catalog_id="cat1",
             asset_def=_make_asset_def("my_asset"),
             filename="f.tif",
         )
-        assert ticket.ticket_id in m._upload_tickets
-        stored = m._upload_tickets[ticket.ticket_id]
+        stored = await store.get(ticket.ticket_id)
+        assert stored is not None
         assert stored["asset_id"] == "my_asset"
         assert stored["catalog_id"] == "cat1"
         assert stored["status"] == UploadStatus.PENDING
 
     @pytest.mark.asyncio
     async def test_content_type_in_headers(self, tmp_path):
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         ticket = await m.initiate_upload(
             catalog_id="cat1",
             asset_def=_make_asset_def(),
@@ -140,18 +217,20 @@ class TestInitiateUpload:
 
     @pytest.mark.asyncio
     async def test_collection_id_stored(self, tmp_path):
-        m = _make_module(tmp_path)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
         ticket = await m.initiate_upload(
             catalog_id="cat1",
             asset_def=_make_asset_def(),
             filename="f.tif",
             collection_id="coll_a",
         )
-        assert m._upload_tickets[ticket.ticket_id]["collection_id"] == "coll_a"
+        stored = await store.get(ticket.ticket_id)
+        assert stored["collection_id"] == "coll_a"
 
     @pytest.mark.asyncio
     async def test_ttl_is_one_hour(self, tmp_path):
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         before = datetime.now(timezone.utc)
         ticket = await m.initiate_upload("cat1", _make_asset_def(), "f.tif")
         after = datetime.now(timezone.utc)
@@ -166,9 +245,9 @@ class TestInitiateUpload:
 
 
 class TestGetUploadStatus:
-    def _seed_ticket(
+    async def _seed_ticket(
         self,
-        m: LocalUploadModule,
+        store: FakeTicketStore,
         *,
         ticket_id: str = "t1",
         catalog_id: str = "cat1",
@@ -180,46 +259,53 @@ class TestGetUploadStatus:
             if expired
             else datetime.now(timezone.utc) + timedelta(hours=1)
         )
-        m._upload_tickets[ticket_id] = {
-            "asset_id": "asset_001",
-            "catalog_id": catalog_id,
-            "collection_id": None,
-            "filename": "f.tif",
-            "expires_at": expires_at,
-            "status": status,
-        }
+        await store.put(
+            ticket_id,
+            {
+                "asset_id": "asset_001",
+                "catalog_id": catalog_id,
+                "collection_id": None,
+                "filename": "f.tif",
+                "expires_at": expires_at,
+                "status": status,
+            },
+        )
         return ticket_id
 
     @pytest.mark.asyncio
     async def test_pending(self, tmp_path):
-        m = _make_module(tmp_path)
-        tid = self._seed_ticket(m, status=UploadStatus.PENDING)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
+        tid = await self._seed_ticket(store, status=UploadStatus.PENDING)
         resp = await m.get_upload_status(ticket_id=tid, catalog_id="cat1")
         assert resp.status == UploadStatus.PENDING
         assert resp.asset_id is None
 
     @pytest.mark.asyncio
     async def test_uploading(self, tmp_path):
-        m = _make_module(tmp_path)
-        tid = self._seed_ticket(m, status=UploadStatus.UPLOADING)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
+        tid = await self._seed_ticket(store, status=UploadStatus.UPLOADING)
         resp = await m.get_upload_status(ticket_id=tid, catalog_id="cat1")
         assert resp.status == UploadStatus.UPLOADING
 
     @pytest.mark.asyncio
     async def test_completed_returns_asset_id_and_removes_ticket(self, tmp_path):
-        m = _make_module(tmp_path)
-        tid = self._seed_ticket(m, status=UploadStatus.COMPLETED)
-        m._upload_tickets[tid]["asset_id_result"] = "registered_asset"
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
+        tid = await self._seed_ticket(store, status=UploadStatus.COMPLETED)
+        await store.update(tid, {"asset_id_result": "registered_asset"})
         resp = await m.get_upload_status(ticket_id=tid, catalog_id="cat1")
         assert resp.status == UploadStatus.COMPLETED
         assert resp.asset_id == "registered_asset"
-        assert tid not in m._upload_tickets  # cleaned up
+        assert await store.get(tid) is None  # cleaned up
 
     @pytest.mark.asyncio
     async def test_failed_returns_error(self, tmp_path):
-        m = _make_module(tmp_path)
-        tid = self._seed_ticket(m, status=UploadStatus.FAILED)
-        m._upload_tickets[tid]["error"] = "disk full"
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
+        tid = await self._seed_ticket(store, status=UploadStatus.FAILED)
+        await store.update(tid, {"error": "disk full"})
         resp = await m.get_upload_status(ticket_id=tid, catalog_id="cat1")
         assert resp.status == UploadStatus.FAILED
         assert resp.error == "disk full"
@@ -227,7 +313,7 @@ class TestGetUploadStatus:
     @pytest.mark.asyncio
     async def test_unknown_ticket_raises_404(self, tmp_path):
         from fastapi import HTTPException
-        m = _make_module(tmp_path)
+        m = _make_module(tmp_path, FakeTicketStore())
         with pytest.raises(HTTPException) as exc_info:
             await m.get_upload_status(ticket_id="nonexistent", catalog_id="cat1")
         assert exc_info.value.status_code == 404
@@ -235,18 +321,20 @@ class TestGetUploadStatus:
     @pytest.mark.asyncio
     async def test_expired_ticket_raises_404_and_removes(self, tmp_path):
         from fastapi import HTTPException
-        m = _make_module(tmp_path)
-        tid = self._seed_ticket(m, expired=True)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
+        tid = await self._seed_ticket(store, expired=True)
         with pytest.raises(HTTPException) as exc_info:
             await m.get_upload_status(ticket_id=tid, catalog_id="cat1")
         assert exc_info.value.status_code == 404
-        assert tid not in m._upload_tickets
+        assert await store.get(tid) is None
 
     @pytest.mark.asyncio
     async def test_catalog_mismatch_raises_404(self, tmp_path):
         from fastapi import HTTPException
-        m = _make_module(tmp_path)
-        self._seed_ticket(m, catalog_id="cat1")
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
+        await self._seed_ticket(store, catalog_id="cat1")
         with pytest.raises(HTTPException) as exc_info:
             await m.get_upload_status(ticket_id="t1", catalog_id="cat_wrong")
         assert exc_info.value.status_code == 404
@@ -268,7 +356,8 @@ class TestCompleteUpload:
 
     @pytest.mark.asyncio
     async def test_moves_file_to_permanent(self, tmp_path):
-        m = _make_module(tmp_path)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
 
         # Create a fake staged file
         staging_file = tmp_path / "staging" / "t1" / "scene.tif"
@@ -283,6 +372,9 @@ class TestCompleteUpload:
             "asset_def": _make_asset_def("scene_001"),
             "status": UploadStatus.UPLOADING,
         }
+        await store.put(
+            "t1", {**ticket, "expires_at": datetime.now(timezone.utc) + timedelta(hours=1)}
+        )
 
         mock_asset = MagicMock()
         mock_asset.asset_id = "scene_001"
@@ -304,7 +396,8 @@ class TestCompleteUpload:
 
     @pytest.mark.asyncio
     async def test_uri_is_file_scheme(self, tmp_path):
-        m = _make_module(tmp_path)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
 
         staging_file = tmp_path / "staging" / "t2" / "f.tif"
         staging_file.parent.mkdir(parents=True)
@@ -318,6 +411,9 @@ class TestCompleteUpload:
             "asset_def": _make_asset_def("a1"),
             "status": UploadStatus.UPLOADING,
         }
+        await store.put(
+            "t2", {**ticket, "expires_at": datetime.now(timezone.utc) + timedelta(hours=1)}
+        )
 
         captured_uri = {}
 
@@ -341,7 +437,8 @@ class TestCompleteUpload:
 
     @pytest.mark.asyncio
     async def test_owned_by_local(self, tmp_path):
-        m = _make_module(tmp_path)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
 
         staging_file = tmp_path / "staging" / "t3" / "f.tif"
         staging_file.parent.mkdir(parents=True)
@@ -355,6 +452,9 @@ class TestCompleteUpload:
             "asset_def": _make_asset_def("a1"),
             "status": UploadStatus.UPLOADING,
         }
+        await store.put(
+            "t3", {**ticket, "expires_at": datetime.now(timezone.utc) + timedelta(hours=1)}
+        )
 
         captured_asset_base = {}
 
@@ -378,7 +478,8 @@ class TestCompleteUpload:
 
     @pytest.mark.asyncio
     async def test_ticket_marked_completed(self, tmp_path):
-        m = _make_module(tmp_path)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
 
         staging_file = tmp_path / "staging" / "t4" / "f.tif"
         staging_file.parent.mkdir(parents=True)
@@ -392,6 +493,9 @@ class TestCompleteUpload:
             "asset_def": _make_asset_def("a1"),
             "status": UploadStatus.UPLOADING,
         }
+        await store.put(
+            "t4", {**ticket, "expires_at": datetime.now(timezone.utc) + timedelta(hours=1)}
+        )
 
         mock_asset = MagicMock()
         mock_asset.asset_id = "a1"
@@ -405,12 +509,15 @@ class TestCompleteUpload:
         ):
             await m._complete_upload("t4", staging_file, ticket)
 
-        assert ticket["status"] == UploadStatus.COMPLETED
-        assert ticket["asset_id_result"] == "a1"
+        # The persisted row reflects COMPLETED + the registered asset id.
+        stored = await store.get("t4")
+        assert stored["status"] == UploadStatus.COMPLETED
+        assert stored["asset_id_result"] == "a1"
 
     @pytest.mark.asyncio
     async def test_collection_id_scopes_path(self, tmp_path):
-        m = _make_module(tmp_path)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
 
         staging_file = tmp_path / "staging" / "t5" / "f.tif"
         staging_file.parent.mkdir(parents=True)
@@ -424,6 +531,9 @@ class TestCompleteUpload:
             "asset_def": _make_asset_def("a1"),
             "status": UploadStatus.UPLOADING,
         }
+        await store.put(
+            "t5", {**ticket, "expires_at": datetime.now(timezone.utc) + timedelta(hours=1)}
+        )
 
         mock_asset = MagicMock()
         mock_asset.asset_id = "a1"
@@ -442,50 +552,38 @@ class TestCompleteUpload:
 
 
 # ---------------------------------------------------------------------------
-# Class-level ticket store (GAP 3) — shared across instances in the process
+# Shared ticket store — cross-replica / multi-worker visibility (issue #1171)
 # ---------------------------------------------------------------------------
 
 
 class TestSharedTicketStore:
-    """The module is instantiated more than once at startup. The instance that
-    answers ``initiate_upload`` may differ from the one whose route closure
-    answers ``POST /local-upload/{ticket_id}``. A per-instance dict would 404
-    every upload; the registry is class-level so both instances see one store.
+    """The registry is no longer a process-local ``ClassVar`` dict — it is the
+    PostgreSQL-backed :class:`LocalUploadTicketStore`. A ticket stamped by the
+    process handling ``initiate_upload`` MUST be resolvable by any other
+    process handling the ``POST /local-upload/{ticket_id}`` receive or the
+    status poll. Modelled here with one shared fake store behind two module
+    instances.
     """
-
-    @pytest.fixture(autouse=True)
-    def _clear_registry(self):
-        LocalUploadModule._upload_tickets.clear()
-        yield
-        LocalUploadModule._upload_tickets.clear()
-
-    def test_registry_is_class_level(self):
-        from typing import get_type_hints  # noqa: F401
-        # The attribute resolves to the same dict object on every instance and
-        # on the class itself.
-        a = LocalUploadModule(staging_dir="/tmp/s", asset_dir="/tmp/a")
-        b = LocalUploadModule(staging_dir="/tmp/s2", asset_dir="/tmp/a2")
-        assert a._upload_tickets is b._upload_tickets
-        assert a._upload_tickets is LocalUploadModule._upload_tickets
 
     @pytest.mark.asyncio
     async def test_ticket_from_one_instance_visible_to_another(self, tmp_path):
+        shared = FakeTicketStore()
+
         # Instance A is the resolved upload driver; it stores the ticket.
-        instance_a = _make_module(tmp_path / "a")
+        instance_a = _make_module(tmp_path / "a", shared)
         ticket = await instance_a.initiate_upload(
             catalog_id="cat1",
             asset_def=_make_asset_def("shared_asset"),
             filename="f.tif",
         )
 
-        # Instance B owns the FastAPI route closure. Its receive path reads the
-        # class-level store and must find the ticket A created.
-        instance_b = _make_module(tmp_path / "b")
-        seen = instance_b._upload_tickets.get(ticket.ticket_id)
+        # Instance B — a *different replica* — reads the same shared backend.
+        instance_b = _make_module(tmp_path / "b", shared)
+        seen = await instance_b._tickets.get(ticket.ticket_id)
         assert seen is not None
         assert seen["asset_id"] == "shared_asset"
 
-        # And the status endpoint on B resolves it too (no 404).
+        # And B's status endpoint resolves it too (no 404).
         resp = await instance_b.get_upload_status(
             ticket_id=ticket.ticket_id, catalog_id="cat1",
         )
@@ -493,7 +591,7 @@ class TestSharedTicketStore:
 
 
 # ---------------------------------------------------------------------------
-# Activation path (GAP 3b) — born-claimed PENDING row flips to ACTIVE
+# Activation path — born-claimed PENDING row flips to ACTIVE
 # ---------------------------------------------------------------------------
 
 
@@ -506,7 +604,8 @@ class TestFinalizePendingActivation:
 
     @pytest.mark.asyncio
     async def test_activates_existing_pending_row(self, tmp_path):
-        m = _make_module(tmp_path)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
 
         staging_file = tmp_path / "staging" / "t-act" / "f.tif"
         staging_file.parent.mkdir(parents=True)
@@ -520,6 +619,10 @@ class TestFinalizePendingActivation:
             "asset_def": _make_asset_def("a1"),
             "status": UploadStatus.UPLOADING,
         }
+        await store.put(
+            "t-act",
+            {**ticket, "expires_at": datetime.now(timezone.utc) + timedelta(hours=1)},
+        )
 
         activated = MagicMock()
         activated.asset_id = "a1"
@@ -553,12 +656,14 @@ class TestFinalizePendingActivation:
         assert captured["uri"].startswith("file:///")
         # size_bytes is derived from the staged file (5 bytes).
         assert captured["size_bytes"] == 5
-        assert ticket["status"] == UploadStatus.COMPLETED
-        assert ticket["asset_id_result"] == "a1"
+        stored = await store.get("t-act")
+        assert stored["status"] == UploadStatus.COMPLETED
+        assert stored["asset_id_result"] == "a1"
 
     @pytest.mark.asyncio
     async def test_falls_back_to_create_when_no_pending_row(self, tmp_path):
-        m = _make_module(tmp_path)
+        store = FakeTicketStore()
+        m = _make_module(tmp_path, store)
 
         staging_file = tmp_path / "staging" / "t-fb" / "f.tif"
         staging_file.parent.mkdir(parents=True)
@@ -572,6 +677,10 @@ class TestFinalizePendingActivation:
             "asset_def": _make_asset_def("a1"),
             "status": UploadStatus.UPLOADING,
         }
+        await store.put(
+            "t-fb",
+            {**ticket, "expires_at": datetime.now(timezone.utc) + timedelta(hours=1)},
+        )
 
         created = MagicMock()
         created.asset_id = "a1"
@@ -592,3 +701,23 @@ class TestFinalizePendingActivation:
         _, kwargs = mock_assets.create_asset.call_args
         assert kwargs["asset"].owned_by == "local"
         assert kwargs["asset"].uri.startswith("file:///")
+
+
+# ---------------------------------------------------------------------------
+# Engine-unavailable guard
+# ---------------------------------------------------------------------------
+
+
+class TestEngineGuard:
+    @pytest.mark.asyncio
+    async def test_tickets_property_raises_without_engine(self, tmp_path):
+        # No fake patched in → property falls through to the real engine
+        # resolver, which returns None in a unit context.
+        m = LocalUploadModule(
+            staging_dir=str(tmp_path / "s"), asset_dir=str(tmp_path / "a")
+        )
+        with patch(
+            "dynastore.tools.protocol_helpers.get_engine", return_value=None
+        ):
+            with pytest.raises(RuntimeError, match="database engine unavailable"):
+                _ = m._tickets
