@@ -75,6 +75,7 @@ from dynastore.modules.db_config.plugin_config import PluginConfig, require_conf
 from dynastore.modules.db_config.platform_config_service import (
     _register_schema,
     enforce_config_immutability,
+    restore_system_assigned_fields,
     run_apply_handlers,
     run_validate_handlers,
 )
@@ -449,8 +450,11 @@ class ConfigService(ConfigsProtocol):
                 current_data = await _cq.select_catalog_config_for_update(phys_schema).execute(
                     conn, ref_key=class_key
                 )
-                if current_data:
-                    current_config = cls.model_validate(current_data)
+                current_config = cls.model_validate(current_data) if current_data else None
+                # Strip caller values for machine-assigned (Computed) fields
+                # before enforce/persist (#1135) — works on first-write too.
+                restore_system_assigned_fields(cls, config, current_config)
+                if current_config is not None:
                     await enforce_config_immutability(
                         current_config, config,
                         catalog_id=catalog_id, collection_id=None, conn=conn,
@@ -540,8 +544,11 @@ class ConfigService(ConfigsProtocol):
                     collection_id=collection_id,
                     ref_key=class_key,
                 )
-                if current_data:
-                    current_config = cls.model_validate(current_data)
+                current_config = cls.model_validate(current_data) if current_data else None
+                # Strip caller values for machine-assigned (Computed) fields
+                # before enforce/persist (#1135) — works on first-write too.
+                restore_system_assigned_fields(cls, config, current_config)
+                if current_config is not None:
                     await enforce_config_immutability(
                         current_config, config,
                         catalog_id=catalog_id, collection_id=collection_id, conn=conn,

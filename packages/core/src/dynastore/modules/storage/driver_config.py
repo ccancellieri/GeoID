@@ -51,7 +51,7 @@ from dynastore.tools.secrets import Secret
 from dynastore.tools.ui_hints import ui
 
 from dynastore.models.protocols.typed_driver import _PluginDriverConfig
-from dynastore.models.mutability import Immutable, Mutable, WriteOnce
+from dynastore.models.mutability import Computed, Immutable, Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
@@ -693,14 +693,37 @@ class ItemsPostgresqlDriverConfig(CollectionDriverConfig):
         {DriverCapability.SYNC, DriverCapability.TRANSACTIONAL}
     )
 
-    # From PostgresStorageLocationConfig — WriteOnce: None → value allowed (set by
-    # ensure_storage()); once set to a non-None value, mutation is rejected.
-    physical_schema: WriteOnce[Optional[str]] = Field(
-        default=None, description="Override auto-resolved schema. Set once by ensure_storage()."
+    # ``physical_table`` is machine-assigned by ``ensure_storage()`` at
+    # provisioning and flows into SQL identifiers — it must never be supplied
+    # or altered by an API caller (would enable identifier injection and
+    # cross-collection table targeting; see #1135).  ``Computed`` marks it
+    # read-only on the wire AND opts it into the config-write strip
+    # (``restore_system_assigned_fields``), so any caller value on the external
+    # path is discarded.  The internal provisioner sets it via
+    # ``model_copy`` + ``check_immutability=False`` (which bypasses the strip).
+    #
+    # The catalog's physical schema is resolved from ``CatalogsProtocol``
+    # (system-generated, per-tenant); there is intentionally NO per-collection
+    # schema override field — a caller-settable schema would break tenant
+    # isolation (#1135 Issue 2 — the former ``physical_schema`` override was
+    # vestigial/read-nowhere and has been removed).
+    physical_table: Computed[Optional[str]] = Field(
+        default=None,
+        description="Machine-assigned physical table name (set by ensure_storage()). Read-only.",
     )
-    physical_table: WriteOnce[Optional[str]] = Field(
-        default=None, description="Override auto-resolved table. Set once by ensure_storage()."
-    )
+
+    @field_validator("physical_table")
+    @classmethod
+    def _validate_physical_table_identifier(cls, v: Optional[str]) -> Optional[str]:
+        """Defense-in-depth: reject any non-identifier ``physical_table`` at
+        validation time so a malformed value can never reach SQL even if a path
+        bypasses the resolver-level guard.  ``None`` (the default / unset) is
+        always allowed; the provisioner assigns a safe generated name."""
+        if v is None:
+            return v
+        from dynastore.tools.db import validate_sql_identifier
+
+        return validate_sql_identifier(v)
 
     # From CollectionPluginConfig — PG-specific structural fields.
     # Discriminated union via `sidecar_type`; default is EMPTY (M1b.2).

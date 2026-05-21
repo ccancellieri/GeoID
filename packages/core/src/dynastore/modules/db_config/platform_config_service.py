@@ -306,6 +306,44 @@ def __configs_protocol_ref():
     return ConfigsProtocol
 
 
+def restore_system_assigned_fields(
+    cls: Type["PluginConfig"],
+    config: "PluginConfig",
+    current_config: Optional["PluginConfig"],
+) -> None:
+    """Discard caller-supplied values for machine-assigned (``Computed``) fields.
+
+    ``Computed[...]`` fields (e.g. ``physical_table``) are assigned by the
+    internal provisioner and flow into SQL identifiers / physical resources —
+    an API caller must never set or change them (would enable identifier
+    injection and cross-collection/tenant targeting; #1135).  On the external
+    write path this restores each such field to the current persisted value, or
+    unsets it when there is no current value, in place on ``config``.
+
+    The internal provisioner writes with ``check_immutability=False`` and does
+    not call this, so it can still stamp the generated value.
+    """
+    from dynastore.models.mutability import computed_fields
+
+    sys_fields = computed_fields(cls)
+    if not sys_fields:
+        return
+    fields_set = getattr(config, "__pydantic_fields_set__", None)
+    for name in sys_fields:
+        current_val = (
+            getattr(current_config, name, None) if current_config is not None else None
+        )
+        # object.__setattr__ writes straight to the instance __dict__ (where
+        # pydantic v2 stores field values), bypassing validate_assignment — the
+        # value is already-persisted/None, so no re-validation is needed.
+        object.__setattr__(config, name, current_val)
+        if fields_set is not None:
+            if current_val is None:
+                fields_set.discard(name)
+            else:
+                fields_set.add(name)
+
+
 async def enforce_config_immutability(
     current_config: Optional["PluginConfig"],
     new_config: "PluginConfig",
@@ -314,43 +352,44 @@ async def enforce_config_immutability(
     collection_id: Optional[str] = None,
     conn: Any = None,
 ) -> None:
-    """Reject Immutable / WriteOnce field mutations once the physical
-    resource has been materialized.
+    """Reject Immutable / WriteOnce field mutations.
 
-    Three gates compose:
+    Gating:
     1. ``current_config is None`` → first write, no constraint.
-    2. ``not is_materialized(...)`` → physical layer empty; Immutable
-       fields are still safely changeable.  No enforcement.
-    3. Materialized → Immutable + WriteOnce checks fire as before.
+    2. ``WriteOnce`` fields lock as soon as they hold a non-None value —
+       **independent of materialization**.  They carry system-assigned
+       identity (e.g. ``engine_ref``) that must not change once stamped, even
+       before any data has landed (#1135).  Only the ``None → value`` first
+       transition is permitted.
+    3. ``Immutable`` fields are materialization-gated: editable while the
+       physical layer is empty, frozen once data lands (PR #738) — the
+       operator mental model for storage-layout fields.
 
-    ``WriteOnce`` semantics are unchanged either way (it's used for
-    system-assigned identity like ``physical_table``/``engine_ref`` that
-    transition None→value exactly once at provisioning).  Routing /
-    schema / storage layout fields marked ``Immutable[]`` become
-    editable on empty resources and frozen after data lands — which is
-    the operator mental model the markers were meant to encode.
+    Machine-assigned ``Computed`` fields (``physical_table``) are handled
+    upstream by ``restore_system_assigned_fields`` (caller value discarded
+    before this runs), so no caller can reach a divergence here.
     """
     if current_config is None:
         return
     model_class = type(current_config)
     if not isinstance(new_config, model_class):
         return
-    if not await is_materialized(model_class, catalog_id, collection_id, conn):
-        return
+
+    materialized = await is_materialized(model_class, catalog_id, collection_id, conn)
     for field_name, field_info in model_class.model_fields.items():
         current_val = getattr(current_config, field_name)
         new_val = getattr(new_config, field_name)
-        if is_immutable_field(field_info):
-            if current_val != new_val:
-                raise ImmutableConfigError(
-                    f"Configuration field '{field_name}' in '{model_class.__name__}' is Immutable. "
-                    f"Modification forbidden: {current_val} -> {new_val}"
-                )
-        elif is_write_once_field(field_info):
+        if is_write_once_field(field_info):
             if current_val is not None and current_val != new_val:
                 raise ImmutableConfigError(
                     f"Configuration field '{field_name}' in '{model_class.__name__}' is WriteOnce. "
                     f"Cannot change a non-None value: {current_val!r} -> {new_val!r}"
+                )
+        elif materialized and is_immutable_field(field_info):
+            if current_val != new_val:
+                raise ImmutableConfigError(
+                    f"Configuration field '{field_name}' in '{model_class.__name__}' is Immutable. "
+                    f"Modification forbidden: {current_val} -> {new_val}"
                 )
 
 
@@ -633,7 +672,12 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 old_config = cls.model_validate(current_data) if not isinstance(
                     current_data, cls
                 ) else current_data
-                if check_immutability:
+            if check_immutability:
+                # Discard caller values for machine-assigned (Computed) fields
+                # BEFORE enforcement/persist (#1135). Internal provisioning uses
+                # check_immutability=False and is unaffected.
+                restore_system_assigned_fields(cls, config, old_config)
+                if old_config is not None:
                     await enforce_config_immutability(
                         old_config, config,
                         catalog_id=None, collection_id=None, conn=conn,

@@ -44,6 +44,7 @@ from typing import (
     Any,
     ClassVar,
     Dict,
+    FrozenSet,
     Iterable,
     Protocol,
     Type,
@@ -199,6 +200,25 @@ def is_write_once_field(field_info: "FieldInfo") -> bool:
     return False
 
 
+def is_computed_field(field_info: "FieldInfo") -> bool:
+    """True when the field is marked ``Computed[...]`` — a stored value that is
+    machine-assigned (generated/recomputed by the system), never editable by an
+    external caller.  Such fields advertise ``readOnly`` and are stripped from
+    caller-supplied config payloads on the external write path."""
+    if get_origin(field_info.annotation) is Annotated:
+        args = get_args(field_info.annotation)
+        if ComputedMarker in args or Computed in args:
+            return True
+    if any(
+        item is ComputedMarker
+        or item is Computed
+        or (isinstance(item, type) and issubclass(item, ComputedMarker))
+        for item in field_info.metadata
+    ):
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 #  Introspection helpers
 # ---------------------------------------------------------------------------
@@ -253,6 +273,19 @@ def missing_markers(cls: Type[Any]) -> Iterable[str]:
     for name in model_fields:
         if _extract_kind(hints.get(name)) is None:
             yield name
+
+
+def computed_fields(cls: Type[Any]) -> FrozenSet[str]:
+    """Names of ``Computed[...]`` fields on a Pydantic model class.
+
+    These are machine-assigned/generated stored fields. The config write path
+    uses this set to discard caller-supplied values on the external (non-trusted)
+    write path — system-assigned fields can never be set or changed by an API
+    caller, only by the internal provisioner (which writes with
+    ``check_immutability=False``)."""
+    return frozenset(
+        name for name, kind in mutability_map(cls).items() if kind == "computed"
+    )
 
 
 @runtime_checkable

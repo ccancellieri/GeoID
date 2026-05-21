@@ -323,7 +323,11 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         schema = await catalogs.resolve_physical_schema(catalog_id, ctx=DriverContext(db_resource=db_resource))
         if not schema:
             raise ValueError(f"No physical schema found for catalog '{catalog_id}'")
-        return schema
+        # SQL-boundary guard (#1135): the schema name is interpolated into f-string
+        # SQL identifiers throughout this driver — never let an unsafe value through,
+        # regardless of how it was stored/resolved.
+        from dynastore.tools.db import validate_sql_identifier
+        return validate_sql_identifier(schema)
 
     async def resolve_physical_table(
         self,
@@ -336,7 +340,15 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         config = await self.get_driver_config(
             catalog_id, collection_id, db_resource=db_resource
         )
-        return config.physical_table
+        table = config.physical_table
+        if table is None:
+            return None
+        # SQL-boundary guard (#1135): ``physical_table`` is interpolated into
+        # f-string SQL identifiers — validate before returning so a value that
+        # bypassed config validation (legacy row, model_copy, extra="allow")
+        # can never reach SQL.
+        from dynastore.tools.db import validate_sql_identifier
+        return validate_sql_identifier(table)
 
     async def set_physical_table(
         self,
@@ -435,6 +447,11 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                 return d
 
             merged = deep_update(base_dump, layer_config_dict)
+            # ``physical_table`` is machine-assigned; a layer_config overlay must
+            # never be able to point this collection at an arbitrary table
+            # (#1135).  Pin it to the trusted stored value (or None for a fresh
+            # collection) regardless of what the overlay carried.
+            merged["physical_table"] = col_config.physical_table
             try:
                 col_config = ItemsPostgresqlDriverConfig.model_validate(merged)
             except Exception as e:
@@ -1456,6 +1473,20 @@ async def _pg_driver_init_collection(
             type(layer_config).__name__, catalog_id, collection_id,
         )
         return
+
+    # ``physical_table`` is machine-assigned by ``ensure_storage()`` — never
+    # honour a caller-supplied value at collection creation (#1135).  Drop it
+    # from the explicit field set so it is neither persisted nor counted toward
+    # the default-fast guard below.  (The generic config-write strip enforces
+    # the same on the PATCH path; this is the create-path belt-and-suspenders.)
+    if pg_config.physical_table is not None:
+        logger.warning(
+            "PG init_collection: ignoring caller-supplied physical_table=%r for "
+            "%s/%s — it is machine-assigned.",
+            pg_config.physical_table, catalog_id, collection_id,
+        )
+        pg_config = pg_config.model_copy(update={"physical_table": None})
+        pg_config.__pydantic_fields_set__.discard("physical_table")
 
     # The default-fast guard: persist only when the caller supplied at
     # least one PG-specific field explicitly.  A bare
