@@ -18,7 +18,7 @@
 
 import logging
 import asyncio
-from typing import List, Optional, Dict, Any, Union, Callable, Awaitable
+from typing import Optional, Dict, Any
 
 # Hard runtime dep — see modules/elasticsearch/module.py for rationale.
 # Forces entry-point load to fail on services without ``GDAL`` (the osgeo
@@ -32,7 +32,6 @@ from osgeo import gdal as _gdal  # noqa: F401
 from dynastore.modules.catalog.asset_service import (
     Asset,
     AssetTypeEnum,
-    AssetService,
     AssetUpdate,
 )
 from dynastore.modules.tasks.models import TaskPayload
@@ -103,23 +102,25 @@ class GdalInfoTask(TaskProtocol, AssetTasksSPI):
         else:
             inputs = {}
 
-        asset_uri = inputs.get("asset_uri")
         asset_id = inputs.get("asset_id")
+        catalog_id = inputs.get("catalog_id")
+        collection_id = inputs.get("collection_id")
 
-        if not asset_uri or not asset_id:
+        # Locator-driven contract: callers supply identifiers only; the task
+        # resolves the asset (and its URI) itself. When invoked at a scoped OGC
+        # endpoint the path identifiers are already injected into ``inputs``;
+        # direct callers pass them in the request body.
+        if not asset_id or not catalog_id:
             raise ValueError(
-                "Asset information (uri, id) is missing in task inputs for GdalInfoTask."
+                "GdalInfoTask requires 'asset_id' and 'catalog_id' in inputs."
             )
 
-        # Ensure we have the asset object (passed via payload)
+        # Prefer the asset object carried on the payload; otherwise resolve it
+        # from the locators.
         asset: Optional[Asset] = payload.asset
-
         if asset is None:
-            # Fallback attempt to fetch if missing in payload but present in inputs
-            catalog_id = inputs.get("catalog_id")
-            collection_id = inputs.get("collection_id")
             assets = get_protocol(AssetsProtocol)
-            if assets and catalog_id and asset_id:
+            if assets is not None:
                 asset = await assets.get_asset(
                     asset_id=asset_id,
                     catalog_id=catalog_id,
@@ -127,7 +128,18 @@ class GdalInfoTask(TaskProtocol, AssetTasksSPI):
                 )
 
         if asset is None:
-            raise ValueError(f"Asset '{asset_id}' could not be resolved.")
+            raise ValueError(
+                f"Asset '{asset_id}' could not be resolved from catalog "
+                f"'{catalog_id}'."
+            )
+
+        # The asset row is the source of truth for the URI and type.
+        asset_uri = str(asset.uri) if asset.uri else None
+        if not asset_uri:
+            raise ValueError(
+                f"Asset '{asset_id}' has no URI to inspect with GDAL."
+            )
+        asset_type = asset.asset_type.value if asset.asset_type else None
 
         from dynastore.modules.gcp.tools import bucket as bucket_tool
 
@@ -137,7 +149,6 @@ class GdalInfoTask(TaskProtocol, AssetTasksSPI):
 
         info = {}
         try:
-            asset_type = inputs.get("asset_type")
             if asset_type == AssetTypeEnum.RASTER.value:
                 info = await asyncio.to_thread(gdal_module.get_raster_info, gdal_path)
             else:

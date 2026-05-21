@@ -22,7 +22,6 @@ from pydantic import ValidationError
 
 from dynastore.modules.db_config.query_executor import DbEngine
 from dynastore.modules import get_protocol
-from dynastore.modules.tasks import runners
 from dynastore.modules.tasks.models import TaskExecutionMode
 from dynastore.modules.processes import models
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
@@ -37,11 +36,20 @@ logger = logging.getLogger(__name__)
 def _resolve_execution_mode(
     process: models.Process,
     preferred_mode: Optional[models.JobControlOptions],
+    has_request_context: bool = False,
 ) -> TaskExecutionMode:
     """
     Determine execution mode from caller preference + process constraints.
 
-    Raises NotImplementedError if no runners are available for any
+    A mode is only viable if some registered runner can actually *handle this
+    process* in that mode — not merely that some runner exists for the mode.
+    This is what makes execution deployment-aware: e.g. ``gdal`` resolves to
+    SYNCHRONOUS where the worker carries the osgeo runtime in-process, and to
+    ASYNCHRONOUS where only a Cloud Run job runner can claim it. Picking a mode
+    on bare existence would select an in-process runner that then can't run the
+    task, surfacing as a late failure instead of correct routing.
+
+    Raises NotImplementedError if no runner can handle the process in any
     supported mode.
     """
     candidate_modes = []
@@ -60,11 +68,13 @@ def _resolve_execution_mode(
         else:
             continue
 
-        if runners.get_runners(check_mode):
+        if execution_engine.get_runners_for(
+            process.id, check_mode, has_request_context=has_request_context
+        ):
             return check_mode
 
     raise NotImplementedError(
-        f"No available execution mode for process '{process.id}'."
+        f"No runner can execute process '{process.id}' in any supported mode."
     )
 
 
@@ -137,8 +147,12 @@ async def execute_process(
     # 2. Validate inputs.
     _validate_process_inputs(process, execution_request)
 
-    # 3. Determine execution mode.
-    execution_mode = _resolve_execution_mode(process, preferred_mode)
+    # 3. Determine execution mode. ``background_tasks`` is the request-context
+    # signal runners use to gate in-process execution, so thread it into the
+    # capability check that picks the mode.
+    execution_mode = _resolve_execution_mode(
+        process, preferred_mode, has_request_context=background_tasks is not None
+    )
 
     # 4. Resolve DB schema and delegate to ExecutionEngine.
     db_schema = "public"
