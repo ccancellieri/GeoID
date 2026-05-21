@@ -282,25 +282,6 @@ class TestCatalogAdminFlow:
             f"Bob {bob_target.principal_id} not in lookup result {found_ids}"
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Catalog-tier-only admin reaching admin_catalog_access via "
-            "REST wiring of (a) condition required_roles + (b) role→"
-            "policy binding 403s with 'No matching ALLOW policy found' "
-            "in observed local runs. Root cause UNDIAGNOSED — "
-            "PolicyService.update_policy already calls invalidate_cache() "
-            "and catalog_admin_required reads its config fresh, so the "
-            "first-cut 'registry caches startup snapshot' framing is "
-            "incomplete. Plausible candidates: stale get_membership_cached "
-            "(60s TTL, keyed on (provider, subject_id)), role→policy "
-            "binding not honored by the evaluator, or _augment_with_"
-            "catalog_sentinels not adding the catalog_admin sentinel. "
-            "Unit coverage in #983's test_catalog_grant_privileged_guard.py "
-            "exercises the same guard at the AdminService method level "
-            "and is green, so the gap is in the request → method path. "
-            "When diagnosed and fixed, drop this xfail; #723 will close."
-        ),
-    )
     async def test_alice_grants_bob_admin_in_her_catalog(
         self,
         in_process_client: AsyncClient,
@@ -311,11 +292,28 @@ class TestCatalogAdminFlow:
     ):
         """POST .../cat_a/principals/{bob}/roles {role: admin} → 204.
 
-        Pins #983 once the request-path gap is diagnosed: catalog admin
-        can appoint a colleague to ``admin`` in their own catalog
-        (platform-tier roles stay blocked). Today this 403s with
-        ``No matching ALLOW policy found`` — see xfail reason for the
-        list of plausible causes still to triage.
+        Pins #983: with the operator delegation wired
+        (``enable_catalog_admin_delegation`` binds ``admin_catalog_access``
+        to the ``catalog_admin`` sentinel and sets
+        ``required_roles=["admin"]``), the catalog's own admin can appoint
+        a colleague to ``admin`` inside her catalog while platform-tier
+        roles stay blocked.
+
+        Path of the ALLOW: ``IamMiddleware._augment_with_catalog_sentinels``
+        adds the ``catalog_admin`` sentinel to Alice's flat role list
+        (she holds ``admin`` in cat_a), the sentinel's ``admin_catalog_access``
+        binding makes the per-catalog mutation policy reachable, and that
+        policy's ``catalog_admin_required`` condition re-confirms Alice's
+        ``admin`` grant for cat_a — all on the live request path.
+
+        This previously carried a non-strict xfail attributing an observed
+        ``No matching ALLOW policy found`` to an "undiagnosed request-path
+        gap". That observation was a misdiagnosis: the denial originated in
+        the ``setup_catalogs`` / ``alice_admin_of_cat_a`` fixtures failing
+        under cross-process test-DB churn (catalog creation / sysadmin
+        grant 403/401/500 while a concurrent run reset the shared schema),
+        not in Alice's own grant. Run in isolation against a stable DB the
+        grant is deterministically 204.
         """
         cat_a, _ = setup_catalogs
         resp = await in_process_client.post(
