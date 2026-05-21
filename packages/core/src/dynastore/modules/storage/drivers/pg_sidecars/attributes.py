@@ -1233,22 +1233,33 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                     "valid_to"
                 )
 
-        # 5b. Explicit value-source override (#1126 ValiditySpec.start_from /
-        # end_from). When the policy names a dotted source path (anything other
-        # than "context") the validity start/end VALUE is extracted from the
-        # feature at that path, overriding the heuristic resolution above.
-        # "context" preserves the default (write_context.valid_from / valid_to,
-        # injected downstream by finalize_payload).
+        # 5b. Explicit value-source override (#1126/#1172 ValiditySpec.start_from
+        # / end_from). Each bound is independent:
+        #   - "context"  → keep the heuristic resolution above (the write-context
+        #                  default is injected downstream by finalize_payload);
+        #   - any path   → extract the bound VALUE from the feature at that
+        #                  dotted path, overriding the heuristic resolution.
+        # ``start_from=None`` is the open-lower-bound case: it has no value
+        # source, so the heuristically resolved start is dropped here and
+        # ``finalize_upsert_payload`` builds ``tstzrange(NULL, …)`` (#1172).
+        # ``end_from=None`` is the historical default and is intentionally NOT
+        # forced here — an absent end value already yields an open upper bound,
+        # while a feature-provided end is still honoured by the heuristic.
         start_from = getattr(self.config, "validity_start_from", "context")
         end_from = getattr(self.config, "validity_end_from", None)
-        if start_from != "context" or (end_from is not None and end_from != "context"):
+        needs_path_walk = (start_from not in (None, "context")) or (
+            end_from not in (None, "context")
+        )
+        if needs_path_walk:
             feature_dict_for_paths: Dict[str, Any] = (
                 feature.model_dump() if isinstance(feature, Feature) else feature
             )
-            if start_from != "context":
+            if start_from not in (None, "context"):
                 valid_from = self._extract_value(feature_dict_for_paths, start_from)
-            if end_from is not None and end_from != "context":
+            if end_from not in (None, "context"):
                 valid_to = self._extract_value(feature_dict_for_paths, end_from)
+        if start_from is None:
+            valid_from = None  # open lower bound — no start value source
 
         if valid_from:
             if isinstance(valid_from, str):
@@ -1699,9 +1710,15 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
                 from datetime import datetime, timezone
 
-                # If start missing, MUST sync with Hub transaction_time to ensure join consistency.
-                # Do NOT rely on DB default CURRENT_TIMESTAMP as it will be > transaction_time.
-                if not v_from:
+                # ``validity_start_from=None`` means an OPEN lower bound: there is
+                # no start value source, so the window stays unbounded below
+                # (``tstzrange(NULL, v_to)``). Otherwise, a missing start MUST
+                # sync with the Hub transaction_time for join consistency — do
+                # NOT rely on the DB default CURRENT_TIMESTAMP, which would land
+                # later than transaction_time. The feature keeps its ingestion
+                # time regardless; this only affects the validity window. (#1172)
+                start_is_open = self.config.validity_start_from is None
+                if not v_from and not start_is_open:
                     v_from = hub_row.get("transaction_time") or datetime.now(
                         timezone.utc
                     )

@@ -37,10 +37,15 @@ The validity **VALUES** come from ``start_from`` / ``end_from``:
   ``write_context.valid_from`` / ``write_context.valid_to``;
 - any other string is a **dotted source path** walked into the feature
   (e.g. ``"properties.start_date"``);
-- ``end_from=None`` (the default) means open-ended (no upper bound).
+- ``None`` means that bound is **open** — there is no value source, so the
+  window is unbounded on that side. ``start_from=None`` yields an open lower
+  bound; ``end_from=None`` (the default) an open upper bound.
+
+The two bounds are fully independent, so all four states are expressible:
+start-only, end-only, both, and neither (a fully-open window).
 
 A feature always receives an ingestion time (``transaction_time``); the
-validity ``(from, to)`` window is optional.
+validity ``(from, to)`` window — and each of its bounds — is optional.
 """
 
 from __future__ import annotations
@@ -62,13 +67,14 @@ class ValiditySpec(BaseModel):
 
     Attributes:
         start_from: Where the validity-range **start** value comes from.
-            ``"context"`` (default) reads ``write_context.valid_from``; any
-            other value is a dotted source path walked into the feature
-            (e.g. ``"properties.start_date"``).
+            ``"context"`` (default) reads ``write_context.valid_from``;
+            ``None`` means an open lower bound (no start value source — the
+            window is unbounded below); any other value is a dotted source
+            path walked into the feature (e.g. ``"properties.start_date"``).
         end_from: Where the validity-range **end** value comes from.
-            ``None`` (default) means open-ended (no upper bound); ``"context"``
-            reads ``write_context.valid_to``; any other value is a dotted
-            source path walked into the feature.
+            ``None`` (default) means an open upper bound (no end value source);
+            ``"context"`` reads ``write_context.valid_to``; any other value is
+            a dotted source path walked into the feature.
         close_on_new_version: When ``on_conflict=NEW_VERSION`` archives a row,
             set the archived (old) row's validity upper bound so the temporal
             history stays non-overlapping.
@@ -76,6 +82,6 @@ class ValiditySpec(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    start_from: str = "context"
+    start_from: Optional[str] = "context"
     end_from: Optional[str] = None
     close_on_new_version: bool = True

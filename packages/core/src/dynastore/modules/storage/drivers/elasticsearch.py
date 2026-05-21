@@ -532,7 +532,13 @@ class ItemsElasticsearchDriver(
                 # Each version gets a unique doc_id. Store validity window.
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
                 stac_doc["id"] = f"{base_id}_{ts}" if base_id else ts
-                if valid_from is None:
+                # An open lower bound (ValiditySpec.start_from is None) keeps
+                # ``_valid_from`` unset; otherwise a missing start defaults to
+                # the ingestion instant for this new version. (#1172)
+                start_is_open = (
+                    policy.validity is not None and policy.validity.start_from is None
+                )
+                if valid_from is None and not start_is_open:
                     stac_doc["_valid_from"] = datetime.now(timezone.utc).isoformat()
 
             # Default (UPDATE): stable doc_id wins; the bulk action below

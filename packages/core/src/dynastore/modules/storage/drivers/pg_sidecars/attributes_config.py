@@ -297,22 +297,23 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
     # overlays these at ``ensure_storage`` time so the ingestion path resolves
     # the validity-range start/end without threading the policy itself.
     # ``"context"`` (default for start) reads ``write_context.valid_from`` /
-    # ``valid_to``; any other string is a dotted source path walked into the
-    # feature; ``validity_end_from=None`` means open-ended.
-    validity_start_from: str = Field(
+    # ``valid_to``; ``None`` means that bound is open (no value source); any
+    # other string is a dotted source path walked into the feature.
+    validity_start_from: Optional[str] = Field(
         default="context",
         description=(
             "Storage-shape mirror of ItemsWritePolicy.validity.start_from. "
-            "'context' reads write_context.valid_from; otherwise a dotted source "
-            "path walked into the feature. Overwritten by the driver at DDL time."
+            "'context' reads write_context.valid_from; None → open lower bound "
+            "(unbounded below); otherwise a dotted source path walked into the "
+            "feature. Overwritten by the driver at DDL time."
         ),
     )
     validity_end_from: Optional[str] = Field(
         default=None,
         description=(
             "Storage-shape mirror of ItemsWritePolicy.validity.end_from. None → "
-            "open-ended; 'context' reads write_context.valid_to; otherwise a "
-            "dotted source path walked into the feature. Overwritten by the "
+            "open upper bound; 'context' reads write_context.valid_to; otherwise "
+            "a dotted source path walked into the feature. Overwritten by the "
             "driver at DDL time."
         ),
     )

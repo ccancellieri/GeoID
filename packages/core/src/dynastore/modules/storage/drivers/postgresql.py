@@ -548,7 +548,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         #   validity_column       ← driver-owned fixed "validity" when validity is
         #                           enabled, else None (the PG storage layout — NOT
         #                           policy-configured; #1168)
-        #   validity_start_from   ← policy.validity.start_from ("context" or path)
+        #   validity_start_from   ← policy.validity.start_from (None/"context"/path)
         #   validity_end_from     ← policy.validity.end_from   (None/"context"/path)
         #   external_id_field  ← "external_id" when policy has EXTERNAL_ID rule,
         #                        None when absent

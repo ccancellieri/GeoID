@@ -117,6 +117,19 @@ class TestValiditySpec:
         spec = ValiditySpec()
         assert spec.start_from == "context"
 
+    def test_start_from_none_is_open_lower_bound(self):
+        """#1172 — ``start_from=None`` expresses an open lower bound; the two
+        bounds are fully independent so end-only / open-lower windows exist."""
+        spec = ValiditySpec(start_from=None, end_from="context")
+        assert spec.start_from is None
+        assert spec.end_from == "context"
+
+    def test_fully_open_window_is_expressible(self):
+        """#1172 — both bounds open (neither start nor end) is a valid state."""
+        spec = ValiditySpec(start_from=None, end_from=None)
+        assert spec.start_from is None
+        assert spec.end_from is None
+
 
 class TestSidecarNullObject:
     """The sidecar carries the PG driver's own ``validity_column`` storage-shape
@@ -443,6 +456,83 @@ class TestValidityValueExtraction:
         ctx: dict = {"geoid": "g1"}
         sc.prepare_upsert_payload({"id": "f1", "properties": {}}, ctx)
         assert "valid_from" not in ctx
+
+    def test_start_from_none_drops_heuristic_start(self):
+        """#1172 — ``validity_start_from=None`` (open lower bound) suppresses any
+        heuristically resolved start so no ``valid_from`` reaches the context,
+        even when the feature carries a ``valid_from`` property."""
+        sc = self._sidecar(validity_start_from=None)
+        ctx: dict = {"geoid": "g1"}
+        sc.prepare_upsert_payload(
+            {
+                "id": "f1",
+                "properties": {
+                    "valid_from": "2020-01-01T00:00:00Z",  # ignored — open lower
+                    "valid_to": "2022-01-01T00:00:00Z",
+                },
+            },
+            ctx,
+        )
+        assert "valid_from" not in ctx
+        assert ctx["valid_to"].year == 2022  # end bound still resolved
+
+
+class TestOpenLowerBoundFinalize:
+    """#1172 — ``finalize_upsert_payload`` must thread an open lower bound
+    (``tstzrange(NULL, v_to)``) when the start is configured as open, instead of
+    defaulting the lower bound to the Hub ``transaction_time``."""
+
+    _PG_VALIDITY_COLUMN = "validity"
+
+    @staticmethod
+    def _sidecar(**overrides):
+        from dynastore.modules.storage.drivers.pg_sidecars.attributes import (
+            FeatureAttributeSidecar,
+        )
+
+        cfg = FeatureAttributeSidecarConfig(
+            storage_mode=AttributeStorageMode.JSONB,
+            validity_column="validity",
+            **overrides,
+        )
+        return FeatureAttributeSidecar(cfg)
+
+    @staticmethod
+    def _bounds(rng):
+        """Read (lower, upper) from whichever tstzrange wrapper finalize built."""
+        lower = getattr(rng, "lower", None)
+        upper = getattr(rng, "upper", None)
+        return lower, upper
+
+    def test_open_lower_bound_when_start_is_none(self):
+        from datetime import datetime, timezone
+
+        sc = self._sidecar(validity_start_from=None)
+        hub = {"transaction_time": datetime(2020, 1, 1, tzinfo=timezone.utc)}
+        ctx = {"valid_to": datetime(2021, 1, 1, tzinfo=timezone.utc)}
+
+        out = sc.finalize_upsert_payload({"geoid": "g1"}, hub, ctx)
+
+        lower, upper = self._bounds(out["validity"])
+        # Open lower bound — NOT defaulted to transaction_time.
+        assert lower is None
+        assert upper == datetime(2021, 1, 1, tzinfo=timezone.utc)
+
+    def test_default_start_still_syncs_to_transaction_time(self):
+        """Regression guard: ``validity_start_from='context'`` (the default)
+        keeps the historical behaviour — a missing start syncs to the Hub
+        transaction_time, never an open lower bound."""
+        from datetime import datetime, timezone
+
+        sc = self._sidecar()  # validity_start_from defaults to "context"
+        hub = {"transaction_time": datetime(2020, 1, 1, tzinfo=timezone.utc)}
+        ctx = {"valid_to": datetime(2021, 1, 1, tzinfo=timezone.utc)}
+
+        out = sc.finalize_upsert_payload({"geoid": "g1"}, hub, ctx)
+
+        lower, upper = self._bounds(out["validity"])
+        assert lower == datetime(2020, 1, 1, tzinfo=timezone.utc)
+        assert upper == datetime(2021, 1, 1, tzinfo=timezone.utc)
 
 
 class TestByTimePartitionValidation:

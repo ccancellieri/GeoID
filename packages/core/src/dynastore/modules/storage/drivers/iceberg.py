@@ -447,7 +447,9 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
 
         Context keys honoured (only if ``enable_validity=True`` in policy):
           - ``asset_id``: stored as ``_asset_id`` column
-          - ``valid_from``: stored as ``_valid_from``; defaults to now()
+          - ``valid_from``: stored as ``_valid_from``; defaults to now() unless
+            ``ValiditySpec.start_from is None`` (open lower bound), in which case
+            ``_valid_from`` is left unset (#1172)
           - ``valid_to``: stored as ``_valid_to``
         """
         loc = await self._get_location_async(catalog_id, collection_id)
@@ -497,7 +499,16 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
             if asset_id is not None:
                 row["_asset_id"] = asset_id
             if policy.enable_validity:
-                row["_valid_from"] = valid_from or now_iso
+                # An open lower bound (ValiditySpec.start_from is None) leaves
+                # ``_valid_from`` unset; otherwise a missing start defaults to
+                # the ingestion instant. (#1172)
+                start_is_open = (
+                    policy.validity is not None and policy.validity.start_from is None
+                )
+                if valid_from is not None:
+                    row["_valid_from"] = valid_from
+                elif not start_is_open:
+                    row["_valid_from"] = now_iso
                 if valid_to is not None:
                     row["_valid_to"] = valid_to
 
