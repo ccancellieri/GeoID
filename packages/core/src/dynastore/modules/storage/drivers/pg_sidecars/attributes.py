@@ -1103,7 +1103,13 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         # Determine SQL expression
         sql_expr = None
-        if field_name in self.config.jsonb_indexed_paths:
+        data_type = "text"  # JSONB extraction defaults to text unless cast
+        if field_name == self.config.jsonb_column_name:
+            # The blob column itself — return the whole JSONB, not a sub-key.
+            # Mirrors ``resolve_query_path``.
+            sql_expr = f"{alias}.{self.config.jsonb_column_name}"
+            data_type = "jsonb"
+        elif field_name in self.config.jsonb_indexed_paths:
             cast_type = self.config.jsonb_indexed_paths[field_name].value
             sql_expr = f"({alias}.{self.config.jsonb_column_name}->>'{field_name}')::{cast_type}"
         elif field_name.startswith("properties."):
@@ -1121,7 +1127,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 FieldCapability.SORTABLE,
                 FieldCapability.GROUPABLE,
             ],
-            data_type="text",  # JSONB extraction defaults to text unless cast
+            data_type=data_type,
             aggregations=["count", "array_agg"],  # Basic aggregations
             expose=True,
         )

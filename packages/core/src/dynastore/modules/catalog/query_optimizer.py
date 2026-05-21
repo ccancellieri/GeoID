@@ -169,6 +169,10 @@ class QueryOptimizer:
                 continue
 
             if sel.field not in self.field_index:
+                # Allow special Hub fields
+                if sel.field in ["geoid", "deleted_at", "transaction_time"]:
+                    continue
+
                 # Try to resolve dynamically
                 found_dynamic = False
                 for sc_config in driver_sidecars(self.col_config):

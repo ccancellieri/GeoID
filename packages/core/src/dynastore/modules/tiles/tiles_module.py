@@ -844,9 +844,17 @@ async def get_collection_source_srid(
         # Fallback to physical lookup via driver
         from dynastore.modules.storage.router import get_driver
         from dynastore.modules.storage.routing_config import Operation
+        from dynastore.modules.storage.hints import Hint
 
+        # Hint.TILES forces routing to a tile-capable driver (today: PG).
+        # Without it, default READ routing returns ES first when ES is
+        # listed ahead of PG, and ES has no schema/table identifiers — the
+        # lookup below would then yield None and break MVT rendering.
         try:
-            driver = await get_driver(Operation.READ, catalog_id, collection_id)
+            driver = await get_driver(
+                Operation.READ, catalog_id, collection_id,
+                hints=frozenset({Hint.TILES}),
+            )
             location = await driver.location(catalog_id, collection_id)
         except (ValueError, Exception):
             return 4326

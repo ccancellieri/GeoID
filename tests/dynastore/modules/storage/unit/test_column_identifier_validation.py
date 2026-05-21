@@ -94,3 +94,26 @@ def test_ddl_quotes_mixed_case_columns() -> None:
 def test_resolve_query_path_quotes_column() -> None:
     expr, alias = _columnar_sidecar().resolve_query_path("Area")
     assert expr == f'{alias}."Area"'
+
+
+# ---------------------------------------------------------------------------
+# JSONB blob column resolution — selecting the whole ``attributes`` blob must
+# return the column itself, not a non-existent ``->>'attributes'`` sub-key.
+# ---------------------------------------------------------------------------
+
+def _jsonb_sidecar() -> FeatureAttributeSidecar:
+    # No attribute_schema -> AUTOMATIC resolves to JSONB.
+    return FeatureAttributeSidecar(FeatureAttributeSidecarConfig())
+
+
+def test_get_dynamic_field_definition_resolves_jsonb_blob_column() -> None:
+    sidecar = _jsonb_sidecar()
+    col = sidecar.config.jsonb_column_name
+    alias = f"sc_{sidecar.sidecar_id}"
+
+    field_def = sidecar.get_dynamic_field_definition(col)
+
+    assert field_def is not None
+    # The whole JSONB blob — NOT ``attributes->>'attributes'``.
+    assert field_def.sql_expression == f"{alias}.{col}"
+    assert field_def.data_type == "jsonb"

@@ -103,6 +103,59 @@ async def test_get_tile_resolution_params_routes_with_tiles_hint():
 
 
 @pytest.mark.asyncio
+async def test_get_collection_source_srid_routes_with_tiles_hint():
+    """get_collection_source_srid must call get_driver with hint=Hint.TILES.
+
+    Regression: the fallback physical-lookup path resolved the driver without
+    a tile hint, so default READ routing returned ES first (no schema/table),
+    the function returned None as the source SRID, and MVTQueryTransform bailed
+    without injecting ST_AsMVTGeom — producing empty (204) tiles for every
+    collection. The sibling get_tile_resolution_params already pins Hint.TILES;
+    this path must do the same.
+    """
+    tiles_module.get_collection_source_srid.cache_clear()
+
+    fake_driver = AsyncMock()
+    fake_driver.location = AsyncMock(
+        return_value=SimpleNamespace(
+            identifiers={"schema": "cat1_data", "table": "col1"}
+        )
+    )
+
+    # No source_crs configured -> the fallback physical-lookup path runs.
+    fake_catalogs = SimpleNamespace(
+        configs=AsyncMock(get_config=AsyncMock(return_value=SimpleNamespace())),
+    )
+
+    get_driver_mock = AsyncMock(return_value=fake_driver)
+
+    fake_driver_ctx = lambda **kw: kw  # noqa: E731 — local stub
+    with (
+        patch.object(tiles_module, "_get_engine", return_value=AsyncMock()),
+        patch("dynastore.modules.tiles.tiles_module.managed_transaction") as mt,
+        patch("dynastore.modules.tiles.tiles_module.get_protocol",
+              return_value=fake_catalogs),
+        patch("dynastore.modules.storage.router.get_driver", new=get_driver_mock),
+        patch.object(tiles_module, "DriverContext", new=fake_driver_ctx),
+        patch.object(tiles_module, "DQLQuery") as dql,
+    ):
+        mt.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+        mt.return_value.__aexit__ = AsyncMock(return_value=None)
+        # geometry_columns lookup returns a concrete SRID.
+        dql.return_value.execute = AsyncMock(return_value=4326)
+
+        result = await tiles_module.get_collection_source_srid("cat1", "col1")
+
+    assert result == 4326
+    assert get_driver_mock.await_count == 1
+    _args, kwargs = get_driver_mock.await_args
+    assert kwargs.get("hints") == frozenset({Hint.TILES}), (
+        f"get_collection_source_srid must pass hints=frozenset({{Hint.TILES}}); "
+        f"got kwargs={kwargs}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_location_failure_is_not_misreported_as_routing(caplog):
     """A driver.location() failure must surface the REAL error, not "add Hint.TILES".
 

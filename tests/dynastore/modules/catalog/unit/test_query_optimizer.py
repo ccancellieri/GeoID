@@ -342,6 +342,69 @@ def test_map_row_to_feature_forwards_read_policy(mock_col_config) -> None:
     assert captured["lang"] == "fr"
 
 
+def test_validate_query_whitelists_geoid_select_when_columnar(mock_col_config, mock_registry):
+    """Selecting the hub ``geoid`` field must validate regardless of how the
+    attributes sidecar resolves. In COLUMNAR mode the dynamic JSONB fallback
+    returns ``None`` for ``geoid`` — without the SELECT-loop hub whitelist that
+    surfaced as ``Unknown field: geoid`` and dropped the whole collection from
+    the tile (empty MVT). The other validation loops (filter/sort/group_by)
+    already whitelist the hub fields; SELECT must mirror them."""
+    from dynastore.modules.storage.drivers.pg_sidecars.attributes import (
+        FeatureAttributeSidecar,
+    )
+    from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+        AttributeSchemaEntry,
+        FeatureAttributeSidecarConfig,
+        PostgresType,
+    )
+
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geom.geom",
+            capabilities=[FieldCapability.SPATIAL],
+            data_type="geometry",
+        )
+    }
+    # The geometries sidecar does not resolve ``geoid`` either — make the
+    # dynamic fallback honestly return None (a bare MagicMock would return a
+    # truthy mock and mask the bug).
+    mock_geom.get_dynamic_field_definition.return_value = None
+
+    # Real attributes sidecar in COLUMNAR mode (attribute_schema present), so
+    # ``get_dynamic_field_definition('geoid')`` returns None for the dynamic
+    # fallback — exactly the runtime condition that triggered the empty tile.
+    attr_sidecar = FeatureAttributeSidecar(
+        FeatureAttributeSidecarConfig(
+            attribute_schema=[
+                AttributeSchemaEntry(name="area", type=PostgresType.INTEGER),
+            ],
+        )
+    )
+    assert (
+        attr_sidecar.get_dynamic_field_definition("geoid") is None
+    ), "precondition: COLUMNAR dynamic fallback yields None for geoid"
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom
+        if getattr(sc, "sidecar_type", "") == "geometries"
+        else attr_sidecar
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    req = QueryRequest(
+        select=[FieldSelection(field="geoid", alias="id")],
+        raw_where=None,
+        include_total_count=False,
+    )
+    errors = optimizer.validate_query(req)
+    assert "Unknown field: geoid" not in errors
+
+
 def test_attributes_sidecar_config_drops_external_id_as_feature_id() -> None:
     """Sidecar config must no longer accept ``external_id_as_feature_id`` —
     that knob moved to ItemsReadPolicy.feature_type."""
