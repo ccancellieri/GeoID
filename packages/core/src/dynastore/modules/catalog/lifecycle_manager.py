@@ -963,9 +963,16 @@ class LifecycleRegistry:
 
 
     async def wait_for_all_tasks(self, timeout: float = 30.0):
-        """Waits for all scheduled catalog lifecycle tasks (both internal and DB-tracked)."""
+        """Waits for all scheduled catalog lifecycle tasks (both internal and DB-tracked).
+
+        The DB task queue poll is skipped when no TaskQueueProtocol provider is
+        registered.  Without an active dispatcher, PENDING rows in the tasks table
+        will never advance to a terminal state, so polling would burn the full
+        ``timeout`` for no benefit.  This also covers the common test scenario
+        where ``TasksModule`` is excluded from the SCOPE — the poll is bypassed and
+        teardown returns as soon as the asyncio ``_active_tasks`` settle.
+        """
         import asyncio
-        import time
 
         # --- 1. Internal Task Registry Wait ---
         if self._active_tasks:
@@ -976,64 +983,74 @@ class LifecycleRegistry:
                 logger.debug(f"wait_for_all_tasks: Internal tasks error: {e}")
 
         # --- 2. Database Task Queue Wait ---
-        from dynastore.models.protocols import DatabaseProtocol
+        # Only poll the DB when a live task dispatcher is registered.  Without a
+        # dispatcher, PENDING tasks will never reach a terminal state in this
+        # process, so the poll loop would run until timeout with zero progress.
+        from dynastore.models.protocols import DatabaseProtocol, TaskQueueProtocol
         from dynastore.modules import get_protocol
-        db_proto = get_protocol(DatabaseProtocol)
-        if db_proto:
-            engine = db_proto.get_any_engine()
-            if engine:
-                from dynastore.modules.tasks.tasks_module import get_task_schema
-                from dynastore.modules.db_config.query_executor import (
-                    managed_transaction,
-                    DDLQuery,
-                    DQLQuery,
-                    ResultHandler,
-                )
-                from dynastore.tasks import get_loaded_task_types
-
-                schema = get_task_schema()
-                loaded_types = list(get_loaded_task_types())
-                logger.info(f"wait_for_all_tasks: loaded_types={loaded_types}, default_schema={schema}")
-
-                if loaded_types:
-                    # Single COUNT on the global tasks table — no per-schema discovery needed.
-                    placeholders = ", ".join(f":t_{i}" for i in range(len(loaded_types)))
-                    type_params = {f"t_{i}": t for i, t in enumerate(loaded_types)}
-                    count_sql = (
-                        f"SELECT COUNT(*) FROM {schema}.tasks "
-                        f"WHERE status IN ('PENDING', 'ACTIVE', 'RUNNING') "
-                        f"AND task_type IN ({placeholders})"
+        dispatcher = get_protocol(TaskQueueProtocol)
+        if dispatcher is None:
+            logger.debug(
+                "wait_for_all_tasks: no TaskQueueProtocol registered — "
+                "skipping DB task-queue poll (no dispatcher is running)"
+            )
+        else:
+            db_proto = get_protocol(DatabaseProtocol)
+            if db_proto:
+                engine = db_proto.get_any_engine()
+                if engine:
+                    from dynastore.modules.tasks.tasks_module import get_task_schema
+                    from dynastore.modules.db_config.query_executor import (
+                        managed_transaction,
+                        DDLQuery,
+                        DQLQuery,
+                        ResultHandler,
                     )
+                    from dynastore.tasks import get_loaded_task_types
 
-                    poll_timeout = min(timeout, 30.0)
-                    start_time = asyncio.get_event_loop().time()
+                    schema = get_task_schema()
+                    loaded_types = list(get_loaded_task_types())
+                    logger.debug(f"wait_for_all_tasks: loaded_types={loaded_types}, default_schema={schema}")
 
-                    while (asyncio.get_event_loop().time() - start_time) < poll_timeout:
-                        self._active_tasks = [t for t in self._active_tasks if not t.done()]
+                    if loaded_types:
+                        # Single COUNT on the global tasks table — no per-schema discovery needed.
+                        placeholders = ", ".join(f":t_{i}" for i in range(len(loaded_types)))
+                        type_params = {f"t_{i}": t for i, t in enumerate(loaded_types)}
+                        count_sql = (
+                            f"SELECT COUNT(*) FROM {schema}.tasks "
+                            f"WHERE status IN ('PENDING', 'ACTIVE', 'RUNNING') "
+                            f"AND task_type IN ({placeholders})"
+                        )
 
-                        try:
-                            async with managed_transaction(engine) as conn:
-                                await DDLQuery("SET LOCAL lock_timeout = '50ms'").execute(conn)
-                                total_pending = await DQLQuery(
-                                    count_sql, result_handler=ResultHandler.SCALAR_ONE
-                                ).execute(conn, **type_params) or 0
-                        except Exception as e:
-                            logger.debug(f"wait_for_all_tasks: poll error: {e}")
-                            if not self._active_tasks:
+                        poll_timeout = min(timeout, 30.0)
+                        start_time = asyncio.get_event_loop().time()
+
+                        while (asyncio.get_event_loop().time() - start_time) < poll_timeout:
+                            self._active_tasks = [t for t in self._active_tasks if not t.done()]
+
+                            try:
+                                async with managed_transaction(engine) as conn:
+                                    await DDLQuery("SET LOCAL lock_timeout = '50ms'").execute(conn)
+                                    total_pending = await DQLQuery(
+                                        count_sql, result_handler=ResultHandler.SCALAR_ONE
+                                    ).execute(conn, **type_params) or 0
+                            except Exception as e:
+                                logger.debug(f"wait_for_all_tasks: poll error: {e}")
+                                if not self._active_tasks:
+                                    break
+                                await asyncio.sleep(0.1)
+                                continue
+
+                            if total_pending == 0 and not self._active_tasks:
                                 break
-                            await asyncio.sleep(0.1)
-                            continue
 
-                        if total_pending == 0 and not self._active_tasks:
-                            break
-
-                        from dynastore.modules.tasks.queue import TASK_STATUS_CHANGED
-                        from dynastore.tools.async_utils import signal_bus
-                        cycle_timeout = 0.1 if not self._active_tasks else 0.5
-                        try:
-                            await signal_bus.wait_for(TASK_STATUS_CHANGED, timeout=cycle_timeout)
-                        except asyncio.TimeoutError:
-                            pass
+                            from dynastore.modules.tasks.queue import TASK_STATUS_CHANGED
+                            from dynastore.tools.async_utils import signal_bus
+                            cycle_timeout = 0.1 if not self._active_tasks else 0.5
+                            try:
+                                await signal_bus.wait_for(TASK_STATUS_CHANGED, timeout=cycle_timeout)
+                            except asyncio.TimeoutError:
+                                pass
 
         # Final settlement check for internal tasks
         settlement_timeout = min(timeout, 5.0)
