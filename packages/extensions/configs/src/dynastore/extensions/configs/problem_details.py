@@ -49,6 +49,7 @@ __all__ = [
     "plugin_not_registered",
     "validation_failed",
     "value_error",
+    "invalid_identifier",
     "collection_not_found",
     "unexpected_failure",
     "problem_exception_handler",
@@ -104,6 +105,27 @@ def value_error(
         type=f"{_TYPE_BASE}/not-found",
         title="Configuration resource not found",
         status=404,
+        detail=str(exc),
+        instance=instance,
+    ))
+
+
+def invalid_identifier(
+    exc: ValueError, *, instance: Optional[str] = None,
+) -> ProblemException:
+    """Wrap a malformed-identifier ``ValueError`` (``InvalidIdentifierError``)
+    as 400.
+
+    A resource id that fails ``validate_sql_identifier`` — most commonly an
+    unsubstituted templating placeholder like ``{{m.catalog}}`` (#1196) — is a
+    *client* input error, not a missing resource (404) or a backend failure
+    (500). 400 matches the write path, which already maps it via
+    ``handle_exception`` (#1191).
+    """
+    return ProblemException(ProblemDetails(
+        type=f"{_TYPE_BASE}/invalid-identifier",
+        title="Invalid resource identifier",
+        status=400,
         detail=str(exc),
         instance=instance,
     ))

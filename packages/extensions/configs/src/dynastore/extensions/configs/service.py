@@ -36,6 +36,7 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.catalog_readiness import require_catalog_ready
 from dynastore.extensions.tools.conflict_handler import conflict_to_409
 from dynastore.extensions.tools.exception_handlers import handle_exception
+from dynastore.tools.db import InvalidIdentifierError
 import dynastore.modules.catalog.catalog_module as catalog_manager
 from dynastore.modules import get_protocol
 from dynastore.models.protocols import WebModuleProtocol, ConfigsProtocol
@@ -671,6 +672,10 @@ class ConfigsService(ExtensionProtocol):
             return config
         except problem_details.ProblemException:
             raise
+        except InvalidIdentifierError as e:
+            # Malformed id (e.g. unsubstituted ``{{...}}`` placeholder) is a
+            # client error -> 400, not a backend failure -> 500 (#1201).
+            raise problem_details.invalid_identifier(e)
         except Exception as e:
             logger.error(f"Error fetching collection config: {e}", exc_info=True)
             raise problem_details.unexpected_failure(e)
@@ -765,6 +770,10 @@ class ConfigsService(ExtensionProtocol):
             return config
         except problem_details.ProblemException:
             raise
+        except InvalidIdentifierError as e:
+            # Malformed id (e.g. unsubstituted ``{{...}}`` placeholder) is a
+            # client error -> 400, not a backend failure -> 500 (#1201).
+            raise problem_details.invalid_identifier(e)
         except Exception as e:
             logger.error(f"Error fetching catalog config: {e}", exc_info=True)
             raise problem_details.unexpected_failure(e)
@@ -826,6 +835,10 @@ class ConfigsService(ExtensionProtocol):
             return config
         except problem_details.ProblemException:
             raise
+        except InvalidIdentifierError as e:
+            # Malformed id (e.g. unsubstituted ``{{...}}`` placeholder) is a
+            # client error -> 400, not a backend failure -> 500 (#1201).
+            raise problem_details.invalid_identifier(e)
         except Exception as e:
             logger.error(f"Error fetching platform config: {e}", exc_info=True)
             raise problem_details.unexpected_failure(e)
