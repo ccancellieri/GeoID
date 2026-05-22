@@ -23,6 +23,7 @@ import time
 from typing import List, Optional, Tuple, Any, Dict, cast
 from uuid import UUID
 from dynastore.tools.cache import cached
+from dynastore.modules.db_config.exceptions import TableNotFoundError
 import json
 
 _SAFE_SCHEMA_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
@@ -206,9 +207,26 @@ class PolicyService:
         self, policy_id: str, catalog_id: Optional[str] = None
     ) -> Optional[Policy]:
         schema = await self._resolve_schema(catalog_id)
-        return await self.storage.get_policy(
-            policy_id, schema=schema, partition_key=catalog_id or "global",
-        )
+        try:
+            return await self.storage.get_policy(
+                policy_id, schema=schema, partition_key=catalog_id or "global",
+            )
+        except TableNotFoundError:
+            # A catalog that doesn't use IAM has no per-tenant ``policies``
+            # table. Treat the lookup as a miss so the evaluator's platform
+            # fallback (``catalog_id=None`` -> ``iam``) still runs, instead of
+            # 500-ing every read on that catalog. The platform ``iam`` schema
+            # is always provisioned, so a missing table there is a real fault
+            # and must surface. Mirrors the grants/roles resilience in
+            # ``PostgresIamStorage.resolve_effective_grants``.
+            if schema == "iam":
+                raise
+            logger.warning(
+                "policies table missing in tenant schema %r (catalog %r is not "
+                "IAM-provisioned); treating policy %r as absent",
+                schema, catalog_id, policy_id,
+            )
+            return None
 
     async def update_policy(
         self, policy: Policy, catalog_id: Optional[str] = None
@@ -222,9 +240,22 @@ class PolicyService:
         self, limit: int = 100, offset: int = 0, catalog_id: Optional[str] = None
     ) -> List[Policy]:
         schema = await self._resolve_schema(catalog_id)
-        return await self.storage.list_policies(
-            limit=limit, offset=offset, schema=schema
-        )
+        try:
+            return await self.storage.list_policies(
+                limit=limit, offset=offset, schema=schema
+            )
+        except TableNotFoundError:
+            # See get_policy: a non-IAM catalog has no tenant policies table;
+            # it simply has no catalog-scoped policies. The platform ``iam``
+            # schema is always provisioned, so a missing table there is real.
+            if schema == "iam":
+                raise
+            logger.warning(
+                "policies table missing in tenant schema %r (catalog %r is not "
+                "IAM-provisioned); returning no catalog-scoped policies",
+                schema, catalog_id,
+            )
+            return []
 
     async def delete_policy(
         self, policy_id: str, catalog_id: Optional[str] = None
