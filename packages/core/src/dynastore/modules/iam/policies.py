@@ -547,11 +547,33 @@ class PolicyService:
         try:
             persisted = await configs.list_configs()
         except Exception:
-            logger.debug(
-                "OidcRoleSyncConfig seed skipped: list_configs failed",
-                exc_info=True,
-            )
-            return
+            # Cold-boot race (#1209): this seed runs from the IamModule
+            # lifespan, which can start before DatastoreModule's
+            # ``ensure_init_db`` creates ``configs.platform_configs`` — so the
+            # first ``list_configs`` raises "relation does not exist". The seed
+            # used to skip one-shot and never retry, leaving
+            # ``reconcile_enabled`` defaulted ``False``: the sysadmin JWT then
+            # resolves to user-tier and every protected route 403s until an
+            # unrelated redeploy. Module/pod startup ordering is not guaranteed,
+            # so rather than depend on it, self-heal — ensure the platform
+            # configs storage (idempotent ``CREATE ... IF NOT EXISTS`` DDL) and
+            # retry the read once.
+            try:
+                from dynastore.modules.db_config.platform_config_service import (
+                    PlatformConfigService,
+                )
+
+                await PlatformConfigService.initialize_storage(self._engine)
+                persisted = await configs.list_configs()
+            except Exception:
+                logger.warning(
+                    "OidcRoleSyncConfig seed skipped: platform configs storage "
+                    "unavailable after ensure-and-retry; OIDC role "
+                    "reconciliation stays disabled until the next cold boot or "
+                    "operator PATCH.",
+                    exc_info=True,
+                )
+                return
 
         existing = cast(Optional[OidcRoleSyncConfig], persisted.get(OidcRoleSyncConfig))
         if existing is None:

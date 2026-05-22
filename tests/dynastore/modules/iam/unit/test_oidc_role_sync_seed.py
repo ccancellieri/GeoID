@@ -153,11 +153,55 @@ async def test_seed_no_warning_when_whitelist_set(caplog):
 
 
 @pytest.mark.asyncio
-async def test_seed_swallows_list_configs_error(caplog):
-    """If ``list_configs`` raises (e.g. DB hiccup at boot), the seed
-    must NOT propagate — it's best-effort, the operator can retry by
-    restarting once DB is healthy."""
+async def test_seed_self_heals_when_configs_table_missing(caplog):
+    """#1209: ``provision_default_policies`` (IamModule lifespan) can run
+    before ``DatastoreModule``'s ``ensure_init_db`` creates
+    ``configs.platform_configs``, so the first ``list_configs`` raises
+    "relation does not exist". The seed used to skip one-shot and never
+    retry — leaving ``reconcile_enabled`` defaulted ``False`` so the
+    sysadmin JWT resolved to user-tier and every protected route 403'd
+    until an unrelated redeploy. It must instead ensure the (idempotent)
+    platform-configs storage and retry once, then seed."""
     svc = _service()
+    svc._engine = object()  # sentinel; initialize_storage is mocked
+    configs = AsyncMock()
+    # First list: table missing. Second list (post ensure-storage): empty.
+    configs.list_configs = AsyncMock(
+        side_effect=[
+            RuntimeError('relation "configs.platform_configs" does not exist'),
+            {},
+        ]
+    )
+    configs.set_config = AsyncMock(return_value=None)
+
+    with patch(
+        "dynastore.modules.iam.policies.get_protocol",
+        return_value=configs,
+    ), patch(
+        "dynastore.modules.db_config.platform_config_service."
+        "PlatformConfigService.initialize_storage",
+        new=AsyncMock(return_value=None),
+    ) as init_storage, caplog.at_level(
+        logging.INFO, logger="dynastore.modules.iam.policies"
+    ):
+        await svc._seed_oidc_role_sync_default()
+
+    init_storage.assert_awaited_once()
+    assert configs.list_configs.await_count == 2
+    configs.set_config.assert_awaited_once()
+    cls_arg, cfg_arg = configs.set_config.await_args.args
+    assert cls_arg is OidcRoleSyncConfig
+    assert cfg_arg.reconcile_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_seed_swallows_persistent_storage_error(caplog):
+    """If ``list_configs`` still raises after the ensure-storage retry
+    (DB genuinely down at boot), the seed must NOT propagate — it's
+    best-effort; the next cold boot or operator PATCH recovers. It now
+    warns (was a silent debug) so the skipped bootstrap is observable."""
+    svc = _service()
+    svc._engine = object()
     configs = AsyncMock()
     configs.list_configs = AsyncMock(side_effect=RuntimeError("DB down"))
     configs.set_config = AsyncMock(return_value=None)
@@ -165,7 +209,15 @@ async def test_seed_swallows_list_configs_error(caplog):
     with patch(
         "dynastore.modules.iam.policies.get_protocol",
         return_value=configs,
-    ), caplog.at_level(logging.DEBUG, logger="dynastore.modules.iam.policies"):
+    ), patch(
+        "dynastore.modules.db_config.platform_config_service."
+        "PlatformConfigService.initialize_storage",
+        new=AsyncMock(return_value=None),
+    ), caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.policies"):
         await svc._seed_oidc_role_sync_default()  # must not raise
 
     configs.set_config.assert_not_awaited()
+    assert any(
+        "platform configs storage" in rec.getMessage().lower()
+        for rec in caplog.records
+    )
