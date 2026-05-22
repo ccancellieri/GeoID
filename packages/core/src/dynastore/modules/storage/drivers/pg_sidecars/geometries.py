@@ -1165,7 +1165,12 @@ class GeometriesSidecar(SidecarProtocol):
                 props = feature.get("properties") or {}
             from dynastore.tools.geospatial import compute_derived_fields
 
-            derived = compute_derived_fields(shapely_geom, props, storage_fields)
+            # ``shapely_geom`` has been processed into ``target_srid``; pass it
+            # so geographic CRSs yield geodesic area/perimeter/length (m²/m)
+            # instead of meaningless square-degree planar values.
+            derived = compute_derived_fields(
+                shapely_geom, props, storage_fields, srid=self.config.target_srid
+            )
             jsonb_payload: Dict[str, Any] = {}
             for f in storage_fields:
                 key = f.resolved_name

@@ -560,10 +560,60 @@ def _extract_feature_property(root_props: Dict[str, Any], path: str) -> Any:
     return current
 
 
+def _crs_is_geographic(srid: Optional[int]) -> bool:
+    """True when ``srid`` denotes a lon/lat (angular) CRS.
+
+    ``None`` returns ``False`` so callers that do not declare a CRS keep the
+    historical planar behaviour. EPSG:4326 short-circuits without pyproj.
+    """
+    if srid is None:
+        return False
+    try:
+        srid_int = int(srid)
+    except (TypeError, ValueError):
+        return False
+    if srid_int == 4326:
+        return True
+    try:
+        from pyproj import CRS
+
+        return bool(CRS.from_epsg(srid_int).is_geographic)
+    except Exception:
+        return False
+
+
+def _geodesic_area_perimeter(
+    geometry: "BaseGeometry",
+) -> Optional[Tuple[float, float]]:
+    """``(area_m2, perimeter_m)`` on the WGS84 ellipsoid, or ``None``.
+
+    Returns ``None`` when pyproj is unavailable so the caller can fall back to
+    the planar Shapely values.
+    """
+    try:
+        from pyproj import Geod
+
+        area, perim = Geod(ellps="WGS84").geometry_area_perimeter(geometry)
+        return abs(float(area)), abs(float(perim))
+    except Exception:
+        return None
+
+
+def _geodesic_length(geometry: "BaseGeometry") -> Optional[float]:
+    """Geodesic length in metres on the WGS84 ellipsoid, or ``None``."""
+    try:
+        from pyproj import Geod
+
+        return float(Geod(ellps="WGS84").geometry_length(geometry))
+    except Exception:
+        return None
+
+
 def compute_derived_fields(
     geometry: "BaseGeometry",
     properties: Dict[str, Any],
     fields: "List[Any]",
+    srid: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Materialise the declared :class:`ComputedField` entries for one feature.
 
@@ -574,6 +624,13 @@ def compute_derived_fields(
     ``EXTERNAL_ID`` is dropped silently — callers strip it upstream since
     it is path-extracted from the feature, not derived from geometry/
     properties.
+
+    ``srid`` is the CRS the ``geometry`` coordinates are expressed in. When it
+    identifies a geographic CRS (e.g. EPSG:4326) the absolute metrics
+    (``area``/``perimeter``/``length``) are computed on the WGS84 ellipsoid and
+    returned in metres / square metres rather than the meaningless square
+    degrees that Shapely's planar ``.area`` would yield on lon/lat coordinates.
+    Omitting ``srid`` preserves the planar behaviour.
     """
     # Local import to avoid a cycle: computed_fields imports from
     # driver_config, which is itself imported from many modules. Keeping
@@ -594,6 +651,17 @@ def compute_derived_fields(
             centroid_lat = float(c.y)
             centroid_lon = float(c.x)
         return centroid_lat, centroid_lon  # type: ignore[return-value]
+
+    geographic = _crs_is_geographic(srid)
+    _ap_memo: List[Optional[Tuple[float, float]]] = []
+
+    def _area_perimeter() -> Optional[Tuple[float, float]]:
+        """Geodesic ``(area_m2, perimeter_m)`` when geographic, else ``None``."""
+        if not geographic:
+            return None
+        if not _ap_memo:
+            _ap_memo.append(_geodesic_area_perimeter(geometry))
+        return _ap_memo[0]
 
     for f in fields:
         kind = f.kind
@@ -643,7 +711,8 @@ def compute_derived_fields(
             out[key] = cell.to_token()  # type: ignore[union-attr]
 
         elif kind == ComputedKind.AREA:
-            out[key] = float(geometry.area)
+            ap = _area_perimeter()
+            out[key] = ap[0] if ap is not None else float(geometry.area)
 
         elif kind == ComputedKind.VOLUME:
             # Shapely exposes .volume only on 3D closed types (Solid).
@@ -652,17 +721,30 @@ def compute_derived_fields(
 
         elif kind == ComputedKind.CIRCULARITY:
             import math as _math
-            if geometry.length > 0:
-                out[key] = float(
-                    (4 * _math.pi * geometry.area) / (geometry.length ** 2)
-                )
+            # Use geodesic area & perimeter together when geographic so the
+            # ratio stays dimensionless and consistent (mixing m² with degrees
+            # would corrupt it).
+            ap = _area_perimeter()
+            if ap is not None:
+                area_val, perim_val = ap
+            else:
+                area_val, perim_val = float(geometry.area), float(geometry.length)
+            if perim_val > 0:
+                out[key] = float((4 * _math.pi * area_val) / (perim_val ** 2))
             else:
                 out[key] = 0.0
 
         elif kind == ComputedKind.CONVEXITY:
-            hull_area = geometry.convex_hull.area
+            ap = _area_perimeter()
+            if ap is not None:
+                area_val = ap[0]
+                hull_ap = _geodesic_area_perimeter(geometry.convex_hull)
+                hull_area = hull_ap[0] if hull_ap is not None else 0.0
+            else:
+                area_val = float(geometry.area)
+                hull_area = float(geometry.convex_hull.area)
             if hull_area > 0:
-                out[key] = float(geometry.area / hull_area)
+                out[key] = float(area_val / hull_area)
             else:
                 out[key] = 0.0
 
@@ -677,12 +759,14 @@ def compute_derived_fields(
             # report 0 / 0 rather than raising — matches Shapely's
             # ``.length`` on a Polygon returning the perimeter.
             if geometry.geom_type in ("Polygon", "MultiPolygon"):
-                out[key] = float(geometry.length)
+                ap = _area_perimeter()
+                out[key] = ap[1] if ap is not None else float(geometry.length)
             else:
                 out[key] = 0.0
 
         elif kind == ComputedKind.LENGTH:
-            out[key] = float(geometry.length)
+            gl = _geodesic_length(geometry) if geographic else None
+            out[key] = gl if gl is not None else float(geometry.length)
 
         elif kind == ComputedKind.CENTROID:
             c = geometry.centroid

@@ -297,7 +297,11 @@ class FeatureAttributeSidecar(SidecarProtocol):
 
                 fields[attr.name] = FieldDefinition(
                     name=attr.name,
-                    sql_expression=f"{alias}.{attr.name}",
+                    # Quote the identifier: columnar columns are created with
+                    # case-preserving DDL (``"CODE" TEXT``). An unquoted
+                    # reference is folded to lowercase by PostgreSQL and fails
+                    # for any non-lowercase column name (the MVT tile 500).
+                    sql_expression=f'{alias}."{attr.name}"',
                     capabilities=caps,
                     data_type=pg_native_to_canonical(attr.type.value),
                     expose=not is_storage_only,  # Storage-only fields not in Feature output
@@ -1045,7 +1049,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
                 fields[attr.name] = FieldDefinition(
                     name=attr.name,
-                    sql_expression=f"{alias}.{attr.name}",
+                    # Quote the identifier — see note in get_queryable_fields.
+                    sql_expression=f'{alias}."{attr.name}"',
                     capabilities=caps,
                     data_type=pg_native_to_canonical(attr.type.value),
                     aggregations=aggs,

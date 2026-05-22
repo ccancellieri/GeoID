@@ -342,32 +342,45 @@ class GcsDetailedReporter(ReportingInterface[GcsDetailedReporterConfig]):
         top-level fields, attributes, and geometry are included in the final report.
         """
         assert self.config is not None
-        # Make a deep copy to avoid modifying the original object which might be used elsewhere.
+        # Make a shallow copy to avoid modifying the original object which might be used elsewhere.
         filtered_result = result.copy()
 
-        if "record" in filtered_result and isinstance(filtered_result["record"], dict):
-            record = filtered_result["record"].copy()
+        record = filtered_result.get("record")
+        # The ingestion pipeline hands back GeoJSON Feature objects (keys
+        # ``geometry``/``properties``), not the legacy flat DWH dict. Normalise
+        # a pydantic model to a plain dict so the exclusion/allow-list below can
+        # operate on it; otherwise geometry would leak and the filters no-op.
+        if record is not None and hasattr(record, "model_dump"):
+            record = record.model_dump(mode="json", exclude_none=True)
 
-            # legacy dwh contract
+        if isinstance(record, dict):
+            record = dict(record)
+
+            # legacy dwh contract: surface asset_id as asset_code
             asset_id = record.get("asset_id")
             if asset_id:
                 record["asset_code"] = str(asset_id)
 
-            # 1. Filter attributes within the 'record' object if a specific list is provided.
+            # 1. Attribute allow-list — applies to the GeoJSON ``properties``
+            #    bag and the legacy flat ``attributes`` bag alike.
             reported_attrs = self.config.reported_attributes
-            if reported_attrs is not None and isinstance(record.get("attributes"), dict):
-                attrs = record["attributes"]
-                record["attributes"] = {
-                    key: attrs[key] for key in reported_attrs if key in attrs  # type: ignore[attr-defined]
-                }
+            if reported_attrs is not None:
+                for attr_key in ("properties", "attributes"):
+                    blob = record.get(attr_key)
+                    if isinstance(blob, dict):
+                        record[attr_key] = {
+                            key: blob[key] for key in reported_attrs if key in blob
+                        }
 
-            # 2. Exclude geometry from the 'record' object if configured to do so.
+            # 2. Exclude geometry — GeoJSON ``geometry`` and legacy ``geom``.
             if not self.config.include_geometry:
+                record.pop("geometry", None)
                 record.pop("geom", None)
 
+            # 3. Exclude bbox — GeoJSON ``bbox`` and legacy ``bbox_coords``.
             if not self.config.include_bbox:
-                if "bbox_coords" in record:
-                    record.pop("bbox_coords", None)
+                record.pop("bbox", None)
+                record.pop("bbox_coords", None)
 
             filtered_result["record"] = record
 

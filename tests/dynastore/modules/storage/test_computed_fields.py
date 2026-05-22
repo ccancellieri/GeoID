@@ -654,3 +654,72 @@ class TestGeometriesSidecarOverlayDDL:
         cols = sc.get_internal_columns()
         assert "geom_stats" in cols
         assert "centroid" in cols
+
+
+class TestGeodesicMetrics:
+    """AREA/PERIMETER/LENGTH must be metric when the geometry CRS is geographic.
+
+    Regression for areas computed in square degrees: a geometry already
+    transformed to EPSG:4326 (lon/lat) has a Shapely ``.area`` in degrees²,
+    which is meaningless and latitude-dependent. When ``srid`` identifies a
+    geographic CRS the metrics are computed on the WGS84 ellipsoid (m² / m).
+    Without ``srid`` the planar values are preserved (back-compat).
+    """
+
+    @pytest.fixture
+    def deg_box(self) -> Polygon:
+        # 1°×1° box straddling the equator/prime-meridian.
+        return Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])
+
+    def test_area_is_geodesic_m2_when_srid_geographic(self, deg_box: Polygon) -> None:
+        from pyproj import Geod
+
+        expected, _ = Geod(ellps="WGS84").geometry_area_perimeter(deg_box)
+        out = compute_derived_fields(
+            deg_box, {}, [ComputedField(kind=ComputedKind.AREA)], srid=4326
+        )
+        assert out["area"] == pytest.approx(abs(expected), rel=1e-6)
+        # Sanity: a 1°×1° box near the equator is ~1.23e10 m², never 1.0.
+        assert out["area"] > 1.0e10
+
+    def test_area_stays_planar_without_srid(self, deg_box: Polygon) -> None:
+        out = compute_derived_fields(
+            deg_box, {}, [ComputedField(kind=ComputedKind.AREA)]
+        )
+        assert out["area"] == pytest.approx(1.0)
+
+    def test_perimeter_is_geodesic_m_when_srid_geographic(
+        self, deg_box: Polygon
+    ) -> None:
+        from pyproj import Geod
+
+        _, expected = Geod(ellps="WGS84").geometry_area_perimeter(deg_box)
+        out = compute_derived_fields(
+            deg_box, {}, [ComputedField(kind=ComputedKind.PERIMETER)], srid=4326
+        )
+        assert out["perimeter"] == pytest.approx(abs(expected), rel=1e-6)
+        assert out["perimeter"] > 1.0e5
+
+    def test_length_is_geodesic_m_when_srid_geographic(self) -> None:
+        from shapely.geometry import LineString
+        from pyproj import Geod
+
+        line = LineString([(0, 0), (1, 0)])
+        expected = Geod(ellps="WGS84").geometry_length(line)
+        out = compute_derived_fields(
+            line, {}, [ComputedField(kind=ComputedKind.LENGTH)], srid=4326
+        )
+        assert out["length"] == pytest.approx(expected, rel=1e-6)
+        # ~111 km for one degree of longitude at the equator.
+        assert out["length"] > 1.0e5
+
+    def test_circularity_stays_dimensionless_when_geographic(
+        self, deg_box: Polygon
+    ) -> None:
+        import math
+
+        out = compute_derived_fields(
+            deg_box, {}, [ComputedField(kind=ComputedKind.CIRCULARITY)], srid=4326
+        )
+        # A near-square remains ~pi/4 whether computed planar or geodesic.
+        assert out["circularity"] == pytest.approx(math.pi / 4, rel=1e-2)
