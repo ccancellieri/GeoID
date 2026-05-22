@@ -204,9 +204,31 @@ class ValidationExceptionHandler(ExceptionHandler):
     def handle(
         self, exception: Exception, context: Optional[Dict[str, Any]] = None
     ) -> Optional[HTTPException]:
+        from dynastore.tools.db import InvalidIdentifierError
+
         context = context or {}
         resource_id = context.get("resource_id", "")
         operation = context.get("operation", "Operation")
+
+        # #1191: an unsubstituted ``{{...}}`` template placeholder in a resource
+        # id is a malformed request, never a real lookup. Reject it as a 400 with
+        # an actionable message — covering both the typed InvalidIdentifierError
+        # raised by ``validate_sql_identifier`` at a guarded boundary, and a raw
+        # ``"<id> not found"`` ValueError from a route that let the literal token
+        # fall through to the resolver as a lookup miss. This must win over the
+        # ``"not found"`` → 404 downgrade below (an opaque 404 is exactly the
+        # "routed-resolve unavailable" symptom we want to replace).
+        msg = str(exception)
+        if isinstance(exception, InvalidIdentifierError) or ("{{" in msg and "}}" in msg):
+            detail = (
+                f"{operation} failed: resource id contains an unsubstituted "
+                f"template placeholder ('{{{{...}}}}'); substitute it with a real "
+                f"value before issuing the request. ({msg})"
+            )
+            logger.warning(detail)
+            return HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=detail
+            )
 
         if resource_id:
             detail = (
