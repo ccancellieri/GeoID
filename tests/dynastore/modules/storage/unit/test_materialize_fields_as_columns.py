@@ -22,11 +22,12 @@ from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
 )
 
 
-def _field(data_type: str = "string", required: bool = False, unique: bool = False):
+def _field(data_type: str = "string", required: bool = False, unique: bool = False, default=None):
     fd = MagicMock()
     fd.data_type = data_type
     fd.required = required
     fd.unique = unique
+    fd.default = default
     fd.description = None
     return fd
 
@@ -160,3 +161,47 @@ def test_materialize_all_unknown_data_type_falls_back_to_text() -> None:
     bridged = bridge_schema_to_attribute_sidecar(schema, _empty_sidecar())
     by_name = {e.name: e for e in bridged.attribute_schema}
     assert by_name["weird"].type == PostgresType.TEXT
+
+
+# ---------------------------------------------------------------------------
+# Per-field default (P6) — FieldDefinition.default threads into the sidecar
+# ---------------------------------------------------------------------------
+
+def test_default_threads_into_new_entry() -> None:
+    """A field's ``default`` reaches the synthesised AttributeSchemaEntry."""
+    schema = MagicMock()
+    schema.materialize_fields_as_columns = True
+    schema.fields = {"status": _field(data_type="string", default="active")}
+    bridged = bridge_schema_to_attribute_sidecar(schema, _empty_sidecar())
+    by_name = {e.name: e for e in bridged.attribute_schema}
+    assert by_name["status"].default == "active"
+    # And it produces a SQL DEFAULT literal.
+    assert by_name["status"].get_sql_default() == "'active'"
+
+
+def test_default_overlays_existing_entry_when_field_declares_one() -> None:
+    """SSOT field default wins over an existing entry's silence."""
+    schema = MagicMock()
+    schema.materialize_fields_as_columns = True
+    schema.fields = {"n": _field(data_type="integer", default=7)}
+    sidecar = FeatureAttributeSidecarConfig(
+        attribute_schema=[AttributeSchemaEntry(name="n", type=PostgresType.INTEGER)]
+    )
+    bridged = bridge_schema_to_attribute_sidecar(schema, sidecar)
+    by_name = {e.name: e for e in bridged.attribute_schema}
+    assert by_name["n"].default == 7
+
+
+def test_existing_entry_default_preserved_when_field_silent() -> None:
+    """A field that declares no default leaves the entry's own default intact."""
+    schema = MagicMock()
+    schema.materialize_fields_as_columns = True
+    schema.fields = {"n": _field(data_type="integer", default=None)}
+    sidecar = FeatureAttributeSidecarConfig(
+        attribute_schema=[
+            AttributeSchemaEntry(name="n", type=PostgresType.INTEGER, default=42)
+        ]
+    )
+    bridged = bridge_schema_to_attribute_sidecar(schema, sidecar)
+    by_name = {e.name: e for e in bridged.attribute_schema}
+    assert by_name["n"].default == 42

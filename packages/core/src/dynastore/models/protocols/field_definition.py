@@ -14,7 +14,7 @@ use it to build OGC/STAC responses.
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from dynastore.models.field_types import canonical_data_type, normalize_subtype
 from dynastore.models.localization import LocalizedText
@@ -69,6 +69,12 @@ class FieldDefinition(BaseModel):
     format: Optional[str] = None
     # None = driver decides from capabilities; True = force a native column; False = force JSONB.
     materialize: Optional[bool] = None
+    # Optional default value for the field. When the field is materialised as a
+    # native column it becomes the column DEFAULT (and back-fills missing values
+    # on write); on JSONB-stored fields it has no effect. The value's Python type
+    # must match ``data_type`` (validated below). This is the SSOT counterpart of
+    # ``AttributeSchemaEntry.default``.
+    default: Optional[Any] = None
 
     @field_validator("data_type")
     @classmethod
@@ -82,6 +88,52 @@ class FieldDefinition(BaseModel):
     @classmethod
     def _normalize_subtype(cls, v: Optional[str]) -> Optional[str]:
         return normalize_subtype(v)
+
+    @model_validator(mode="after")
+    def _validate_default_type(self) -> "FieldDefinition":
+        """Reject a ``default`` whose Python type can't back ``data_type``.
+
+        Caught at config-parse time rather than deep in DDL generation, over the
+        canonical vocabulary. ``date``/``time``/``timestamp`` take an ISO-8601
+        string (config is JSON, so there is no native datetime); ``jsonb`` and
+        any parametrized/unknown canonical token accept any value; ``geometry``
+        has no SQL-literal default form and rejects one. Mirrors
+        ``AttributeSchemaEntry.validate_default_type`` but also keeps ``bool``
+        out of the numeric types (``bool`` is an ``int`` subclass in Python).
+        """
+        if self.default is None:
+            return self
+        dt = (self.data_type or "").lower()
+        if dt in ("integer", "bigint"):
+            if isinstance(self.default, bool) or not isinstance(self.default, int):
+                raise ValueError(
+                    f"Default for field '{self.name}' must be an integer, "
+                    f"got {type(self.default).__name__}"
+                )
+        elif dt in ("double", "numeric"):
+            if isinstance(self.default, bool) or not isinstance(self.default, (int, float)):
+                raise ValueError(
+                    f"Default for field '{self.name}' must be a number, "
+                    f"got {type(self.default).__name__}"
+                )
+        elif dt == "boolean":
+            if not isinstance(self.default, bool):
+                raise ValueError(
+                    f"Default for field '{self.name}' must be a boolean, "
+                    f"got {type(self.default).__name__}"
+                )
+        elif dt in ("string", "uuid", "date", "time", "timestamp", "binary"):
+            if not isinstance(self.default, str):
+                raise ValueError(
+                    f"Default for field '{self.name}' must be a string, "
+                    f"got {type(self.default).__name__}"
+                )
+        elif dt.startswith("geometry"):
+            raise ValueError(
+                f"Default values are not supported on geometry field '{self.name}'"
+            )
+        # jsonb (and any parametrized/unknown canonical token): accept as-is.
+        return self
 
     def supports_aggregation(self, agg_func: str) -> bool:
         if self.aggregations is None or "*" in (self.aggregations or []):

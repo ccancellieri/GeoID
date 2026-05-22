@@ -158,9 +158,19 @@ def bridge_schema_to_attribute_sidecar(
         if entry is not None:
             new_nullable = not fd.required if fd.required else entry.nullable
             new_unique = True if fd.unique else entry.unique
-            if entry.nullable != new_nullable or entry.unique != new_unique:
+            # SSOT field default wins when declared; silence keeps the entry's own.
+            new_default = fd.default if fd.default is not None else entry.default
+            if (
+                entry.nullable != new_nullable
+                or entry.unique != new_unique
+                or entry.default != new_default
+            ):
                 existing[name] = entry.model_copy(
-                    update={"nullable": new_nullable, "unique": new_unique}
+                    update={
+                        "nullable": new_nullable,
+                        "unique": new_unique,
+                        "default": new_default,
+                    }
                 )
                 changed = True
             continue
@@ -220,6 +230,7 @@ def bridge_schema_to_attribute_sidecar(
             type=pg_type,
             nullable=not fd.required,
             unique=bool(fd.unique),
+            default=fd.default,
             description=fd.description if isinstance(fd.description, str) else None,
         )
         order.append(name)
