@@ -716,8 +716,12 @@ class GeometriesSidecar(SidecarProtocol):
 
         # 2. Transform Logic
         if target_srid != source_srid:
-            # Simplified transform logic
-            geom_col = f"ST_Transform({geom_col}, :target_srid)"
+            # ``ST_Transform`` is overloaded — ``(geometry, integer)`` and
+            # ``(geometry, text)`` (a proj string). A bare untyped bind param
+            # resolves to ``text`` at plan time, so asyncpg rejects the integer
+            # SRID ("expected str, got int"). The cast pins the param type to
+            # integer (matching the tile-bounds expression below).
+            geom_col = f"ST_Transform({geom_col}, CAST(:target_srid AS INTEGER))"
 
         # 3. Simplification
         simplification = params.get("simplification")

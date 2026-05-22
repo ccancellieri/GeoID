@@ -94,6 +94,25 @@ def test_mvt_extent_buffer_are_literals_not_binds():
     assert "buffer" not in req.raw_params
 
 
+def test_mvt_transform_srid_is_integer_cast_not_bare_param():
+    """The SRID feeding ``ST_Transform`` must be integer-typed in the SQL.
+
+    ``ST_Transform`` is overloaded — ``(geometry, integer)`` and
+    ``(geometry, text)`` (a proj string). A bare untyped bind param resolves
+    to ``text`` during prepared-statement planning, so asyncpg then rejects the
+    integer SRID with ``invalid input for query argument $1: 3857 (expected
+    str, got int)``. Wrapping it in ``CAST(... AS INTEGER)`` (as the tile-bounds
+    expression already does) pins the param type to integer and resolves the
+    overload.
+    """
+    req = MVTQueryTransform().transform_query(_base_request(), _mvt_context(_col_config()))
+    raw = " ".join(req.raw_selects)
+    assert "ST_Transform(" in raw
+    # No bare ``:target_srid`` param feeding the overloaded ST_Transform.
+    assert ", :target_srid)" not in raw
+    assert "CAST(:target_srid AS INTEGER)" in raw
+
+
 def test_mvt_skips_when_no_geometry_sidecar():
     cfg = SimpleNamespace(sidecars=[FeatureAttributeSidecarConfig()])  # no geometry
     req = MVTQueryTransform().transform_query(_base_request(), _mvt_context(cfg))
