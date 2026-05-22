@@ -178,6 +178,7 @@
   <!-- ── POLICIES TAB ── -->
   <div id="tab-policies" class="tab-pane">
     <div class="toolbar">
+      <input class="search-box" id="policy-search" placeholder="Search by ID, action, or resource…" oninput="filterPolicies()">
       <div id="cs-policies-container"></div>
       <button class="btn btn-primary" onclick="openPolicyModal()"><i class="fa-solid fa-plus"></i> New Policy</button>
       <button class="btn btn-primary" onclick="loadPolicies()"><i class="fa-solid fa-rotate"></i></button>
@@ -724,6 +725,15 @@ function renderPolicies(list) {
   tb.querySelectorAll('[data-action="delete-policy"]').forEach(b => b.addEventListener('click', () => deletePolicy(b.dataset.id)));
   tb.querySelectorAll('[data-action="edit-policy"]').forEach(b => b.addEventListener('click', () => openPolicyModal(b.dataset.id)));
   tb.querySelectorAll('[data-action="usage-policy"]').forEach(b => b.addEventListener('click', () => openPolicyUsage(b.dataset.id)));
+}
+function filterPolicies() {
+  const q = document.getElementById('policy-search').value.toLowerCase();
+  renderPolicies((_allPolicies || []).filter(p =>
+    (p.id||'').toLowerCase().includes(q) ||
+    (p.description||'').toLowerCase().includes(q) ||
+    (p.actions||[]).some(a => (a||'').toLowerCase().includes(q)) ||
+    (p.resources||[]).some(r => (r||'').toLowerCase().includes(q))
+  ));
 }
 // ── POLICY MODAL (create + edit) ──
 //
