@@ -56,15 +56,28 @@ async def _run_query(conn, stmt, params=None):
 def _pick_operation(request: Optional[QueryRequest]) -> str:
     """Choose the routing operation based on query content.
 
-    Filtered requests (bbox, attribute filters, fulltext) → SEARCH operation.
-    Browsing/pagination without filters → READ operation.
+    Genuine search predicates (bbox/spatial, attribute filters, CQL2,
+    fulltext) → SEARCH operation. A plain browse → READ operation.
+
+    Temporal-validity conditions are NOT search predicates: every OGC
+    features browse carries an implicit ``validity @> now()`` default
+    (``parse_ogc_query_request`` appends it whenever no ``datetime`` is
+    supplied), and an explicit ``?datetime=`` is the standard OGC browse
+    parameter. Both are READ modifiers applied uniformly on the read
+    backend, so they must not flip a browse onto the SEARCH backend. Were
+    they counted, ``request.filters`` would never be empty and every
+    ``/items`` browse would be misrouted to the SEARCH primary (ES),
+    bypassing the operator's READ routing (PG/geometry-exact) and losing
+    the total count.
     """
     from dynastore.modules.storage.routing_config import Operation
 
-    if request and (
-        getattr(request, "filters", None)
-        or getattr(request, "cql_filter", None)
-    ):
+    if request is None:
+        return Operation.READ
+    if getattr(request, "cql_filter", None):
+        return Operation.SEARCH
+    filters = getattr(request, "filters", None) or []
+    if any(getattr(fc, "field", None) != "validity" for fc in filters):
         return Operation.SEARCH
     return Operation.READ
 

@@ -22,6 +22,7 @@ from dynastore.modules.elasticsearch.items_projection import (
     project_item_for_es,
     resolve_es_field_path,
     strip_reserved_members,
+    unproject_item_from_es,
 )
 from dynastore.modules.elasticsearch.mappings import (
     COMMON_PROPERTIES,
@@ -348,3 +349,112 @@ def test_build_item_mapping_respects_custom_known_fields() -> None:
 def test_resolve_es_field_path_parametric(field: str, known: bool, expected: str) -> None:
     out = resolve_es_field_path(field, build_known_fields())
     assert out == expected
+
+
+# --- unproject (read path) ---------------------------------------------
+#
+# Inverse of project_item_for_es: rebuild the GeoJSON/STAC read contract
+# from an indexed _source. Regression guard for the malformed feature read
+# where ES served items with attributes nested under properties.extras,
+# internal/echo keys leaked at the top level, and geometry was {}.
+
+
+def test_unproject_hoists_extras_to_flat_properties() -> None:
+    src: Dict[str, Any] = {
+        "type": "Feature",
+        "id": "325",
+        "geometry": {},
+        "collection": "glosis_demo",
+        "catalog_id": "datamgr01",
+        "_external_id": "325",
+        "_asset_id": "ALBL1_01",
+        "properties": {
+            "extras": {
+                "CODE": "325",
+                "NAME": "Lushnje",
+                "area": 580580547.78,
+            }
+        },
+        # leaked top-level echo (surfaces via Feature extra="allow")
+        "CODE": "325",
+        "NAME": "Lushnje",
+        "area": 580580547.78,
+    }
+    out = unproject_item_from_es(src)
+
+    assert out["type"] == "Feature"
+    assert out["id"] == "325"
+    assert out["properties"] == {
+        "CODE": "325",
+        "NAME": "Lushnje",
+        "area": 580580547.78,
+    }
+    assert "extras" not in out["properties"]
+    # No internal fields, no top-level attribute echo, no catalog_id leak.
+    for leaked in (
+        "CODE",
+        "NAME",
+        "area",
+        "catalog_id",
+        "_external_id",
+        "_asset_id",
+    ):
+        assert leaked not in out
+    # collection is a structural STAC member — preserved.
+    assert out["collection"] == "glosis_demo"
+    # empty {} geometry normalised to a valid GeoJSON null geometry.
+    assert out["geometry"] is None
+
+
+def test_unproject_keeps_real_geometry_and_bbox() -> None:
+    src = {
+        "type": "Feature",
+        "id": "1",
+        "geometry": {"type": "Point", "coordinates": [1, 2]},
+        "bbox": [1, 2, 1, 2],
+        "properties": {"extras": {"a": 1}},
+    }
+    out = unproject_item_from_es(src)
+    assert out["geometry"] == {"type": "Point", "coordinates": [1, 2]}
+    assert out["bbox"] == [1, 2, 1, 2]
+    assert out["properties"] == {"a": 1}
+
+
+def test_unproject_flat_key_wins_on_collision() -> None:
+    src = {
+        "type": "Feature",
+        "id": "1",
+        "geometry": None,
+        "properties": {"k": "flat", "extras": {"k": "nested", "j": "only"}},
+    }
+    out = unproject_item_from_es(src)
+    assert out["properties"]["k"] == "flat"
+    assert out["properties"]["j"] == "only"
+
+
+def test_unproject_is_inverse_of_project() -> None:
+    known = build_known_fields()
+    original = {
+        "type": "Feature",
+        "id": "x",
+        "collection": "c",
+        "geometry": {"type": "Point", "coordinates": [0, 0]},
+        "properties": {
+            "datetime": "2026-01-01T00:00:00Z",  # Tier 1 — stays flat
+            "CODE": "325",  # unknown — projected to extras
+            "NAME": "L",
+        },
+    }
+    projected = project_item_for_es(original, known)
+    assert "extras" in projected["properties"]  # sanity: projection happened
+
+    restored = unproject_item_from_es(projected)
+    assert restored["properties"]["datetime"] == "2026-01-01T00:00:00Z"
+    assert restored["properties"]["CODE"] == "325"
+    assert restored["properties"]["NAME"] == "L"
+    assert "extras" not in restored["properties"]
+
+
+def test_unproject_non_dict_passthrough() -> None:
+    assert unproject_item_from_es(None) is None
+    assert unproject_item_from_es("x") == "x"

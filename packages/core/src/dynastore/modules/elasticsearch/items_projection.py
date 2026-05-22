@@ -453,6 +453,58 @@ def project_item_for_es(doc: Dict[str, Any], known_fields: Dict[str, Dict[str, A
     return out
 
 
+def unproject_item_from_es(source: Dict[str, Any]) -> Dict[str, Any]:
+    """Rebuild the GeoJSON/STAC read contract from an indexed ``_source``.
+
+    Inverse of :func:`project_item_for_es`. The write path routes unknown
+    ``properties`` keys under ``properties.extras`` (Tier 3) and attaches
+    internal ``_*`` tracking fields (``_external_id``, ``_asset_id``,
+    ``_simplification_factor``, …) at the document top level. A raw
+    ``_source`` therefore violates the read contract three ways:
+
+    * attributes are nested under ``properties.extras``;
+    * internal ``_*`` fields and any leaked echo keys sit at the top level
+      (and would surface on the wire because :class:`dynastore.models.ogc.Feature`
+      is ``extra="allow"``);
+    * ``geometry`` may be an empty ``{}``.
+
+    This helper restores the canonical shape:
+
+    * ``properties.extras.*`` is hoisted back to flat ``properties.*`` (an
+      existing flat key wins on collision — it is the more specific value);
+    * only GeoJSON/STAC structural members (:data:`_RESERVED_MEMBER_KEYS`)
+      survive at the top level — internal ``_*`` fields and leaked
+      attribute/echo keys are dropped;
+    * an empty/falsy ``geometry`` is normalised to ``None`` so the output is
+      valid GeoJSON (``null`` geometry) instead of ``{}``.
+
+    Pure function — returns a new dict, the input is not mutated.
+    Read-policy exposure (id override, ``expose`` gating) is layered on by
+    the caller after this structural normalisation.
+    """
+    if not isinstance(source, dict):
+        return source
+
+    props_in = source.get("properties")
+    props: Dict[str, Any] = dict(props_in) if isinstance(props_in, dict) else {}
+    extras = props.pop("extras", None)
+    if isinstance(extras, dict):
+        for k, v in extras.items():
+            props.setdefault(k, v)
+
+    out: Dict[str, Any] = {"type": "Feature", "properties": props}
+    for key in _RESERVED_MEMBER_KEYS:
+        if key == "type":
+            continue
+        if key in source:
+            out[key] = source[key]
+
+    if not out.get("geometry"):
+        out["geometry"] = None
+
+    return out
+
+
 def resolve_es_field_path(
     stac_path: str,
     known_fields: Dict[str, Dict[str, Any]],

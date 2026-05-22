@@ -114,6 +114,8 @@ FullLogs*.txt
 test-results.xml
 test_run.log
 geoid-refs.json
+# DWH ingestion report dumps written to CWD by manual report runs
+geodata_reports_*.json
 
 # Temporary / Reproduction Scripts
 debug_*.py

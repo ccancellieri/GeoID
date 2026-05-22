@@ -653,6 +653,77 @@ class ItemsElasticsearchDriver(
         return ItemsWritePolicy()
 
     @staticmethod
+    async def _resolve_read_policy(
+        catalog_id: str, collection_id: str,
+    ) -> "ItemsReadPolicy":
+        """Resolve ItemsReadPolicy from the config waterfall.
+
+        Degrade-safe: any miss (no configs protocol, no stored row, fetch
+        error) returns the default policy so a read never 500s on a missing
+        wire-shape config.
+        """
+        from dynastore.modules.storage.read_policy import ItemsReadPolicy
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        try:
+            configs = get_protocol(ConfigsProtocol)
+            if configs:
+                result = await configs.get_config(
+                    ItemsReadPolicy,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+                if isinstance(result, ItemsReadPolicy):
+                    return result
+        except Exception:
+            pass
+        return ItemsReadPolicy()
+
+    @staticmethod
+    def _es_source_to_feature(
+        source: Dict[str, Any],
+        read_policy: Optional["ItemsReadPolicy"] = None,
+    ) -> Feature:
+        """Reconstruct a read-contract Feature from an indexed ES ``_source``.
+
+        The indexed ``_source`` is shaped for indexing, not for the wire:
+        unknown attributes are nested under ``properties.extras``, internal
+        ``_*`` tracking fields and leaked echo keys sit at the top level, and
+        ``geometry`` may be empty ``{}``. Returning it verbatim produced
+        malformed GeoJSON (extras nesting, top-level attribute echo via the
+        ``extra="allow"`` Feature model, ``"geometry": {}``).
+
+        Structural normalisation (un-project ``extras`` → flat ``properties``,
+        drop internal/echo top-level keys, null an empty geometry) is
+        delegated to :func:`unproject_item_from_es`. Read-policy exposure is
+        layered on here so an ES-served read matches the PostgreSQL
+        ``map_row_to_feature`` contract:
+
+        * ``external_id_as_feature_id`` → the indexed ``_external_id`` becomes
+          the feature ``id``;
+        * ``expose_geoid`` / ``expose_created`` gate the ``geoid`` / ``created``
+          properties (suppressed unless the policy opts in).
+        """
+        from dynastore.modules.elasticsearch.items_projection import (
+            unproject_item_from_es,
+        )
+
+        clean = unproject_item_from_es(source)
+        props = clean.get("properties")
+        if read_policy is not None and isinstance(props, dict):
+            ft = read_policy.feature_type
+            if getattr(ft, "external_id_as_feature_id", False) and isinstance(source, dict):
+                ext = source.get("_external_id")
+                if ext is not None:
+                    clean["id"] = str(ext)
+            if not getattr(ft, "expose_geoid", False):
+                props.pop("geoid", None)
+            if not getattr(ft, "expose_created", False):
+                props.pop("created", None)
+        return Feature.model_validate(clean)
+
+    @staticmethod
     def _extract_external_id_from_doc(doc: dict, field_path: Optional[str]) -> Optional[str]:
         """Extract external_id using a dot-notation path from an ES document."""
         if field_path is None:
@@ -774,6 +845,9 @@ class ItemsElasticsearchDriver(
     ) -> AsyncIterator[Feature]:
         es = _es_client_required()
         index_name = _tenant_items_index(catalog_id)
+        # Resolve the wire-shape policy once per query so every hit is
+        # reconstructed against the same read contract (id source, exposure).
+        read_policy = await self._resolve_read_policy(catalog_id, collection_id)
 
         if entity_ids:
             for eid in entity_ids:
@@ -784,7 +858,7 @@ class ItemsElasticsearchDriver(
                     )
                     src = resp.get("_source")
                     if src is not None:
-                        yield Feature.model_validate(src)
+                        yield self._es_source_to_feature(src, read_policy)
                 except Exception:
                     pass
         else:
@@ -814,7 +888,9 @@ class ItemsElasticsearchDriver(
                 )
                 for hit in resp.get("hits", {}).get("hits", []):
                     try:
-                        yield Feature.model_validate(hit["_source"])
+                        yield self._es_source_to_feature(
+                            hit["_source"], read_policy,
+                        )
                     except Exception:
                         pass
             except Exception as e:
