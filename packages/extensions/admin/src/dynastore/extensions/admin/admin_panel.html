@@ -150,7 +150,7 @@
   <!-- ── PRINCIPALS TAB ── -->
   <div id="tab-principals" class="tab-pane">
     <div class="toolbar">
-      <input class="search-box" id="principal-search" placeholder="Search by identifier or role…">
+      <input class="search-box" id="principal-search" placeholder="Search by identifier or role…" oninput="filterPrincipals()">
       <button class="btn btn-primary" onclick="loadPrincipals()"><i class="fa-solid fa-rotate"></i> Refresh</button>
     </div>
     <div class="table-wrap">
@@ -626,6 +626,14 @@ function renderPrincipals(list) {
       <td><button class="btn btn-sm btn-primary" data-action="catalog-modal" data-id="${escapeHtml(p.id)}"><i class="fa-solid fa-database"></i> Catalog Role</button></td>
     </tr>`).join('');
   tb.querySelectorAll('[data-action="catalog-modal"]').forEach(b => b.addEventListener('click', () => openCatalogModal(b.dataset.id)));
+}
+function filterPrincipals() {
+  const q = document.getElementById('principal-search').value.toLowerCase();
+  renderPrincipals((_allPrincipals || []).filter(p =>
+    (p.display_name||'').toLowerCase().includes(q) ||
+    (p.subject_id||'').toLowerCase().includes(q) ||
+    (p.roles||[]).some(r => (r||'').toLowerCase().includes(q))
+  ));
 }
 
 // ── ROLES ──
