@@ -1,6 +1,6 @@
 """Unit tests for the geoid extension's anonymous lookup policy registration:
 
-- ALLOW anonymous on /search/catalogs/{cat}/geoid/* when catalog opts in.
+- ALLOW anonymous on POST /search/catalogs/{cat}/items-search when catalog opts in.
 - DENY anonymous on /stac/catalogs/{cat}/* and /features/catalogs/{cat}/*
   when the same catalog opts in (lockdown to lookup-only for anonymous).
 """
@@ -12,7 +12,8 @@ _ANON = IamRolesConfig().anonymous_role_name
 
 
 def test_register_geoid_policies_registers_anonymous_lookup_allow(monkeypatch):
-    """Registers ALLOW policy on /search/catalogs/.../geoid/* with the lookup-public condition."""
+    """Registers ALLOW policy on POST /search/catalogs/.../items-search with the
+    lookup-public condition (#1210)."""
     from dynastore.extensions.geoid import policies as geoid_policies
 
     pm = MagicMock()
@@ -27,8 +28,11 @@ def test_register_geoid_policies_registers_anonymous_lookup_allow(monkeypatch):
     assert "geoid_anonymous_lookup_per_catalog" in registered
     p = registered["geoid_anonymous_lookup_per_catalog"]
     assert p.effect == "ALLOW"
-    assert "GET" in p.actions and "POST" in p.actions
-    assert any("/search/catalogs/" in r and "geoid" in r for r in p.resources)
+    assert p.actions == ["POST"]
+    # Every opened resource is the items-search sub-path — the ALLOW must NOT
+    # leak onto the broad catalog-scoped item search (POST /search/catalogs/{cat}).
+    assert p.resources
+    assert all("items-search" in r for r in p.resources)
     assert any(c.type == "catalog_lookup_public_allowed" for c in p.conditions)
 
 

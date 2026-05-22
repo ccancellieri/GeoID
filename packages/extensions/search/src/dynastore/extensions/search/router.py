@@ -12,8 +12,9 @@ extension is item-only and dispatches through ``ItemsRoutingConfig.operations[SE
 (the platform default pins ``items_elasticsearch_driver`` whose
 ``preferred_for`` includes ``Hint.GEOMETRY_SIMPLIFIED``).
 
-GeoID lookup routes (/search/catalogs/{cat}/geoid/...) are served by the
-geoid extension's lookup_router.py (PG-backed, no Elasticsearch dependency).
+The GeoID item-resolve route (POST /search/catalogs/{cat}/items-search) is
+served by the geoid extension's lookup_router.py (PG-backed; geoid resolution
+uses the catalog's private ES index when pinned, external_id over PostgreSQL).
 
 Conformance class: https://api.stacspec.org/v1.0.0/item-search
 """

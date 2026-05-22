@@ -27,9 +27,9 @@ the protocol contract will work transparently.
 - `reindex_catalog(catalog_id, mode?)` -> `Dict`
 - `reindex_collection(catalog_id, collection_id, mode?)` -> `Dict`
 
-> **Note:** `/search/catalogs/{cat}/geoid/...` lookup endpoints are served by the
-> geoid extension's `lookup_router.py` (PG-backed). They are not part of this
-> extension's surface and do not depend on `SearchProtocol`.
+> **Note:** the `POST /search/catalogs/{cat}/items-search` item-resolve endpoint
+> is served by the geoid extension's `lookup_router.py` (PG-backed). It is not
+> part of this extension's surface and does not depend on `SearchProtocol`.
 
 ## Models
 

@@ -510,3 +510,5 @@ async def lookup_by_external_id(
             row["external_id"] = external_id
         out.append(row)
     return out
+
+

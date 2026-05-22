@@ -23,7 +23,7 @@ register_platform_notebook(
             "Anonymous demo of the lookup-only profile: geoid lookup + "
             "exact-item GET on STAC/Features both succeed without a token, "
             "while collection list / items list / STAC search return 401/403. "
-            "Drives /search/catalogs/{cat}/geoid (PG-backed exact geometry) "
+            "Drives POST /search/catalogs/{cat}/items-search (PG-backed) "
             "and contrasts the open catalog surface against the auth-gated "
             "surface to show DENY policies firing as expected."
         )

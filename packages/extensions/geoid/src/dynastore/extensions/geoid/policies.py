@@ -20,7 +20,7 @@ _COLLECTION_WRITE_CONDITION = [{"type": "collection_write_anonymous_allowed"}]
 def register_geoid_policies():
     """Register all geoid-extension PermissionProtocol policies + role grants.
 
-    1. ALLOW anonymous on /search/catalogs/{cat}/geoid/* — gated on
+    1. ALLOW anonymous on POST /search/catalogs/{cat}/items-search — gated on
        CatalogLookupAudience.is_public via catalog_lookup_public_allowed.
     2. DENY anonymous on /stac/catalogs/{cat}/* under the same condition
        (lookup-only mode locks anonymous out of STAC enumeration).
@@ -52,11 +52,12 @@ def register_geoid_policies():
     pm.register_policy(Policy(
         id="geoid_anonymous_lookup_per_catalog",
         description=(
-            "Anonymous access to /search/catalogs/{cat}/geoid lookups when the "
-            "catalog has opted in via CatalogLookupAudience.is_public."
+            "Anonymous access to POST /search/catalogs/{cat}/items-search "
+            "(resolve one item by geoid or external_id) when the catalog has "
+            "opted in via CatalogLookupAudience.is_public."
         ),
-        actions=["GET", "POST"],
-        resources=[r"/search/catalogs/[^/]+/geoid(/.*)?"],
+        actions=["POST"],
+        resources=[r"/search/catalogs/[^/]+/items-search(/.*)?"],
         conditions=_LOOKUP_PUBLIC_CONDITION,
         effect="ALLOW",
     ))
@@ -65,11 +66,11 @@ def register_geoid_policies():
     # deliberately NOT in the resource list so the broad
     # ``stac_public_access`` / ``features_public_access`` ALLOW policy still
     # surfaces it. Anonymous clients on lookup-only catalogs can therefore:
-    #   * /search/catalogs/{cat}/geoid/{geoid}              (geoid lookup)
-    #   * POST /search/catalogs/{cat}/geoid                  (batch + ext-id)
+    #   * POST /search/catalogs/{cat}/items-search           (geoid/ext-id resolve)
     #   * GET .../collections/{coll}/items/{id}              (exact item)
-    # ...and nothing else. Collection/item enumeration and item search are
-    # blocked.
+    # ...and nothing else. Collection/item enumeration and the broad item
+    # search (POST /search/catalogs/{cat}) stay denied-by-default for
+    # anonymous — only the items-search sub-path is opened.
     _STAC_ENUMERATION_RESOURCES = [
         r"/stac/catalogs/[^/]+",
         r"/stac/catalogs/[^/]+/collections",

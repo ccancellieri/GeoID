@@ -120,16 +120,20 @@ Filters: `q`, `bbox`, `intersects`, `datetime`, `ids`, `geoid`, `external_id`, `
 
 Pagination uses ES `search_after` cursors exposed via STAC `next` links.
 
-### GeoID Lookup endpoints
+### GeoID item-resolve endpoint
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/search/geoid/{geoid}` | Look up a single geoid — returns `{geoid, catalog_id, collection_id}` |
-| `POST` | `/search/geoid` | Batch lookup — accepts `{geoids: [...], catalog_id?, limit?}` |
+| `POST` | `/search/catalogs/{catalog_id}/items-search` | Resolve an item by exactly one of `geoid` or `external_id` (#1210) |
 
-These endpoints query the private index (`{prefix}-geoid-*` or `{prefix}-geoid-{catalog_id}`).
-When `catalog_id` is provided (query param on GET, body field on POST), the lookup is restricted
-to that catalog's private index. Otherwise all private indexes are searched.
+Body carries **exactly one** of `geoid` or `external_id` (supplying both, or neither, is a 400).
+A `geoid` is resolved catalog-wide (it is unique within a catalog). An `external_id` is not
+globally unique, so it **requires a `collection_id`** and is resolved within that single collection
+only — a bare `external_id` is a 400 (un-fao/GeoID#1204 R2: the public lookup is a targeted
+resolve, never a cross-collection scan). Resolution is routing-aware: a `geoid` is served from the
+catalog's private ES index when one is pinned (id fetch), otherwise — and for `external_id`, which
+is not a document id — over PostgreSQL. The route is hosted by the geoid extension's
+`lookup_router.py`.
 
 Response:
 ```json
