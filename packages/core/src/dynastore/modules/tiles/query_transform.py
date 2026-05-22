@@ -26,8 +26,12 @@ Transforms queries for Mapbox Vector Tile (MVT) generation by:
 """
 
 import logging
-from typing import Dict, Any, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+
 from dynastore.models.query_builder import QueryRequest, FieldSelection
+
+if TYPE_CHECKING:
+    from dynastore.modules.storage.drivers.pg_sidecars import GeometriesSidecar
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +59,13 @@ class MVTQueryTransform:
     ) -> QueryRequest:
         """
         Transform query for MVT generation.
-        
-        Replaces geometry selection with ST_AsMVTGeom and adds spatial filter.
+
+        Resolves the geometry projection through the collection's geometry
+        sidecar so the physical geometry column is never hardcoded here, then
+        adds the tile-bounds spatial filter. The per-row ``ST_AsMVTGeom`` is
+        produced on the fly by the driver; the wrapping ``ST_AsMVT`` aggregates
+        the ``geom`` output column into the tile.
         """
-        extent = context.get("extent", 4096)
-        buffer = context.get("buffer", 256)
         target_srid = context.get("target_srid")
         tile_wkb = context.get("tile_wkb")
         srid = context.get("srid")  # Source SRID
@@ -70,28 +76,38 @@ class MVTQueryTransform:
             )
             return query_request
 
-        # Remove existing geometry selections
-        query_request.select = [s for s in query_request.select if s.field != "geom"]
+        geom_sidecar = self._resolve_geometry_sidecar(context.get("col_config"))
+        if geom_sidecar is None:
+            logger.warning("MVT transform: collection has no geometry sidecar; skipping")
+            return query_request
 
-        # Add a placeholder geometry selection to ensure GeometrySidecar joins
-        # The actual geometry will come from raw_selects below
-        query_request.select.append(FieldSelection(field="geom", alias="_geom_source"))
+        geom_field = geom_sidecar.get_main_geometry_field() or "geom"
+        sidecar_alias = f"sc_{geom_sidecar.sidecar_id}"
+        qualified_geom = f"{sidecar_alias}.{geom_field}"
 
-        # Add MVT geometry transformation via raw SQL
-        # QueryOptimizer will resolve 'geom' to the correct sidecar table alias
-        mvt_geom_expr = (
-            f"ST_AsMVTGeom("
-            f"ST_Transform(geom, CAST(:target_srid AS INTEGER)), "
-            f"ST_SetSRID(ST_GeomFromWKB(:tile_wkb), CAST(:target_srid AS INTEGER)), "
-            f":extent, :buffer, true) AS geom"
+        # On-the-fly MVT geometry from the geometry sidecar (storage-agnostic;
+        # the physical column is resolved by the sidecar, not hardcoded here).
+        mvt_geom_expr = geom_sidecar.get_geometry_select(context, sidecar_alias)
+        if not mvt_geom_expr:
+            logger.warning(
+                "MVT transform: geometry sidecar produced no geometry expression; skipping"
+            )
+            return query_request
+
+        # Drop any existing geometry selection and add a placeholder so the
+        # QueryOptimizer joins the geometry sidecar table; the actual MVT
+        # geometry comes from the raw select below, aliased ``geom`` for the
+        # wrapping ST_AsMVT(..., 'geom').
+        query_request.select = [s for s in query_request.select if s.field != geom_field]
+        query_request.select.append(
+            FieldSelection(field=geom_field, alias="_geom_source")
         )
+        query_request.raw_selects.append(f"{mvt_geom_expr} AS geom")
 
-        query_request.raw_selects.append(mvt_geom_expr)
-
-        # Add spatial filter for tile bounds
-        # This uses the source SRID for efficient index usage
+        # Spatial filter for tile bounds on the sidecar's qualified geometry
+        # (source SRID for efficient spatial-index use).
         spatial_filter = (
-            "ST_Intersects(geom, "
+            f"ST_Intersects({qualified_geom}, "
             "ST_Transform(ST_SetSRID(ST_GeomFromWKB(:tile_wkb), "
             "CAST(:target_srid AS INTEGER)), CAST(:srid AS INTEGER)))"
         )
@@ -101,23 +117,54 @@ class MVTQueryTransform:
         else:
             query_request.raw_where = spatial_filter
 
-        # Inject MVT parameters
+        # Bind params referenced by the geometry expression and the filter.
+        # ``extent``/``buffer`` are emitted as literals by ``get_geometry_select``
+        # (matching the wrapping ST_AsMVT extent), so only the SRIDs, tile
+        # envelope, and optional simplification tolerance need binding.
         query_request.raw_params.update(
             {
                 "target_srid": target_srid,
                 "tile_wkb": tile_wkb,
-                "extent": extent,
-                "buffer": buffer,
                 "srid": srid,
             }
         )
+        simplification = context.get("simplification")
+        if simplification:
+            query_request.raw_params["simplification"] = simplification
 
         logger.debug(
-            f"MVT transform applied: extent={extent}, buffer={buffer}, "
-            f"target_srid={target_srid}, srid={srid}"
+            "MVT transform applied: geom=%s, target_srid=%s, srid=%s",
+            qualified_geom,
+            target_srid,
+            srid,
         )
 
         return query_request
+
+    def _resolve_geometry_sidecar(
+        self, col_config: Any
+    ) -> Optional["GeometriesSidecar"]:
+        """Resolve the collection's geometry sidecar, or ``None``.
+
+        Mirrors the QueryOptimizer's sidecar resolution so the MVT geometry
+        expression is sourced from the same sidecar the optimizer joins. Returns
+        ``None`` for non-PG drivers (which carry no sidecars) or collections
+        without a geometry sidecar.
+        """
+        if col_config is None:
+            return None
+
+        from dynastore.modules.storage.drivers.pg_sidecars import (
+            GeometriesSidecar,
+            SidecarRegistry,
+            driver_sidecars,
+        )
+
+        for cfg in driver_sidecars(col_config):
+            sidecar = SidecarRegistry.get_sidecar(cfg, lenient=True)
+            if isinstance(sidecar, GeometriesSidecar):
+                return sidecar
+        return None
 
     def post_process_sql(
         self, sql: str, params: Dict[str, Any], context: Dict[str, Any]

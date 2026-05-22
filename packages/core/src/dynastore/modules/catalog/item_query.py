@@ -332,16 +332,47 @@ class ItemQueryMixin:
     ) -> QueryRequest:
         """Build base QueryRequest from params before transformations"""
         from dynastore.models.query_builder import QueryRequest, FieldSelection
+        from dynastore.modules.storage.drivers.pg_sidecars import (
+            SidecarRegistry,
+            driver_sidecars,
+        )
+
+        # Resolve the collection's sidecars once. The geometry and property
+        # field names come from the sidecars themselves so this base query is
+        # agnostic to the physical storage layout (JSONB blob vs COLUMNAR
+        # columns, default vs renamed geometry column).
+        sidecars = [
+            sc
+            for sc in (
+                SidecarRegistry.get_sidecar(cfg, lenient=True)
+                for cfg in driver_sidecars(col_config)
+            )
+            if sc is not None
+        ]
 
         # Mandatory ID
         selects = [FieldSelection(field="geoid", alias="id")]
 
-        # Geometry (if requested or by default)
+        # Geometry (if requested or by default). Skipped for MVT, where the MVT
+        # query transform injects the on-the-fly ST_AsMVTGeom projection.
         if params.get("with_geometry", True) and params.get("geom_format") != "MVT":
-            selects.append(FieldSelection(field="geom"))
+            geom_field = next(
+                (
+                    name
+                    for name in (sc.get_main_geometry_field() for sc in sidecars)
+                    if name
+                ),
+                None,
+            )
+            if geom_field:
+                selects.append(FieldSelection(field=geom_field))
 
-        # Attributes (JSONB)
-        selects.append(FieldSelection(field="attributes"))
+        # Properties — storage-agnostic. Each sidecar reports its property field
+        # names (JSONB → the blob column; COLUMNAR → the individual columns);
+        # the optimizer resolves each to its SQL expression.
+        for sc in sidecars:
+            for field_name in sc.get_property_field_names():
+                selects.append(FieldSelection(field=field_name))
 
         query_req = QueryRequest(
             select=selects,

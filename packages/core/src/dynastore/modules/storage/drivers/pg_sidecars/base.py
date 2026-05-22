@@ -789,6 +789,23 @@ class SidecarProtocol(ABC):
         """
         return None
 
+    def get_property_field_names(self) -> List[str]:
+        """
+        Return the names of this sidecar's feature *property* fields, in a way
+        that is independent of the physical storage layout.
+
+        Property fields are the user-facing attributes that populate
+        ``feature.properties`` — distinct from identity columns (external_id,
+        asset_id), geometry, and computed statistics. A consumer that needs to
+        project a collection's properties without knowing whether they live in a
+        JSONB blob or individual COLUMNAR columns selects exactly these field
+        names and lets the QueryOptimizer resolve each to its SQL expression.
+
+        Default implementation returns an empty list; only sidecars that own
+        user-facing properties (the attributes sidecar) override this.
+        """
+        return []
+
     @abstractmethod
     def get_identity_columns(self) -> List[str]:
         """

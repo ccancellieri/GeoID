@@ -94,8 +94,11 @@ async def test_mvt_query_transformation(catalog_id, collection_id, db_engine, ap
         assert "ST_Intersects" in sql, "MVT transformation should add spatial filter"
         assert "target_srid" in bind_params
         assert "tile_wkb" in bind_params
-        assert bind_params["extent"] == 4096
-        assert bind_params["buffer"] == 256
+        # extent/buffer are emitted as literals inside ST_AsMVTGeom (matching the
+        # wrapping ST_AsMVT extent), not as bind params.
+        assert "4096" in sql
+        assert "extent" not in bind_params
+        assert "buffer" not in bind_params
 
 
 @pytest.mark.asyncio

@@ -147,6 +147,22 @@ class FeatureAttributeSidecar(SidecarProtocol):
             return AttributeStorageMode.COLUMNAR
         return AttributeStorageMode.JSONB
 
+    def get_property_field_names(self) -> List[str]:
+        """Property field names, storage-agnostic (JSONB blob vs COLUMNAR columns).
+
+        - JSONB: the single blob column (``jsonb_column_name``); the optimizer
+          resolves it to the whole document, preserving the long-standing tile
+          property shape.
+        - COLUMNAR: one name per declared ``attribute_schema`` column.
+
+        Identity columns and computed statistics are intentionally excluded —
+        they are not feature properties. See ``get_property_field_names`` on the
+        base protocol for the contract.
+        """
+        if self.resolved_storage_mode == AttributeStorageMode.JSONB:
+            return [self.config.jsonb_column_name]
+        return [attr.name for attr in (self.config.attribute_schema or [])]
+
     # ------------------------------------------------------------------
     # Attribute-statistics storage-shape helpers (consume the
     # ``compute_fields_overlay``; mirror the geometries sidecar). #1074
