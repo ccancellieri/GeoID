@@ -158,6 +158,37 @@ def collection_not_found(
     ))
 
 
+def asset_not_found(
+    catalog_id: str, collection_id: str, asset_id: str, *, instance: Optional[str] = None,
+) -> ProblemException:
+    """404 when the asset named for a schema-derivation does not exist in the
+    target collection."""
+    return ProblemException(ProblemDetails(
+        type=f"{_TYPE_BASE}/asset-not-found",
+        title="Asset not found",
+        status=404,
+        detail=(
+            f"Asset '{asset_id}' was not found in collection '{collection_id}' "
+            f"of catalog '{catalog_id}'."
+        ),
+        instance=instance,
+    ))
+
+
+def cannot_derive_schema(
+    detail: str, *, instance: Optional[str] = None,
+) -> ProblemException:
+    """422 when a schema cannot be derived from the asset — it carries no
+    ``gdalinfo`` metadata, or the blob has no usable layer."""
+    return ProblemException(ProblemDetails(
+        type=f"{_TYPE_BASE}/schema-not-derivable",
+        title="Cannot derive items schema",
+        status=422,
+        detail=detail,
+        instance=instance,
+    ))
+
+
 def engine_write_forbidden_at_tenant_scope(
     plugin_id: str, *, scope: str, instance: Optional[str] = None,
 ) -> ProblemException:

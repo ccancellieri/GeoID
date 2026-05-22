@@ -18,10 +18,11 @@
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, status, Request, FastAPI
 from fastapi.responses import Response
+from pydantic import BaseModel
 from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
 from dynastore.extensions.configs._composed_query_params import (
     IncludeQuery,
@@ -61,6 +62,18 @@ from .policies import register_configs_policies
 from . import problem_details
 
 logger = logging.getLogger(__name__)
+
+
+class ItemsSchemaDeriveRequest(BaseModel):
+    """Body for the items_schema derive endpoint.
+
+    ``asset_id`` names a vector asset (in the target collection) whose stored
+    ``gdalinfo`` metadata seeds the proposal; ``layer`` selects a layer for
+    multi-layer sources (GeoPackage/FileGDB) — the first layer wins when omitted.
+    """
+
+    asset_id: str
+    layer: Optional[str] = None
 
 
 class ConfigsService(ExtensionProtocol):
@@ -229,6 +242,13 @@ class ConfigsService(ExtensionProtocol):
             methods=["DELETE"],
             summary="Delete a collection-level plugin configuration",
             status_code=status.HTTP_204_NO_CONTENT,
+        )
+        # ---- items_schema derivation (propose; apply is the existing PUT) ----
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/items-schema/derive",
+            self.derive_items_schema_proposal,
+            methods=["POST"],
+            summary="Derive a proposed items_schema for a collection from a vector asset's gdalinfo",
         )
 
     @property
@@ -750,6 +770,97 @@ class ConfigsService(ExtensionProtocol):
         )
         await self._invalidate_exposure()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    async def derive_items_schema_proposal(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        body: ItemsSchemaDeriveRequest,
+    ) -> Dict[str, Any]:
+        """Derive a *proposed* items_schema for a collection from a vector
+        asset's stored ``gdalinfo`` metadata.
+
+        Pure read — nothing is persisted. The returned ``fields`` is a
+        merge-patch body ready to apply via
+        ``PUT /configs/catalogs/{cat}/collections/{col}/plugins/items_schema``.
+        The proposal merges the derivation onto the collection's current schema:
+        existing per-field admin tuning is preserved (only ``data_type`` /
+        ``subtype`` come from the derivation), fields new in the asset are added,
+        and fields the asset lacks are kept. ``summary`` reports what changed.
+
+        Gated to sysadmin by the existing ``configs_access`` policy (the whole
+        ``/configs/.*`` surface is deny-by-default for everyone else).
+        """
+        instance = (
+            f"/configs/catalogs/{catalog_id}/collections/"
+            f"{collection_id}/items-schema/derive"
+        )
+        await require_catalog_ready(catalog_id)
+
+        collections = get_protocol(CollectionsProtocol)
+        assert collections is not None, "CollectionsProtocol not registered"
+        if await collections.get_collection(catalog_id, collection_id) is None:
+            raise problem_details.collection_not_found(
+                catalog_id, collection_id, instance=instance,
+            )
+
+        try:
+            from dynastore.models.protocols import AssetsProtocol
+            from dynastore.modules.storage.driver_config import ItemsSchema
+            from dynastore.tasks.ingestion.schema_from_gdalinfo import (
+                derive_schema_from_gdalinfo,
+                merge_derived_fields,
+            )
+
+            assets = get_protocol(AssetsProtocol)
+            assert assets is not None, "AssetsProtocol not registered"
+            asset = await assets.get_asset(
+                asset_id=body.asset_id,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+            if asset is None:
+                raise problem_details.asset_not_found(
+                    catalog_id, collection_id, body.asset_id, instance=instance,
+                )
+
+            gdalinfo = (asset.metadata or {}).get("gdalinfo")
+            if not gdalinfo:
+                raise problem_details.cannot_derive_schema(
+                    f"Asset '{body.asset_id}' carries no 'gdalinfo' metadata; "
+                    f"run the gdal task on it before deriving a schema.",
+                    instance=instance,
+                )
+            try:
+                derived = derive_schema_from_gdalinfo(gdalinfo, layer_name=body.layer)
+            except RuntimeError as e:
+                raise problem_details.cannot_derive_schema(str(e), instance=instance)
+
+            current = await self.configs.get_config(
+                ItemsSchema, catalog_id, collection_id,
+            )
+            merged, summary = merge_derived_fields(current.fields or {}, derived)
+
+            return {
+                "catalog_id": catalog_id,
+                "collection_id": collection_id,
+                "asset_id": body.asset_id,
+                "layer": body.layer,
+                "fields": {
+                    name: fd.model_dump(mode="json", exclude_none=True)
+                    for name, fd in merged.items()
+                },
+                "summary": summary,
+            }
+        except problem_details.ProblemException:
+            raise
+        except InvalidIdentifierError as e:
+            raise problem_details.invalid_identifier(e)
+        except Exception as e:
+            logger.error(
+                f"Error deriving items_schema proposal: {e}", exc_info=True,
+            )
+            raise problem_details.unexpected_failure(e)
 
     # Catalog Level
 

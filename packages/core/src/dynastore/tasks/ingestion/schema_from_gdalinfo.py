@@ -22,7 +22,7 @@ mapping lives in exactly one place (:func:`dynastore.models.field_types.ogr_to_c
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dynastore.models.field_types import ogr_to_canonical
 from dynastore.models.protocols.field_definition import FieldDefinition
@@ -125,3 +125,49 @@ def derive_schema_from_gdalinfo(
         )
 
     return out
+
+
+def merge_derived_fields(
+    current: Dict[str, FieldDefinition],
+    derived: Dict[str, FieldDefinition],
+) -> Tuple[Dict[str, FieldDefinition], Dict[str, List[str]]]:
+    """Merge ``derived`` fields into the ``current`` schema, preserving tuning.
+
+    The derivation only knows about *type* — so for a field that already exists
+    in ``current`` it contributes ``data_type``/``subtype`` only; every other
+    attribute an admin set (``materialize``, ``capabilities``, ``required``,
+    ``unique``, ``title``, ``description`` …) is kept. Fields new in ``derived``
+    are added as-is. Fields present in ``current`` but absent from ``derived``
+    are kept untouched — removal is destructive and never automatic, so
+    re-deriving from a different asset can't silently drop columns.
+
+    Returns ``(merged, summary)`` where ``summary`` buckets field names into
+    ``added`` / ``updated`` (type or subtype changed) / ``unchanged`` /
+    ``preserved`` (kept; not present in the derivation).
+    """
+    merged: Dict[str, FieldDefinition] = dict(current)
+    added: List[str] = []
+    updated: List[str] = []
+    unchanged: List[str] = []
+
+    for name, dfd in derived.items():
+        cur = current.get(name)
+        if cur is None:
+            merged[name] = dfd
+            added.append(name)
+            continue
+        merged[name] = cur.model_copy(
+            update={"data_type": dfd.data_type, "subtype": dfd.subtype}
+        )
+        if (cur.data_type, cur.subtype) == (dfd.data_type, dfd.subtype):
+            unchanged.append(name)
+        else:
+            updated.append(name)
+
+    summary = {
+        "added": sorted(added),
+        "updated": sorted(updated),
+        "unchanged": sorted(unchanged),
+        "preserved": sorted(n for n in current if n not in derived),
+    }
+    return merged, summary

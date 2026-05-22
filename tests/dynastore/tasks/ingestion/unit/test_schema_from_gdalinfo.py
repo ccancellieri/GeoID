@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import pytest
 
+from dynastore.models.protocols.field_definition import FieldCapability, FieldDefinition
 from dynastore.tasks.ingestion.schema_from_gdalinfo import (
     derive_schema_from_gdalinfo,
     field_definition_from_ogr_names,
     geometry_field_definition,
+    merge_derived_fields,
 )
 
 
@@ -163,3 +165,67 @@ def test_geometry_field_definition_without_type() -> None:
     assert fd.name == "geometry"
     assert fd.data_type == "geometry"
     assert "geometry" in fd.description.lower()
+
+
+# ---------------------------------------------------------------------------
+# merge_derived_fields — preserve admin tuning, never silently drop
+# ---------------------------------------------------------------------------
+
+def test_merge_into_empty_schema_adds_everything() -> None:
+    derived = derive_schema_from_gdalinfo(_blob([{"name": "a", "type": "String"}]))
+    merged, summary = merge_derived_fields({}, derived)
+    assert set(merged) == {"geometry", "a"}
+    assert summary["added"] == ["a", "geometry"]
+    assert summary["updated"] == [] and summary["preserved"] == []
+
+
+def test_merge_preserves_admin_tuning_and_updates_type() -> None:
+    # Admin tuned "lanes": forced a column, FILTERABLE, required, custom title.
+    current = {
+        "lanes": FieldDefinition(
+            name="lanes", data_type="string", materialize=True, required=True,
+            capabilities=[FieldCapability.FILTERABLE], title="Lane count",
+            description="hand-written",
+        ),
+    }
+    # The asset says lanes is really an integer.
+    derived = {"lanes": field_definition_from_ogr_names("lanes", "Integer")}
+    merged, summary = merge_derived_fields(current, derived)
+
+    out = merged["lanes"]
+    assert out.data_type == "integer"          # taken from derivation
+    assert out.materialize is True             # admin tuning preserved
+    assert out.required is True
+    assert out.capabilities == [FieldCapability.FILTERABLE]
+    assert out.title == "Lane count"
+    assert out.description == "hand-written"   # not overwritten
+    assert summary["updated"] == ["lanes"]
+
+
+def test_merge_same_type_is_unchanged() -> None:
+    current = {"name": FieldDefinition(name="name", data_type="string", materialize=True)}
+    derived = {"name": field_definition_from_ogr_names("name", "String")}
+    merged, summary = merge_derived_fields(current, derived)
+    assert summary["unchanged"] == ["name"]
+    assert summary["updated"] == []
+    assert merged["name"].materialize is True
+
+
+def test_merge_keeps_fields_absent_from_asset() -> None:
+    current = {
+        "legacy": FieldDefinition(name="legacy", data_type="string", materialize=True),
+    }
+    derived = {"new_col": field_definition_from_ogr_names("new_col", "Integer")}
+    merged, summary = merge_derived_fields(current, derived)
+    assert "legacy" in merged                 # never auto-dropped
+    assert merged["legacy"].materialize is True
+    assert summary["preserved"] == ["legacy"]
+    assert summary["added"] == ["new_col"]
+
+
+def test_merge_subtype_change_counts_as_update() -> None:
+    current = {"flag": FieldDefinition(name="flag", data_type="integer")}
+    derived = {"flag": field_definition_from_ogr_names("flag", "Integer", "Boolean")}
+    merged, summary = merge_derived_fields(current, derived)
+    assert (merged["flag"].data_type, merged["flag"].subtype) == ("boolean", "boolean")
+    assert summary["updated"] == ["flag"]
