@@ -167,16 +167,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                             conn=conn, force=True
                         )
 
-                # One-shot purge of inert `viewer` rows left behind by
-                # tenants seeded before #643 slice 1. Runs after schema
-                # init + default-policy provision so the table exists.
-                # Guarded inside the migration — operator-customized
-                # viewer rows survive.
-                from dynastore.modules.iam.viewer_role_purge_migration import (
-                    purge_viewer_role_rows,
-                )
-                await purge_viewer_role_rows(engine)
-
             except Exception as e:
                 logger.error(f"Failed to initialize IamModule: {e}", exc_info=True)
 

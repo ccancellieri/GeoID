@@ -149,12 +149,22 @@ logger = logging.getLogger(__name__)
 
 # DDL execution timeouts — short by default to surface deadlocks fast in
 # prod, but tunable for CI where xdist parallelism + shared PG instance
-# create lock contention that a 30s ceiling routinely exceeds. Set
+# create lock contention that the default ceiling routinely exceeds. Set
 # ``DYNASTORE_DDL_STATEMENT_TIMEOUT`` / ``DYNASTORE_DDL_LOCK_TIMEOUT``
 # (PG interval syntax: ``30s``, ``2min``, ``"120s"``) in test compose to
 # raise the ceiling without weakening prod behaviour.
+#
+# lock_timeout is kept SMALL on purpose: a DDL statement takes an
+# AccessExclusiveLock, and a *pending* exclusive request queues ahead of
+# every reader — so a DDL that waits N seconds for its lock freezes the
+# whole application for N seconds. Bounding acquisition to a small window
+# (mirrors DBConfig.lock_timeout, the engine-wide default) means a DDL can
+# never convoy the app: it fails fast with 55P03 and is retried instead.
+# statement_timeout stays larger — it bounds DDL *execution* (so a long
+# build can finish) while still guaranteeing the lock is released and never
+# left open indefinitely.
 _DDL_STATEMENT_TIMEOUT = os.environ.get("DYNASTORE_DDL_STATEMENT_TIMEOUT", "30s")
-_DDL_LOCK_TIMEOUT = os.environ.get("DYNASTORE_DDL_LOCK_TIMEOUT", "30s")
+_DDL_LOCK_TIMEOUT = os.environ.get("DYNASTORE_DDL_LOCK_TIMEOUT", "5s")
 
 _metadata = MetaData()
 

@@ -172,6 +172,19 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                             "tcp_keepalives_count": str(
                                 db_config.tcp_keepalives_count
                             ),
+                            # Bounded lock windows on every connection so a
+                            # stuck DDL or a leaked / interrupted transaction
+                            # can never block the whole application. lock_timeout
+                            # caps how long any statement waits to acquire a
+                            # lock; idle_in_transaction_session_timeout makes
+                            # PostgreSQL release a held lock server-side when a
+                            # transaction is left open idle — even if the client
+                            # was interrupted and never rolled back. See
+                            # DBConfig.lock_timeout.
+                            "lock_timeout": db_config.lock_timeout,
+                            "idle_in_transaction_session_timeout": (
+                                db_config.idle_in_transaction_session_timeout
+                            ),
                         },
                     },
                 )

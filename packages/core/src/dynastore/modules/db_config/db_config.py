@@ -49,6 +49,25 @@ class DBConfig:
     tcp_keepalives_idle: int = int(os.getenv("DB_TCP_KEEPALIVES_IDLE", "300"))
     tcp_keepalives_interval: int = int(os.getenv("DB_TCP_KEEPALIVES_INTERVAL", "30"))
     tcp_keepalives_count: int = int(os.getenv("DB_TCP_KEEPALIVES_COUNT", "5"))
+    # Lock-safety GUCs — applied as server_settings on EVERY connection (see
+    # db_service). They make it impossible for one statement, or a leaked /
+    # interrupted transaction, to freeze the whole application:
+    #   * lock_timeout — the longest ANY statement will wait to acquire a
+    #     lock. A pending lock request (e.g. an ALTER's AccessExclusive that
+    #     queues ahead of every reader) can never convoy the application for
+    #     longer than this window; on expiry the statement fails with 55P03
+    #     (retried by retry_on_lock_conflict) instead of blocking forever.
+    #   * idle_in_transaction_session_timeout — PostgreSQL terminates a
+    #     backend that holds a transaction open while idle past this window,
+    #     releasing its locks SERVER-side. This is the only guarantee that
+    #     holds when a client is interrupted / OOM-killed mid-transaction and
+    #     never runs ROLLBACK — the exact failure mode that pinned
+    #     catalog.catalogs behind an idle-in-transaction reader while an
+    #     ALTER waited on it. A DDL therefore can never leave a lock open.
+    lock_timeout: str = os.getenv("DB_LOCK_TIMEOUT", "5s")
+    idle_in_transaction_session_timeout: str = os.getenv(
+        "DB_IDLE_IN_TRANSACTION_TIMEOUT", "30s"
+    )
 
     @property
     def pool_max_overflow(self) -> int:
