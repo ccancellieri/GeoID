@@ -1160,20 +1160,33 @@ CREATE TABLE IF NOT EXISTS "{schema}".pmtiles_archives (
 );
 """
 
+# PMTiles tiles are already gzip-compressed per tile, so column-level TOAST
+# compression only burns CPU and — worse — forces PostgreSQL to detoast the
+# whole value on every ``substring()`` range read. EXTERNAL storage keeps the
+# BYTEA uncompressed and out-of-line so a partial read (header / directory /
+# single tile) is served without materialising the whole archive (#1206).
+# Idempotent; applies to subsequent writes, so it also upgrades pre-existing
+# archive tables.
+_PMTILES_ARCHIVE_STORAGE_DDL = (
+    'ALTER TABLE "{schema}".pmtiles_archives ALTER COLUMN data SET STORAGE EXTERNAL;'
+)
+
 
 async def ensure_pmtiles_archive_storage_exists(conn: DbResource, schema: str) -> None:
-    """Idempotent DDL guard: creates pmtiles_archives if it does not yet exist."""
-    if await check_table_exists(conn, "pmtiles_archives", schema=schema):
-        return
-    await DDLQuery(_PMTILES_ARCHIVE_DDL.format(schema=schema)).execute(conn)
+    """Idempotent DDL guard: creates pmtiles_archives and pins EXTERNAL storage."""
+    if not await check_table_exists(conn, "pmtiles_archives", schema=schema):
+        await DDLQuery(_PMTILES_ARCHIVE_DDL.format(schema=schema)).execute(conn)
+    await DDLQuery(_PMTILES_ARCHIVE_STORAGE_DDL.format(schema=schema)).execute(conn)
 
 
 class PGTileArchive(TileArchiveStorageProtocol):
     """PG BYTEA archive store. On-premise fallback only.
 
-    ⚠ get_tile_from_archive downloads the full archive per call —
-    suitable only for small datasets. Production deployments should prefer
-    StorageBackedTileArchive (GCS / S3) which uses range-reads.
+    ``get_tile_from_archive`` range-reads the stored PMTiles archive — it pulls
+    only the header, the directory entries it has to walk, and the requested
+    tile, via ``substring()`` over the (EXTERNAL-stored) BYTEA — so serving one
+    tile never materialises the whole archive. This mirrors the range-read
+    contract of the object-storage-backed ``StorageBackedTileArchive`` (#1206).
     """
 
     def __init__(self):
@@ -1234,6 +1247,38 @@ class PGTileArchive(TileArchiveStorageProtocol):
                 return False
             raise
 
+    async def _read_archive_range(
+        self,
+        schema: str,
+        collection_id: str,
+        tms_id: str,
+        offset: int,
+        length: int,
+    ) -> Optional[bytes]:
+        """Fetch ``[offset, offset+length)`` from the stored PMTiles BYTEA.
+
+        ``substring`` lets PostgreSQL serve a partial read of the (EXTERNAL,
+        uncompressed) value instead of materialising the whole archive. BYTEA
+        ``substring`` is 1-indexed, hence ``offset + 1``. Returns ``None`` when
+        the archive row is absent.
+        """
+        sql = f"""
+            SELECT substring(data FROM :start FOR :length)
+            FROM "{schema}".pmtiles_archives
+            WHERE collection_id=:collection_id AND tms_id=:tms_id;
+        """
+        async with managed_transaction(self.engine) as conn:
+            chunk = await DQLQuery(
+                sql, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
+            ).execute(
+                conn,
+                start=offset + 1,
+                length=length,
+                collection_id=collection_id,
+                tms_id=tms_id,
+            )
+        return bytes(chunk) if chunk is not None else None
+
     async def get_tile_from_archive(
         self,
         catalog_id: str,
@@ -1243,33 +1288,54 @@ class PGTileArchive(TileArchiveStorageProtocol):
         x: int,
         y: int,
     ) -> Optional[bytes]:
+        from pmtiles.tile import (
+            deserialize_directory,
+            deserialize_header,
+            find_tile,
+            zxy_to_tileid,
+        )
+
         schema = await self._get_schema(catalog_id)
-        sql = f"""
-            SELECT data FROM "{schema}".pmtiles_archives
-            WHERE collection_id=:collection_id AND tms_id=:tms_id;
-        """
         try:
-            async with managed_transaction(self.engine) as conn:
-                data: Optional[bytes] = await DQLQuery(
-                    sql, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
-                ).execute(conn, collection_id=collection_id, tms_id=tms_id)
-        except Exception as exc:
-            if "42P01" in str(exc):
+            header_bytes = await self._read_archive_range(
+                schema, collection_id, tms_id, 0, 127
+            )
+            if not header_bytes:
                 return None
-            raise
-
-        if data is None:
+            header = deserialize_header(header_bytes)
+            tile_id = zxy_to_tileid(z, x, y)
+            dir_offset = header["root_offset"]
+            dir_length = header["root_length"]
+            # PMTiles caps directory nesting at one root + leaf levels; the
+            # spec's reference reader bounds the walk at depth 4.
+            for _ in range(4):
+                dir_bytes = await self._read_archive_range(
+                    schema, collection_id, tms_id, dir_offset, dir_length
+                )
+                if not dir_bytes:
+                    return None
+                entry = find_tile(deserialize_directory(dir_bytes), tile_id)
+                if entry is None:
+                    return None
+                if entry.run_length == 0:
+                    # Leaf-directory pointer — descend and resolve again.
+                    dir_offset = header["leaf_directory_offset"] + entry.offset
+                    dir_length = entry.length
+                    continue
+                return await self._read_archive_range(
+                    schema,
+                    collection_id,
+                    tms_id,
+                    header["tile_data_offset"] + entry.offset,
+                    entry.length,
+                )
             return None
-
-        try:
-            from pmtiles.reader import Reader, MemorySource
-
-            reader = Reader(MemorySource(data))
-            return reader.get(z, x, y)
-        except Exception:
+        except Exception as exc:
+            if "42P01" in str(exc):  # archive table not provisioned yet
+                return None
             logger.warning(
                 f"PGTileArchive: failed to extract tile z={z} x={x} y={y} "
-                f"from archive for {collection_id}/{tms_id}"
+                f"from archive for {collection_id}/{tms_id}: {exc}"
             )
             return None
 
