@@ -48,6 +48,9 @@ def _mock_layer_defn(field_specs: list[tuple[str, str]]) -> MagicMock:
 def _mock_layer(field_specs: list[tuple[str, str]], name: str = "roads") -> MagicMock:
     layer = MagicMock()
     layer.GetName.return_value = name
+    # A real geometry-type int so the (unpatched) ogr.GeometryTypeToName call
+    # in extract_ogr_schema resolves to a real label.
+    layer.GetGeomType.return_value = ogr.wkbUnknown
     layer.GetLayerDefn.return_value = _mock_layer_defn(field_specs)
     return layer
 

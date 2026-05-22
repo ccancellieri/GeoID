@@ -45,6 +45,10 @@ from osgeo import ogr, gdal  # noqa: F401
 
 from dynastore.models.field_types import ogr_to_canonical
 from dynastore.models.protocols.field_definition import FieldDefinition
+from dynastore.tasks.ingestion.schema_from_gdalinfo import (
+    field_definition_from_ogr_names,
+    geometry_field_definition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,31 +131,22 @@ def extract_ogr_schema(
             layer = ds.GetLayer(0)
 
         layer_defn = layer.GetLayerDefn()
-        out: Dict[str, FieldDefinition] = {}
 
         # Geometry first — always present (or always absent) on an OGR
         # layer; we declare it unconditionally so downstream sidecars
-        # don't need a separate "is there geometry?" probe.
-        out["geometry"] = FieldDefinition(
-            name="geometry",
-            data_type="geometry",
-            description="Feature geometry (derived from OGR layer geometry column).",
-        )
+        # don't need a separate "is there geometry?" probe. Built through the
+        # same shared helpers as the blob-sourced path so the two agree.
+        out: Dict[str, FieldDefinition] = {
+            "geometry": geometry_field_definition(
+                ogr.GeometryTypeToName(layer.GetGeomType())
+            ),
+        }
 
         for i in range(layer_defn.GetFieldCount()):
             fd = layer_defn.GetFieldDefn(i)
             fname = fd.GetName()
-            data_type, subtype = _map_ogr_type(fd)
-            type_name = _ogr_field_type_name(fd)
-            sub_name = _ogr_field_subtype_name(fd)
-            out[fname] = FieldDefinition(
-                name=fname,
-                data_type=data_type,
-                subtype=subtype,
-                description=(
-                    f"Auto-derived from OGR field {fname!r} (OGR type: "
-                    f"{type_name}{f', subtype: {sub_name}' if sub_name else ''})."
-                ),
+            out[fname] = field_definition_from_ogr_names(
+                fname, _ogr_field_type_name(fd), _ogr_field_subtype_name(fd),
             )
 
         logger.info(

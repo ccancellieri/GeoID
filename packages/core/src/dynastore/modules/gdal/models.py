@@ -25,6 +25,10 @@ class VectorFieldInfo(BaseModel):
     """Describes a single field in a vector layer."""
     name: str
     type: str
+    # OGR field subtype label (Boolean/Int16/Float32/JSON/UUID) when the source
+    # declares one — recorded so a schema derived from this blob keeps the same
+    # fidelity as a direct OGR read (see tasks/ingestion/schema_from_gdalinfo).
+    subtype: Optional[str] = None
 
 class VectorCoordinateSystem(BaseModel):
     """Describes the coordinate system of a vector layer."""

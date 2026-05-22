@@ -18,7 +18,6 @@
 
 import logging
 from enum import Enum
-from typing import Optional, Tuple, Set
 
 try:
     from osgeo import gdal, ogr
@@ -105,10 +104,16 @@ def get_vector_info(file_path: str) -> dict:
             layer_def = layer.GetLayerDefn()
             for j in range(layer_def.GetFieldCount()):
                 field_def = layer_def.GetFieldDefn(j)
-                layer_info["fields"].append({
+                field_entry = {
                     "name": field_def.GetName(),
                     "type": field_def.GetFieldTypeName(field_def.GetType())
-                })
+                }
+                # Record the OGR subtype (Boolean/Int16/Float32/JSON/UUID) when
+                # present so a schema derived from this blob keeps full fidelity.
+                sub = field_def.GetSubType()
+                if sub != ogr.OFSTNone:
+                    field_entry["subtype"] = ogr.GetFieldSubTypeName(sub)
+                layer_info["fields"].append(field_entry)
             result["layers"].append(layer_info)
         del ds
         return result
