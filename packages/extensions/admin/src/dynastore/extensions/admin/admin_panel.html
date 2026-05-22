@@ -184,7 +184,7 @@
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>Effect</th><th>Actions</th><th>Resources</th><th>Description</th><th>Ops</th></tr></thead>
+        <thead><tr><th>ID</th><th>Effect</th><th>Priority</th><th>Actions</th><th>Resources</th><th>Description</th><th>Ops</th></tr></thead>
         <tbody id="policies-tbody"><tr><td colspan="6" class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading…</td></tr></tbody>
       </table>
     </div>
@@ -279,6 +279,8 @@
     <div class="form-row"><label>Effect</label>
       <select id="pm-effect"><option value="ALLOW">ALLOW</option><option value="DENY">DENY</option></select>
     </div>
+    <div class="form-row"><label>Priority — [-1000, 1000], higher wins; ties resolve to DENY</label>
+      <input id="pm-priority" type="number" min="-1000" max="1000" step="1" value="0"/></div>
     <div class="form-row"><label>Actions (comma-separated)</label><input id="pm-actions" placeholder="GET, POST, PUT, DELETE"/></div>
     <div class="form-row"><label>Resources (regex patterns, one per line)</label>
       <textarea id="pm-resources" placeholder="/my/resource/.*&#10;/other/path">/my/resource/.*</textarea>
@@ -390,7 +392,7 @@ async function loadUsers() {
   const tb = document.getElementById('users-tbody');
   tb.innerHTML = '<tr><td colspan="5" class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading…</td></tr>';
   try {
-    _allUsers = await apiFetch('/users');
+    _allUsers = await apiFetch('/principals');
     renderUsers(_allUsers);
   } catch(e) { tb.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(e.message)}</td></tr>`; }
 }
@@ -430,7 +432,7 @@ async function createUser() {
   const roles = csvToList(document.getElementById('nm-roles').value);
   if (!username || !password) { toast('Username and password are required.', false); return; }
   try {
-    await apiFetch('/users', { method:'POST', body: JSON.stringify({username,password,email,roles}) });
+    await apiFetch('/principals', { method:'POST', body: JSON.stringify({username,password,email,roles}) });
     toast('User created successfully.'); closeUserModal(); loadUsers();
   } catch(e) { toast(e.message, false); }
 }
@@ -438,7 +440,7 @@ async function setUserActive(id, active) {
   const verb = active ? 'Reactivate' : 'Deactivate';
   if (!confirm(`${verb} this user?`)) return;
   try {
-    await apiFetch(`/users/${id}`, { method:'PUT', body: JSON.stringify({is_active: active}) });
+    await apiFetch(`/principals/${id}`, { method:'PUT', body: JSON.stringify({is_active: active}) });
     toast(`User ${active ? 'reactivated' : 'deactivated'}.`); loadUsers();
   } catch(e) { toast(e.message, false); }
 }
@@ -522,20 +524,40 @@ async function revokeCatalogRoleFor(catalog, principalId, role) {
   } catch(e) { toast(e.message, false); }
 }
 
+// Populate a <select> with role options via safe DOM nodes (no innerHTML).
+function _setRoleOptions(sel, names, emptyLabel) {
+  sel.replaceChildren();
+  if (!names.length) {
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = emptyLabel;
+    sel.appendChild(o);
+    return;
+  }
+  for (const n of names) {
+    const o = document.createElement('option');
+    o.value = n;
+    o.textContent = n;
+    sel.appendChild(o);
+  }
+}
+
 async function openCatalogGrantModal(prefilledSubjectId) {
   const cat = document.getElementById('cp-catalog-select').value;
   if (!cat) { toast('Pick a catalog first.', false); return; }
   document.getElementById('cg-catalog').value = cat;
   document.getElementById('cg-principal').value = prefilledSubjectId || '';
   const sel = document.getElementById('cg-role');
-  sel.innerHTML = '<option>Loading…</option>';
+  _setRoleOptions(sel, [], 'Loading…');
   try {
     const roles = await apiFetch(`/roles?catalog_id=${encodeURIComponent(cat)}`);
     const names = (roles || []).map(r => r.name).filter(Boolean);
-    const merged = Array.from(new Set([...names, 'admin', 'user', 'viewer']));
-    sel.innerHTML = merged.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
+    // Offer only roles actually registered for this catalog — the grant endpoint
+    // rejects any other name with 422. Injecting a fixed list (admin/user/viewer)
+    // here surfaced ungranted roles like 'viewer' that then failed on submit.
+    _setRoleOptions(sel, names, 'No roles registered for this catalog');
   } catch(_) {
-    sel.innerHTML = ['admin', 'user', 'viewer'].map(n => `<option value="${n}">${n}</option>`).join('');
+    _setRoleOptions(sel, [], 'Error loading roles');
   }
   document.getElementById('catalog-grant-modal').classList.remove('hidden');
 }
@@ -652,7 +674,7 @@ async function deleteRole(name) {
 // ── POLICIES ──
 async function loadPolicies() {
   const tb = document.getElementById('policies-tbody');
-  tb.innerHTML = '<tr><td colspan="6" class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading…</td></tr>';
+  tb.innerHTML = '<tr><td colspan="7" class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading…</td></tr>';
   try {
     let url = `/policies`;
     if (_csPolicies && _csPolicies.state.catalogId && _csPolicies.state.catalogId !== '_system_') {
@@ -660,12 +682,12 @@ async function loadPolicies() {
     }
     _allPolicies = await apiFetch(url);
     renderPolicies(_allPolicies);
-  } catch(e) { tb.innerHTML = `<tr><td colspan="6" class="empty">Error: ${escapeHtml(e.message)}</td></tr>`; }
+  } catch(e) { tb.innerHTML = `<tr><td colspan="7" class="empty">Error: ${escapeHtml(e.message)}</td></tr>`; }
 }
 function renderPolicies(list) {
   const tb = document.getElementById('policies-tbody');
   const sys = new Set(['public_access','self_service_access','sysadmin_full_access']);
-  if (!list.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No policies found.</td></tr>'; return; }
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">No policies found.</td></tr>'; return; }
   // Builds row HTML. Every user-controlled value is escaped via escapeHtml();
   // condition type checks read from a fixed allowlist (rate_limit, max_count).
   tb.innerHTML = list.map(p => {
@@ -684,6 +706,7 @@ function renderPolicies(list) {
     <tr>
       <td><strong style="font-family:monospace">${escapeHtml(p.id)}</strong> ${limitBadges}</td>
       <td><span class="badge" style="background:${p.effect==='ALLOW'?'rgba(63,185,80,.15)':'rgba(248,81,73,.15)'};color:${p.effect==='ALLOW'?'var(--success)':'var(--danger)'}">${escapeHtml(p.effect)}</span></td>
+      <td style="text-align:center;font-family:monospace">${escapeHtml(String(p.priority ?? 0))}</td>
       <td><div class="chip-list">${(p.actions||[]).map(a=>`<span class="badge badge-role">${escapeHtml(a)}</span>`).join('')}</div></td>
       <td style="font-family:monospace;font-size:0.75rem;max-width:260px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((p.resources||[]).join(', '))}</td>
       <td style="color:var(--text-dim)">${escapeHtml(p.description || '—')}</td>
@@ -714,6 +737,7 @@ function openPolicyModal(editId) {
     document.getElementById('pm-id').disabled = true;
     document.getElementById('pm-desc').value = p.description || '';
     document.getElementById('pm-effect').value = p.effect;
+    document.getElementById('pm-priority').value = String(p.priority ?? 0);
     document.getElementById('pm-actions').value = (p.actions || []).join(', ');
     document.getElementById('pm-resources').value = (p.resources || []).join('\n');
     (p.conditions || []).forEach(c => addPolicyCondition(c));
@@ -722,6 +746,7 @@ function openPolicyModal(editId) {
     document.getElementById('pm-id').value = '';
     document.getElementById('pm-desc').value = '';
     document.getElementById('pm-effect').value = 'ALLOW';
+    document.getElementById('pm-priority').value = '0';
     document.getElementById('pm-actions').value = '';
     document.getElementById('pm-resources').value = '/my/resource/.*';
   }
@@ -839,19 +864,22 @@ async function submitPolicy() {
   const id = document.getElementById('pm-id').value.trim();
   const description = document.getElementById('pm-desc').value.trim();
   const effect = document.getElementById('pm-effect').value;
+  const prioRaw = document.getElementById('pm-priority').value;
+  const priority = prioRaw === '' ? 0 : Number(prioRaw);
   const actions = csvToList(document.getElementById('pm-actions').value);
   const resources = document.getElementById('pm-resources').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if (!id || !actions.length || !resources.length) { toast('ID, actions and resources are required.', false); return; }
+  if (!Number.isInteger(priority) || priority < -1000 || priority > 1000) { toast('Priority must be an integer in [-1000, 1000].', false); return; }
   let conditions;
   try {
     conditions = Array.from(document.querySelectorAll('#pm-conditions .cond-card')).map(_readCondition);
   } catch (e) { toast(e.message, false); return; }
   try {
     if (mode === 'edit') {
-      await apiFetch(`/policies/${encodeURIComponent(id)}`, { method:'PUT', body: JSON.stringify({description, effect, actions, resources, conditions}) });
+      await apiFetch(`/policies/${encodeURIComponent(id)}`, { method:'PUT', body: JSON.stringify({description, effect, priority, actions, resources, conditions}) });
       toast('Policy updated.');
     } else {
-      await apiFetch('/policies', { method:'POST', body: JSON.stringify({id, description, effect, actions, resources, conditions}) });
+      await apiFetch('/policies', { method:'POST', body: JSON.stringify({id, description, effect, priority, actions, resources, conditions}) });
       toast('Policy created.');
     }
     document.getElementById('policy-modal').classList.add('hidden');
