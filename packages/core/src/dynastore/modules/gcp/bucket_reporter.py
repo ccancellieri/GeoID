@@ -110,6 +110,13 @@ class GcsDetailedReporter(ReportingInterface[GcsDetailedReporterConfig]):
     report to a GCS bucket upon task completion for detailed analysis.
     """
 
+    # Re-declare the inherited ``config`` attribute's type. ``__init__`` assigns
+    # ``self.config = None`` to disable the reporter when GCP/config is absent;
+    # without this annotation the type checker would infer the attribute as
+    # ``None``-only from that assignment, collapsing every later
+    # ``assert self.config is not None`` to ``Never``.
+    config: Optional[GcsDetailedReporterConfig]
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
