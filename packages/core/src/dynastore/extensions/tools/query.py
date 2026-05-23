@@ -163,8 +163,8 @@ async def maybe_dispatch_items_to_search_driver(
         return None
 
     from dynastore.modules.storage import router as _router
-    from dynastore.models.protocols.storage_driver import Capability
     from dynastore.models.protocols.item_search import ItemSearchProtocol
+    from dynastore.modules.catalog.item_query import is_query_fallback_driver
 
     try:
         resolved = await _router.get_items_search_driver(
@@ -174,14 +174,12 @@ async def maybe_dispatch_items_to_search_driver(
         return None
 
     driver: Any = resolved.driver
-    if driver is None:
-        return None
 
-    # A read-primary fallback (PostgreSQL) advertises QUERY_FALLBACK_SOURCE:
-    # no dedicated search backend, so defer to the PG stream_items path.
-    if Capability.QUERY_FALLBACK_SOURCE in getattr(
-        driver, "capabilities", frozenset()
-    ):
+    # A read-primary fallback (PostgreSQL) advertises QUERY_FALLBACK_SOURCE
+    # (and an absent driver is treated the same): no dedicated search backend,
+    # so defer to the PG stream_items path. Shared gate with the read_entities
+    # browse path (``item_query._try_driver_dispatch``).
+    if is_query_fallback_driver(driver):
         return None
 
     # The resolved driver must implement the structural-search capability.

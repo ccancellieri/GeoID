@@ -82,6 +82,33 @@ def _pick_operation(request: Optional[QueryRequest]) -> str:
     return Operation.READ
 
 
+def is_query_fallback_driver(driver: Any) -> bool:
+    """True when a resolved items driver is the read-primary PG fallback.
+
+    Both item-listing dispatch paths — the ``read_entities`` browse path
+    (:func:`_try_driver_dispatch`) and the structural-search path
+    (:func:`dynastore.extensions.tools.query.maybe_dispatch_items_to_search_driver`)
+    — must decline to dispatch and let the PostgreSQL ``stream_items`` path
+    serve the listing when no dedicated non-PG backend is configured. That is
+    the case when driver resolution yielded nothing (``driver is None``) or the
+    resolved driver advertises :attr:`Capability.QUERY_FALLBACK_SOURCE` (the PG
+    read primary). This is the single thin slice the two otherwise-distinct
+    resolvers genuinely share; the resolution and feature-projection steps
+    remain path-specific.
+
+    ``capabilities`` is read defensively (``getattr(..., frozenset())``): a real
+    driver always declares it, but a missing attribute degrades to "not a
+    fallback" rather than raising.
+    """
+    if driver is None:
+        return True
+    from dynastore.models.protocols.storage_driver import Capability
+
+    return Capability.QUERY_FALLBACK_SOURCE in getattr(
+        driver, "capabilities", frozenset()
+    )
+
+
 async def _try_driver_dispatch(
     catalog_id: str,
     collection_id: str,
@@ -111,8 +138,7 @@ async def _try_driver_dispatch(
     except Exception:
         return None
 
-    from dynastore.models.protocols.storage_driver import Capability
-    if resolved is None or Capability.QUERY_FALLBACK_SOURCE in resolved.capabilities:
+    if is_query_fallback_driver(resolved):
         return None
 
     effective_limit = (request.limit if request and request.limit else limit) or limit
