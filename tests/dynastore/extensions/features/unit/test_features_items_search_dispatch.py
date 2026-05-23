@@ -2,7 +2,8 @@
 dispatch (#1047).
 
 ``get_items`` resolves the items SEARCH driver via routing and dispatches
-through ``ItemSearchProtocol`` (``maybe_dispatch_items_to_search_driver``) for a
+through its streaming ``read_entities`` + ``count_entities`` contract
+(``maybe_dispatch_items_to_search_driver``) for a
 structural-only listing; when the helper declines (CQL ``filter`` / shorthand
 attribute filter / non-4326 CRS / read-primary PG driver) it falls through to
 the PostgreSQL ``stream_items`` path. Either way the response is a streamed

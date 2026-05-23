@@ -2,9 +2,9 @@
 
 ``_maybe_dispatch_to_es_search`` resolves the items SEARCH driver via routing
 (``router.get_items_search_driver`` — SEARCH→READ fallback, #989) and
-dispatches the structural query to **that driver** via the
-``ItemSearchProtocol`` capability. It no longer hardcodes the public
-Elasticsearch class, so:
+dispatches the structural query to **that driver** via its streaming
+``read_entities`` + ``count_entities`` contract. It no longer hardcodes the
+public Elasticsearch class, so:
 
 * a catalog routing SEARCH to the tenant-private ES driver is honoured;
 * a catalog with no dedicated search driver (PG ``QUERY_FALLBACK_SOURCE``)
@@ -12,8 +12,10 @@ Elasticsearch class, so:
 * mixed drivers across collections fall through to PG.
 
 The downstream serializer reads ``feature.properties["_catalog_id" |
-"_collection_id"]`` on each hit, so the dispatch must return ``Feature``
-pydantic instances with those markers injected — the shape the PG path emits.
+"_collection_id"]`` on each hit, so the dispatch injects those markers on the
+read-contract ``Feature`` instances ``read_entities`` yields — the shape the PG
+path emits. Read-contract reconstruction itself is the driver's job and is
+pinned at the driver layer (``test_elasticsearch_driver.py``), not here.
 """
 
 from __future__ import annotations
@@ -29,43 +31,51 @@ from dynastore.models.shared_models import Feature
 
 
 @dataclass
-class _StubItemSearchResult:
-    features: List[Dict[str, Any]]
-    total: int = 0
-
-
-@dataclass
 class _Resolved:
     """Stand-in for ``ResolvedDriver`` — the dispatcher reads ``.driver``."""
 
     driver: Any
 
 
-class _FakeSearchDriver:
-    """A search-capable items driver (satisfies ``ItemSearchProtocol``).
+class _FakeEsItemsDriver:
+    """An ES items driver: ``is_es_items_driver`` marker + streaming
+    ``read_entities`` (yields read-contract Features) + ``count_entities``.
 
     Stands in for either the public or the tenant-private ES driver — the
     dispatcher treats both identically because it dispatches through the
-    capability, not the concrete class.
+    streaming contract, not the concrete class.
     """
 
+    is_es_items_driver = True
     capabilities = frozenset({Capability.READ})
 
-    def __init__(self, features: List[Dict[str, Any]], total: int):
-        self._result = _StubItemSearchResult(features=features, total=total)
-        self.calls: list = []
+    def __init__(self, features: List[Feature], total: int):
+        self._features = features
+        self._total = total
+        self.read_calls: list = []
+        self.count_calls: list = []
 
-    async def search_items_struct(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._result
+    async def read_entities(
+        self, catalog_id, collection_id, *,
+        entity_ids=None, request=None, context=None,
+        limit=100, offset=0, db_resource=None,
+    ):
+        self.read_calls.append(
+            {"collection_id": collection_id, "request": request,
+             "limit": limit, "offset": offset}
+        )
+        for f in self._features:
+            yield f
+
+    async def count_entities(
+        self, catalog_id, collection_id, *, request=None, db_resource=None,
+    ):
+        self.count_calls.append({"collection_id": collection_id, "request": request})
+        return self._total
 
 
 class _FakePgFallbackDriver:
-    """A read-primary driver with no dedicated search backend — the PG case.
-
-    Advertises ``QUERY_FALLBACK_SOURCE`` so the dispatcher declines and lets
-    the PostgreSQL ``QueryOptimizer`` path serve the query.
-    """
+    """A read-primary driver with no dedicated search backend — the PG case."""
 
     capabilities = frozenset({Capability.READ, Capability.QUERY_FALLBACK_SOURCE})
 
@@ -80,6 +90,18 @@ class _SearchRequest:
     datetime: Optional[str] = None
     limit: int = 10
     offset: int = 0
+
+
+def _feat(fid: str, collection: Optional[str] = None) -> Feature:
+    d: Dict[str, Any] = {
+        "type": "Feature",
+        "id": fid,
+        "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+        "properties": {"datetime": "2024-01-01T00:00:00Z"},
+    }
+    if collection:
+        d["collection"] = collection
+    return Feature.model_validate(d)
 
 
 def _patch_resolver(monkeypatch, driver_for):
@@ -99,15 +121,7 @@ def _patch_resolver(monkeypatch, driver_for):
 
 @pytest.mark.asyncio
 async def test_dispatch_returns_feature_instances(monkeypatch):
-    hit = {
-        "type": "Feature",
-        "id": "item-1",
-        "geometry": {"type": "Point", "coordinates": [10.0, 20.0]},
-        "bbox": [10.0, 20.0, 10.0, 20.0],
-        "properties": {"datetime": "2024-01-01T00:00:00Z"},
-        "collection": "col-a",
-    }
-    drv = _FakeSearchDriver(features=[hit], total=1)
+    drv = _FakeEsItemsDriver(features=[_feat("item-1", "col-a")], total=1)
     _patch_resolver(monkeypatch, lambda cid: drv)
 
     out = await _maybe_dispatch_to_es_search("cat-x", _SearchRequest(collections=["col-a"]))
@@ -122,14 +136,7 @@ async def test_dispatch_returns_feature_instances(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dispatch_injects_cross_collection_markers(monkeypatch):
-    hit = {
-        "type": "Feature",
-        "id": "item-2",
-        "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
-        "properties": {"datetime": "2024-01-01T00:00:00Z"},
-        "collection": "col-b",
-    }
-    drv = _FakeSearchDriver(features=[hit], total=1)
+    drv = _FakeEsItemsDriver(features=[_feat("item-2", "col-b")], total=1)
     _patch_resolver(monkeypatch, lambda cid: drv)
 
     out = await _maybe_dispatch_to_es_search("cat-y", _SearchRequest(collections=["col-b"]))
@@ -141,13 +148,7 @@ async def test_dispatch_injects_cross_collection_markers(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dispatch_falls_back_to_request_collection_when_missing(monkeypatch):
-    hit = {
-        "type": "Feature",
-        "id": "legacy-item",
-        "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
-        "properties": {"datetime": "2024-01-01T00:00:00Z"},
-    }
-    drv = _FakeSearchDriver(features=[hit], total=1)
+    drv = _FakeEsItemsDriver(features=[_feat("legacy-item")], total=1)
     _patch_resolver(monkeypatch, lambda cid: drv)
 
     out = await _maybe_dispatch_to_es_search("cat-z", _SearchRequest(collections=["only-one"]))
@@ -158,43 +159,42 @@ async def test_dispatch_falls_back_to_request_collection_when_missing(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_dispatch_skips_malformed_hits(monkeypatch):
-    bad = {"type": "Feature", "properties": {}}  # no id
-    good = {
-        "type": "Feature",
-        "id": "ok",
-        "geometry": None,
-        "properties": {},
-        "collection": "c1",
-    }
-    drv = _FakeSearchDriver(features=[bad, good], total=2)
+async def test_total_comes_from_count_not_stream_length(monkeypatch):
+    # numberMatched is the count, decoupled from the page of Features streamed.
+    drv = _FakeEsItemsDriver(features=[_feat("ok", "c1")], total=42)
     _patch_resolver(monkeypatch, lambda cid: drv)
 
     out = await _maybe_dispatch_to_es_search("cat-t", _SearchRequest(collections=["c1"]))
     assert out is not None
     features, total, _ = out
-    assert total == 2  # numberMatched preserved; 1 hit dropped
+    assert total == 42
     assert len(features) == 1
     assert features[0].id == "ok"
+    assert drv.count_calls, "count_entities must supply numberMatched"
 
 
 @pytest.mark.asyncio
-async def test_dispatch_threads_offset_to_driver(monkeypatch):
-    """STAC ``offset`` must reach the driver (paginates past page 1)."""
-    drv = _FakeSearchDriver(features=[], total=0)
+async def test_dispatch_threads_params_to_driver(monkeypatch):
+    """STAC limit/offset + multi-collection set reach the driver request."""
+    drv = _FakeEsItemsDriver(features=[], total=0)
     _patch_resolver(monkeypatch, lambda cid: drv)
 
     await _maybe_dispatch_to_es_search(
-        "cat-x", _SearchRequest(collections=["c1"], limit=25, offset=50)
+        "cat-x", _SearchRequest(collections=["c1", "c2"], limit=25, offset=50)
     )
-    assert drv.calls and drv.calls[0]["offset"] == 50
-    assert drv.calls[0]["limit"] == 25
+    assert drv.read_calls
+    rc = drv.read_calls[0]
+    assert rc["limit"] == 25
+    assert rc["offset"] == 50
+    req = rc["request"]
+    assert req.collections == ["c1", "c2"]
+    assert req.offset == 50
+    assert req.limit == 25
 
 
 @pytest.mark.asyncio
 async def test_dispatch_declines_for_pg_fallback_driver(monkeypatch):
-    """A QUERY_FALLBACK_SOURCE (PG) driver → dispatch returns None so the
-    PostgreSQL path serves the search."""
+    """A QUERY_FALLBACK_SOURCE (PG) driver → None so the PostgreSQL path runs."""
     _patch_resolver(monkeypatch, lambda cid: _FakePgFallbackDriver())
     out = await _maybe_dispatch_to_es_search("cat-x", _SearchRequest(collections=["c1"]))
     assert out is None
@@ -203,7 +203,7 @@ async def test_dispatch_declines_for_pg_fallback_driver(monkeypatch):
 @pytest.mark.asyncio
 async def test_dispatch_declines_for_mixed_drivers(monkeypatch):
     """Heterogeneous SEARCH drivers across collections → None (PG path)."""
-    es = _FakeSearchDriver(features=[], total=0)
+    es = _FakeEsItemsDriver(features=[], total=0)
     pg = _FakePgFallbackDriver()
     mapping = {"c1": es, "c2": pg}
     _patch_resolver(monkeypatch, lambda cid: mapping[cid])
@@ -214,8 +214,20 @@ async def test_dispatch_declines_for_mixed_drivers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_declines_for_non_es_driver(monkeypatch):
+    """A non-fallback driver without the is_es_items_driver marker → None."""
+
+    class _NotEs:
+        capabilities = frozenset({Capability.READ})
+
+    _patch_resolver(monkeypatch, lambda cid: _NotEs())
+    out = await _maybe_dispatch_to_es_search("cat-x", _SearchRequest(collections=["c1"]))
+    assert out is None
+
+
+@pytest.mark.asyncio
 async def test_dispatch_declines_when_cql_filter_present(monkeypatch):
-    drv = _FakeSearchDriver(features=[], total=0)
+    drv = _FakeEsItemsDriver(features=[], total=0)
     _patch_resolver(monkeypatch, lambda cid: drv)
     out = await _maybe_dispatch_to_es_search(
         "cat-x", _SearchRequest(collections=["c1"], filter={"op": "=", "args": []})
@@ -225,7 +237,7 @@ async def test_dispatch_declines_when_cql_filter_present(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dispatch_declines_without_collections(monkeypatch):
-    drv = _FakeSearchDriver(features=[], total=0)
+    drv = _FakeEsItemsDriver(features=[], total=0)
     _patch_resolver(monkeypatch, lambda cid: drv)
     out = await _maybe_dispatch_to_es_search("cat-x", _SearchRequest(collections=None))
     assert out is None

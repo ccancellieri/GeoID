@@ -225,6 +225,29 @@ class QueryRequest(BaseModel):
     limit: Optional[int] = None
     offset: Optional[int] = None
 
+    # --- Structural search dimensions (driver-agnostic) ---
+    # Honored by the streaming read/count path of every items driver: ES routes
+    # them through ``build_items_query``; PG through its query optimizer. These
+    # are the canonical, driver-agnostic home for the structural search params
+    # (collections / bbox / intersects / datetime) the item-listing endpoints
+    # carry — replacing the per-call kwargs of the old materialized search path.
+    collections: Optional[List[str]] = Field(
+        default=None,
+        description="Restrict results to these collection ids (multi-collection search).",
+    )
+    bbox: Optional[List[float]] = Field(
+        default=None,
+        description="Spatial extent filter [minx, miny, maxx, maxy] (CRS84).",
+    )
+    intersects: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="GeoJSON geometry that result items must intersect.",
+    )
+    datetime: Optional[str] = Field(
+        default=None,
+        description="RFC3339 instant or interval (start/end) temporal filter.",
+    )
+
     # --- Internal escape hatches (server-side use only, never populated from user input) ---
     raw_selects: List[str] = Field(
         default_factory=list,

@@ -267,15 +267,15 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         )
 
         # ── Routing-aware items SEARCH-driver dispatch (#1047) ────────────
-        # Mirror STAC ``/search`` (#1257): for a structural-only listing (no
-        # CQL2 ``filter`` and no free-text ``q``) resolve the items SEARCH
-        # driver via routing and dispatch through the backend-agnostic
-        # ``ItemSearchProtocol`` — public ES, the tenant-private ES index, or
-        # any future search-capable driver. The helper returns ``None``
+        # Mirror STAC ``/search``: for a structural-only listing (no CQL2
+        # ``filter`` and no free-text ``q``) resolve the items SEARCH driver
+        # via routing and dispatch through its streaming ``read_entities`` +
+        # ``count_entities`` contract — public ES, the tenant-private ES index,
+        # or any future ES items driver. The helper returns ``None``
         # (→ the PG ``stream_items`` path below) for a CQL filter, a
-        # read-primary (PG ``QUERY_FALLBACK_SOURCE``) driver, or a driver
-        # without the structural-search capability. Free-text ``q`` folds into
-        # a CQL ``ILIKE`` predicate, so it defers to the PG path too.
+        # read-primary (PG ``QUERY_FALLBACK_SOURCE``) driver, or a non-ES items
+        # driver. Free-text ``q`` folds into a CQL ``ILIKE`` predicate, so it
+        # defers to the PG path too.
         has_complex_filter = bool(filter) or bool(q)
         search_dispatch = None
         if not has_complex_filter:

@@ -1,10 +1,10 @@
 """Unit tests for ``is_query_fallback_driver`` — the shared item-listing gate.
 
-The two item-listing dispatch paths (``_try_driver_dispatch`` over
-``read_entities`` and ``maybe_dispatch_items_to_search_driver`` over
-``ItemSearchProtocol``) share exactly one thin step: deciding whether a
-resolved items driver is the read-primary PG fallback, in which case both
-decline and let the PostgreSQL ``stream_items`` path serve the listing.
+The two item-listing dispatch paths (``_try_driver_dispatch`` and
+``maybe_dispatch_items_to_search_driver``, both over the driver's streaming
+``read_entities``) share exactly one thin step: deciding whether a resolved
+items driver is the read-primary PG fallback, in which case both decline and
+let the PostgreSQL ``stream_items`` path serve the listing.
 
 These tests pin that shared semantics: ``None`` driver → fallback; a driver
 advertising ``QUERY_FALLBACK_SOURCE`` → fallback; a non-PG search/read driver

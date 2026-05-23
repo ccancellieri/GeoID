@@ -209,14 +209,14 @@ class SearchService(ExtensionProtocol):
             numberReturned=len(features),
         )
 
-    # NOTE: ``search_items_struct`` (the singleton ``ItemSearchProtocol``
-    # provider for the STAC fast path) was retired with #989. STAC ``/search``
-    # now resolves the items SEARCH driver via routing and dispatches the
-    # structural query to that driver's own ``search_items_struct`` (shared
-    # ``_ElasticsearchBase`` implementation) — so a catalog routing SEARCH to
-    # the tenant-private ES index is honoured, which the public-only singleton
-    # could not express. SearchService keeps its own ``/search`` REST router
-    # (full-text, sort, search_after tokens) via :meth:`search_items`.
+    # NOTE: the structural STAC fast path is no longer a bespoke search method.
+    # STAC ``/search`` resolves the items SEARCH driver via routing and streams
+    # the structural query through that driver's ``read_entities`` +
+    # ``count_entities`` contract (shared ``_ElasticsearchBase`` implementation)
+    # — so a catalog routing SEARCH to the tenant-private ES index is honoured,
+    # which a public-only singleton could not express. SearchService keeps its
+    # own ``/search`` REST router (full-text, sort, search_after tokens) via
+    # :meth:`search_items`.
 
     async def reindex_catalog(
         self,

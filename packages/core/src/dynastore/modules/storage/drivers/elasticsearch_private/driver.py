@@ -142,28 +142,6 @@ class ItemsElasticsearchPrivateDriver(
         """The private index is not sharded by collection — no ``_routing``."""
         return None
 
-    def _search_index_name(self, catalog_id: Optional[str]) -> str:
-        """Structural search targets the tenant-scoped private items index.
-
-        Overrides :meth:`_ElasticsearchBase._search_index_name` so STAC
-        ``/search`` routed to this driver (a GEOID-style private catalog)
-        queries ``{prefix}-{catalog_id}-private-items`` and never the public
-        items index/alias — privacy is enforced by the physical index split
-        (#1047), not just IAM. Private items are always tenant-scoped (no
-        cross-tenant private alias by design), so a catalog scope is required.
-        """
-        from dynastore.modules.elasticsearch.client import get_index_prefix
-        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            get_private_index_name,
-        )
-
-        if not catalog_id:
-            raise ValueError(
-                "Private items search requires a catalog scope — there is no "
-                "cross-tenant private items alias by design (#1047)."
-            )
-        return get_private_index_name(get_index_prefix(), catalog_id)
-
     async def _resolve_simplify_geometry(
         self,
         catalog_id: str,

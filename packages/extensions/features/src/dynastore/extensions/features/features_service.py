@@ -921,15 +921,15 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
             }
 
             # ── Routing-aware items SEARCH-driver dispatch (#1047) ────────
-            # Mirror STAC ``/search`` (#1257): for structural-only listings
-            # (no CQL2 ``filter`` / shorthand attribute filter, no non-4326
-            # CRS reprojection) resolve the items SEARCH driver via routing
-            # and dispatch through the backend-agnostic ``ItemSearchProtocol``
-            # — public ES, the tenant-private ES index, or any future
-            # search-capable driver. The helper returns ``None`` (→ the PG
-            # ``stream_items`` path below) for CQL/attribute filters, a
-            # read-primary (PG ``QUERY_FALLBACK_SOURCE``) driver, or a driver
-            # without the structural-search capability. CRS reprojection is a
+            # Mirror STAC ``/search``: for structural-only listings (no CQL2
+            # ``filter`` / shorthand attribute filter, no non-4326 CRS
+            # reprojection) resolve the items SEARCH driver via routing and
+            # dispatch through its streaming ``read_entities`` +
+            # ``count_entities`` contract — public ES, the tenant-private ES
+            # index, or any future ES items driver. The helper returns ``None``
+            # (→ the PG ``stream_items`` path below) for CQL/attribute filters,
+            # a read-primary (PG ``QUERY_FALLBACK_SOURCE``) driver, or a non-ES
+            # items driver. CRS reprojection is a
             # PG-only capability, so a non-4326 output/bbox CRS also defers.
             from dynastore.extensions.tools.query import (
                 maybe_dispatch_items_to_search_driver,

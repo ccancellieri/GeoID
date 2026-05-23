@@ -194,55 +194,30 @@ def _parse_collection_sort_sql(sortby: Optional[str], lang: Optional[str] = None
     raise ValueError(f"Invalid sort field: {field!r}")
 
 
-def _es_hits_to_features(
-    raw_features: list,
+def _inject_search_hints(
+    features: list,
     cat_id: str,
     cids: list,
 ) -> list:
-    """Turn ES search hits into read-contract Features.
+    """Inject the catalog/collection hints the STAC search serializer reads.
 
-    The ES dispatch returns plain dicts in the indexed ``_source`` shape:
-    unknown attributes nested under ``properties.extras`` (Tier-3 projection),
-    internal ``_*`` tracking fields and leaked echo keys at the top level
-    (which would surface via the ``extra="allow"`` Feature model), and possibly
-    an empty ``{}`` geometry. :func:`unproject_item_from_es` restores the
-    GeoJSON/STAC read contract so STAC ``/search`` returns the same shape as
-    GET items and the PostgreSQL path (#1247).
-
-    The platform search serializer
-    (``stac_generator.create_search_results_collection``) reads
-    ``feature.properties["_catalog_id"]`` / ``["_collection_id"]`` — injected by
-    the PG path — so those are mirrored here. The collection hint prefers the
-    indexed top-level ``collection`` and falls back to the sole requested
+    ``read_entities`` already returns read-contract Features (extras
+    un-nested, empty geometry nulled, internal/echo keys stripped — the
+    reconstruction the driver owns), so this only mirrors the
+    ``feature.properties["_catalog_id"]`` / ``["_collection_id"]`` hints the
+    platform search serializer (``stac_generator.create_search_results_collection``)
+    reads — the same hints the PostgreSQL path injects. The collection hint
+    prefers the item's own ``collection`` and falls back to the sole requested
     collection when only one is in scope.
     """
-    from dynastore.models.shared_models import Feature
-    from dynastore.modules.elasticsearch.items_projection import (
-        unproject_item_from_es,
-    )
-
-    features: list = []
-    for raw in raw_features:
-        if isinstance(raw, Feature):
-            features.append(raw)
-            continue
-        clean = unproject_item_from_es(raw) if isinstance(raw, dict) else raw
-        try:
-            feat = Feature.model_validate(clean)
-        except Exception as exc:
-            logger.warning(
-                "STAC search → ES dispatch: skipping malformed hit (catalog=%s): %s",
-                cat_id, exc,
-            )
-            continue
+    for feat in features:
         if feat.properties is None:
             feat.properties = {}
         feat.properties.setdefault("_catalog_id", cat_id)
-        coll_id = clean.get("collection") if isinstance(clean, dict) else None
+        coll_id = getattr(feat, "collection", None)
         if not coll_id and len(cids) == 1:
             coll_id = cids[0]
         feat.properties.setdefault("_collection_id", coll_id or "")
-        features.append(feat)
     return features
 
 
@@ -257,10 +232,10 @@ async def _maybe_dispatch_to_es_search(
     collection's items SEARCH driver is resolved via
     :func:`router.get_items_search_driver` (``Operation.SEARCH`` then a
     ``READ`` fallback). The structural query is then dispatched to **that
-    driver** through the backend-agnostic :class:`ItemSearchProtocol`
-    capability — so a public-ES catalog, a GEOID-style catalog routing SEARCH
-    to its tenant-private ES index, or any future search-capable driver are
-    all served the same way, with no hardcoded driver class.
+    driver** through its streaming ``read_entities`` + ``count_entities``
+    contract — so a public-ES catalog, a GEOID-style catalog routing SEARCH
+    to its tenant-private ES index, or any future ES items driver are all
+    served the same way, with no hardcoded driver class.
 
     Returns ``None`` (caller falls back to the PostgreSQL ``QueryOptimizer``
     path) when the dispatch is not applicable:
@@ -271,7 +246,7 @@ async def _maybe_dispatch_to_es_search(
     * the resolved driver is a read-primary fallback (PostgreSQL, advertising
       ``Capability.QUERY_FALLBACK_SOURCE``) — i.e. the catalog has no
       dedicated search backend, the routing-aware "fall back to READ" case;
-    * the resolved driver does not advertise the structural-search capability.
+    * the resolved driver is not an ES items driver (no ``is_es_items_driver``).
 
     Closes the user-visible part of #222 (ES-routed collections returned 0
     items because every search unconditionally built raw PG SQL) and the
@@ -289,7 +264,7 @@ async def _maybe_dispatch_to_es_search(
 
     from dynastore.modules.storage.router import get_items_search_driver
     from dynastore.models.protocols.storage_driver import Capability
-    from dynastore.models.protocols.item_search import ItemSearchProtocol
+    from dynastore.models.query_builder import QueryRequest
 
     # Resolve the items SEARCH driver per collection. All collections must
     # resolve to the same driver class to be served in a single query;
@@ -314,21 +289,33 @@ async def _maybe_dispatch_to_es_search(
     if Capability.QUERY_FALLBACK_SOURCE in getattr(driver, "capabilities", frozenset()):
         return None
 
-    # The resolved driver must implement the structural-search capability.
-    if not isinstance(driver, ItemSearchProtocol):
+    # Only ES items drivers honor the structural QueryRequest dimensions on
+    # their streaming read/count path today; anything else → PG path.
+    if not getattr(driver, "is_es_items_driver", False):
         return None
 
+    # Multi-collection search: carry the collection set on the request so the
+    # driver scopes via its terms filter and queries all shards. cids[0] is the
+    # representative positional (the index is per-catalog, not per-collection).
+    request = QueryRequest(
+        item_ids=search_request.ids,
+        collections=cids,
+        bbox=list(search_request.bbox) if search_request.bbox else None,
+        intersects=search_request.intersects,
+        datetime=search_request.datetime,
+        limit=search_request.limit,
+        offset=search_request.offset,
+    )
+
     try:
-        result = await driver.search_items_struct(
-            catalog_id=cat_id,
-            collections=cids,
-            ids=search_request.ids,
-            bbox=list(search_request.bbox) if search_request.bbox else None,
-            intersects=search_request.intersects,
-            datetime=search_request.datetime,
-            limit=search_request.limit,
-            offset=search_request.offset,
+        # read_entities streams read-contract Features (O(1) memory); the page
+        # is bounded by ``limit`` so materializing it for the response is fine.
+        items = driver.read_entities(
+            cat_id, cids[0], request=request,
+            limit=search_request.limit, offset=search_request.offset,
         )
+        features = [feat async for feat in items]
+        total = await driver.count_entities(cat_id, cids[0], request=request)
     except Exception as exc:
         logger.warning(
             "STAC search → SEARCH-driver dispatch failed "
@@ -337,11 +324,10 @@ async def _maybe_dispatch_to_es_search(
         )
         return None  # fall back to PG path on error
 
-    # The driver returns raw ES ``_source`` dicts. Reconstruct the read
-    # contract and inject the serializer's catalog/collection hints — see
-    # :func:`_es_hits_to_features`.
-    features = _es_hits_to_features(result.features, cat_id, cids)
-    return features, result.total, None
+    # read_entities already rebuilt the read contract; only inject the
+    # serializer's catalog/collection hints — see :func:`_inject_search_hints`.
+    _inject_search_hints(features, cat_id, cids)
+    return features, total, None
 
 
 async def search_items(

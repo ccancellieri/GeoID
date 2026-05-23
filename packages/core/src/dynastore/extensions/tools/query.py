@@ -74,46 +74,6 @@ async def resolve_items_read_policy(
         return None
 
 
-def _items_hits_to_features(
-    raw_features: list,
-    catalog_id: str,
-    collection_id: str,
-) -> list:
-    """Turn raw search-driver hits into read-contract OGC ``Feature`` objects.
-
-    ``ItemSearchProtocol.search_items_struct`` returns plain dicts in the
-    indexed ``_source`` shape: unknown attributes nested under
-    ``properties.extras`` (Tier-3 projection), internal ``_*`` tracking fields
-    and leaked echo keys at the top level (which would otherwise surface via the
-    ``extra="allow"`` Feature model), and possibly an empty ``{}`` geometry.
-    :func:`unproject_item_from_es` restores the GeoJSON/STAC read contract so
-    the OGC ``/items`` dispatch returns the same shape as the PostgreSQL
-    ``stream_items`` path. Mirrors ``stac/search.py::_es_hits_to_features``.
-    """
-    from dynastore.models.ogc import Feature
-    from dynastore.modules.elasticsearch.items_projection import (
-        unproject_item_from_es,
-    )
-
-    features: list = []
-    for raw in raw_features:
-        if isinstance(raw, Feature):
-            features.append(raw)
-            continue
-        clean = unproject_item_from_es(raw) if isinstance(raw, dict) else raw
-        try:
-            feat = Feature.model_validate(clean)
-        except Exception as exc:  # noqa: BLE001 — skip a malformed hit, never 500
-            logger.warning(
-                "OGC /items → SEARCH-driver dispatch: skipping malformed hit "
-                "(catalog=%s, collection=%s): %s",
-                catalog_id, collection_id, exc,
-            )
-            continue
-        features.append(feat)
-    return features
-
-
 async def maybe_dispatch_items_to_search_driver(
     catalog_id: str,
     collection_id: str,
@@ -133,12 +93,11 @@ async def maybe_dispatch_items_to_search_driver(
     so they resolve the items SEARCH driver via routing
     (:func:`router.get_items_search_driver` — ``Operation.SEARCH`` then a
     ``READ`` fallback) and dispatch the structural query to **that driver**
-    through the backend-agnostic
-    :class:`~dynastore.models.protocols.item_search.ItemSearchProtocol`
-    capability — exactly as STAC ``/search`` does after #1257. A public-ES
-    catalog, a GEOID-style catalog routing SEARCH to its tenant-private ES
-    index, or any future search-capable driver are all served the same way,
-    with no hardcoded driver class (#1047).
+    through its streaming ``read_entities`` + ``count_entities`` contract —
+    exactly as STAC ``/search`` does. A public-ES catalog, a GEOID-style
+    catalog routing SEARCH to its tenant-private ES index, or any future
+    ES items driver are all served the same way, with no hardcoded driver
+    class (#1047).
 
     Returns ``None`` (caller falls back to the existing PostgreSQL
     ``stream_items`` path) when the dispatch is not applicable:
@@ -163,8 +122,8 @@ async def maybe_dispatch_items_to_search_driver(
         return None
 
     from dynastore.modules.storage import router as _router
-    from dynastore.models.protocols.item_search import ItemSearchProtocol
     from dynastore.modules.catalog.item_query import is_query_fallback_driver
+    from dynastore.models.query_builder import QueryRequest
 
     try:
         resolved = await _router.get_items_search_driver(
@@ -182,20 +141,33 @@ async def maybe_dispatch_items_to_search_driver(
     if is_query_fallback_driver(driver):
         return None
 
-    # The resolved driver must implement the structural-search capability.
-    if not isinstance(driver, ItemSearchProtocol):
+    # Only ES items drivers honor the structural QueryRequest dimensions on
+    # their streaming read/count path today; anything else defers to the PG
+    # ``stream_items`` path. (Marker, not isinstance — same gate the indexer
+    # and item_service use, ``is_es_items_driver``.)
+    if not getattr(driver, "is_es_items_driver", False):
         return None
 
+    # Single-collection /items: leave ``collections`` unset so the driver keeps
+    # its routed single-collection fast path; the positional collection scopes.
+    request = QueryRequest(
+        item_ids=ids,
+        bbox=bbox,
+        intersects=intersects,
+        datetime=datetime,
+        limit=limit,
+        offset=offset,
+    )
+
     try:
-        result = await driver.search_items_struct(
-            catalog_id=catalog_id,
-            collections=[collection_id],
-            ids=ids,
-            bbox=bbox,
-            intersects=intersects,
-            datetime=datetime,
-            limit=limit,
-            offset=offset,
+        # ``read_entities`` streams read-contract Features (O(1) memory);
+        # ``count_entities`` supplies numberMatched so paging links stay correct.
+        items = driver.read_entities(
+            catalog_id, collection_id,
+            request=request, limit=limit, offset=offset,
+        )
+        total = await driver.count_entities(
+            catalog_id, collection_id, request=request,
         )
     except Exception as exc:  # noqa: BLE001 — degrade to PG path, never 500
         logger.warning(
@@ -205,17 +177,9 @@ async def maybe_dispatch_items_to_search_driver(
         )
         return None
 
-    features = _items_hits_to_features(
-        result.features, catalog_id, collection_id,
-    )
-
-    async def _feature_stream():
-        for feat in features:
-            yield feat
-
     return QueryResponse(
-        items=_feature_stream(),
-        total_count=result.total,
+        items=items,
+        total_count=total,
         catalog_id=catalog_id,
         collection_id=collection_id,
     )

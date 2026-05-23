@@ -58,7 +58,6 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
 
 if TYPE_CHECKING:
-    from dynastore.models.protocols.item_search import ItemSearchResult
     from dynastore.modules.storage.driver_config import ItemsWritePolicy
     from dynastore.modules.storage.read_policy import ItemsReadPolicy
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -397,104 +396,6 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         return collection_id
 
     # ------------------------------------------------------------------
-    # Structural item search (ItemSearchProtocol capability)
-    # ------------------------------------------------------------------
-    # The STAC ``/search`` fast path resolves the items SEARCH driver via
-    # routing (``router.get_items_search_driver``) and dispatches here when
-    # the resolved driver advertises this capability — instead of hardcoding
-    # the public Elasticsearch class (#989). Both the public items index and
-    # the tenant-scoped private items index share this one implementation; the
-    # only difference is which index :meth:`_search_index_name` resolves to, so
-    # a GEOID catalog routing SEARCH to the private driver transparently
-    # queries its private index.
-
-    def _search_index_name(self, catalog_id: Optional[str]) -> str:
-        """Resolve the ES index/alias a structural search targets.
-
-        Public default: the per-tenant items index for a scoped query, or the
-        cross-catalog public items alias when no catalog is in scope (the
-        global lookup case). Private/other drivers override this.
-        """
-        from dynastore.modules.elasticsearch.client import get_index_prefix
-        from dynastore.modules.elasticsearch.mappings import get_public_items_alias
-
-        if catalog_id:
-            return _tenant_items_index(catalog_id)
-        return get_public_items_alias(get_index_prefix())
-
-    async def search_items_struct(
-        self,
-        *,
-        catalog_id: Optional[str],
-        collections: Optional[List[str]],
-        ids: Optional[List[str]],
-        bbox: Optional[List[float]],
-        intersects: Optional[Dict[str, Any]],
-        datetime: Optional[str],
-        limit: int,
-        offset: int = 0,
-    ) -> "ItemSearchResult":
-        """Structural (filter-free) item search — satisfies
-        :class:`~dynastore.models.protocols.item_search.ItemSearchProtocol`.
-
-        Builds the canonical ES DSL via the :func:`build_items_query` SSOT
-        (shared with the search extension), runs it against the
-        driver-resolved index with ``from``/``size`` pagination, and returns
-        the raw ``_source`` docs + total hit count. Read-contract
-        reconstruction (un-projecting ``properties.extras`` → flat, nulling an
-        empty geometry) is the caller's responsibility via
-        :func:`dynastore.modules.elasticsearch.items_projection.unproject_item_from_es`,
-        keeping this method backend-shaped and model-free.
-
-        Degrades to an empty result (never raises) when the ES client is
-        unavailable, mirroring the search extension's ``ignore_unavailable`` /
-        ``allow_no_indices`` posture so a brand-new install returns ``[]``
-        rather than 500ing.
-        """
-        from dynastore.models.protocols.item_search import ItemSearchResult
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_query import build_items_query
-
-        # ``es`` typed Any: the opensearch-py stubs omit the ``search``
-        # query-string params (``ignore_unavailable`` / ``allow_no_indices``),
-        # mirroring the search extension's ``es_client`` (Any) call site.
-        es: Any = get_client()
-        if es is None:
-            return ItemSearchResult(features=[], total=0)
-
-        query = build_items_query(
-            ids=ids,
-            collections=collections,
-            bbox=bbox,
-            intersects=intersects,
-            datetime=datetime,
-        )
-        es_body: Dict[str, Any] = {
-            "query": query,
-            "size": limit,
-            "from": offset,
-        }
-        try:
-            resp = await es.search(
-                index=self._search_index_name(catalog_id),
-                body=es_body,
-                ignore_unavailable=True,
-                allow_no_indices=True,
-            )
-        except Exception as exc:  # noqa: BLE001 — search degrades, never 500s
-            logger.warning(
-                "search_items_struct: ES query failed (catalog=%s, "
-                "collections=%s): %s",
-                catalog_id, collections, exc,
-            )
-            return ItemSearchResult(features=[], total=0)
-
-        hits = resp.get("hits", {})
-        total = hits.get("total", {}).get("value", 0)
-        features = [h["_source"] for h in hits.get("hits", [])]
-        return ItemSearchResult(features=features, total=total)
-
-    # ------------------------------------------------------------------
     # CollectionItemsStore Protocol — data-side ops
     # ------------------------------------------------------------------
     # Identical between public and private modulo the two seams: the index
@@ -516,13 +417,23 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         es = get_client()
         if es is None:
             return 0
-        query = self._query_request_to_es(request) if request is not None else None
+        # ``_query_request_to_es`` returns an enveloped ``{"query": ...}``;
+        # ``es_count_items`` adds its own collection scope, so it wants the
+        # inner query only (a double envelope is a malformed count body).
+        inner = (
+            self._query_request_to_es(request).get("query")
+            if request is not None
+            else None
+        )
+        # Multi-collection: scoping is carried by the query's terms filter, so
+        # drop the single-collection scope + routing (mirrors read_entities).
+        multi = bool(request is not None and request.collections)
         return await es_count_items(
             es,
             self._items_index_name(catalog_id),
-            query=query,
-            collection=collection_id,
-            routing=self._collection_routing(collection_id),
+            query=inner,
+            collection=None if multi else collection_id,
+            routing=None if multi else self._collection_routing(collection_id),
         )
 
     async def compute_extents(
@@ -589,29 +500,103 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
 
     @staticmethod
     def _query_request_to_es(request: QueryRequest) -> dict:
-        """Convert a QueryRequest to an ES query body."""
-        must: list = []
+        """Convert a QueryRequest to an ES query body.
+
+        Structural dimensions (``item_ids``, ``collections``, ``bbox``,
+        ``intersects``, ``datetime``) are translated by the shared
+        :func:`~dynastore.modules.elasticsearch.items_query.build_items_query`
+        SSOT so the streaming read/count path produces exactly the same DSL the
+        search path used to build. Any remaining attribute predicates carried on
+        ``filters`` (``eq`` / ``like`` / a legacy ``bbox`` condition) are merged
+        as additional ``must`` clauses.
+        """
+        from dynastore.modules.elasticsearch.items_query import build_items_query
+
+        inner = build_items_query(
+            ids=request.item_ids,
+            collections=request.collections,
+            bbox=request.bbox,
+            intersects=request.intersects,
+            datetime=request.datetime,
+        )
+
+        extra_must: list = []
         for f in request.filters:
             op = f.operator if isinstance(f.operator, str) else f.operator.value
-            if op == "bbox" and f.field == "geometry":
+            if op in ("eq", "="):
+                extra_must.append({"term": {f.field: f.value}})
+            elif op in ("like", "ilike"):
+                extra_must.append({"wildcard": {f.field: f.value}})
+            elif op in ("bbox", "&&") and f.field == "geometry":
                 coords = f.value
                 if isinstance(coords, (list, tuple)) and len(coords) >= 4:
-                    must.append({
-                        "geo_bounding_box": {
+                    extra_must.append({
+                        "geo_shape": {
                             "geometry": {
-                                "top_left": {"lon": coords[0], "lat": coords[3]},
-                                "bottom_right": {"lon": coords[2], "lat": coords[1]},
+                                "shape": {
+                                    "type": "envelope",
+                                    "coordinates": [
+                                        [coords[0], coords[3]],
+                                        [coords[2], coords[1]],
+                                    ],
+                                },
+                                "relation": "intersects",
                             }
                         }
                     })
-            elif op in ("eq", "="):
-                must.append({"term": {f.field: f.value}})
-            elif op in ("like", "ilike"):
-                must.append({"wildcard": {f.field: f.value}})
 
-        if not must:
-            return {"query": {"match_all": {}}}
-        return {"query": {"bool": {"must": must}}}
+        if not extra_must:
+            return {"query": inner}
+
+        # Fold attribute predicates into the structural bool. A ``match_all``
+        # (no structural dims) collapses to just the attribute musts.
+        if "bool" in inner:
+            bool_body = dict(inner["bool"])
+            bool_body["must"] = list(bool_body.get("must", [])) + extra_must
+            return {"query": {"bool": bool_body}}
+        return {"query": {"bool": {"must": extra_must}}}
+
+    @staticmethod
+    def _build_read_search_body(
+        collection_id: str,
+        request: Optional[QueryRequest],
+        limit: int,
+        offset: int,
+    ) -> tuple:
+        """Build the ``(body, params)`` for a streaming items search.
+
+        Single-collection (the common ``/items`` browse): force a
+        ``{"term": {"collection": …}}`` filter and route to that collection's
+        shard. Multi-collection (``request.collections`` set, e.g. STAC
+        ``/search`` across collections): the ``build_items_query`` SSOT already
+        scopes via a ``{"terms": {"collection": […]}}`` filter, so query all
+        shards with no single-collection routing.
+        """
+        base = (
+            _ItemsElasticsearchBase._query_request_to_es(request)
+            if request
+            else {"query": {"match_all": {}}}
+        )
+        base_query = base.get("query", {"match_all": {}})
+        size = limit if request is None or request.limit is None else request.limit
+        from_ = offset if request is None or request.offset is None else request.offset
+        params: Dict[str, Any] = {"size": str(size), "from": str(from_)}
+
+        if request is not None and request.collections:
+            # Multi-collection: scoping is already in base_query's terms filter.
+            return {"query": base_query}, params
+
+        collection_filter = {"term": {"collection": collection_id}}
+        body = {
+            "query": {
+                "bool": {
+                    "must": [base_query],
+                    "filter": [collection_filter],
+                }
+            }
+        }
+        params["routing"] = collection_id
+        return body, params
 
 
 # ---------------------------------------------------------------------------
@@ -1162,29 +1147,16 @@ class ItemsElasticsearchDriver(
                 except Exception:
                     pass
         else:
-            base = self._query_request_to_es(request) if request else {"query": {"match_all": {}}}
-            # Always scope by collection so a tenant-wide index returns
-            # only this collection's hits.
-            collection_filter = {"term": {"collection": collection_id}}
-            base_query = base.get("query", {"match_all": {}})
-            scoped_query = {
-                "bool": {
-                    "must": [base_query],
-                    "filter": [collection_filter],
-                }
-            }
-            size = limit if request is None or request.limit is None else request.limit
-            from_ = offset if request is None or request.offset is None else request.offset
-
+            # Single-collection scopes+routes to one collection's shard;
+            # multi-collection (request.collections) queries all shards.
+            body, params = self._build_read_search_body(
+                collection_id, request, limit, offset,
+            )
             try:
                 resp = await es.search(
                     index=index_name,
-                    body={"query": scoped_query},
-                    params={
-                        "routing": collection_id,
-                        "size": str(size),
-                        "from": str(from_),
-                    },
+                    body=body,
+                    params=params,
                 )
                 for hit in resp.get("hits", {}).get("hits", []):
                     try:
