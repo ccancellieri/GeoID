@@ -31,166 +31,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _parse_sort(
-    sortby: Optional[str],
-    known_fields: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
-    """Parse STAC sortby string into ES sort clause.
-
-    Sort paths are resolved through
-    :func:`dynastore.modules.elasticsearch.items_projection.resolve_es_field_path`
-    so a request to sort on an unknown extension field
-    (``properties.foo:bar``) targets the ``properties.extras.foo:bar``
-    bucket where the projection helper actually wrote it. Tier-1 paths
-    (and Tier-2 paths when ``known_fields`` carries the per-catalog
-    overlay) pass through unchanged.
-
-    ``known_fields`` defaults to Tier 1 only — used by cross-catalog
-    ``/search`` (against the platform alias) where Tier-2 fields are
-    not guaranteed to exist on every member; on non-declaring catalogs
-    they sort as missing (graceful per-index miss, zero ES cost). The
-    per-catalog ``/search`` call site resolves the catalog's full
-    known-fields map and threads it in so Tier-2 paths sort on their
-    explicit ``properties.<key>`` path.
-    """
-    if not sortby:
-        return [{"_score": {"order": "desc"}}]
-    from dynastore.modules.elasticsearch.items_projection import (
-        build_known_fields,
-        resolve_es_field_path,
-    )
-    if known_fields is None:
-        known_fields = build_known_fields()
-    direction = "desc" if sortby.startswith("-") else "asc"
-    field = sortby.lstrip("+-")
-    field = resolve_es_field_path(field, known_fields)
-    # Text fields sort on the .keyword sub-field
-    text_fields = {"properties.title", "title", "description", "properties.description"}
-    if field in text_fields:
-        field = f"{field}.keyword"
-    return [{field: {"order": direction}}, {"_score": {"order": "desc"}}]
-
-
-def _parse_datetime_filter(datetime_str: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Convert STAC datetime string to ES range filter."""
-    if not datetime_str:
-        return None
-    if "/" in datetime_str:
-        parts = datetime_str.split("/")
-        gte = None if parts[0] == ".." else parts[0]
-        lte = None if parts[1] == ".." else parts[1]
-        r: Dict[str, Any] = {}
-        if gte:
-            r["gte"] = gte
-        if lte:
-            r["lte"] = lte
-        return {"range": {"properties.datetime": r}}
-    return {
-        "bool": {
-            "should": [
-                {"term": {"properties.datetime": datetime_str}},
-                {"range": {"properties.datetime": {"lte": datetime_str}}},
-            ]
-        }
-    }
+# The ES items-query DSL now lives in the core single source of truth
+# (``dynastore.modules.elasticsearch.items_query``) so the routing-aware item
+# search dispatched through whichever driver a catalog pins for
+# ``Operation.SEARCH`` builds the same query as this extension (#989). These
+# module-level shims preserve the historical ``search_service`` import surface
+# (consumed by ``test_search_item_filters`` and ``test_items_projection``).
+from dynastore.modules.elasticsearch.items_query import (  # noqa: E402
+    build_items_query as _build_items_query,
+    parse_sort as _parse_sort,
+)
 
 
 def _build_item_query(body: SearchBody) -> Dict[str, Any]:
-    """Build an Elasticsearch query DSL from a STAC SearchBody."""
-    must: List[Dict[str, Any]] = []
-    filter_: List[Dict[str, Any]] = []
+    """Build an Elasticsearch query DSL from a STAC SearchBody.
 
-    if body.q:
-        # ``lenient: true`` makes Elasticsearch skip fields that cannot
-        # honour the query (e.g. ``properties.file:size`` is mapped as
-        # ``long`` but the ``properties.*`` wildcard pulls it into the
-        # multi_match — without lenient, ES rejects the whole search with
-        # ``Can only use fuzzy queries on keyword and text fields - not on
-        # [properties.file:size] which is of type [long]``).  The wildcard
-        # is load-bearing for STAC extension keywords we don't list
-        # explicitly, so we keep it and let ES ignore type mismatches.
-        must.append({
-            "multi_match": {
-                "query": body.q,
-                "type": "best_fields",
-                "fields": [
-                    "id^3",
-                    "title.*^2",
-                    "properties.title.*^2",
-                    "description.*",
-                    "properties.description.*",
-                    "keywords.*",
-                    "properties.keywords.*",
-                    "properties.*",
-                ],
-                "fuzziness": "AUTO",
-                "lenient": True,
-                "minimum_should_match": "1",
-            }
-        })
-
-    # ``catalog_id`` scoping is enforced by index naming itself —
-    # :meth:`SearchService._resolve_items_index` routes scoped queries to
-    # ``{prefix}-{catalog_id}-items`` so every doc returned is implicitly
-    # in-catalog. The driver does not materialise a ``catalog_id`` keyword
-    # on each item doc, so a term filter on it would match zero docs and
-    # silently empty every catalog-scoped response (#819 comment 4).
-
-    if body.ids:
-        filter_.append({"terms": {"id": body.ids}})
-
-    if body.geoid:
-        # In this stack the STAC Item ``id`` IS the geoid — the canonical
-        # identifier the platform mints and the only field reliably indexed
-        # at the root for every item. Match on ``id``; ``properties.geoid``
-        # and root ``geoid`` are reserved-but-unwritten in the public items
-        # mapping, so targeting them silently misses every doc (#819).
-        filter_.append({"terms": {"id": body.geoid}})
-
-    if body.external_id:
-        # ``_external_id`` is the internal mirror written by the items driver
-        # (see ItemsElasticsearchDriver._extract_external_id_from_doc); it is
-        # the only reliably-indexed external_id field across writers.
-        filter_.append({"terms": {"_external_id": body.external_id}})
-
-    if body.collections:
-        filter_.append({"terms": {"collection": body.collections}})
-
-    if body.bbox:
-        lon_min, lat_min, lon_max, lat_max = body.bbox[:4]
-        filter_.append({
-            "geo_shape": {
-                "geometry": {
-                    "shape": {
-                        "type": "envelope",
-                        "coordinates": [[lon_min, lat_max], [lon_max, lat_min]],
-                    },
-                    "relation": "intersects",
-                }
-            }
-        })
-    elif body.intersects:
-        filter_.append({
-            "geo_shape": {
-                "geometry": {
-                    "shape": body.intersects,
-                    "relation": "intersects",
-                }
-            }
-        })
-
-    dt_filter = _parse_datetime_filter(body.datetime)
-    if dt_filter:
-        filter_.append(dt_filter)
-
-    if not must and not filter_:
-        return {"match_all": {}}
-    return {
-        "bool": {
-            **({"must": must} if must else {}),
-            **({"filter": filter_} if filter_ else {}),
-        }
-    }
+    Thin adapter over the core :func:`build_items_query` SSOT.
+    """
+    return _build_items_query(
+        q=body.q,
+        ids=body.ids,
+        geoid=body.geoid,
+        external_id=body.external_id,
+        collections=body.collections,
+        bbox=body.bbox,
+        intersects=body.intersects,
+        datetime=body.datetime,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -342,39 +209,14 @@ class SearchService(ExtensionProtocol):
             numberReturned=len(features),
         )
 
-    async def search_items_struct(
-        self,
-        *,
-        catalog_id: Optional[str],
-        collections: Optional[List[str]],
-        ids: Optional[List[str]],
-        bbox: Optional[List[float]],
-        intersects: Optional[Dict[str, Any]],
-        datetime: Optional[str],
-        limit: int,
-    ) -> "ItemSearchResult":
-        """Backend-agnostic structural search — satisfies
-        :class:`~dynastore.models.protocols.item_search.ItemSearchProtocol`.
-        """
-        from dynastore.models.protocols.item_search import ItemSearchResult
-
-        body = SearchBody(
-            q=None,
-            token=None,
-            sortby=None,
-            catalog_id=catalog_id,
-            collections=collections,
-            ids=ids,
-            bbox=bbox,
-            intersects=intersects,
-            datetime=datetime,
-            limit=limit,
-        )
-        ic = await self.search_items(body)
-        return ItemSearchResult(
-            features=list(ic.features),
-            total=ic.numberMatched or 0,
-        )
+    # NOTE: ``search_items_struct`` (the singleton ``ItemSearchProtocol``
+    # provider for the STAC fast path) was retired with #989. STAC ``/search``
+    # now resolves the items SEARCH driver via routing and dispatches the
+    # structural query to that driver's own ``search_items_struct`` (shared
+    # ``_ElasticsearchBase`` implementation) — so a catalog routing SEARCH to
+    # the tenant-private ES index is honoured, which the public-only singleton
+    # could not express. SearchService keeps its own ``/search`` REST router
+    # (full-text, sort, search_after tokens) via :meth:`search_items`.
 
     async def reindex_catalog(
         self,

@@ -250,54 +250,76 @@ async def _maybe_dispatch_to_es_search(
     cat_id: str,
     search_request: "ItemSearchRequest",
 ) -> Optional[Tuple[list, int, Optional[Dict[str, Any]]]]:
-    """If the target collections route reads through
-    ``items_elasticsearch_driver``, run the ES path via
-    :class:`SearchService` and return STAC-shaped results.  Returns
-    ``None`` when this dispatch is not applicable (no ES driver, CQL2
-    filter present, multi-collection mixed-driver, …) so the caller
-    falls back to the PG path.
+    """Dispatch a structural search to the catalog's routing-pinned items
+    SEARCH driver, when one is configured and search-capable.
 
-    Closes the user-visible part of issue #222 — basic STAC search on
-    ES-routed collections returns 0 items today because every search
-    unconditionally builds raw PG SQL.
+    Resolution is fully routing-driven (issue #989): each requested
+    collection's items SEARCH driver is resolved via
+    :func:`router.get_items_search_driver` (``Operation.SEARCH`` then a
+    ``READ`` fallback). The structural query is then dispatched to **that
+    driver** through the backend-agnostic :class:`ItemSearchProtocol`
+    capability — so a public-ES catalog, a GEOID-style catalog routing SEARCH
+    to its tenant-private ES index, or any future search-capable driver are
+    all served the same way, with no hardcoded driver class.
+
+    Returns ``None`` (caller falls back to the PostgreSQL ``QueryOptimizer``
+    path) when the dispatch is not applicable:
+
+    * a CQL2 ``filter`` is present (no CQL2→search-backend translator yet);
+    * no collections are scoped;
+    * the collections resolve to mixed drivers (can't serve in one query);
+    * the resolved driver is a read-primary fallback (PostgreSQL, advertising
+      ``Capability.QUERY_FALLBACK_SOURCE``) — i.e. the catalog has no
+      dedicated search backend, the routing-aware "fall back to READ" case;
+    * the resolved driver does not advertise the structural-search capability.
+
+    Closes the user-visible part of #222 (ES-routed collections returned 0
+    items because every search unconditionally built raw PG SQL) and the
+    driver-coupling reported on #989 (the fast path hardcoded the public ES
+    class and resolved ``Operation.READ`` instead of ``SEARCH``).
     """
-    # Only basic structural filters routed through ES today.
+    # Only basic structural filters are routed to a search backend today;
+    # CQL2 filters continue to the PG path (no CQL2→backend translator yet).
     if search_request.filter is not None:
         return None
-
-    # Resolve the primary READ driver for each requested collection.
-    # When mixed (some ES, some PG) we don't dispatch — fall back to
-    # PG and let the QueryOptimizer per-collection logic handle it.
-    from dynastore.modules.storage.router import get_driver
-    from dynastore.modules.storage.routing_config import Operation
 
     cids = search_request.collections or []
     if not cids:
         return None
-    es_indexer_id = "items_elasticsearch_driver"
-    for cid in cids:
-        try:
-            driver = await get_driver(Operation.READ, cat_id, cid)
-        except Exception:
-            return None
-        driver_id = type(driver).__name__
-        # Snake-case match — same convention used in routing_config.
-        from dynastore.modules.storage.routing_config import _to_snake
-        if _to_snake(driver_id) != es_indexer_id:
-            return None  # at least one collection isn't ES — bail
 
-    # All target collections route through ES. Dispatch via the
-    # backend-agnostic ItemSearchProtocol — this avoids importing
-    # search-extension internals (search_models / search_service) and
-    # keeps stac/search.py free of cross-extension coupling (#234).
+    from dynastore.modules.storage.router import get_items_search_driver
+    from dynastore.models.protocols.storage_driver import Capability
     from dynastore.models.protocols.item_search import ItemSearchProtocol
 
-    search_svc = get_protocol(ItemSearchProtocol)
-    if search_svc is None:
-        return None  # no ItemSearchProtocol provider registered
+    # Resolve the items SEARCH driver per collection. All collections must
+    # resolve to the same driver class to be served in a single query;
+    # otherwise defer to the PG per-collection logic.
+    driver: Any = None
+    for cid in cids:
+        try:
+            resolved = await get_items_search_driver(cat_id, cid)
+        except Exception:
+            return None
+        candidate = resolved.driver
+        if driver is None:
+            driver = candidate
+        elif type(candidate) is not type(driver):
+            return None  # mixed drivers — PG path
+
+    if driver is None:
+        return None
+
+    # A read-primary fallback (PostgreSQL) advertises QUERY_FALLBACK_SOURCE:
+    # no dedicated search backend, so defer to the QueryOptimizer SQL path.
+    if Capability.QUERY_FALLBACK_SOURCE in getattr(driver, "capabilities", frozenset()):
+        return None
+
+    # The resolved driver must implement the structural-search capability.
+    if not isinstance(driver, ItemSearchProtocol):
+        return None
 
     try:
-        result = await search_svc.search_items_struct(
+        result = await driver.search_items_struct(
             catalog_id=cat_id,
             collections=cids,
             ids=search_request.ids,
@@ -305,17 +327,19 @@ async def _maybe_dispatch_to_es_search(
             intersects=search_request.intersects,
             datetime=search_request.datetime,
             limit=search_request.limit,
+            offset=search_request.offset,
         )
     except Exception as exc:
         logger.warning(
-            "STAC search → ES dispatch failed (catalog=%s, collections=%s): %s",
-            cat_id, cids, exc,
+            "STAC search → SEARCH-driver dispatch failed "
+            "(catalog=%s, collections=%s, driver=%s): %s",
+            cat_id, cids, type(driver).__name__, exc,
         )
         return None  # fall back to PG path on error
 
-    # ItemSearchProtocol returns plain dicts (the raw ES ``_source`` shape).
-    # Reconstruct the read contract and inject the serializer's catalog/collection
-    # hints — see :func:`_es_hits_to_features`.
+    # The driver returns raw ES ``_source`` dicts. Reconstruct the read
+    # contract and inject the serializer's catalog/collection hints — see
+    # :func:`_es_hits_to_features`.
     features = _es_hits_to_features(result.features, cat_id, cids)
     return features, result.total, None
 
@@ -334,20 +358,18 @@ async def search_items(
     assert search_request.catalog_id is not None, "search_request.catalog_id required"
     cat_id: str = search_request.catalog_id
 
-    # ── ES dispatch fast path (issue #222) ────────────────────────────
-    # When the resolved primary READ driver is ``items_elasticsearch_driver``
-    # and the request is structural-filter only (no CQL2 ``filter``),
-    # delegate to the platform :class:`SearchService` which already
-    # implements the ES query path against ``{prefix}-items-{cat}`` /
-    # the public alias.  CQL2 + ES is intentionally NOT routed here yet
-    # because no CQL2→ES translator exists; those queries fall through
-    # to the PG path (operator's responsibility to ensure their data
-    # is in PG, or pin the collection's READ to PG via routing config).
-    es_dispatch_result = await _maybe_dispatch_to_es_search(
+    # ── Routing-aware search-driver dispatch (issues #222, #989) ──────
+    # For structural-filter-only requests (no CQL2 ``filter``), dispatch to
+    # the items SEARCH driver the catalog's routing pins — public ES, the
+    # tenant-private ES index, or any future search-capable driver — resolved
+    # via ``router.get_items_search_driver``. CQL2 and read-primary
+    # (PostgreSQL ``QUERY_FALLBACK_SOURCE``) catalogs fall through to the
+    # QueryOptimizer SQL path below. See :func:`_maybe_dispatch_to_es_search`.
+    search_dispatch_result = await _maybe_dispatch_to_es_search(
         cat_id, search_request,
     )
-    if es_dispatch_result is not None:
-        return es_dispatch_result
+    if search_dispatch_result is not None:
+        return search_dispatch_result
 
     # Helper to execute with a connection (reusing if present, connecting if engine)
     _catalogs = catalogs

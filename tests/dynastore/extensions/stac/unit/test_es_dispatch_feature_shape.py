@@ -1,17 +1,19 @@
-"""Unit tests pinning the ES-dispatch return contract.
+"""Unit tests pinning the routing-aware STAC ``/search`` dispatch contract.
 
-``_maybe_dispatch_to_es_search`` is the ES fast path on STAC ``/search``.
-The downstream serializer (``stac_generator.create_search_results_collection``)
-reads ``feature.properties.get("_catalog_id" | "_collection_id")`` on each
-hit, so the dispatch must return ``Feature`` pydantic instances with those
-cross-collection markers injected — exactly the shape the PG path emits at
-``packages/extensions/stac/.../search.py:882-883``.
+``_maybe_dispatch_to_es_search`` resolves the items SEARCH driver via routing
+(``router.get_items_search_driver`` — SEARCH→READ fallback, #989) and
+dispatches the structural query to **that driver** via the
+``ItemSearchProtocol`` capability. It no longer hardcodes the public
+Elasticsearch class, so:
 
-Closes the regression that surfaces once #914 is fixed: with
-``catalog_id`` now present on indexed docs the ES path actually returns
-hits, exposing a ``'dict' object has no attribute 'properties'``
-AttributeError in the serializer when the dispatch returns raw
-``_source`` dicts.
+* a catalog routing SEARCH to the tenant-private ES driver is honoured;
+* a catalog with no dedicated search driver (PG ``QUERY_FALLBACK_SOURCE``)
+  falls through to the PostgreSQL path (dispatch returns ``None``);
+* mixed drivers across collections fall through to PG.
+
+The downstream serializer reads ``feature.properties["_catalog_id" |
+"_collection_id"]`` on each hit, so the dispatch must return ``Feature``
+pydantic instances with those markers injected — the shape the PG path emits.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from dynastore.extensions.stac.search import _maybe_dispatch_to_es_search
+from dynastore.models.protocols.storage_driver import Capability
 from dynastore.models.shared_models import Feature
 
 
@@ -31,22 +34,40 @@ class _StubItemSearchResult:
     total: int = 0
 
 
-class _StubSearchProtocol:
+@dataclass
+class _Resolved:
+    """Stand-in for ``ResolvedDriver`` — the dispatcher reads ``.driver``."""
+
+    driver: Any
+
+
+class _FakeSearchDriver:
+    """A search-capable items driver (satisfies ``ItemSearchProtocol``).
+
+    Stands in for either the public or the tenant-private ES driver — the
+    dispatcher treats both identically because it dispatches through the
+    capability, not the concrete class.
+    """
+
+    capabilities = frozenset({Capability.READ})
+
     def __init__(self, features: List[Dict[str, Any]], total: int):
         self._result = _StubItemSearchResult(features=features, total=total)
+        self.calls: list = []
 
-    async def search_items_struct(self, **_kwargs):
+    async def search_items_struct(self, **kwargs):
+        self.calls.append(kwargs)
         return self._result
 
 
-class _StubDriver:
-    """Class name must snake-case to ``items_elasticsearch_driver`` to
-    pass the ES-routing gate in :func:`_maybe_dispatch_to_es_search`."""
+class _FakePgFallbackDriver:
+    """A read-primary driver with no dedicated search backend — the PG case.
 
+    Advertises ``QUERY_FALLBACK_SOURCE`` so the dispatcher declines and lets
+    the PostgreSQL ``QueryOptimizer`` path serve the query.
+    """
 
-# Rename via class-attribute trick so isinstance/repr don't matter; the
-# function only reads ``type(driver).__name__``.
-_StubDriver.__name__ = "ItemsElasticsearchDriver"
+    capabilities = frozenset({Capability.READ, Capability.QUERY_FALLBACK_SOURCE})
 
 
 @dataclass
@@ -58,45 +79,26 @@ class _SearchRequest:
     intersects: Optional[Dict[str, Any]] = None
     datetime: Optional[str] = None
     limit: int = 10
+    offset: int = 0
 
 
-def _patch_dispatch(monkeypatch, *, hits, total, driver_cls=_StubDriver):
-    """Wire the four ``get_*`` lookups the dispatcher performs."""
+def _patch_resolver(monkeypatch, driver_for):
+    """Patch ``get_items_search_driver`` to return ``driver_for(cid)``."""
     import dynastore.modules.storage.router as _router
-    import dynastore.modules.storage.routing_config as _routing
-    import dynastore.tools.discovery as _discovery
-    from dynastore.models.protocols.item_search import ItemSearchProtocol
 
-    async def _fake_get_driver(_op, _cat, _cid):
-        return driver_cls()
+    async def _fake_get_items_search_driver(cat, cid=None, **_kw):
+        drv = driver_for(cid)
+        if drv is None:
+            raise ValueError("no driver")
+        return _Resolved(driver=drv)
 
-    monkeypatch.setattr(_router, "get_driver", _fake_get_driver)
-    # _to_snake is imported inside the function — pinned via module attr.
     monkeypatch.setattr(
-        _routing, "_to_snake", lambda name: "items_elasticsearch_driver"
+        _router, "get_items_search_driver", _fake_get_items_search_driver
     )
-
-    stub = _StubSearchProtocol(features=hits, total=total)
-
-    def _fake_get_protocol(proto):
-        if proto is ItemSearchProtocol:
-            return stub
-        return None
-
-    # Imported inside the function body of search.py — patch the module
-    # that gets imported there.
-    monkeypatch.setattr(_discovery, "get_protocol", _fake_get_protocol)
-    # search.py top-level also has ``get_protocol`` bound — patch both.
-    import dynastore.extensions.stac.search as _search_mod
-
-    monkeypatch.setattr(_search_mod, "get_protocol", _fake_get_protocol)
 
 
 @pytest.mark.asyncio
-async def test_es_dispatch_returns_feature_instances(monkeypatch):
-    """Raw _source dicts must be parsed into Feature pydantic models so
-    the cross-collection serializer's ``feature.properties.get(...)``
-    calls don't AttributeError."""
+async def test_dispatch_returns_feature_instances(monkeypatch):
     hit = {
         "type": "Feature",
         "id": "item-1",
@@ -104,12 +106,11 @@ async def test_es_dispatch_returns_feature_instances(monkeypatch):
         "bbox": [10.0, 20.0, 10.0, 20.0],
         "properties": {"datetime": "2024-01-01T00:00:00Z"},
         "collection": "col-a",
-        "catalog_id": "cat-x",
     }
-    _patch_dispatch(monkeypatch, hits=[hit], total=1)
+    drv = _FakeSearchDriver(features=[hit], total=1)
+    _patch_resolver(monkeypatch, lambda cid: drv)
 
-    req = _SearchRequest(collections=["col-a"])
-    out = await _maybe_dispatch_to_es_search("cat-x", req)
+    out = await _maybe_dispatch_to_es_search("cat-x", _SearchRequest(collections=["col-a"]))
 
     assert out is not None
     features, total, aggs = out
@@ -120,24 +121,18 @@ async def test_es_dispatch_returns_feature_instances(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_es_dispatch_injects_cross_collection_markers(monkeypatch):
-    """Mirror the PG path (search.py:882-883) — inject
-    ``_catalog_id`` + ``_collection_id`` into ``feature.properties`` so
-    ``stac_generator.create_search_results_collection`` can dispatch
-    per-item rendering."""
+async def test_dispatch_injects_cross_collection_markers(monkeypatch):
     hit = {
         "type": "Feature",
         "id": "item-2",
         "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
-        "bbox": [0.0, 0.0, 0.0, 0.0],
         "properties": {"datetime": "2024-01-01T00:00:00Z"},
         "collection": "col-b",
-        "catalog_id": "cat-y",
     }
-    _patch_dispatch(monkeypatch, hits=[hit], total=1)
+    drv = _FakeSearchDriver(features=[hit], total=1)
+    _patch_resolver(monkeypatch, lambda cid: drv)
 
-    req = _SearchRequest(collections=["col-b"])
-    out = await _maybe_dispatch_to_es_search("cat-y", req)
+    out = await _maybe_dispatch_to_es_search("cat-y", _SearchRequest(collections=["col-b"]))
     assert out is not None
     features, _total, _aggs = out
     assert features[0].properties["_catalog_id"] == "cat-y"
@@ -145,23 +140,17 @@ async def test_es_dispatch_injects_cross_collection_markers(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_es_dispatch_falls_back_to_request_collection_when_missing(
-    monkeypatch,
-):
-    """If the indexed doc lacks ``collection`` (legacy pre-#959 docs)
-    and exactly one collection is in scope, fall back to the requested
-    cid so the serializer still has a non-empty key."""
+async def test_dispatch_falls_back_to_request_collection_when_missing(monkeypatch):
     hit = {
         "type": "Feature",
         "id": "legacy-item",
         "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
         "properties": {"datetime": "2024-01-01T00:00:00Z"},
-        # no `collection`, no `catalog_id`
     }
-    _patch_dispatch(monkeypatch, hits=[hit], total=1)
+    drv = _FakeSearchDriver(features=[hit], total=1)
+    _patch_resolver(monkeypatch, lambda cid: drv)
 
-    req = _SearchRequest(collections=["only-one"])
-    out = await _maybe_dispatch_to_es_search("cat-z", req)
+    out = await _maybe_dispatch_to_es_search("cat-z", _SearchRequest(collections=["only-one"]))
     assert out is not None
     features, _, _ = out
     assert features[0].properties["_catalog_id"] == "cat-z"
@@ -169,9 +158,7 @@ async def test_es_dispatch_falls_back_to_request_collection_when_missing(
 
 
 @pytest.mark.asyncio
-async def test_es_dispatch_skips_malformed_hits(monkeypatch):
-    """A doc missing required ``id`` (Feature is strict on it) must be
-    skipped with a warning, not crash the whole search."""
+async def test_dispatch_skips_malformed_hits(monkeypatch):
     bad = {"type": "Feature", "properties": {}}  # no id
     good = {
         "type": "Feature",
@@ -180,13 +167,65 @@ async def test_es_dispatch_skips_malformed_hits(monkeypatch):
         "properties": {},
         "collection": "c1",
     }
-    _patch_dispatch(monkeypatch, hits=[bad, good], total=2)
+    drv = _FakeSearchDriver(features=[bad, good], total=2)
+    _patch_resolver(monkeypatch, lambda cid: drv)
 
-    req = _SearchRequest(collections=["c1"])
-    out = await _maybe_dispatch_to_es_search("cat-t", req)
+    out = await _maybe_dispatch_to_es_search("cat-t", _SearchRequest(collections=["c1"]))
     assert out is not None
     features, total, _ = out
-    # total preserved (operator-visible numberMatched); 1 hit dropped.
-    assert total == 2
+    assert total == 2  # numberMatched preserved; 1 hit dropped
     assert len(features) == 1
     assert features[0].id == "ok"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_threads_offset_to_driver(monkeypatch):
+    """STAC ``offset`` must reach the driver (paginates past page 1)."""
+    drv = _FakeSearchDriver(features=[], total=0)
+    _patch_resolver(monkeypatch, lambda cid: drv)
+
+    await _maybe_dispatch_to_es_search(
+        "cat-x", _SearchRequest(collections=["c1"], limit=25, offset=50)
+    )
+    assert drv.calls and drv.calls[0]["offset"] == 50
+    assert drv.calls[0]["limit"] == 25
+
+
+@pytest.mark.asyncio
+async def test_dispatch_declines_for_pg_fallback_driver(monkeypatch):
+    """A QUERY_FALLBACK_SOURCE (PG) driver → dispatch returns None so the
+    PostgreSQL path serves the search."""
+    _patch_resolver(monkeypatch, lambda cid: _FakePgFallbackDriver())
+    out = await _maybe_dispatch_to_es_search("cat-x", _SearchRequest(collections=["c1"]))
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_declines_for_mixed_drivers(monkeypatch):
+    """Heterogeneous SEARCH drivers across collections → None (PG path)."""
+    es = _FakeSearchDriver(features=[], total=0)
+    pg = _FakePgFallbackDriver()
+    mapping = {"c1": es, "c2": pg}
+    _patch_resolver(monkeypatch, lambda cid: mapping[cid])
+    out = await _maybe_dispatch_to_es_search(
+        "cat-x", _SearchRequest(collections=["c1", "c2"])
+    )
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_declines_when_cql_filter_present(monkeypatch):
+    drv = _FakeSearchDriver(features=[], total=0)
+    _patch_resolver(monkeypatch, lambda cid: drv)
+    out = await _maybe_dispatch_to_es_search(
+        "cat-x", _SearchRequest(collections=["c1"], filter={"op": "=", "args": []})
+    )
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_declines_without_collections(monkeypatch):
+    drv = _FakeSearchDriver(features=[], total=0)
+    _patch_resolver(monkeypatch, lambda cid: drv)
+    out = await _maybe_dispatch_to_es_search("cat-x", _SearchRequest(collections=None))
+    assert out is None

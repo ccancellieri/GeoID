@@ -58,7 +58,9 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
 
 if TYPE_CHECKING:
+    from dynastore.models.protocols.item_search import ItemSearchResult
     from dynastore.modules.storage.driver_config import ItemsWritePolicy
+    from dynastore.modules.storage.read_policy import ItemsReadPolicy
     from dynastore.modules.storage.storage_location import StorageLocation
 
 from dynastore.models.ogc import Feature, FeatureCollection
@@ -319,6 +321,104 @@ class _ElasticsearchBase:
         if isinstance(entity, dict):
             return entity.get("id")
         return None
+
+    # ------------------------------------------------------------------
+    # Structural item search (ItemSearchProtocol capability)
+    # ------------------------------------------------------------------
+    # The STAC ``/search`` fast path resolves the items SEARCH driver via
+    # routing (``router.get_items_search_driver``) and dispatches here when
+    # the resolved driver advertises this capability — instead of hardcoding
+    # the public Elasticsearch class (#989). Both the public items index and
+    # the tenant-scoped private items index share this one implementation; the
+    # only difference is which index :meth:`_search_index_name` resolves to, so
+    # a GEOID catalog routing SEARCH to the private driver transparently
+    # queries its private index.
+
+    def _search_index_name(self, catalog_id: Optional[str]) -> str:
+        """Resolve the ES index/alias a structural search targets.
+
+        Public default: the per-tenant items index for a scoped query, or the
+        cross-catalog public items alias when no catalog is in scope (the
+        global lookup case). Private/other drivers override this.
+        """
+        from dynastore.modules.elasticsearch.client import get_index_prefix
+        from dynastore.modules.elasticsearch.mappings import get_public_items_alias
+
+        if catalog_id:
+            return _tenant_items_index(catalog_id)
+        return get_public_items_alias(get_index_prefix())
+
+    async def search_items_struct(
+        self,
+        *,
+        catalog_id: Optional[str],
+        collections: Optional[List[str]],
+        ids: Optional[List[str]],
+        bbox: Optional[List[float]],
+        intersects: Optional[Dict[str, Any]],
+        datetime: Optional[str],
+        limit: int,
+        offset: int = 0,
+    ) -> "ItemSearchResult":
+        """Structural (filter-free) item search — satisfies
+        :class:`~dynastore.models.protocols.item_search.ItemSearchProtocol`.
+
+        Builds the canonical ES DSL via the :func:`build_items_query` SSOT
+        (shared with the search extension), runs it against the
+        driver-resolved index with ``from``/``size`` pagination, and returns
+        the raw ``_source`` docs + total hit count. Read-contract
+        reconstruction (un-projecting ``properties.extras`` → flat, nulling an
+        empty geometry) is the caller's responsibility via
+        :func:`dynastore.modules.elasticsearch.items_projection.unproject_item_from_es`,
+        keeping this method backend-shaped and model-free.
+
+        Degrades to an empty result (never raises) when the ES client is
+        unavailable, mirroring the search extension's ``ignore_unavailable`` /
+        ``allow_no_indices`` posture so a brand-new install returns ``[]``
+        rather than 500ing.
+        """
+        from dynastore.models.protocols.item_search import ItemSearchResult
+        from dynastore.modules.elasticsearch.client import get_client
+        from dynastore.modules.elasticsearch.items_query import build_items_query
+
+        # ``es`` typed Any: the opensearch-py stubs omit the ``search``
+        # query-string params (``ignore_unavailable`` / ``allow_no_indices``),
+        # mirroring the search extension's ``es_client`` (Any) call site.
+        es: Any = get_client()
+        if es is None:
+            return ItemSearchResult(features=[], total=0)
+
+        query = build_items_query(
+            ids=ids,
+            collections=collections,
+            bbox=bbox,
+            intersects=intersects,
+            datetime=datetime,
+        )
+        es_body: Dict[str, Any] = {
+            "query": query,
+            "size": limit,
+            "from": offset,
+        }
+        try:
+            resp = await es.search(
+                index=self._search_index_name(catalog_id),
+                body=es_body,
+                ignore_unavailable=True,
+                allow_no_indices=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — search degrades, never 500s
+            logger.warning(
+                "search_items_struct: ES query failed (catalog=%s, "
+                "collections=%s): %s",
+                catalog_id, collections, exc,
+            )
+            return ItemSearchResult(features=[], total=0)
+
+        hits = resp.get("hits", {})
+        total = hits.get("total", {}).get("value", 0)
+        features = [h["_source"] for h in hits.get("hits", [])]
+        return ItemSearchResult(features=features, total=total)
 
 
 # ---------------------------------------------------------------------------
