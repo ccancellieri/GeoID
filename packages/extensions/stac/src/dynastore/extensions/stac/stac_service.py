@@ -82,6 +82,7 @@ from dynastore.models.localization import normalize_i18n_for_replace
 logger = logging.getLogger(__name__)
 from dynastore.modules.db_config.exceptions import TableNotFoundError
 from dynastore.extensions.tools.language_utils import get_language
+from dynastore.extensions.tools.localization_utils import detect_use_lang
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.protocols.web import StaticFilesProtocol
 import os
@@ -515,24 +516,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
             # We use STACCatalog (DTO) for validation but the catalogs_svc expects the structure to be merged
             # The definition is a Pydantic model with localized fields. model_dump() handles serialization.
-            # Auto-detect if multi-language input is used
-            from dynastore.models.localization import is_multilanguage_input
-
             input_data = definition.model_dump(exclude_unset=True)
-            use_lang = (
-                "*"
-                if any(
-                    is_multilanguage_input(input_data.get(f))
-                    for f in [
-                        "title",
-                        "description",
-                        "keywords",
-                        "license",
-                        "extra_metadata",
-                    ]
-                )
-                else language
-            )
+            use_lang = detect_use_lang(input_data, language)
 
             catalogs_svc = await self._get_catalogs_service()
             created_catalog_model = await catalogs_svc.create_catalog(
@@ -563,29 +548,13 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         # STACCollection inherits from CoreCollection -> BaseMetadata -> LocalizedFieldsBase
         # model_dump will handle serialization
         try:
-            # Auto-detect if multi-language input is used
-            from dynastore.models.localization import is_multilanguage_input
-
             input_data = request_body.model_dump(exclude_unset=True)
 
             # Write-time STAC validation (lenient — warnings only; pystac/stac-pydantic
             # are too strict on optional fields like `links` to gate the request).
             validate_stac_collection(input_data)
 
-            use_lang = (
-                "*"
-                if any(
-                    is_multilanguage_input(input_data.get(f))
-                    for f in [
-                        "title",
-                        "description",
-                        "keywords",
-                        "license",
-                        "extra_metadata",
-                    ]
-                )
-                else language
-            )
+            use_lang = detect_use_lang(input_data, language)
 
             catalogs_svc = await self._get_catalogs_service()
             # Fail-fast guard: reject writes against catalogs whose
@@ -653,24 +622,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         definition: STACCatalogUpdate,
         language: str = Depends(get_language),
     ):
-        # Auto-detect if multi-language input is used
-        from dynastore.models.localization import is_multilanguage_input
-
         input_data = definition.model_dump(exclude_unset=True)
-        use_lang = (
-            "*"
-            if any(
-                is_multilanguage_input(input_data.get(f))
-                for f in [
-                    "title",
-                    "description",
-                    "keywords",
-                    "license",
-                    "extra_metadata",
-                ]
-            )
-            else language
-        )
+        use_lang = detect_use_lang(input_data, language)
 
         catalogs_svc = await self._get_catalogs_service()
         # Fail-fast guard: can't mutate metadata on a catalog whose
@@ -751,9 +704,6 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         request: Request,
         language: str = Depends(get_language),
     ):
-        # Auto-detect if multi-language input is used
-        from dynastore.models.localization import is_multilanguage_input
-
         input_data = request_body.model_dump(exclude_unset=True)
 
         # Validate the *resulting* state (post-merge), not the raw partial body.
@@ -769,20 +719,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         # Sidecars are now handled transparently by ItemsProtocol / LifecycleRegistry
         # No need to manually inject them here.
 
-        use_lang = (
-            "*"
-            if any(
-                is_multilanguage_input(input_data.get(f))
-                for f in [
-                    "title",
-                    "description",
-                    "keywords",
-                    "license",
-                    "extra_metadata",
-                ]
-            )
-            else language
-        )
+        use_lang = detect_use_lang(input_data, language)
 
         catalogs_svc = await self._get_catalogs_service()
         # Fail-fast guard: can't update a collection when the enclosing

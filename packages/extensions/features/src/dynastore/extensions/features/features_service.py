@@ -69,6 +69,7 @@ from dynastore.models.shared_models import (
 from dynastore.models.ogc import Feature as _OGCFeature
 from dynastore.extensions.tools.url import get_root_url, get_url
 from dynastore.extensions.tools.language_utils import get_language
+from dynastore.extensions.tools.localization_utils import detect_use_lang
 from pydantic import BaseModel, Field, ConfigDict, AliasChoices
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
@@ -144,67 +145,6 @@ SUPPORTED_CQL_FUNCTIONS = [
 ]
 
 
-def _generate_pagination_links(
-    request: Request, offset: int, limit: int, count: int
-) -> List[Link]:
-    """Generates 'self', 'next', and 'prev' links for paginated responses."""
-    links = [
-        Link(
-            href=str(request.url),
-            rel="self",
-            type="application/geo+json",
-            title=LocalizedText(en="This document"),
-        )
-    ]
-
-    if (offset + limit) < count:
-        next_url = request.url.replace_query_params(offset=offset + limit)
-        links.append(
-            Link(
-                href=str(next_url),
-                rel="next",
-                type="application/geo+json",
-                title=LocalizedText(en="Next page"),
-            )
-        )
-
-    if offset > 0:
-        prev_offset = max(0, offset - limit)
-        prev_url = request.url.replace_query_params(offset=prev_offset)
-        links.append(
-            Link(
-                href=str(prev_url),
-                rel="prev",
-                type="application/geo+json",
-                title=LocalizedText(en="Previous page"),
-            )
-        )
-
-    return links
-
-
-async def _resolve_crs_uri_to_srid(
-    crs_uri: str, conn: AsyncConnection, catalog_id: str
-) -> Optional[int]:
-    """Resolves a CRS URI to a PostGIS SRID."""
-    if not crs_uri:
-        return None
-    if "CRS84" in crs_uri.upper():
-        return 4326
-
-    match = re.search(r"[/|:](\d+)$", crs_uri)
-    if match:
-        return int(match.group(1))
-
-    crs_svc = get_protocol(CRSProtocol)
-    if crs_svc is not None:
-        crs_def = await crs_svc.get_crs_by_uri(conn, catalog_id, crs_uri)
-        if crs_def is not None and hasattr(crs_def, "srid"):
-            return crs_def.srid
-
-    raise HTTPException(
-        status_code=400, detail=f"Unsupported or unknown CRS URI: {crs_uri}"
-    )
 class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     priority: int = 100
     router: APIRouter
@@ -494,28 +434,12 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 "extra_metadata": definition.extra_metadata,
             }
 
-            # Auto-detect if multi-language input is used
-            from dynastore.models.localization import is_multilanguage_input
-
             # For creation, we check the input data dictionary constructed above
             # Note: definition.title/description might already be resolved/typed by Pydantic
             # We dump the model to check raw input structure
             input_dump = definition.model_dump(exclude_unset=True)
 
-            use_lang = (
-                "*"
-                if any(
-                    is_multilanguage_input(input_dump.get(f))
-                    for f in [
-                        "title",
-                        "description",
-                        "keywords",
-                        "license",
-                        "extra_metadata",
-                    ]
-                )
-                else language
-            )
+            use_lang = detect_use_lang(input_dump, language)
 
             created_catalog_model = await catalogs_svc.create_catalog(
                 catalog_data=catalog_data,
@@ -613,23 +537,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         # Use id as code in the internal representation
         catalog_dict = definition.model_dump(exclude_unset=True)
 
-        # Auto-detect if multi-language input is used
-        from dynastore.models.localization import is_multilanguage_input
-
-        use_lang = (
-            "*"
-            if any(
-                is_multilanguage_input(catalog_dict.get(f))
-                for f in [
-                    "title",
-                    "description",
-                    "keywords",
-                    "license",
-                    "extra_metadata",
-                ]
-            )
-            else language
-        )
+        use_lang = detect_use_lang(catalog_dict, language)
 
         # Pass raw dict, manager handles validation
         catalog = await catalogs_svc.update_catalog(
@@ -765,23 +673,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
             # Use id as code in the internal representation
             collection_dict = collection_def.model_dump(exclude_unset=True)
 
-            # Auto-detect if multi-language input is used
-            from dynastore.models.localization import is_multilanguage_input
-
-            use_lang = (
-                "*"
-                if any(
-                    is_multilanguage_input(collection_dict.get(f))
-                    for f in [
-                        "title",
-                        "description",
-                        "keywords",
-                        "license",
-                        "extra_metadata",
-                    ]
-                )
-                else language
-            )
+            use_lang = detect_use_lang(collection_dict, language)
 
             # Pass raw dict, manager handles localization
             # Pass conn as db_resource for transactional integrity
@@ -913,23 +805,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalogs_svc = await self._get_catalogs_service()
         updates_dict = collection_def.model_dump(exclude_unset=True)
 
-        # Auto-detect if multi-language input is used
-        from dynastore.models.localization import is_multilanguage_input
-
-        use_lang = (
-            "*"
-            if any(
-                is_multilanguage_input(updates_dict.get(f))
-                for f in [
-                    "title",
-                    "description",
-                    "keywords",
-                    "license",
-                    "extra_metadata",
-                ]
-            )
-            else language
-        )
+        use_lang = detect_use_lang(updates_dict, language)
 
         updated_collection = await catalogs_svc.update_collection(
             catalog_id=catalog_id,
