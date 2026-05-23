@@ -28,6 +28,26 @@ with its bounding box as a hard floor.
 The caller receives a `simplification_factor` (final/original byte
 ratio) and a `simplification_mode` so the persisted document can
 record how much fidelity was lost.
+
+Geometry policy (issue #1248)
+=============================
+
+Simplification is **opt-in**. Elasticsearch drivers index *exact*
+geometry by default; they only call :func:`simplify_to_fit` when their
+``simplify_geometry`` driver config flag is set (or an equivalent
+routing hint asks for the simplified read surface). Use
+:func:`maybe_simplify_for_es` so each write call site honours that flag
+with a single line.
+
+When simplification stays disabled, the platform must not silently
+truncate an oversized geometry: the pre-write guard in
+``item_service.upsert`` rejects an item whose geometry serializes above
+:data:`DEFAULT_MAX_BYTES` with HTTP 422 *before* any driver write, so
+the PG primary row is never created (ES is an async secondary; rejecting
+post-commit would leave PG and ES inconsistent). The byte measurement
+uses the GeoJSON serialization of the geometry alone (see
+:func:`geometry_geojson_size`) because the ES per-document limit is
+dominated by the geometry payload and the threshold is an ES constraint.
 """
 
 from typing import Any, Tuple
@@ -139,3 +159,57 @@ def simplify_to_fit(
     # Fallback: bbox polygon. Always fits (5 coordinate pairs).
     doc[geometry_key] = mapping(box(*geom.bounds))
     return doc, 0.0, MODE_BBOX
+
+
+def maybe_simplify_for_es(
+    doc: dict,
+    *,
+    simplify: bool,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    geometry_key: str = "geometry",
+) -> Tuple[dict, float, str]:
+    """Opt-in wrapper around :func:`simplify_to_fit` for ES write paths.
+
+    Issue #1248: ES indexes EXACT geometry by default. Simplification is
+    opt-in, gated by the driver's ``simplify_geometry`` config flag (or an
+    equivalent routing hint) which the caller resolves and passes as
+    ``simplify``.
+
+    - ``simplify=False`` (default for both ES items drivers): return the
+      document untouched with ``(doc, 1.0, MODE_NONE)``. Exact geometry is
+      indexed; oversized geometries are rejected up-front by the
+      ``item_service.upsert`` pre-write guard rather than truncated here.
+    - ``simplify=True``: delegate to :func:`simplify_to_fit` so the doc is
+      shrunk to fit the ES per-document byte budget.
+
+    The input ``doc`` is returned for chaining (mutated in place only when
+    simplification actually runs).
+    """
+    if not simplify:
+        return doc, 1.0, MODE_NONE
+    return simplify_to_fit(
+        doc,
+        max_bytes=max_bytes,
+        max_iterations=max_iterations,
+        geometry_key=geometry_key,
+    )
+
+
+def geometry_geojson_size(geometry: Any) -> int:
+    """Return the GeoJSON-serialized byte size of a geometry.
+
+    Used by the ``item_service.upsert`` pre-write guard (issue #1248) to
+    decide whether an item's geometry busts the ES per-document limit.
+
+    The measurement is the geometry alone (not the whole STAC item):
+    Elasticsearch's per-document size is dominated by the geometry payload
+    and the 10 MB threshold (:data:`DEFAULT_MAX_BYTES`) is an ES-specific
+    constraint, so measuring the geometry's GeoJSON serialization is the
+    stable, driver-shape-independent signal. ``None`` / empty geometry
+    measures as 0 bytes (PG-only catalogs and point geometries never trip
+    the guard).
+    """
+    if not geometry:
+        return 0
+    return len(orjson.dumps(geometry, default=orjson_default))

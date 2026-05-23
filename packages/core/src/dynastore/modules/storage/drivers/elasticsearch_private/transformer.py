@@ -43,11 +43,11 @@ class PrivateEntityTransformer:
     """Transforms STAC items into the tenant-feature shape and back.
 
     On indexing: builds a tenant-feature doc via
-    :func:`build_tenant_feature_doc` and then applies
-    :func:`simplify_to_fit` to keep the doc within ES's per-document size
-    limit. The resulting ``simplification_factor`` and
-    ``simplification_mode`` are persisted on the doc so clients can
-    detect when geometry fidelity was reduced.
+    :func:`build_tenant_feature_doc`. Geometry is indexed EXACTLY by
+    default (#1248); :func:`simplify_to_fit` only runs when the private
+    driver's ``simplify_geometry`` config flag is enabled. The resulting
+    ``simplification_factor`` and ``simplification_mode`` are persisted on
+    the doc so clients can detect when geometry fidelity was reduced.
 
     On READ (restore): lifts the per-tenant flat fields back into a
     standard Feature shape — geometry, bbox, properties (with
@@ -80,7 +80,7 @@ class PrivateEntityTransformer:
         from dynastore.modules.storage.drivers.elasticsearch_private.doc_builder import (
             build_tenant_feature_doc,
         )
-        from dynastore.tools.geometry_simplify import simplify_to_fit
+        from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
         # build_tenant_feature_doc accepts a Feature/dict and lifts geoid /
         # external_id / geometry / bbox / properties into the tenant-feature
@@ -90,10 +90,40 @@ class PrivateEntityTransformer:
             catalog_id=catalog_id,
             collection_id=collection_id or "",
         )
-        doc, factor, mode = simplify_to_fit(doc)
+        # #1248: exact geometry by default — simplification is opt-in via the
+        # private driver's ``simplify_geometry`` config flag.
+        simplify_geometry = await self._resolve_simplify_geometry(
+            catalog_id, collection_id,
+        )
+        doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
         doc["simplification_factor"] = factor
         doc["simplification_mode"] = mode
         return doc
+
+    @staticmethod
+    async def _resolve_simplify_geometry(
+        catalog_id: str, collection_id: Optional[str],
+    ) -> bool:
+        """Resolve the private driver's ``simplify_geometry`` flag (#1248).
+
+        Exact geometry is indexed by default; simplification is opt-in via
+        ``ItemsElasticsearchPrivateDriverConfig.simplify_geometry``.
+        """
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.storage.driver_config import (
+            ItemsElasticsearchPrivateDriverConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        configs = get_protocol(ConfigsProtocol)
+        if configs is None:
+            return False
+        config = await configs.get_config(
+            ItemsElasticsearchPrivateDriverConfig,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+        )
+        return bool(getattr(config, "simplify_geometry", False))
 
     async def restore_from_index(
         self,

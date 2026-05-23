@@ -547,7 +547,7 @@ class ItemsElasticsearchDriver(
             project_item_for_es,
             resolve_catalog_known_fields,
         )
-        from dynastore.tools.geometry_simplify import simplify_to_fit
+        from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
         items = self._normalize_entities(entities)
         if not items:
@@ -555,6 +555,15 @@ class ItemsElasticsearchDriver(
         es = _es_client_required()
         index_name = _tenant_items_index(catalog_id)
         known_fields = await resolve_catalog_known_fields(catalog_id)
+
+        # Issue #1248: exact geometry by default. Simplification is opt-in via
+        # the driver's ``simplify_geometry`` config flag; oversized geometries
+        # are otherwise rejected up-front by ``item_service.upsert`` (HTTP 422)
+        # rather than truncated here.
+        driver_config = await self.get_driver_config(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
+        simplify_geometry = bool(getattr(driver_config, "simplify_geometry", False))
 
         # Service-layer enforcement of FieldDefinition.required / .unique for
         # drivers (like ES) that don't advertise native REQUIRED_ENFORCEMENT /
@@ -638,10 +647,12 @@ class ItemsElasticsearchDriver(
             # Default (UPDATE): stable doc_id wins; the bulk action below
             # uses ``index`` semantics (upsert in place).
 
-            # Guard against the ES 10MB per-doc limit. For oversize docs
-            # the geometry is simplified in place and the ratio is
-            # recorded so consumers can detect lossy storage.
-            stac_doc, factor, mode = simplify_to_fit(stac_doc)
+            # Geometry policy (#1248): index EXACT geometry by default. Only
+            # when ``simplify_geometry`` is enabled do we shrink oversize docs
+            # to fit the ES 10MB per-doc limit and record the lossy ratio.
+            stac_doc, factor, mode = maybe_simplify_for_es(
+                stac_doc, simplify=simplify_geometry,
+            )
             if mode != "none":
                 stac_doc["_simplification_factor"] = factor
                 stac_doc["_simplification_mode"] = mode

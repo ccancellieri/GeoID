@@ -95,8 +95,9 @@ class PrivateIndexTask(TaskProtocol):
     collection's ``ItemsRoutingConfig`` pins
     ``items_elasticsearch_private_driver`` in any operation. The full feature
     is fetched via ``ItemCrudProtocol`` so the dispatcher only needs
-    to send identifiers. Geometry simplification is applied via
-    ``simplify_to_fit`` to honour the ES 10MB per-doc limit.
+    to send identifiers. Geometry is indexed EXACTLY by default (#1248);
+    ``simplify_to_fit`` only runs when the private driver's
+    ``simplify_geometry`` config flag is enabled.
     """
 
     task_type = "elasticsearch_private_index"
@@ -111,8 +112,11 @@ class PrivateIndexTask(TaskProtocol):
             TENANT_FEATURE_MAPPING,
             get_private_index_name,
         )
+        from dynastore.modules.storage.driver_config import (
+            ItemsElasticsearchPrivateDriverConfig,
+        )
         from dynastore.tools.discovery import get_protocol
-        from dynastore.tools.geometry_simplify import simplify_to_fit
+        from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
         inputs = PrivateIndexInputs.model_validate(payload.inputs)
         index_name = get_private_index_name(_get_index_prefix(), inputs.catalog_id)
@@ -144,7 +148,21 @@ class PrivateIndexTask(TaskProtocol):
         doc = build_tenant_feature_doc(
             feature, catalog_id=inputs.catalog_id, collection_id=inputs.collection_id,
         )
-        doc, factor, mode = simplify_to_fit(doc)
+        # #1248: exact geometry by default — simplification is opt-in via the
+        # private driver's ``simplify_geometry`` config flag.
+        simplify_geometry = False
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        configs = get_protocol(ConfigsProtocol)
+        if configs is not None:
+            private_config = await configs.get_config(
+                ItemsElasticsearchPrivateDriverConfig,
+                catalog_id=inputs.catalog_id,
+                collection_id=inputs.collection_id,
+            )
+            simplify_geometry = bool(
+                getattr(private_config, "simplify_geometry", False)
+            )
+        doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
         doc["simplification_factor"] = factor
         doc["simplification_mode"] = mode
 

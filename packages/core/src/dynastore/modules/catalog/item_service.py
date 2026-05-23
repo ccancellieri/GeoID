@@ -410,6 +410,125 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         return feature
 
+    @staticmethod
+    def _resolved_driver_is_es_items(driver: Any) -> bool:
+        """True when a resolved driver is one of the ES items drivers.
+
+        Detected by class name so this guard does not import the ES driver
+        classes (keeps the catalog module free of a hard ES dependency and
+        works with the unit-test stubs that re-label ``__name__``).
+        """
+        return type(driver).__name__ in (
+            "ItemsElasticsearchDriver",
+            "ItemsElasticsearchPrivateDriver",
+        )
+
+    async def _es_items_driver_simplify_enabled(
+        self,
+        driver: Any,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[DbResource] = None,
+    ) -> bool:
+        """Resolve whether an ES items driver has geometry simplification on.
+
+        The private driver exposes ``_resolve_simplify_geometry``; the public
+        driver resolves its ``simplify_geometry`` flag through
+        ``get_driver_config``. Defaults to False (exact-by-default, #1248) if
+        neither path yields a value.
+        """
+        resolver = getattr(driver, "_resolve_simplify_geometry", None)
+        if resolver is not None:
+            try:
+                return bool(await resolver(
+                    catalog_id, collection_id, db_resource=db_resource,
+                ))
+            except Exception:
+                return False
+        get_config = getattr(driver, "get_driver_config", None)
+        if get_config is not None:
+            try:
+                cfg = await get_config(
+                    catalog_id, collection_id, db_resource=db_resource,
+                )
+                return bool(getattr(cfg, "simplify_geometry", False))
+            except Exception:
+                return False
+        return False
+
+    async def _enforce_es_geometry_size_limit(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        items_list: List[Any],
+        resolved_drivers: List[Any],
+        *,
+        db_resource: Optional[DbResource] = None,
+    ) -> None:
+        """Pre-write 10 MB geometry guard for ES-backed collections (#1248).
+
+        ES is an async secondary: the PG primary commits before the ES write
+        ever runs, so a true "don't keep the primary row" reject for an
+        oversized geometry MUST happen BEFORE any driver write. When the
+        resolved WRITE routing includes an ES items secondary whose
+        ``simplify_geometry`` is disabled, an item whose geometry serializes
+        above ``DEFAULT_MAX_BYTES`` (10 MB) rejects the whole ingest with a
+        422-shaped ``ValueError`` before anything is written to ANY driver
+        (primary included).
+
+        No reject when no ES items secondary is routed (e.g. a PG-only
+        catalog) — PG handles large geometries fine; the 10 MB ceiling is an
+        Elasticsearch per-document constraint. No reject when the routed ES
+        driver has simplification enabled, since it will shrink the geometry
+        to fit on its own.
+
+        The byte measurement uses the GeoJSON serialization of the geometry
+        alone (``geometry_geojson_size``): the ES per-document size is
+        dominated by the geometry payload and the threshold is an ES
+        constraint, so the geometry's own serialized size is the stable,
+        driver-shape-independent signal.
+        """
+        from dynastore.tools.geometry_simplify import (
+            DEFAULT_MAX_BYTES,
+            geometry_geojson_size,
+        )
+
+        # Find ES items secondaries that index exact geometry (simplify off).
+        guarded = False
+        for resolved in resolved_drivers:
+            driver = getattr(resolved, "driver", resolved)
+            if not self._resolved_driver_is_es_items(driver):
+                continue
+            if await self._es_items_driver_simplify_enabled(
+                driver, catalog_id, collection_id, db_resource=db_resource,
+            ):
+                continue
+            guarded = True
+            break
+
+        if not guarded:
+            return
+
+        for item in items_list:
+            if isinstance(item, dict):
+                geometry = item.get("geometry")
+                item_id = item.get("id")
+            else:
+                geometry = getattr(item, "geometry", None)
+                item_id = getattr(item, "id", None)
+            size = geometry_geojson_size(geometry)
+            if size > DEFAULT_MAX_BYTES:
+                raise ValueError(
+                    f"Item '{item_id}' geometry is {size} bytes, exceeding the "
+                    f"{DEFAULT_MAX_BYTES}-byte (10 MB) Elasticsearch "
+                    f"per-document limit. The collection routes an Elasticsearch "
+                    f"items index with geometry simplification disabled, so the "
+                    f"item is rejected before any write. Reduce the geometry "
+                    f"resolution, or enable 'simplify_geometry' on the "
+                    f"Elasticsearch items driver to index a simplified copy."
+                )
+
     async def upsert(
         self,
         catalog_id: str,
@@ -475,6 +594,17 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         from dynastore.modules.storage.router import get_write_drivers
         resolved_drivers = await get_write_drivers(catalog_id, collection_id)
         primary = resolved_drivers[0]
+
+        # Pre-write 10 MB geometry guard (#1248). Runs before BOTH the
+        # non-PG primary branch (A) and the PG-primary branch (B) so an
+        # oversized geometry destined for an exact-geometry ES secondary is
+        # rejected with HTTP 422 before any driver write — the PG primary row
+        # is never created (ES is an async secondary; rejecting post-commit
+        # would leave PG and ES inconsistent).
+        await self._enforce_es_geometry_size_limit(
+            catalog_id, collection_id, items_list, resolved_drivers,
+            db_resource=db_resource,
+        )
 
         from dynastore.models.protocols.storage_driver import Capability
         if primary is not None and Capability.QUERY_FALLBACK_SOURCE not in primary.driver.capabilities:

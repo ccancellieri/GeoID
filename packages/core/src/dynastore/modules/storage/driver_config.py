@@ -989,6 +989,22 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
             "index rebuild (ES does not allow tightening a live mapping)."
         ),
     )
+    # Issue #1248: exact geometry by default. When False (default) the
+    # driver indexes the geometry verbatim; an oversized geometry is
+    # rejected up-front by the ``item_service.upsert`` pre-write guard
+    # (HTTP 422) so the PG primary row is never created. Set True to
+    # restore the legacy behaviour of shrinking oversized geometries via
+    # ``simplify_to_fit`` to fit the ES 10 MB per-document limit.
+    simplify_geometry: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, oversized geometries are simplified to fit the "
+            "Elasticsearch 10 MB per-document limit before indexing "
+            "(lossy). When False (default), exact geometry is indexed and "
+            "items whose geometry exceeds 10 MB are rejected with HTTP 422 "
+            "before any write."
+        ),
+    )
 
 
 class ItemsElasticsearchPrivateDriverConfig(CollectionDriverConfig):
@@ -1020,6 +1036,19 @@ class ItemsElasticsearchPrivateDriverConfig(CollectionDriverConfig):
     model_config = ConfigDict(extra="allow")
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({DriverCapability.ASYNC})
+    # Issue #1248: exact geometry by default — see
+    # ``ItemsElasticsearchDriverConfig.simplify_geometry`` for the full
+    # rationale. The private driver shares the same opt-in semantics.
+    simplify_geometry: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, oversized geometries are simplified to fit the "
+            "Elasticsearch 10 MB per-document limit before indexing "
+            "(lossy). When False (default), exact geometry is indexed and "
+            "items whose geometry exceeds 10 MB are rejected with HTTP 422 "
+            "before any write."
+        ),
+    )
 
 
 class ItemsDuckdbDriverConfig(CollectionDriverConfig):

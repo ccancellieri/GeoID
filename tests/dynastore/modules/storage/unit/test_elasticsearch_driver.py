@@ -736,6 +736,103 @@ class TestWriteEntitiesTenantIndex:
         assert len(action_id) > len("EXT-1_")
 
 
+class TestWriteEntitiesGeometryPolicy:
+    """#1248 — ES indexes EXACT geometry by default; simplification opt-in."""
+
+    @staticmethod
+    def _big_polygon_feature(item_id="big1"):
+        """A feature whose geometry serializes well over the 10 MB limit
+        when indexed exactly."""
+        import math
+
+        from dynastore.models.ogc import Feature
+
+        # 300k vertices → GeoJSON serialization busts the 10 MB ES limit, so
+        # exact-by-default is observably different from the lossy shrink path.
+        n = 300_000
+        ring = [
+            [math.cos(2 * math.pi * i / n), math.sin(2 * math.pi * i / n)]
+            for i in range(n)
+        ] + [[1.0, 0.0]]
+        return Feature.model_validate({
+            "id": item_id,
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+            "properties": {},
+        })
+
+    async def _run_write(self, driver_config, feature):
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch.object(
+            ItemsElasticsearchDriver, "get_driver_config",
+            AsyncMock(return_value=driver_config),
+        ):
+            driver = ItemsElasticsearchDriver()
+            await driver.write_entities("cat1", "col1", [feature])
+        return es
+
+    @pytest.mark.asyncio
+    async def test_exact_geometry_round_trips_by_default(self):
+        """Default config (simplify_geometry=False): the indexed doc carries
+        the FULL geometry — never an empty ``{}`` — so the geometry round-trips
+        into the ES index payload (the #1248 symptom)."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsElasticsearchDriverConfig,
+        )
+
+        feature = self._big_polygon_feature()
+        es = await self._run_write(ItemsElasticsearchDriverConfig(), feature)
+
+        assert len(es.bulk_calls) == 1
+        body = es.bulk_calls[0]["body"]
+        doc = body[1]
+        geom = doc.get("geometry")
+        assert geom, "geometry must not be empty/{} on exact-by-default write"
+        assert geom["type"] == "Polygon"
+        # Full vertex count preserved — geometry indexed verbatim even though
+        # it busts the 10 MB ES limit (simplify_to_fit was NOT called).
+        assert len(geom["coordinates"][0]) == 300_001
+        # No simplification metadata stamped when simplify disabled.
+        assert "_simplification_mode" not in doc
+        assert "_simplification_factor" not in doc
+
+    @pytest.mark.asyncio
+    async def test_simplification_runs_only_when_flag_enabled(self):
+        """simplify_geometry=True restores the lossy shrink path."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsElasticsearchDriverConfig,
+        )
+
+        feature = self._big_polygon_feature()
+        es = await self._run_write(
+            ItemsElasticsearchDriverConfig(simplify_geometry=True), feature,
+        )
+
+        body = es.bulk_calls[0]["body"]
+        doc = body[1]
+        # Lossy path stamped the metadata and shrank the geometry.
+        assert doc.get("_simplification_mode") in ("tolerance", "bbox")
+        geom = doc.get("geometry")
+        assert geom
+        assert len(geom["coordinates"][0]) < 300_001
+
+
 class TestLocationReportsTenantIndex:
     @pytest.mark.asyncio
     async def test_includes_routing_in_canonical_uri(self):

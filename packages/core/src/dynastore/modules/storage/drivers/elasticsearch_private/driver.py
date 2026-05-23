@@ -166,6 +166,35 @@ class ItemsElasticsearchPrivateDriver(
             )
         return es
 
+    async def _resolve_simplify_geometry(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> bool:
+        """Resolve the ``simplify_geometry`` flag for the private driver (#1248).
+
+        Exact geometry is indexed by default; simplification is opt-in via
+        the per-driver ``ItemsElasticsearchPrivateDriverConfig`` config. The
+        inherited ``_ElasticsearchBase.get_driver_config`` resolves the
+        *public* config class, so the private driver reads its own.
+        """
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.models.driver_context import DriverContext
+        from dynastore.tools.discovery import get_protocol
+
+        configs = get_protocol(ConfigsProtocol)
+        if configs is None:
+            return False
+        config = await configs.get_config(
+            ItemsElasticsearchPrivateDriverConfig,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            ctx=DriverContext(db_resource=db_resource),
+        )
+        return bool(getattr(config, "simplify_geometry", False))
+
     @asynccontextmanager
     async def lifespan(self, app_state: object):
         """Restore DENY policies; item-tier propagation runs through the
@@ -200,11 +229,16 @@ class ItemsElasticsearchPrivateDriver(
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
         )
-        from dynastore.tools.geometry_simplify import simplify_to_fit
+        from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
         index_name = get_private_index_name(_get_index_prefix(), catalog_id)
         items = self._normalize_entities(entities)
         es = self._get_client()
+
+        # #1248: exact geometry by default — simplification is opt-in.
+        simplify_geometry = await self._resolve_simplify_geometry(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
 
         if not await es.indices.exists(index=index_name):
             try:
@@ -227,7 +261,9 @@ class ItemsElasticsearchPrivateDriver(
             doc = build_tenant_feature_doc(
                 item, catalog_id=catalog_id, collection_id=collection_id,
             )
-            doc, factor, mode = simplify_to_fit(doc)
+            doc, factor, mode = maybe_simplify_for_es(
+                doc, simplify=simplify_geometry,
+            )
             doc["simplification_factor"] = factor
             doc["simplification_mode"] = mode
             bulk_body.append({"index": {"_index": index_name, "_id": geoid}})
@@ -449,7 +485,7 @@ class ItemsElasticsearchPrivateDriver(
         from dynastore.modules.storage.drivers.elasticsearch_private.doc_builder import (
             build_tenant_feature_doc,
         )
-        from dynastore.tools.geometry_simplify import simplify_to_fit
+        from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
         if not await es.indices.exists(index=index_name):
             try:
@@ -469,7 +505,11 @@ class ItemsElasticsearchPrivateDriver(
         doc = build_tenant_feature_doc(
             src, catalog_id=ctx.catalog, collection_id=ctx.collection,
         )
-        doc, factor, mode = simplify_to_fit(doc)
+        # #1248: exact geometry by default — simplification is opt-in.
+        simplify_geometry = await self._resolve_simplify_geometry(
+            ctx.catalog, ctx.collection,
+        )
+        doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
         doc["simplification_factor"] = factor
         doc["simplification_mode"] = mode
         await es.index(index=index_name, id=op.entity_id, body=doc)
@@ -490,7 +530,7 @@ class ItemsElasticsearchPrivateDriver(
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
         )
-        from dynastore.tools.geometry_simplify import simplify_to_fit
+        from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
         if not ops:
             return BulkResult()
@@ -498,6 +538,11 @@ class ItemsElasticsearchPrivateDriver(
             raise ValueError(
                 "ItemsElasticsearchPrivateDriver.index_bulk: collection required for item ops",
             )
+
+        # #1248: exact geometry by default — simplification is opt-in.
+        simplify_geometry = await self._resolve_simplify_geometry(
+            ctx.catalog, ctx.collection,
+        )
 
         index_name = get_private_index_name(_get_index_prefix(), ctx.catalog)
         es = self._get_client()
@@ -527,7 +572,9 @@ class ItemsElasticsearchPrivateDriver(
             doc = build_tenant_feature_doc(
                 src, catalog_id=ctx.catalog, collection_id=ctx.collection,
             )
-            doc, factor, mode = simplify_to_fit(doc)
+            doc, factor, mode = maybe_simplify_for_es(
+                doc, simplify=simplify_geometry,
+            )
             doc["simplification_factor"] = factor
             doc["simplification_mode"] = mode
             body.append({"index": {"_index": index_name, "_id": op.entity_id}})
