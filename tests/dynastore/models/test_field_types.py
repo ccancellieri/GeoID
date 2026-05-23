@@ -12,6 +12,8 @@ import pytest
 from dynastore.models.field_types import (
     CANONICAL_DATA_TYPES,
     CANONICAL_SUBTYPES,
+    CANONICAL_TO_JSON_SCHEMA,
+    CANONICAL_TO_PG_DDL,
     DataSubtype,
     DataType,
     canonical_data_type,
@@ -108,3 +110,33 @@ def test_field_definition_validator_strict() -> None:
 def test_field_definition_geometry_param_preserved() -> None:
     fd = FieldDefinition(name="g", data_type="geometry(Point,4326)")
     assert fd.data_type == "geometry(point,4326)"
+
+
+def test_canonical_to_pg_ddl_representative_mappings() -> None:
+    # Pins the canonical -> PostgreSQL DDL table now co-located in the SSOT.
+    assert CANONICAL_TO_PG_DDL["string"] == "TEXT"
+    assert CANONICAL_TO_PG_DDL["integer"] == "INTEGER"
+    assert CANONICAL_TO_PG_DDL["timestamp"] == "TIMESTAMPTZ"
+    assert CANONICAL_TO_PG_DDL["double"] == "FLOAT"
+    # No "geometry" key — geometry columns are not materialized via this table.
+    assert "geometry" not in CANONICAL_TO_PG_DDL
+
+
+def test_canonical_to_json_schema_representative_mappings() -> None:
+    # Pins the canonical -> JSON-Schema fragment table now co-located in the SSOT.
+    assert CANONICAL_TO_JSON_SCHEMA["string"] == {"type": "string"}
+    assert CANONICAL_TO_JSON_SCHEMA["integer"] == {"type": "integer"}
+    assert CANONICAL_TO_JSON_SCHEMA["timestamp"] == {
+        "type": "string",
+        "format": "date-time",
+    }
+    assert CANONICAL_TO_JSON_SCHEMA["geometry"] == {"type": "object"}
+
+
+def test_co_located_tables_are_the_objects_the_use_sites_consume() -> None:
+    # The storage modules must alias the SSOT objects, not redefine them.
+    from dynastore.modules.storage.field_constraints import _DATA_TYPE_TO_PG_NAME
+    from dynastore.modules.storage.schema_derive import _TYPE_MAP
+
+    assert _DATA_TYPE_TO_PG_NAME is CANONICAL_TO_PG_DDL
+    assert _TYPE_MAP is CANONICAL_TO_JSON_SCHEMA

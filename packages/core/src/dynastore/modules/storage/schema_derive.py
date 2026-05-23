@@ -7,25 +7,14 @@ of truth for both write-validation and the produced feature shape.
 
 from typing import Dict, Literal, Optional
 
+from dynastore.models.field_types import CANONICAL_TO_JSON_SCHEMA
 from dynastore.models.protocols.field_definition import FieldDefinition
 
-# Canonical data_type (see ``dynastore.models.field_types``) -> JSON-Schema
-# property fragment. Keyed on canonical tokens; lookups normalize first.
-_TYPE_MAP: Dict[str, dict] = {
-    "string": {"type": "string"},
-    "uuid": {"type": "string", "format": "uuid"},
-    "integer": {"type": "integer"},
-    "bigint": {"type": "integer"},
-    "double": {"type": "number"},
-    "numeric": {"type": "number"},
-    "boolean": {"type": "boolean"},
-    "timestamp": {"type": "string", "format": "date-time"},
-    "date": {"type": "string", "format": "date"},
-    "time": {"type": "string", "format": "time"},
-    "binary": {"type": "string", "contentEncoding": "base64"},
-    "geometry": {"type": "object"},
-    "jsonb": {"type": "object"},
-}
+# Canonical data_type -> JSON-Schema property fragment. The table lives in the
+# canonical vocabulary SSOT (``dynastore.models.field_types``); aliased here for
+# the single use-site below, which normalizes and keeps its ``{"type": "string"}``
+# fallback.
+_TYPE_MAP = CANONICAL_TO_JSON_SCHEMA
 
 
 def derive_wire_schema(

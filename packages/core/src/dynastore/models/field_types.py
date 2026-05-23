@@ -167,3 +167,50 @@ def ogr_to_canonical(
     if sub in ("int16", "float32"):
         return (base, sub)
     return (base, None)
+
+
+# ---------------------------------------------------------------------------
+# Canonical -> persistence / wire translation tables
+# ---------------------------------------------------------------------------
+
+# Canonical ``data_type`` -> PostgreSQL type name, used to materialize sidecar
+# columns. Keyed on canonical tokens only; inputs are already canonical
+# (validated on FieldDefinition), so the single use-site defaults to TEXT for
+# any value that bypassed validation rather than raising mid-DDL. The
+# (type, subtype) refinement is intentionally not used yet — Boolean/JSON/UUID
+# subtypes already promote their base type to boolean/jsonb/uuid upstream, and
+# Int16/Float32 stay INTEGER/FLOAT (a safe widening) until subtype-aware
+# narrowing (SMALLINT/REAL) is wired.
+CANONICAL_TO_PG_DDL: dict[str, str] = {
+    "string": "TEXT",
+    "integer": "INTEGER",
+    "bigint": "BIGINT",
+    "double": "FLOAT",       # PG FLOAT == float8 == double precision
+    "numeric": "NUMERIC",
+    "boolean": "BOOLEAN",
+    "date": "DATE",
+    "time": "TIME",
+    "timestamp": "TIMESTAMPTZ",
+    "binary": "BYTEA",
+    "jsonb": "JSONB",
+    "uuid": "UUID",
+}
+
+# Canonical ``data_type`` -> Draft-2020-12 JSON-Schema property fragment, used
+# to derive the wire schema for a feature's ``properties``. Keyed on canonical
+# tokens; the single use-site normalizes and defaults to ``{"type": "string"}``.
+CANONICAL_TO_JSON_SCHEMA: dict[str, dict] = {
+    "string": {"type": "string"},
+    "uuid": {"type": "string", "format": "uuid"},
+    "integer": {"type": "integer"},
+    "bigint": {"type": "integer"},
+    "double": {"type": "number"},
+    "numeric": {"type": "number"},
+    "boolean": {"type": "boolean"},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "date": {"type": "string", "format": "date"},
+    "time": {"type": "string", "format": "time"},
+    "binary": {"type": "string", "contentEncoding": "base64"},
+    "geometry": {"type": "object"},
+    "jsonb": {"type": "object"},
+}

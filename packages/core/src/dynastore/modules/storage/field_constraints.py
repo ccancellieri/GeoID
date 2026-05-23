@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, Mapping, Optional
 
+from dynastore.models.field_types import CANONICAL_TO_PG_DDL
 from dynastore.models.protocols.field_definition import FieldCapability, FieldDefinition
 from dynastore.modules.storage.errors import (
     RequiredFieldMissingError,
@@ -43,27 +44,10 @@ if TYPE_CHECKING:
     from dynastore.modules.storage.driver_config import ItemsSchema
 
 
-# Canonical ``data_type`` (see ``dynastore.models.field_types``) -> PG type name.
-# Keyed on canonical tokens only; inputs are already canonical (validated on
-# FieldDefinition), and the lookup defaults to TEXT for any value that bypassed
-# validation rather than raising mid-DDL. The (type, subtype) refinement is
-# intentionally not used yet — Boolean/JSON/UUID subtypes already promote their
-# base type to boolean/jsonb/uuid upstream, and Int16/Float32 stay INTEGER/FLOAT
-# (a safe widening) until subtype-aware narrowing (SMALLINT/REAL) is wired.
-_DATA_TYPE_TO_PG_NAME: Dict[str, str] = {
-    "string": "TEXT",
-    "integer": "INTEGER",
-    "bigint": "BIGINT",
-    "double": "FLOAT",       # PG FLOAT == float8 == double precision
-    "numeric": "NUMERIC",
-    "boolean": "BOOLEAN",
-    "date": "DATE",
-    "time": "TIME",
-    "timestamp": "TIMESTAMPTZ",
-    "binary": "BYTEA",
-    "jsonb": "JSONB",
-    "uuid": "UUID",
-}
+# Canonical ``data_type`` -> PG type name. The table lives in the canonical
+# vocabulary SSOT (``dynastore.models.field_types``); aliased here for the
+# single use-site below, which keeps its tolerant TEXT fallback.
+_DATA_TYPE_TO_PG_NAME = CANONICAL_TO_PG_DDL
 
 
 def pg_native_to_canonical(pg_type: str) -> str:
