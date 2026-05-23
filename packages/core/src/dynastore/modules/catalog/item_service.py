@@ -1512,6 +1512,21 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         # Position 0 is the primary driver — already written by the caller.
         secondaries = resolved[1:] if _primary_already_written else resolved
+        # Item-indexer drivers (the ES public/private drivers —
+        # ``is_item_indexer=True``, pinned as ``secondary_index=True`` WRITE
+        # entries) are owned by the index dispatcher
+        # (``_dispatch_index_upsert`` → ``index_bulk``), which stamps the
+        # canonical identity (``_external_id`` / ``_asset_id``) onto the index
+        # payload. Fanning them out here as storage drivers too would
+        # double-write the same index via ``write_entities`` — which rebuilds
+        # the tenant doc from the read-back Feature (no identity, no context)
+        # and races the dispatcher's stamped write (last-writer-wins drops the
+        # identity fields, #1289). The dispatcher is their single write path
+        # (role separation, #990); skip them here.
+        secondaries = [
+            r for r in secondaries
+            if not getattr(type(r.driver), "is_item_indexer", False)
+        ]
         if not secondaries:
             return
 
