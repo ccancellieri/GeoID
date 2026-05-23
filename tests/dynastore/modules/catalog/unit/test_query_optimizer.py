@@ -405,6 +405,124 @@ def test_validate_query_whitelists_geoid_select_when_columnar(mock_col_config, m
     assert "Unknown field: geoid" not in errors
 
 
+def test_raw_where_resolved_columnar_expr_not_double_qualified(mock_col_config, mock_registry):
+    """Regression for #1255: a CQL filter on a COLUMNAR column compiles
+    straight to its resolved ``sql_expression`` (the quoted form
+    ``sc_attributes."adm2_pcode"``) before reaching ``build_optimized_query``.
+
+    The ``raw_where`` field-mapping loop must NOT re-substitute the bare field
+    name *inside* that already-resolved quoted identifier. The leading ``"``
+    is neither ``.`` nor a word char, so the ``(?<![.\\w])`` lookbehind failed
+    to skip it and the name matched again, producing the invalid
+    ``sc_attributes."sc_attributes."adm2_pcode""`` and a Postgres syntax error.
+    """
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom", sql_expression="sc_geom.geom",
+            capabilities=[FieldCapability.SPATIAL], data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = "LEFT JOIN geom_table sc_geom ON h.geoid = sc_geom.geoid"
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+
+    mock_attr = MagicMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    # COLUMNAR columns resolve to the quoted form ``sc_attributes."<name>"``.
+    mock_attr.get_queryable_fields.return_value = {
+        "adm2_pcode": FieldDefinition(
+            name="adm2_pcode",
+            sql_expression='sc_attributes."adm2_pcode"',
+            capabilities=[FieldCapability.FILTERABLE],
+            data_type="string",
+        )
+    }
+    mock_attr.get_join_clause.return_value = (
+        "LEFT JOIN attr_table sc_attributes ON h.geoid = sc_attributes.geoid"
+    )
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom if getattr(sc, "sidecar_type", "") == "geometries" else mock_attr
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    # The CQL filter has ALREADY compiled to the resolved expression.
+    req = QueryRequest(
+        select=[FieldSelection(field="geom", alias="geometry")],
+        raw_where='sc_attributes."adm2_pcode" = :cqlp_0',
+        raw_params={"cqlp_0": "PK001"},
+        include_total_count=False,
+    )
+    sql, params = optimizer.build_optimized_query(req, "schema", "table")
+
+    assert 'sc_attributes."sc_attributes."adm2_pcode""' not in sql
+    assert 'sc_attributes."adm2_pcode" = :cqlp_0' in sql
+    assert params["cqlp_0"] == "PK001"
+
+
+def test_raw_where_bare_columnar_token_still_substituted(mock_col_config, mock_registry):
+    """The idempotency guard must not regress the legitimate case: a *bare*
+    field token in ``raw_where`` (resolved expression not yet present) must
+    still be mapped to its quoted COLUMNAR ``sql_expression``."""
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom", sql_expression="sc_geom.geom",
+            capabilities=[FieldCapability.SPATIAL], data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = "LEFT JOIN geom_table sc_geom ON h.geoid = sc_geom.geoid"
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+
+    mock_attr = MagicMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {
+        "adm2_pcode": FieldDefinition(
+            name="adm2_pcode",
+            sql_expression='sc_attributes."adm2_pcode"',
+            capabilities=[FieldCapability.FILTERABLE],
+            data_type="string",
+        )
+    }
+    mock_attr.get_join_clause.return_value = (
+        "LEFT JOIN attr_table sc_attributes ON h.geoid = sc_attributes.geoid"
+    )
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom if getattr(sc, "sidecar_type", "") == "geometries" else mock_attr
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    req = QueryRequest(
+        select=[FieldSelection(field="geom", alias="geometry")],
+        raw_where="adm2_pcode = :cqlp_0",
+        raw_params={"cqlp_0": "PK001"},
+        include_total_count=False,
+    )
+    sql, _ = optimizer.build_optimized_query(req, "schema", "table")
+
+    assert 'sc_attributes."adm2_pcode" = :cqlp_0' in sql
+    assert 'sc_attributes."sc_attributes."adm2_pcode""' not in sql
+
+
 def test_attributes_sidecar_config_drops_external_id_as_feature_id() -> None:
     """Sidecar config must no longer accept ``external_id_as_feature_id`` —
     that knob moved to ItemsReadPolicy.feature_type."""

@@ -648,6 +648,18 @@ class QueryOptimizer:
                 if field_name == "geoid":
                     continue
 
+                # Idempotency guard (#1255): a CQL filter compiles straight to
+                # the resolved ``sql_expression`` before reaching here. If that
+                # expression is already present, re-running the substitution
+                # would match the bare ``field_name`` *inside* it — the leading
+                # ``"`` of a quoted COLUMNAR identifier
+                # (``sc_attributes."adm2_pcode"``) is neither ``.`` nor a word
+                # char, so the lookbehind below does not skip it — producing the
+                # invalid ``sc_attributes."sc_attributes."adm2_pcode""``. Skip
+                # fields whose resolved expression is already in place.
+                if field_def.sql_expression in processed_where:
+                    continue
+
                 pattern = rf"(?<![.\w])\b{re.escape(field_name)}\b"
                 processed_where = re.sub(
                     pattern, field_def.sql_expression, processed_where
