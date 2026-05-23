@@ -67,9 +67,15 @@ class TestAssetsWritePolicyDefaults:
         cfg = AssetsWritePolicy()
         assert cfg.require_filename is True
 
-    def test_default_skip_if_unchanged_content_hash_is_false(self) -> None:
-        cfg = AssetsWritePolicy()
-        assert cfg.skip_if_unchanged_content_hash is False
+    def test_skip_if_unchanged_content_hash_field_is_gone(self) -> None:
+        # The special-case boolean was collapsed into the unified identity
+        # model — an ``AssetIdentityRule(match_on=["content_hash"],
+        # on_match=REFUSE_RETURN)`` now expresses the same behaviour. The
+        # field must no longer exist (``extra="forbid"`` rejects old configs).
+        fields = set(AssetsWritePolicy.model_fields.keys())
+        assert "skip_if_unchanged_content_hash" not in fields
+        with pytest.raises(ValidationError):
+            AssetsWritePolicy(skip_if_unchanged_content_hash=True)  # type: ignore[call-arg]
 
     def test_default_round_trip_preserves_chain(self) -> None:
         """dump → re-validate yields a policy whose chain is byte-identical."""
@@ -202,6 +208,41 @@ class TestAssetsWritePolicyIdentityValidator:
             identity=[AssetIdentityRule(match_on=["content_hash"])],
         )
         assert cfg.identity[0].match_on == ["content_hash"]
+
+    def test_content_hash_refuse_return_rule_validates_only_with_derive_optin(
+        self,
+    ) -> None:
+        """The unified replacement for ``skip_if_unchanged_content_hash``:
+        a content_hash rule pinned to REFUSE_RETURN validates iff
+        ``derive.content_hash`` is on, and resolves to the CONTENT_HASH
+        engine field carrying the override action."""
+        # Without the derive opt-in the reference is unknown → rejected.
+        with pytest.raises(ValidationError):
+            AssetsWritePolicy(
+                identity=[
+                    AssetIdentityRule(
+                        match_on=["content_hash"],
+                        on_match=AssetWriteConflictPolicy.REFUSE_RETURN,
+                    ),
+                ],
+            )
+        # With derive.content_hash=True it validates and resolves.
+        cfg = AssetsWritePolicy(
+            on_conflict=AssetWriteConflictPolicy.UPDATE,
+            derive=AssetDeriveSpec(
+                asset_id=True, filename=True, content_hash=True
+            ),
+            identity=[
+                AssetIdentityRule(
+                    match_on=["content_hash"],
+                    on_match=AssetWriteConflictPolicy.REFUSE_RETURN,
+                ),
+                AssetIdentityRule(match_on=["asset_id"]),
+            ],
+        )
+        resolved = cfg.resolved_identity()
+        assert resolved[0].match_on[0].kind == AssetIdentityKind.CONTENT_HASH
+        assert resolved[0].on_match == AssetWriteConflictPolicy.REFUSE_RETURN
 
     def test_metadata_name_resolves(self) -> None:
         cfg = AssetsWritePolicy(

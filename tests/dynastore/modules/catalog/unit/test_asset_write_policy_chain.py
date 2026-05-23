@@ -488,32 +488,85 @@ async def test_refuse_return_echoes_existing(fake_dql: _Recorder) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hash gating — UPDATE collapses to REFUSE_RETURN when content_hash unchanged
+# content_hash identity rule — the unified replacement for the removed
+# ``skip_if_unchanged_content_hash`` boolean. A rule matching on content_hash
+# with on_match=REFUSE_RETURN turns an unchanged re-upload into a no-op
+# return-existing; a differing hash misses and the chain proceeds normally.
 # ---------------------------------------------------------------------------
 
 
+def _content_hash_idempotent_policy() -> AssetsWritePolicy:
+    """Policy whose first rule short-circuits an unchanged-content re-upload to
+    REFUSE_RETURN, falling back to UPDATE on an asset_id match otherwise."""
+    return AssetsWritePolicy(
+        on_conflict=AssetWriteConflictPolicy.UPDATE,
+        derive=AssetDeriveSpec(asset_id=True, filename=True, content_hash=True),
+        identity=[
+            AssetIdentityRule(
+                match_on=["content_hash"],
+                on_match=AssetWriteConflictPolicy.REFUSE_RETURN,
+            ),
+            AssetIdentityRule(match_on=["asset_id"]),
+        ],
+    )
+
+
+# Probe-specific predicates keyed on each probe's WHERE-clause term (the
+# SELECT column list contains every column name, so match on the WHERE term
+# instead to disambiguate the content_hash probe from the asset_id probe).
+def is_content_hash_probe(sql: str) -> bool:
+    return is_select(sql) and "AND content_hash = :tagged" in sql
+
+
+def is_asset_id_probe(sql: str) -> bool:
+    return is_select(sql) and "AND asset_id = :asset_id" in sql
+
+
 @pytest.mark.asyncio
-async def test_hash_gating_collapses_update_to_refuse_return(
+async def test_content_hash_rule_returns_existing_when_hash_matches(
     fake_dql: _Recorder,
 ) -> None:
-    fake_dql.when(is_select_by("asset_id"), EXISTING_ROW)
+    """Incoming content_hash matches an existing row → the content_hash probe
+    hits, on_match=REFUSE_RETURN echoes the existing row, no UPDATE issued."""
+    # The content_hash probe is the one that hits (matching on content_hash
+    # inherently means the incoming hash equals an existing row's hash).
+    fake_dql.when(is_content_hash_probe, EXISTING_ROW)
 
-    policy = AssetsWritePolicy(
-        on_conflict=AssetWriteConflictPolicy.UPDATE,
-        skip_if_unchanged_content_hash=True,
-    )
-    # Payload carries no content_hash field on AssetCreate today, but the
-    # runner reads via getattr — exercise via a custom attribute set on the
-    # payload object so the gating branch is reachable in unit-test land.
     payload = physical()
     object.__setattr__(payload, "content_hash", "deadbeef")  # same as EXISTING_ROW
 
     result = await upsert_asset(
-        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=_content_hash_idempotent_policy()
     )
 
     assert result.action == "returned_existing"
+    assert result.matcher_hit == AssetIdentityKind.CONTENT_HASH
     assert not any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
+    assert not any(is_insert(c["sql"]) for c in fake_dql.calls)
+
+
+@pytest.mark.asyncio
+async def test_content_hash_rule_falls_through_to_update_when_hash_differs(
+    fake_dql: _Recorder,
+) -> None:
+    """Incoming content_hash differs from every existing row → the content_hash
+    probe misses, the chain falls through to the asset_id rule which UPDATEs."""
+    updated_row = dict(EXISTING_ROW, metadata={"version": 99})
+    # content_hash probe misses (no row with the incoming hash); asset_id hits.
+    fake_dql.when(is_content_hash_probe, None)
+    fake_dql.when(is_asset_id_probe, EXISTING_ROW)
+    fake_dql.when(is_update_metadata, updated_row)
+
+    payload = physical(metadata={"version": 99})
+    object.__setattr__(payload, "content_hash", "newhash")  # differs
+
+    result = await upsert_asset(
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=_content_hash_idempotent_policy()
+    )
+
+    assert result.action == "updated"
+    assert result.matcher_hit == AssetIdentityKind.ASSET_ID
+    assert any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -700,50 +753,52 @@ async def test_content_hash_probe_sends_tagged_bind_only(
 
 
 @pytest.mark.asyncio
-async def test_hash_gating_requires_byte_for_byte_match(
+async def test_content_hash_rule_byte_for_byte_match_submits_tagged_form(
     fake_dql: _Recorder,
 ) -> None:
-    """``skip_if_unchanged_content_hash`` compares stored and incoming
-    values as-is. Tagged-vs-untagged are NOT considered equal — both
-    sides MUST submit the tagged form."""
-    tagged_existing = dict(EXISTING_ROW, content_hash="md5:abc==")
-    fake_dql.when(is_select_by("asset_id"), tagged_existing)
+    """The content_hash equality is enforced by the SQL probe's ``:tagged``
+    bind (``content_hash = :tagged``), so byte-for-byte matching is the DB's
+    job. A tagged payload submits the tagged form; when the DB returns the
+    row the REFUSE_RETURN rule echoes it with no UPDATE."""
+    fake_dql.when(is_content_hash_probe, dict(EXISTING_ROW, content_hash="md5:abc=="))
 
-    policy = AssetsWritePolicy(
-        on_conflict=AssetWriteConflictPolicy.UPDATE,
-        skip_if_unchanged_content_hash=True,
-    )
     payload = physical()
     object.__setattr__(payload, "content_hash", "md5:abc==")
 
     result = await upsert_asset(
-        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=_content_hash_idempotent_policy()
     )
     assert result.action == "returned_existing"
     assert not any(is_update_metadata(c["sql"]) for c in fake_dql.calls)
+    # The bind submitted to the probe is the verbatim tagged form.
+    probe_call = next(c for c in fake_dql.calls if is_content_hash_probe(c["sql"]))
+    assert probe_call["params"]["tagged"] == "md5:abc=="
 
 
 @pytest.mark.asyncio
-async def test_hash_gating_rejects_untagged_payload(
+async def test_content_hash_rule_untagged_payload_does_not_short_circuit(
     fake_dql: _Recorder,
 ) -> None:
-    """Untagged ``abc==`` payload does NOT short-circuit against a tagged
-    ``md5:abc==`` row — the gating compare is byte-for-byte. The conflict
-    flow then falls through to the UPDATE branch."""
-    tagged_existing = dict(EXISTING_ROW, content_hash="md5:abc==")
-    fake_dql.when(is_select_by("asset_id"), tagged_existing)
+    """An untagged ``abc==`` payload submits ``abc==`` to the probe; it does
+    NOT equal a tagged ``md5:abc==`` row, so the DB returns no match (probe
+    miss) and the chain falls through to the asset_id UPDATE rule — no
+    return-existing short-circuit."""
+    # content_hash probe misses (untagged != tagged at the DB); asset_id hits.
+    fake_dql.when(is_content_hash_probe, None)
+    fake_dql.when(is_asset_id_probe, dict(EXISTING_ROW, content_hash="md5:abc=="))
+    fake_dql.when(is_update_metadata, dict(EXISTING_ROW, metadata={"version": 99}))
 
-    policy = AssetsWritePolicy(
-        on_conflict=AssetWriteConflictPolicy.UPDATE,
-        skip_if_unchanged_content_hash=True,
-    )
-    payload = physical()
-    object.__setattr__(payload, "content_hash", "abc==")  # untagged — no match
+    payload = physical(metadata={"version": 99})
+    object.__setattr__(payload, "content_hash", "abc==")  # untagged
 
     result = await upsert_asset(
-        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=policy
+        conn=_spec_conn(), scope=SCOPE, payload=payload, policy=_content_hash_idempotent_policy()
     )
     assert result.action != "returned_existing"
+    assert result.action == "updated"
+    # The untagged bind was sent verbatim — equality is the DB's call.
+    probe_call = next(c for c in fake_dql.calls if is_content_hash_probe(c["sql"]))
+    assert probe_call["params"]["tagged"] == "abc=="
 
 
 @pytest.mark.asyncio

@@ -444,16 +444,31 @@ class AssetsWritePolicy(PluginConfig):
        (or 207 ``IngestionReport`` entry) instead of silently mutating the
        existing row.
 
-    2. **Idempotent re-upload** (same content, same key, no error)::
+    2. **Idempotent re-upload** (unchanged content → no-op return-existing)::
 
            AssetsWritePolicy(
-               on_conflict=AssetWriteConflictPolicy.REFUSE_RETURN,
-               derive=AssetDeriveSpec(asset_id=True, content_hash=True),
+               on_conflict=AssetWriteConflictPolicy.UPDATE,
+               derive=AssetDeriveSpec(
+                   asset_id=True, filename=True, content_hash=True
+               ),
                identity=[
+                   AssetIdentityRule(
+                       match_on=["content_hash"],
+                       on_match=AssetWriteConflictPolicy.REFUSE_RETURN,
+                   ),
                    AssetIdentityRule(match_on=["asset_id"]),
-                   AssetIdentityRule(match_on=["content_hash"]),
                ],
            )
+
+       The ``content_hash`` rule is the unified replacement for the old
+       ``skip_if_unchanged_content_hash`` boolean: matching on
+       ``content_hash`` *is* the "incoming hash equals an existing row's
+       hash" condition, and ``on_match=REFUSE_RETURN`` makes that an
+       idempotent no-op that echoes the existing row. Put the rule ahead of
+       the mutating rules so an unchanged re-upload short-circuits before
+       ``UPDATE`` / ``NEW_VERSION`` fire. ``content_hash`` only matches
+       post-finalize (PENDING upload-create rows have no hash yet), so the
+       upload-create path falls through to the cheaper rules unchanged.
 
     3. **External-id dedup via metadata** (e.g. ISO19115 fileIdentifier)::
 
@@ -547,18 +562,6 @@ class AssetsWritePolicy(PluginConfig):
             "incoming payload has no filename."
         ),
     )
-    skip_if_unchanged_content_hash: Mutable[bool] = Field(
-        default=False,
-        examples=[False, True],
-        description=(
-            "Post-finalize idempotence shortcut. When True, a matched row "
-            "whose ``content_hash`` equals the incoming hash short-circuits "
-            "the conflict action: ``NEW_VERSION`` becomes a no-op, "
-            "``UPDATE`` collapses to ``REFUSE_RETURN``. Has no effect during "
-            "upload-create (where the row is PENDING and has no hash yet)."
-        ),
-    )
-
     def requires_driver_versioning(self) -> bool:
         """True iff the policy needs an asset driver that supports versioning."""
         return self.on_conflict == AssetWriteConflictPolicy.NEW_VERSION
@@ -616,7 +619,8 @@ class AssetWritePolicyDefaults(PluginConfig):
       - At platform / catalog tiers: prefer ``AssetWritePolicyDefaults`` for
         posture.
       - At collection tier: use ``AssetsWritePolicy`` for the full surface
-        (derive buckets, identity rules, content-hash gating).
+        (derive buckets, identity rules — including a ``content_hash`` rule
+        for idempotent re-upload).
       - When both are present, ``AssetsWritePolicy`` at the closer tier wins
         for the fields it owns; ``AssetWritePolicyDefaults`` at upstream
         tiers fills the gap via the standard waterfall.

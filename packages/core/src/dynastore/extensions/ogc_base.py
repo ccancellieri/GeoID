@@ -396,7 +396,7 @@ class OGCTransactionMixin:
             )
             created = []
         except ConflictError as exc:
-            # on_asset_conflict=refuse_asset: duplicate detected → abort batch → 409.
+            # on_batch_conflict=refuse_batch: duplicate detected → abort batch → 409.
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(exc)
             )

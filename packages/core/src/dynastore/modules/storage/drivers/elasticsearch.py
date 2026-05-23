@@ -713,8 +713,8 @@ class ItemsElasticsearchDriver(
         - REFUSE: skip if a doc with the same external_id already exists.
         - NEW_VERSION: index with a timestamped doc_id suffix; stores ``valid_from``/``valid_to``.
 
-        Batch-level via ``on_asset_conflict``:
-        - REFUSE (``refuse_asset``): raise ``ConflictError`` if any external_id already exists.
+        Batch-level via ``on_batch_conflict``:
+        - REFUSE (``refuse_batch``): raise ``ConflictError`` if any external_id already exists.
         """
         from datetime import datetime, timezone
         from dynastore.modules.elasticsearch.items_projection import (
@@ -779,11 +779,11 @@ class ItemsElasticsearchDriver(
 
             base_id = external_id or stac_doc.get("id")
 
-            # Asset-level (batch-level) check — runs before item-level; raises on first match.
-            if policy.on_asset_conflict is not None and external_id:
-                from dynastore.modules.storage.driver_config import AssetConflictPolicy
+            # Batch-level check — runs before item-level; raises on first match.
+            if policy.on_batch_conflict is not None and external_id:
+                from dynastore.modules.storage.driver_config import BatchConflictPolicy
                 if (
-                    policy.on_asset_conflict == AssetConflictPolicy.REFUSE
+                    policy.on_batch_conflict == BatchConflictPolicy.REFUSE
                     and await self._es_doc_exists_by_external_id(
                         es, index_name, collection_id, external_id,
                     )
@@ -791,7 +791,7 @@ class ItemsElasticsearchDriver(
                     from dynastore.modules.storage.errors import ConflictError
                     raise ConflictError(
                         f"ES driver: external_id '{external_id}' already exists "
-                        f"in {catalog_id}/{collection_id} (policy=refuse_asset)"
+                        f"in {catalog_id}/{collection_id} (policy=refuse_batch)"
                     )
 
             # Item-level check — skip this entity, continue batch.

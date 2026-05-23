@@ -181,20 +181,29 @@ class WriteConflictPolicy(StrEnum):
     REFUSE_FAIL = "refuse_fail"
 
 
-class AssetConflictPolicy(StrEnum):
-    """Asset-level (batch-level) conflict policy — checked before item processing.
+class BatchConflictPolicy(StrEnum):
+    """Batch-level conflict policy — an all-or-nothing pre-flight guard.
 
-    When set, the driver checks whether any entity in the incoming asset batch
-    has a duplicate identity before processing items.  A positive match triggers
-    the configured response for the entire batch.
+    When set, before processing any items the driver scans the incoming ingest
+    batch and checks whether any feature collides with an existing feature's
+    identity. A single positive match aborts the ENTIRE batch — nothing is
+    written. This is a coarse, batch-wide gate, not a per-item action.
 
-    This operates at a different level than ``WriteConflictPolicy`` (per-item).
-    Both can be combined: e.g. ``on_conflict=REFUSE`` (skip individual item
-    duplicates) and ``on_asset_conflict=REFUSE`` (reject entire batch if any
-    duplicate is found).
+    This is distinct from, and orthogonal to, two other "conflict" knobs:
+
+    - ``WriteConflictPolicy`` (``ItemsWritePolicy.on_conflict``) — per-item
+      identity collision handling (update / new_version / refuse / …). It acts
+      row-by-row as items are processed.
+    - ``AssetsWritePolicy.on_conflict`` — re-registration of the same physical
+      asset/file. It governs whether an already-known asset may be re-ingested,
+      and has nothing to do with feature identity.
+
+    Batch-level and per-item policies compose: e.g. ``on_conflict=REFUSE``
+    (skip individual duplicate rows) plus ``on_batch_conflict=REFUSE`` (reject
+    the whole batch up front if any feature collides).
     """
 
-    REFUSE = "refuse_asset"     # hard stop — reject the entire asset batch
+    REFUSE = "refuse_batch"     # hard stop — reject the entire ingest batch
 
 
 class GeometriesWriteBehavior(BaseModel):
@@ -346,7 +355,7 @@ class ItemsWritePolicy(PluginConfig):
     types/constraints, and required-ness is enforced on the write path by the
     normal required-field check plus NOT NULL columns.
 
-    Posture flags: :attr:`on_conflict`, :attr:`on_asset_conflict`,
+    Posture flags: :attr:`on_conflict`, :attr:`on_batch_conflict`,
     :attr:`validity` (null-object :class:`ValiditySpec`; :attr:`enable_validity`
     is a derived read-only property), :attr:`track_asset_id`. Validity is a
     driver-abstracted concept — the policy carries where the validity start/end
@@ -359,7 +368,7 @@ class ItemsWritePolicy(PluginConfig):
     materialization-gated enforcer leaves them freely editable until the first
     collection lands, then freezes them so a catalog-tier default change cannot
     silently re-resolve into (and diverge) already-materialised collections.
-    The behaviour knobs (:attr:`on_conflict`, :attr:`on_asset_conflict`,
+    The behaviour knobs (:attr:`on_conflict`, :attr:`on_batch_conflict`,
     :attr:`track_asset_id`) stay ``Mutable`` — they alter future write
     behaviour without rewriting existing rows.
 
@@ -429,15 +438,19 @@ class ItemsWritePolicy(PluginConfig):
             "strict-mode pipelines)."
         ),
     )
-    on_asset_conflict: Mutable[Optional[AssetConflictPolicy]] = Field(
+    on_batch_conflict: Mutable[Optional[BatchConflictPolicy]] = Field(
         default=None,
-        examples=[None, "refuse_asset"],
+        examples=[None, "refuse_batch"],
         description=(
-            "Asset-level (batch-level) conflict policy, checked BEFORE item "
-            "processing begins. ``None`` (default) skips batch-level checks. "
-            "``refuse_asset`` rejects the entire asset batch if any single "
-            "entity conflicts — useful for re-upload idempotency where partial "
-            "overlap should fail the whole asset."
+            "Batch-level conflict guard, evaluated BEFORE any item is processed. "
+            "``None`` (default) skips the batch-wide pre-flight check. "
+            "``refuse_batch`` scans the incoming ingest batch and rejects it in "
+            "full if ANY feature collides with an existing feature's identity — "
+            "an all-or-nothing gate for high-integrity pipelines where partial "
+            "overlap must fail the whole batch. This is unrelated to "
+            "``AssetsWritePolicy.on_conflict`` (which governs re-registration of "
+            "the same physical asset/file), and orthogonal to ``on_conflict`` "
+            "(the per-item identity action applied row-by-row)."
         ),
     )
     derive: Immutable[DeriveSpec] = Field(

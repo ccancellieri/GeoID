@@ -538,28 +538,19 @@ async def upsert_asset(
             conn, scope, payload, policy
         )
 
-    # 2. Hash gating — when enabled and the existing row's content_hash
-    #    matches the incoming one, short-circuit the conflict action so
-    #    re-finalising the same blob is a no-op. The starting action is
-    #    the rule-level override when the rule provided one, otherwise the
-    #    policy default — so a rule that pins ``on_match=REFUSE_RETURN``
-    #    is honoured at this stage.
+    # 2. Resolve the effective action for a matched row: the rule-level
+    #    override when the winning rule provided one, otherwise the policy
+    #    default. Idempotent "unchanged content" handling is no longer a
+    #    special boolean — it is expressed declaratively as an identity rule
+    #    matching on ``content_hash`` (matching on content_hash *is* the
+    #    "incoming hash equals an existing row's hash" condition) with
+    #    ``on_match=REFUSE_RETURN``, which lands in this same resolution and
+    #    dispatches to the return-existing branch below.
     on_conflict = (
         winning_rule.on_match
         if (winning_rule is not None and winning_rule.on_match is not None)
         else policy.on_conflict
     )
-    incoming_hash = getattr(payload, "content_hash", None)
-    if (
-        existing
-        and policy.skip_if_unchanged_content_hash
-        and incoming_hash
-        and existing.get("content_hash") == incoming_hash
-    ):
-        if on_conflict == AssetWriteConflictPolicy.NEW_VERSION:
-            on_conflict = AssetWriteConflictPolicy.REFUSE_RETURN
-        elif on_conflict == AssetWriteConflictPolicy.UPDATE:
-            on_conflict = AssetWriteConflictPolicy.REFUSE_RETURN
 
     # 3. NEW_VERSION special case: no matcher_hit yet (we skipped the chain
     #    for NEW_VERSION). Probe by asset_id specifically — versioning is

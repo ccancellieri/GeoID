@@ -515,27 +515,27 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
 
         on_conflict = policy.on_conflict
 
-        if on_conflict == WriteConflictPolicy.REFUSE or policy.on_asset_conflict is not None:
+        if on_conflict == WriteConflictPolicy.REFUSE or policy.on_batch_conflict is not None:
             # Collect external_ids that already exist in the table.
             ext_ids = [
                 row["_external_id"] for row in rows if "_external_id" in row
             ]
             if ext_ids:
                 from pyiceberg.expressions import In
-                from dynastore.modules.storage.driver_config import AssetConflictPolicy
+                from dynastore.modules.storage.driver_config import BatchConflictPolicy
                 existing = await run_in_thread(
                     lambda: table.scan().filter(In("_external_id", ext_ids)).to_arrow()  # type: ignore[call-arg]
                 )
                 existing_ids = set(existing.column("_external_id").to_pylist()) if existing.num_rows > 0 else set()
 
                 if (
-                    policy.on_asset_conflict == AssetConflictPolicy.REFUSE
+                    policy.on_batch_conflict == BatchConflictPolicy.REFUSE
                     and existing_ids
                 ):
                     from dynastore.modules.storage.errors import ConflictError
                     raise ConflictError(
                         f"Iceberg: external_id(s) {sorted(existing_ids)} already exist "
-                        f"in {catalog_id}/{collection_id} (policy=refuse_asset)"
+                        f"in {catalog_id}/{collection_id} (policy=refuse_batch)"
                     )
 
                 if on_conflict == WriteConflictPolicy.REFUSE:

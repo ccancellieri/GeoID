@@ -42,7 +42,7 @@ from dynastore.models.protocols.storage_driver import (
 )
 from dynastore.modules.storage.storage_location import StorageLocation
 from dynastore.modules.storage.driver_config import (
-    AssetConflictPolicy,
+    BatchConflictPolicy,
     AssetDriverConfig,
     CollectionDriverConfig,
     ItemsWritePolicy,
@@ -128,6 +128,7 @@ __all__ = [
     # Write policy
     "ItemsWritePolicy",
     "WriteConflictPolicy",
+    "BatchConflictPolicy",
     # Temporal validity spec
     "ValiditySpec",
     # Read policy (#950 phase 3 — registered, not yet consumed by drivers)

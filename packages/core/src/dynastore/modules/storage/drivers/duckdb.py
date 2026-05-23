@@ -431,7 +431,7 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
         from dynastore.modules.storage.drivers._duckdb_helpers import dicts_to_features
         from dynastore.modules.storage.driver_config import (
             ItemsWritePolicy, WriteConflictPolicy,
-            AssetConflictPolicy,
+            BatchConflictPolicy,
         )
 
         ctx = context or {}
@@ -484,8 +484,8 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                             ).fetchone()
                             if existing:
                                 continue
-                        elif policy.on_asset_conflict is not None and ext_id:
-                            if policy.on_asset_conflict == AssetConflictPolicy.REFUSE:
+                        elif policy.on_batch_conflict is not None and ext_id:
+                            if policy.on_batch_conflict == BatchConflictPolicy.REFUSE:
                                 existing = conn.execute(
                                     f"SELECT id FROM {table_name} WHERE external_id = ?", [ext_id]
                                 ).fetchone()
@@ -493,7 +493,7 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                                     from dynastore.modules.storage.errors import ConflictError
                                     raise ConflictError(
                                         f"DuckDB: external_id '{ext_id}' already exists in "
-                                        f"{catalog_id}/{collection_id} (policy=refuse_asset)"
+                                        f"{catalog_id}/{collection_id} (policy=refuse_batch)"
                                     )
 
                         row_with_ext = dict(row)

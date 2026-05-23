@@ -219,24 +219,24 @@ class ItemDistributedMixin(_Host):
 
         effective_on_conflict = _select_effective_on_conflict(write_policy, matched_rule)
 
-        # 1.6 Asset-level (batch-level) collision guard.
+        # 1.6 Batch-level collision guard.
         # Uses active_rec from identity resolution — if a duplicate was found
-        # AND the batch policy is refuse_asset, abort the whole batch via
+        # AND the batch policy is refuse_batch, abort the whole batch via
         # ConflictError so the transaction rolls back and the caller returns 409.
-        if active_rec and write_policy and write_policy.on_asset_conflict is not None:
-            from dynastore.modules.storage.driver_config import AssetConflictPolicy
-            if write_policy.on_asset_conflict == AssetConflictPolicy.REFUSE:
+        if active_rec and write_policy and write_policy.on_batch_conflict is not None:
+            from dynastore.modules.storage.driver_config import BatchConflictPolicy
+            if write_policy.on_batch_conflict == BatchConflictPolicy.REFUSE:
                 rule_name = (
                     ",".join(str(cf.kind) for cf in matched_rule.match_on)
                     if matched_rule else "unknown"
                 )
                 logger.warning(
-                    "Feature rejected: batch-level collision (refuse_asset) via rule=[%s] "
+                    "Feature rejected: batch-level collision (refuse_batch) via rule=[%s] "
                     "geoid=%s", rule_name, active_rec.get("geoid")
                 )
                 raise ConflictError(
                     f"Write refused: duplicate detected via [{rule_name}] "
-                    f"(geoid={active_rec.get('geoid')}); policy=refuse_asset",
+                    f"(geoid={active_rec.get('geoid')}); policy=refuse_batch",
                     geoid=active_rec.get("geoid"),
                     matcher=rule_name,
                 )
