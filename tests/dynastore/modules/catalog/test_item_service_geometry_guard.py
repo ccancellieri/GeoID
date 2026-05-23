@@ -67,7 +67,14 @@ _StubPgDriver.__name__ = "ItemsPostgresqlDriver"
 
 
 class _StubEsDriver:
-    """ES items driver stub exposing a resolvable ``simplify_geometry`` flag."""
+    """ES items driver stub exposing a resolvable ``simplify_geometry`` flag.
+
+    Carries the ``is_es_items_driver`` structural marker — the same class attr
+    set on ``_ItemsElasticsearchBase`` — so the guard's
+    ``_resolved_driver_is_es_items`` detects it without a class-name match.
+    """
+
+    is_es_items_driver = True
 
     def __init__(self, simplify_geometry: bool):
         self._simplify = simplify_geometry
@@ -80,7 +87,6 @@ class _StubEsDriver:
 
 def _es_resolved(simplify_geometry: bool):
     drv = _StubEsDriver(simplify_geometry)
-    type(drv).__name__ = "ItemsElasticsearchDriver"
     return _StubResolved(drv)
 
 

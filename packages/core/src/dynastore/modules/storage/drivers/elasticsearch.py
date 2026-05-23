@@ -190,6 +190,28 @@ async def _ensure_in_public_alias_once(catalog_id: str, index_name: str) -> None
 class _ElasticsearchBase:
     """Shared helpers for ES storage drivers."""
 
+    def is_available(self) -> bool:
+        """Available whenever the shared ES client is wired up.
+
+        The platform's :class:`ElasticsearchModule.lifespan` initialises the
+        singleton; this returns ``True`` once that has run. Shared by every ES
+        driver (items public/private and assets).
+        """
+        try:
+            from dynastore.modules.elasticsearch.client import get_client
+        except (ImportError, ModuleNotFoundError):
+            return False
+        return get_client() is not None
+
+    def _get_client(self) -> Any:
+        """Return the shared async ES client, raising if not initialised.
+
+        Single accessor for every ES driver — wraps the module-level
+        :func:`_es_client_required` so subclasses never import
+        :func:`dynastore.modules.elasticsearch.client.get_client` directly.
+        """
+        return _es_client_required()
+
     async def get_driver_config(
         self,
         catalog_id: str,
@@ -322,6 +344,58 @@ class _ElasticsearchBase:
             return entity.get("id")
         return None
 
+
+# ---------------------------------------------------------------------------
+# Shared items base — public + private ES item drivers
+# ---------------------------------------------------------------------------
+
+class _ItemsElasticsearchBase(_ElasticsearchBase):
+    """Shared surface for the two ES *items* drivers.
+
+    Holds the structural-search capability, the single index-name seam every
+    index-naming method routes through, and the collection-routing seam plus
+    the data-side ops (``count``/``extents``/``aggregate``/``introspect``)
+    that differ between the public and private drivers ONLY in those two
+    seams. The genuinely divergent CRUD surface (``write_entities`` /
+    ``read_entities`` / ``index`` / ``index_bulk`` / ``ensure_storage`` /
+    ``drop_storage`` / ``delete_entities`` / ``location`` /
+    ``get_entity_fields``) stays on each concrete driver because the doc model
+    (public STAC projection vs private ``build_tenant_feature_doc``), index
+    lifecycle (public alias enrolment vs tenant-only), conflict policy, and
+    read reconstruction genuinely differ.
+
+    The :data:`is_es_items_driver` marker lets non-ES code
+    (``item_service._resolved_driver_is_es_items``) detect an ES items driver
+    structurally without importing either concrete class.
+    """
+
+    # Structural marker for the two ES items drivers — consumed by
+    # ``modules/catalog/item_service.py`` (which must stay free of a hard ES
+    # import) via ``getattr(driver, "is_es_items_driver", False)``.
+    is_es_items_driver: ClassVar[bool] = True
+
+    # ------------------------------------------------------------------
+    # Override seams
+    # ------------------------------------------------------------------
+
+    def _items_index_name(self, catalog_id: str) -> str:
+        """Resolve the per-tenant items index this driver reads/writes.
+
+        The SINGLE seam every index-naming method routes through. Public →
+        ``{prefix}-items-{catalog_id}``; private →
+        ``{prefix}-{catalog_id}-private-items``. Concrete drivers override.
+        """
+        raise NotImplementedError
+
+    def _collection_routing(self, collection_id: Optional[str]) -> Optional[str]:
+        """Resolve the ES ``_routing`` key for collection-scoped data ops.
+
+        The public per-tenant index is sharded by ``_routing=collection_id``
+        so single-collection queries hit one shard; the private index is not
+        routed by collection (override returns ``None``).
+        """
+        return collection_id
+
     # ------------------------------------------------------------------
     # Structural item search (ItemSearchProtocol capability)
     # ------------------------------------------------------------------
@@ -420,13 +494,132 @@ class _ElasticsearchBase:
         features = [h["_source"] for h in hits.get("hits", [])]
         return ItemSearchResult(features=features, total=total)
 
+    # ------------------------------------------------------------------
+    # CollectionItemsStore Protocol — data-side ops
+    # ------------------------------------------------------------------
+    # Identical between public and private modulo the two seams: the index
+    # name (:meth:`_items_index_name`) and the collection routing key
+    # (:meth:`_collection_routing` — ``collection_id`` for the routed public
+    # index, ``None`` for the unrouted private index).
+
+    async def count_entities(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        request: Optional[Any] = None,
+        db_resource: Optional[Any] = None,
+    ) -> int:
+        from dynastore.modules.elasticsearch.client import get_client
+        from dynastore.modules.elasticsearch.items_es_ops import es_count_items
+
+        es = get_client()
+        if es is None:
+            return 0
+        query = self._query_request_to_es(request) if request is not None else None
+        return await es_count_items(
+            es,
+            self._items_index_name(catalog_id),
+            query=query,
+            collection=collection_id,
+            routing=self._collection_routing(collection_id),
+        )
+
+    async def compute_extents(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
+        from dynastore.modules.elasticsearch.client import get_client
+        from dynastore.modules.elasticsearch.items_es_ops import es_extents
+
+        es = get_client()
+        if es is None:
+            return None
+        return await es_extents(
+            es,
+            self._items_index_name(catalog_id),
+            collection=collection_id,
+            routing=self._collection_routing(collection_id),
+        )
+
+    async def aggregate(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        aggregation_type: str,
+        field: Optional[str] = None,
+        request: Optional[Any] = None,
+        db_resource: Optional[Any] = None,
+    ) -> Any:
+        from dynastore.modules.elasticsearch.client import get_client
+        from dynastore.modules.elasticsearch.items_es_ops import es_aggregate
+
+        es = get_client()
+        if es is None:
+            return None
+        query = self._query_request_to_es(request) if request is not None else None
+        return await es_aggregate(
+            es,
+            self._items_index_name(catalog_id),
+            aggregation_type=aggregation_type,
+            field=field,
+            query=query,
+            collection=collection_id,
+            routing=self._collection_routing(collection_id),
+        )
+
+    async def introspect_schema(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> List[Any]:
+        from dynastore.modules.elasticsearch.client import get_client
+        from dynastore.modules.elasticsearch.items_es_ops import es_introspect_mapping
+
+        es = get_client()
+        if es is None:
+            return []
+        return await es_introspect_mapping(es, self._items_index_name(catalog_id))
+
+    @staticmethod
+    def _query_request_to_es(request: QueryRequest) -> dict:
+        """Convert a QueryRequest to an ES query body."""
+        must: list = []
+        for f in request.filters:
+            op = f.operator if isinstance(f.operator, str) else f.operator.value
+            if op == "bbox" and f.field == "geometry":
+                coords = f.value
+                if isinstance(coords, (list, tuple)) and len(coords) >= 4:
+                    must.append({
+                        "geo_bounding_box": {
+                            "geometry": {
+                                "top_left": {"lon": coords[0], "lat": coords[3]},
+                                "bottom_right": {"lon": coords[2], "lat": coords[1]},
+                            }
+                        }
+                    })
+            elif op in ("eq", "="):
+                must.append({"term": {f.field: f.value}})
+            elif op in ("like", "ilike"):
+                must.append({"wildcard": {f.field: f.value}})
+
+        if not must:
+            return {"query": {"match_all": {}}}
+        return {"query": {"bool": {"must": must}}}
+
 
 # ---------------------------------------------------------------------------
 # ItemsElasticsearchDriver — public STAC items index
 # ---------------------------------------------------------------------------
 
 class ItemsElasticsearchDriver(
-    TypedDriver[ItemsElasticsearchDriverConfig], _ElasticsearchBase, ModuleProtocol,
+    TypedDriver[ItemsElasticsearchDriverConfig], _ItemsElasticsearchBase, ModuleProtocol,
 ):
     """Elasticsearch storage driver for STAC items.
 
@@ -476,13 +669,9 @@ class ItemsElasticsearchDriver(
         Hint.AGGREGATION, Hint.COUNT, Hint.STATISTICS,
     })
 
-    def is_available(self) -> bool:
-        # Available whenever the shared ES client is wired up.
-        try:
-            from dynastore.modules.elasticsearch.client import get_client
-        except (ImportError, ModuleNotFoundError):
-            return False
-        return get_client() is not None
+    def _items_index_name(self, catalog_id: str) -> str:
+        """Public per-tenant items index ``{prefix}-items-{catalog_id}``."""
+        return _tenant_items_index(catalog_id)
 
     @property
     def es_client(self) -> Any:
@@ -553,7 +742,7 @@ class ItemsElasticsearchDriver(
         if not items:
             return []
         es = _es_client_required()
-        index_name = _tenant_items_index(catalog_id)
+        index_name = self._items_index_name(catalog_id)
         known_fields = await resolve_catalog_known_fields(catalog_id)
 
         # Issue #1248: exact geometry by default. Simplification is opt-in via
@@ -919,7 +1108,7 @@ class ItemsElasticsearchDriver(
 
         try:
             es = _es_client_required()
-            index_name = _tenant_items_index(catalog_id)
+            index_name = self._items_index_name(catalog_id)
             mapping = await es.indices.get_mapping(index=index_name)
             properties: Dict[str, Any] = {}
             for idx_data in mapping.values():
@@ -955,7 +1144,7 @@ class ItemsElasticsearchDriver(
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
         es = _es_client_required()
-        index_name = _tenant_items_index(catalog_id)
+        index_name = self._items_index_name(catalog_id)
         # Resolve the wire-shape policy once per query so every hit is
         # reconstructed against the same read contract (id source, exposure).
         read_policy = await self._resolve_read_policy(catalog_id, collection_id)
@@ -1025,7 +1214,7 @@ class ItemsElasticsearchDriver(
                 len(entity_ids),
             )
         es = _es_client_required()
-        index_name = _tenant_items_index(catalog_id)
+        index_name = self._items_index_name(catalog_id)
         deleted = 0
         for eid in entity_ids:
             try:
@@ -1068,7 +1257,7 @@ class ItemsElasticsearchDriver(
         )
 
         es = _es_client_required()
-        index_name = _tenant_items_index(catalog_id)
+        index_name = self._items_index_name(catalog_id)
 
         try:
             exists = await es.indices.exists(index=index_name)
@@ -1122,7 +1311,7 @@ class ItemsElasticsearchDriver(
         )
 
         es = _es_client_required()
-        index_name = _tenant_items_index(catalog_id)
+        index_name = self._items_index_name(catalog_id)
         if collection_id:
             try:
                 await es.delete_by_query(
@@ -1197,7 +1386,7 @@ class ItemsElasticsearchDriver(
             )
 
         es = _es_client_required()
-        index_name = _tenant_items_index(ctx.catalog)
+        index_name = self._items_index_name(ctx.catalog)
         await _ensure_in_public_alias_once(ctx.catalog, index_name)
 
         if op.op_type == "delete":
@@ -1255,7 +1444,7 @@ class ItemsElasticsearchDriver(
         )
 
         es = _es_client_required()
-        index_name = _tenant_items_index(ctx.catalog)
+        index_name = self._items_index_name(ctx.catalog)
         await _ensure_in_public_alias_once(ctx.catalog, index_name)
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
 
@@ -1358,32 +1547,6 @@ class ItemsElasticsearchDriver(
                            catalog_id, collection_id, item_id, e)
             return None
 
-    @staticmethod
-    def _query_request_to_es(request: QueryRequest) -> dict:
-        """Convert a QueryRequest to an ES query body."""
-        must: list = []
-        for f in request.filters:
-            op = f.operator if isinstance(f.operator, str) else f.operator.value
-            if op == "bbox" and f.field == "geometry":
-                coords = f.value
-                if isinstance(coords, (list, tuple)) and len(coords) >= 4:
-                    must.append({
-                        "geo_bounding_box": {
-                            "geometry": {
-                                "top_left": {"lon": coords[0], "lat": coords[3]},
-                                "bottom_right": {"lon": coords[2], "lat": coords[1]},
-                            }
-                        }
-                    })
-            elif op in ("eq", "="):
-                must.append({"term": {f.field: f.value}})
-            elif op in ("like", "ilike"):
-                must.append({"wildcard": {f.field: f.value}})
-
-        if not must:
-            return {"query": {"match_all": {}}}
-        return {"query": {"bool": {"must": must}}}
-
     async def location(
         self,
         catalog_id: str,
@@ -1397,7 +1560,7 @@ class ItemsElasticsearchDriver(
         """
         from dynastore.modules.storage.storage_location import StorageLocation
 
-        index_name = _tenant_items_index(catalog_id)
+        index_name = self._items_index_name(catalog_id)
         return StorageLocation(
             backend="elasticsearch",
             canonical_uri=f"es://{index_name}?routing={collection_id}",
@@ -1408,99 +1571,10 @@ class ItemsElasticsearchDriver(
             display_label=f"{index_name} (routing={collection_id})",
         )
 
-    # ------------------------------------------------------------------
-    # CollectionItemsStore Protocol — data-side ops
-    # ------------------------------------------------------------------
-    # All four delegate to the shared ``items_es_ops`` helpers (which
-    # use the shared async ES client from
-    # :mod:`dynastore.modules.elasticsearch.client`). The per-tenant
-    # index is shared across all collections of a catalog; the routing
-    # key is the collection_id.
-
-    async def count_entities(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        request: Optional[Any] = None,
-        db_resource: Optional[Any] = None,
-    ) -> int:
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_es_ops import es_count_items
-
-        es = get_client()
-        if es is None:
-            return 0
-        query = self._query_request_to_es(request) if request is not None else None
-        return await es_count_items(
-            es,
-            _tenant_items_index(catalog_id),
-            query=query,
-            collection=collection_id,
-            routing=collection_id,
-        )
-
-    async def compute_extents(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> Optional[Dict[str, Any]]:
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_es_ops import es_extents
-
-        es = get_client()
-        if es is None:
-            return None
-        return await es_extents(
-            es,
-            _tenant_items_index(catalog_id),
-            collection=collection_id,
-            routing=collection_id,
-        )
-
-    async def aggregate(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        aggregation_type: str,
-        field: Optional[str] = None,
-        request: Optional[Any] = None,
-        db_resource: Optional[Any] = None,
-    ) -> Any:
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_es_ops import es_aggregate
-
-        es = get_client()
-        if es is None:
-            return None
-        query = self._query_request_to_es(request) if request is not None else None
-        return await es_aggregate(
-            es,
-            _tenant_items_index(catalog_id),
-            aggregation_type=aggregation_type,
-            field=field,
-            query=query,
-            collection=collection_id,
-            routing=collection_id,
-        )
-
-    async def introspect_schema(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> List[Any]:
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_es_ops import es_introspect_mapping
-
-        es = get_client()
-        if es is None:
-            return []
-        return await es_introspect_mapping(es, _tenant_items_index(catalog_id))
+    # Data-side ops (count/extents/aggregate/introspect) are inherited from
+    # :class:`_ItemsElasticsearchBase`; the public per-tenant index is sharded
+    # by ``_routing=collection_id`` so the default ``_collection_routing``
+    # (returns ``collection_id``) and ``_items_index_name`` above suffice.
 
     # --- Admin ops not supported on this backend ---
 
@@ -1612,16 +1686,7 @@ class AssetElasticsearchDriver(
     preferred_for: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.ASSETS})
     supported_hints: FrozenSet[Hint] = frozenset({Hint.SEARCH, Hint.ASSETS, Hint.FULLTEXT})
 
-    def is_available(self) -> bool:
-        try:
-            from dynastore.modules.elasticsearch.client import get_client
-        except (ImportError, ModuleNotFoundError):
-            return False
-        return get_client() is not None
-
-    def _get_client(self):
-        """Return the shared async ES client."""
-        return _es_client_required()
+    # ``is_available`` / ``_get_client`` inherited from ``_ElasticsearchBase``.
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):

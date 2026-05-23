@@ -240,6 +240,92 @@ class TestItemsElasticsearchPrivateDriverMeta:
         assert not driver.auto_register_for_routing
 
 
+class TestItemsIndexNameSeam:
+    """The single index-name seam (:meth:`_items_index_name`) and the
+    collection-routing seam (:meth:`_collection_routing`) that the shared
+    :class:`_ItemsElasticsearchBase` data-side ops route through.
+
+    The public per-tenant index is sharded by ``_routing=collection_id``; the
+    private index is not (routing ``None``). Pinning the seam resolution here
+    so a future change to either driver's index naming or routing is caught.
+    """
+
+    def test_public_index_name_is_tenant_items_index(self):
+        from dynastore.modules.elasticsearch.mappings import get_tenant_items_index
+        from dynastore.modules.elasticsearch.client import get_index_prefix
+
+        driver = ItemsElasticsearchDriver()
+        name = driver._items_index_name("cat1")
+        assert name == get_tenant_items_index(get_index_prefix(), "cat1")
+        assert "private" not in name
+
+    def test_public_routing_is_collection_id(self):
+        driver = ItemsElasticsearchDriver()
+        assert driver._collection_routing("col1") == "col1"
+        assert driver._collection_routing(None) is None
+
+    def test_private_index_name_is_private_index(self):
+        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
+            get_private_index_name,
+        )
+        from dynastore.modules.elasticsearch.client import get_index_prefix
+
+        driver = ItemsElasticsearchPrivateDriver()
+        name = driver._items_index_name("cat1")
+        assert name == get_private_index_name(get_index_prefix(), "cat1")
+        assert name.endswith("-private-items")
+
+    def test_private_routing_is_none(self):
+        """The private index is not sharded by collection — never routed."""
+        driver = ItemsElasticsearchPrivateDriver()
+        assert driver._collection_routing("col1") is None
+        assert driver._collection_routing(None) is None
+
+    def test_es_items_marker_present_on_both_drivers(self):
+        """The structural marker that ``item_service`` uses to detect an ES
+        items driver without importing the classes."""
+        assert ItemsElasticsearchDriver().is_es_items_driver is True
+        assert ItemsElasticsearchPrivateDriver().is_es_items_driver is True
+
+
+class TestDataSideOpsRouteThroughSeam:
+    """The shared count/extents/aggregate/introspect ops resolve their index
+    and routing via the per-driver seams — public passes ``routing``, private
+    does not (mirroring the pre-refactor behaviour)."""
+
+    @pytest.mark.asyncio
+    async def test_public_count_passes_routing(self):
+        driver = ItemsElasticsearchDriver()
+        es = MagicMock()
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.items_es_ops.es_count_items",
+            new=AsyncMock(return_value=7),
+        ) as mock_count:
+            result = await driver.count_entities("cat1", "col1")
+        assert result == 7
+        _, kwargs = mock_count.call_args
+        assert kwargs["routing"] == "col1"
+        assert kwargs["collection"] == "col1"
+
+    @pytest.mark.asyncio
+    async def test_private_count_omits_routing(self):
+        driver = ItemsElasticsearchPrivateDriver()
+        es = MagicMock()
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.items_es_ops.es_count_items",
+            new=AsyncMock(return_value=3),
+        ) as mock_count:
+            result = await driver.count_entities("cat1", "col1")
+        assert result == 3
+        _, kwargs = mock_count.call_args
+        assert kwargs["routing"] is None
+        assert kwargs["collection"] == "col1"
+
+
 class TestQueryRequestToEs:
     def test_empty_request(self):
         from dynastore.models.query_builder import QueryRequest

@@ -414,14 +414,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
     def _resolved_driver_is_es_items(driver: Any) -> bool:
         """True when a resolved driver is one of the ES items drivers.
 
-        Detected by class name so this guard does not import the ES driver
-        classes (keeps the catalog module free of a hard ES dependency and
-        works with the unit-test stubs that re-label ``__name__``).
+        Detected via the structural ``is_es_items_driver`` class marker
+        (set on ``_ItemsElasticsearchBase``, inherited by both the public and
+        private ES items drivers) so this guard does not import the ES driver
+        classes — keeping the catalog module free of a hard ES dependency.
         """
-        return type(driver).__name__ in (
-            "ItemsElasticsearchDriver",
-            "ItemsElasticsearchPrivateDriver",
-        )
+        return bool(getattr(driver, "is_es_items_driver", False))
 
     async def _es_items_driver_simplify_enabled(
         self,

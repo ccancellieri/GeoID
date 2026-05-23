@@ -20,8 +20,10 @@ per-tenant index whose name is owned by this subpackage
 (``{prefix}-{catalog_id}-private-items``). Driver-private mapping
 (``TENANT_FEATURE_MAPPING``) lives in :mod:`.mappings`.
 
-Manages DENY access policies in its own lifecycle. Shares the
-:class:`_ElasticsearchBase` helpers with the public items driver.
+Manages DENY access policies in its own lifecycle. Inherits the shared
+:class:`_ItemsElasticsearchBase` surface (structural search, the index-name
+seam, and the data-side count/extents/aggregate/introspect ops) with the
+public items driver.
 
 Registered as ``storage_elasticsearch_private`` via entry points.
 """
@@ -44,7 +46,7 @@ from dynastore.modules.protocols import ModuleProtocol
 from dynastore.modules.storage.driver_config import (
     ItemsElasticsearchPrivateDriverConfig,
 )
-from dynastore.modules.storage.drivers.elasticsearch import _ElasticsearchBase
+from dynastore.modules.storage.drivers.elasticsearch import _ItemsElasticsearchBase
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
 
@@ -53,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 class ItemsElasticsearchPrivateDriver(
     TypedDriver[ItemsElasticsearchPrivateDriverConfig],
-    _ElasticsearchBase,
+    _ItemsElasticsearchBase,
     ModuleProtocol,
 ):
     """Tenant-scoped Elasticsearch storage driver (a.k.a. "private").
@@ -123,14 +125,22 @@ class ItemsElasticsearchPrivateDriver(
         Hint.STATISTICS,
     })
 
-    def is_available(self) -> bool:
-        # Driver is available whenever the shared ES client is wired up
-        # (ElasticsearchModule.lifespan has started).
-        try:
-            from dynastore.modules.elasticsearch.client import get_client
-        except (ImportError, ModuleNotFoundError):
-            return False
-        return get_client() is not None
+    # ``is_available`` / ``_get_client`` inherited from ``_ElasticsearchBase``.
+
+    def _items_index_name(self, catalog_id: str) -> str:
+        """Private per-tenant index ``{prefix}-{catalog_id}-private-items``.
+
+        The single index-name seam every CRUD + data-side op routes through.
+        """
+        from dynastore.modules.elasticsearch.client import get_index_prefix
+        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
+            get_private_index_name,
+        )
+        return get_private_index_name(get_index_prefix(), catalog_id)
+
+    def _collection_routing(self, collection_id: Optional[str]) -> Optional[str]:
+        """The private index is not sharded by collection — no ``_routing``."""
+        return None
 
     def _search_index_name(self, catalog_id: Optional[str]) -> str:
         """Structural search targets the tenant-scoped private items index.
@@ -153,18 +163,6 @@ class ItemsElasticsearchPrivateDriver(
                 "cross-tenant private items alias by design (#1047)."
             )
         return get_private_index_name(get_index_prefix(), catalog_id)
-
-    def _get_client(self):
-        """Return the shared async ES client."""
-        from dynastore.modules.elasticsearch.client import get_client
-
-        es = get_client()
-        if es is None:
-            raise RuntimeError(
-                "ES client not initialised — ElasticsearchModule.lifespan "
-                "must have started before private items operations are invoked."
-            )
-        return es
 
     async def _resolve_simplify_geometry(
         self,
@@ -218,20 +216,18 @@ class ItemsElasticsearchPrivateDriver(
         context: Optional[Dict[str, Any]] = None,
         db_resource: Optional[Any] = None,
     ) -> List[Feature]:
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
         from dynastore.modules.storage.drivers.elasticsearch_private.doc_builder import (
             build_tenant_feature_doc,
         )
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
             TENANT_FEATURE_MAPPING,
-            get_private_index_name,
         )
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
         )
         from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
-        index_name = get_private_index_name(_get_index_prefix(), catalog_id)
+        index_name = self._items_index_name(catalog_id)
         items = self._normalize_entities(entities)
         es = self._get_client()
 
@@ -286,15 +282,11 @@ class ItemsElasticsearchPrivateDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            get_private_index_name,
-        )
 
         if not entity_ids:
             return
 
-        index_name = get_private_index_name(_get_index_prefix(), catalog_id)
+        index_name = self._items_index_name(catalog_id)
         es = self._get_client()
 
         if not await es.indices.exists(index=index_name):
@@ -338,12 +330,8 @@ class ItemsElasticsearchPrivateDriver(
             raise SoftDeleteNotSupportedError(
                 "ItemsElasticsearchPrivateDriver does not support soft delete."
             )
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            get_private_index_name,
-        )
 
-        index_name = get_private_index_name(_get_index_prefix(), catalog_id)
+        index_name = self._items_index_name(catalog_id)
         es = self._get_client()
         deleted = 0
 
@@ -362,16 +350,14 @@ class ItemsElasticsearchPrivateDriver(
         collection_id: Optional[str] = None,
         **kwargs,
     ) -> None:
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
             TENANT_FEATURE_MAPPING,
-            get_private_index_name,
         )
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
         )
 
-        index_name = get_private_index_name(_get_index_prefix(), catalog_id)
+        index_name = self._items_index_name(catalog_id)
         es = self._get_client()
 
         if not await es.indices.exists(index=index_name):
@@ -400,12 +386,8 @@ class ItemsElasticsearchPrivateDriver(
             raise SoftDeleteNotSupportedError(
                 "ItemsElasticsearchPrivateDriver does not support soft drop."
             )
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            get_private_index_name,
-        )
 
-        index_name = get_private_index_name(_get_index_prefix(), catalog_id)
+        index_name = self._items_index_name(catalog_id)
         es = self._get_client()
         await es.indices.delete(
             index=index_name, params={"ignore_unavailable": "true"},
@@ -460,18 +442,14 @@ class ItemsElasticsearchPrivateDriver(
                 "ItemsElasticsearchPrivateDriver.index: collection required for item ops",
             )
 
-        from dynastore.modules.elasticsearch.client import (
-            get_index_prefix as _get_index_prefix,
-        )
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
             TENANT_FEATURE_MAPPING,
-            get_private_index_name,
         )
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
         )
 
-        index_name = get_private_index_name(_get_index_prefix(), ctx.catalog)
+        index_name = self._items_index_name(ctx.catalog)
         es = self._get_client()
 
         if op.op_type == "delete":
@@ -517,15 +495,11 @@ class ItemsElasticsearchPrivateDriver(
     async def index_bulk(self, ctx, ops):
         """Bulk-apply a batch of item ops via the ES ``_bulk`` API."""
         from dynastore.models.protocols.indexer import BulkResult
-        from dynastore.modules.elasticsearch.client import (
-            get_index_prefix as _get_index_prefix,
-        )
         from dynastore.modules.storage.drivers.elasticsearch_private.doc_builder import (
             build_tenant_feature_doc,
         )
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
             TENANT_FEATURE_MAPPING,
-            get_private_index_name,
         )
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
@@ -544,7 +518,7 @@ class ItemsElasticsearchPrivateDriver(
             ctx.catalog, ctx.collection,
         )
 
-        index_name = get_private_index_name(_get_index_prefix(), ctx.catalog)
+        index_name = self._items_index_name(ctx.catalog)
         es = self._get_client()
 
         if not await es.indices.exists(index=index_name):
@@ -782,13 +756,10 @@ class ItemsElasticsearchPrivateDriver(
     ) -> "StorageLocation":
         """Return typed physical storage coordinates for this private index."""
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            get_private_index_name,
-        )
         from dynastore.modules.storage.storage_location import StorageLocation
 
         prefix = _get_index_prefix()
-        index_name = get_private_index_name(prefix, catalog_id)
+        index_name = self._items_index_name(catalog_id)
         return StorageLocation(
             backend="elasticsearch_private",
             canonical_uri=f"es://{index_name}",
@@ -797,93 +768,14 @@ class ItemsElasticsearchPrivateDriver(
         )
 
     # ------------------------------------------------------------------
-    # CollectionItemsStore Protocol — data-side ops (parity with public)
+    # CollectionItemsStore Protocol — data-side ops
     # ------------------------------------------------------------------
-    # Mirror the public driver's implementation against the per-tenant
-    # private index ``{prefix}-{catalog_id}-private-items``. The private index
-    # holds every collection of the catalog in one place, scoped at
-    # query time by the ``collection`` field — same shape as public.
-
-    def _private_index(self, catalog_id: str) -> str:
-        from dynastore.modules.elasticsearch.client import get_index_prefix
-        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            get_private_index_name,
-        )
-        return get_private_index_name(get_index_prefix(), catalog_id)
-
-    async def count_entities(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        request: Optional[Any] = None,
-        db_resource: Optional[Any] = None,
-    ) -> int:
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_es_ops import es_count_items
-
-        es = get_client()
-        if es is None:
-            return 0
-        return await es_count_items(
-            es, self._private_index(catalog_id), collection=collection_id,
-        )
-
-    async def compute_extents(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> Optional[Dict[str, Any]]:
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_es_ops import es_extents
-
-        es = get_client()
-        if es is None:
-            return None
-        return await es_extents(
-            es, self._private_index(catalog_id), collection=collection_id,
-        )
-
-    async def aggregate(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        aggregation_type: str,
-        field: Optional[str] = None,
-        request: Optional[Any] = None,
-        db_resource: Optional[Any] = None,
-    ) -> Any:
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_es_ops import es_aggregate
-
-        es = get_client()
-        if es is None:
-            return None
-        return await es_aggregate(
-            es,
-            self._private_index(catalog_id),
-            aggregation_type=aggregation_type,
-            field=field,
-            collection=collection_id,
-        )
-
-    async def introspect_schema(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> List[Any]:
-        from dynastore.modules.elasticsearch.client import get_client
-        from dynastore.modules.elasticsearch.items_es_ops import es_introspect_mapping
-
-        es = get_client()
-        if es is None:
-            return []
-        return await es_introspect_mapping(es, self._private_index(catalog_id))
+    # ``count_entities`` / ``compute_extents`` / ``aggregate`` /
+    # ``introspect_schema`` are inherited from :class:`_ItemsElasticsearchBase`.
+    # The private index is not sharded by collection, so the
+    # :meth:`_collection_routing` override (returns ``None``) keeps the
+    # inherited ops from sending a ``_routing`` param — preserving the prior
+    # private-driver behaviour, which never passed routing on these ops.
 
     async def get_entity_fields(
         self,
