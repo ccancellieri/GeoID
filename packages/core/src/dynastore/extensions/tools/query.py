@@ -74,6 +74,155 @@ async def resolve_items_read_policy(
         return None
 
 
+def _items_hits_to_features(
+    raw_features: list,
+    catalog_id: str,
+    collection_id: str,
+) -> list:
+    """Turn raw search-driver hits into read-contract OGC ``Feature`` objects.
+
+    ``ItemSearchProtocol.search_items_struct`` returns plain dicts in the
+    indexed ``_source`` shape: unknown attributes nested under
+    ``properties.extras`` (Tier-3 projection), internal ``_*`` tracking fields
+    and leaked echo keys at the top level (which would otherwise surface via the
+    ``extra="allow"`` Feature model), and possibly an empty ``{}`` geometry.
+    :func:`unproject_item_from_es` restores the GeoJSON/STAC read contract so
+    the OGC ``/items`` dispatch returns the same shape as the PostgreSQL
+    ``stream_items`` path. Mirrors ``stac/search.py::_es_hits_to_features``.
+    """
+    from dynastore.models.ogc import Feature
+    from dynastore.modules.elasticsearch.items_projection import (
+        unproject_item_from_es,
+    )
+
+    features: list = []
+    for raw in raw_features:
+        if isinstance(raw, Feature):
+            features.append(raw)
+            continue
+        clean = unproject_item_from_es(raw) if isinstance(raw, dict) else raw
+        try:
+            feat = Feature.model_validate(clean)
+        except Exception as exc:  # noqa: BLE001 — skip a malformed hit, never 500
+            logger.warning(
+                "OGC /items → SEARCH-driver dispatch: skipping malformed hit "
+                "(catalog=%s, collection=%s): %s",
+                catalog_id, collection_id, exc,
+            )
+            continue
+        features.append(feat)
+    return features
+
+
+async def maybe_dispatch_items_to_search_driver(
+    catalog_id: str,
+    collection_id: str,
+    *,
+    bbox: Optional[List[float]] = None,
+    intersects: Optional[Dict[str, Any]] = None,
+    datetime: Optional[str] = None,
+    ids: Optional[List[str]] = None,
+    limit: int = 10,
+    offset: int = 0,
+    has_complex_filter: bool = False,
+) -> Optional[QueryResponse]:
+    """Dispatch an OGC ``/items`` listing to the collection's routing-pinned
+    items SEARCH driver, when one is configured and search-capable.
+
+    Used by the OGC API - Features and OGC API - Records ``/items`` endpoints
+    so they resolve the items SEARCH driver via routing
+    (:func:`router.get_items_search_driver` — ``Operation.SEARCH`` then a
+    ``READ`` fallback) and dispatch the structural query to **that driver**
+    through the backend-agnostic
+    :class:`~dynastore.models.protocols.item_search.ItemSearchProtocol`
+    capability — exactly as STAC ``/search`` does after #1257. A public-ES
+    catalog, a GEOID-style catalog routing SEARCH to its tenant-private ES
+    index, or any future search-capable driver are all served the same way,
+    with no hardcoded driver class (#1047).
+
+    Returns ``None`` (caller falls back to the existing PostgreSQL
+    ``stream_items`` path) when the dispatch is not applicable:
+
+    * a CQL2 / shorthand attribute ``filter`` is present (no CQL2→search-backend
+      translator yet — same restriction as STAC ``/search``);
+    * the resolved driver is a read-primary fallback (PostgreSQL, advertising
+      ``Capability.QUERY_FALLBACK_SOURCE``) — i.e. the catalog has no dedicated
+      search backend;
+    * the resolved driver does not advertise the structural-search capability;
+    * driver resolution or the dispatch itself raises (degrade, never 500).
+
+    On a successful dispatch returns a :class:`QueryResponse` whose ``items`` is
+    an async iterator of read-contract :class:`~dynastore.models.ogc.Feature`
+    objects and whose ``total_count`` carries the backend ``numberMatched`` —
+    so paging links stay correct (unlike the ``read_entities`` browse path,
+    which cannot report a total).
+    """
+    # Only basic structural filters are routed to a search backend today;
+    # CQL2 / attribute-shorthand filters continue to the PG path.
+    if has_complex_filter:
+        return None
+
+    from dynastore.modules.storage import router as _router
+    from dynastore.models.protocols.storage_driver import Capability
+    from dynastore.models.protocols.item_search import ItemSearchProtocol
+
+    try:
+        resolved = await _router.get_items_search_driver(
+            catalog_id, collection_id,
+        )
+    except Exception:
+        return None
+
+    driver: Any = resolved.driver
+    if driver is None:
+        return None
+
+    # A read-primary fallback (PostgreSQL) advertises QUERY_FALLBACK_SOURCE:
+    # no dedicated search backend, so defer to the PG stream_items path.
+    if Capability.QUERY_FALLBACK_SOURCE in getattr(
+        driver, "capabilities", frozenset()
+    ):
+        return None
+
+    # The resolved driver must implement the structural-search capability.
+    if not isinstance(driver, ItemSearchProtocol):
+        return None
+
+    try:
+        result = await driver.search_items_struct(
+            catalog_id=catalog_id,
+            collections=[collection_id],
+            ids=ids,
+            bbox=bbox,
+            intersects=intersects,
+            datetime=datetime,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:  # noqa: BLE001 — degrade to PG path, never 500
+        logger.warning(
+            "OGC /items → SEARCH-driver dispatch failed "
+            "(catalog=%s, collection=%s, driver=%s): %s",
+            catalog_id, collection_id, type(driver).__name__, exc,
+        )
+        return None
+
+    features = _items_hits_to_features(
+        result.features, catalog_id, collection_id,
+    )
+
+    async def _feature_stream():
+        for feat in features:
+            yield feat
+
+    return QueryResponse(
+        items=_feature_stream(),
+        total_count=result.total,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+
+
 # OGC API Features query parameters that are handled explicitly by the
 # request parser / route handler and therefore must NOT be treated as
 # ad-hoc property=value attribute filters.

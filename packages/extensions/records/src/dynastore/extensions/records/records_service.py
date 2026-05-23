@@ -261,7 +261,31 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         if not collection_meta:
             raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
 
-        from dynastore.extensions.tools.query import parse_ogc_query_request
+        from dynastore.extensions.tools.query import (
+            parse_ogc_query_request,
+            maybe_dispatch_items_to_search_driver,
+        )
+
+        # ── Routing-aware items SEARCH-driver dispatch (#1047) ────────────
+        # Mirror STAC ``/search`` (#1257): for a structural-only listing (no
+        # CQL2 ``filter`` and no free-text ``q``) resolve the items SEARCH
+        # driver via routing and dispatch through the backend-agnostic
+        # ``ItemSearchProtocol`` — public ES, the tenant-private ES index, or
+        # any future search-capable driver. The helper returns ``None``
+        # (→ the PG ``stream_items`` path below) for a CQL filter, a
+        # read-primary (PG ``QUERY_FALLBACK_SOURCE``) driver, or a driver
+        # without the structural-search capability. Free-text ``q`` folds into
+        # a CQL ``ILIKE`` predicate, so it defers to the PG path too.
+        has_complex_filter = bool(filter) or bool(q)
+        search_dispatch = None
+        if not has_complex_filter:
+            search_dispatch = await maybe_dispatch_items_to_search_driver(
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                limit=limit,
+                offset=offset,
+                has_complex_filter=False,
+            )
 
         request_obj = parse_ogc_query_request(
             bbox=None,
@@ -284,17 +308,19 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                 request_obj.cql_filter = ilike_expr
 
         items_protocol = cast(ItemsProtocol, catalogs_svc)
-        try:
-            from dynastore.models.driver_context import DriverContext
-            query_response = await items_protocol.stream_items(
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-                request=request_obj,
-                ctx=DriverContext(db_resource=conn) if conn is not None else None,
-                consumer=ConsumerType.OGC_RECORDS,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        if search_dispatch is not None:
+            query_response = search_dispatch
+        else:
+            try:
+                query_response = await items_protocol.stream_items(
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    request=request_obj,
+                    ctx=DriverContext(db_resource=conn) if conn is not None else None,
+                    consumer=ConsumerType.OGC_RECORDS,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
 
         count = query_response.total_count or 0
         root_url = get_root_url(request)

@@ -1076,6 +1076,46 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 if key not in OGC_RESERVED_QUERY_PARAMS and value != ""
             }
 
+            # ── Routing-aware items SEARCH-driver dispatch (#1047) ────────
+            # Mirror STAC ``/search`` (#1257): for structural-only listings
+            # (no CQL2 ``filter`` / shorthand attribute filter, no non-4326
+            # CRS reprojection) resolve the items SEARCH driver via routing
+            # and dispatch through the backend-agnostic ``ItemSearchProtocol``
+            # — public ES, the tenant-private ES index, or any future
+            # search-capable driver. The helper returns ``None`` (→ the PG
+            # ``stream_items`` path below) for CQL/attribute filters, a
+            # read-primary (PG ``QUERY_FALLBACK_SOURCE``) driver, or a driver
+            # without the structural-search capability. CRS reprojection is a
+            # PG-only capability, so a non-4326 output/bbox CRS also defers.
+            from dynastore.extensions.tools.query import (
+                maybe_dispatch_items_to_search_driver,
+            )
+
+            has_complex_filter = bool(filter) or bool(extra_filters)
+            wants_crs_reproject = (
+                target_crs_srid not in (None, 4326)
+                or bbox_crs_srid not in (None, 4326)
+            )
+            search_dispatch: Optional[Any] = None
+            if not has_complex_filter and not wants_crs_reproject:
+                parsed_bbox: Optional[List[float]] = None
+                if bbox:
+                    try:
+                        _b = [float(v) for v in bbox.split(",")]
+                        if len(_b) == 4:
+                            parsed_bbox = _b
+                    except ValueError:
+                        parsed_bbox = None
+                search_dispatch = await maybe_dispatch_items_to_search_driver(
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    bbox=parsed_bbox,
+                    datetime=datetime_param,
+                    limit=limit,
+                    offset=offset,
+                    has_complex_filter=False,
+                )
+
             request_obj = parse_ogc_query_request(
                 bbox=bbox,
                 datetime_param=datetime_param,
@@ -1090,18 +1130,21 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
 
             # Execute search via protocol (streaming)
             items_protocol = cast(ItemsProtocol, catalogs_svc)
-            try:
-                query_response = await items_protocol.stream_items(
-                    catalog_id=catalog_id,
-                    collection_id=collection_id,
-                    request=request_obj,
-                    # Decouple from request connection to allow background streaming
-                    ctx=None,
-                    consumer=ConsumerType.OGC_FEATURES,
-                )
-            except ValueError as e:
-                # Catch invalid properties/fields and return 400
-                raise HTTPException(status_code=400, detail=str(e))
+            if search_dispatch is not None:
+                query_response = search_dispatch
+            else:
+                try:
+                    query_response = await items_protocol.stream_items(
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        request=request_obj,
+                        # Decouple from request connection to allow background streaming
+                        ctx=None,
+                        consumer=ConsumerType.OGC_FEATURES,
+                    )
+                except ValueError as e:
+                    # Catch invalid properties/fields and return 400
+                    raise HTTPException(status_code=400, detail=str(e))
 
             count = query_response.total_count or 0
             root_url = get_root_url(request)
