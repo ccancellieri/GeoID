@@ -26,8 +26,7 @@ from typing import List, Optional, cast
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from dynastore.extensions.edr.config import EDRConfig
-from dynastore.extensions.ogc_base import OGCServiceMixin
+from dynastore.extensions.ogc_base import OGCServiceMixin, ogc_asset_href
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.ogc_policies import (
     ogc_anonymous_role_binding,
@@ -71,17 +70,6 @@ def _resolve_edr_format(f: Optional[str]) -> str:
     if v == "geojson":
         return "geojson"
     raise HTTPException(status_code=415, detail=f"Unsupported EDR format: {f!r}")
-
-
-def _asset_href(item: dict) -> str:
-    assets = item.get("assets") or {}
-    for key in ("data", "coverage"):
-        if key in assets and assets[key].get("href"):
-            return assets[key]["href"]
-    for a in assets.values():
-        if a.get("href"):
-            return a["href"]
-    raise HTTPException(status_code=404, detail="No asset href on EDR item.")
 
 
 def _resolve_band_names(item: dict, requested_params: Optional[List[str]]) -> List[str]:
@@ -328,7 +316,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
                 detail="No items found for the given query parameters.",
             )
 
-        href = _asset_href(item)
+        href = ogc_asset_href(item, error_detail="No asset href on EDR item.")
         requested_params = (
             [p.strip() for p in parameter_name.split(",")]
             if parameter_name
@@ -390,7 +378,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
                 detail="No items found for the given query parameters.",
             )
 
-        href = _asset_href(item)
+        href = ogc_asset_href(item, error_detail="No asset href on EDR item.")
         requested_params = (
             [p.strip() for p in parameter_name.split(",")]
             if parameter_name
@@ -446,7 +434,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
                 detail="No items found for the given query parameters.",
             )
 
-        href = _asset_href(item)
+        href = ogc_asset_href(item, error_detail="No asset href on EDR item.")
         requested_params = (
             [p.strip() for p in parameter_name.split(",")]
             if parameter_name
@@ -490,44 +478,8 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         )
 
     # ------------------------------------------------------------------
-    # Config helper
-    # ------------------------------------------------------------------
-
-    async def _get_edr_config(
-        self,
-        catalog_id: Optional[str] = None,
-        collection_id: Optional[str] = None,
-    ) -> EDRConfig:
-        try:
-            configs_svc = await self._get_configs_service()
-            return await configs_svc.get_config(EDRConfig, catalog_id, collection_id)
-        except Exception:
-            return EDRConfig()
-
-    # ------------------------------------------------------------------
     # Internal item access helpers
     # ------------------------------------------------------------------
-
-    async def _get_first_item(
-        self,
-        catalog_id: str,
-        collection_id: str,
-    ) -> Optional[dict]:
-        from dynastore.models.query_builder import QueryRequest
-
-        catalogs = cast(CatalogsProtocol, await self._get_catalogs_service())
-        try:
-            features = await catalogs.search_items(
-                catalog_id, collection_id, QueryRequest(limit=1)
-            )
-        except Exception:
-            return None
-        if not features:
-            return None
-        first = features[0]
-        if hasattr(first, "model_dump"):
-            return first.model_dump(by_alias=True, exclude_none=True)
-        return dict(first)
 
     async def _get_item_for_datetime(
         self,

@@ -21,7 +21,7 @@ and protocol-specific response models. Zero core changes needed.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional, cast
+from typing import Optional
 
 import rasterio as _rasterio_scope_gate  # noqa: F401  # SCOPE gate: extension_coverages requires rasterio
 _ = _rasterio_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
@@ -31,7 +31,7 @@ from fastapi.responses import StreamingResponse
 
 from dynastore.extensions.coverages.config import CoveragesConfig
 from dynastore.extensions.coverages.links import build_coverage_links
-from dynastore.extensions.ogc_base import OGCServiceMixin
+from dynastore.extensions.ogc_base import OGCServiceMixin, ogc_asset_href
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.ogc_policies import (
     ogc_anonymous_role_binding,
@@ -44,17 +44,6 @@ from dynastore.modules.coverages.subset import parse_subset
 from dynastore.modules.coverages.writers import MEDIA_TYPE_FOR
 
 from . import coverages_models as cm
-
-
-def _asset_href(item: dict) -> str:
-    assets = item.get("assets") or {}
-    for key in ("data", "coverage"):
-        if key in assets and assets[key].get("href"):
-            return assets[key]["href"]
-    for a in assets.values():
-        if a.get("href"):
-            return a["href"]
-    raise HTTPException(status_code=404, detail="No asset href on coverage item.")
 
 
 def _stream_coverage_geotiff(href: str, subset):
@@ -349,10 +338,10 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
     ):
         """Stream a coverage by content-negotiated format with optional subset."""
         fmt = _resolve_format(f)
-        item = await self._get_first_coverage_item(catalog_id, collection_id)
+        item = await self._get_first_item(catalog_id, collection_id)
         if item is None:
             raise HTTPException(status_code=404, detail="No coverage item found.")
-        href = _asset_href(item)
+        href = ogc_asset_href(item, error_detail="No asset href on coverage item.")
         if fmt == "geotiff":
             gen = _stream_coverage_geotiff(href, subset=subset)
         elif fmt == "covjson":
@@ -378,62 +367,23 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         self, catalog_id: str, collection_id: str,
     ) -> dict:
         """Return the OGC Coverages DomainSet derived from the first item."""
-        item = await self._get_first_coverage_item(catalog_id, collection_id)
+        item = await self._get_first_item(catalog_id, collection_id)
         return _extract_domainset(item)
 
     async def get_coverage_rangetype(
         self, catalog_id: str, collection_id: str,
     ) -> dict:
         """Return the OGC Coverages RangeType derived from the first item."""
-        item = await self._get_first_coverage_item(catalog_id, collection_id)
+        item = await self._get_first_item(catalog_id, collection_id)
         return _extract_rangetype(item)
-
-    async def _get_coverages_config(
-        self, catalog_id: Optional[str] = None, collection_id: Optional[str] = None,
-    ) -> CoveragesConfig:
-        """Fetch CoveragesConfig via the platform configs service with waterfall.
-
-        Falls back to a default-constructed CoveragesConfig if the configs service
-        is unavailable (keeps handlers resilient in test / stub contexts).
-        """
-        try:
-            configs_svc = await self._get_configs_service()
-            return await configs_svc.get_config(
-                CoveragesConfig, catalog_id, collection_id,
-            )
-        except Exception:  # pragma: no cover - defensive fallback
-            return CoveragesConfig()
-
-    async def _get_first_coverage_item(
-        self, catalog_id: str, collection_id: str,
-    ) -> Optional[dict]:
-        """Return the first item in a collection as a plain dict, or None."""
-        from dynastore.models.protocols import CatalogsProtocol
-        from dynastore.models.query_builder import QueryRequest
-
-        catalogs = cast(CatalogsProtocol, await self._get_catalogs_service())
-        try:
-            features = await catalogs.search_items(
-                catalog_id, collection_id, QueryRequest(limit=1),
-            )
-        except Exception:
-            return None
-        if not features:
-            return None
-        first = features[0]
-        # Feature is a pydantic model — coerce to the same dict shape the
-        # domainset/rangetype helpers expect.
-        if hasattr(first, "model_dump"):
-            return first.model_dump(by_alias=True, exclude_none=True)
-        return dict(first)
 
     async def get_coverage_metadata(
         self, catalog_id: str, collection_id: str, request: Request,
     ):
-        item = await self._get_first_coverage_item(catalog_id, collection_id)
+        item = await self._get_first_item(catalog_id, collection_id)
         if item is None:
             raise HTTPException(status_code=404, detail="No coverage item found.")
-        cfg = await self._get_coverages_config(catalog_id, collection_id)
+        cfg = await self._get_plugin_config(CoveragesConfig, catalog_id, collection_id)
         return _build_metadata_response(
             item=item,
             base_url=get_root_url(request).rstrip("/"),

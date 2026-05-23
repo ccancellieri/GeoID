@@ -34,7 +34,7 @@ Usage::
 """
 
 import logging
-from typing import Any, List, Optional, cast
+from typing import TYPE_CHECKING, Any, List, Optional, Type, TypeVar, cast
 
 from fastapi import HTTPException, Request, Response, status
 
@@ -51,7 +51,36 @@ from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.shared_models import Link
 from dynastore.tools.discovery import get_protocol
 
+if TYPE_CHECKING:
+    from dynastore.modules.db_config.plugin_config import PluginConfig
+
 logger = logging.getLogger(__name__)
+
+# Bound to ``PluginConfig`` so ``_get_plugin_config`` narrows its return type
+# to the requested config class and the ``config_cls()`` fallback is known to
+# be constructible.  Imported under TYPE_CHECKING only — the mixin stays free
+# of a runtime dependency on ``modules.db_config``.
+_T = TypeVar("_T", bound="PluginConfig")
+
+
+def ogc_asset_href(
+    item: dict, *, error_detail: str = "No asset href on item."
+) -> str:
+    """Return the first usable asset href from a STAC-style *item* dict.
+
+    Prefers the conventional ``data``/``coverage`` asset keys, then falls
+    back to the first asset that carries an ``href``.  Raises ``404`` with
+    *error_detail* when no asset href can be resolved.  Shared by the
+    Coverages and EDR services, which pass protocol-specific error messages.
+    """
+    assets = item.get("assets") or {}
+    for key in ("data", "coverage"):
+        if key in assets and assets[key].get("href"):
+            return assets[key]["href"]
+    for a in assets.values():
+        if a.get("href"):
+            return a["href"]
+    raise HTTPException(status_code=404, detail=error_detail)
 
 
 class OGCServiceMixin:
@@ -105,6 +134,52 @@ class OGCServiceMixin:
                 )
             self._ogc_configs_protocol = svc
         return cast(ConfigsProtocol, self._ogc_configs_protocol)
+
+    # ------------------------------------------------------------------
+    # Shared config / item access helpers
+    # ------------------------------------------------------------------
+
+    async def _get_plugin_config(
+        self,
+        config_cls: Type[_T],
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+    ) -> _T:
+        """Fetch a plugin config via the platform configs service with waterfall.
+
+        Falls back to a default-constructed ``config_cls()`` when the configs
+        service is unavailable, keeping handlers resilient in test / stub
+        contexts.  Shared by the Coverages, EDR, and DGGS services.
+        """
+        try:
+            configs_svc = await self._get_configs_service()
+            return await configs_svc.get_config(config_cls, catalog_id, collection_id)
+        except Exception:  # pragma: no cover - defensive fallback
+            return config_cls()
+
+    async def _get_first_item(
+        self,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Optional[dict]:
+        """Return the first item in a collection as a plain dict, or None."""
+        from dynastore.models.query_builder import QueryRequest
+
+        catalogs = await self._get_catalogs_service()
+        try:
+            features = await catalogs.search_items(
+                catalog_id, collection_id, QueryRequest(limit=1)
+            )
+        except Exception:
+            return None
+        if not features:
+            return None
+        first = features[0]
+        # Feature is a pydantic model — coerce to the same dict shape the
+        # domainset/rangetype helpers expect.
+        if hasattr(first, "model_dump"):
+            return first.model_dump(by_alias=True, exclude_none=True)
+        return dict(first)
 
     # ------------------------------------------------------------------
     # Fail-fast catalog-readiness guard

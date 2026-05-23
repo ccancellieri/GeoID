@@ -28,27 +28,27 @@ def test_format_rejects_unknown():
 
 
 def test_asset_href_prefers_data_key():
-    from dynastore.extensions.edr.edr_service import _asset_href
+    from dynastore.extensions.ogc_base import ogc_asset_href
     item = {
         "assets": {
             "data": {"href": "gs://bucket/data.tif"},
             "coverage": {"href": "gs://bucket/cov.tif"},
         }
     }
-    assert _asset_href(item) == "gs://bucket/data.tif"
+    assert ogc_asset_href(item) == "gs://bucket/data.tif"
 
 
 def test_asset_href_falls_back_to_any():
-    from dynastore.extensions.edr.edr_service import _asset_href
+    from dynastore.extensions.ogc_base import ogc_asset_href
     item = {"assets": {"thumbnail": {"href": "https://host/thumb.png"}}}
-    assert _asset_href(item) == "https://host/thumb.png"
+    assert ogc_asset_href(item) == "https://host/thumb.png"
 
 
 def test_asset_href_raises_404_when_missing():
     from fastapi import HTTPException
-    from dynastore.extensions.edr.edr_service import _asset_href
+    from dynastore.extensions.ogc_base import ogc_asset_href
     with pytest.raises(HTTPException) as exc:
-        _asset_href({"assets": {}})
+        ogc_asset_href({"assets": {}}, error_detail="No asset href on EDR item.")
     assert exc.value.status_code == 404
 
 

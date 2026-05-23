@@ -351,7 +351,7 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
                 detail=f"Unsupported DGGRS '{dggs_id}'. Supported: {list(_SUPPORTED_DGGRS)}",
             )
 
-        config = await self._get_dggs_config(catalog_id, collection_id)
+        config = await self._get_plugin_config(DGGSConfig, catalog_id, collection_id)
         resolution = zone_level if zone_level is not None else config.default_resolution
         resolution = min(resolution, config.max_resolution)
 
@@ -431,7 +431,7 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
             sidecar_field = f"s2_res{resolution}"
             cell_int = s2_indexer.cell_str_to_int(zoneId)
 
-        config = await self._get_dggs_config(catalog_id, collection_id)
+        config = await self._get_plugin_config(DGGSConfig, catalog_id, collection_id)
 
         if await self._has_sidecar_field(catalog_id, collection_id, sidecar_field):
             # Preferred: exact B-tree EQ on pre-computed sidecar column.
@@ -503,17 +503,6 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
             return sidecar_field in (fields or {})
         except Exception:
             return False
-
-    async def _get_dggs_config(
-        self,
-        catalog_id: Optional[str] = None,
-        collection_id: Optional[str] = None,
-    ) -> DGGSConfig:
-        try:
-            configs_svc = await self._get_configs_service()
-            return await configs_svc.get_config(DGGSConfig, catalog_id, collection_id)
-        except Exception:
-            return DGGSConfig()
 
     async def _fetch_features(
         self,

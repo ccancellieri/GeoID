@@ -165,7 +165,7 @@ async def test_get_dggs_data_calls_fetch_and_aggregates_h3():
         "max_features_per_request": 1000,
     })()
 
-    with patch.object(svc, "_get_dggs_config", new_callable=AsyncMock, return_value=fake_config), \
+    with patch.object(svc, "_get_plugin_config", new_callable=AsyncMock, return_value=fake_config), \
          patch.object(svc, "_fetch_features", new_callable=AsyncMock, return_value=[mock_feature]):
         request = MagicMock()
         result = await svc.get_dggs_data(
@@ -207,7 +207,7 @@ async def test_get_dggs_data_calls_fetch_and_aggregates_s2():
         "max_features_per_request": 1000,
     })()
 
-    with patch.object(svc, "_get_dggs_config", new_callable=AsyncMock, return_value=fake_config), \
+    with patch.object(svc, "_get_plugin_config", new_callable=AsyncMock, return_value=fake_config), \
          patch.object(svc, "_fetch_features", new_callable=AsyncMock, return_value=[mock_feature]):
         request = MagicMock()
         result = await svc.get_dggs_data(
