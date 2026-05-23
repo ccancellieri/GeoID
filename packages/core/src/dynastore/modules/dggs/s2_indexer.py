@@ -14,7 +14,7 @@
 
 """S2 indexing utilities: coordinate → cell token, cell → GeoJSON geometry."""
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 S2_MIN_LEVEL = 0
 S2_MAX_LEVEL = 30
@@ -151,27 +151,3 @@ def bbox_to_cells(
     coverer.max_cells = 1_000_000
     covering = coverer.get_covering(rect)
     return {c.to_token() for c in covering}
-
-
-def parse_bbox(bbox_str: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
-    """Parse a comma-separated bbox string into (xmin, ymin, xmax, ymax).
-
-    Returns None if the string is empty or None.
-    Raises ValueError on malformed input.
-    """
-    if not bbox_str:
-        return None
-    parts = [p.strip() for p in bbox_str.split(",")]
-    if len(parts) != 4:
-        raise ValueError(
-            f"bbox must have exactly 4 comma-separated values (xmin,ymin,xmax,ymax), got {len(parts)}"
-        )
-    try:
-        xmin, ymin, xmax, ymax = (float(p) for p in parts)
-    except ValueError:
-        raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}")
-    if xmin >= xmax or ymin >= ymax:
-        raise ValueError(
-            f"bbox is degenerate: xmin={xmin} >= xmax={xmax} or ymin={ymin} >= ymax={ymax}"
-        )
-    return xmin, ymin, xmax, ymax

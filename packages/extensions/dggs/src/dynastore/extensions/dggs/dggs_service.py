@@ -31,6 +31,9 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional, Set
 
+# Dependency-free helper (no h3/s2sphere): safe to import before the SCOPE gate.
+from dynastore.modules.dggs.bbox import parse_bbox
+
 import h3 as _h3_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires h3
 import s2sphere as _s2sphere_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires s2sphere
 _ = (_h3_scope_gate, _s2sphere_scope_gate)  # silence pyright "unused" — load-bearing for SCOPE filtering
@@ -51,7 +54,6 @@ from dynastore.modules.dggs.aggregator import aggregate_features
 from dynastore.modules.dggs.h3_indexer import (
     H3_MAX_RESOLUTION,
     H3_MIN_RESOLUTION,
-    parse_bbox,
 )
 from dynastore.modules.dggs.models import (
     DGGRSInfo,

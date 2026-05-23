@@ -14,7 +14,7 @@
 
 """H3 indexing utilities: coordinate → cell, cell → GeoJSON geometry."""
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 H3_MIN_RESOLUTION = 0
 H3_MAX_RESOLUTION = 15
@@ -113,27 +113,3 @@ def cell_int_to_str(val: int) -> str:
     from the DB and needing the canonical cell ID string.
     """
     return format(val, "x")
-
-
-def parse_bbox(bbox_str: str) -> Optional[Tuple[float, float, float, float]]:
-    """Parse a comma-separated bbox string into (xmin, ymin, xmax, ymax).
-
-    Returns None if the string is empty or None.
-    Raises ValueError on malformed input.
-    """
-    if not bbox_str:
-        return None
-    parts = [p.strip() for p in bbox_str.split(",")]
-    if len(parts) != 4:
-        raise ValueError(
-            f"bbox must have exactly 4 comma-separated values (xmin,ymin,xmax,ymax), got {len(parts)}"
-        )
-    try:
-        xmin, ymin, xmax, ymax = (float(p) for p in parts)
-    except ValueError:
-        raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}")
-    if xmin >= xmax or ymin >= ymax:
-        raise ValueError(
-            f"bbox is degenerate: xmin={xmin} >= xmax={xmax} or ymin={ymin} >= ymax={ymax}"
-        )
-    return xmin, ymin, xmax, ymax
