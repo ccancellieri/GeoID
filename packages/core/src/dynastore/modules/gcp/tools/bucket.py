@@ -100,6 +100,10 @@ def get_gdal_path(file_url: str) -> str:
         base_path = f"/vsigs/{parsed_url.bucket}/{parsed_url.path}"
     elif parsed_url.scheme in [FileSystem.https, FileSystem.http]:
         base_path = f"/vsicurl/{file_url}"
+    elif parsed_url.scheme == FileSystem.file:
+        # Local / on-prem asset: GDAL/OGR cannot open a ``file://`` URI, it
+        # needs a plain filesystem path. ``parse_url`` already extracted it.
+        base_path = parsed_url.path
     else:
         base_path = file_url # Assume it's a local path
 

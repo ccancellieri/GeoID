@@ -156,4 +156,10 @@ def _to_vsigs(uri: str) -> str:
     """
     if uri.startswith("gs://"):
         return "/vsigs/" + uri[len("gs://"):]
+    if uri.startswith("file://"):
+        # Local / on-prem asset: strip the ``file://`` scheme to a plain path;
+        # GDAL/OGR readers cannot open a ``file://`` URI directly.
+        from urllib.parse import urlparse
+
+        return urlparse(uri).path or uri
     return uri
