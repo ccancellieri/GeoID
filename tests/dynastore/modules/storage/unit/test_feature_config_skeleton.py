@@ -11,6 +11,8 @@ from dynastore.modules.storage.computed_fields import (
     DeriveSpec,
     FeatureType,
     GeometryStat,
+    SpatialCell,
+    StatisticStorageMode,
 )
 from dynastore.modules.storage.driver_config import (
     ItemsSchema,
@@ -52,7 +54,9 @@ class TestExposeValidation:
         asyncio.run(_validate_read_policy(ItemsReadPolicy(), "cat", "col", None))
 
     def test_rejects_unknown_name(self, monkeypatch) -> None:
-        wp = ItemsWritePolicy(derive=DeriveSpec(geometry_stats=[GeometryStat(stat=ComputedKind.AREA)]))
+        wp = ItemsWritePolicy(derive=DeriveSpec(geometry_stats=[
+            GeometryStat(stat=ComputedKind.AREA, store=StatisticStorageMode.JSONB),
+        ]))
         schema = ItemsSchema(fields={"name": FieldDefinition(name="name", data_type="string")})
         monkeypatch.setattr(
             "dynastore.tools.discovery.get_protocol",
@@ -63,11 +67,55 @@ class TestExposeValidation:
             asyncio.run(_validate_read_policy(rp, "cat", "col", None))
 
     def test_accepts_computed_and_declared(self, monkeypatch) -> None:
-        wp = ItemsWritePolicy(derive=DeriveSpec(geometry_stats=[GeometryStat(stat=ComputedKind.AREA)]))
+        wp = ItemsWritePolicy(derive=DeriveSpec(geometry_stats=[
+            GeometryStat(stat=ComputedKind.AREA, store=StatisticStorageMode.JSONB),
+        ]))
         schema = ItemsSchema(fields={"name": FieldDefinition(name="name", data_type="string")})
         monkeypatch.setattr(
             "dynastore.tools.discovery.get_protocol",
             lambda _p: _fake_configs(wp, schema),
         )
         rp = ItemsReadPolicy(feature_type=FeatureType(expose=["area", "name"]))
+        asyncio.run(_validate_read_policy(rp, "cat", "col", None))
+
+    def test_rejects_exposed_but_unstored_stat(self, monkeypatch) -> None:
+        # #330 B5 — a statistic computed with store=None is never persisted, so
+        # exposing it would silently yield a missing property. Reject at save.
+        wp = ItemsWritePolicy(derive=DeriveSpec(geometry_stats=[
+            GeometryStat(stat=ComputedKind.AREA, store=None),
+        ]))
+        schema = ItemsSchema(fields={"name": FieldDefinition(name="name", data_type="string")})
+        monkeypatch.setattr(
+            "dynastore.tools.discovery.get_protocol",
+            lambda _p: _fake_configs(wp, schema),
+        )
+        rp = ItemsReadPolicy(feature_type=FeatureType(expose=["area"]))
+        with pytest.raises(ValueError, match="store=None"):
+            asyncio.run(_validate_read_policy(rp, "cat", "col", None))
+
+    def test_accepts_stored_stat(self, monkeypatch) -> None:
+        # The same stat with a store is readable — exposing it is fine.
+        wp = ItemsWritePolicy(derive=DeriveSpec(geometry_stats=[
+            GeometryStat(stat=ComputedKind.AREA, store=StatisticStorageMode.COLUMNAR),
+        ]))
+        schema = ItemsSchema(fields={"name": FieldDefinition(name="name", data_type="string")})
+        monkeypatch.setattr(
+            "dynastore.tools.discovery.get_protocol",
+            lambda _p: _fake_configs(wp, schema),
+        )
+        rp = ItemsReadPolicy(feature_type=FeatureType(expose=["area"]))
+        asyncio.run(_validate_read_policy(rp, "cat", "col", None))
+
+    def test_accepts_spatial_cell_without_store(self, monkeypatch) -> None:
+        # Spatial cells / hashes / external_id always materialise their own
+        # column (storage_mode does not apply), so exposing them is always valid.
+        wp = ItemsWritePolicy(derive=DeriveSpec(
+            spatial_cells=[SpatialCell(grid="h3", resolution=7)],
+        ))
+        schema = ItemsSchema(fields={"name": FieldDefinition(name="name", data_type="string")})
+        monkeypatch.setattr(
+            "dynastore.tools.discovery.get_protocol",
+            lambda _p: _fake_configs(wp, schema),
+        )
+        rp = ItemsReadPolicy(feature_type=FeatureType(expose=["h3_7"]))
         asyncio.run(_validate_read_policy(rp, "cat", "col", None))

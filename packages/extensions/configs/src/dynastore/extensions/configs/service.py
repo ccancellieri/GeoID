@@ -841,6 +841,39 @@ class ConfigsService(ExtensionProtocol):
             )
             merged, summary = merge_derived_fields(current.fields or {}, derived)
 
+            # Propose the physical ``attribute_schema`` the merged items_schema
+            # implies, using the SAME SSOT bridge the PG driver runs at
+            # materialisation (``bridge_schema_to_attribute_sidecar``). Returning
+            # it here keeps ``items_schema.fields`` and the columnar
+            # ``attribute_schema`` from drifting silently: a field only lands in
+            # a native column when it carries a constraint, ``access=FAST``, or a
+            # queryable capability — otherwise it stays in JSONB. ``summary``
+            # reports the split so an author sees, up front, which fields will
+            # NOT become columns (the START_DATE/END_DATE foot-gun).
+            from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+                FeatureAttributeSidecarConfig,
+            )
+            from dynastore.modules.storage.field_constraints import (
+                bridge_schema_to_attribute_sidecar,
+            )
+
+            proposed_schema = current.model_copy(update={"fields": merged})
+            bridged = bridge_schema_to_attribute_sidecar(
+                proposed_schema, FeatureAttributeSidecarConfig()
+            )
+            attribute_schema = [
+                entry.model_dump(mode="json", exclude_none=True)
+                for entry in (bridged.attribute_schema or [])
+            ]
+            columnar = {entry["name"] for entry in attribute_schema}
+            summary["columnar"] = sorted(columnar)
+            summary["jsonb"] = sorted(
+                name
+                for name, fd in merged.items()
+                if not (fd.data_type or "").lower().startswith("geometry")
+                and name not in columnar
+            )
+
             return {
                 "catalog_id": catalog_id,
                 "collection_id": collection_id,
@@ -850,6 +883,7 @@ class ConfigsService(ExtensionProtocol):
                     name: fd.model_dump(mode="json", exclude_none=True)
                     for name, fd in merged.items()
                 },
+                "attribute_schema": attribute_schema,
                 "summary": summary,
             }
         except problem_details.ProblemException:

@@ -35,6 +35,7 @@ etc.), not *what operation* it performs.  Operations are defined in
 """
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from enum import StrEnum
@@ -55,6 +56,7 @@ from dynastore.models.protocols.typed_driver import _PluginDriverConfig
 from dynastore.models.mutability import Computed, Immutable, Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.modules.storage.computed_fields import (
+    _STATISTIC_STORAGE_KINDS,
     ComputedField,
     ComputedKind,
     DeriveSpec,
@@ -81,6 +83,8 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
 )
 
 _PgSidecarConfig = PgSidecarConfig
+
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +694,52 @@ class ItemsWritePolicy(PluginConfig):
         # ``name`` on EXTERNAL_ID is the source path (no leading "properties."
         # collapse — that's resolved at extraction time).
         return cf.name or None
+
+
+async def _warn_unstored_unreferenced_stats(
+    config: PluginConfig,
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    db_resource: Optional[object],
+) -> None:
+    """Warn on statistic derivations that are computed but stored nowhere.
+
+    A ``geometry_stats`` / ``attribute_stats`` entry with ``store=None`` is
+    computed on every write but never persisted. That is legitimate only when
+    an identity rule references it (a compute-only match axis). When no identity
+    rule does, the value feeds nothing — it cannot be exposed (``ItemsReadPolicy``
+    rejects exposing it), queried, or read back — so a ``store: null`` here is
+    almost always an authoring foot-gun (the GLOSIS case declared ``area`` this
+    way and then referenced it downstream, where it silently never existed).
+
+    Surfaced as a WARNING rather than a hard error: staging a derivation before
+    wiring its consumer is a valid intermediate state, and the read-side
+    ``expose`` validator already turns the actually-broken case into a 4xx.
+    """
+    if not isinstance(config, ItemsWritePolicy):
+        return
+    identity_names = {n for rule in config.identity for n in rule.match_on}
+    suspect = sorted(
+        cf.resolved_name
+        for cf in config.compute
+        if cf.kind in _STATISTIC_STORAGE_KINDS
+        and cf.storage_mode is None
+        and cf.resolved_name not in identity_names
+    )
+    if suspect:
+        _logger.warning(
+            "ItemsWritePolicy for %s/%s declares statistic(s) %s with store=None "
+            "that no identity rule references: they are computed on every write "
+            "but never persisted and feed nothing, so they cannot be exposed or "
+            "queried. Set a store (jsonb/columnar) to materialise them, reference "
+            "them from an identity rule, or remove them.",
+            catalog_id,
+            collection_id,
+            suspect,
+        )
+
+
+ItemsWritePolicy.register_validate_handler(_warn_unstored_unreferenced_stats)
 
 
 # ---------------------------------------------------------------------------

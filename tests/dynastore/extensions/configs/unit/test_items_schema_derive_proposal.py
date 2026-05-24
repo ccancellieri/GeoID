@@ -116,6 +116,55 @@ async def test_happy_path_merges_and_preserves_tuning() -> None:
 
 
 @pytest.mark.asyncio
+async def test_proposes_attribute_schema_for_constrained_fields() -> None:
+    # #330 B4 — the proposal carries a physical ``attribute_schema`` aligned to
+    # the merged items_schema, derived through the same SSOT bridge the PG driver
+    # uses at materialisation. A field becomes a native column only when it
+    # carries a constraint, ``access=FAST``, or a queryable capability; plain
+    # fields stay in JSONB. The split is reported under ``summary``.
+    current = ItemsSchema(fields={
+        "name": FieldDefinition(name="name", data_type="string", access=FieldAccess.FAST),
+        "osm_id": FieldDefinition(name="osm_id", data_type="integer", required=True),
+    })
+    svc, ctx = _service(
+        current_schema=current,
+        collection=object(),
+        asset=_asset({"gdalinfo": _GDALINFO}),
+    )
+    out = await _run(svc, ctx)
+
+    attr = {e["name"]: e for e in out["attribute_schema"]}
+    # FAST field + required field both lift into columns; plain is_paved stays JSONB.
+    assert set(attr) == {"name", "osm_id"}
+    assert attr["name"]["type"] == "TEXT"
+    assert attr["name"]["nullable"] is True
+    assert attr["osm_id"]["nullable"] is False  # required -> NOT NULL
+    # geometry is owned by the geometry sidecar and never an attribute column.
+    assert "geometry" not in attr
+
+    summary = out["summary"]
+    assert summary["columnar"] == ["name", "osm_id"]
+    assert summary["jsonb"] == ["is_paved"]
+
+
+@pytest.mark.asyncio
+async def test_plain_fields_stay_jsonb_are_surfaced() -> None:
+    # #330 B4 — the GLOSIS foot-gun: plain (AUTO, unconstrained) fields silently
+    # land in JSONB rather than a column. The proposal makes that explicit: an
+    # empty ``attribute_schema`` and every field listed under ``summary['jsonb']``.
+    svc, ctx = _service(
+        current_schema=ItemsSchema(),
+        collection=object(),
+        asset=_asset({"gdalinfo": _GDALINFO}),
+    )
+    out = await _run(svc, ctx)
+
+    assert out["attribute_schema"] == []
+    assert out["summary"]["columnar"] == []
+    assert out["summary"]["jsonb"] == ["is_paved", "name", "osm_id"]
+
+
+@pytest.mark.asyncio
 async def test_existing_field_not_in_asset_is_preserved() -> None:
     current = ItemsSchema(fields={
         "legacy": FieldDefinition(name="legacy", data_type="string", access=FieldAccess.FAST),

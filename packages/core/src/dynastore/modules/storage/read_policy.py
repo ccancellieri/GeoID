@@ -95,13 +95,16 @@ async def _validate_read_policy(
     collection_id: Optional[str],
     db_resource: Optional[object],
 ) -> None:
-    """Reject ``feature_type.expose`` names the collection can't produce.
+    """Reject ``feature_type.expose`` names the collection can't surface.
 
-    Each ``expose`` entry must resolve to a ``ComputedField.resolved_name``
-    from ``ItemsWritePolicy.compute`` or a declared ``ItemsSchema.fields``
-    key at the same scope. Fail-fast at config-save so a typo never silently
-    drops an expected output property. Skipped when the sibling configs are
-    not yet present.
+    Each ``expose`` entry must resolve to a declared ``ItemsSchema.fields`` key
+    or a *readable* ``ComputedField`` from ``ItemsWritePolicy.compute`` at the
+    same scope. A statistic derivation declared with ``store=None`` is computed
+    but never persisted, so it cannot be read back — exposing it would silently
+    yield a missing property (the GLOSIS foot-gun). Both unknown names and
+    exposed-but-unstored statistics are rejected fail-fast at config-save so a
+    typo or a ``store: null`` never quietly drops an expected output property.
+    Skipped when the sibling configs are not yet present.
     """
     if not isinstance(config, ItemsReadPolicy):
         return
@@ -111,6 +114,9 @@ async def _validate_read_policy(
 
     try:
         from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.storage.computed_fields import (
+            _STATISTIC_STORAGE_KINDS,
+        )
         from dynastore.modules.storage.driver_config import (
             ItemsSchema,
             ItemsWritePolicy,
@@ -124,18 +130,41 @@ async def _validate_read_policy(
         wp = await configs.get_config(
             ItemsWritePolicy, catalog_id=catalog_id, collection_id=collection_id
         )
-        computed = {cf.resolved_name for cf in getattr(wp, "compute", []) or []}
+        computed = {cf.resolved_name: cf for cf in getattr(wp, "compute", []) or []}
         schema = await configs.get_config(
             ItemsSchema, catalog_id=catalog_id, collection_id=collection_id
         )
         declared = set(getattr(schema, "fields", {}) or {})
-        allowed = computed | declared
-        unknown = [e for e in expose if e not in allowed]
-        if unknown:
+
+        unknown: list[str] = []
+        unstored: list[str] = []
+        for e in expose:
+            if e in declared:
+                continue
+            cf = computed.get(e)
+            if cf is None:
+                unknown.append(e)
+            elif cf.kind in _STATISTIC_STORAGE_KINDS and cf.storage_mode is None:
+                # Computed every write but persisted nowhere — unreadable.
+                unstored.append(e)
+
+        if unknown or unstored:
+            parts: list[str] = []
+            if unknown:
+                parts.append(
+                    "reference field(s) not produced by ItemsWritePolicy.compute "
+                    f"nor declared in ItemsSchema.fields: {sorted(unknown)}"
+                )
+            if unstored:
+                parts.append(
+                    "reference computed statistic(s) declared with store=None "
+                    "(computed but never persisted, so unreadable): "
+                    f"{sorted(unstored)} — set a store (jsonb/columnar) on the "
+                    "geometry_stats/attribute_stats entry to surface them"
+                )
             raise ValueError(
-                "ItemsReadPolicy.feature_type.expose references field(s) not produced "
-                f"by ItemsWritePolicy.compute nor declared in ItemsSchema.fields for "
-                f"{catalog_id}/{collection_id}: {sorted(unknown)}. "
+                "ItemsReadPolicy.feature_type.expose for "
+                f"{catalog_id}/{collection_id} " + "; ".join(parts) + ". "
                 f"Computed: {sorted(computed)}; declared: {sorted(declared)}."
             )
     except ValueError:
