@@ -28,7 +28,11 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from dynastore.modules.db_config.engine_config import ValkeyEngineConfig
-from dynastore.tools.cache_valkey import ValkeyCacheBackend, build_valkey_client
+from dynastore.tools.cache_valkey import (
+    ValkeyCacheBackend,
+    build_discovery_port_remap,
+    build_valkey_client,
+)
 
 
 # --------------------------------------------------------------------------
@@ -49,9 +53,75 @@ def test_valkey_engine_config_cluster_discovery_defaults() -> None:
     #     connections — only the discovery endpoint answers).
     assert cfg.require_full_coverage is False
     assert cfg.dynamic_startup_nodes is False
+    # Discovery-port remap is opt-in — only Memorystore Valkey 9 advertises
+    # unreachable internal shard addresses, so the default must not perturb
+    # Valkey 8 / other clusters that advertise reachable node addresses.
+    assert cfg.discovery_port_remap is False
     # Discovery endpoint is opt-in (set via configs API in cluster deployments).
     assert cfg.discovery_host is None
     assert cfg.discovery_port == 6379
+
+
+# --------------------------------------------------------------------------
+# build_discovery_port_remap — Memorystore Valkey 9 unreachable-shard fix
+# --------------------------------------------------------------------------
+
+
+def test_build_discovery_port_remap_forces_discovery_port_keeps_host() -> None:
+    """The remap rewrites the port to discovery_port and preserves the host.
+
+    Memorystore Valkey 9 CLUSTER advertises internal shard addresses at the
+    cluster-bus port range (e.g. ``10.132.0.10:11026``). Each shard's host is
+    still its own reachable PSC IP, so the remap must keep the host and only
+    correct the port (dynastore#264).
+    """
+    remap = build_discovery_port_remap(6379)
+    # Internal cluster-bus address → reachable PSC endpoint, same host.
+    assert remap(("10.132.0.10", 11026)) == ("10.132.0.10", 6379)
+    assert remap(("10.132.0.9", 11007)) == ("10.132.0.9", 6379)
+    # Already-correct port is left as the discovery port (idempotent).
+    assert remap(("10.132.0.9", 6379)) == ("10.132.0.9", 6379)
+
+
+def test_build_discovery_port_remap_honours_non_default_port() -> None:
+    """A non-6379 discovery port is propagated to every remapped address."""
+    remap = build_discovery_port_remap(6380)
+    assert remap(("10.132.0.10", 11026)) == ("10.132.0.10", 6380)
+
+
+def test_build_valkey_client_cluster_wires_address_remap_when_enabled() -> None:
+    """``discovery_port_remap=True`` wires an ``address_remap`` callable.
+
+    The callable handed to ValkeyCluster must rewrite a discovered internal
+    shard address to the reachable discovery port while keeping the host.
+    """
+    with patch("valkey.asyncio.cluster.ValkeyCluster") as MockCluster:
+        build_valkey_client(
+            cluster_mode=True,
+            discovery_host="10.132.0.9",
+            discovery_port=6379,
+            discovery_port_remap=True,
+        )
+
+    MockCluster.assert_called_once()
+    _args, kwargs = MockCluster.call_args
+    remap = kwargs["address_remap"]
+    assert callable(remap)
+    assert remap(("10.132.0.10", 11026)) == ("10.132.0.10", 6379)
+
+
+def test_build_valkey_client_cluster_no_remap_by_default() -> None:
+    """Without the flag, no ``address_remap`` is passed (Valkey 8 unaffected)."""
+    with patch("valkey.asyncio.cluster.ValkeyCluster") as MockCluster:
+        build_valkey_client(
+            cluster_mode=True,
+            discovery_host="10.132.0.9",
+            discovery_port=6379,
+        )
+
+    MockCluster.assert_called_once()
+    _args, kwargs = MockCluster.call_args
+    assert "address_remap" not in kwargs
 
 
 # --------------------------------------------------------------------------
@@ -137,3 +207,33 @@ def test_legacy_backend_url_path_propagates_socket_hardening() -> None:
     assert pool_kwargs["socket_connect_timeout"] == cfg.socket_connect_timeout_seconds
     assert pool_kwargs["socket_keepalive"] is True
     assert pool_kwargs["socket_keepalive_options"]  # non-empty on Linux/macOS
+
+
+# --------------------------------------------------------------------------
+# ValkeyEngineConfig.engine_init — plumbs discovery_port_remap to the builder
+# --------------------------------------------------------------------------
+
+
+async def test_engine_init_plumbs_discovery_port_remap_to_builder() -> None:
+    """The engine config forwards ``discovery_port_remap`` to build_valkey_client.
+
+    Pins the wiring so a Memorystore Valkey 9 operator who flips the config
+    knob actually gets the address-remap behaviour built into the client.
+    """
+    cfg = ValkeyEngineConfig(
+        cluster_mode=True,
+        discovery_host="10.132.0.9",  # type: ignore[arg-type]
+        discovery_port=6379,
+        discovery_port_remap=True,
+    )
+    with patch(
+        "dynastore.tools.cache_valkey.build_valkey_client",
+        return_value=(object(), None),
+    ) as mock_build:
+        await cfg.engine_init()
+
+    mock_build.assert_called_once()
+    _args, kwargs = mock_build.call_args
+    assert kwargs["discovery_port_remap"] is True
+    assert kwargs["cluster_mode"] is True
+    assert kwargs["discovery_host"] == "10.132.0.9"

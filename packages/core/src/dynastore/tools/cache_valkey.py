@@ -26,8 +26,8 @@ Configuration SSOT is ``ValkeyEngineConfig`` (in
 ``modules/db_config/engine_config.py``), exposed via the configs API
 under ``platform/protocols/storage`` and applied live without restart —
 URL, discovery_host/port, cluster_mode, require_full_coverage,
-dynamic_startup_nodes, TLS, IAM, socket_timeout/connect_timeout,
-TCP keepalives.
+dynamic_startup_nodes, discovery_port_remap, TLS, IAM,
+socket_timeout/connect_timeout, TCP keepalives.
 
 Env-var bootstrap fallback (used only when the engine cache isn't
 available, e.g. a minimal worker SCOPE that omits ``DBConfigModule``):
@@ -58,7 +58,7 @@ import os
 import socket
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 
 # msgpack + valkey are optional — provided by the ``module_cache`` extra.
@@ -259,6 +259,33 @@ def _build_keepalive_options(
     return opts
 
 
+def build_discovery_port_remap(
+    discovery_port: int,
+) -> Callable[[Tuple[str, int]], Tuple[str, int]]:
+    """Build an ``address_remap`` callable that forces every node to the discovery port.
+
+    GCP Memorystore for Valkey 9 CLUSTER instances answer topology commands
+    (``CLUSTER SLOTS`` / ``CLUSTER NODES``) on the PSC discovery endpoint with
+    *internal* shard addresses at the cluster-bus port range (e.g.
+    ``10.132.0.10:11026``). Those addresses are **not reachable** from a client
+    going through PSC — the client follows them and hangs (the v8→v9 regression
+    in dynastore#264).
+
+    Each shard's advertised host is still its own reachable PSC IP; only the
+    port is wrong. valkey-py invokes ``RedisCluster.remap_host_port`` on every
+    discovered ``(host, port)``; this callable preserves the discovered host
+    and rewrites the port back to ``discovery_port`` (typically ``6379``), so
+    the client talks to each shard on its reachable PSC endpoint instead of the
+    internal cluster-bus port.
+    """
+
+    def _remap(address: Tuple[str, int]) -> Tuple[str, int]:
+        host, _port = address
+        return (host, discovery_port)
+
+    return _remap
+
+
 def build_valkey_client(
     *,
     url: Optional[str] = None,
@@ -267,6 +294,7 @@ def build_valkey_client(
     cluster_mode: bool = False,
     require_full_coverage: bool = False,
     dynamic_startup_nodes: bool = False,
+    discovery_port_remap: bool = False,
     tls: bool = False,
     tls_ca_path: Optional[str] = None,
     tls_cert_reqs: str = "none",
@@ -287,6 +315,12 @@ def build_valkey_client(
     set, uses the host+port discovery endpoint with ``dynamic_startup_nodes``
     + ``require_full_coverage`` knobs (Memorystore Valkey CLUSTER pattern).
     Otherwise falls back to ``ValkeyCluster.from_url(url, ...)``.
+
+    ``discovery_port_remap`` (cluster mode only): when True, every node address
+    discovered from the cluster topology has its port rewritten back to
+    ``discovery_port`` via an ``address_remap`` callable. This is the fix for
+    Memorystore Valkey 9 CLUSTER, which advertises unreachable internal shard
+    addresses at the cluster-bus port range (see ``build_discovery_port_remap``).
     """
     if not _CACHE_DEPS_OK:
         raise ModuleNotFoundError(
@@ -348,6 +382,14 @@ def build_valkey_client(
         cluster_kwargs["ssl"] = tls
         cluster_kwargs["require_full_coverage"] = require_full_coverage
         cluster_kwargs["dynamic_startup_nodes"] = dynamic_startup_nodes
+
+        # Memorystore Valkey 9 advertises unreachable internal shard
+        # addresses (cluster-bus port range) in its topology; rewrite every
+        # discovered node's port back to the reachable discovery port.
+        if discovery_port_remap:
+            cluster_kwargs["address_remap"] = build_discovery_port_remap(
+                discovery_port
+            )
 
         # Discovery endpoint preferred (Memorystore Valkey CLUSTER pattern)
         if discovery_host:

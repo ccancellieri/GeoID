@@ -589,6 +589,23 @@ class ValkeyEngineConfig(EngineConfig):
         ),
     )
 
+    discovery_port_remap: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Rewrite every cluster-discovered node address to the "
+            "``discovery_port`` (cluster mode only).  GCP Memorystore for "
+            "Valkey 9 CLUSTER advertises unreachable internal shard "
+            "addresses at the cluster-bus port range (e.g. "
+            "``10.132.0.10:11026``) in ``CLUSTER SLOTS`` / ``CLUSTER NODES`` "
+            "responses; following them hangs the client.  When True, an "
+            "``address_remap`` callable preserves each discovered host but "
+            "forces its port back to ``discovery_port`` so the client talks "
+            "to each shard on its reachable PSC endpoint.  Leave False for "
+            "Memorystore Valkey 8 and other clusters that advertise "
+            "reachable node addresses."
+        ),
+    )
+
     # ------------------------------------------------------------------
     # TLS (Mutable)
     # ------------------------------------------------------------------
@@ -723,6 +740,7 @@ class ValkeyEngineConfig(EngineConfig):
             cluster_mode=self.cluster_mode,
             require_full_coverage=self.require_full_coverage,
             dynamic_startup_nodes=self.dynamic_startup_nodes,
+            discovery_port_remap=self.discovery_port_remap,
             tls=self.tls,
             tls_ca_path=self.tls_ca_path,
             tls_cert_reqs=self.tls_cert_reqs,
