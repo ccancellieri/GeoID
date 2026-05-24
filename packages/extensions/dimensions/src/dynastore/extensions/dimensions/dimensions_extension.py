@@ -41,7 +41,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Query, Request
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
@@ -56,7 +56,10 @@ from dynastore.models.driver_context import DriverContext
 # ``get_registered_dimensions`` below already use class-name matching to avoid
 # triggering this import from the rest of the codebase.
 from ogc_dimensions.api.routes import (
-    DIMENSIONS, DimensionConfig, router as dimensions_router,
+    DIMENSIONS,
+    DimensionConfig,
+    router as dimensions_router,
+    search as _upstream_search,
 )
 from ogc_dimensions.providers import (
     DailyPeriodProvider,
@@ -64,6 +67,8 @@ from ogc_dimensions.providers import (
     StaticTreeProvider,
     LeveledTreeProvider,
 )
+
+from .similarity import search_similar
 
 logger = logging.getLogger(__name__)
 
@@ -656,6 +661,86 @@ async def materialize_all_dimensions(
 
 
 # ---------------------------------------------------------------------------
+# Similarity search route (OGC conf/dimension-similarity)
+# ---------------------------------------------------------------------------
+
+
+def _similarity_feature(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrap one ``{id, name, score}`` ranked member as a GeoJSON Feature."""
+    return {
+        "type": "Feature",
+        "id": row.get("id"),
+        "geometry": None,
+        "properties": {
+            "title": row.get("name"),
+            "recordType": "dimension-member",
+            "dimension:similarity": row.get("score"),
+        },
+    }
+
+
+async def search_route(
+    request: Request,
+    dimension_id: str,
+    similar: Optional[str] = Query(
+        None,
+        description=(
+            "Free-text query for lexical (pg_trgm) similarity ranking of "
+            "dimension members. Implements OGC conf/dimension-similarity."
+        ),
+    ),
+    exact: Optional[str] = Query(None, description="Exact match on member code"),
+    min: Optional[str] = Query(None, description="Range minimum"),
+    max: Optional[str] = Query(None, description="Range maximum"),
+    like: Optional[str] = Query(None, description="Pattern match (fnmatch)"),
+    extent_min: Optional[str] = Query(None, description="Extent minimum"),
+    extent_max: Optional[str] = Query(None, description="Extent maximum"),
+    limit: int = Query(100, ge=1, le=10000),
+    language: Optional[str] = Query(None, description="RFC 5646 Language-Tag."),
+):
+    """Search dimension members.
+
+    When ``?similar=`` is present this runs the default ``pg_trgm`` lexical
+    similarity ranking over the materialized members (OGC
+    ``conf/dimension-similarity``), returning a ranked FeatureCollection.
+    All other search parameters (``exact`` / ``min`` / ``max`` / ``like``)
+    are delegated unchanged to the upstream ogc-dimensions in-memory search,
+    keeping a single source of truth for those protocols.
+    """
+    if similar is not None:
+        rows = await search_similar(dimension_id, similar, limit=limit)
+        features = [_similarity_feature(r) for r in rows]
+        self_url = str(
+            request.url.remove_query_params(keys=list(request.query_params.keys()))
+        )
+        return {
+            "type": "FeatureCollection",
+            "numberMatched": len(features),
+            "numberReturned": len(features),
+            "features": features,
+            "links": [
+                {"rel": "self", "href": self_url, "type": "application/geo+json"},
+            ],
+        }
+
+    # No similarity query — delegate to the upstream search implementation,
+    # which owns the exact / range / like protocols (and raises 400 when no
+    # search parameter at all is supplied).
+    return await _upstream_search(
+        request=request,
+        dimension_id=dimension_id,
+        exact=exact,
+        min=min,
+        max=max,
+        like=like,
+        extent_min=extent_min,
+        extent_max=extent_max,
+        limit=limit,
+        language=language,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Extension
 # ---------------------------------------------------------------------------
 
@@ -682,6 +767,17 @@ class DimensionsExtension(ExtensionProtocol, OGCServiceMixin):
         self._dimensions = DIMENSIONS
 
         self.router = APIRouter(prefix="/dimensions", tags=["OGC Dimensions"])
+        # Register the geoid-owned /search route BEFORE including the upstream
+        # router so it intercepts ``?similar=`` (the Similarity conformance
+        # class, backed by pg_trgm over materialized members) while delegating
+        # exact / range / like back to the upstream in-memory implementation.
+        # FastAPI matches the first-registered route for a given path.
+        self.router.add_api_route(
+            "/{dimension_id}/search",
+            search_route,
+            methods=["GET"],
+            name="dimensions-search",
+        )
         self.router.include_router(dimensions_router)
 
         logger.info(

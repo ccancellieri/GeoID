@@ -31,6 +31,10 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 -- Tries to enable btree_gist, required for advanced indexing capabilities.
 CREATE EXTENSION IF NOT EXISTS btree_gin;
 
+-- Enables trigram (pg_trgm) lexical fuzzy matching: similarity() / `%` operator
+-- and gin_trgm_ops index support, used by the dimension Similarity search.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 -- SELECT extname, extversion FROM pg_extension WHERE extname = 'btree_gin';
 
 -- SHOW search_path;

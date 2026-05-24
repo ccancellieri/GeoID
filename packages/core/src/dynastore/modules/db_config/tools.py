@@ -95,6 +95,10 @@ async def ensure_init_db(resource: DbResource):
     # sidecar GENERATED columns to maintain the SHA256 *_hash columns
     # without application-side write code.
     await maintenance_tools.ensure_db_extension(resource, "pgcrypto")
+    # pg_trgm powers lexical fuzzy matching (``similarity()`` / ``%`` operator).
+    # Used by the dimension Similarity conformance class to rank materialized
+    # dimension members by trigram similarity against their member labels.
+    await maintenance_tools.ensure_db_extension(resource, "pg_trgm")
 
     # --- Initialize Platform Config Storage ---
     from dynastore.modules.db_config.platform_config_service import PlatformConfigService
