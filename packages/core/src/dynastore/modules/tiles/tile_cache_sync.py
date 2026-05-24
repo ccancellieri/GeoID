@@ -12,21 +12,24 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-"""Write-reactive tile-cache invalidation (issue #1292, Phase 1).
+"""Write-reactive tile-cache invalidation (issue #1292; enqueue reworked in #1298).
 
 When features in a collection are created or updated, any cached map tile
 that overlaps the feature's *new* bbox is now stale. This module is the
 coordinator that, on the write path, works out which tiles a batch of
-features touches across the served zoom range and enqueues a durable
-mark-stale obligation on the OUTBOX — the same atomic, retry-guaranteed
-machinery the secondary index uses. A background drain then deletes those
-tiles so the next read repopulates lazily from fresh data.
+features touches across the served zoom range and enqueues a
+``tiles_preseed`` task with ``operation=invalidate`` and the batch's
+per-feature bboxes. That task runs on the EXISTING tiles-preseed Cloud Run
+Job and deletes the covered tiles (no render, no save), so the next read
+repopulates lazily from fresh data.
 
-Design (see #1292):
+Design (see #1292 / #1298):
 
-* **OUTBOX seam, not events.** The enqueue rides the write transaction
-  (atomic with the data write); a failed enqueue rolls the write back.
-  Delivery is retry-guaranteed by the drain.
+* **Reuse the preseed mechanism, no new Job (#1298).** Earlier this enqueued
+  a bespoke ``tile_cache_invalidator`` OUTBOX obligation drained by its own
+  Cloud Run Job. That separate drain is gone — invalidation is now just the
+  light branch of the preseed task (``operation=invalidate``), enqueued as a
+  normal task on the already-deployed ``tiles_preseed`` job.
 * **Capability-gated, enabled by default.** No on/off flag. The
   participant is active for a collection when a tile reader
   (``TileStorageProtocol``) is registered AND its backing store is
@@ -34,7 +37,16 @@ Design (see #1292):
 * **Verify + degrade.** If the store is not usable we log a WARNING and
   skip — the cache is simply not accelerated. Invalidation must NEVER
   block a read or a write.
-* **Invalidate, don't eager-render.** We mark tiles stale (delete them);
+* **Coalesce only identical coverage via dedup_key.** Each batch enqueues a
+  light invalidate task carrying *that batch's* coverage. The ``dedup_key``
+  embeds a coverage signature derived from the batch's bboxes, so it
+  coalesces ONLY edits whose coverage is identical to an already-queued
+  task (safe — the surviving task invalidates that exact area, and the lazy
+  read-miss re-render reflects every write there). Edits at a DISTINCT bbox
+  get a different signature and therefore their OWN invalidate task — no
+  edit's tiles are ever dropped. Within a single batch, coalescing still
+  happens via per-feature bbox dedup + the capped ``affected_tiles_for_batch``.
+* **Invalidate, don't eager-render.** The invalidate task deletes the tiles;
   the existing lazy read-miss path re-renders via ``ST_AsMVT``.
 * **Scale.** We never load geometry — we read the canonical bbox envelope
   off the Feature and compute tile coverage from it via ``morecantile``.
@@ -54,18 +66,12 @@ unioned in once core carries it on the write/event payload.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
-
-# OUTBOX driver_id for the tile-cache invalidation participant. It is NOT a
-# CollectionItemsStore driver — tiles aren't entities — so it never appears
-# in the items routing config. It rides the OUTBOX as a free-form driver_id
-# whose drain (``TileCacheBulkIndexer``) marks tiles stale instead of
-# indexing documents.
-TILE_CACHE_DRIVER_ID = "tile_cache_invalidator"
 
 # Tile formats the read/render path serves and caches. ``tiles_service`` caches
 # under each of these (format is part of the tile primary key / object key), so
@@ -110,15 +116,15 @@ TileCoord = Tuple[str, int, int, int]
 # surface it to this participant. Concretely, item_service must read the
 # existing row's bbox BEFORE the upsert/delete (inside the same wrapping TX,
 # from the canonical bbox envelope column — never the raw geometry) and pass a
-# {item_id: prior_bbox} map through to ``enqueue_tile_invalidations`` /
+# {item_id: prior_bbox} map through to ``enqueue_tile_invalidation_task`` /
 # ``affected_tiles_for_batch`` (and the ITEM_DELETION event payload must carry
 # the prior bbox too). The union point is already present below: every place
 # that consumes a feature's new bbox would also consume its prior bbox and add
 # those tiles to the same coalesced set. No change to the coverage/coalesce/cap
-# math or the drain is needed — only the prior-bbox source.
+# math or the invalidate task is needed — only the prior-bbox source.
 # ---------------------------------------------------------------------------
 PHASE2_PRIOR_BBOX_EXTENSION_POINT = (
-    "affected_tiles_for_batch / enqueue_tile_invalidations accept a "
+    "affected_tiles_for_batch / enqueue_tile_invalidation_task accept a "
     "prior_bboxes map once item_service captures the pre-write bbox on the "
     "write txn (and ITEM_DELETION carries it)."
 )
@@ -449,34 +455,30 @@ async def verify_cache_store(
 
 
 # ===========================================================================
-# Enqueue side (write path) — atomic OUTBOX enqueue on the write txn
+# Enqueue side (write path) — enqueue a tiles_preseed invalidate task
 # ===========================================================================
 
+# Coordinate precision for the dedup coverage signature. 6 decimal places of
+# WGS84 longitude/latitude is ~0.1 m — fine enough to collapse float-repr noise
+# (two edits to the *same* extent hash the same) without merging genuinely
+# different extents into one dedup bucket.
+_SIGNATURE_PRECISION = 6
 
-def _encode_tile_payload(tiles: Set[TileCoord]) -> Dict[str, Any]:
-    """Serialize a coalesced tile set into a single OUTBOX payload.
 
-    One outbox row carries the whole coalesced batch (not one row per tile),
-    so a GLOSIS batch that touches thousands of tiles enqueues a single
-    durable obligation. The drain expands it back to coordinates.
+def _coverage_signature(bboxes: Sequence[Sequence[float]]) -> str:
+    """Deterministic short signature of a batch's coverage.
+
+    Sorts the bboxes and rounds each coordinate to a fixed precision, then
+    hashes the canonical repr. Identical coverage (same extents, any order,
+    float-repr noise within precision) yields the SAME signature; any distinct
+    extent yields a DIFFERENT one. Used in the dedup_key so coalescing only
+    suppresses identical-coverage edits and never drops a distinct-bbox edit.
     """
-    return {
-        "tiles": [
-            {"tms_id": tms_id, "z": z, "x": x, "y": y}
-            for (tms_id, z, x, y) in sorted(tiles)
-        ],
-    }
-
-
-def decode_tile_payload(payload: Dict[str, Any]) -> List[TileCoord]:
-    """Inverse of :func:`_encode_tile_payload` (used by the drain)."""
-    out: List[TileCoord] = []
-    for t in payload.get("tiles", []) or []:
-        try:
-            out.append((str(t["tms_id"]), int(t["z"]), int(t["x"]), int(t["y"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return out
+    rounded = sorted(
+        tuple(round(float(c), _SIGNATURE_PRECISION) for c in bbox)
+        for bbox in bboxes
+    )
+    return hashlib.sha1(repr(rounded).encode()).hexdigest()[:16]
 
 
 async def _resolve_tile_extent(
@@ -509,92 +511,124 @@ async def _resolve_tile_extent(
     return tms_ids, min_zoom, max_zoom
 
 
-async def enqueue_tile_invalidations(
-    conn: Any,
+async def enqueue_tile_invalidation_task(
     catalog_id: str,
     collection_id: str,
     features: Sequence[Any],
     *,
-    outbox: Optional[Any] = None,
-    max_tiles: int = DEFAULT_MAX_TILES_PER_BATCH,
+    engine: Any,
+    schema: str,
 ) -> int:
-    """Coalesce a batch's affected tiles and enqueue ONE OUTBOX obligation.
+    """Enqueue a ``tiles_preseed`` task with ``operation=invalidate`` (#1298).
 
-    ``conn`` is forwarded to ``outbox.enqueue_bulk``. Phase 1 callers pass
-    ``None``: the enqueue runs AFTER the data write is already committed, so
-    there is nothing to be atomic with, and ``PgOutboxStore`` then acquires
-    its OWN raw asyncpg connection and sets ``search_path`` to the tenant
-    schema (mirroring ``IndexDispatcher._enqueue_outbox_record``). A non-None
-    ``conn`` MUST be a raw asyncpg connection with ``search_path`` already
-    pinned — a SQLAlchemy connection has no ``copy_records_to_table`` and would
-    fail; the worst case of the self-managed path is one stale tile read.
+    On a feature create/update the changed bboxes make the cached tiles
+    overlapping them stale. Rather than draining a bespoke OUTBOX obligation on
+    its own Cloud Run Job (the earlier Phase-1 design), this enqueues the LIGHT
+    branch of the existing preseed task — ``operation=invalidate`` — which runs
+    on the already-deployed ``tiles_preseed`` job and DELETES the covered tiles
+    (no render, no save). The next read repopulates lazily from fresh data.
 
-    Returns the number of tiles marked for invalidation (0 when the
-    participant is inactive, no bbox is derivable, or coverage is empty).
-    Never raises out — invalidation must not break a write.
+    ``engine`` (the DB ``DbResource``) and ``schema`` (the tenant physical
+    schema) are needed to INSERT the task row via ``tasks_module.create_task``.
+    The task row is independent of the data write — both call sites run this
+    AFTER the data write committed, so there is nothing to be atomic with.
+
+    The ``dedup_key`` embeds a coverage signature derived from this batch's
+    bboxes, so it coalesces ONLY an already-queued invalidate task whose
+    coverage is identical (safe — that task invalidates the exact same area).
+    An edit at a DISTINCT bbox produces a different signature and gets its own
+    task, so its tiles are never dropped.
+
+    Returns the number of distinct bboxes enqueued on the task (0 when the
+    participant is inactive, no bbox is derivable, the task module is
+    unavailable, or an identical-coverage invalidate task is still pending — a
+    dedup hit, which is correct: that area is already queued). Never raises
+    out — invalidation must not break a write.
     """
     if not features:
         return 0
     try:
+        # Capability gate on the enqueue side (the task itself is just the
+        # executor): skip when the L2 cache is off / no usable tile store.
         if not await is_tile_cache_active(catalog_id, collection_id):
             return 0
 
-        tms_ids, min_zoom, max_zoom = await _resolve_tile_extent(
-            catalog_id, collection_id,
-        )
-        coverage = coverage_for_features(
-            features, tms_ids, min_zoom, max_zoom, max_tiles=max_tiles,
-        )
-        if not coverage.tiles:
+        # Per-feature bboxes → dedup. The task recomputes coverage (with the
+        # same coalesce + cap math) from these bboxes; we only need to pass the
+        # bboxes, not the expanded tile set.
+        seen: set = set()
+        bboxes: List[List[float]] = []
+        for f in features:
+            bb = feature_bbox(f)
+            if bb is None:
+                continue
+            key = tuple(bb)
+            if key in seen:
+                continue
+            seen.add(key)
+            bboxes.append([bb[0], bb[1], bb[2], bb[3]])
+        if not bboxes:
             return 0
 
-        from dynastore.models.protocols.indexing import OutboxRecord
-        from dynastore.modules.storage.driver_instance_id import (
-            compute_driver_instance_id,
-        )
-        from dynastore.tools.identifiers import generate_uuidv7
+        # Coverage signature → dedup_key. Two enqueues with identical coverage
+        # collapse onto one task (safe); distinct coverage gets distinct keys so
+        # no edit's tiles are ever lost to dedup.
+        signature = _coverage_signature(bboxes)
 
-        if outbox is None:
-            from dynastore.modules.storage.index_dispatcher import (
-                get_index_dispatcher,
-            )
-            outbox = get_index_dispatcher()._outbox
-        if outbox is None:
-            # No OutboxStore wired (cold boot / minimal SCOPE) — skip the
-            # enqueue rather than crash; the outer try also degrades safely.
+        from dynastore.modules.tasks import tasks_module
+        from dynastore.modules.tasks.models import TaskCreate
+        from dynastore.modules.processes.models import ExecuteRequest
+
+        # The preseed task unwraps inputs via
+        # ``TilePreseedRequest.model_validate(payload.inputs.inputs)`` — i.e. the
+        # stored task payload is an OGC ``ExecuteRequest`` whose inner ``.inputs``
+        # is the user dict. ``create_task`` stores ``TaskCreate.inputs`` verbatim
+        # and the dispatcher hydrates it back into ``ExecuteRequest(**stored)``
+        # (see processes_module.execute_process → inputs=ExecuteRequest.model_dump()
+        # and tasks/__init__.hydrate_task_payload). So we must store the full
+        # ExecuteRequest envelope, with the user dict nested under ``inputs``.
+        exec_request = ExecuteRequest(
+            inputs={
+                "catalog_id": catalog_id,
+                "collection_id": collection_id,
+                "operation": "invalidate",
+                "update_bbox": bboxes,
+            }
+        )
+
+        task = await tasks_module.create_task(
+            engine,
+            TaskCreate(
+                task_type="tiles_preseed",
+                type="process",
+                caller_id="tile_cache_invalidation",
+                inputs=exec_request.model_dump(),
+                collection_id=collection_id,
+                dedup_key=f"tile-invalidate:{catalog_id}:{collection_id}:{signature}",
+            ),
+            schema=schema,
+            initial_status="PENDING",
+        )
+        if task is None:
+            # Dedup hit — a still-pending/running invalidate task for THIS exact
+            # coverage already exists, so this batch's identical area is already
+            # queued. Correct to coalesce: the surviving task invalidates the
+            # same tiles and the lazy re-render reflects this write too.
             logger.debug(
-                "tile_cache: no OutboxStore available; skipping invalidation "
-                "enqueue for %s/%s", catalog_id, collection_id,
+                "tile_cache: invalidate task coalesced (identical coverage) "
+                "for %s/%s sig=%s",
+                catalog_id, collection_id, signature,
             )
             return 0
 
-        inst = compute_driver_instance_id(
-            TILE_CACHE_DRIVER_ID, catalog_id, collection_id,
-        )
-        op_id = generate_uuidv7()
-        record = OutboxRecord(
-            op_id=op_id,
-            driver_id=TILE_CACHE_DRIVER_ID,
-            driver_instance_id=inst,
-            collection_id=collection_id,
-            # Semantically a mark-stale / delete of the cached tiles, not an
-            # upsert of an entity. ``delete`` is the accurate op for the drain.
-            op="delete",
-            item_id=None,
-            payload=_encode_tile_payload(coverage.tiles),
-            idempotency_key=str(op_id),
-        )
-        await outbox.enqueue_bulk(conn, catalog_id=catalog_id, rows=[record])
         logger.info(
-            "tile_cache: enqueued invalidation of %d tile(s) for %s/%s "
-            "(bboxes=%d, clamped=%s)",
-            len(coverage.tiles), catalog_id, collection_id,
-            coverage.bbox_count, coverage.clamped,
+            "tile_cache: enqueued invalidate task %s for %s/%s (%d bbox(es))",
+            task.task_id, catalog_id, collection_id, len(bboxes),
         )
-        return len(coverage.tiles)
+        return len(bboxes)
     except Exception as exc:  # noqa: BLE001 — never break the write
         logger.warning(
-            "tile_cache: failed to enqueue invalidation for %s/%s: %s",
+            "tile_cache: failed to enqueue invalidate task for %s/%s: %s",
             catalog_id, collection_id, exc,
         )
         return 0

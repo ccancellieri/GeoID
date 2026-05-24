@@ -1,12 +1,14 @@
-"""Unit tests for write-reactive tile-cache invalidation (#1292, Phase 1).
+"""Unit tests for write-reactive tile-cache invalidation (#1292; #1298 enqueue).
 
 DB-free: exercises the pure coverage/coalesce/cap math, the capability
-gate + degrade, the OUTBOX enqueue (with a fake OutboxStore), the drain-side
-:class:`TileCacheBulkIndexer` (with a fake provider), and config-reactivity
-reconcile (with fakes), without touching Postgres or a bucket.
+gate + degrade, the ``tiles_preseed`` invalidate-task enqueue (driving the
+REAL ``TaskCreate``/``create_task`` shape so an envelope bug fails here rather
+than silently in prod), and config-reactivity reconcile (with fakes), without
+touching Postgres or a bucket.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, List, Tuple
 
 import pytest
@@ -14,11 +16,9 @@ import pytest
 from dynastore.modules.tiles import tile_cache_sync as tcs
 from dynastore.modules.tiles.tile_cache_sync import (
     DEFAULT_MAX_TILES_PER_BATCH,
-    TILE_CACHE_DRIVER_ID,
     affected_tiles_for_batch,
     clamp_zoom_range_to_cap,
     coverage_for_features,
-    decode_tile_payload,
     feature_bbox,
 )
 
@@ -165,23 +165,6 @@ def test_clamp_monotonic_in_cap():
     assert high >= low
 
 
-# ---------------------------------------------------------------------------
-# payload encode/decode round-trip
-# ---------------------------------------------------------------------------
-
-
-def test_payload_round_trip():
-    tiles = {("WebMercatorQuad", 3, 4, 5), ("WebMercatorQuad", 6, 7, 8)}
-    payload = tcs._encode_tile_payload(tiles)
-    decoded = set(decode_tile_payload(payload))
-    assert decoded == tiles
-
-
-def test_decode_skips_malformed_entries():
-    payload = {"tiles": [{"tms_id": "X", "z": 1, "x": 2, "y": 3}, {"bad": True}]}
-    assert decode_tile_payload(payload) == [("X", 1, 2, 3)]
-
-
 # ===========================================================================
 # Capability gate + degrade
 # ===========================================================================
@@ -190,7 +173,8 @@ def test_decode_skips_malformed_entries():
 class _FakeProvider:
     """Fake reader/store implementing the coordinate-variant primitive (#1292).
 
-    Records each coordinate-variant delete (all served formats in one call).
+    Method signatures match the real ``TileStorageProtocol`` so a green run
+    here is genuine verification, not a shape-mismatch false positive.
     """
 
     def __init__(self, *, exists_raises: bool = False) -> None:
@@ -198,13 +182,13 @@ class _FakeProvider:
         self.deleted: List[Tuple] = []          # per-format delete_tile calls
         self.variant_calls: List[Tuple] = []    # delete_tile_variants calls
 
-    async def check_tile_exists(self, *args, **kwargs) -> bool:
+    async def check_tile_exists(self, catalog_id, collection_id, tms_id, z, x, y, format) -> bool:
         if self.exists_raises:
             raise RuntimeError("bucket unreachable")
         return False
 
-    async def delete_tile(self, catalog_id, collection_id, tms_id, z, x, y, fmt) -> bool:
-        self.deleted.append((catalog_id, collection_id, tms_id, z, x, y, fmt))
+    async def delete_tile(self, catalog_id, collection_id, tms_id, z, x, y, format) -> bool:
+        self.deleted.append((catalog_id, collection_id, tms_id, z, x, y, format))
         return True
 
     async def delete_tile_variants(
@@ -217,17 +201,6 @@ class _FakeProvider:
 
     async def delete_tiles_for_collection(self, catalog_id, collection_id) -> int:
         return 0
-
-
-class _LegacyProvider:
-    """Provider WITHOUT the variant primitive — exercises the drain fallback."""
-
-    def __init__(self) -> None:
-        self.deleted: List[Tuple] = []
-
-    async def delete_tile(self, catalog_id, collection_id, tms_id, z, x, y, fmt) -> bool:
-        self.deleted.append((catalog_id, collection_id, tms_id, z, x, y, fmt))
-        return True
 
 
 @pytest.mark.asyncio
@@ -256,377 +229,348 @@ async def test_gate_degrades_when_store_unusable(monkeypatch):
 
 
 # ===========================================================================
-# Enqueue side (OUTBOX, atomic) — with a fake OutboxStore
+# Enqueue side — enqueue a tiles_preseed `operation=invalidate` task (#1298).
+#
+# These drive the REAL TaskCreate / create_task input shaping. A fake DB layer
+# (managed_transaction + DQLQuery) lets the genuine create_task build its INSERT
+# so we can assert the stored `inputs` is the OGC ExecuteRequest envelope the
+# preseed task consumes (payload.inputs.inputs). Mocking create_task into a
+# no-op would hide an envelope bug — exactly the Phase-1 lesson.
 # ===========================================================================
 
 
-class _FakeOutbox:
-    def __init__(self) -> None:
-        self.rows: List[Any] = []
-        self.conns: List[Any] = []
+class _FakeRowResult:
+    """A minimal row dict that Task.model_validate can accept for create_task."""
 
-    async def enqueue_bulk(self, conn=None, *, catalog_id: str, rows) -> None:
-        self.conns.append(conn)
-        self.rows.extend(rows)
+
+def _install_fake_create_task_db(
+    monkeypatch, *, captured: dict, dedup_existing: bool = False, store: dict | None = None,
+):
+    """Patch the DB primitives create_task uses so it runs without Postgres.
+
+    Captures the LAST INSERT's bind kwargs (including the JSON-serialized
+    `inputs`) into ``captured`` so a test can assert the real envelope shape.
+
+    Dedup is modeled faithfully against the REAL dedup_key the production code
+    builds: the pre-check SELECT consults a per-(schema_name, dedup_key) ``store``
+    of already-inserted non-terminal tasks and returns a row when one exists, so
+    ``create_task`` short-circuits to None exactly as it would in Postgres. Pass
+    a shared ``store`` dict across two enqueues to exercise the real coalesce
+    (identical key) vs. distinct-key (no coalesce) behaviour. ``dedup_existing``
+    pre-seeds the store as a wildcard so any first enqueue is treated as a hit.
+    """
+    import dynastore.modules.tasks.tasks_module as tm
+
+    if store is None:
+        store = {}
+    # When dedup_existing is requested, every dedup pre-check should hit.
+    seeded_wildcard = {"value": dedup_existing}
+
+    class _FakeConn:
+        pass
+
+    class _FakeTxCtx:
+        async def __aenter__(self):
+            return _FakeConn()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    def _fake_managed_transaction(_engine):
+        return _FakeTxCtx()
+
+    from dynastore.modules.db_config.query_executor import ResultHandler
+
+    class _FakeQuery:
+        def __init__(self, sql, *, result_handler=None):
+            self.sql = sql
+            self.result_handler = result_handler
+
+        async def execute(self, conn, **kwargs):
+            sql_l = self.sql.strip().upper()
+            if sql_l.startswith("SELECT"):
+                # dedup pre-check, against the REAL (schema_name, dedup_key).
+                if seeded_wildcard["value"]:
+                    return {"task_id": "existing"}
+                key = (kwargs.get("schema_name"), kwargs.get("dedup_key"))
+                if key in store:
+                    return {"task_id": store[key]}
+                return None
+            # INSERT ... RETURNING * — capture binds, register the dedup key so a
+            # later identical-key SELECT coalesces, and return a full task row.
+            captured.clear()
+            captured.update(kwargs)
+            from datetime import datetime, timezone
+
+            key = (kwargs.get("schema_name"), kwargs.get("dedup_key"))
+            store[key] = kwargs["task_id"]
+
+            # The real PG JSONB column hands back a dict on read (not the
+            # serialized string the INSERT bind carried). Mirror that so
+            # Task.model_validate accepts the row, as it would in prod.
+            stored_inputs = kwargs["inputs"]
+            if isinstance(stored_inputs, str):
+                stored_inputs = json.loads(stored_inputs)
+            return {
+                "task_id": kwargs["task_id"],
+                "schema_name": kwargs["schema_name"],
+                "scope": kwargs["scope"],
+                "caller_id": kwargs["caller_id"],
+                "task_type": kwargs["task_type"],
+                "type": kwargs["type"],
+                "execution_mode": kwargs["execution_mode"],
+                "inputs": stored_inputs,
+                "timestamp": kwargs["timestamp"],
+                "collection_id": kwargs["collection_id"],
+                "dedup_key": kwargs["dedup_key"],
+                "status": kwargs["status"],
+                "created_at": datetime.now(timezone.utc),
+            }
+
+    monkeypatch.setattr(tm, "managed_transaction", _fake_managed_transaction)
+    monkeypatch.setattr(tm, "DQLQuery", _FakeQuery)
+    monkeypatch.setattr(tm, "ResultHandler", ResultHandler, raising=False)
+    # get_task cache invalidate is a no-op-friendly call on a fake conn.
+    monkeypatch.setattr(tm.get_task, "cache_invalidate", lambda *a, **k: None, raising=False)
+    return store
 
 
 @pytest.mark.asyncio
-async def test_enqueue_builds_single_coalesced_row(monkeypatch):
+async def test_enqueue_creates_invalidate_task_with_execute_request_envelope(monkeypatch):
     provider = _FakeProvider()
     import dynastore.modules as _mods
     monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
 
-    async def _extent(_cat, _col):
-        return ["WebMercatorQuad"], 0, 4
+    captured: dict = {}
+    _install_fake_create_task_db(monkeypatch, captured=captured)
 
-    monkeypatch.setattr(tcs, "_resolve_tile_extent", _extent)
-
-    outbox = _FakeOutbox()
     feats = [
         {"id": "a", "bbox": [12.0, 41.0, 13.0, 42.0]},
         {"id": "b", "bbox": [12.5, 41.5, 13.5, 42.5]},
     ]
-    # Phase 1: the write is already committed, so the hook passes conn=None —
-    # PgOutboxStore acquires its own raw asyncpg conn and sets search_path.
-    n = await tcs.enqueue_tile_invalidations(
-        None, "cat", "col", feats, outbox=outbox,
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", feats, engine=object(), schema="s_cat",
     )
-    assert n > 0
-    # ONE coalesced outbox row for the whole batch — not one per feature/tile.
-    assert len(outbox.rows) == 1
-    rec = outbox.rows[0]
-    assert rec.driver_id == TILE_CACHE_DRIVER_ID
-    assert rec.collection_id == "col"
-    # Semantically a mark-stale / delete, not an entity upsert.
-    assert rec.op == "delete"
-    # Self-managed enqueue: forwarded conn is None (PgOutboxStore owns it).
-    assert outbox.conns == [None]
-    # Payload carries the coalesced tile set.
-    decoded = decode_tile_payload(rec.payload)
-    assert len(decoded) == n
+    # Two distinct bboxes enqueued.
+    assert n == 2
+
+    # The task row was created as a `tiles_preseed` PENDING task for the
+    # collection, with the per-collection dedup key.
+    assert captured["task_type"] == "tiles_preseed"
+    assert captured["status"] == "PENDING"
+    assert captured["schema_name"] == "s_cat"
+    assert captured["collection_id"] == "col"
+    # dedup_key is per-collection + a coverage signature so only identical-
+    # coverage edits coalesce; distinct bboxes get distinct keys.
+    assert captured["dedup_key"].startswith("tile-invalidate:cat:col:")
+
+    # The stored `inputs` MUST be the OGC ExecuteRequest envelope the preseed
+    # task unwraps via payload.inputs.inputs. Round-trip it back through the
+    # REAL models the dispatcher uses (ExecuteRequest, then TilePreseedRequest).
+    stored = json.loads(captured["inputs"])
+    from dynastore.modules.processes.models import ExecuteRequest
+    from dynastore.tasks.tiles_preseed.models import TilePreseedRequest
+
+    exec_req = ExecuteRequest(**stored)
+    inner = exec_req.inputs  # this is what payload.inputs.inputs yields
+    assert inner["operation"] == "invalidate"
+    assert inner["catalog_id"] == "cat"
+    assert inner["collection_id"] == "col"
+    assert len(inner["update_bbox"]) == 2
+
+    # And it validates as the request the task actually consumes.
+    req = TilePreseedRequest.model_validate(inner)
+    assert req.operation == "invalidate"
+    assert req.catalog_id == "cat"
+    assert req.collection_id == "col"
+    assert len(req.update_bbox) == 2
+
+
+@pytest.mark.asyncio
+async def test_enqueue_collapses_duplicate_bboxes_within_batch(monkeypatch):
+    provider = _FakeProvider()
+    import dynastore.modules as _mods
+    monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
+
+    captured: dict = {}
+    _install_fake_create_task_db(monkeypatch, captured=captured)
+
+    # Two identical bboxes in one batch collapse to one update_bbox entry.
+    feats = [
+        {"id": "a", "bbox": [12.0, 41.0, 13.0, 42.0]},
+        {"id": "b", "bbox": [12.0, 41.0, 13.0, 42.0]},
+    ]
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", feats, engine=object(), schema="s_cat",
+    )
+    assert n == 1
+    stored = json.loads(captured["inputs"])
+    assert len(stored["inputs"]["update_bbox"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_coalesces_identical_coverage(monkeypatch):
+    """Two enqueues with the SAME bboxes coalesce: the second is a dedup hit.
+
+    Identical coverage is the SAFE coalescing case — the first task already
+    invalidates that exact area, so the second enqueue correctly returns 0 once
+    its coverage-signature dedup_key matches the still-pending first task.
+    """
+    provider = _FakeProvider()
+    import dynastore.modules as _mods
+    monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
+
+    captured: dict = {}
+    store = _install_fake_create_task_db(monkeypatch, captured=captured)
+
+    feats = [{"id": "a", "bbox": [12.0, 41.0, 13.0, 42.0]}]
+
+    first = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", feats, engine=object(), schema="s_cat",
+    )
+    first_key = captured["dedup_key"]
+    assert first == 1
+
+    # Same coverage again, first task still non-terminal (registered in store).
+    second = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", feats, engine=object(), schema="s_cat",
+    )
+    # Coalesced — identical signature → dedup hit → 0.
+    assert second == 0
+    # Only one task got created (store has a single entry for this key).
+    assert (("s_cat", first_key)) in store
+    assert len(store) == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_distinct_bboxes_both_enqueue_no_coverage_lost(monkeypatch):
+    """C1 regression: two non-terminal enqueues at DISJOINT bboxes BOTH enqueue.
+
+    The original bug used a static per-collection dedup_key, so batch B at a
+    disjoint bbox Y was deduped against batch A's still-pending task (carrying
+    X) and DROPPED — Y's tiles were never invalidated. The coverage-signature
+    dedup_key fixes this: B's signature differs from A's, so create_task is NOT
+    deduped and B's own invalidate task is created carrying Y's bbox.
+    """
+    provider = _FakeProvider()
+    import dynastore.modules as _mods
+    monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
+
+    captured: dict = {}
+    store = _install_fake_create_task_db(monkeypatch, captured=captured)
+
+    bbox_x = [12.0, 41.0, 13.0, 42.0]
+    bbox_y = [-100.0, 30.0, -99.0, 31.0]  # disjoint from X
+
+    # Batch A enqueues at X (task stays non-terminal in the store).
+    n_a = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [{"id": "a", "bbox": bbox_x}], engine=object(), schema="s_cat",
+    )
+    key_a = captured["dedup_key"]
+    assert n_a == 1
+
+    # Batch B enqueues at the DISJOINT bbox Y while A is still pending.
+    n_b = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [{"id": "b", "bbox": bbox_y}], engine=object(), schema="s_cat",
+    )
+    key_b = captured["dedup_key"]
+
+    # B must NOT be deduped — its tiles must be invalidated.
+    assert n_b > 0
+    # Distinct signatures → two separate tasks queued.
+    assert key_a != key_b
+    assert len(store) == 2
+
+    # The SECOND task carries Y's bbox in its invalidate envelope, so Y's tiles
+    # will be invalidated (the whole point of the fix).
+    stored = json.loads(captured["inputs"])
+    from dynastore.modules.processes.models import ExecuteRequest
+    from dynastore.tasks.tiles_preseed.models import TilePreseedRequest
+
+    inner = ExecuteRequest(**stored).inputs
+    assert inner["operation"] == "invalidate"
+    req = TilePreseedRequest.model_validate(inner)
+    assert req.operation == "invalidate"
+    assert [list(b) for b in req.update_bbox] == [bbox_y]
+
+
+def test_coverage_signature_matches_for_identical_differs_for_distinct():
+    """The dedup signature is stable for identical coverage, distinct otherwise."""
+    x = [[12.0, 41.0, 13.0, 42.0]]
+    y = [[-100.0, 30.0, -99.0, 31.0]]
+
+    # Identical coverage → identical signature (order- and noise-stable).
+    assert tcs._coverage_signature(x) == tcs._coverage_signature(list(x))
+    # Float-repr noise within precision collapses to the same signature.
+    x_noisy = [[12.0000000001, 41.0, 13.0, 42.0]]
+    assert tcs._coverage_signature(x) == tcs._coverage_signature(x_noisy)
+    # Order independence: same set of bboxes in different order → same signature.
+    multi_ab = [[12.0, 41.0, 13.0, 42.0], [-100.0, 30.0, -99.0, 31.0]]
+    multi_ba = [[-100.0, 30.0, -99.0, 31.0], [12.0, 41.0, 13.0, 42.0]]
+    assert tcs._coverage_signature(multi_ab) == tcs._coverage_signature(multi_ba)
+    # Distinct coverage → distinct signature.
+    assert tcs._coverage_signature(x) != tcs._coverage_signature(y)
 
 
 @pytest.mark.asyncio
 async def test_enqueue_noop_when_inactive(monkeypatch):
     import dynastore.modules as _mods
     monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: None)
-    outbox = _FakeOutbox()
-    n = await tcs.enqueue_tile_invalidations(
-        object(), "cat", "col", [{"id": "a", "bbox": [0, 0, 1, 1]}], outbox=outbox,
+
+    created: List[Any] = []
+
+    async def _boom_create(*a, **k):
+        created.append((a, k))
+        raise AssertionError("create_task must not be called when inactive")
+
+    import dynastore.modules.tasks.tasks_module as tm
+    monkeypatch.setattr(tm, "create_task", _boom_create)
+
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [{"id": "a", "bbox": [0, 0, 1, 1]}],
+        engine=object(), schema="s_cat",
     )
     assert n == 0
-    assert outbox.rows == []
+    assert created == []
 
 
 @pytest.mark.asyncio
-async def test_enqueue_never_raises_on_outbox_error(monkeypatch):
+async def test_enqueue_noop_when_no_bbox(monkeypatch):
     provider = _FakeProvider()
     import dynastore.modules as _mods
     monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
 
-    async def _extent(_cat, _col):
-        return ["WebMercatorQuad"], 0, 2
+    async def _boom_create(*a, **k):
+        raise AssertionError("create_task must not be called with no bbox")
 
-    monkeypatch.setattr(tcs, "_resolve_tile_extent", _extent)
+    import dynastore.modules.tasks.tasks_module as tm
+    monkeypatch.setattr(tm, "create_task", _boom_create)
 
-    class _BoomOutbox:
-        async def enqueue_bulk(self, *a, **k):
-            raise RuntimeError("outbox down")
-
-    # The enqueue swallows the error and returns 0 (write must not break).
-    n = await tcs.enqueue_tile_invalidations(
-        object(), "cat", "col", [{"id": "a", "bbox": [12, 41, 13, 42]}],
-        outbox=_BoomOutbox(),
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [{"id": "a", "properties": {}}],  # no bbox/geometry
+        engine=object(), schema="s_cat",
     )
     assert n == 0
 
 
-# ===========================================================================
-# Contract test against the REAL PgOutboxStore (no MagicMock outbox)
-#
-# The blocker passed unit tests precisely because the outbox was a fake. These
-# drive the genuine ``PgOutboxStore.enqueue_bulk`` method/shape so a regression
-# (passing a non-None SQLAlchemy conn, or a wrong column/record shape) fails
-# here instead of silently in prod.
-# ===========================================================================
-
-
-class _FakeRawConn:
-    """Stand-in for a raw asyncpg connection.
-
-    Implements ``copy_records_to_table`` (the asyncpg bulk-COPY method
-    ``PgOutboxStore.enqueue_bulk`` requires) and ``execute`` (used by
-    ``_ensure_search_path`` on pool conns). A SQLAlchemy ``AsyncConnection`` has
-    NEITHER — which is exactly why the blocker silently failed when handed one.
-    """
-
-    def __init__(self) -> None:
-        self.copied: List[Any] = []
-        self.executed: List[str] = []
-
-    async def copy_records_to_table(self, table, *, records, columns):
-        self.copied.append((table, list(records), list(columns)))
-
-    async def execute(self, sql, *args):
-        self.executed.append(sql)
-
-
-class _SqlAlchemyLikeConn:
-    """A conn WITHOUT ``copy_records_to_table`` — like a SQLAlchemy conn.
-
-    Used to prove that handing such a conn to ``PgOutboxStore.enqueue_bulk``
-    blows up (AttributeError) — i.e. the original blocker. The hook must never
-    do this; it passes conn=None.
-    """
-
-    async def execute(self, sql, *args):
-        return None
-
-
 @pytest.mark.asyncio
-async def test_real_pg_outbox_enqueue_with_conn_none_uses_own_conn():
-    """conn=None → store acquires its OWN raw conn and COPYs the single row."""
-    from dynastore.modules.storage.pg_outbox import PgOutboxStore
-
-    raw = _FakeRawConn()
-    store = PgOutboxStore(single_conn=raw)
-
+async def test_enqueue_never_raises_on_create_error(monkeypatch):
     provider = _FakeProvider()
     import dynastore.modules as _mods
-    import importlib
+    monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
 
-    tile_cache_sync = importlib.import_module(
-        "dynastore.modules.tiles.tile_cache_sync"
+    async def _boom_create(*a, **k):
+        raise RuntimeError("tasks table down")
+
+    import dynastore.modules.tasks.tasks_module as tm
+    monkeypatch.setattr(tm, "create_task", _boom_create)
+
+    # Swallows the error and returns 0 (write must not break).
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [{"id": "a", "bbox": [12, 41, 13, 42]}],
+        engine=object(), schema="s_cat",
     )
-    # Resolve the provider + a fixed extent without DB.
-    feats = [{"id": "a", "bbox": [12.0, 41.0, 13.0, 42.0]}]
-    import pytest as _pytest  # noqa: F401  (kept for symmetry)
-
-    async def _extent(_cat, _col):
-        return ["WebMercatorQuad"], 0, 3
-
-    # monkeypatch via setattr on the module objects directly (no fixture here).
-    _orig_get = _mods.get_protocol
-    _orig_extent = tile_cache_sync._resolve_tile_extent
-    _mods.get_protocol = lambda *_a, **_k: provider  # type: ignore[assignment]
-    tile_cache_sync._resolve_tile_extent = _extent  # type: ignore[assignment]
-    try:
-        n = await tile_cache_sync.enqueue_tile_invalidations(
-            None, "cat", "col", feats, outbox=store,
-        )
-    finally:
-        _mods.get_protocol = _orig_get  # type: ignore[assignment]
-        tile_cache_sync._resolve_tile_extent = _orig_extent  # type: ignore[assignment]
-
-    assert n > 0
-    # Exactly one COPY into storage_outbox with the canonical column list.
-    assert len(raw.copied) == 1
-    table, records, columns = raw.copied[0]
-    assert table == "storage_outbox"
-    assert columns == [
-        "op_id", "driver_id", "driver_instance_id", "collection_id",
-        "op", "item_id", "payload", "idempotency_key",
-    ]
-    # ONE coalesced row; op is the delete/mark-stale op; driver pinned.
-    assert len(records) == 1
-    row = records[0]
-    # Column order: (op_id, driver_id, driver_instance_id, collection_id,
-    #                op, item_id, payload, idempotency_key)
-    assert row[1] == "tile_cache_invalidator"
-    assert row[3] == "col"
-    assert row[4] == "delete"
-    assert row[5] is None  # item_id
-
-
-@pytest.mark.asyncio
-async def test_real_pg_outbox_enqueue_rejects_sqlalchemy_like_conn():
-    """A non-None SQLAlchemy-style conn has no copy_records_to_table → raises.
-
-    This is the blocker's failure mode. The hook must pass conn=None; if a
-    future change reintroduces a wrapping TX and hands a SQLAlchemy conn, the
-    real store will raise here. (``enqueue_tile_invalidations`` swallows it and
-    returns 0 — never breaking the write — but a coverage of 0 is the symptom.)
-    """
-    from dynastore.modules.storage.pg_outbox import PgOutboxStore
-    from dynastore.models.protocols.indexing import OutboxRecord
-    from dynastore.tools.identifiers import generate_uuidv7
-
-    bad_conn = _SqlAlchemyLikeConn()
-    store = PgOutboxStore(single_conn=object())  # store's own conn unused here
-    op_id = generate_uuidv7()
-    rec = OutboxRecord(
-        op_id=op_id,
-        driver_id="tile_cache_invalidator",
-        driver_instance_id="inst",
-        collection_id="col",
-        op="delete",
-        item_id=None,
-        payload={"tiles": []},
-        idempotency_key=str(op_id),
-    )
-    # Passing a non-None conn that lacks copy_records_to_table must raise —
-    # exactly the silent blocker if it reaches the swallowing caller.
-    with pytest.raises(AttributeError):
-        await store.enqueue_bulk(bad_conn, catalog_id="cat", rows=[rec])
-
-
-# ===========================================================================
-# Drain-side TileCacheBulkIndexer — with a fake provider
-# ===========================================================================
-
-
-def _make_op(tiles, *, op_id=None, catalog="cat", collection="col"):
-    from uuid import uuid4
-
-    from dynastore.models.protocols.indexing import IndexableOp
-
-    return IndexableOp(
-        op_id=op_id or uuid4(),
-        op="upsert",
-        catalog_id=catalog,
-        collection_id=collection,
-        driver_instance_id="inst",
-        item_id=None,
-        payload=tcs._encode_tile_payload(set(tiles)),
-        idempotency_key="k",
-    )
-
-
-@pytest.mark.asyncio
-async def test_indexer_deletes_tiles_and_passes():
-    from dynastore.tasks.outbox_drain.tile_cache_indexer_adapter import (
-        TileCacheBulkIndexer,
-    )
-
-    provider = _FakeProvider()
-    indexer = TileCacheBulkIndexer(provider=provider)
-    tiles = {("WebMercatorQuad", 3, 4, 5), ("WebMercatorQuad", 4, 8, 10)}
-    op = _make_op(tiles)
-    result = await indexer.index_bulk([op])
-    assert result.passed == [op.op_id]
-    assert result.transient == [] and result.poison == []
-    # One coordinate-variant delete per tile (each drops all served formats +
-    # all cache-id variants in a single call).
-    assert len(provider.variant_calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_indexer_invalidates_all_served_formats():
-    """Drain must drop BOTH mvt and pbf for each coordinate (#1292 SHOULD-FIX 2).
-
-    The read/render path caches both formats; invalidating only mvt would leave
-    a stale pbf. The variant primitive receives the full served-format set.
-    """
-    from dynastore.tasks.outbox_drain.tile_cache_indexer_adapter import (
-        TileCacheBulkIndexer,
-    )
-    from dynastore.modules.tiles.tile_cache_sync import SERVED_TILE_FORMATS
-
-    assert set(SERVED_TILE_FORMATS) == {"mvt", "pbf"}
-
-    provider = _FakeProvider()
-    indexer = TileCacheBulkIndexer(provider=provider)
-    op = _make_op({("WebMercatorQuad", 5, 1, 2)})
-    result = await indexer.index_bulk([op])
-    assert result.passed == [op.op_id]
-    assert len(provider.variant_calls) == 1
-    (_cat, _col, _tms, _z, _x, _y, formats) = provider.variant_calls[0]
-    # Every served format is invalidated for the coordinate.
-    assert set(formats) == set(SERVED_TILE_FORMATS)
-
-
-@pytest.mark.asyncio
-async def test_indexer_legacy_fallback_deletes_each_format():
-    """A provider without the variant primitive still drops every served format.
-
-    The legacy fallback can only match the bare collection id (not @hash /
-    multi-collection variants), but it MUST at least iterate all served formats.
-    """
-    from dynastore.tasks.outbox_drain.tile_cache_indexer_adapter import (
-        TileCacheBulkIndexer,
-    )
-    from dynastore.modules.tiles.tile_cache_sync import SERVED_TILE_FORMATS
-
-    provider = _LegacyProvider()
-    indexer = TileCacheBulkIndexer(provider=provider)
-    op = _make_op({("WebMercatorQuad", 5, 1, 2)})
-    result = await indexer.index_bulk([op])
-    assert result.passed == [op.op_id]
-    # One delete_tile per served format for the single coordinate.
-    deleted_formats = {d[6] for d in provider.deleted}
-    assert deleted_formats == set(SERVED_TILE_FORMATS)
-    assert len(provider.deleted) == len(SERVED_TILE_FORMATS)
-
-
-@pytest.mark.asyncio
-async def test_indexer_idempotent_on_absent_tiles():
-    # delete_tile returning True for an absent tile → still passes (mark-stale
-    # is idempotent / order-tolerant).
-    from dynastore.tasks.outbox_drain.tile_cache_indexer_adapter import (
-        TileCacheBulkIndexer,
-    )
-
-    class _AbsentProvider(_FakeProvider):
-        async def delete_tile_variants(self, *a, **k) -> bool:
-            return True  # absent tile delete = no-op success
-
-    indexer = TileCacheBulkIndexer(provider=_AbsentProvider())
-    op = _make_op({("WebMercatorQuad", 3, 4, 5)})
-    result = await indexer.index_bulk([op])
-    assert result.passed == [op.op_id]
-
-
-@pytest.mark.asyncio
-async def test_indexer_retries_when_no_provider(monkeypatch):
-    from dynastore.tasks.outbox_drain.tile_cache_indexer_adapter import (
-        TileCacheBulkIndexer,
-    )
-
-    import dynastore.modules as _mods
-    monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: None)
-    indexer = TileCacheBulkIndexer(provider=None)
-    op = _make_op({("WebMercatorQuad", 3, 4, 5)})
-    result = await indexer.index_bulk([op])
-    # Whole op → transient (retry); the store may come back.
-    assert [oid for oid, _r in result.transient] == [op.op_id]
-    assert result.passed == []
-
-
-@pytest.mark.asyncio
-async def test_indexer_retries_on_store_error():
-    from dynastore.tasks.outbox_drain.tile_cache_indexer_adapter import (
-        TileCacheBulkIndexer,
-    )
-
-    class _BoomProvider(_FakeProvider):
-        async def delete_tile_variants(self, *a, **k) -> bool:
-            raise RuntimeError("store hiccup")
-
-    indexer = TileCacheBulkIndexer(provider=_BoomProvider())
-    op = _make_op({("WebMercatorQuad", 3, 4, 5)})
-    result = await indexer.index_bulk([op])
-    assert [oid for oid, _r in result.transient] == [op.op_id]
-
-
-@pytest.mark.asyncio
-async def test_indexer_passes_empty_payload():
-    from dynastore.tasks.outbox_drain.tile_cache_indexer_adapter import (
-        TileCacheBulkIndexer,
-    )
-
-    from dynastore.models.protocols.indexing import IndexableOp
-    from uuid import uuid4
-
-    provider = _FakeProvider()
-    indexer = TileCacheBulkIndexer(provider=provider)
-    op = IndexableOp(
-        op_id=uuid4(), op="upsert", catalog_id="cat", collection_id="col",
-        driver_instance_id="inst", item_id=None, payload={"tiles": []},
-        idempotency_key="k",
-    )
-    result = await indexer.index_bulk([op])
-    assert result.passed == [op.op_id]
-    assert provider.deleted == []
+    assert n == 0
 
 
 # ===========================================================================

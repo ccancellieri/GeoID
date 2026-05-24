@@ -90,6 +90,16 @@ class TilePreseedTask(
                 TaskUpdate(status=TaskStatusEnum.RUNNING, progress=0), schema=schema,
             )
 
+        # operation=invalidate is the LIGHT write-reactive path (#1298, under
+        # #1292): for the changed bbox(es) + zoom range, delete the covered
+        # tiles — NO MVT render, NO save. seed/renew fall through to the
+        # existing render path below (renew == re-seed today).
+        if request.operation == "invalidate":
+            return await self._invalidate_tiles(
+                engine=engine, request=request, payload=payload,
+                config_manager=config_manager, catalog_id=catalog_id, schema=schema,
+            )
+
         results: Dict[str, Any] = {"generated": 0, "skipped": 0, "errors": 0}
 
         try:
@@ -235,6 +245,160 @@ class TilePreseedTask(
 
         except Exception as e:
             logger.error(f"Pre-seed task failed: {e}", exc_info=True)
+            if payload.task_id:
+                await tasks_module.update_task(
+                    engine, payload.task_id,
+                    TaskUpdate(status=TaskStatusEnum.FAILED, error_message=str(e)),
+                    schema=schema,
+                )
+            raise e
+
+    async def _invalidate_tiles(
+        self, *, engine: DbResource, request: "TilePreseedRequest",
+        payload: "TaskPayload[ExecuteRequest]", config_manager: Any,
+        catalog_id: str, schema: str,
+    ) -> Optional[StatusInfo]:
+        """Light write-reactive invalidation path (#1298, under #1292).
+
+        For the changed bbox(es) + served zoom range, compute the covered tiles
+        (with the same coalesce + cap math the Phase-1 write hook used) and
+        DELETE them via the registered ``TileStorageProtocol`` — no MVT render,
+        no save. Deleting an absent tile is a no-op success, so the next read
+        repopulates lazily from fresh data.
+
+        Degrade-safe: a missing ``TileStorageProtocol`` provider logs a warning
+        and completes (nothing to invalidate). Capability gating belongs on the
+        enqueue side (``is_tile_cache_active``); this task is the executor and
+        simply attempts the deletes.
+        """
+        from dynastore.modules.tiles.tile_cache_sync import (
+            DEFAULT_MAX_TILES_PER_BATCH,
+            SERVED_TILE_FORMATS,
+            affected_tiles_for_batch,
+        )
+
+        results: Dict[str, Any] = {"deleted": 0, "errors": 0, "operation": "invalidate"}
+
+        try:
+            preseed_config = await config_manager.get_config(
+                TilesPreseedConfig, catalog_id, request.collection_id
+            )
+            runtime_config = await config_manager.get_config(
+                TilesConfig, catalog_id, request.collection_id
+            )
+            if not isinstance(runtime_config, TilesConfig):
+                runtime_config = TilesConfig()
+
+            # Resolve target collections exactly like the render path.
+            target_collections: List[str] = []
+            if request.collection_id:
+                target_collections = [request.collection_id]
+            elif isinstance(preseed_config, TilesPreseedConfig) and preseed_config.collections_to_preseed:
+                target_collections = preseed_config.collections_to_preseed
+            else:
+                logger.warning(f"No target collections for {catalog_id}. Skipping invalidation.")
+                return None
+
+            # Served TMS ids + zoom range from TilesConfig (the request may
+            # override the TMS ids; preseed_config.target_tms_ids is the
+            # configured fallback, mirroring the render path).
+            tms_ids = request.tms_ids or (
+                preseed_config.target_tms_ids
+                if isinstance(preseed_config, TilesPreseedConfig)
+                else None
+            ) or runtime_config.supported_tms_ids or ["WebMercatorQuad"]
+            min_zoom = int(runtime_config.min_zoom)
+            max_zoom = int(runtime_config.max_zoom)
+
+            # The bboxes to invalidate. In practice the write hook always
+            # supplies update_bbox; fall back to preseed/runtime/world bbox.
+            effective_bboxes = (
+                request.update_bbox
+                or (preseed_config.bboxes if isinstance(preseed_config, TilesPreseedConfig) else None)
+                or runtime_config.bbox
+                or [(-180.0, -85.0511287798, 180.0, 85.0511287798)]
+            )
+
+            storage = get_protocol(TileStorageProtocol)
+            if storage is None:
+                # Degrade-safe: nothing to invalidate without a tile store.
+                logger.warning(
+                    "tiles_preseed invalidate: no TileStorageProtocol registered "
+                    "for %s — nothing to invalidate.", catalog_id,
+                )
+                if payload.task_id:
+                    await tasks_module.update_task(
+                        engine, payload.task_id,
+                        TaskUpdate(status=TaskStatusEnum.COMPLETED, progress=100, outputs=results),
+                        schema=schema,
+                    )
+                return None
+
+            # Reuse the Phase-1 coverage math so the fan-out is bounded exactly
+            # as the write path bounded it (continent-scale bbox is capped).
+            coverage_bboxes = [
+                (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                for b in effective_bboxes
+            ]
+            tiles = affected_tiles_for_batch(
+                coverage_bboxes, list(tms_ids),
+                min_zoom, max_zoom, max_tiles=DEFAULT_MAX_TILES_PER_BATCH,
+            )
+
+            # Prefer the coordinate-variant primitive (drops every served format
+            # + every effective_cache_id variant of the coordinate in one call);
+            # fall back to per-format delete_tile for providers that lack it.
+            delete_variants = getattr(storage, "delete_tile_variants", None)
+            delete_tile = getattr(storage, "delete_tile", None)
+
+            for col_id in target_collections:
+                for (tms_id, z, x, y) in tiles:
+                    try:
+                        if delete_variants is not None:
+                            await delete_variants(
+                                catalog_id, col_id, tms_id, z, x, y, SERVED_TILE_FORMATS,
+                            )
+                            results["deleted"] += 1
+                        elif delete_tile is not None:
+                            # Legacy fallback: delete every served format under
+                            # the bare collection id (cache-id-suffixed variants
+                            # are unreachable here). Mirrors the per-format loop
+                            # the old drain adapter used.
+                            for fmt in SERVED_TILE_FORMATS:
+                                await delete_tile(catalog_id, col_id, tms_id, z, x, y, fmt)
+                            results["deleted"] += 1
+                        else:
+                            logger.warning(
+                                "tiles_preseed invalidate: provider has no "
+                                "delete_tile / delete_tile_variants for %s — "
+                                "cannot invalidate.", catalog_id,
+                            )
+                            break
+                    except Exception as exc:
+                        logger.warning(
+                            "tiles_preseed invalidate: delete failed for "
+                            "%s/%s %s/%d/%d/%d: %s",
+                            catalog_id, col_id, tms_id, z, x, y, exc,
+                        )
+                        results["errors"] += 1
+
+            logger.info(
+                "tiles_preseed invalidate: deleted %d tile(s) for %s (%d collection(s), "
+                "%d bbox(es), zoom %d..%d)",
+                results["deleted"], catalog_id, len(target_collections),
+                len(effective_bboxes), min_zoom, max_zoom,
+            )
+
+            if payload.task_id:
+                await tasks_module.update_task(
+                    engine, payload.task_id,
+                    TaskUpdate(status=TaskStatusEnum.COMPLETED, progress=100, outputs=results),
+                    schema=schema,
+                )
+            return None
+
+        except Exception as e:
+            logger.error(f"Tile invalidation task failed: {e}", exc_info=True)
             if payload.task_id:
                 await tasks_module.update_task(
                     engine, payload.task_id,

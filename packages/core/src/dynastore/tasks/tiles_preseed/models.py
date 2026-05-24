@@ -31,3 +31,12 @@ class TilePreseedRequest(BaseModel):
         "mvt",
         description="Output format: 'mvt' stores individual tiles; 'pmtiles' builds a PMTiles v3 archive.",
     )
+    operation: Literal["seed", "renew", "invalidate"] = Field(
+        "seed",
+        description=(
+            "Preseed operation: 'seed' / 'renew' render MVT/PMTiles and save the "
+            "tiles (renew == re-seed today; the distinction is intent labelling); "
+            "'invalidate' deletes the tiles covering update_bbox without rendering "
+            "anything (the light write-reactive cache-invalidation path)."
+        ),
+    )

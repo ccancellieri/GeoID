@@ -340,14 +340,10 @@ worker_task_tiles_preseed = ["dynastore[task_base,module_catalog,tiles,crs,modul
 worker_task_gdal = ["dynastore[task_base,module_catalog,gdal,module_storage_postgresql]"]
 worker_task_dimensions_materialize = ["dynastore[task_base,module_catalog,extension_dimensions,module_storage_postgresql]"]
 worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
-# tile_cache_invalidator (#1292) — write-reactive tile-cache invalidation drain.
-# Mirrors elasticsearch_indexer: outbox_drain supplies the generic drain
-# machinery; the concrete BulkIndexer is TileCacheBulkIndexer (in tiles), which
-# deletes stale tiles via the registered TileStorageProtocol. Needs `tiles` for
-# that provider and `module_catalog` for per-tenant schema resolution. No
-# morecantile: coverage math runs on the WRITE path (catalog service); the drain
-# only decodes the coalesced payload and deletes.
-worker_task_tile_cache_invalidator = ["dynastore[task_base,module_catalog,tiles,outbox_drain,module_storage_postgresql]"]
+# Write-reactive tile-cache invalidation (#1292) needs no dedicated SCOPE / Job
+# (#1298): it reuses the existing tiles_preseed task (operation=invalidate),
+# which already deploys as the geospatial-tiles-preseed-job
+# (worker_task_tiles_preseed).
 
 # ==========================================================================
 # SERVICE COMPOSITIONS (async-db)

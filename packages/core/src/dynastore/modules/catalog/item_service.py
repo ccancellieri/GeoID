@@ -1307,49 +1307,60 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         *,
         db_resource: Optional[DbResource] = None,
     ) -> None:
-        """Write-reactive tile-cache invalidation on create/update (#1292).
+        """Write-reactive tile-cache invalidation on create/update (#1292/#1298).
 
-        For each batch of written features, compute which cached tiles their
-        NEW bbox makes stale (across the served zoom range, coalesced + capped)
-        and enqueue ONE durable OUTBOX obligation. A background drain
-        (``TileCacheBulkIndexer``) then deletes those tiles so the next read
-        repopulates lazily.
+        For each batch of written features, enqueue a ``tiles_preseed`` task
+        with ``operation=invalidate`` and the batch's per-feature bboxes. That
+        task runs on the EXISTING tiles-preseed Cloud Run Job and deletes the
+        cached tiles the new bboxes make stale (across the served zoom range,
+        coalesced + capped); the next read repopulates lazily. There is no
+        separate drain / Job anymore (#1298) — invalidation is the light branch
+        of the preseed task.
 
         Both call sites run this AFTER the data write has committed (the
-        feature rows are already durable). There is therefore nothing to be
-        atomic with, so — unlike ``_dispatch_index_upsert`` — we do NOT wrap a
-        ``managed_transaction`` and hand a SQLAlchemy connection to the outbox.
-        That would break: ``PgOutboxStore.enqueue_bulk`` with a non-None conn
-        calls the RAW ``asyncpg.copy_records_to_table``, which a SQLAlchemy
-        ``AsyncConnection`` does not implement, and the table lives in the
-        per-tenant schema that ``managed_transaction`` never sets on the
-        ``search_path``. Instead we pass ``conn=None`` so the store acquires
-        its OWN raw asyncpg connection and pins ``search_path`` itself, exactly
-        as the dispatcher's missing-indexer path does
-        (``IndexDispatcher._enqueue_outbox_record`` → ``enqueue_bulk(None, …)``).
-        The worst case of a self-managed enqueue here is one stale tile read,
-        which the lazy re-render immediately repairs.
+        feature rows are already durable), so the task row is independent —
+        nothing to be atomic with. The enqueue needs the DB engine and the
+        catalog's tenant physical schema to INSERT the task row; both are
+        resolved here from the in-scope ``db_resource``/``self.engine`` and
+        ``CatalogsProtocol.resolve_physical_schema`` (the same pieces the
+        index-dispatch path resolves).
 
-        Capability-gated and degrade-safe inside ``enqueue_tile_invalidations``
-        — it is a no-op when no tile reader / cache store is present, and never
-        raises out, so a missing or misconfigured cache can never block a
-        write. Phase 1 covers create/update (new bbox); DELETE / geometry-MOVE
-        (prior bbox) is Phase 2 — see ``tile_cache_sync`` for the core
-        extension point that is still needed.
+        Capability-gated and degrade-safe inside
+        ``enqueue_tile_invalidation_task`` — it is a no-op when no tile reader /
+        cache store is present, and never raises out, so a missing or
+        misconfigured cache can never block a write. The ``dedup_key`` embeds a
+        coverage signature, so it coalesces only an already-queued invalidate
+        task whose coverage is identical (safe); an edit at a distinct bbox gets
+        its own task and is never dropped. Phase 1 covers create/update
+        (new bbox); DELETE / geometry-MOVE (prior bbox) is Phase 2 — see
+        ``tile_cache_sync`` for the core extension point that is still needed.
         """
         if not results:
             return
         from dynastore.modules.tiles.tile_cache_sync import (
-            enqueue_tile_invalidations,
+            enqueue_tile_invalidation_task,
         )
 
         try:
-            # Self-managed enqueue: conn=None lets PgOutboxStore acquire its
-            # own raw asyncpg conn + set search_path. The data write is
-            # already committed at both call sites, so no wrapping TX is
-            # needed (and a SQLAlchemy conn would be the wrong type anyway).
-            await enqueue_tile_invalidations(
-                None, catalog_id, collection_id, results,
+            engine = db_resource or self.engine
+            if engine is None:
+                logger.debug(
+                    "tile_cache: no engine available; skipping invalidation "
+                    "enqueue for %s/%s", catalog_id, collection_id,
+                )
+                return
+            schema = await self._resolve_physical_schema(
+                catalog_id, db_resource=engine,
+            )
+            if schema is None:
+                logger.debug(
+                    "tile_cache: cannot resolve physical schema for %s; "
+                    "skipping invalidation enqueue", catalog_id,
+                )
+                return
+            await enqueue_tile_invalidation_task(
+                catalog_id, collection_id, results,
+                engine=engine, schema=schema,
             )
         except Exception as exc:  # noqa: BLE001 — invalidation never breaks a write
             logger.warning(
