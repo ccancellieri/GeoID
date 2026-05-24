@@ -700,6 +700,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     processing_context=processing_context,
                 )
 
+            # Write-reactive tile-cache invalidation (#1292): mark stale the
+            # tiles the new feature bboxes touch. No-op + degrade-safe when no
+            # tile reader / cache store is present; never blocks the write.
+            if results:
+                await self._dispatch_tile_cache_invalidation(
+                    catalog_id, collection_id, results,
+                    db_resource=db_resource or self.engine,
+                )
+
             # Emit events for non-indexer subscribers (audit, telemetry).
             # Index propagation no longer rides this channel — it goes
             # through the dispatcher above so failures are attributable
@@ -1078,6 +1087,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 processing_context=processing_context,
             )
 
+        # ── Post-commit: write-reactive tile-cache invalidation (#1292) ──
+        # Mark stale the tiles the new feature bboxes touch (coalesced per
+        # batch, capped). No-op + degrade-safe when no tile reader / cache
+        # store is present; never blocks the write.
+        if results:
+            await self._dispatch_tile_cache_invalidation(
+                catalog_id, collection_id, results, db_resource=engine,
+            )
+
         # ── Post-commit: emit events for non-indexer subscribers ──────
         if results:
             try:
@@ -1279,6 +1297,64 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             logger.warning(
                 "Index dispatcher fan-out failed for %s/%s (%d items): %s",
                 catalog_id, collection_id, len(ops), e,
+            )
+
+    async def _dispatch_tile_cache_invalidation(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        results: List["Feature"],
+        *,
+        db_resource: Optional[DbResource] = None,
+    ) -> None:
+        """Write-reactive tile-cache invalidation on create/update (#1292).
+
+        For each batch of written features, compute which cached tiles their
+        NEW bbox makes stale (across the served zoom range, coalesced + capped)
+        and enqueue ONE durable OUTBOX obligation. A background drain
+        (``TileCacheBulkIndexer``) then deletes those tiles so the next read
+        repopulates lazily.
+
+        Both call sites run this AFTER the data write has committed (the
+        feature rows are already durable). There is therefore nothing to be
+        atomic with, so — unlike ``_dispatch_index_upsert`` — we do NOT wrap a
+        ``managed_transaction`` and hand a SQLAlchemy connection to the outbox.
+        That would break: ``PgOutboxStore.enqueue_bulk`` with a non-None conn
+        calls the RAW ``asyncpg.copy_records_to_table``, which a SQLAlchemy
+        ``AsyncConnection`` does not implement, and the table lives in the
+        per-tenant schema that ``managed_transaction`` never sets on the
+        ``search_path``. Instead we pass ``conn=None`` so the store acquires
+        its OWN raw asyncpg connection and pins ``search_path`` itself, exactly
+        as the dispatcher's missing-indexer path does
+        (``IndexDispatcher._enqueue_outbox_record`` → ``enqueue_bulk(None, …)``).
+        The worst case of a self-managed enqueue here is one stale tile read,
+        which the lazy re-render immediately repairs.
+
+        Capability-gated and degrade-safe inside ``enqueue_tile_invalidations``
+        — it is a no-op when no tile reader / cache store is present, and never
+        raises out, so a missing or misconfigured cache can never block a
+        write. Phase 1 covers create/update (new bbox); DELETE / geometry-MOVE
+        (prior bbox) is Phase 2 — see ``tile_cache_sync`` for the core
+        extension point that is still needed.
+        """
+        if not results:
+            return
+        from dynastore.modules.tiles.tile_cache_sync import (
+            enqueue_tile_invalidations,
+        )
+
+        try:
+            # Self-managed enqueue: conn=None lets PgOutboxStore acquire its
+            # own raw asyncpg conn + set search_path. The data write is
+            # already committed at both call sites, so no wrapping TX is
+            # needed (and a SQLAlchemy conn would be the wrong type anyway).
+            await enqueue_tile_invalidations(
+                None, catalog_id, collection_id, results,
+            )
+        except Exception as exc:  # noqa: BLE001 — invalidation never breaks a write
+            logger.warning(
+                "tile_cache: invalidation dispatch failed for %s/%s: %s",
+                catalog_id, collection_id, exc,
             )
 
     # ------------------------------------------------------------------

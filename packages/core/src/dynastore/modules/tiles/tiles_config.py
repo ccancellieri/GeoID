@@ -13,7 +13,7 @@
 #    limitations under the License.
 
 from typing import ClassVar, Dict, List, Optional, Tuple
-from pydantic import Field, BaseModel
+from pydantic import Field
 from dynastore.models.mutability import Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
@@ -119,6 +119,27 @@ class TilesCachingConfig(PluginConfig):
             "tile object written to the bucket. 0 disables browser/CDN "
             "caching (objects still persist server-side). Default is one "
             "year (the GCS max-age ceiling)."
+        ),
+    )
+
+    # --- Write-reactive invalidation (#1292) ---
+    #
+    # Write-reactive invalidation itself has NO on/off knob: it is enabled by
+    # default and capability-gated on the presence of a tile reader + a usable
+    # cache store (see ``tile_cache_sync.is_tile_cache_active``). The only knob
+    # genuinely worth exposing (issue #1292) is an OPT-IN to eagerly re-seed a
+    # hot zoom range after invalidation, for collections that need instant
+    # freshness instead of lazy repopulate-on-read.
+    eager_reseed_max_zoom: Mutable[Optional[int]] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Phase 3 opt-in (#1292): when set, the write-reactive tile-cache "
+            "sync eagerly re-renders invalidated tiles up to this zoom level "
+            "after marking them stale, instead of waiting for the next "
+            "read-miss. ``None`` (default) = pure invalidate-on-write + lazy "
+            "repopulate. Currently honored as a no-op stub; eager reseed is "
+            "wired in a follow-up."
         ),
     )
 
