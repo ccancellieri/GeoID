@@ -14,7 +14,7 @@
 
 """``ItemService.upsert_bulk`` atomic outbox enqueue + same-item coalescing.
 
-Three scenarios covered:
+Scenarios covered:
 
 1. **Coalesce same-item ops in-chunk** — three ops with the same ``id``
    produce a single outbox row (latest payload wins). Halves outbox
@@ -29,6 +29,13 @@ Three scenarios covered:
    the outbox enqueue runs, the outbox enqueue is never invoked (the
    TX context manager exits with the exception before the outbox
    step).
+4. **Identity stamping on OUTBOX records** — ``_external_id`` / ``_asset_id``
+   are stamped onto each outbox payload (parity with the read-back dispatch
+   path, #1287), applied to a per-record copy so the FATAL primary write keeps
+   the unstamped items.
+5. **Access-envelope stamping** — when the collection routes WRITE to an
+   access-aware driver, the outbox payload also carries ``_visibility`` /
+   ``_owner`` / ``_grant_subjects`` (#1285/#1287).
 
 The tests inject a fake routing resolver, a fake driver registry, a
 fake outbox store, and a stub TX/db resource via the new
@@ -338,3 +345,99 @@ async def test_upsert_bulk_does_not_enqueue_when_pg_fails():
     assert engine.tx_state.entered
     assert engine.tx_state.rolled_back
     assert not engine.tx_state.committed
+
+
+@pytest.mark.asyncio
+async def test_upsert_bulk_stamps_identity_on_outbox_records():
+    """OUTBOX payloads carry the canonical ``_external_id`` (from the write
+    policy's ``external_id_path``) and ``_asset_id`` (from
+    ``processing_context``) — parity with the read-back dispatch path (#1287).
+    The inline FATAL primary write keeps the UNSTAMPED items."""
+    engine = _FakeEngine()
+    driver = _RecordingDriver()
+    outbox = _RecordingOutbox()
+    svc = _service_with(
+        engine=engine,
+        driver_map={"items_postgresql_driver": driver},
+        outbox=outbox,
+        fatal_drivers=["items_postgresql_driver"],
+        outbox_drivers=["items_elasticsearch_driver"],
+    )
+
+    # Stub the per-collection derivations the stamp context resolves through
+    # (no ConfigsProtocol / routing in this unit graph).
+    async def _ext_path(catalog_id, collection_id):
+        return "properties.CODE"
+
+    async def _no_envelope(catalog_id, collection_id, processing_context):
+        return None  # non-access-aware collection → no access fields
+
+    svc._resolve_external_id_path = _ext_path  # type: ignore[assignment]
+    svc._resolve_access_envelope = _no_envelope  # type: ignore[assignment]
+
+    items = [
+        {"id": "i1", "properties": {"CODE": "ITA_01"}},
+        {"id": "i2", "properties": {"CODE": "ITA_02"}},
+    ]
+
+    await svc.upsert_bulk(
+        "cat", "col", items, processing_context={"asset_id": "asset-xyz"},
+    )
+
+    # OUTBOX rows carry stamped identity, per item.
+    rows = outbox.enqueued_calls[0]["rows"]
+    by_id = {r.item_id: r.payload for r in rows}
+    assert by_id["i1"]["_external_id"] == "ITA_01"
+    assert by_id["i1"]["_asset_id"] == "asset-xyz"
+    assert by_id["i2"]["_external_id"] == "ITA_02"
+    assert by_id["i2"]["_asset_id"] == "asset-xyz"
+    # Non-access-aware collection: no access-envelope fields leaked in.
+    assert "_visibility" not in by_id["i1"]
+    assert "_owner" not in by_id["i1"]
+
+    # The inline FATAL primary write received the UNSTAMPED items: stamping is
+    # applied to a per-record copy, never the shared store payload.
+    pg_entities = driver.calls[0]["entities"]
+    assert all("_external_id" not in e for e in pg_entities)
+    assert all("_asset_id" not in e for e in pg_entities)
+
+
+@pytest.mark.asyncio
+async def test_upsert_bulk_stamps_access_envelope_for_access_aware_driver():
+    """When the collection routes WRITE to an access-aware driver, OUTBOX
+    payloads also carry the access envelope (``_visibility`` / ``_owner`` /
+    ``_grant_subjects``) — #1285/#1287. The primary write stays clean."""
+    engine = _FakeEngine()
+    driver = _RecordingDriver()
+    outbox = _RecordingOutbox()
+    svc = _service_with(
+        engine=engine,
+        driver_map={"items_postgresql_driver": driver},
+        outbox=outbox,
+        fatal_drivers=["items_postgresql_driver"],
+        outbox_drivers=["items_elasticsearch_envelope_driver"],
+    )
+
+    async def _no_ext(catalog_id, collection_id):
+        return None
+
+    async def _envelope(catalog_id, collection_id, processing_context):
+        return {
+            "_visibility": "private",
+            "_owner": "alice",
+            "_grant_subjects": [],
+        }
+
+    svc._resolve_external_id_path = _no_ext  # type: ignore[assignment]
+    svc._resolve_access_envelope = _envelope  # type: ignore[assignment]
+
+    items = [{"id": "i1", "properties": {}}]
+
+    await svc.upsert_bulk("cat", "col", items)
+
+    payload = outbox.enqueued_calls[0]["rows"][0].payload
+    assert payload["_visibility"] == "private"
+    assert payload["_owner"] == "alice"
+    assert payload["_grant_subjects"] == []
+    # Primary store row is untouched by the envelope stamping.
+    assert "_visibility" not in driver.calls[0]["entities"][0]

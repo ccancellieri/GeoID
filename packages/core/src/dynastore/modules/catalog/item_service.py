@@ -20,6 +20,7 @@ import asyncio
 import copy
 import logging
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional, Any, Dict, Union
 
@@ -131,6 +132,23 @@ soft_delete_item_query = DQLQuery(
     "UPDATE {catalog_id}.{collection_id} SET deleted_at = NOW() WHERE geoid = :geoid AND deleted_at IS NULL;",
     result_handler=ResultHandler.ROWCOUNT,
 )
+
+
+@dataclass(frozen=True)
+class _IndexStampContext:
+    """Resolved inputs for stamping the canonical identity + access-envelope
+    fields onto an index/outbox payload.
+
+    Derived once per write and shared by both index-write paths so they stamp
+    identically (#1287): the read-back dispatch
+    (:meth:`ItemService._dispatch_index_upsert`) and the atomic OUTBOX bulk
+    path (:meth:`ItemService.upsert_bulk`). ``access_envelope`` is ``None``
+    unless the collection routes WRITE to an access-aware driver.
+    """
+
+    external_id_path: Optional[str]
+    asset_id: Optional[Any]
+    access_envelope: Optional[Dict[str, Any]]
 
 
 class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
@@ -1256,6 +1274,63 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             for r in resolved
         )
 
+    async def _resolve_index_stamp_context(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        processing_context: Optional[Dict[str, Any]],
+    ) -> _IndexStampContext:
+        """Resolve the identity + access-envelope stamping inputs once.
+
+        Single derivation point shared by the read-back index dispatch
+        (:meth:`_dispatch_index_upsert`) and the atomic OUTBOX bulk path
+        (:meth:`upsert_bulk`) so a collection populated via either path indexes
+        the same canonical ``_external_id`` / ``_asset_id`` — and, when it
+        routes WRITE to an access-aware driver, the same ``_visibility`` /
+        ``_owner`` / ``_grant_subjects``. See #1287.
+        """
+        return _IndexStampContext(
+            external_id_path=await self._resolve_external_id_path(
+                catalog_id, collection_id,
+            ),
+            asset_id=(processing_context or {}).get("asset_id"),
+            access_envelope=await self._resolve_access_envelope(
+                catalog_id, collection_id, processing_context,
+            ),
+        )
+
+    def _apply_index_stamp(
+        self,
+        payload: Dict[str, Any],
+        ctx: _IndexStampContext,
+    ) -> Dict[str, Any]:
+        """Stamp canonical identity + access-envelope fields onto ``payload``.
+
+        Mutates and returns ``payload`` — which must be the index/outbox record
+        body, never the API-returned Feature nor the primary-store row.
+        ``_external_id`` is overwritten from the resolved path; every other
+        field uses ``setdefault`` so an explicit value already on the payload
+        wins. The ES read path strips these internal ``_*`` keys, so they never
+        surface to clients.
+        """
+        if ctx.external_id_path:
+            ext = self._extract_by_path(payload, ctx.external_id_path)
+            if ext is not None:
+                payload["_external_id"] = str(ext)
+        if ctx.asset_id is not None:
+            payload.setdefault("_asset_id", str(ctx.asset_id))
+        if ctx.access_envelope is not None:
+            # Stamp only the access fields with a resolved value; ``_owner`` may
+            # be ``None`` (no principal in context) — omit it then so the doc
+            # builder simply does not set ``owner``.
+            payload.setdefault("_visibility", ctx.access_envelope["_visibility"])
+            if ctx.access_envelope["_owner"] is not None:
+                payload.setdefault("_owner", ctx.access_envelope["_owner"])
+            payload.setdefault(
+                "_grant_subjects", ctx.access_envelope["_grant_subjects"],
+            )
+        return payload
+
     async def _dispatch_index_upsert(
         self,
         catalog_id: str,
@@ -1303,39 +1378,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             get_index_dispatcher,
         )
 
-        external_id_path = await self._resolve_external_id_path(
-            catalog_id, collection_id,
-        )
-        asset_id = (processing_context or {}).get("asset_id")
-
-        # Access-envelope stamping seam (#1285): resolve once per dispatch. This
-        # is ``None`` unless the collection routes WRITE to an access-aware
-        # driver, so non-envelope collections stamp nothing and their stored
-        # docs are unchanged. ``_visibility`` / ``_owner`` / ``_grant_subjects``
-        # are read by ``build_envelope_feature_doc`` to populate the typed
-        # access fields the read filter matches on.
-        access_envelope = await self._resolve_access_envelope(
+        # Identity + access-envelope stamping seam (#1285/#1287): resolve once
+        # per dispatch. ``access_envelope`` is ``None`` unless the collection
+        # routes WRITE to an access-aware driver, so non-envelope collections
+        # stamp nothing beyond the canonical identity and their stored docs are
+        # unchanged. Shared with the atomic OUTBOX path (:meth:`upsert_bulk`) so
+        # both index-write paths stamp identically.
+        stamp_ctx = await self._resolve_index_stamp_context(
             catalog_id, collection_id, processing_context,
         )
-
-        def _stamp_identity(payload: Dict[str, Any]) -> Dict[str, Any]:
-            if external_id_path:
-                ext = self._extract_by_path(payload, external_id_path)
-                if ext is not None:
-                    payload["_external_id"] = str(ext)
-            if asset_id is not None:
-                payload.setdefault("_asset_id", str(asset_id))
-            if access_envelope is not None:
-                # Stamp only the access fields with a resolved value; ``_owner``
-                # may be ``None`` (no principal in context) — omit it then so the
-                # doc builder simply does not set ``owner``.
-                payload.setdefault("_visibility", access_envelope["_visibility"])
-                if access_envelope["_owner"] is not None:
-                    payload.setdefault("_owner", access_envelope["_owner"])
-                payload.setdefault(
-                    "_grant_subjects", access_envelope["_grant_subjects"],
-                )
-            return payload
 
         dispatcher = get_index_dispatcher()
         ops = [
@@ -1343,8 +1394,8 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 op_type="upsert",
                 entity_type="item",
                 entity_id=str(r.id) if r.id else "",
-                payload=_stamp_identity(
-                    r.model_dump(by_alias=True, exclude_none=True)
+                payload=self._apply_index_stamp(
+                    r.model_dump(by_alias=True, exclude_none=True), stamp_ctx,
                 ),
             )
             for r in results
@@ -1485,6 +1536,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         items: List[Dict[str, Any]],
         *,
         db_resource: Optional[DbResource] = None,
+        processing_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Atomic bulk upsert with same-item coalescing + outbox enqueue.
 
@@ -1516,6 +1568,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         ``IGNORE`` secondary-index entries are not enqueued here — they're
         tolerant by design and are still handled by the post-commit
         dispatcher path on the legacy :meth:`upsert` flow.
+
+        Each OUTBOX record's payload carries the same canonical identity +
+        access-envelope stamping as the read-back dispatch path (#1287):
+        ``_external_id`` from the write policy's ``external_id_path``,
+        ``_asset_id`` from ``processing_context``, and — when the collection
+        routes WRITE to an access-aware driver — ``_visibility`` / ``_owner`` /
+        ``_grant_subjects``. Stamping is applied to a per-record copy, so the
+        inline FATAL ``write_entities`` (primary store) write still receives the
+        unstamped items.
 
         Test injection seams (set on the instance, not the constructor):
         ``_test_routing_resolver``, ``_test_driver_registry``,
@@ -1646,6 +1707,13 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                         "upsert_bulk has ASYNC OUTBOX routing entries but "
                         "no OutboxStore is wired."
                     )
+                # Resolve the identity + access-envelope stamping inputs once
+                # for this collection (#1287). Applied to a per-record copy
+                # below so the inline FATAL primary write above keeps the
+                # unstamped items.
+                stamp_ctx = await self._resolve_index_stamp_context(
+                    catalog_id, collection_id, processing_context,
+                )
                 records: List[OutboxRecord] = []
                 for entry in async_outbox_entries:
                     inst = compute_driver_instance_id(
@@ -1660,8 +1728,8 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                             driver_instance_id=inst,
                             collection_id=collection_id,
                             op="upsert",
+                            payload=self._apply_index_stamp(dict(it), stamp_ctx),
                             item_id=item_id_str,
-                            payload=it if isinstance(it, dict) else dict(it),
                             idempotency_key=item_id_str or str(generate_uuidv7()),
                         ))
                 if records:
