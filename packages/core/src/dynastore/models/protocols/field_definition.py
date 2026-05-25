@@ -140,6 +140,16 @@ class FieldDefinition(BaseModel):
     enum: Optional[List[Any]] = None
     pattern: Optional[str] = None
     format: Optional[str] = None
+    # Optional ingestion-time parse hint for a temporal field (``date`` /
+    # ``time`` / ``timestamp``). A ``strptime`` pattern (e.g. ``%d/%m/%Y``) that
+    # the ingestion coercion uses to read the source string before re-emitting
+    # canonical ISO-8601. Distinct from ``format`` above, which carries the
+    # JSON-Schema *output* format (``date`` vs ``date-time``); this is the
+    # *input* pattern. When set, it disambiguates numeric formats that
+    # ``dateutil``'s auto-detection resolves month-first (so a European
+    # ``01/02/2024`` is read as 1 Feb, not 2 Jan). Unset → auto-detection.
+    # Ignored for non-temporal fields. See ``apply_temporal_coercion`` (#1350).
+    parse_format: Optional[str] = None
     # Driver-agnostic access intent — how aggressively to optimise this field for
     # query access (see :class:`FieldAccess`). The driver picks the mechanism; AUTO
     # defers to the declared ``capabilities``. Replaces the former PG-specific

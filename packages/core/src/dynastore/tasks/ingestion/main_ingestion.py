@@ -21,6 +21,7 @@ import re
 import os
 import asyncio
 import itertools
+from datetime import datetime
 from typing import Optional
 
 from dateutil import parser as _dateutil_parser
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 _TEMPORAL_DATA_TYPES = frozenset({"date", "time", "timestamp"})
 
 
-def _coerce_temporal_value(value, data_type: str):
+def _coerce_temporal_value(value, data_type: str, parse_format: Optional[str] = None):
     """Best-effort coercion of a single value to canonical ISO-8601.
 
     The typed write path already accepts ISO-8601 strings for ``date`` /
@@ -56,23 +57,40 @@ def _coerce_temporal_value(value, data_type: str):
     ``31/12/2024`` or ``Jan 31 2024``). This normalises a parseable string to
     the ISO form the write path accepts.
 
+    ``parse_format`` is the field's optional ``strptime`` hint (#1350). When
+    set it is tried first, so ambiguous numeric formats are read exactly as the
+    operator declared (``%d/%m/%Y`` reads ``01/02/2024`` as 1 Feb, not the
+    month-first 2 Jan that ``dateutil`` auto-detection would pick). A value that
+    does not match the explicit pattern is returned unchanged — it then falls
+    through to the typed write, which rejects just that row via the 207
+    IngestionReport rather than silently month-first-guessing against the
+    operator's stated intent. With no hint, parsing falls back to
+    ``dateutil`` auto-detection (the #1333 behaviour).
+
     Only strings are touched; a value that is already a non-string (e.g. a
     reader-decoded ``datetime``) or that cannot be parsed is returned
     unchanged. An unparseable value then falls through to the typed write,
     which rejects just that row via the 207 IngestionReport rather than
-    failing the whole batch. Ambiguous numeric formats (``01/02/2024``) follow
-    ``dateutil``'s month-first default; an explicit per-field format hint is a
-    separate follow-up.
+    failing the whole batch.
     """
     if not isinstance(value, str):
         return value
     text = value.strip()
     if not text:
         return value
-    try:
-        parsed = _dateutil_parser.parse(text)
-    except (ValueError, OverflowError, TypeError):
-        return value
+    if parse_format:
+        try:
+            parsed = datetime.strptime(text, parse_format)
+        except (ValueError, TypeError):
+            # Explicit pattern set but this row doesn't match it: respect the
+            # operator's intent and leave the row for the typed write to reject
+            # (207), rather than auto-detecting a different interpretation.
+            return value
+    else:
+        try:
+            parsed = _dateutil_parser.parse(text)
+        except (ValueError, OverflowError, TypeError):
+            return value
     if data_type == "date":
         return parsed.date().isoformat()
     if data_type == "time":
@@ -83,16 +101,20 @@ def _coerce_temporal_value(value, data_type: str):
 def apply_temporal_coercion(properties: dict, temporal_fields: dict) -> dict:
     """Coerce every schema-declared temporal property in ``properties`` in place.
 
-    ``temporal_fields`` maps a field name to its canonical temporal
-    ``data_type``. Properties not named there are left untouched, so this is a
-    no-op for collections whose items-schema declares no temporal field.
-    Returns ``properties`` for call-site convenience.
+    ``temporal_fields`` maps a field name to a ``(data_type, parse_format)``
+    pair — its canonical temporal ``data_type`` and the optional ``strptime``
+    input hint (#1350; ``None`` when the field declares no hint). Properties not
+    named there are left untouched, so this is a no-op for collections whose
+    items-schema declares no temporal field. Returns ``properties`` for
+    call-site convenience.
     """
     if not temporal_fields:
         return properties
-    for name, data_type in temporal_fields.items():
+    for name, (data_type, parse_format) in temporal_fields.items():
         if name in properties:
-            properties[name] = _coerce_temporal_value(properties[name], data_type)
+            properties[name] = _coerce_temporal_value(
+                properties[name], data_type, parse_format
+            )
     return properties
 
 
@@ -330,7 +352,10 @@ async def run_ingestion_task(
             )
             if items_schema and items_schema.fields:
                 temporal_fields = {
-                    name: fdef.data_type
+                    name: (
+                        fdef.data_type,
+                        getattr(fdef, "parse_format", None),
+                    )
                     for name, fdef in items_schema.fields.items()
                     if getattr(fdef, "data_type", None) in _TEMPORAL_DATA_TYPES
                 }
