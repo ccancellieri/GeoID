@@ -194,6 +194,8 @@ SET status = 'active',
     uri = :uri,
     content_hash = :content_hash,
     size_bytes = :size_bytes,
+    owned_by = 'gcs',
+    metadata = metadata - '_upload',
     updated_at = NOW()
 WHERE catalog_id = :catalog_id
   AND collection_id IS NOT DISTINCT FROM :collection_id

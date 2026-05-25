@@ -916,6 +916,7 @@ class AssetService(AssetsProtocol):
         updated_doc: Dict[str, Any] = current.model_dump()
         updated_doc["metadata"] = update.metadata
         updated_doc["collection_id"] = collection_id
+        updated_doc["updated_at"] = datetime.now(timezone.utc)
 
         write_driver = await get_asset_driver("WRITE", catalog_id, collection_id)
         await write_driver.index_asset(catalog_id, updated_doc, db_resource=db_resource)
@@ -996,6 +997,7 @@ class AssetService(AssetsProtocol):
             "    owned_by = :owned_by, "
             "    content_hash = :content_hash, "
             "    size_bytes = :size_bytes, "
+            "    metadata = metadata - '_upload', "
             "    updated_at = NOW() "
             "WHERE catalog_id = :catalog_id "
             "AND collection_id IS NOT DISTINCT FROM :collection_id "

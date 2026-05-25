@@ -19,7 +19,7 @@ Covers:
 * GET /assets/ landing page (links: self, conformance, service-doc).
 * GET /assets/conformance returns the draft conformance URIs (incl. search).
 * Single-asset GET surfaces HATEOAS ``links`` (self / collection /
-  alternate-download).
+  enclosure-download).
 * Bulk POST returns 201 ``BulkCreationResponse`` when fully accepted.
 * Bulk POST returns 207 ``IngestionReport`` on partial rejection (first
   payload refused via ``REFUSE_FAIL``, second one accepted).
@@ -253,9 +253,9 @@ def test_single_asset_get_includes_self_link(monkeypatch: pytest.MonkeyPatch) ->
     assert rels["collection"]["href"].endswith(
         "/assets/catalogs/cat/collections/col"
     )
-    # active physical → alternate download link present
-    assert "alternate" in rels
-    assert rels["alternate"]["href"].endswith("/download")
+    # active physical → enclosure download link present
+    assert "enclosure" in rels
+    assert rels["enclosure"]["href"].endswith("/download")
 
 
 # ---------------------------------------------------------------------------

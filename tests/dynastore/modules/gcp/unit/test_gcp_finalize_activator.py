@@ -237,6 +237,21 @@ async def test_missing_md5_writes_null_content_hash() -> None:
     assert update_call["binds"]["content_hash"] is None
 
 
+def test_update_sql_sets_owned_by_and_clears_upload_metadata() -> None:
+    """The activate UPDATE must claim the row for the GCS backend and scrub
+    the leaked resumable-upload credential.
+
+    * ``owned_by = 'gcs'`` so ``GcsAssetDownload.applies_to`` resolves a
+      download backend (otherwise the endpoint 404s) and GCS metadata
+      mirroring / hard-delete bucket cleanup stay enabled.
+    * ``metadata = metadata - '_upload'`` removes the resumable upload URL +
+      ticket_id + expires_at (an expired signed credential) from the row.
+    """
+    sql = activator_mod._UPDATE_ACTIVATE_SQL
+    assert "owned_by = 'gcs'" in sql
+    assert "metadata = metadata - '_upload'" in sql
+
+
 @pytest.mark.asyncio
 async def test_ticket_id_disambiguation_handles_jsonstring_metadata() -> None:
     """Driver may surface metadata as a JSON string (asyncpg cursor) — the

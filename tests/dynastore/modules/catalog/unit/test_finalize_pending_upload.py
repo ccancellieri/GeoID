@@ -159,3 +159,22 @@ async def test_no_engine_returns_none():
         "cat1", uri="file:///z", owned_by="local", asset_id="a1",
     )
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_strips_leaked_upload_blob():
+    """The activation UPDATE must clear ``metadata._upload`` so the leaked
+    resumable upload URL / ticket_id / expires_at don't persist post-finalize."""
+    service = _make_service()
+    rows = [
+        {"asset_id": "target", "status": "pending", "metadata": {"_upload": {"ticket_id": "T-1"}}},
+    ]
+    activated = MagicMock(asset_id="target")
+    p_schema, p_txn, p_dql, p_get = _patch_common(service, rows, activated)
+    with p_schema, p_txn, p_dql, p_get:
+        await service.finalize_pending_upload(
+            "cat1", uri="file:///x", owned_by="local",
+            ticket_id="T-1", size_bytes=42,
+        )
+    update_sql = next(s for s in _FakeDQL.calls if s.strip().upper().startswith("UPDATE"))
+    assert "metadata - '_upload'" in update_sql

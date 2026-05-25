@@ -1112,8 +1112,8 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Build OGC HATEOAS links for a single-asset GET response.
 
         Always emits ``self``. Adds ``collection`` when the asset is
-        collection-scoped, and ``alternate`` (download via the parametric
-        process surface) for active physical assets.
+        collection-scoped, and ``enclosure`` (download of the asset bytes)
+        for active physical assets.
 
         Returns relative-path hrefs; the FastAPI app + the registered
         root-path serve them naturally without any baked-in scheme/host.
@@ -1165,7 +1165,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             links.append(
                 Link(
                     href=f"{dl_base}/download",
-                    rel="alternate",
+                    rel="enclosure",
                     type="application/octet-stream",
                     title="Download asset bytes",  # type: ignore[arg-type]
                 )
