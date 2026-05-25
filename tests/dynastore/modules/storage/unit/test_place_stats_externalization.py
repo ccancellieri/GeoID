@@ -216,13 +216,18 @@ def test_z_range_prism():
 
 
 def test_centroid_3d_prism():
+    # COLUMNAR centroid_3d targets a GEOMETRY(POINTZ) column, so the value is
+    # WKB hex (not a coordinate array — that would fail the geometry column).
+    from shapely import wkb as _wkb
+
     fields = [ComputedField(kind=ComputedKind.CENTROID_3D, storage_mode=StatisticStorageMode.COLUMNAR)]
     result = compute_place_derived_fields(_PRISM, fields)
     assert "centroid_3d" in result
-    cx, cy, cz = result["centroid_3d"]
-    assert abs(cx - 0.5) < 1e-9
-    assert abs(cy - 0.5) < 1e-9
-    assert abs(cz - 2.5) < 1e-9  # midpoint of lower=0 upper=5
+    pt = _wkb.loads(result["centroid_3d"], hex=True)
+    assert pt.has_z
+    assert abs(pt.x - 0.5) < 1e-9
+    assert abs(pt.y - 0.5) < 1e-9
+    assert abs(pt.z - 2.5) < 1e-9  # midpoint of lower=0 upper=5
 
 
 def test_surface_to_volume_ratio_prism():

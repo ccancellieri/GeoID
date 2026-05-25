@@ -111,7 +111,11 @@ class GeometriesSidecar(SidecarProtocol):
         ComputedKind.CENTROID_3D: "GEOMETRY(POINTZ, 4326)",
         ComputedKind.Z_RANGE: "DOUBLE PRECISION",
         ComputedKind.VERTICAL_GRADIENT: "DOUBLE PRECISION",
-        ComputedKind.TEMPORAL_DURATION: "INTERVAL",
+        # Duration is materialised as a numeric count of seconds
+        # (``_place_temporal_duration`` returns a float, and the cross-driver
+        # ``field_projection`` declares it ``double``), so the column must be
+        # numeric — an ``INTERVAL`` column rejects the numeric value.
+        ComputedKind.TEMPORAL_DURATION: "DOUBLE PRECISION",
     }
 
     _NUMERIC_KINDS: frozenset = frozenset({
@@ -1481,6 +1485,25 @@ class GeometriesSidecar(SidecarProtocol):
             conn, wkb=wkb_hex, prec=self.config.geohash_precision
         )
         return row or None
+
+    def geometry_value_columns(self) -> set:
+        """Column names this sidecar writes as PostGIS geometry values.
+
+        The raw sidecar-upsert builder must wrap these with
+        ``ST_GeomFromEWKB(decode(:col, 'hex'))`` — a geometry column rejects a
+        raw bind. Besides the always-present ``geom``/``bbox_geom`` it includes
+        every COLUMNAR ``centroid`` / ``centroid_3d`` field under its
+        (possibly renamed) resolved column name, so a renamed or 3D centroid is
+        wrapped too — not just a column literally named ``centroid``.
+        """
+        cols = {self.config.geom_column, "bbox_geom"}
+        for f in self._storage_fields():
+            if (
+                f.storage_mode == StatisticStorageMode.COLUMNAR
+                and f.kind in (ComputedKind.CENTROID, ComputedKind.CENTROID_3D)
+            ):
+                cols.add(f.resolved_name)
+        return cols
 
     def get_internal_columns(self) -> set:
         """

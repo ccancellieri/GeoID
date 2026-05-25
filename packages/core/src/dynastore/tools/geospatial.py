@@ -638,6 +638,7 @@ def compute_derived_fields(
     # ``computed_fields`` future direction without ordering pain.
     from dynastore.modules.storage.computed_fields import (
         ComputedKind,
+        StatisticStorageMode,
     )
 
     out: Dict[str, Any] = {}
@@ -777,6 +778,14 @@ def compute_derived_fields(
             # emits 2D. With ``centroid_type=None`` the field is either
             # not stored or stored as a JSONB array.
             centroid_type = getattr(f, "centroid_type", None)
+            # A COLUMNAR centroid lives in a dedicated ``GEOMETRY(POINT, srid)``
+            # column (the geometries sidecar's ``_centroid_sql_type`` defaults
+            # the geometry to POINT when ``centroid_type`` is unset), so its
+            # value MUST be WKB — a coordinate array would fail the geometry
+            # column type. Mirror that DDL default here. Only a JSONB-stored
+            # centroid (shared ``geom_stats`` blob) stays the ``[x, y]`` array.
+            if centroid_type is None and getattr(f, "storage_mode", None) == StatisticStorageMode.COLUMNAR:
+                centroid_type = "POINT"
             if centroid_type is not None:
                 from shapely import wkb as _wkb_mod
                 if centroid_type == "POINTZ":
@@ -901,7 +910,10 @@ def compute_place_derived_fields(
     Returns a dict keyed by each field's ``resolved_name``. Fields that
     cannot be derived (wrong geometry type, missing Z) are silently skipped.
     """
-    from dynastore.modules.storage.computed_fields import ComputedKind
+    from dynastore.modules.storage.computed_fields import (
+        ComputedKind,
+        StatisticStorageMode,
+    )
 
     out: Dict[str, Any] = {}
     geom_type = place_dict.get("type", "") if place_dict else ""
@@ -918,7 +930,17 @@ def compute_place_derived_fields(
             elif kind == ComputedKind.CENTROID_3D:
                 result = _place_centroid_3d(place_dict, geom_type)
                 if result is not None:
-                    out[key] = result
+                    # A COLUMNAR centroid_3d lives in a ``GEOMETRY(POINTZ)``
+                    # column, so it must be WKB; a JSONB-stored one keeps the
+                    # ``[x, y, z]`` coordinate array.
+                    if getattr(f, "storage_mode", None) == StatisticStorageMode.COLUMNAR:
+                        from shapely import wkb as _wkb_mod
+                        from shapely.geometry import Point as _Point
+
+                        pt = _Point(result[0], result[1], result[2])
+                        out[key] = _wkb_mod.dumps(pt, hex=True, output_dimension=3)
+                    else:
+                        out[key] = result
 
             elif kind == ComputedKind.VERTICAL_GRADIENT:
                 result = _place_vertical_gradient(place_dict, geom_type)

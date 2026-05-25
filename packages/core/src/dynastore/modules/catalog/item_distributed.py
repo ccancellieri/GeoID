@@ -8,7 +8,7 @@ inherits from this mixin.
 
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Any, Dict, TYPE_CHECKING
+from typing import List, Optional, Any, Dict, Set, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from dynastore.models.ogc import Feature as _Feature
@@ -449,8 +449,12 @@ class ItemDistributedMixin(_Host):
                 sidecar, full_payload, col_config
             )
 
+            _gvc = getattr(sidecar, "geometry_value_columns", None)
+            geom_cols = cast("Optional[Set[str]]", _gvc()) if callable(_gvc) else None
+
             await self._upsert_sidecar_table_raw(
-                conn, schema, sc_table, full_payload, conflict_cols=conflict_cols
+                conn, schema, sc_table, full_payload, conflict_cols=conflict_cols,
+                geom_cols=geom_cols,
             )
 
             # JSON-FG Place Statistics: insert into <hub_table>_place if configured
@@ -465,7 +469,8 @@ class ItemDistributedMixin(_Host):
                         if "geoid" not in place_payload:
                             place_payload["geoid"] = geoid
                         await self._upsert_sidecar_table_raw(
-                            conn, schema, place_table, place_payload, conflict_cols=["geoid"]
+                            conn, schema, place_table, place_payload, conflict_cols=["geoid"],
+                            geom_cols=geom_cols,
                         )
                 except Exception as e:
                     logger.warning(f"Place stats upsert skipped for geoid {geoid}: {e}")
@@ -533,8 +538,12 @@ class ItemDistributedMixin(_Host):
                 sidecar, full_payload, col_config
             )
 
+            _gvc = getattr(sidecar, "geometry_value_columns", None)
+            geom_cols = cast("Optional[Set[str]]", _gvc()) if callable(_gvc) else None
+
             await self._upsert_sidecar_table_raw(
-                conn, schema, sc_table, full_payload, conflict_cols=conflict_cols
+                conn, schema, sc_table, full_payload, conflict_cols=conflict_cols,
+                geom_cols=geom_cols,
             )
 
         return dict(row_data)
@@ -606,9 +615,20 @@ class ItemDistributedMixin(_Host):
         return payload
 
     async def _upsert_sidecar_table_raw(
-        self, conn, schema, table, data, conflict_cols: List[str] = ["geoid"]
+        self, conn, schema, table, data, conflict_cols: List[str] = ["geoid"],
+        geom_cols: Optional[Set[str]] = None,
     ):
-        """Sidecar upsert with ON CONFLICT (conflict_cols)."""
+        """Sidecar upsert with ON CONFLICT (conflict_cols).
+
+        ``geom_cols`` is the set of columns whose string values are WKB hex and
+        must be wrapped with ``ST_GeomFromEWKB`` (a geometry column rejects a raw
+        bind). The geometries sidecar supplies it via ``geometry_value_columns``
+        so renamed centroid columns and ``centroid_3d`` are covered, not only a
+        column literally named ``centroid``. Falls back to the historical fixed
+        set when a caller doesn't supply one.
+        """
+        if geom_cols is None:
+            geom_cols = {"geom", "bbox_geom", "centroid"}
         cols: list = []
         vals: list = []
         updates: list = []
@@ -616,7 +636,7 @@ class ItemDistributedMixin(_Host):
         for k, v in data.items():
             cols.append(f'"{k}"')
             # Geometry columns: pass WKB hex through ST_GeomFromEWKB
-            if k in ["geom", "bbox_geom", "centroid"] and isinstance(v, str):
+            if k in geom_cols and isinstance(v, str):
                 vals.append(f"ST_GeomFromEWKB(decode(:{k}, 'hex'))")
                 params[k] = v
             # Range columns (e.g. validity TSTZRANGE): duck-type for any Range-like
