@@ -116,7 +116,6 @@ class PolicyResponse(BaseModel):
     resources: List[str]
     effect: Literal["ALLOW", "DENY"]
     priority: int = 0
-    partition_key: Optional[str] = None
     conditions: List[Condition] = Field(default_factory=list)
 
 

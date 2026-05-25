@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 from uuid import UUID
 
 from dynastore.modules.db_config.query_executor import DDLQuery, DDLBatch, DQLQuery, ResultHandler
-from .models import Principal, Role, RefreshToken, IdentityLink, Policy
+from .models import Principal, Role, RefreshToken, IdentityLink
 
 # --- Queries (IAM Tables) ---
 
@@ -722,65 +722,10 @@ PRUNE_EXPIRED_REFRESH_TOKENS = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
-# --- Policy CRUD Queries ---
-
-INSERT_POLICY = DQLQuery(
-    """
-    INSERT INTO {schema}.policies (id, version, description, effect, priority, actions, resources, conditions, partition_key)
-    VALUES (:id, :version, :description, :effect, :priority, :actions, :resources, :conditions, :partition_key)
-    RETURNING *;
-    """,
-    result_handler=ResultHandler.ONE_DICT,
-    post_processor=lambda row: Policy(**row) if row else None,
-)
-
-GET_POLICY = DQLQuery(
-    "SELECT * FROM {schema}.policies WHERE id = :id;",
-    result_handler=ResultHandler.ONE_DICT,
-    post_processor=lambda row: Policy(**row) if row else None,
-)
-
-LIST_POLICIES = DQLQuery(
-    """SELECT * FROM {schema}.policies
-    ORDER BY created_at DESC
-    LIMIT :limit OFFSET :offset;""",
-    result_handler=ResultHandler.ALL_DICTS,
-    post_processor=lambda rows: [Policy(**row) for row in rows],
-)
-
-UPDATE_POLICY = DQLQuery(
-    """
-    UPDATE {schema}.policies
-    SET version = :version,
-        description = :description,
-        effect = :effect,
-        priority = :priority,
-        actions = :actions,
-        resources = :resources,
-        conditions = :conditions
-    WHERE id = :id
-    RETURNING *;
-    """,
-    result_handler=ResultHandler.ONE_DICT,
-    post_processor=lambda row: Policy(**row) if row else None,
-)
-
-DELETE_POLICY = DQLQuery(
-    "DELETE FROM {schema}.policies WHERE id = :id;",
-    result_handler=ResultHandler.ROWCOUNT,
-)
-
-# Orphan-counter cleanup: ``iam.usage_counters`` carries no FK to
-# ``iam.policies`` (the comment on CREATE_USAGE_COUNTERS_TABLE flags it),
-# so deleting a policy leaves its rate-limit / lifetime rows behind. The
-# nightly reaper only drops rows whose ``expires_at`` has passed, so
-# lifetime quotas (``expires_at IS NULL``) for a removed policy would
-# linger forever. Run this immediately after DELETE_POLICY in the same
-# transaction.
-DELETE_USAGE_COUNTERS_FOR_POLICY = DQLQuery(
-    "DELETE FROM {schema}.usage_counters WHERE policy_id = :policy_id;",
-    result_handler=ResultHandler.ROWCOUNT,
-)
+# Policy CRUD lives in ``PostgresPolicyStorage`` (partition-aware: every
+# read/write/delete filters by the full ``(id, partition_key)`` primary
+# key). The unfiltered ``WHERE id = :id`` duplicates that used to live here
+# were callerless and could read/update across tenant partitions — removed.
 
 # --- Identity Link Queries ---
 

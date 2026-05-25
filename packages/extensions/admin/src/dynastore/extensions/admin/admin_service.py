@@ -67,7 +67,6 @@ def _policy_to_response(p: Policy) -> PolicyResponse:
         resources=p.resources,
         effect=p.effect,
         priority=p.priority,
-        partition_key=p.partition_key,
         conditions=getattr(p, "conditions", []) or [],
     )
 

@@ -819,39 +819,6 @@ class IamService:
             iam_manager=self, provider=provider, subject_id=subject_id
         )
 
-    # --- Policy Management ---
-
-    async def create_policy(self, policy, catalog_id: Optional[str] = None):
-        """Creates a new policy."""
-        schema = await self._resolve_schema(catalog_id)
-        return await self.storage.create_policy(policy, schema=schema)
-
-    async def get_policy(self, policy_id: str, catalog_id: Optional[str] = None):
-        """Retrieves a policy by ID."""
-        schema = await self._resolve_schema(catalog_id)
-        return await self.storage.get_policy(policy_id, schema=schema)
-
-    async def list_policies(
-        self, limit: int = 100, offset: int = 0, catalog_id: Optional[str] = None
-    ):
-        """Lists all policies with pagination."""
-        schema = await self._resolve_schema(catalog_id)
-        return await self.storage.list_policies(
-            limit=limit, offset=offset, schema=schema
-        )
-
-    async def update_policy(self, policy, catalog_id: Optional[str] = None):
-        """Updates an existing policy."""
-        schema = await self._resolve_schema(catalog_id)
-        return await self.storage.update_policy(policy, schema=schema)
-
-    async def delete_policy(
-        self, policy_id: str, catalog_id: Optional[str] = None
-    ) -> bool:
-        """Deletes a policy."""
-        schema = await self._resolve_schema(catalog_id)
-        return await self.storage.delete_policy(policy_id, schema=schema)
-
     # --- Identity Link Management ---
 
     async def create_identity_link(

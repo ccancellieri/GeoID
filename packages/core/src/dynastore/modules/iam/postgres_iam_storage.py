@@ -40,7 +40,6 @@ from .models import (
     Role,
     RefreshToken,
     IdentityLink,
-    Policy,
 )
 from .iam_storage import AbstractIamStorage
 from .interfaces import AuthorizationStorageProtocol
@@ -568,76 +567,6 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 principal_id=pid, catalog_schema=catalog_schema, conn=conn
             )
         return list({*platform, *catalog})
-
-    # ------------------------------------------------------------------
-    # Policy CRUD — platform-only for PR-1 (deferred D11 to PR-2).
-    # ------------------------------------------------------------------
-
-    async def create_policy(
-        self, policy: Policy, conn: Optional[DbResource] = None, schema: str = "iam"
-    ) -> Policy:
-        async with managed_transaction(conn or self.engine) as db:
-            return await INSERT_POLICY.execute(
-                db,
-                schema=schema,
-                id=policy.id,
-                version=policy.version,
-                description=policy.description,
-                effect=policy.effect,
-                priority=policy.priority,
-                actions=json.dumps(policy.actions),
-                resources=json.dumps(policy.resources),
-                conditions=json.dumps([c.model_dump() for c in policy.conditions]),
-                partition_key=policy.partition_key or "global",
-            )
-
-    async def get_policy(
-        self, policy_id: str, conn: Optional[DbResource] = None, schema: str = "iam"
-    ) -> Optional[Policy]:
-        async with managed_transaction(conn or self.engine) as db:
-            return await GET_POLICY.execute(db, schema=schema, id=policy_id)
-
-    async def list_policies(
-        self,
-        limit: int = 100,
-        offset: int = 0,
-        conn: Optional[DbResource] = None,
-        schema: str = "iam",
-    ) -> List[Policy]:
-        async with managed_transaction(conn or self.engine) as db:
-            return await LIST_POLICIES.execute(
-                db, schema=schema, limit=limit, offset=offset
-            )
-
-    async def update_policy(
-        self, policy: Policy, conn: Optional[DbResource] = None, schema: str = "iam"
-    ) -> Optional[Policy]:
-        async with managed_transaction(conn or self.engine) as db:
-            return await UPDATE_POLICY.execute(
-                db,
-                schema=schema,
-                id=policy.id,
-                version=policy.version,
-                description=policy.description,
-                effect=policy.effect,
-                priority=policy.priority,
-                actions=json.dumps(policy.actions),
-                resources=json.dumps(policy.resources),
-                conditions=json.dumps([c.model_dump() for c in policy.conditions]),
-            )
-
-    async def delete_policy(
-        self, policy_id: str, conn: Optional[DbResource] = None, schema: str = "iam"
-    ) -> bool:
-        async with managed_transaction(conn or self.engine) as db:
-            # Drop orphan usage rows first — no FK from usage_counters to
-            # policies, so the windowed-only nightly reaper would leave
-            # lifetime-quota rows for this policy lingering forever.
-            await DELETE_USAGE_COUNTERS_FOR_POLICY.execute(
-                db, schema=schema, policy_id=policy_id
-            )
-            count = await DELETE_POLICY.execute(db, schema=schema, id=policy_id)
-            return count > 0
 
     # ------------------------------------------------------------------
     # Identity Link Management — platform-only (D12).

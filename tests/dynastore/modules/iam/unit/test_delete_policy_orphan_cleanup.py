@@ -18,9 +18,9 @@
 ``iam.usage_counters`` has no FK to ``iam.policies`` (see comment on
 ``CREATE_USAGE_COUNTERS_TABLE``). The nightly reaper only drops rows
 with ``expires_at < NOW()``, so lifetime-quota rows (``expires_at IS
-NULL``) for a deleted policy would linger indefinitely. Both storage
-implementations must DELETE the counter rows in the same transaction as
-the policy row.
+NULL``) for a deleted policy would linger indefinitely. The live policy
+storage (``PostgresPolicyStorage``, partition-aware) must DELETE the
+counter rows in the same transaction as the policy row.
 """
 
 from __future__ import annotations
@@ -28,51 +28,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-
-@pytest.mark.asyncio
-async def test_postgres_iam_storage_cleans_orphan_counters_on_delete() -> None:
-    from dynastore.modules.iam.iam_queries import (
-        DELETE_POLICY,
-        DELETE_USAGE_COUNTERS_FOR_POLICY,
-    )
-    from dynastore.modules.iam.postgres_iam_storage import PostgresIamStorage
-
-    storage = PostgresIamStorage.__new__(PostgresIamStorage)
-    storage.engine = MagicMock()
-
-    call_order: list[str] = []
-
-    async def cleanup_side(*a, **kw):
-        call_order.append("cleanup")
-        return 3
-
-    async def delete_side(*a, **kw):
-        call_order.append("delete")
-        return 1
-
-    fake_db = MagicMock()
-    mt_cm = MagicMock()
-    mt_cm.__aenter__ = AsyncMock(return_value=fake_db)
-    mt_cm.__aexit__ = AsyncMock(return_value=None)
-
-    cleanup_mock = AsyncMock(side_effect=cleanup_side)
-    delete_mock = AsyncMock(side_effect=delete_side)
-
-    with patch(
-        "dynastore.modules.iam.postgres_iam_storage.managed_transaction",
-        return_value=mt_cm,
-    ), patch.object(
-        DELETE_USAGE_COUNTERS_FOR_POLICY, "execute", cleanup_mock
-    ), patch.object(DELETE_POLICY, "execute", delete_mock):
-        result = await storage.delete_policy("tile-anon-rate")
-
-    assert result is True
-    assert call_order == ["cleanup", "delete"]
-
-    assert cleanup_mock.await_count == 1
-    kwargs = cleanup_mock.await_args.kwargs
-    assert kwargs["policy_id"] == "tile-anon-rate"
 
 
 @pytest.mark.asyncio
@@ -124,15 +79,11 @@ async def test_postgres_policy_storage_cleans_orphan_counters_on_delete() -> Non
 
 
 def test_cleanup_sql_targets_usage_counters_by_policy_id() -> None:
-    from dynastore.modules.iam.iam_queries import (
-        DELETE_USAGE_COUNTERS_FOR_POLICY as Q_GLOBAL,
-    )
     from dynastore.modules.iam.postgres_policy_storage import (
         DELETE_USAGE_COUNTERS_FOR_POLICY as Q_PARTITIONED,
     )
 
-    for q in (Q_GLOBAL, Q_PARTITIONED):
-        sql = q.template.lower()
-        assert "delete from {schema}.usage_counters" in sql
-        assert "policy_id = :policy_id" in sql
-        assert "partition_key" not in sql
+    sql = Q_PARTITIONED.template.lower()
+    assert "delete from {schema}.usage_counters" in sql
+    assert "policy_id = :policy_id" in sql
+    assert "partition_key" not in sql
