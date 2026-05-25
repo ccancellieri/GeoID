@@ -494,6 +494,94 @@ async def test_enqueue_distinct_bboxes_both_enqueue_no_coverage_lost(monkeypatch
     assert [list(b) for b in req.update_bbox] == [bbox_y]
 
 
+@pytest.mark.asyncio
+async def test_enqueue_prior_bbox_only_invalidates_old_footprint(monkeypatch):
+    """Phase 2 (#1297) DELETE case: no new feature, only a prior bbox.
+
+    A delete passes ``features=[]`` and the deleted item's extent as
+    ``prior_bboxes``; the invalidate task must carry that extent so the tiles
+    it used to occupy are dropped.
+    """
+    provider = _FakeProvider()
+    import dynastore.modules as _mods
+    monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
+
+    captured: dict = {}
+    _install_fake_create_task_db(monkeypatch, captured=captured)
+
+    prior = (12.0, 41.0, 13.0, 42.0)
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [], engine=object(), schema="s_cat",
+        prior_bboxes=[prior],
+    )
+    assert n == 1
+    stored = json.loads(captured["inputs"])
+    from dynastore.modules.processes.models import ExecuteRequest
+
+    inner = ExecuteRequest(**stored).inputs
+    assert inner["operation"] == "invalidate"
+    assert [list(b) for b in inner["update_bbox"]] == [list(prior)]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_unions_new_and_prior_bboxes(monkeypatch):
+    """Phase 2 geometry-MOVE shape: new and prior extents both invalidate."""
+    provider = _FakeProvider()
+    import dynastore.modules as _mods
+    monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
+
+    captured: dict = {}
+    _install_fake_create_task_db(monkeypatch, captured=captured)
+
+    new_bbox = [20.0, 50.0, 21.0, 51.0]
+    prior = (12.0, 41.0, 13.0, 42.0)
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [{"id": "a", "bbox": new_bbox}], engine=object(),
+        schema="s_cat", prior_bboxes=[prior],
+    )
+    assert n == 2
+    stored = json.loads(captured["inputs"])
+    from dynastore.modules.processes.models import ExecuteRequest
+
+    got = {tuple(b) for b in ExecuteRequest(**stored).inputs["update_bbox"]}
+    assert got == {tuple(new_bbox), prior}
+
+
+@pytest.mark.asyncio
+async def test_enqueue_dedups_prior_bbox_equal_to_new(monkeypatch):
+    """A prior bbox identical to the new bbox collapses to one entry."""
+    provider = _FakeProvider()
+    import dynastore.modules as _mods
+    monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
+
+    captured: dict = {}
+    _install_fake_create_task_db(monkeypatch, captured=captured)
+
+    same = [12.0, 41.0, 13.0, 42.0]
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [{"id": "a", "bbox": same}], engine=object(),
+        schema="s_cat", prior_bboxes=[tuple(same)],
+    )
+    assert n == 1
+    stored = json.loads(captured["inputs"])
+    from dynastore.modules.processes.models import ExecuteRequest
+
+    assert len(ExecuteRequest(**stored).inputs["update_bbox"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_noop_when_features_and_prior_empty(monkeypatch):
+    """No new features and no prior bboxes → nothing enqueued (no gate call)."""
+    captured: dict = {}
+    store = _install_fake_create_task_db(monkeypatch, captured=captured)
+
+    n = await tcs.enqueue_tile_invalidation_task(
+        "cat", "col", [], engine=object(), schema="s_cat", prior_bboxes=[],
+    )
+    assert n == 0
+    assert store == {}
+
+
 def test_coverage_signature_matches_for_identical_differs_for_distinct():
     """The dedup signature is stable for identical coverage, distinct otherwise."""
     x = [[12.0, 41.0, 13.0, 42.0]]

@@ -22,7 +22,7 @@ import logging
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List, Optional, Any, Dict, Union
+from typing import TYPE_CHECKING, List, Optional, Any, Dict, Union, Sequence, Tuple
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.router import ResolvedDriver
@@ -1578,6 +1578,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         results: List["Feature"],
         *,
         db_resource: Optional[DbResource] = None,
+        prior_bboxes: Optional[Sequence[Tuple[float, float, float, float]]] = None,
     ) -> None:
         """Write-reactive tile-cache invalidation on create/update (#1292/#1298).
 
@@ -1603,11 +1604,13 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         misconfigured cache can never block a write. The ``dedup_key`` embeds a
         coverage signature, so it coalesces only an already-queued invalidate
         task whose coverage is identical (safe); an edit at a distinct bbox gets
-        its own task and is never dropped. Phase 1 covers create/update
-        (new bbox); DELETE / geometry-MOVE (prior bbox) is Phase 2 — see
-        ``tile_cache_sync`` for the core extension point that is still needed.
+        its own task and is never dropped. ``results`` carries the NEW bboxes
+        (create/update); ``prior_bboxes`` carries pre-write extents a feature
+        used to occupy — the DELETE case (``results`` empty) and the
+        geometry-MOVE case (#1297) — unioned into the same coverage so the old
+        footprint's tiles are dropped too.
         """
-        if not results:
+        if not results and not prior_bboxes:
             return
         from dynastore.modules.tiles.tile_cache_sync import (
             enqueue_tile_invalidation_task,
@@ -1633,6 +1636,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             await enqueue_tile_invalidation_task(
                 catalog_id, collection_id, results,
                 engine=engine, schema=schema,
+                prior_bboxes=prior_bboxes,
             )
         except Exception as exc:  # noqa: BLE001 — invalidation never breaks a write
             logger.warning(

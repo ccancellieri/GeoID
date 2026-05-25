@@ -59,10 +59,12 @@ Design (see #1292 / #1298):
   regeneration of an earlier one, because regeneration is a *read*-miss
   repopulate that always reflects current data.
 
-Phase 2 (prior-bbox capture for DELETE / geometry-MOVE) is NOT in this
-module — see :data:`PHASE2_PRIOR_BBOX_EXTENSION_POINT` and
-``affected_tiles_for_batch`` for the slot where a prior bbox would be
-unioned in once core carries it on the write/event payload.
+Phase 2 unions a feature's PRIOR bbox into the same coverage so a DELETE or
+geometry-MOVE also drops the old footprint. The DELETE case is wired
+(``delete_item`` supplies ``prior_bboxes``); the geometry-MOVE-on-update case
+is still pending — see :data:`PHASE2_PRIOR_BBOX_EXTENSION_POINT` and the
+``prior_bboxes`` slot on ``affected_tiles_for_batch`` /
+``enqueue_tile_invalidation_task``.
 """
 from __future__ import annotations
 
@@ -103,30 +105,30 @@ TileCoord = Tuple[str, int, int, int]
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 extension point (documented; not implemented here).
+# Phase 2 prior-bbox capture (#1297).
 #
-# To invalidate the tiles a feature *used to* occupy (DELETE, or a geometry
-# MOVE where the old footprint no longer overlaps the new one) the listener
-# needs the feature's PRIOR bbox. Today the write/event payload doesn't carry
-# it:
-#   * ITEM_DELETION carries only item_id (no geometry/bbox);
-#   * ITEM_UPDATE / the secondary-write fan-out carries only the NEW feature.
+# To invalidate the tiles a feature *used to* occupy the listener needs the
+# feature's PRIOR bbox, which the Phase-1 write/event payload didn't carry.
 #
-# Core change required (Phase 2): capture the prior bbox on the write txn and
-# surface it to this participant. Concretely, item_service must read the
-# existing row's bbox BEFORE the upsert/delete (inside the same wrapping TX,
-# from the canonical bbox envelope column — never the raw geometry) and pass a
-# {item_id: prior_bbox} map through to ``enqueue_tile_invalidation_task`` /
-# ``affected_tiles_for_batch`` (and the ITEM_DELETION event payload must carry
-# the prior bbox too). The union point is already present below: every place
-# that consumes a feature's new bbox would also consume its prior bbox and add
-# those tiles to the same coalesced set. No change to the coverage/coalesce/cap
-# math or the invalidate task is needed — only the prior-bbox source.
+# DELETE — WIRED. ``ItemQueryMixin.delete_item`` now reads the item's bbox
+# (via the existing read path → ``feature_bbox``, the materialized envelope,
+# never raw geometry) BEFORE the soft-delete and, when the tile cache is
+# active, enqueues an invalidate task with that extent as ``prior_bboxes``.
+#
+# GEOMETRY-MOVE on UPDATE — still pending. When a feature's geometry moves so
+# its old footprint no longer overlaps the new one, Phase 1 already invalidates
+# the NEW bbox but the OLD tiles stay stale. Capturing the prior bbox on the
+# create/update path needs a pre-read of the existing rows' envelope before the
+# upsert (inside the write path, from the canonical bbox column — never the raw
+# geometry) and passing those extents as ``prior_bboxes`` to
+# ``_dispatch_tile_cache_invalidation``. The union point is already present
+# below and ``enqueue_tile_invalidation_task`` already accepts ``prior_bboxes``;
+# only the upsert-path prior-bbox source is missing.
 # ---------------------------------------------------------------------------
 PHASE2_PRIOR_BBOX_EXTENSION_POINT = (
-    "affected_tiles_for_batch / enqueue_tile_invalidation_task accept a "
-    "prior_bboxes map once item_service captures the pre-write bbox on the "
-    "write txn (and ITEM_DELETION carries it)."
+    "DELETE prior-bbox is wired via delete_item. Remaining: capture the "
+    "pre-write bbox on the create/update path and pass it as prior_bboxes to "
+    "_dispatch_tile_cache_invalidation for the geometry-MOVE case."
 )
 
 
@@ -518,6 +520,7 @@ async def enqueue_tile_invalidation_task(
     *,
     engine: Any,
     schema: str,
+    prior_bboxes: Optional[Sequence[TileBBox]] = None,
 ) -> int:
     """Enqueue a ``tiles_preseed`` task with ``operation=invalidate`` (#1298).
 
@@ -528,16 +531,24 @@ async def enqueue_tile_invalidation_task(
     on the already-deployed ``tiles_preseed`` job and DELETES the covered tiles
     (no render, no save). The next read repopulates lazily from fresh data.
 
+    ``features`` are the feature(s) whose NEW bbox is now stale (create/update).
+    ``prior_bboxes`` (Phase 2, #1297) are the pre-write extents a feature USED
+    to occupy — the DELETE case (where there is no new feature, so ``features``
+    is empty) and the geometry-MOVE case. They are unioned into the same
+    coverage and the dedup signature, so the task also drops the tiles covering
+    the old footprint. At least one of ``features`` / ``prior_bboxes`` must
+    carry a bbox for anything to be enqueued.
+
     ``engine`` (the DB ``DbResource``) and ``schema`` (the tenant physical
     schema) are needed to INSERT the task row via ``tasks_module.create_task``.
-    The task row is independent of the data write — both call sites run this
+    The task row is independent of the data write — every call site runs this
     AFTER the data write committed, so there is nothing to be atomic with.
 
-    The ``dedup_key`` embeds a coverage signature derived from this batch's
-    bboxes, so it coalesces ONLY an already-queued invalidate task whose
-    coverage is identical (safe — that task invalidates the exact same area).
-    An edit at a DISTINCT bbox produces a different signature and gets its own
-    task, so its tiles are never dropped.
+    The ``dedup_key`` embeds a coverage signature derived from the union of new
+    and prior bboxes, so it coalesces ONLY an already-queued invalidate task
+    whose coverage is identical (safe — that task invalidates the exact same
+    area). An edit at a DISTINCT bbox produces a different signature and gets
+    its own task, so its tiles are never dropped.
 
     Returns the number of distinct bboxes enqueued on the task (0 when the
     participant is inactive, no bbox is derivable, the task module is
@@ -545,7 +556,7 @@ async def enqueue_tile_invalidation_task(
     dedup hit, which is correct: that area is already queued). Never raises
     out — invalidation must not break a write.
     """
-    if not features:
+    if not features and not prior_bboxes:
         return 0
     try:
         # Capability gate on the enqueue side (the task itself is just the
@@ -553,13 +564,21 @@ async def enqueue_tile_invalidation_task(
         if not await is_tile_cache_active(catalog_id, collection_id):
             return 0
 
-        # Per-feature bboxes → dedup. The task recomputes coverage (with the
-        # same coalesce + cap math) from these bboxes; we only need to pass the
-        # bboxes, not the expanded tile set.
+        # New + prior bboxes → one deduped coverage set. The task recomputes
+        # coverage (with the same coalesce + cap math) from these bboxes; we
+        # only need to pass the bboxes, not the expanded tile set.
         seen: set = set()
         bboxes: List[List[float]] = []
-        for f in features:
+        for f in features or ():
             bb = feature_bbox(f)
+            if bb is None:
+                continue
+            key = tuple(bb)
+            if key in seen:
+                continue
+            seen.add(key)
+            bboxes.append([bb[0], bb[1], bb[2], bb[3]])
+        for bb in prior_bboxes or ():
             if bb is None:
                 continue
             key = tuple(bb)

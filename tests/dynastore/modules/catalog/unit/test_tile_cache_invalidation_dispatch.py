@@ -35,7 +35,9 @@ from dynastore.modules.catalog.item_service import ItemService
 async def test_dispatch_enqueues_invalidate_task_with_engine_and_schema(monkeypatch):
     calls: List[Any] = []
 
-    async def _fake_enqueue(catalog_id, collection_id, features, *, engine, schema):
+    async def _fake_enqueue(
+        catalog_id, collection_id, features, *, engine, schema, prior_bboxes=None,
+    ):
         calls.append((catalog_id, collection_id, list(features), engine, schema))
         return len(features)
 
@@ -65,7 +67,9 @@ async def test_dispatch_uses_explicit_db_resource(monkeypatch):
     """A db_resource kwarg is preferred over self.engine for the enqueue."""
     seen: List[Any] = []
 
-    async def _fake_enqueue(catalog_id, collection_id, features, *, engine, schema):
+    async def _fake_enqueue(
+        catalog_id, collection_id, features, *, engine, schema, prior_bboxes=None,
+    ):
         seen.append(engine)
         return 0
 
@@ -117,6 +121,35 @@ async def test_dispatch_noop_on_empty(monkeypatch):
     svc = ItemService(engine=object())  # type: ignore[arg-type]
     await svc._dispatch_tile_cache_invalidation("cat", "col", [])  # type: ignore[arg-type]
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_passes_prior_bboxes_with_empty_results(monkeypatch):
+    """Phase 2 (#1297): a delete dispatches with empty ``results`` and a
+    ``prior_bboxes`` extent — the enqueue still fires and forwards the prior
+    bbox so the old footprint's tiles are dropped."""
+    seen: List[Any] = []
+
+    async def _fake_enqueue(
+        catalog_id, collection_id, features, *, engine, schema, prior_bboxes=None,
+    ):
+        seen.append((list(features), prior_bboxes))
+        return 1
+
+    async def _fake_resolve_schema(self, catalog_id, db_resource=None):
+        return "s_cat"
+
+    monkeypatch.setattr(tcs, "enqueue_tile_invalidation_task", _fake_enqueue)
+    monkeypatch.setattr(
+        ItemService, "_resolve_physical_schema", _fake_resolve_schema, raising=False
+    )
+
+    svc = ItemService(engine=object())  # type: ignore[arg-type]
+    prior = [(12.0, 41.0, 13.0, 42.0)]
+    await svc._dispatch_tile_cache_invalidation(
+        "cat", "col", [], prior_bboxes=prior,  # type: ignore[arg-type]
+    )
+    assert seen == [([], prior)]
 
 
 @pytest.mark.asyncio

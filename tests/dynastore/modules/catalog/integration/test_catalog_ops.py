@@ -232,3 +232,77 @@ async def test_item_ops(
 
         await lifecycle_registry.wait_for_all_tasks()
         await catalogs_svc.delete_catalog(catalog_id, force=True)
+
+
+@pytest.mark.asyncio
+async def test_delete_enqueues_prior_bbox_tile_invalidation(
+    app_lifespan,
+    catalogs_svc,
+    catalog_obj,
+    catalog_id,
+    collection_obj,
+    collection_id,
+    item_id,
+    monkeypatch,
+):
+    """Phase 2 (#1297): deleting an item enqueues a tile invalidation carrying
+    the extent the feature used to occupy.
+
+    With the tile cache forced active, ``delete_item`` reads the live item's
+    bbox before the soft-delete and dispatches an invalidate task with that
+    extent as ``prior_bboxes`` (and no new feature), so the tiles it occupied
+    are dropped. The enqueue is captured to assert the wiring end-to-end on a
+    real collection + feature.
+    """
+    import dynastore.modules.tiles.tile_cache_sync as tcs
+
+    captured = []
+
+    async def _active(*_a, **_k):
+        return True
+
+    async def _capture_enqueue(
+        cat, col, features, *, engine, schema, prior_bboxes=None,
+    ):
+        captured.append((cat, col, list(features), prior_bboxes))
+        return len(prior_bboxes or [])
+
+    monkeypatch.setattr(tcs, "is_tile_cache_active", _active)
+    monkeypatch.setattr(tcs, "enqueue_tile_invalidation_task", _capture_enqueue)
+
+    await catalogs_svc.delete_catalog(catalog_id, force=True)
+    await catalogs_svc.create_catalog(catalog_obj)
+    await catalogs_svc.create_collection(catalog_id, collection_obj)
+    try:
+        from dynastore.extensions.features.ogc_models import FeatureDefinition
+
+        feat_def = FeatureDefinition(
+            type="Feature",
+            id=item_id,
+            geometry={"type": "Point", "coordinates": [12.5, 41.9]},
+            properties={"name": "prior-bbox delete"},
+        )
+        res = await catalogs_svc.upsert(catalog_id, collection_id, feat_def)
+        assert res is not None
+
+        rows = await catalogs_svc.delete_item(
+            catalog_id, collection_id, str(res.id),
+        )
+        assert rows > 0
+
+        # The upsert also invalidates (Phase 1, new bbox), so isolate the
+        # DELETE's Phase-2 enqueue: no NEW feature, a prior bbox present.
+        delete_calls = [c for c in captured if c[2] == [] and c[3]]
+        assert len(delete_calls) == 1, (
+            f"delete must enqueue one prior-bbox invalidation; got {captured!r}"
+        )
+        cat, col, _feats, prior = delete_calls[0]
+        assert (cat, col) == (catalog_id, collection_id)
+        assert prior == [(12.5, 41.9, 12.5, 41.9)], (
+            "the deleted point's extent must be forwarded as prior_bboxes"
+        )
+    finally:
+        from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
+
+        await lifecycle_registry.wait_for_all_tasks()
+        await catalogs_svc.delete_catalog(catalog_id, force=True)

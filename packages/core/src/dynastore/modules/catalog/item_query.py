@@ -638,6 +638,43 @@ class ItemQueryMixin:
                 if row else None
             )
 
+    async def _capture_prior_bbox_for_delete(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        item_id: str,
+        ctx: Optional[DriverContext],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Read an item's current extent before a soft-delete (#1297).
+
+        Phase 2 tile-cache invalidation needs the tiles a feature *used to*
+        occupy. This reads that extent off the materialized bbox envelope via
+        the normal read path (``feature_bbox`` — never raw geometry) BEFORE the
+        delete removes the row. Gated on ``is_tile_cache_active`` so non-tile
+        deployments pay nothing, and degrade-safe (returns ``None`` on any
+        error) — capturing the prior bbox must never block or fail a delete.
+        """
+        try:
+            from dynastore.modules.tiles.tile_cache_sync import (
+                feature_bbox,
+                is_tile_cache_active,
+            )
+
+            if not await is_tile_cache_active(catalog_id, collection_id):
+                return None
+            existing = await self.get_item(
+                catalog_id, collection_id, item_id, ctx=ctx,
+            )
+            if existing is None:
+                return None
+            return feature_bbox(existing)
+        except Exception as exc:  # noqa: BLE001 — never break the delete
+            logger.debug(
+                "tile_cache: prior-bbox capture skipped for %s/%s/%s: %s",
+                catalog_id, collection_id, item_id, exc,
+            )
+            return None
+
     async def delete_item(
         self,
         catalog_id: str,
@@ -650,6 +687,14 @@ class ItemQueryMixin:
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+
+        # Phase 2 tile-cache (#1297): capture the item's current extent BEFORE
+        # the soft-delete so the invalidate task can drop the tiles it used to
+        # occupy. Gated + degrade-safe — never blocks the delete.
+        prior_bbox = await self._capture_prior_bbox_for_delete(
+            catalog_id, collection_id, item_id, ctx,
+        )
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_physical_schema(
                 catalog_id, db_resource=conn
@@ -756,6 +801,29 @@ class ItemQueryMixin:
                 except Exception as e:
                     logger.warning(f"Failed to emit item deletion event: {e}")
 
+                # Phase 2 tile-cache invalidation (#1297): drop the tiles the
+                # deleted feature used to occupy. The invalidate task row is
+                # independent of this delete (its own connection), so enqueuing
+                # it here is safe; gated + degrade-safe inside the enqueue, so it
+                # never blocks the delete.
+                if prior_bbox is not None:
+                    try:
+                        from dynastore.modules.tiles.tile_cache_sync import (
+                            enqueue_tile_invalidation_task,
+                        )
+
+                        await enqueue_tile_invalidation_task(
+                            catalog_id, collection_id, [],
+                            engine=db_resource or self.engine,
+                            schema=phys_schema,
+                            prior_bboxes=[prior_bbox],
+                        )
+                    except Exception as exc:  # noqa: BLE001 — never break delete
+                        logger.warning(
+                            "tile_cache: delete invalidation failed for "
+                            "%s/%s: %s", catalog_id, collection_id, exc,
+                        )
+
         return rows
 
     async def _enqueue_index_deletes(
@@ -786,9 +854,6 @@ class ItemQueryMixin:
         from dynastore.models.protocols.indexing import OutboxRecord
         from dynastore.modules.storage.driver_instance_id import (
             compute_driver_instance_id,
-        )
-        from dynastore.modules.storage.routing_config import (
-            FailurePolicy, Operation, WriteMode,
         )
         from dynastore.tools.identifiers import generate_uuidv7
 
