@@ -130,9 +130,9 @@ async def test_helper_does_not_retry_on_unrelated_exception():
 
 @pytest.mark.asyncio
 async def test_ensure_init_db_retries_platform_config_initialize_storage():
-    """The 6th bootstrap call goes through raw DDL, not ensure_db_extension —
-    it must still be retried so a DB bounce one step later does not abort
-    the lifespan."""
+    """The platform-config bootstrap call goes through raw DDL, not
+    ensure_db_extension — it must still be retried so a DB bounce one step
+    later does not abort the lifespan."""
     from dynastore.modules.db_config import tools as db_tools
 
     ext_mock = AsyncMock()
@@ -144,5 +144,5 @@ async def test_ensure_init_db_retries_platform_config_initialize_storage():
          patch.object(asyncio, "sleep", AsyncMock()):
         await db_tools.ensure_init_db(object())
 
-    assert ext_mock.await_count == 5  # postgis, postgis_topology, btree_gist, btree_gin, pgcrypto
+    assert ext_mock.await_count == 6  # postgis, postgis_topology, btree_gist, btree_gin, pgcrypto, pg_trgm
     assert init_storage_mock.await_count == 2  # one invalidated + one success

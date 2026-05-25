@@ -64,29 +64,29 @@ async def test_logical_item_retrieval(app_lifespan_module):
         properties={"name": "Test Item", "external_id": ext_id},
     )
 
-    # Upsert item (single)
-    # Retrieve logically (get_item handles resolution)
-    # Note: For this test, item_id in get_item can be external_id or geoid depending on config.
-    # Without specific sidecar config, get_item expects geoid.
-    # However, this test is checking PROTOCOL COMPOSITION, not sidecar logic details.
-    # As we removed get_item_by_external_id, we should test get_item.
-
-    # Let's assume for this basic test we just want to verify connectivity.
-    # But get_item requires a valid geoid if no sidecar config is active.
-    # We don't have the geoid easily here unless we catch the upsert return.
-
-    # Updated: Upsert returns the created item(s).
+    # Upsert (single) — returns the created item(s).
     created_items = await catalogs_svc.upsert(catalog_id, collection_id, item_data)
     created_item = (
         created_items[0] if isinstance(created_items, list) else created_items
     )
 
-    # get_item should support retrieval by external_id (logical ID)
-    logical_id = item_data.properties["external_id"]
+    # The feature id is the retrieval key for get_item. With the default read
+    # policy (``external_id_as_feature_id=False``) that id IS the geoid, so we
+    # retrieve by whatever id the upsert assigned rather than the raw
+    # external_id — external_id-as-feature-id is a separate, config-gated path
+    # covered by the geoid-default-id / query-optimizer tests. This test only
+    # asserts the *protocol composition* contract: get_item resolves the
+    # physical schema/table from the logical (catalog, collection, id) tuple
+    # with no manual resolution.
+    feature_id = (
+        created_item.get("id") if isinstance(created_item, dict)
+        else getattr(created_item, "id", None)
+    )
+    assert feature_id, f"upsert did not return a feature id: {created_item!r}"
 
-    # Verify using get_item with logical ID
-    item = await catalogs_svc.get_item(catalog_id, collection_id, logical_id)
-    assert item is not None, f"Item not found via get_item for id {logical_id}"
+    # Verify using get_item with the logical (catalog, collection, id) tuple.
+    item = await catalogs_svc.get_item(catalog_id, collection_id, feature_id)
+    assert item is not None, f"Item not found via get_item for id {feature_id}"
 
     # Handle both dict and object/row access depending on service return type
     if hasattr(item, "properties"):
@@ -105,16 +105,11 @@ async def test_logical_item_retrieval(app_lifespan_module):
 
     assert attributes["name"] == "Test Item"
 
-    # Retrieve via items property
+    # Retrieve via the items property accessor (same protocol, same key).
     item_via_prop = await catalogs_svc.items.get_item(
-        catalog_id, collection_id, logical_id
+        catalog_id, collection_id, feature_id
     )
     assert item_via_prop is not None
-
-    # Verify retrieval by geoid is also supported (fallback or explicit?)
-    # Currently get_item with configured sidecar usually enforces external_id.
-    # If we want geoid support, we need to check if the implementation allows it.
-    # For now, let's assume logical ID is the primary contract.
 
     # Cleanup
     await catalogs_svc.delete_catalog(catalog_id, force=True)
