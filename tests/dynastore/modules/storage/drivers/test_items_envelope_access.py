@@ -156,6 +156,84 @@ def test_empty_allow_not_allow_all_matches_nothing():
 
 
 # ---------------------------------------------------------------------------
+# Union node (exclusion-union of per-collection sub-filters)
+# ---------------------------------------------------------------------------
+
+
+def test_union_translates_to_should_of_complete_subfilters():
+    sub_a = AccessFilter(allow=(AccessClause((
+        FieldPredicate("collection_id", ("a",)),
+        FieldPredicate("visibility", ("public",)),
+    )),))
+    sub_b = AccessFilter(allow=(AccessClause((
+        FieldPredicate("collection_id", ("b",)),
+        FieldPredicate("owner", ("me",)),
+    )),))
+    u = AccessFilter.union_of([sub_a, sub_b])
+    es = access_filter_to_es(u)
+    assert es["bool"]["minimum_should_match"] == 1
+    should = es["bool"]["should"]
+    # Each sub-filter contributes its OWN complete clause (not flattened).
+    assert {"bool": {"should": [{"bool": {"filter": [
+        {"terms": {"collection_id": ["a"]}},
+        {"terms": {"visibility": ["public"]}},
+    ]}}], "minimum_should_match": 1}} in should
+    assert {"bool": {"should": [{"bool": {"filter": [
+        {"terms": {"collection_id": ["b"]}},
+        {"terms": {"owner": ["me"]}},
+    ]}}], "minimum_should_match": 1}} in should
+
+
+def test_union_deny_does_not_cross_contaminate():
+    # A: public allowed but owner=blocked denied (scoped to A); B: public allowed.
+    sub_a = AccessFilter(
+        allow=(AccessClause((
+            FieldPredicate("collection_id", ("a",)),
+            FieldPredicate("visibility", ("public",)),
+        )),),
+        deny=(AccessClause((
+            FieldPredicate("collection_id", ("a",)),
+            FieldPredicate("owner", ("blocked",)),
+        )),),
+    )
+    sub_b = AccessFilter(allow=(AccessClause((
+        FieldPredicate("collection_id", ("b",)),
+        FieldPredicate("visibility", ("public",)),
+    )),))
+    u = AccessFilter.union_of([sub_a, sub_b])
+    es = access_filter_to_es(u)
+    blocked_a = {"collection_id": "a", "visibility": "public", "owner": "blocked"}
+    blocked_b = {"collection_id": "b", "visibility": "public", "owner": "blocked"}
+    # A's deny excludes its own blocked doc; B's same-owner doc is unaffected.
+    assert _es_clause_admits(es, blocked_a) is False
+    assert _es_clause_admits(es, blocked_b) is True
+    # ES path agrees with admits() reference semantics.
+    assert _es_clause_admits(es, blocked_a) == u.admits(blocked_a)
+    assert _es_clause_admits(es, blocked_b) == u.admits(blocked_b)
+
+
+def test_union_drops_deny_everything_subfilter():
+    # A grants access; B (no access) compiles to deny_everything → inert in OR.
+    sub_a = AccessFilter(allow=(AccessClause((
+        FieldPredicate("collection_id", ("a",)),
+    )),))
+    u = AccessFilter.union_of([sub_a, AccessFilter.deny_everything()])
+    # Single live branch → returned as-is (no wrapper node).
+    assert u.union == ()
+    assert u.admits({"collection_id": "a"}) is True
+    assert u.admits({"collection_id": "b"}) is False
+
+
+def test_union_of_all_denied_is_deny_everything():
+    u = AccessFilter.union_of([
+        AccessFilter.deny_everything(),
+        AccessFilter.deny_everything(),
+    ])
+    assert u.deny_all is True
+    assert access_filter_to_es(u) == {"match_none": {}}
+
+
+# ---------------------------------------------------------------------------
 # Property-style cross-check: ES translation agrees with admits()
 # ---------------------------------------------------------------------------
 
@@ -242,6 +320,12 @@ def _sample_filters() -> List[AccessFilter]:
         AccessFilter(allow=(unconditional,)),
         AccessFilter(allow=(unconditional,), deny=(deny_bob,)),
         AccessFilter(allow=()),
+        # Exclusion-union of per-collection sub-filters: each stays intact so
+        # the ES translation must agree with the union branch of ``admits``.
+        AccessFilter.union_of([
+            AccessFilter(allow=(pub,)),
+            AccessFilter(allow=(own_alice,), deny=(deny_bob,)),
+        ]),
     ]
 
 

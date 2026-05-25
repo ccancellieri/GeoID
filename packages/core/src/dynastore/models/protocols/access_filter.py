@@ -42,6 +42,13 @@ Semantics (a faithful, *fail-closed* projection of ``evaluate_access``):
     (``must_not``) and therefore win over ALLOW, preserving the deny-precedence
     invariant of ``evaluate_access`` *structurally* rather than by re-ranking.
 
+    For a query that spans several collections with DIFFERENT per-collection
+    grants, the scopes combine as an *exclusion-union* via the ``union`` field
+    (see :meth:`union_of`): ``d`` is visible iff at least one collection's
+    *complete* sub-filter admits it. The sub-filters are NOT flattened into one
+    allow/deny set — that would let one collection's DENY suppress another
+    collection's documents — they are evaluated independently and OR-ed.
+
 The cardinal safety rule (proved by the drift guard property test):
     The filter must be **equal-or-stricter** than ``evaluate_access``. A filter
     that admits a document the engine would deny is a security leak; a filter
@@ -139,6 +146,23 @@ class AccessFilter:
     #: informational: lets callers log/alert that search may under-return.
     uncompilable: bool = False
 
+    #: OR of *complete* sub-filters (exclusion-union). When non-empty a document
+    #: is admitted iff at least one sub-filter admits it in full — that is, the
+    #: sub-filter's own ``allow``/``deny``/``deny_all``/``allow_all`` logic is
+    #: evaluated independently and the results OR-ed. This is how a
+    #: multi-collection read combines DIFFERENT per-collection grants WITHOUT
+    #: cross-contamination: each sub-filter is already pinned to its own
+    #: ``collection_id`` (every allow AND deny clause carries that pin), so its
+    #: DENY clauses can only suppress its own collection's documents and its
+    #: ALLOW clauses can only admit them. Flattening clauses across collections
+    #: into a single ``allow``/``deny`` set would let a collection-A DENY (or an
+    #: ``allow_all`` from A) wrongly affect collection-B documents — the union
+    #: node exists precisely to prevent that. When ``union`` is set the top-level
+    #: ``allow``/``deny``/``allow_all`` are ignored (``deny_all`` still wins as a
+    #: fail-closed short-circuit); a sub-filter that is itself ``deny_everything``
+    #: simply contributes nothing (its collection yields zero rows).
+    union: Tuple["AccessFilter", ...] = ()
+
     #: Free-form driver hints the generic fields cannot carry. Drivers that do
     #: not understand a key MUST ignore it (never fail-open on it).
     extra: Mapping[str, Any] = field(default_factory=dict)
@@ -167,10 +191,47 @@ class AccessFilter:
             return cls.deny_everything(uncompilable=uncompilable)
         return cls(allow=allow_t, deny=tuple(deny), uncompilable=uncompilable)
 
+    @classmethod
+    def union_of(cls, sub_filters: Sequence["AccessFilter"]) -> "AccessFilter":
+        """Combine complete sub-filters as an exclusion-union (OR of sub-filters).
+
+        Used to merge per-collection read scopes for a multi-collection query so
+        each collection returns exactly what its OWN grants allow. Each sub-filter
+        must already be pinned to its collection (its allow AND deny clauses carry
+        the ``collection_id`` predicate) so a sub-filter's DENY can never suppress
+        another collection's documents.
+
+        Fail-closed reductions (never widen):
+          * no sub-filters ⟹ :meth:`deny_everything` (nothing in scope);
+          * sub-filters that are themselves ``deny_everything`` are dropped —
+            their collection simply yields zero rows, but they must NOT collapse
+            the whole union to deny;
+          * if every sub-filter is ``deny_everything`` ⟹ :meth:`deny_everything`;
+          * a single surviving sub-filter is returned as-is (no wrapper node);
+          * ``uncompilable`` is OR-ed across sub-filters so telemetry still sees
+            that some branch under-returns.
+        """
+        subs = tuple(sub_filters)
+        any_uncompilable = any(s.uncompilable for s in subs)
+        # A ``deny_everything`` sub-filter admits nothing; in an OR it is inert,
+        # so drop it rather than letting it short-circuit the whole union.
+        live = tuple(s for s in subs if not s.deny_all)
+        if not live:
+            return cls.deny_everything(uncompilable=any_uncompilable)
+        if len(live) == 1:
+            sub = live[0]
+            if any_uncompilable and not sub.uncompilable:
+                # Preserve the union-wide under-return signal on the lone branch.
+                from dataclasses import replace
+
+                return replace(sub, uncompilable=True)
+            return sub
+        return cls(union=live, uncompilable=any_uncompilable)
+
     @property
     def is_unconditional(self) -> bool:
         """True when no per-document clause needs to be applied at all."""
-        return self.allow_all and not self.deny
+        return self.allow_all and not self.deny and not self.union
 
     def admits(self, document: Mapping[str, Any]) -> bool:
         """Reference semantics — the contract every driver translation matches.
@@ -181,6 +242,12 @@ class AccessFilter:
         """
         if self.deny_all:
             return False
+        if self.union:
+            # Exclusion-union: each sub-filter is evaluated IN FULL (its own
+            # allow+deny+allow_all logic) and the results OR-ed. Because every
+            # sub-filter is collection-pinned, a sub-filter's DENY cannot reach
+            # another collection's documents.
+            return any(sub.admits(document) for sub in self.union)
         if any(clause.matches(document) for clause in self.deny):
             return False
         if self.allow_all:

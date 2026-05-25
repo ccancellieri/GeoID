@@ -27,6 +27,9 @@ Translation rules (a faithful mirror of ``admits``):
 
 * ``None`` input            → ``None`` (no row-level restriction).
 * ``deny_all``              → ``{"match_none": {}}`` (return nothing).
+* non-empty ``union``       → ``bool`` ``should`` of each sub-filter's COMPLETE
+  translation with ``minimum_should_match: 1`` (exclusion-union; each
+  collection's allow+deny stays scoped to its own sub-clause — see ``admits``).
 * ``allow_all`` and no deny → ``None`` (no restriction).
 * otherwise build a ``bool``:
     - allow clauses (unless ``allow_all``) become a ``should`` list with
@@ -86,6 +89,26 @@ def access_filter_to_es(access_filter: Any) -> Optional[Dict[str, Any]]:
 
     if access_filter.deny_all:
         return {"match_none": {}}
+
+    union = getattr(access_filter, "union", ())
+    if union:
+        # Exclusion-union: OR the COMPLETE translation of each sub-filter so each
+        # collection's allow+deny logic stays scoped to its own subtree (the ES
+        # mirror of ``AccessFilter.admits``'s union branch). A sub-filter that is
+        # ``deny_everything`` translates to ``match_none`` and so contributes
+        # nothing inside the ``should`` — its collection simply yields no rows,
+        # without suppressing any other collection's documents.
+        should_subs: List[Dict[str, Any]] = []
+        for sub in union:
+            sub_clause = access_filter_to_es(sub)
+            if sub_clause is None:
+                # An ``allow_all`` sub-filter with no deny imposes no restriction
+                # → it admits every document in its own (collection-pinned) scope.
+                # Mirror ``admits`` exactly: that sub-filter alone would return
+                # True, so the union must too.
+                sub_clause = {"match_all": {}}
+            should_subs.append(sub_clause)
+        return {"bool": {"should": should_subs, "minimum_should_match": 1}}
 
     deny_clauses: List[Dict[str, Any]] = [
         _clause_to_bool(c) for c in access_filter.deny

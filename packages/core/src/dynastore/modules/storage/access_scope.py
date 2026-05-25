@@ -82,12 +82,25 @@ async def compile_read_access_filter(
     """Compile the caller's read scope to a neutral ``AccessFilter``.
 
     Returns ``AccessFilter.deny_everything()`` when no ``PermissionProtocol`` is
-    registered (fail-closed). A search spanning exactly one collection is
-    compiled at collection scope so collection-level grants pin precisely;
-    a multi-collection search is compiled at catalog scope (the envelope index
-    is per-catalog and tenant-isolated, so catalog-level visibility/ownership is
-    the dominant model — per-collection differential grants across a
-    multi-collection query are a documented follow-up).
+    registered (fail-closed).
+
+    Compilation scope by collection count:
+
+    * **exactly one** collection — compiled at collection scope so
+      collection-level grants pin precisely.
+    * **zero / ``None``** collections — compiled at catalog scope (a
+      catalog-wide read; the envelope index is per-catalog and tenant-isolated).
+    * **several** collections — compiled ONCE PER COLLECTION and combined as an
+      *exclusion-union* (:meth:`AccessFilter.union_of`): a document is admitted
+      iff at least one collection's *complete* per-collection filter (its ALLOW
+      AND DENY, all already pinned to that ``collection_id``) admits it. This is
+      what lets a principal with DIFFERENT grants per collection get exactly
+      what each collection allows. Crucially the per-collection filters are NOT
+      flattened into one allow/deny set: each stays intact so a collection-A
+      DENY (or a non-collection-pinned visibility DENY) can never suppress a
+      collection-B document. A collection the principal cannot read compiles to
+      ``deny_everything`` and simply contributes nothing (exclusion-union),
+      never failing the whole query.
     """
     from dynastore.models.protocols.policies import PermissionProtocol
     from dynastore.models.protocols.access_filter import AccessFilter
@@ -97,12 +110,30 @@ async def compile_read_access_filter(
     if perms is None:
         return AccessFilter.deny_everything()
 
-    single_collection = (
-        collections[0] if collections and len(collections) == 1 else None
-    )
-    return await perms.compile_read_filter(
-        principals or [],
-        catalog_id=catalog_id,
-        collection_id=single_collection,
-        principal=principal,
-    )
+    norm_principals = principals or []
+
+    # Zero/None collections → catalog scope (unchanged). Exactly one collection →
+    # collection scope (unchanged). These two paths are byte-for-byte identical
+    # to the prior behaviour.
+    if not collections or len(collections) == 1:
+        single_collection = collections[0] if collections else None
+        return await perms.compile_read_filter(
+            norm_principals,
+            catalog_id=catalog_id,
+            collection_id=single_collection,
+            principal=principal,
+        )
+
+    # Several collections → compile each independently (each pinned to its own
+    # ``collection_id`` by the engine's ``_scope_clause``) and exclusion-union
+    # them. Per-collection isolation is preserved by NOT flattening clauses.
+    sub_filters = [
+        await perms.compile_read_filter(
+            norm_principals,
+            catalog_id=catalog_id,
+            collection_id=collection,
+            principal=principal,
+        )
+        for collection in collections
+    ]
+    return AccessFilter.union_of(sub_filters)
