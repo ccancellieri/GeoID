@@ -27,6 +27,7 @@ This module provides the GeometriesSidecar which manages:
 """
 
 import hashlib
+import json
 import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
@@ -47,6 +48,7 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import (
     FieldCapability,
 )
 from dynastore.modules.catalog.models import LocalizedText
+from dynastore.tools.json import CustomJSONEncoder
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
     ComputedKind,
@@ -1221,7 +1223,15 @@ class GeometriesSidecar(SidecarProtocol):
                 else:
                     payload[key] = derived[key]
             if jsonb_payload:
-                payload["geom_stats"] = jsonb_payload
+                # Serialize to a JSON string before binding. The sidecar upsert
+                # passes payload values straight to the driver with no ``::jsonb``
+                # cast or codec, so a raw dict is rejected ("can't adapt type
+                # 'dict'" on psycopg2 sync workers; asyncpg's built-in jsonb
+                # codec also expects str). Mirrors the attributes sidecar's
+                # ``attribute_stats`` handling.
+                payload["geom_stats"] = json.dumps(
+                    jsonb_payload, cls=CustomJSONEncoder
+                )
         elif storage_fields and not shapely_geom:
             # Fail-fast: if stats are declared we MUST have a valid geometry.
             raise ValueError(
@@ -1300,7 +1310,10 @@ class GeometriesSidecar(SidecarProtocol):
                 f.storage_mode == StatisticStorageMode.JSONB for f in place_fields
             )
             if has_jsonb:
-                payload["place_stats"] = place_stats
+                # JSON string, not a raw dict — see the geom_stats note above.
+                payload["place_stats"] = json.dumps(
+                    place_stats, cls=CustomJSONEncoder
+                )
             else:
                 for k, v in place_stats.items():
                     payload[f"place_{k}"] = v
