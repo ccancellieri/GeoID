@@ -31,6 +31,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from dynastore.models.protocols.field_definition import FieldCapability
+
 logger = logging.getLogger(__name__)
 
 
@@ -222,6 +224,38 @@ _ES_TYPE_TO_DATA_TYPE = {
     "object": "jsonb", "nested": "jsonb",
 }
 
+# ES type → queryable capabilities, co-located with the canonical-type table so
+# the two can never drift apart (they must share the same key set — see the SSOT
+# test). ``unsigned_long`` is aggregatable like the other numerics; ``binary``
+# carries no query caps (you cannot filter/sort/aggregate a blob).
+_NUMERIC_CAPS = [
+    FieldCapability.FILTERABLE,
+    FieldCapability.SORTABLE,
+    FieldCapability.AGGREGATABLE,
+]
+_ES_TYPE_TO_CAPS: Dict[str, List[FieldCapability]] = {
+    "text": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+    "keyword": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.GROUPABLE],
+    "ip": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+    "long": _NUMERIC_CAPS,
+    "unsigned_long": _NUMERIC_CAPS,
+    "integer": _NUMERIC_CAPS,
+    "short": _NUMERIC_CAPS,
+    "byte": _NUMERIC_CAPS,
+    "float": _NUMERIC_CAPS,
+    "double": _NUMERIC_CAPS,
+    "half_float": _NUMERIC_CAPS,
+    "scaled_float": _NUMERIC_CAPS,
+    "date": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+    "date_nanos": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+    "boolean": [FieldCapability.FILTERABLE],
+    "binary": [],
+    "geo_point": [FieldCapability.SPATIAL],
+    "geo_shape": [FieldCapability.SPATIAL],
+    "object": [FieldCapability.FILTERABLE],
+    "nested": [FieldCapability.FILTERABLE],
+}
+
 
 async def es_introspect_mapping(
     es: Any,
@@ -238,26 +272,7 @@ async def es_introspect_mapping(
     """
     from dynastore.models.protocols.field_definition import (
         FieldDefinition as ProtocolFieldDefinition,
-        FieldCapability,
     )
-
-    es_caps_map = {
-        "text": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-        "keyword": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.GROUPABLE],
-        "long": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE],
-        "integer": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE],
-        "short": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE],
-        "byte": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE],
-        "float": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE],
-        "double": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE],
-        "half_float": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE],
-        "scaled_float": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE],
-        "date": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-        "date_nanos": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-        "boolean": [FieldCapability.FILTERABLE],
-        "geo_point": [FieldCapability.SPATIAL],
-        "geo_shape": [FieldCapability.SPATIAL],
-    }
 
     try:
         mapping = await es.indices.get_mapping(index=index_name)
@@ -278,7 +293,7 @@ async def es_introspect_mapping(
         if name.startswith(skip_internal_prefix):
             continue
         es_type = (info or {}).get("type", "object")
-        caps = es_caps_map.get(es_type, [FieldCapability.FILTERABLE])
+        caps = _ES_TYPE_TO_CAPS.get(es_type, [FieldCapability.FILTERABLE])
         out.append(
             ProtocolFieldDefinition(
                 name=name,

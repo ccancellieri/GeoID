@@ -1108,64 +1108,20 @@ class ItemsElasticsearchDriver(
         entity_level: str = "item",
         db_resource: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Return FieldDefinition dict from ES index mappings."""
-        from dynastore.models.protocols.field_definition import (
-            FieldDefinition as ProtocolFieldDefinition,
-            FieldCapability,
-        )
+        """Return the introspected field set as a dict keyed by field name.
 
+        Delegates to the inherited ``introspect_schema`` so the ES-type →
+        canonical/capability mapping lives in exactly one place (the
+        ``es_introspect_mapping`` SSOT helper), shared with the envelope driver.
+        The previous inline copy of those tables had drifted — it mapped
+        ``object``/``nested`` to ``string`` and dropped ``date_nanos``, and only
+        skipped four named internal fields rather than every ``_``-prefixed one
+        (#1216).
+        """
         if entity_level != "item" or not collection_id:
             return {}
-
-        _NUM = [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.AGGREGATABLE]
-        es_type_map = {
-            "text": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-            "keyword": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE, FieldCapability.GROUPABLE],
-            "long": _NUM, "integer": _NUM, "short": _NUM, "byte": _NUM,
-            "unsigned_long": _NUM,
-            "float": _NUM, "double": _NUM, "half_float": _NUM, "scaled_float": _NUM,
-            "date": [FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-            "boolean": [FieldCapability.FILTERABLE],
-            "binary": [],
-            "geo_point": [FieldCapability.SPATIAL],
-            "geo_shape": [FieldCapability.SPATIAL],
-        }
-        # ES type -> canonical data_type (see ``dynastore.models.field_types``).
-        # ES has no date-only type; its "date" is an instant -> "timestamp".
-        data_type_map = {
-            "text": "string", "keyword": "string", "ip": "string",
-            "long": "bigint", "unsigned_long": "bigint",
-            "integer": "integer", "short": "integer", "byte": "integer",
-            "float": "double", "double": "double",
-            "half_float": "double", "scaled_float": "double",
-            "date": "timestamp", "boolean": "boolean", "binary": "binary",
-            "geo_point": "geometry", "geo_shape": "geometry",
-        }
-
-        try:
-            es = _es_client_required()
-            index_name = self._items_index_name(catalog_id)
-            mapping = await es.indices.get_mapping(index=index_name)
-            properties: Dict[str, Any] = {}
-            for idx_data in mapping.values():
-                properties = idx_data.get("mappings", {}).get("properties", {})
-                break
-
-            result = {}
-            internal = {"_asset_id", "_external_id", "_valid_from", "_valid_to"}
-            for name, field_info in properties.items():
-                if name.startswith("_") and name in internal:
-                    continue
-                es_type = field_info.get("type", "object")
-                caps = es_type_map.get(es_type, [FieldCapability.FILTERABLE])
-                result[name] = ProtocolFieldDefinition(
-                    name=name,
-                    data_type=data_type_map.get(es_type, "string"),
-                    capabilities=caps,
-                )
-            return result
-        except Exception:
-            return {}
+        fields = await self.introspect_schema(catalog_id, collection_id)
+        return {getattr(f, "name", str(f)): f for f in fields}
 
     async def read_entities(
         self,
