@@ -73,6 +73,18 @@ logger = logging.getLogger(__name__)
 # ENUMS & CONSTANTS
 # ============================================================================
 
+# Maps each ``SimplificationAlgorithm`` *value* to its PostGIS function. The tile
+# pipeline passes the bare enum value (e.g. ``topology_preserving``), which is NOT
+# a SQL identifier — emitting it verbatim raises ``function topology_preserving(
+# geometry, unknown) does not exist``. Only names in this table are ever
+# interpolated into SQL, so the algorithm string can never inject arbitrary calls.
+_SIMPLIFY_SQL_FUNCTIONS: Dict[str, str] = {
+    SimplificationAlgorithm.DOUGLAS_PEUCKER.value: "ST_Simplify",
+    SimplificationAlgorithm.TOPOLOGY_PRESERVING.value: "ST_SimplifyPreserveTopology",
+    SimplificationAlgorithm.VISVALINGAM_WHYATT.value: "ST_SimplifyVW",
+}
+_DEFAULT_SIMPLIFY_SQL_FUNCTION = "ST_SimplifyPreserveTopology"
+
 
 # ============================================================================
 # IMPLEMENTATION
@@ -730,8 +742,9 @@ class GeometriesSidecar(SidecarProtocol):
         # 3. Simplification
         simplification = params.get("simplification")
         if simplification and simplification > 0:
-            algo = params.get("simplification_algorithm", "ST_SimplifyPreserveTopology")
-            geom_col = f"{algo}({geom_col}, :simplification)"
+            algo = params.get("simplification_algorithm") or ""
+            func = _SIMPLIFY_SQL_FUNCTIONS.get(algo, _DEFAULT_SIMPLIFY_SQL_FUNCTION)
+            geom_col = f"{func}({geom_col}, :simplification)"
 
         # 4. Final Formatting
         geom_format = params.get("geom_format", "WKB")

@@ -11,11 +11,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from dynastore.models.query_builder import QueryRequest, FieldSelection
 from dynastore.modules.tiles.query_transform import MVTQueryTransform
 from dynastore.modules.storage.drivers.pg_sidecars import (
     FeatureAttributeSidecarConfig,
     GeometriesSidecarConfig,
+)
+from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+    SimplificationAlgorithm,
 )
 
 
@@ -72,14 +77,43 @@ def test_mvt_geometry_honors_renamed_geometry_column():
     assert "sc_geometries.geom " not in raw  # not the default name
 
 
-def test_mvt_simplification_binds_when_configured():
+@pytest.mark.parametrize(
+    "algorithm, expected_fn",
+    [
+        (SimplificationAlgorithm.DOUGLAS_PEUCKER, "ST_Simplify("),
+        (SimplificationAlgorithm.TOPOLOGY_PRESERVING, "ST_SimplifyPreserveTopology("),
+        (SimplificationAlgorithm.VISVALINGAM_WHYATT, "ST_SimplifyVW("),
+    ],
+)
+def test_mvt_simplification_maps_algorithm_to_postgis_function(algorithm, expected_fn):
+    """The simplification *algorithm enum value* must map to its PostGIS function.
+
+    The tile pipeline passes ``SimplificationAlgorithm.value`` (e.g.
+    ``topology_preserving``) — a bare enum string, never a SQL identifier. Emitting
+    it verbatim produces ``function topology_preserving(geometry, unknown) does not
+    exist``; it must be translated to ``ST_SimplifyPreserveTopology`` (and siblings).
+    """
     req = MVTQueryTransform().transform_query(
         _base_request(),
         _mvt_context(
             _col_config(),
             simplification=0.001,
-            simplification_algorithm="ST_SimplifyPreserveTopology",
+            simplification_algorithm=algorithm.value,
         ),
+    )
+    raw = " ".join(req.raw_selects)
+    assert expected_fn in raw
+    # The raw enum value must never leak through as a SQL function name.
+    assert f"{algorithm.value}(" not in raw
+    assert req.raw_params["simplification"] == 0.001
+
+
+def test_mvt_simplification_defaults_to_preserve_topology():
+    """Absent an explicit algorithm, simplification falls back to the
+    topology-preserving PostGIS function."""
+    req = MVTQueryTransform().transform_query(
+        _base_request(),
+        _mvt_context(_col_config(), simplification=0.001),
     )
     raw = " ".join(req.raw_selects)
     assert "ST_SimplifyPreserveTopology(" in raw
