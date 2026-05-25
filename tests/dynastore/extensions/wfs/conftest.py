@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from dynastore.tools.identifiers import generate_id_hex
 
@@ -73,11 +75,23 @@ async def setup_collection(
     )
     assert r.status_code == 201
 
-    r = await in_process_client_module.put(
-        f"/configs/catalogs/{catalog_id}/collections/{collection_id}/plugins/collection_plugin_config",
-        json=config_data,
+    # The config storage for a freshly-created collection can briefly return
+    # 409 while provisioning settles (the "config PUT right after create"
+    # race). It is harmless and self-clears, but surfaces under xdist parallel
+    # load and flakes this fixture. Poll the PUT until it stops racing — the
+    # same retry pattern operators use against the live configs API.
+    config_url = (
+        f"/configs/catalogs/{catalog_id}/collections/{collection_id}"
+        f"/plugins/collection_plugin_config"
     )
-    assert r.status_code in [200, 204]
+    for attempt in range(10):
+        r = await in_process_client_module.put(config_url, json=config_data)
+        if r.status_code != 409:
+            break
+        await asyncio.sleep(0.2 * (attempt + 1))
+    assert r.status_code in [200, 204], (
+        f"config PUT failed after retries: {r.status_code} {r.text}"
+    )
 
     yield collection_id
     # Cleanup is handled by setup_catalog (delete catalog deletes collections)
