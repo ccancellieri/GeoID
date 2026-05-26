@@ -98,7 +98,6 @@
     /* Chip variants the shared file does not declare — keep semantic names. */
     .chip-active  { color: var(--olive);            border-color: var(--olive); }
     .chip-off     { color: var(--terracotta-deep);  border-color: var(--terracotta-deep); }
-    .chip-system  { color: var(--amber);            border-color: var(--amber); }
 
     /* Inline revoke button inside a chip — flat, danger-tinted. */
     .chip-x {
@@ -873,7 +872,6 @@ async function loadPolicies() {
 }
 function renderPolicies(list) {
   const tb = document.getElementById('policies-tbody');
-  const sys = new Set(['public_access','self_service_access','sysadmin_full_access']);
   if (!list.length) { tb.innerHTML = '<tr class="empty-row"><td colspan="7">No policies found.</td></tr>'; return; }
   // Builds row HTML. Every user-controlled value is escaped via escapeHtml();
   // condition type checks read from a fixed allowlist (rate_limit, max_count).
@@ -885,7 +883,7 @@ function renderPolicies(list) {
       hasRate ? '<span class="chip limit-rate" title="Has rate_limit condition">rate</span>' : '',
       hasQuota ? '<span class="chip limit-quota" title="Has max_count condition">quota</span>' : '',
     ].filter(Boolean).join(' ');
-    const ops = sys.has(p.id) ? '<span class="chip chip-system">System</span>' : `
+    const ops = `
         <button class="btn btn-secondary btn-xs" type="button" data-action="edit-policy" data-id="${escapeHtml(p.id)}" aria-label="Edit policy" title="Edit">Edit</button>
         ${(hasRate || hasQuota) ? `<button class="btn btn-secondary btn-xs" type="button" data-action="usage-policy" data-id="${escapeHtml(p.id)}" aria-label="Show usage" title="Usage">Usage</button>` : ''}
         <button class="btn btn-danger btn-xs" type="button" data-action="delete-policy" data-id="${escapeHtml(p.id)}" aria-label="Delete policy" title="Delete">Delete</button>`;
