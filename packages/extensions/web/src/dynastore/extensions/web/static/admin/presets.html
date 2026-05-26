@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Presets — DynaStore</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="../static/common/admin.css">
+</head>
+<body>
+  <main>
+    <header class="masthead">
+      <div class="folio">IV.</div>
+      <div>
+        <div class="kicker">DynaStore — Atlas of governance</div>
+        <h1>Presets</h1>
+      </div>
+      <div class="stamp" id="masthead-stamp"></div>
+    </header>
+
+    <p class="subtitle">
+      Presets are named bundles of configuration changes that bring a catalog,
+      collection, or platform to a known posture in a single operation. Apply
+      them to establish baseline routing, IAM policies, or extension defaults;
+      roll them back when the persisted rows still match the preset exactly.
+    </p>
+
+    <!-- Scope picker ---------------------------------------------------- -->
+    <section class="plate" aria-label="Scope">
+      <div class="plate-header">
+        <h3>Scope</h3>
+        <div class="plate-meta" id="scope-route">GET /admin/catalogs · /catalogs/{cat}/collections</div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label for="scope-catalog">Catalog</label>
+          <select id="scope-catalog" aria-label="Catalog selector">
+            <option value="">— platform scope —</option>
+          </select>
+        </div>
+        <div>
+          <label for="scope-collection">Collection</label>
+          <select id="scope-collection" disabled aria-label="Collection selector">
+            <option value="">— pick a collection —</option>
+          </select>
+        </div>
+      </div>
+      <div id="scope-status" class="hint" role="status" aria-live="polite"></div>
+    </section>
+
+    <!-- Filters --------------------------------------------------------- -->
+    <section class="plate" aria-label="Filters">
+      <div class="plate-header">
+        <h3>Filters</h3>
+        <div class="plate-meta">GET /admin/presets?q=&hellip;</div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label for="filter-q">Search</label>
+          <input id="filter-q" type="search" placeholder="name, description, keywords…"
+                 aria-label="Full-text search">
+        </div>
+        <div>
+          <label for="filter-name">Name prefix</label>
+          <input id="filter-name" type="text" placeholder="public_" aria-label="Name prefix filter">
+        </div>
+        <div>
+          <label for="filter-tier">Tier</label>
+          <select id="filter-tier" aria-label="Tier filter">
+            <option value="">— all tiers —</option>
+            <option value="platform">platform</option>
+            <option value="catalog">catalog</option>
+            <option value="collection">collection</option>
+            <option value="items">items</option>
+            <option value="assets">assets</option>
+          </select>
+        </div>
+        <div>
+          <label for="filter-keywords">Keywords (comma-separated)</label>
+          <input id="filter-keywords" type="text" placeholder="iam, routing" aria-label="Keyword filter">
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-secondary" type="button" id="filter-btn"
+                aria-label="Apply filters">Search</button>
+        <span id="filter-status" class="hint" role="status" aria-live="polite"></span>
+      </div>
+    </section>
+
+    <!-- Preset list ----------------------------------------------------- -->
+    <section class="plate" aria-label="Preset list">
+      <div class="plate-header">
+        <h3>Registered presets</h3>
+        <div class="plate-meta" id="list-meta">GET /admin/presets</div>
+      </div>
+      <div id="presets-list" role="list" aria-label="Preset list"></div>
+      <div id="presets-pagination" class="form-actions" style="display:none">
+        <button class="btn btn-secondary" type="button" id="presets-prev-btn"
+                aria-label="Previous page" disabled>Previous</button>
+        <span id="presets-cursor-label" class="hint"></span>
+        <button class="btn btn-secondary" type="button" id="presets-next-btn"
+                aria-label="Next page">Next</button>
+      </div>
+    </section>
+
+    <!-- Preset detail --------------------------------------------------- -->
+    <section class="plate" id="detail-plate" style="display:none"
+             aria-label="Preset detail">
+      <div class="plate-header">
+        <h3 id="detail-title">Preset detail</h3>
+        <div class="plate-meta" id="detail-route">GET /admin/presets/{name}</div>
+      </div>
+      <p id="detail-description" class="hint"></p>
+      <div class="form-row" id="detail-meta-row">
+        <div>
+          <span class="kv-label">Tier</span>
+          <span id="detail-tier" class="chip"></span>
+        </div>
+        <div>
+          <span class="kv-label">Keywords</span>
+          <span id="detail-keywords"></span>
+        </div>
+      </div>
+
+      <div id="detail-params-section" style="display:none">
+        <h4 class="ci-subhead">Parameters</h4>
+        <div id="detail-params-form" class="schema-form" aria-label="Preset parameters form"></div>
+      </div>
+      <div id="detail-params-fallback" style="display:none">
+        <h4 class="ci-subhead">Parameters (raw schema)</h4>
+        <pre id="detail-params-json" class="hint"></pre>
+      </div>
+
+      <div class="form-actions" id="detail-actions">
+        <button class="btn btn-secondary" type="button" id="btn-dry-run"
+                aria-label="Dry-run this preset without writing changes">Dry-run</button>
+        <button class="btn" type="button" id="btn-apply"
+                aria-label="Apply this preset to the selected scope">Apply</button>
+        <button class="btn btn-danger" type="button" id="btn-rollback" disabled
+                aria-label="Roll back this preset from the selected scope">Rollback</button>
+        <span id="detail-action-status" class="hint" role="status" aria-live="polite"></span>
+      </div>
+
+      <!-- Self-lockout confirmation dialog -->
+      <dialog id="lockout-dialog" aria-labelledby="lockout-dialog-title">
+        <div class="plate explainer-plate">
+          <div class="plate-header">
+            <h3 id="lockout-dialog-title">Confirm rollback — IAM risk</h3>
+          </div>
+          <p class="hint">
+            Rolling back this preset may remove IAM policies or roles that
+            grant your current session its admin access. Proceed only if you
+            have an alternative path to restore access.
+          </p>
+          <div class="form-row">
+            <label>
+              <input type="checkbox" id="lockout-force-checkbox">
+              I understand and want to force this rollback
+              (<code>force_self_revoke=true</code>)
+            </label>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-danger" type="button" id="lockout-confirm-btn"
+                    disabled aria-label="Confirm forced rollback">Confirm rollback</button>
+            <button class="btn btn-secondary" type="button" id="lockout-cancel-btn"
+                    aria-label="Cancel rollback">Cancel</button>
+          </div>
+        </div>
+      </dialog>
+
+      <!-- Dry-run result -->
+      <div id="dry-run-result" style="display:none">
+        <hr class="rule">
+        <h4 class="ci-subhead">Dry-run plan</h4>
+        <div class="plate-meta" id="dry-run-scope-label"></div>
+        <div id="dry-run-warnings" style="display:none">
+          <p class="hint" id="dry-run-warning-text" data-level="error"></p>
+        </div>
+        <table id="dry-run-table" aria-label="Dry-run plan entries">
+          <thead>
+            <tr>
+              <th>Kind</th>
+              <th>Target</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody id="dry-run-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Applied history ------------------------------------------------- -->
+    <section class="plate" id="history-plate" style="display:none"
+             aria-label="Applied history">
+      <div class="plate-header">
+        <h3>Applied at this scope</h3>
+        <div class="plate-meta" id="history-route">assembled client-side per preset</div>
+      </div>
+      <p class="hint">
+        Presets whose persisted configuration at the current scope exactly
+        matches the preset bundle. A diverged row means an operator edited
+        the configuration after the preset was applied; rollback will be
+        blocked until the rows are reconciled.
+      </p>
+      <div id="history-list" role="list" aria-label="Applied presets at scope"></div>
+    </section>
+  </main>
+
+  <script>
+    document.getElementById("masthead-stamp").textContent =
+      `FOLIO ${new Date().toISOString().slice(0, 10)}\nREV. ${Math.floor(Math.random()*900+100)}`;
+  </script>
+  <script type="module" src="../static/admin/presets.js"></script>
+</body>
+</html>
