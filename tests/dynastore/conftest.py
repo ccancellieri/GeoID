@@ -5,6 +5,29 @@ import asyncio
 import uuid
 from dynastore.tools.identifiers import generate_geoid, generate_id_hex, generate_task_id
 
+
+@pytest.fixture(scope="session")
+def worker_id(request) -> str:
+    """``worker_id`` fallback for serial runs (``pytest -p no:xdist``).
+
+    pytest-xdist's own ``worker_id`` fixture is session-scoped; a same-named
+    fixture in conftest overrides it during collection. Session scope is
+    required so module-scoped consumers like ``shared_catalog`` can depend on
+    it without a ``ScopeMismatch``. Under xdist we read
+    ``workerinput['workerid']`` (the same source the upstream fixture uses)
+    so behaviour matches the plugin; without xdist we return ``"master"``.
+
+    Without this fallback, ``-p no:xdist`` invocations error out at fixture
+    setup for every test depending on ``shared_catalog`` (which requires a
+    stable per-worker id derivation). The 9 setup ERRORs in the 2026-05-26
+    integration sweep all trace to this single missing fixture, not to any
+    production code path.
+    """
+    xdist_input = getattr(request.config, "workerinput", None)
+    if xdist_input is not None:
+        return xdist_input["workerid"]
+    return "master"
+
 # Must configure testing environment variables before ANY Pydantic models are imported!
 os.environ["DYNASTORE_QUEUE_POLL_INTERVAL"] = "0.5"
 
