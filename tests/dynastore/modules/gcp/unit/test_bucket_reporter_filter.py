@@ -80,7 +80,13 @@ def test_pydantic_feature_record_is_normalized_and_geometry_excluded() -> None:
 
 
 def test_legacy_flat_record_geom_still_excluded() -> None:
-    legacy = {"asset_id": "ITAL1_01", "geom": "0101...", "attributes": {"CODE": "x"}}
+    # Legacy DWH dict path: ``asset_id`` rides inside ``system`` since the D1
+    # envelope split, so the legacy ``asset_code`` alias derives from there.
+    legacy = {
+        "system": {"asset_id": "ITAL1_01"},
+        "geom": "0101...",
+        "attributes": {"CODE": "x"},
+    }
     out = _reporter(include_geometry=False)._filter_result_for_reporting(
         {"status": "SUCCESS", "record": legacy}
     )
@@ -123,7 +129,7 @@ def test_dedup_preserves_legacy_asset_code_top_level() -> None:
     """The reporter's own legacy DWH field ``asset_code`` is not a duplicate of
     ``properties`` and must survive the top-level dedup."""
     record = _feature_record_with_top_level_echo()
-    record["asset_id"] = "ITAL1_01"
+    record["system"] = {"asset_id": "ITAL1_01"}
     out = _reporter(include_geometry=False)._filter_result_for_reporting(
         {"status": "SUCCESS", "record": record}
     )
@@ -132,57 +138,65 @@ def test_dedup_preserves_legacy_asset_code_top_level() -> None:
 
 
 def _enriched_record() -> dict:
-    """A report record after ingestion enrichment: identity stamped at the top
-    level and the generated statistics merged into ``properties``."""
+    """A report record after the D1 envelope split: user attributes live alone
+    in ``properties``, platform statistics under ``stats``, identity under
+    ``system``."""
     return {
         "type": "Feature",
         "id": "geoid-1621",
         "geometry": {"type": "Point", "coordinates": [13.3, 45.6]},
-        "properties": {"NAME": "Friuli", "area": 7845.0, "perimeter": 412.3},
+        "properties": {"NAME": "Friuli"},
+        "stats": {"area": 7845.0, "perimeter": 412.3},
+        "system": {
+            "geoid": "geoid-1621",
+            "external_id": "1621",
+            "asset_id": "ITAL1_01",
+        },
+    }
+
+
+def test_system_envelope_kept_with_legacy_asset_code_alias() -> None:
+    out = _reporter(include_geometry=False)._filter_result_for_reporting(
+        {"status": "SUCCESS", "record": _enriched_record()}
+    )
+    rec = out["record"]
+    assert rec["system"] == {
         "geoid": "geoid-1621",
         "external_id": "1621",
         "asset_id": "ITAL1_01",
     }
+    assert rec["asset_code"] == "ITAL1_01"  # legacy alias derived from system
+    # Identity must no longer appear at the GeoJSON top level.
+    for key in ("geoid", "external_id", "asset_id"):
+        assert key not in rec
 
 
-def test_identity_keys_kept_at_top_level_by_default() -> None:
+def test_user_properties_and_platform_stats_are_separate_siblings() -> None:
     out = _reporter(include_geometry=False)._filter_result_for_reporting(
         {"status": "SUCCESS", "record": _enriched_record()}
     )
-    rec = out["record"]
-    assert rec["geoid"] == "geoid-1621"
-    assert rec["external_id"] == "1621"
-    assert rec["asset_id"] == "ITAL1_01"
-    assert rec["asset_code"] == "ITAL1_01"  # legacy alias still synthesised
+    assert out["record"]["properties"] == {"NAME": "Friuli"}
+    assert out["record"]["stats"] == {"area": 7845.0, "perimeter": 412.3}
+    # ``area`` (a geometry stat) must NOT leak back into ``properties``.
+    assert "area" not in out["record"]["properties"]
 
 
-def test_generated_statistics_survive_under_properties() -> None:
-    out = _reporter(include_geometry=False)._filter_result_for_reporting(
-        {"status": "SUCCESS", "record": _enriched_record()}
-    )
-    assert out["record"]["properties"] == {
-        "NAME": "Friuli",
-        "area": 7845.0,
-        "perimeter": 412.3,
-    }
-
-
-def test_include_geoid_false_suppresses_geoid() -> None:
+def test_include_geoid_false_suppresses_geoid_in_system() -> None:
     out = _reporter(
         include_geometry=False, include_geoid=False
     )._filter_result_for_reporting({"status": "SUCCESS", "record": _enriched_record()})
     rec = out["record"]
-    assert "geoid" not in rec
-    assert rec["external_id"] == "1621"  # others unaffected
+    assert "geoid" not in rec["system"]
+    assert rec["system"]["external_id"] == "1621"  # others unaffected
 
 
-def test_include_external_id_false_suppresses_external_id() -> None:
+def test_include_external_id_false_suppresses_external_id_in_system() -> None:
     out = _reporter(
         include_geometry=False, include_external_id=False
     )._filter_result_for_reporting({"status": "SUCCESS", "record": _enriched_record()})
     rec = out["record"]
-    assert "external_id" not in rec
-    assert rec["geoid"] == "geoid-1621"
+    assert "external_id" not in rec["system"]
+    assert rec["system"]["geoid"] == "geoid-1621"
 
 
 def test_include_asset_id_false_suppresses_asset_id_and_legacy_alias() -> None:
@@ -190,15 +204,16 @@ def test_include_asset_id_false_suppresses_asset_id_and_legacy_alias() -> None:
         include_geometry=False, include_asset_id=False
     )._filter_result_for_reporting({"status": "SUCCESS", "record": _enriched_record()})
     rec = out["record"]
-    assert "asset_id" not in rec
+    assert "asset_id" not in rec["system"]
     assert "asset_code" not in rec
-    assert rec["geoid"] == "geoid-1621"
+    assert rec["system"]["geoid"] == "geoid-1621"
 
 
-def test_reported_attributes_allow_list_still_filters_statistics() -> None:
-    """The attribute allow-list governs the merged statistics too — a stat not
-    on the list is dropped, exactly like a regular attribute."""
+def test_reported_attributes_allow_list_does_not_touch_stats() -> None:
+    """The user-attribute allow-list governs ``properties`` only — platform
+    statistics under ``stats`` are a separate concern and ride through whole."""
     out = _reporter(
-        include_geometry=False, reported_attributes=["NAME", "area"]
+        include_geometry=False, reported_attributes=["NAME"]
     )._filter_result_for_reporting({"status": "SUCCESS", "record": _enriched_record()})
-    assert out["record"]["properties"] == {"NAME": "Friuli", "area": 7845.0}
+    assert out["record"]["properties"] == {"NAME": "Friuli"}
+    assert out["record"]["stats"] == {"area": 7845.0, "perimeter": 412.3}

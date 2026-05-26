@@ -163,9 +163,6 @@ class ItemDistributedMixin(_Host):
             ))
             if isinstance(wp, ItemsWritePolicy):
                 write_policy = wp
-        on_conflict = (
-            write_policy.on_conflict if write_policy else WriteConflictPolicy.UPDATE
-        )
 
         # 1.5 Acceptance Check — rejections are surfaced to callers as
         # structured SidecarRejectedError, never a silent None. Upper layers
@@ -255,26 +252,6 @@ class ItemDistributedMixin(_Host):
                     geoid=active_rec.get("geoid"),
                     matcher=rule_name,
                 )
-
-        # 1.7 Hash gating: if enabled and an unchanged geometry_hash matches,
-        # short-circuit the action to avoid churning identical rows.
-        # Issue #220: geometry_hash lives on the geometries sidecar (PG-
-        # generated STORED column).  ``active_rec`` carries it via the
-        # matcher's JOIN; ``processing_context`` carries the incoming
-        # hash computed by the geometries sidecar's pre-write hook.
-        if (
-            active_rec
-            and write_policy
-            and write_policy.geometries.skip_if_unchanged_geometry_hash
-        ):
-            incoming_ch = processing_context.get("geometry_hash")
-            if incoming_ch and active_rec.get("geometry_hash") == incoming_ch:
-                logger.info(
-                    "DISTRIBUTED UPSERT: geometry_hash unchanged — collapsing "
-                    f"{on_conflict} to REFUSE_RETURN (geoid={active_rec.get('geoid')})"
-                )
-                on_conflict = WriteConflictPolicy.REFUSE_RETURN
-                effective_on_conflict = WriteConflictPolicy.REFUSE_RETURN
 
         # 1.8 REFUSE_FAIL: raise immediately so the batch aborts.
         if active_rec and effective_on_conflict == WriteConflictPolicy.REFUSE_FAIL:

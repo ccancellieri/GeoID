@@ -27,9 +27,9 @@ Two built-in constraint types:
 
 Identity / validity / geometry-hash semantics now live on
 :class:`~dynastore.modules.storage.driver_config.ItemsWritePolicy`
-(``compute``/``identity``/``schema``/
-``geometries.skip_if_unchanged_geometry_hash``)
-rather than as schema constraints.
+(``compute``/``identity``/``schema``) — geometry-hash skip is expressed
+as an ``IdentityRule(match_on=["geometry_hash"], ...)`` entry rather
+than a sub-config flag.
 
 Additional constraint types can be registered by any module.
 

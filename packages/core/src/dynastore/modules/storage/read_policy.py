@@ -34,7 +34,7 @@ Collection-scoped only.
 """
 
 import logging
-from typing import ClassVar, Optional, Tuple
+from typing import Any, ClassVar, List, Optional, Tuple
 
 from pydantic import Field
 
@@ -181,4 +181,35 @@ async def _validate_read_policy(
 ItemsReadPolicy.register_validate_handler(_validate_read_policy)
 
 
-__all__ = ["ItemsReadPolicy"]
+def project_select_for_feature_type(feature_type: FeatureType) -> List[Any]:
+    """Build the SELECT list a read path needs to honour ``feature_type``.
+
+    Sibling SSOT to ``ItemService.map_row_to_feature``: the Python read path
+    fetches every property column and lets the row-mapper drop what
+    ``feature_type`` does not surface; the SQL-aggregating tile path cannot
+    project per row (``ST_AsMVT`` emits every selected column as a tile
+    property) so the same wire-shape contract is materialised here as the
+    SELECT list. Both paths thus answer to a single declarative contract
+    (``ItemsReadPolicy.feature_type``) — never two divergent code paths.
+
+    ``expose`` names are taken at face value; ``_validate_read_policy``
+    already rejects names that the collection cannot surface (unknown field
+    or unstored computed value) at config-save time.
+    """
+    from dynastore.models.query_builder import FieldSelection
+
+    selects: List[FieldSelection] = []
+
+    if feature_type.expose_geoid:
+        selects.append(FieldSelection(field="geoid"))
+
+    if feature_type.expose_created:
+        selects.append(FieldSelection(field="transaction_time", alias="created"))
+
+    for name in feature_type.expose:
+        selects.append(FieldSelection(field=name))
+
+    return selects
+
+
+__all__ = ["ItemsReadPolicy", "project_select_for_feature_type"]

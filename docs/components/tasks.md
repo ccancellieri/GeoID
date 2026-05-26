@@ -208,6 +208,33 @@ Tasks use a Strategy Pattern to handle complex reporting without polluting inges
 - **DatabaseStatusReporter:** Batches API completion back down to the DB `progress` column integers.
 - **GcsDetailedReporter:** Stores granular row-by-row pass/fails in memory and pushes them into an external Cloud Storage Bucket strictly at the `task_finish` bound.
 
+### Per-record envelope
+
+Every reporter consumes the same per-record dict shape:
+
+```json
+{
+  "status": "SUCCESS",
+  "message": null,
+  "record": {
+    "type": "Feature",
+    "id": "019e6318-...",
+    "geometry": { "type": "Polygon", "coordinates": [] },
+    "properties": { "CODE": "305", "NAME": "Berat" },
+    "stats":      { "area": 17999118217.71, "centroid": "0101...", "bbox": [10.62, 44.79, 13.11, 46.68] },
+    "system":     { "geoid": "019e6318-...", "external_id": "305", "asset_id": "ALBL1_01",
+                    "geometry_hash": "…", "attributes_hash": "…", "validity": "[2024-01-01,)",
+                    "transaction_time": "2026-02-26T18:09:04.131762+00:00", "deleted_at": null }
+  }
+}
+```
+
+- `properties` — user attributes only.
+- `stats` — flat, platform-derived: `geometry_stats`, `attribute_stats`, `content_hashes`, `spatial_cells`.
+- `system` — identity + lifecycle. Absent keys are omitted (predictable shape: `stats` and `system` are always present, possibly empty).
+
+Rejections use the same envelope: `properties` echoes the offending input, `system` carries whichever identity fields were derived, `stats` is `{}`.
+
 ## Generic Execution via `main_task.py`
 A generic worker. It boots up looking for command line constants `task_name` and `payload`.
 It initiates required system constants by iterating the `SCOPE`-filtered module registry, mapping the required dependencies, bridging synchronous databases, and dynamically invoking mapped functions based on the payload string cleanly avoiding rewriting infrastructure for every new async script operation.

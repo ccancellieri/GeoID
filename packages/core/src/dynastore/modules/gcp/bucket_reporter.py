@@ -56,7 +56,12 @@ _FEATURE_STRUCTURAL_KEYS = frozenset(
         "stac_extensions",
     }
 )
-_REPORT_LEGACY_TOP_LEVEL_KEYS = frozenset({"asset_code", "asset_id"})
+_REPORT_LEGACY_TOP_LEVEL_KEYS = frozenset({"asset_code"})
+# Sibling envelope keys to ``properties`` introduced by the reporter-shape
+# split (D1): ``stats`` is the flat platform-derived statistic bag (formerly
+# mixed into ``properties``); ``system`` carries identity + lifecycle fields
+# (formerly stamped at the record top level).
+_REPORT_ENVELOPE_KEYS = frozenset({"stats", "system"})
 
 if TYPE_CHECKING:
     from dynastore.modules.gcp.gcp_module import GCPModule
@@ -400,15 +405,33 @@ class GcsDetailedReporter(ReportingInterface[GcsDetailedReporterConfig]):
         if isinstance(record, dict):
             record = dict(record)
 
+            # Identity lives under ``record["system"]`` since the D1 envelope
+            # split: include_*=False strips a single key from that bag rather
+            # than the record top level.
+            system = record.get("system")
+            if isinstance(system, dict):
+                system = dict(system)
+                if self.config.include_geoid is False:
+                    system.pop("geoid", None)
+                if self.config.include_external_id is False:
+                    system.pop("external_id", None)
+                if self.config.include_asset_id is False:
+                    system.pop("asset_id", None)
+                record["system"] = system
+            else:
+                system = None
+
             # legacy dwh contract: surface asset_id as asset_code (skipped when
             # asset_id is suppressed so the alias doesn't smuggle it back in).
-            if self.config.include_asset_id is not False:
-                asset_id = record.get("asset_id")
+            if self.config.include_asset_id is not False and isinstance(system, dict):
+                asset_id = system.get("asset_id")
                 if asset_id:
                     record["asset_code"] = str(asset_id)
 
             # 1. Attribute allow-list — applies to the GeoJSON ``properties``
-            #    bag and the legacy flat ``attributes`` bag alike.
+            #    bag and the legacy flat ``attributes`` bag alike. ``stats`` is
+            #    its own sibling envelope key (platform-derived) and is not
+            #    subject to the user-attribute allow-list.
             reported_attrs = self.config.reported_attributes
             if reported_attrs is not None:
                 for attr_key in ("properties", "attributes"):
@@ -430,20 +453,15 @@ class GcsDetailedReporter(ReportingInterface[GcsDetailedReporterConfig]):
 
             # 4. De-duplicate the top level. Sidecar attributes are echoed at
             #    the Feature top level (from ``__pydantic_extra__``) as well as
-            #    under ``properties``; keep only structural + legacy DWH keys so
-            #    each attribute is reported once, under ``properties``. The
-            #    ingestion-stamped identity keys (geoid / external_id / asset_id)
-            #    are admitted on top, each suppressible via its ``include_*`` flag
-            #    (default None = include when the ingestion produced it).
-            allowed_top_level = set(_FEATURE_STRUCTURAL_KEYS) | set(
-                _REPORT_LEGACY_TOP_LEVEL_KEYS
+            #    under ``properties``; keep only structural + legacy DWH keys
+            #    plus the envelope siblings ``stats``/``system`` so each
+            #    attribute appears once, under ``properties``.
+            allowed_top_level = (
+                set(_FEATURE_STRUCTURAL_KEYS)
+                | set(_REPORT_LEGACY_TOP_LEVEL_KEYS)
+                | set(_REPORT_ENVELOPE_KEYS)
             )
-            if self.config.include_geoid is not False:
-                allowed_top_level.add("geoid")
-            if self.config.include_external_id is not False:
-                allowed_top_level.add("external_id")
             if self.config.include_asset_id is False:
-                allowed_top_level.discard("asset_id")
                 allowed_top_level.discard("asset_code")
             record = {
                 key: value

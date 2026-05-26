@@ -79,9 +79,8 @@ class GeometriesSidecarConfig(SidecarConfig):
     (FK to hub on ``geoid``).  Columns include ``geom`` (and optional
     ``bbox_geom``), a STORED GENERATED ``geohash CHAR(N)`` driven by
     ``ST_GeoHash(geom, N)``, and a STORED GENERATED ``geometry_hash
-    CHAR(64)`` (SHA256 of ``ST_AsBinary(geom)``) used by
-    ``ComputedKind.GEOMETRY_HASH`` and the
-    ``geometries.skip_if_unchanged_geometry_hash`` write-policy gate.
+    CHAR(64)`` (SHA256 of ``ST_AsBinary(geom)``) consumed by the
+    ``ComputedKind.GEOMETRY_HASH`` identity matcher.
 
     Attached by default for VECTOR / RASTER collections; not attached
     for RECORDS (no spatial component).

@@ -48,9 +48,10 @@ sidecar lands without touching the driver-config Union — just declare
 Owns `{schema}.{table}_geometries`.  One row per item, FK to hub on
 `geoid`.  Stores `geom` (and optional `bbox_geom`), STORED GENERATED
 `geohash CHAR(N)` from `ST_GeoHash(geom, N)`, and a STORED GENERATED
-`geometry_hash CHAR(64)` (SHA256 of `ST_AsBinary(geom)`) used by
-`IdentityMatcher.GEOMETRY_HASH` and the
-`geometries.skip_if_unchanged_geometry_hash` write-policy gate.
+`geometry_hash CHAR(64)` (SHA256 of `ST_AsBinary(geom)`) consumed by
+the `IdentityMatcher.GEOMETRY_HASH` identity matcher (an
+`IdentityRule(match_on=["geometry_hash"], on_match="refuse_return")`
+on `ItemsWritePolicy.identity`).
 
 Attached by default for VECTOR + RASTER collections; not attached for
 RECORDS (no spatial component).

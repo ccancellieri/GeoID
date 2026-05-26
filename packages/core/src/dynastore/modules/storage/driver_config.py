@@ -282,17 +282,6 @@ class GeometriesWriteBehavior(BaseModel):
             "which also fixes winding order."
         ),
     )
-    skip_if_unchanged_geometry_hash: bool = Field(
-        default=False,
-        examples=[False, True],
-        description=(
-            "If True, matched features whose ``geometry_hash`` equals the "
-            "incoming one bypass ``NEW_VERSION`` (treated as a no-op) and "
-            "collapse ``UPDATE`` to ``REFUSE_RETURN``. Enables 'new version "
-            "only when geometry differs'. Requires the geometries sidecar "
-            "to be enabled (it computes geometry_hash on write)."
-        ),
-    )
 
 
 def _default_identity_rules() -> List[IdentityRule]:
@@ -304,6 +293,10 @@ def _default_identity_rules() -> List[IdentityRule]:
     The ``"external_id"`` axis is always referenceable even without a path
     (its value then comes from ``write_context.external_id_override`` or the
     feature id).
+
+    A ``geometry_hash`` skip-on-match rule is appended at model-validation
+    time when :attr:`ItemsWritePolicy.derive.content_hashes` includes
+    ``"geometry"`` (see :meth:`ItemsWritePolicy._append_geometry_hash_default`).
     """
     return [IdentityRule(match_on=["external_id"])]
 
@@ -349,8 +342,8 @@ class ItemsWritePolicy(PluginConfig):
       outputs); rules OR across the list (first match wins). Per-rule
       ``on_match`` overrides :attr:`on_conflict`.
     - :attr:`geometries` — per-row geometry transform / validation block
-      (SRID, fix, simplify, allow-list, geometry-hash version gate). Runs
-      before the :attr:`derive` derivations.
+      (SRID, fix, simplify, allow-list). Runs before the :attr:`derive`
+      derivations.
 
     The wire JSON-Schema for feature ``properties`` is NOT carried on this
     policy. It is derived from ``ItemsSchema`` at read time inside
@@ -385,10 +378,13 @@ class ItemsWritePolicy(PluginConfig):
     - ``valid_to``             — validity range end (None = open-ended)
 
     Hash-gated versioning:
-      When ``geometries.skip_if_unchanged_geometry_hash=True`` a match whose
-      ``geometry_hash`` equals the incoming feature short-circuits the
-      action: ``NEW_VERSION`` degrades to a no-op, ``UPDATE`` degrades to
-      ``REFUSE_RETURN``. Enables "new version only when geometry differs".
+      Authoring ``derive.content_hashes=["geometry"]`` auto-appends a
+      ``IdentityRule(match_on=["geometry_hash"], on_match=REFUSE_RETURN)``
+      to the default identity chain — a match on the byte-exact
+      ``geometry_hash`` of the incoming feature short-circuits the write
+      and echoes the existing row. To opt out, author an explicit
+      :attr:`identity` list that omits the rule (or set ``on_match`` to a
+      different policy).
 
     Worked scenarios:
 
@@ -396,12 +392,15 @@ class ItemsWritePolicy(PluginConfig):
 
            ItemsWritePolicy(
                on_conflict=WriteConflictPolicy.NEW_VERSION,
-               derive=DeriveSpec(external_id="properties.code"),
-               geometries=GeometriesWriteBehavior(skip_if_unchanged_geometry_hash=True),
+               derive=DeriveSpec(
+                   external_id="properties.code",
+                   content_hashes=["geometry"],
+               ),
            )
 
-       Each upsert keyed on ``properties.code`` versions the existing row
-       UNLESS the geometry_hash is identical (then it's a no-op).
+       Each upsert keyed on ``properties.code`` versions the existing row.
+       The auto-appended ``geometry_hash`` rule short-circuits identical
+       geometries to ``REFUSE_RETURN``.
 
     2. **Geohash dedup at city precision**::
 
@@ -566,10 +565,10 @@ class ItemsWritePolicy(PluginConfig):
             "moved here so operators tune write behaviour from a single "
             "policy plugin while the sidecar config remains "
             "storage-shape-only. Immutable once a collection is materialised: "
-            "SRID / simplification / geometry-hash settings shape the "
-            "stored geometry, so changing them after rows land would diverge "
-            "the geometry of existing collections from the new default. Tune "
-            "it before the first collection is created."
+            "SRID / simplification settings shape the stored geometry, so "
+            "changing them after rows land would diverge the geometry of "
+            "existing collections from the new default. Tune it before the "
+            "first collection is created."
         ),
     )
 
@@ -660,6 +659,28 @@ class ItemsWritePolicy(PluginConfig):
 
             return DeriveSpec.from_computed_fields(resolve_compute(v))
         return v
+
+    @model_validator(mode="after")
+    def _append_geometry_hash_default(self) -> "ItemsWritePolicy":
+        # WHY: geometry_hash is the geometries sidecar's PG-generated
+        # CHAR(64) (sha256 of ST_AsBinary(geom)) — byte-exact, not semantic.
+        # When the operator authors content_hashes=["geometry"] they are
+        # opting in to deriving the column; the natural default is to skip
+        # writes that produce an identical geometry. REFUSE_RETURN gives
+        # idempotent read-through (echo the existing row), matching the
+        # legacy hash-gate semantics.
+        if (
+            self.identity == [IdentityRule(match_on=["external_id"])]
+            and "geometry" in self.derive.content_hashes
+            and not any("geometry_hash" in r.match_on for r in self.identity)
+        ):
+            self.identity = list(self.identity) + [
+                IdentityRule(
+                    match_on=["geometry_hash"],
+                    on_match=WriteConflictPolicy.REFUSE_RETURN,
+                )
+            ]
+        return self
 
     @model_validator(mode="after")
     def _validate_identity_refs(self) -> "ItemsWritePolicy":

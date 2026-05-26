@@ -27,19 +27,11 @@ from shapely import wkb
 import morecantile
 
 from dynastore.modules.db_config.query_executor import (
-    DQLExecutor,
     ResultHandler,
     DQLQuery,
 )
-from dynastore.modules.db_config.shared_queries import (
-    build_filter_clause,
-    get_table_column_names,
-)
-from dynastore.modules.catalog.validation import get_valid_properties
 from dynastore.tools.geospatial import SimplificationAlgorithm
 from .tiles_models import TileMatrixSet
-from .tiles_config import TilesConfig
-from dynastore.modules.db_config.exceptions import InternalValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +101,7 @@ async def _build_collection_subquery(
     """
     Builds the subquery for a single collection using ItemService.
     """
-    from dynastore.models.protocols import ItemsProtocol
+    from dynastore.models.protocols import ConfigsProtocol, ItemsProtocol
     from dynastore.tools.discovery import get_protocol
 
     items_svc = get_protocol(ItemsProtocol)
@@ -128,6 +120,28 @@ async def _build_collection_subquery(
         except ValueError:
             pass
 
+    # Resolve the collection's read-shape contract once. ST_AsMVT emits every
+    # selected column as a tile property, so honouring feature_type at SELECT
+    # time is the only way to prevent leaks (raw geometry WKB, undeclared
+    # JSONB keys, geoid).
+    feature_type = None
+    try:
+        from dynastore.modules.storage.read_policy import ItemsReadPolicy
+
+        configs = get_protocol(ConfigsProtocol)
+        if configs is not None:
+            policy = await configs.get_config(
+                ItemsReadPolicy,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+            feature_type = getattr(policy, "feature_type", None)
+    except Exception as exc:  # noqa: BLE001 — read assembly must not break on config miss
+        logger.debug(
+            "tile read_policy resolution skipped for %s/%s: %s",
+            catalog_id, collection_id, exc,
+        )
+
     # 2. Build Parameters for ItemService
     params = {
         "srid": source_srid,
@@ -142,6 +156,7 @@ async def _build_collection_subquery(
         "datetime": datetime_str,
         "cql_filter": cql_filter,
         "tile_wkb": tile_wkb,
+        "feature_type": feature_type,
     }
 
     if subset_params:
