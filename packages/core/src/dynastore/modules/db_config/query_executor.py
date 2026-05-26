@@ -374,32 +374,39 @@ class TemplateQueryBuilder(QueryBuilderStrategy):
         is_ddl = isinstance(self.query_template, DDL)
         template_str = str(self.query_template)
 
-        if isinstance(db_resource, (Engine, AsyncEngine, SAConnection, AsyncConnection)):
-            dialect = db_resource.dialect
-        elif isinstance(db_resource, (SASession, AsyncSession)):
-            bind = db_resource.bind
-            if bind is not None:
-                dialect = bind.dialect
-            else:
-                raise TypeError(
-                    f"TemplateQueryBuilder: Session has no bind, cannot resolve dialect."
-                )
-        else:
-            raise TypeError(
-                f"TemplateQueryBuilder: Unable to resolve dialect from {type(db_resource)}."
-            )
-
         template_identifiers = re.findall(r"{(\w+)}", template_str)
         quoted_identifiers, params = {}, {}
-        for key, value in raw_params.items():
-            if key in template_identifiers:
-                val_str = str(value)
-                try:
-                    quoted_identifiers[key] = dialect.identifier_preparer.quote(val_str)
-                except Exception:
-                    quoted_identifiers[key] = f'"{val_str.replace('"', '""')}"'
+
+        if template_identifiers:
+            # Identifier substitutions require a dialect to quote names safely.
+            if isinstance(db_resource, (Engine, AsyncEngine, SAConnection, AsyncConnection)):
+                dialect = db_resource.dialect
+            elif isinstance(db_resource, (SASession, AsyncSession)):
+                bind = db_resource.bind
+                if bind is not None:
+                    dialect = bind.dialect
+                else:
+                    raise TypeError(
+                        f"TemplateQueryBuilder: Session has no bind, cannot resolve dialect."
+                    )
             else:
-                params[key] = value
+                raise TypeError(
+                    f"TemplateQueryBuilder: Unable to resolve dialect from {type(db_resource)}."
+                )
+
+            for key, value in raw_params.items():
+                if key in template_identifiers:
+                    val_str = str(value)
+                    try:
+                        quoted_identifiers[key] = dialect.identifier_preparer.quote(val_str)
+                    except Exception:
+                        quoted_identifiers[key] = f'"{val_str.replace('"', '""')}"'
+                else:
+                    params[key] = value
+        else:
+            # No identifier slots — all params are bind parameters; no dialect needed.
+            params = dict(raw_params)
+
         final_query_str = template_str
         for key, value in quoted_identifiers.items():
             final_query_str = final_query_str.replace(f"{{{key}}}", value)

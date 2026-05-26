@@ -118,15 +118,34 @@ def apply_temporal_coercion(properties: dict, temporal_fields: dict) -> dict:
     return properties
 
 
-def _enrich_report_record(record, generated: dict):
-    """Stamp the info the ingestion generated onto one report record.
+# Identity + lifecycle fields lifted from ``generated`` into ``record["system"]``.
+# Each is omitted from the envelope when its value is None — absent values
+# simply don't appear, so a reporter never sees a half-populated system bag.
+_SYSTEM_KEYS = (
+    "geoid",
+    "external_id",
+    "asset_id",
+    "geometry_hash",
+    "attributes_hash",
+    "validity",
+    "transaction_time",
+    "deleted_at",
+)
 
-    Identity (``geoid`` / ``external_id`` / ``asset_id``) goes to the record
-    top level — each only when actually produced, so absent values simply don't
-    appear ("if enabled"). Every generated statistic is merged into
-    ``properties`` (the "calculated attributes"); a real attribute wins on a
-    name clash. Returns a plain ``dict`` so every reporter sees one shape — the
-    same normalisation ``GcsDetailedReporter`` already applies.
+
+def _build_report_envelope(record, generated: dict | None) -> dict:
+    """Reshape one ingestion outcome into the report envelope.
+
+    Returns a dict with sibling keys ``properties`` (user attributes only —
+    never mixed with platform-derived values), ``stats`` (flat dict of computed
+    statistics), and ``system`` (identity + lifecycle fields, each present only
+    when the ingestion actually produced a value). GeoJSON envelope keys
+    (``type``/``id``/``geometry``) stay at the record top level.
+
+    ``generated`` is the per-item entry from ``ctx.extensions["_generated_stats"]``
+    or ``None`` on fallback / rejection paths where the upsert never produced one.
+    A ``model_dump``-able ``record`` is normalised first so every reporter sees
+    one shape.
     """
     if hasattr(record, "model_dump"):
         rec = record.model_dump(mode="json", exclude_none=True)
@@ -134,15 +153,27 @@ def _enrich_report_record(record, generated: dict):
         rec = dict(record)
     else:
         return record
-    for key in ("geoid", "external_id", "asset_id"):
-        value = generated.get(key)
+
+    props = rec.get("properties")
+    rec["properties"] = dict(props) if isinstance(props, dict) else {}
+
+    gen = generated or {}
+    raw_stats = gen.get("stats") or {}
+    rec["stats"] = dict(raw_stats) if isinstance(raw_stats, dict) else {}
+
+    system: dict = {}
+    for key in _SYSTEM_KEYS:
+        value = gen.get(key)
         if value is not None:
-            rec[key] = value
-    stats = generated.get("stats") or {}
-    if stats:
-        props = rec.get("properties")
-        rec["properties"] = {**stats, **(props if isinstance(props, dict) else {})}
+            system[key] = value
+    rec["system"] = system
+
     return rec
+
+
+def _enrich_report_record(record, generated: dict) -> dict:
+    """Build a SUCCESS-path report envelope. See ``_build_report_envelope``."""
+    return _build_report_envelope(record, generated)
 
 
 async def _broadcast_batch_outcome(
@@ -191,17 +222,18 @@ async def _broadcast_batch_outcome(
     )
     outcomes = []
     for i, rec in enumerate(records):
-        if gen is not None:
-            rec = _enrich_report_record(rec, gen[i])
+        rec = _enrich_report_record(rec, gen[i] if gen is not None else {})
         outcomes.append({"status": "SUCCESS", "message": None, "record": rec})
     for rej in rejections:
-        rec = rej.get("record")
-        if rec is None:
-            rec = {
-                k: rej[k]
-                for k in ("geoid", "external_id")
-                if rej.get(k) is not None
-            }
+        # Identity that the upsert managed to derive before the row was rejected.
+        # Only keys the rejection carried surface in ``system`` (e.g. external_id
+        # is known pre-write, geoid only when a sidecar minted one).
+        rej_generated = {
+            k: rej[k]
+            for k in _SYSTEM_KEYS
+            if rej.get(k) is not None
+        }
+        rec = _build_report_envelope(rej.get("record") or {}, rej_generated)
         outcomes.append({
             "status": "FAILED",
             "message": rej.get("message") or rej.get("reason") or "rejected",

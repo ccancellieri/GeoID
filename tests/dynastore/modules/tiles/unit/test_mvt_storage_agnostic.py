@@ -60,8 +60,10 @@ def test_mvt_geometry_resolved_via_sidecar_default_column():
     assert raw.rstrip().endswith("AS geom")
     # The spatial filter is sidecar-qualified, never a bare ``geom``.
     assert "ST_Intersects(sc_geometries.geom" in (req.raw_where or "")
-    # A placeholder selection forces the geometry-sidecar JOIN.
-    assert any(s.alias == "_geom_source" for s in req.select)
+    # No raw-geometry placeholder leaks into the select — QueryOptimizer.
+    # require_geometry already forces the geometry-sidecar JOIN; selecting
+    # the raw geom column would surface WKB bytes as an MVT property.
+    assert not any(s.alias == "_geom_source" for s in req.select)
     assert req.raw_params["target_srid"] == 3857
     assert req.raw_params["srid"] == 4326
     assert req.raw_params["tile_wkb"] == b"\x00" * 8

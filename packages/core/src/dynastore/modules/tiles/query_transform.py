@@ -28,7 +28,7 @@ Transforms queries for Mapbox Vector Tile (MVT) generation by:
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
-from dynastore.models.query_builder import QueryRequest, FieldSelection
+from dynastore.models.query_builder import QueryRequest
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.drivers.pg_sidecars import GeometriesSidecar
@@ -94,14 +94,16 @@ class MVTQueryTransform:
             )
             return query_request
 
-        # Drop any existing geometry selection and add a placeholder so the
-        # QueryOptimizer joins the geometry sidecar table; the actual MVT
-        # geometry comes from the raw select below, aliased ``geom`` for the
-        # wrapping ST_AsMVT(..., 'geom').
+        # Drop any existing geometry selection; the actual MVT geometry comes
+        # from the raw select below, aliased ``geom`` for the wrapping
+        # ST_AsMVT(..., 'geom'). The geometry sidecar is JOINed unconditionally
+        # by ``QueryOptimizer.determine_required_sidecars`` (``require_geometry``
+        # defaults to True), so no placeholder selection is needed — and a
+        # placeholder would leak the raw geometry column into the tile as a
+        # property (every column selected by the inner SELECT becomes an MVT
+        # property; the previous ``_geom_source`` alias surfaced WKB hex bytes
+        # in every feature on the live tile path).
         query_request.select = [s for s in query_request.select if s.field != geom_field]
-        query_request.select.append(
-            FieldSelection(field=geom_field, alias="_geom_source")
-        )
         query_request.raw_selects.append(f"{mvt_geom_expr} AS geom")
 
         # Spatial filter for tile bounds on the sidecar's qualified geometry
@@ -169,5 +171,29 @@ class MVTQueryTransform:
     def post_process_sql(
         self, sql: str, params: Dict[str, Any], context: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
-        """No SQL post-processing needed for MVT"""
-        return sql, params
+        """Restrict the tile's per-feature columns to what ``feature_type`` allows.
+
+        ST_AsMVT emits every column of the inner SELECT as a tile property; the
+        QueryOptimizer auto-adds ``h.geoid`` whenever ``query.select`` is
+        non-empty and the consumer did not include geoid explicitly. Wrap the
+        subquery so only ``geom`` plus the policy-authorised columns reach the
+        outer ``ST_AsMVT(mvtgeom.*, ...)``. Without this wrap the legacy tile
+        path leaked ``geoid`` (and, before the geometry-placeholder removal,
+        raw WKB) into every feature regardless of ``feature_type.expose``.
+        """
+        feature_type = context.get("feature_type")
+        if feature_type is None:
+            return sql, params
+
+        keep: list[str] = ["geom"]
+        if feature_type.expose_geoid:
+            keep.append("geoid")
+        if feature_type.expose_created:
+            keep.append("created")
+        keep.extend(feature_type.expose or [])
+
+        # ``identifier`` quote each column name so JSONB-derived names with
+        # mixed-case (``CODE``/``NAME``) survive Postgres' lowercase-folding.
+        quoted = ", ".join(f'"{c}"' for c in keep)
+        wrapped = f"SELECT {quoted} FROM ({sql}) _mvt_inner"
+        return wrapped, params

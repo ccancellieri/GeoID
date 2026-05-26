@@ -170,6 +170,7 @@ async def execute_process(
         mode=execution_mode,
         caller_id=caller_id,
         db_schema=db_schema or "public",
+        collection_id=collection_id,
         background_tasks=background_tasks,
         dedup_key=dedup_key,
     )

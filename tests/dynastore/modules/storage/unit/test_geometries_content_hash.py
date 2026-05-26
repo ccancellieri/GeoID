@@ -3,8 +3,9 @@ the geometry-derived ``geometry_hash`` into the per-item context dict.
 
 Without this propagation the orchestrator's ``hub_payload`` never carries
 ``geometry_hash``, the hub column stays NULL on every insert, and the
-``GEOMETRY_HASH`` identity matcher plus ``skip_if_unchanged_geometry_hash``
-gate become dead code paths.
+``GEOMETRY_HASH`` identity matcher (the
+``IdentityRule(match_on=["geometry_hash"])`` rule on
+``ItemsWritePolicy.identity``) becomes a dead code path.
 
 Two paths are exercised:
 
@@ -126,10 +127,9 @@ class TestContentHashPropagation:
 class TestPlumbingFieldsHiddenByDefault:
     """``geometry_hash`` and ``geohash`` are write-policy plumbing — they
     must be queryable at the SQL layer (so the GEOMETRY_HASH / GEOHASH
-    matchers and the ``skip_if_unchanged_geometry_hash`` gate work) but
-    must not surface in the public Feature output by default. Hiding is
-    enforced via the internal-column sets consulted by
-    ``AttributesSidecar.map_row_to_feature``'s JSONB merge."""
+    identity matchers work) but must not surface in the public Feature
+    output by default. Hiding is enforced via the internal-column sets
+    consulted by ``AttributesSidecar.map_row_to_feature``'s JSONB merge."""
 
     def test_hub_internal_columns_includes_geometry_hash(self):
         assert "geometry_hash" in HUB_INTERNAL_COLUMNS, (

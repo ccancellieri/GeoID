@@ -1362,10 +1362,14 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
 
     async def delete_item(
         self,
+        request: Request,
         catalog_id: str,
         collection_id: str,
         item_id: str,
         engine=Depends(get_async_engine),
     ):
         async with managed_transaction(engine) as conn:
-            return await self._delete_item(catalog_id, collection_id, item_id, conn)
+            return await self._delete_item(
+                catalog_id, collection_id, item_id, conn,
+                caller_id=self._principal_caller_id(request),
+            )

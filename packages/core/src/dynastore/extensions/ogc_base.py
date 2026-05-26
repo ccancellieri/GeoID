@@ -263,23 +263,48 @@ class OGCServiceMixin:
     # Shared CRUD helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _principal_caller_id(request: Request) -> Optional[str]:
+        """Derive a ``caller_id`` string for write-attribution from the
+        authenticated request principal.
+
+        Format mirrors the existing attribution wiring: ``"{provider}:{subject_id}"``
+        when a ``Principal`` is on ``request.state``, otherwise ``None`` (the
+        downstream enqueue falls back to ``"system:tile_cache_invalidation"``).
+        """
+        from dynastore.models.auth import Principal
+
+        principal: Optional[Principal] = getattr(request.state, "principal", None)
+        if principal is None or not principal.subject_id:
+            return None
+        if principal.provider:
+            return f"{principal.provider}:{principal.subject_id}"
+        return principal.subject_id
+
     async def _delete_item(
         self,
         catalog_id: str,
         collection_id: str,
         item_id: str,
         db_resource,
+        caller_id: Optional[str] = None,
     ) -> Response:
         """Shared item deletion: delete + 404 check + 204 response.
 
         The caller is responsible for transaction management (e.g.
         ``managed_transaction``) — this mixin stays decoupled from
         ``modules.db_config``.
+
+        ``caller_id`` is forwarded so the post-commit tile-cache
+        invalidation task is attributed to the originating principal —
+        matches the create/update attribution shipped in #1404/#1405.
         """
         catalogs_svc = await self._get_catalogs_service()
         from dynastore.models.driver_context import DriverContext
         rows_affected = await catalogs_svc.delete_item(
-            catalog_id, collection_id, item_id, ctx=DriverContext(db_resource=db_resource)
+            catalog_id, collection_id, item_id,
+            ctx=DriverContext(db_resource=db_resource),
+            caller_id=caller_id,
         )
         if rows_affected == 0:
             raise HTTPException(

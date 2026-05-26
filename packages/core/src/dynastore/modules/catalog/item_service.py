@@ -763,6 +763,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 await self._dispatch_tile_cache_invalidation(
                     catalog_id, collection_id, results,
                     db_resource=db_resource or self.engine,
+                    processing_context=processing_context,
                 )
 
             # Emit events for non-indexer subscribers (audit, telemetry).
@@ -1227,6 +1228,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         if results:
             await self._dispatch_tile_cache_invalidation(
                 catalog_id, collection_id, results, db_resource=engine,
+                processing_context=processing_context,
             )
 
         # ── Post-commit: emit events for non-indexer subscribers ──────
@@ -1579,6 +1581,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         *,
         db_resource: Optional[DbResource] = None,
         prior_bboxes: Optional[Sequence[Tuple[float, float, float, float]]] = None,
+        processing_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Write-reactive tile-cache invalidation on create/update (#1292/#1298).
 
@@ -1633,10 +1636,24 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     "skipping invalidation enqueue", catalog_id,
                 )
                 return
+            # Attribute the enqueued task to the originating principal when
+            # the write path supplied one (matches the same sources used by
+            # ``_resolve_access_envelope`` — owner / principal_id / subject_id).
+            # Falls back to ``"system:tile_cache_invalidation"`` inside
+            # ``enqueue_tile_invalidation_task`` so audit queries on
+            # ``caller_id IS NULL`` stay meaningful.
+            pc = processing_context or {}
+            caller_id = (
+                pc.get("caller_id")
+                or pc.get("principal_id")
+                or pc.get("subject_id")
+                or pc.get("owner")
+            )
             await enqueue_tile_invalidation_task(
                 catalog_id, collection_id, results,
                 engine=engine, schema=schema,
                 prior_bboxes=prior_bboxes,
+                caller_id=caller_id,
             )
         except Exception as exc:  # noqa: BLE001 — invalidation never breaks a write
             logger.warning(

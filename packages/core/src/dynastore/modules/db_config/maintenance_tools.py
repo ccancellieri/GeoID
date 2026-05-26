@@ -514,3 +514,22 @@ async def register_cron_job(
     """
 
     await DDLQuery(cron_ddl, check_query=check_exists).execute(conn)
+
+
+async def unregister_cron_job(conn: DbResource, job_name: str) -> bool:
+    """Unregister a pg_cron job, returning ``True`` if it was removed.
+
+    Safe to call when the job is not registered — returns ``False``
+    without raising. Mirrors :func:`register_cron_job`'s existence-check
+    pattern so callers never need to guard with their own
+    ``check_cron_job_exists`` calls.
+    """
+    from .locking_tools import check_cron_job_exists
+
+    if not await check_cron_job_exists(conn, job_name):
+        return False
+    await DQLQuery(
+        "SELECT cron.unschedule(:job_name)",
+        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    ).execute(conn, job_name=job_name)
+    return True

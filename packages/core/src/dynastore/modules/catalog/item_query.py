@@ -389,12 +389,38 @@ class ItemQueryMixin:
             if sc is not None
         ]
 
+        is_mvt = params.get("geom_format") == "MVT"
+        feature_type = params.get("feature_type")
+
+        # MVT honours ``ItemsReadPolicy.feature_type`` as the wire-shape contract:
+        # ST_AsMVT emits every selected column as a tile property, so a row-time
+        # projection (the /items path) cannot be retro-fitted here — the SELECT
+        # list IS the projection. Anything not in ``feature_type.expose`` (plus
+        # the explicit ``expose_geoid``/``expose_created`` toggles) MUST NOT be
+        # selected, or it leaks into the tile (raw WKB, undeclared JSONB keys,
+        # geoid duplicates seen on the live tile path before this guard).
+        if is_mvt and feature_type is not None:
+            from dynastore.modules.storage.read_policy import (
+                project_select_for_feature_type,
+            )
+            selects = project_select_for_feature_type(feature_type)
+            query_req = QueryRequest(
+                select=selects,
+                limit=params.get("limit"),
+                offset=params.get("offset"),
+                raw_where=params.get("where"),
+                raw_params=params.get("raw_params", {}),
+            )
+            if params.get("cql_filter"):
+                query_req.cql_filter = params["cql_filter"]
+            return query_req
+
         # Mandatory ID
         selects = [FieldSelection(field="geoid", alias="id")]
 
         # Geometry (if requested or by default). Skipped for MVT, where the MVT
         # query transform injects the on-the-fly ST_AsMVTGeom projection.
-        if params.get("with_geometry", True) and params.get("geom_format") != "MVT":
+        if params.get("with_geometry", True) and not is_mvt:
             geom_field = next(
                 (
                     name
@@ -784,6 +810,7 @@ class ItemQueryMixin:
         collection_id: str,
         item_id: str,
         ctx: Optional[DriverContext] = None,
+        caller_id: Optional[str] = None,
     ) -> int:
         from dynastore.modules.catalog.tools import recalculate_and_update_extents
 
@@ -920,6 +947,7 @@ class ItemQueryMixin:
                             engine=db_resource or self.engine,
                             schema=phys_schema,
                             prior_bboxes=[prior_bbox],
+                            caller_id=caller_id,
                         )
                     except Exception as exc:  # noqa: BLE001 — never break delete
                         logger.warning(

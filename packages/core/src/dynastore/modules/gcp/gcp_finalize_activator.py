@@ -60,7 +60,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Optional
 
-from sqlalchemy import text
+from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
 
 logger = logging.getLogger(__name__)
 
@@ -274,23 +274,16 @@ async def activate(
     issuing the UPDATE — Pub/Sub re-deliveries are normal.
     """
     select_sql = _select_sql(schema)
-    rows_result = await conn.execute(
-        text(select_sql),
-        {
-            "catalog_id": event.catalog_id,
-            "collection_id": event.collection_id,
-            "filename": event.filename,
-        },
+    rows = await DQLQuery(
+        select_sql,
+        result_handler=ResultHandler.ALL,
+    ).execute(
+        conn,
+        catalog_id=event.catalog_id,
+        collection_id=event.collection_id,
+        filename=event.filename,
     )
-
-    # Result shape: SQLAlchemy ``Result`` exposes ``.fetchall()``; in tests
-    # we accept a plain list / async coroutine returning a list.
-    if hasattr(rows_result, "fetchall"):
-        rows = rows_result.fetchall()
-    elif isinstance(rows_result, list):
-        rows = rows_result
-    else:  # pragma: no cover - defensive
-        rows = list(rows_result or [])
+    rows = rows or []
 
     if not rows:
         await _log_orphan(event)
@@ -331,16 +324,17 @@ async def activate(
     tagged_hash = (
         f"md5:{event.md5_hash}" if event.md5_hash else None
     )
-    await conn.execute(
-        text(update_sql),
-        {
-            "uri": event.uri,
-            "content_hash": tagged_hash,
-            "size_bytes": event.size_bytes,
-            "catalog_id": event.catalog_id,
-            "collection_id": event.collection_id,
-            "asset_id": chosen_asset_id,
-        },
+    await DQLQuery(
+        update_sql,
+        result_handler=ResultHandler.ROWCOUNT,
+    ).execute(
+        conn,
+        uri=event.uri,
+        content_hash=tagged_hash,
+        size_bytes=event.size_bytes,
+        catalog_id=event.catalog_id,
+        collection_id=event.collection_id,
+        asset_id=chosen_asset_id,
     )
 
     return ActivationOutcome(

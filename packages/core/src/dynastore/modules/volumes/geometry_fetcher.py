@@ -19,6 +19,7 @@ from dynastore.models.protocols.geometry_fetcher import (
     FeatureGeometry,
     GeometryFetcherProtocol,
 )
+from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
 from dynastore.tools.db import validate_sql_identifier
 
 logger = logging.getLogger(__name__)
@@ -41,9 +42,11 @@ def build_geometry_query(spec: GeometryQuerySpec) -> str:
     Columns returned per row: ``feature_id``, ``geom_wkb``, ``height``.
     Rows where the geometry is NULL are excluded.
 
-    The feature-ID filter uses a ``$1::text[]`` parameter placeholder; callers
-    must pass ``list(spec.feature_ids)`` as the first bind parameter so that
-    feature IDs are never interpolated into the SQL string.
+    The feature-ID filter uses an ``ANY(:feature_ids)`` named-parameter
+    placeholder; callers must pass ``feature_ids=list(spec.feature_ids)``
+    as a keyword argument so that feature IDs are never interpolated into
+    the SQL string. The bind value must be a Python list — SQLAlchemy
+    passes it as an array to the asyncpg/psycopg driver.
     """
     hub = f'"{spec.schema}"."{spec.hub_table}"'
     geoms = f'"{spec.schema}"."{spec.geometries_table}"'
@@ -68,7 +71,7 @@ def build_geometry_query(spec: GeometryQuerySpec) -> str:
         f"JOIN {geoms} g "
         f'ON h."{spec.feature_id_column}" = g."{spec.feature_id_column}" '
         f'WHERE g."{spec.geom_column}" IS NOT NULL '
-        f'  AND h."{spec.feature_id_column}" = ANY($1::text[])'
+        f'  AND h."{spec.feature_id_column}" = ANY(:feature_ids)'
     )
 
 
@@ -152,14 +155,12 @@ class SidecarGeometryFetcher:
         sql = build_geometry_query(spec)
 
         async with self._connect() as conn:
-            rows = await conn.execute(sql, list(spec.feature_ids))
-            if hasattr(rows, "__aiter__"):
-                rows = [r async for r in rows]
-            elif hasattr(rows, "fetchall"):
-                rows = await rows.fetchall()
+            raw_rows = await DQLQuery(
+                sql,
+                result_handler=ResultHandler.ALL_DICTS,
+            ).execute(conn, feature_ids=list(spec.feature_ids))
 
-        normalized = [dict(r) if not isinstance(r, dict) else r for r in rows]
-        return rows_to_geometries(normalized)
+        return rows_to_geometries(raw_rows or [])
 
 
 assert issubclass(SidecarGeometryFetcher, GeometryFetcherProtocol)

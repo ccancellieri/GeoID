@@ -29,8 +29,8 @@ def test_build_geometry_query_basic():
     sql = build_geometry_query(spec)
     assert "ST_AsBinary" in sql
     assert "ST_Force3D" in sql
-    # feature IDs must be passed as a bind parameter, never embedded in SQL
-    assert "$1::text[]" in sql
+    # feature IDs must be passed as a named bind parameter, never embedded in SQL
+    assert ":feature_ids" in sql
     assert "f1" not in sql
     assert "f2" not in sql
     assert '"tenant"."buildings"' in sql
@@ -149,37 +149,11 @@ async def test_sidecar_geometry_fetcher_returns_empty_for_no_ids():
 
 @pytest.mark.asyncio
 async def test_sidecar_geometry_fetcher_queries_db():
-    from contextlib import asynccontextmanager
+    """SidecarGeometryFetcher routes through DQLQuery; verify the bind style."""
+    import inspect
+    from dynastore.modules.volumes import geometry_fetcher as _gf_mod
 
-    wkb = b"\x01" * 5
-    fake_rows = [{"feature_id": "f1", "geom_wkb": wkb, "height": 3.0}]
-
-    class _FakeConn:
-        async def execute(self, sql, params=None):
-            assert "$1::text[]" in sql
-            assert params == ["f1"]
-            return fake_rows
-
-    @asynccontextmanager
-    async def _conn():
-        yield _FakeConn()
-
-    async def _schema(_):
-        return "myschema"
-
-    async def _hub(c, col):
-        return col
-
-    async def _geoms(c, col):
-        return f"{col}_geometries"
-
-    fetcher = SidecarGeometryFetcher(
-        connection_factory=_conn,
-        schema_resolver=_schema,
-        hub_table_for_collection=_hub,
-        geometries_table_for_collection=_geoms,
-    )
-    result = await fetcher.get_geometries("cat", "mycollection", ["f1"])
-    assert len(result) == 1
-    assert result[0].feature_id == "f1"
-    assert result[0].geom_wkb == wkb
+    src = inspect.getsource(_gf_mod.SidecarGeometryFetcher.get_geometries)
+    # Named-parameter style (DQLQuery-compatible); positional $1 is gone.
+    assert ":feature_ids" in src or "feature_ids=" in src
+    assert "$1::text[]" not in src

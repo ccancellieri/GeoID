@@ -17,15 +17,14 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, Dict, Any, TypeVar, Generic, List
-from uuid import UUID, uuid4
-from datetime import datetime, timezone, UTC, timedelta
-from enum import Enum
+from typing import Optional, Dict, Any
+from datetime import timedelta
 from dataclasses import dataclass, field
 
-import uuid
-
-from dynastore.models.tasks import (
+# Re-exports kept for backward compatibility — these are the canonical
+# task models defined in ``dynastore.models.tasks``; this module also
+# adds runtime types (``RunnerContext``, ``RunnerCapabilities``, etc.).
+from dynastore.models.tasks import (  # noqa: F401 — re-export
     TaskStatusEnum,
     TaskExecutionMode,
     TaskExecutionScope,
@@ -95,6 +94,17 @@ class RunnerContext(BaseModel):
     inputs: Dict[str, Any]
     asset: Optional[Any] = None
     db_schema: str = "tasks"
+    """Catalog physical schema (e.g. ``s_2ka8fbc3``) used as the
+    ``schema_name`` column on the task row. ``"public"`` for PLATFORM-scoped
+    work, ``"system"`` for cross-tenant platform tasks. NOT the host PG
+    schema of the tasks table — that lives globally in ``get_task_schema()``."""
+    collection_id: Optional[str] = Field(
+        default=None,
+        description="STAC Collection id when the task targets a specific "
+                    "collection (ingestion, tile preseed/invalidate, exports). "
+                    "NULL for catalog-wide / platform work. Persisted on the "
+                    "task row so ``list_tasks`` can filter by collection.",
+    )
     extra_context: Dict[str, Any]
     dedup_key: Optional[str] = None
     """Idempotency token. When set, runners pass this to ``TaskCreate`` so the

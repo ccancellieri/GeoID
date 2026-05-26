@@ -46,7 +46,12 @@ from dynastore.modules.gcp.gcp_finalize_activator import (
 
 
 class _FakeResult:
-    """Mimics SQLAlchemy ``Result.fetchall()``."""
+    """Mimics a SQLAlchemy ``Result`` — supports ``.all()``, ``.fetchall()``, and ``.rowcount``.
+
+    DQLQuery uses ``result.all()`` (via ``ResultHandler.ALL`` /
+    ``ResultHandler.ROWCOUNT``); the original code used ``result.fetchall()``.
+    Both methods are provided so the scaffold works with either call path.
+    """
 
     def __init__(self, rows: List[Dict[str, Any]]) -> None:
         self._rows = rows
@@ -54,25 +59,56 @@ class _FakeResult:
     def fetchall(self) -> List[Dict[str, Any]]:
         return list(self._rows)
 
+    def all(self) -> List[Dict[str, Any]]:
+        return list(self._rows)
+
+    @property
+    def rowcount(self) -> int:
+        return len(self._rows)
+
 
 class _FakeConn:
     """Captures executed SQL + binds.
 
-    The activator runs ``conn.execute(text(SQL), {binds})`` — the first
-    call is the SELECT FOR UPDATE, the second is the UPDATE. We let
-    callers stage the SELECT result via ``select_rows``.
+    DQLQuery calls ``conn.execute(text(SQL), {binds})`` under the hood;
+    this fake intercepts that call and records it in ``self.calls``.
+
+    ``is_async_resource`` is patched in each test to return True for
+    ``_FakeConn`` instances so DQLQuery dispatches via the async path.
     """
 
     def __init__(self, select_rows: List[Dict[str, Any]]) -> None:
         self._select_rows = select_rows
         self.calls: List[Dict[str, Any]] = []
 
-    async def execute(self, sql_clause: Any, binds: Dict[str, Any]) -> Any:
-        # ``text()`` clauses str() back to the rendered SQL string.
-        self.calls.append({"sql": str(sql_clause), "binds": dict(binds)})
+    async def execute(self, sql_clause: Any, binds: Any = None, **_kw: Any) -> Any:
+        bound = dict(binds) if isinstance(binds, dict) else {}
+        self.calls.append({"sql": str(sql_clause), "binds": bound})
         if len(self.calls) == 1:
             return _FakeResult(self._select_rows)
         return _FakeResult([])
+
+
+@pytest.fixture(autouse=True)
+def _patch_is_async_resource():
+    """Make DQLQuery treat ``_FakeConn`` as an async resource.
+
+    DQLQuery dispatches via ``is_async_resource(conn)``; without this patch the
+    sync path is chosen and the async ``_FakeConn.execute`` coroutine is never
+    awaited.  The patch intercepts the check for ``_FakeConn`` while leaving all
+    real SQLAlchemy types unaffected.
+    """
+    import dynastore.modules.db_config.query_executor as _qe
+
+    _orig = _qe.is_async_resource
+
+    def _patched(conn):
+        if isinstance(conn, _FakeConn):
+            return True
+        return _orig(conn)
+
+    with patch.object(_qe, "is_async_resource", side_effect=_patched):
+        yield
 
 
 def _make_event(

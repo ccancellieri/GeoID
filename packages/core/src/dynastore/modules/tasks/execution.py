@@ -123,6 +123,7 @@ class ExecutionEngine:
         mode: TaskExecutionMode = TaskExecutionMode.ASYNCHRONOUS,
         caller_id: str = SYSTEM_USER_ID,
         db_schema: str = "tasks",
+        collection_id: Optional[str] = None,
         background_tasks: Any = None,
         dedup_key: Optional[str] = None,
         **extras: Any,
@@ -133,6 +134,12 @@ class ExecutionEngine:
         Builds a ``RunnerContext``, selects the highest-priority capable
         runner, and delegates execution.  Falls through to the next runner
         on failure until all are exhausted.
+
+        ``collection_id`` (when known) is forwarded into ``RunnerContext`` so
+        runner-side ``TaskCreate(...)`` writes it onto the persisted row.
+        Without this, the column on ``tasks.tasks`` stayed NULL for OGC
+        Process-routed work even when the route resolved
+        ``/collections/{collection_id}`` — losing per-collection filterability.
 
         Returns whatever the runner returns (result for sync, StatusInfo /
         Task for async).
@@ -156,6 +163,7 @@ class ExecutionEngine:
             caller_id=caller_id,
             inputs=inputs,
             db_schema=db_schema,
+            collection_id=collection_id,
             dedup_key=dedup_key,
             extra_context={
                 "background_tasks": background_tasks,

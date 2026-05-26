@@ -521,6 +521,7 @@ async def enqueue_tile_invalidation_task(
     engine: Any,
     schema: str,
     prior_bboxes: Optional[Sequence[TileBBox]] = None,
+    caller_id: Optional[str] = None,
 ) -> int:
     """Enqueue a ``tiles_preseed`` task with ``operation=invalidate`` (#1298).
 
@@ -543,6 +544,12 @@ async def enqueue_tile_invalidation_task(
     schema) are needed to INSERT the task row via ``tasks_module.create_task``.
     The task row is independent of the data write — every call site runs this
     AFTER the data write committed, so there is nothing to be atomic with.
+
+    ``caller_id`` records the originating principal (the user whose write
+    triggered the invalidation). When ``None`` the row is stamped
+    ``"system:tile_cache_invalidation"`` — a sentinel that makes
+    ``caller_id IS NULL`` audit queries trivially flag any genuinely
+    unattributed enqueue.
 
     The ``dedup_key`` embeds a coverage signature derived from the union of new
     and prior bboxes, so it coalesces ONLY an already-queued invalidate task
@@ -620,7 +627,7 @@ async def enqueue_tile_invalidation_task(
             TaskCreate(
                 task_type="tiles_preseed",
                 type="process",
-                caller_id="tile_cache_invalidation",
+                caller_id=caller_id or "system:tile_cache_invalidation",
                 inputs=exec_request.model_dump(),
                 collection_id=collection_id,
                 dedup_key=f"tile-invalidate:{catalog_id}:{collection_id}:{signature}",

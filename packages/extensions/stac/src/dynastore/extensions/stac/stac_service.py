@@ -1177,6 +1177,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
     async def delete_stac_item(
         self,
+        request: Request,
         catalog_id: str,
         collection_id: str,
         item_id: str,
@@ -1189,7 +1190,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         collection_id = validate_sql_identifier(collection_id)
 
         async with managed_transaction(engine) as conn:
-            return await self._delete_item(catalog_id, collection_id, item_id, conn)
+            return await self._delete_item(
+                catalog_id, collection_id, item_id, conn,
+                caller_id=self._principal_caller_id(request),
+            )
 
     async def search_items_post(
         self,

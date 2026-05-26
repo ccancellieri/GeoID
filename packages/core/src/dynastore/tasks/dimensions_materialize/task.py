@@ -16,7 +16,6 @@ import logging
 from typing import Any, Dict, Optional
 
 from dynastore.models.protocols import CatalogsProtocol
-from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.processes.models import Process, StatusInfo
 from dynastore.modules.processes.protocols import ProcessTaskProtocol
 from dynastore.modules.tasks import tasks_module
@@ -71,22 +70,11 @@ class DimensionsMaterializeTask(
             )
         engine = self.engine  # narrowed to non-None above
 
-        # PLATFORM-scoped tasks persist status rows to the ``public`` schema
-        # (see ProcessScope docstring). We do NOT resolve against
-        # ``_dimensions_`` because the catalog may not exist yet on a fresh
-        # deploy — materialization itself creates it via ensure_catalog_exists.
+        # PLATFORM-scoped tasks set ``schema_name = "public"`` on the global
+        # ``tasks.tasks`` row (see ProcessScope docstring). The tasks table
+        # itself is provisioned once at ``TasksModule.lifespan`` in
+        # ``get_task_schema()`` — we do NOT create a per-schema tasks copy.
         schema = "public"
-
-        # Ensure task_storage exists in the target schema (cellular safety).
-        try:
-            async with managed_transaction(engine) as conn:
-                await tasks_module.ensure_task_storage_exists(conn, schema)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "dimensions_materialize: could not ensure task storage in "
-                "%r: %s. Task state updates may be skipped.",
-                schema, exc,
-            )
 
         async def _report(update: TaskUpdate) -> None:
             if not payload.task_id:

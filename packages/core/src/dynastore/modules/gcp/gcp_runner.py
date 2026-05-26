@@ -267,6 +267,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 caller_id=context.caller_id,
                 task_type=context.task_type,
                 inputs=inputs_dict,
+                collection_id=context.collection_id,
                 max_retries=job_max_retries if job_max_retries is not None else 3,
                 dedup_key=dedup_key,
             )

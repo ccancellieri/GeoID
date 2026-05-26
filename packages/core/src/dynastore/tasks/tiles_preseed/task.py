@@ -81,8 +81,11 @@ class TilePreseedTask(
         if schema is None:
             raise RuntimeError(f"Cannot resolve physical schema for catalog {catalog_id!r}.")
 
-        async with managed_transaction(engine) as conn:
-            await tasks_module.ensure_task_storage_exists(conn, schema)
+        # `schema` is the catalog's physical PG schema — used as the
+        # `schema_name` tenant discriminator on `tasks.tasks`. It is NOT a
+        # second physical home for the tasks table: tasks live globally in
+        # `get_task_schema()`.tasks (see `tasks_module.GLOBAL_TASKS_TABLE_DDL`),
+        # provisioned once at `TasksModule.lifespan`.
 
         if payload.task_id:
             await tasks_module.update_task(

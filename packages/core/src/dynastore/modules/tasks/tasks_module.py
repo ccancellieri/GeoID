@@ -634,6 +634,29 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                         )
                     await ensure_task_storage_exists(locked_conn, schema)
 
+                # Optional one-shot cleanup of pre-existing per-tenant
+                # ``{schema}.tasks`` tables left over from the
+                # cellular-safety pattern that this PR removes. Opt-in via
+                # ``DYNASTORE_TASKS_DROP_LEGACY_TENANT_TABLES=1`` because it
+                # issues DROP TABLE + pg_cron.unschedule per tenant — safe
+                # only after a deploy where no service still depends on
+                # the old shape. Idempotent: skips schemas without a
+                # ``tasks`` table and any pg_cron job names that aren't
+                # registered.
+                if os.getenv(
+                    "DYNASTORE_TASKS_DROP_LEGACY_TENANT_TABLES", "0",
+                ).lower() in ("1", "true", "yes"):
+                    try:
+                        async with managed_transaction(engine) as cleanup_conn:
+                            await _drop_legacy_tenant_tasks_tables(
+                                cleanup_conn, global_schema=schema,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — cleanup never blocks boot
+                        logger.warning(
+                            "TasksModule: legacy tenant-tasks cleanup skipped: %s",
+                            exc,
+                        )
+
                 # Post-condition: verify current-month partition is visible on a
                 # fresh connection. If it's not, crash loud — Cloud Run will
                 # restart the pod rather than letting the dispatcher spin on
@@ -1017,17 +1040,44 @@ async def _assert_current_partition_ready(conn: DbResource, schema: str) -> None
 
 async def ensure_task_storage_exists(conn: DbResource, schema: str):
     """
-    Ensures that the global tasks table exists in the specified schema.
-    Called at every startup. All steps are idempotent and must run every time:
+    Provision the global ``tasks.tasks`` partitioned table + its indexes,
+    triggers, pg_notify functions, monthly partitions, retention / partition-
+    creation / reaper pg_cron jobs.
+
+    There is exactly ONE legitimate caller: ``TasksModule.lifespan`` at app
+    startup, with ``schema == get_task_schema()`` (default ``"tasks"``).
+    Multi-tenancy is column-based — ``schema_name`` on each task row carries
+    the catalog physical schema; the table itself is never duplicated per
+    tenant. Callers that pass a catalog/tenant schema are a bug: they would
+    create an unread shadow table plus six redundant pg_cron registrations
+    per tenant (the reaper alone runs every minute → guaranteed wasted load).
+
+    All steps are idempotent and must run every time on the global schema:
     table/index DDL use IF NOT EXISTS, partition + retention/cron helpers all
     check-then-create. The table-existence check is NOT used to short-circuit
     the rest of this function — otherwise a restart after a month rollover
     would never create the current-month partition and the dispatcher would
     hit "relation does not exist" on claim_batch.
 
+    Raises ``RuntimeError`` if ``schema`` is anything other than
+    ``get_task_schema()``. This is a hard guard against the pattern that
+    polluted catalog schemas with empty ``{tenant}.tasks`` tables prior to
+    this fix — every read/write path pins the global schema, so a tenant
+    copy is dead weight that only the reaper would ever touch.
+
     Note: events table is now owned by EventsModule (priority=11).
     """
     from dynastore.modules.db_config import maintenance_tools
+
+    global_schema = get_task_schema()
+    if schema != global_schema:
+        raise RuntimeError(
+            f"ensure_task_storage_exists: refusing DDL on non-global schema "
+            f"{schema!r} (expected {global_schema!r}). Tasks live in a single "
+            f"global partitioned table; per-tenant tasks tables are a bug "
+            f"and were never read. Use schema_name='{schema}' on the row "
+            f"instead (the tenant discriminator column)."
+        )
 
     # Ensure schema exists first
     await ensure_schema_exists(conn, schema)
@@ -1116,6 +1166,104 @@ async def ensure_task_storage_exists(conn: DbResource, schema: str):
             f"manual SELECT {schema}.reap_stuck_tasks() or next successful boot."
         )
 
+
+_DISCOVER_LEGACY_TENANT_TASKS_SQL = """
+SELECT n.nspname AS schema_name
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'tasks'
+  AND c.relkind IN ('p', 'r')
+  AND n.nspname <> :global_schema
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+"""
+
+
+async def _drop_legacy_tenant_tasks_tables(
+    conn: DbResource, *, global_schema: str,
+) -> int:
+    """One-shot cleanup of legacy per-tenant ``{schema}.tasks`` tables.
+
+    Removes the dead-weight tables (and their per-schema pg_cron reaper /
+    retention / partition-creation registrations) that earlier revisions of
+    ``tiles_preseed`` / ``tiles_export`` / ``dimensions_materialize`` created
+    each time they ran on a fresh schema. The current code paths never read
+    these tables — every CRUD path pins ``global_schema`` — so dropping them
+    is non-destructive to live work; the only effect is that pg_cron stops
+    burning a reaper-per-minute on empty tables.
+
+    Idempotent: gracefully skips schemas that have no ``tasks`` table, and
+    pg_cron jobs that aren't registered (``cron.unschedule`` raises when the
+    job name is unknown — we catch and continue per-job).
+
+    Returns the number of tenant ``tasks`` tables dropped.
+    """
+    from dynastore.modules.db_config import maintenance_tools
+
+    skipped = {global_schema, "pg_catalog", "information_schema"}
+
+    # Discover tenant schemas that currently host a ``tasks`` table.
+    # Restrict to partitioned tables (``relkind = 'p'``) so we never touch a
+    # hypothetical non-partitioned ``tasks`` that some unrelated extension
+    # might own — the legacy pattern always created a RANGE-partitioned one.
+    rows = await DQLQuery(
+        _DISCOVER_LEGACY_TENANT_TASKS_SQL,
+        result_handler=ResultHandler.ALL,
+    ).execute(conn, global_schema=global_schema)
+    tenant_schemas = [
+        r[0] for r in (rows or []) if r and r[0] not in skipped
+    ]
+
+    if not tenant_schemas:
+        logger.info(
+            "TasksModule: no legacy tenant tasks tables found; cleanup is a no-op.",
+        )
+        return 0
+
+    dropped = 0
+    for tenant_schema in tenant_schemas:
+        # Unregister the per-schema pg_cron jobs first so they stop firing
+        # against the about-to-be-dropped table. Job names follow the
+        # convention set by ``ensure_task_storage_exists`` / the
+        # ``maintenance_tools`` helpers: a reaper plus retention /
+        # partition-creation entries scoped by schema + table.
+        for job_name in (
+            f"dynastore-task-reaper-{tenant_schema}",
+            f"prune-{tenant_schema}-tasks",
+            f"partman-{tenant_schema}-tasks",
+        ):
+            try:
+                await maintenance_tools.unregister_cron_job(conn, job_name)
+            except Exception as exc:  # noqa: BLE001 — best-effort, job may not exist
+                logger.debug(
+                    "TasksModule: pg_cron.unschedule(%r) skipped: %s",
+                    job_name, exc,
+                )
+
+        # Drop the partitioned tasks table itself. ``CASCADE`` removes the
+        # monthly child partitions + dependent indexes/triggers in one shot.
+        # We trust the discovered schema name (PG returned it from pg_class)
+        # but still quote it via ``format(%I)`` for defence-in-depth.
+        try:
+            await DDLQuery(
+                f'DROP TABLE IF EXISTS "{tenant_schema}".tasks CASCADE'
+            ).execute(conn)
+            dropped += 1
+            logger.info(
+                "TasksModule: dropped legacy tenant tasks table %s.tasks",
+                tenant_schema,
+            )
+        except Exception as exc:  # noqa: BLE001 — log and continue, never fail boot
+            logger.warning(
+                "TasksModule: could not drop %s.tasks: %s",
+                tenant_schema, exc,
+            )
+
+    logger.info(
+        "TasksModule: legacy tenant-tasks cleanup complete — %d table(s) dropped, "
+        "%d schema(s) examined.",
+        dropped, len(tenant_schemas),
+    )
+    return dropped
 
 
 # --- Public API Functions ---

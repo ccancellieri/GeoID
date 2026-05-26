@@ -18,12 +18,11 @@
 
 import logging
 import os
-from typing import Any, Callable, Coroutine, List, Optional, Union, Dict, Tuple, Type, Protocol, runtime_checkable, AsyncGenerator
+from typing import Any, List, Union, Dict, Tuple, Protocol, runtime_checkable, AsyncGenerator
 from contextlib import asynccontextmanager
 
 from dynastore.modules.tasks.models import (PermanentTaskFailure, Task, TaskCreate,
-                                            TaskExecutionMode, TaskPayload,
-                                            TaskStatusEnum, TaskUpdate, RunnerContext)
+                                            TaskExecutionMode, TaskStatusEnum, TaskUpdate, RunnerContext)
 from dynastore.tasks import get_task_instance
 import asyncio
 from dynastore.tools.plugin import ProtocolPlugin
@@ -200,6 +199,7 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
             caller_id=context.caller_id,
             task_type=str(context.task_type),
             inputs=context.inputs,
+            collection_id=context.collection_id,
             dedup_key=context.dedup_key,
         )
 
@@ -323,6 +323,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
             caller_id=context.caller_id,
             task_type=str(context.task_type),
             inputs=context.inputs,
+            collection_id=context.collection_id,
             dedup_key=context.dedup_key,
         )
         job = await tasks_mgr.create_task(
@@ -757,6 +758,7 @@ class WorkerQueueRunner(RunnerProtocol, ProtocolPlugin[Any]):
             caller_id=context.caller_id,
             task_type=str(context.task_type),
             inputs=context.inputs,
+            collection_id=context.collection_id,
             dedup_key=context.dedup_key,
         )
         job = await tasks_mgr.create_task(

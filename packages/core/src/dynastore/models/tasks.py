@@ -70,20 +70,46 @@ sequenceDiagram
 
 #### Data Partitioning & Table Structure
 
-To ensure scalability and isolation, the task system is split across multiple levels:
+Tasks live in **one global PG table**, ``{DYNASTORE_TASK_SCHEMA}.tasks`` (default
+``tasks.tasks``), provisioned once at ``TasksModule.lifespan``. Multi-tenancy is
+modelled via columns, not per-tenant tables:
 
-*   **System Level (Global Tasks):**
-    Defined in the `tasks.tasks` schema/table. This table stores tasks that affect the entire platform or common infrastructure (e.g., global provisioning, system-wide maintenance).
-*   **Catalog Level (Tenant Tasks):**
-    Each catalog (tenant) has its own isolated `tasks` table within its physical schema (e.g., `s_<catalog_id>.tasks`). This prevents cross-tenant noise and ensures that heavy task loads in one catalog do not impact others.
-*   **Collection Level:**
-    Tasks targeting a specific STAC Collection (e.g. data ingestion into a collection) live inside the tenant-level `tasks` table but are identified by the `collection_id` column. This allows for rapid filtering of tasks relevant to a specific dataset.
+*   **Tenant / Catalog discriminator:** the ``schema_name`` column carries the
+    catalog's physical PG schema (e.g. ``s_2ka8fbc3``) for ``CATALOG``-scoped
+    tasks, ``"public"`` for ``PLATFORM`` tasks, and ``"system"`` for
+    cross-tenant platform tasks. Every CRUD path (``get_task``,
+    ``update_task``, ``claim_batch``) filters on **both** ``task_id`` AND
+    ``schema_name`` — a ``task_id`` alone is not tenant-safe.
+*   **Collection scope:** the ``collection_id`` column carries the target
+    STAC Collection id for collection-scoped work (ingestion, tile preseed/
+    invalidation, exports). NULL when the task is catalog-wide.
+*   **Caller / principal:** the ``caller_id`` column records the originator —
+    the authenticated user's subject id for user-initiated work, or a
+    ``"system:<reason>"`` sentinel for system-emitted tasks (e.g.
+    ``"system:platform"``, ``"system:tile_cache_invalidation"``).
+*   **Dedup:** the partial unique index ``idx_tasks_dedup`` on
+    ``(schema_name, dedup_key, timestamp)`` for non-terminal rows guarantees
+    that two tenants sharing the same ``dedup_key`` do not collide. The
+    cross-partition dedup guard in ``enqueue()`` is also ``schema_name``-scoped.
+
+A single global dispatcher claims tasks across all tenants via ``FOR UPDATE
+SKIP LOCKED`` against the partial ``idx_tasks_queue`` index (filtered on
+``status IN ('PENDING','ACTIVE')`` — the hot working set, never the full
+partition). Runners receive ``schema_name`` so they operate in the correct
+tenant context.
+
+There is no per-catalog ``{tenant}.tasks`` table.
+``ensure_task_storage_exists`` now refuses non-global schemas; any tenant
+copies that existed on older deployments are dead weight (never read by any
+CRUD path) and should be dropped as a one-shot maintenance step.
 
 #### Maintenance & Retention
 
 The task system is designed for high-volume, ephemeral data management:
 
-*   **Partitioning:** All `tasks` tables are partitioned by **RANGE** on the `timestamp` column. By default, partitions are created monthly (`ensure_future_partitions`).
+*   **Partitioning:** ``tasks.tasks`` is partitioned by **RANGE** on the
+    ``timestamp`` column. By default, partitions are created monthly
+    (``ensure_future_partitions``).
 *   **Retention Policy:** A background process (`register_retention_policy`) manages the data lifecycle. COMPLETED and FAILED tasks are typically pruned after 1 month to prevent the database from growing indefinitely.
 *   **Recovery:** A 'Janitor' process detects tasks in `ACTIVE` state that have missed their heartbeats (exceeding `locked_until`) and automatically resets them to `PENDING` for retry or moves them to `DEAD_LETTER`.
 
@@ -135,7 +161,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, Dict, Any, TypeVar, Generic, List
 from dynastore.models.shared_models import Link
 from uuid import UUID, uuid4
-from datetime import datetime, timezone, UTC, timedelta
+from datetime import datetime, timezone
 from enum import Enum
 
 # --- Enumerations ---

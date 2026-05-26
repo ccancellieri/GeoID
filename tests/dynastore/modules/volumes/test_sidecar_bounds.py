@@ -1,3 +1,7 @@
+import asyncio
+import inspect
+from unittest.mock import patch
+
 import pytest
 
 from dynastore.modules.volumes.sidecar_bounds import (
@@ -7,6 +11,34 @@ from dynastore.modules.volumes.sidecar_bounds import (
     row_to_feature_bounds,
     rows_to_bounds,
 )
+
+
+@pytest.fixture(autouse=True)
+def _patch_is_async_resource_for_fake_conns():
+    """Make DQLQuery treat fake test connections as async resources.
+
+    DQLQuery dispatches via ``is_async_resource(conn)`` — an isinstance check
+    against SQLAlchemy async types. Fake test conns don't pass that check.
+    This fixture patches the predicate to also return True for any object
+    whose ``execute`` attribute is a coroutine function, so fake conns with
+    ``async def execute(...)`` are dispatched via the async code path.
+    """
+    import dynastore.modules.db_config.query_executor as _qe
+
+    _orig = _qe.is_async_resource
+
+    def _patched(conn):
+        if not _orig(conn):
+            exec_attr = getattr(conn, "execute", None)
+            if exec_attr is not None and (
+                asyncio.iscoroutinefunction(exec_attr)
+                or inspect.iscoroutinefunction(exec_attr)
+            ):
+                return True
+        return _orig(conn)
+
+    with patch.object(_qe, "is_async_resource", side_effect=_patched):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -159,29 +191,64 @@ def _make_table(name: str):
     return _t
 
 
+class _FakeRow:
+    """Mimics a SQLAlchemy ``Row`` — supports ``_asdict()`` and dict-like access."""
+
+    def __init__(self, data: dict):
+        self._data = data
+
+    def _asdict(self):
+        return dict(self._data)
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+
+class _FakeResult:
+    """Mimics a SQLAlchemy ``Result`` — supports ``.all()`` and ``.fetchall()``."""
+
+    def __init__(self, rows):
+        # Wrap plain dicts so _asdict() calls (from ResultHandler.ALL_DICTS) work.
+        self._rows = [_FakeRow(r) if isinstance(r, dict) else r for r in rows]
+
+    def all(self):
+        return list(self._rows)
+
+    def fetchall(self):
+        return list(self._rows)
+
+
 def _fake_connection_factory_returning(rows, sql_sink=None):
     """Build an async-context-manager connection factory for tests.
 
     Accepts the test's expected row list + an optional sink list that
-    captures each executed SQL string. The connection's execute() returns
-    the rows directly (SidecarBoundsSource normalizes list -> rows).
+    captures each executed SQL string. DQLQuery calls
+    ``conn.execute(text_clause, params_dict)``; the fake's ``execute``
+    accepts ``(sql_clause, params=None, **kw)`` and returns a
+    ``_FakeResult`` that supports ``.all()`` / ``.fetchall()``.
     """
+    class _Conn:
+        async def execute(self, sql_clause, params=None, **_kw):
+            if sql_sink is not None:
+                sql_sink.append(str(sql_clause))
+            return _FakeResult(rows)
+
     class _FactoryCM:
+        _conn_cls = _Conn  # exposed for autouse patch
+
         async def __aenter__(self):
             return _Conn()
 
         async def __aexit__(self, *a):
             return None
 
-    class _Conn:
-        async def execute(self, sql):
-            if sql_sink is not None:
-                sql_sink.append(sql)
-            return rows
-
     def _call(*args, **kwargs):
         return _FactoryCM()
 
+    _call._conn_cls = _Conn  # expose for autouse patch
     return _call
 
 

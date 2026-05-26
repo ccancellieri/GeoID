@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Sequence
 
 from dynastore.models.protocols.bounds_source import BoundsSourceProtocol
+from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
 from dynastore.modules.volumes.bounds import FeatureBounds
 from dynastore.tools.cache import cached
 from dynastore.tools.db import validate_sql_identifier
@@ -199,14 +200,11 @@ class SidecarBoundsSource:
         sql = build_bounds_query(spec)
 
         async with self._connect() as conn:
-            rows = await conn.execute(sql)
-            # rows may be a list, an async iterator, or an aiopg/asyncpg
-            # cursor — normalize to a sync list.
-            if hasattr(rows, "__aiter__"):
-                rows = [r async for r in rows]
-            elif hasattr(rows, "fetchall"):
-                rows = await rows.fetchall()
-        return rows_to_bounds(rows)
+            raw_rows = await DQLQuery(
+                sql,
+                result_handler=ResultHandler.ALL_DICTS,
+            ).execute(conn)
+        return rows_to_bounds(raw_rows or [])
 
 
 # Structural protocol sanity check — ensures the class still satisfies
