@@ -431,11 +431,41 @@ class IamExtension(ExtensionProtocol):
         # REMOVED IN PR-5: this entire contributor-discovery block and
         # the PolicyContributor protocol are deleted once every contributor
         # has been converted to a registered Preset.
+        #
+        # PR-3 narrowing: skip contributors whose class is already covered
+        # by a registered PolicyContributorPreset.  Those contributors are
+        # managed via the preset lifecycle (POST /admin/presets/{name}) and
+        # must not be auto-seeded at boot.  Any contributor without a
+        # matching preset still runs through this loop as a safety net until
+        # PR-5 removes it entirely.
         try:
             from dynastore.models.protocols.policy_contributor import PolicyContributor
+            from dynastore.modules.storage.presets.policy_contributor_adapter import (
+                PolicyContributorPreset,
+            )
+            from dynastore.modules.storage.presets.registry import list_presets, get_preset
+
+            # Build a set of contributor class types that now have a registered
+            # PolicyContributorPreset so we can skip them below.
+            _preset_covered_classes: set[type] = set()
+            for preset_name in list_presets():
+                try:
+                    preset = get_preset(preset_name)
+                    if isinstance(preset, PolicyContributorPreset):
+                        _preset_covered_classes.add(preset.contributor_class)
+                except Exception:
+                    pass
+
             contributors = get_protocols(PolicyContributor)
             for contributor in contributors:
-                origin = type(contributor).__name__
+                contributor_cls = type(contributor)
+                origin = contributor_cls.__name__
+                if contributor_cls in _preset_covered_classes:
+                    logger.debug(
+                        "IamExtension: skipping %s — covered by a registered preset",
+                        origin,
+                    )
+                    continue
                 try:
                     for policy in contributor.get_policies() or []:
                         self._policy_service.register_policy(policy)
