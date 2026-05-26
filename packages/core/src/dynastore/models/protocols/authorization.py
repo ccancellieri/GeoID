@@ -59,6 +59,7 @@ class RoleSeed(BaseModel):
     parent: Optional[str] = None
 
 
+# Consumed by the ``default_roles_baseline`` preset; planned removal in PR-5 when boot-time auto-seed is dropped.
 _DEFAULT_PLATFORM_ROLES: List[RoleSeed] = [
     RoleSeed(
         name="sysadmin",
@@ -70,6 +71,7 @@ _DEFAULT_PLATFORM_ROLES: List[RoleSeed] = [
 ]
 
 
+# Consumed by the ``default_roles_baseline`` preset; planned removal in PR-5 when boot-time auto-seed is dropped.
 _DEFAULT_CATALOG_ROLES: List[RoleSeed] = [
     RoleSeed(
         name="admin",

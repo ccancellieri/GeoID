@@ -168,6 +168,18 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                             _bf_exc,
                         )
 
+                    # Backfill: insert a synthetic default_roles_baseline audit row
+                    # so that DELETE /admin/presets/default_roles_baseline works on
+                    # upgraded deployments. Idempotent — no-op when row already exists.
+                    try:
+                        from dynastore.modules.iam.migrations.backfill_default_roles_baseline_audit import run_backfill as _run_roles_bf
+                        await _run_roles_bf(engine=engine)
+                    except Exception as _roles_bf_exc:
+                        logger.warning(
+                            "IamModule: default_roles_baseline backfill failed (non-fatal): %s",
+                            _roles_bf_exc,
+                        )
+
                     # Self-heal guard: if the platform-tier sysadmin role
                     # is still absent after normal provision (e.g. iam_storage
                     # was None on first pass, or a DB reset happened before a

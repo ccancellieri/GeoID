@@ -1,4 +1,4 @@
-#    Copyright 2025 FAO
+#    Copyright 2026 FAO
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -11,11 +11,16 @@
 #    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
-#
-#    Author: Carlo Cancellieri (ccancellieri@gmail.com)
-#    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
-#    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-# Register IAM presets at module load time so they appear in GET /admin/presets
-# before any request is served.
-from dynastore.modules.iam import presets as _iam_presets  # noqa: F401
+"""IAM presets — platform-tier presets that operate on IAM data.
+
+Imported by ``dynastore.modules.iam.module`` at module load time so
+registrations happen before ``GET /admin/presets`` is served.
+"""
+from dynastore.modules.storage.presets.registry import register_preset
+
+from .default_roles_baseline import DefaultRolesBaseline
+
+register_preset(DefaultRolesBaseline())
+
+__all__ = ["DefaultRolesBaseline"]
