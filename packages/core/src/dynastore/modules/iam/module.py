@@ -151,6 +151,23 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     # Provision default global policies
                     await self._policy_service.provision_default_policies(conn=conn)
 
+                    # Backfill: insert a synthetic iam_baseline audit row so
+                    # that DELETE /admin/presets/iam_baseline works on upgraded
+                    # deployments that had the contributor-loop seeding run.
+                    # Idempotent — no-op when the row already exists.
+                    try:
+                        from dynastore.modules.iam.migrations.backfill_iam_baseline_audit import run_backfill
+                        await run_backfill(
+                            engine=engine,
+                            policy_storage=policy_storage,
+                            iam_storage=self.storage,
+                        )
+                    except Exception as _bf_exc:
+                        logger.warning(
+                            "IamModule: iam_baseline backfill failed (non-fatal): %s",
+                            _bf_exc,
+                        )
+
                     # Self-heal guard: if the platform-tier sysadmin role
                     # is still absent after normal provision (e.g. iam_storage
                     # was None on first pass, or a DB reset happened before a

@@ -15,3 +15,7 @@
 #    Author: Carlo Cancellieri (ccancellieri@gmail.com)
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
+
+# Register IAM extension presets into the global registry on import.
+# Importing the subpackage has no DB side-effects — only in-memory registration.
+from dynastore.extensions.iam import presets as _iam_presets  # noqa: F401

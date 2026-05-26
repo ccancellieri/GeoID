@@ -36,67 +36,11 @@ from dynastore.modules.iam.iam_service import IamService
 from dynastore.tools.discovery import get_protocol, get_protocols
 from dynastore.modules.db_config.query_executor import DbResource
 
-from dynastore.modules.iam.models import (
-    Role,
-    Policy,
-)
 from dynastore.models.protocols.policies import PermissionProtocol
 from dynastore.extensions.iam.middleware import IamMiddleware
 from dynastore.extensions.iam.authorization_api import me_router
 logger = logging.getLogger(__name__)
 
-
-def iam_service_policies():
-    """Pure declaration of IAM service policies (admin + self-service auth API).
-
-    Returned to IAM via ``IamExtension.get_policies``. Same pattern as
-    every other plugin in the SCOPE matrix — no direct
-    ``register_policy`` call. IAM consuming its own contribution is the
-    canonical case for this Protocol; treating it the same way as
-    other plugins keeps the registration site singular and the seeding
-    logic uniform.
-    """
-    return [
-        Policy(
-            id="admin_authorization_api",
-            description="Allows admin users to manage user roles and permissions",
-            actions=["GET", "POST", "PUT", "DELETE", "PATCH"],
-            resources=["/admin/principals/.*", "/admin/roles/.*", "/admin/policies/.*"],
-            effect="ALLOW",
-            partition_key="global",
-        ),
-        Policy(
-            id="self_service_authorization_api",
-            description="Allows authenticated users to view their own roles and catalog access",
-            actions=["GET"],
-            # me_router is mounted at /iam/me; resources must include the
-            # /iam/ prefix because the matcher is start-anchored. The bare
-            # /iam/me path needs its own entry — `.*` requires ≥1 trailing
-            # char and would not match `/iam/me`.
-            resources=["/iam/me", "/iam/me/.*", "/auth/userinfo"],
-            effect="ALLOW",
-            partition_key="global",
-        ),
-    ]
-
-
-def iam_service_role_bindings(
-    sysadmin_role_name=None,
-    admin_role_name=None,
-    user_role_name=None,
-):
-    """Pure declaration of role bindings for IAM service policies.
-
-    Role names default from the active ``IamRolesConfig`` so seed-time
-    bindings track operator-renamed deployments without explicit args.
-    """
-    from dynastore.models.protocols.authorization import IamRolesConfig
-    cfg = IamRolesConfig()
-    return [
-        Role(name=admin_role_name or cfg.admin_role_name, policies=["admin_authorization_api"]),
-        Role(name=sysadmin_role_name or cfg.sysadmin_role_name, policies=["admin_authorization_api"]),
-        Role(name=user_role_name or cfg.default_user_role_name, policies=["self_service_authorization_api"]),
-    ]
 
 
 def _build_oauth2_endpoints() -> tuple[str, str]:
@@ -260,15 +204,6 @@ class IamExtension(ExtensionProtocol):
     def get_web_pages(self):
         from dynastore.extensions.tools.web_collect import collect_web_pages
         return collect_web_pages(self)
-
-    # PolicyContributor: declare IAM's own service policies; the lifespan
-    # contributor loop forwards them to PermissionProtocol — same path as
-    # every other plugin in the SCOPE matrix.
-    def get_policies(self):
-        return iam_service_policies()
-
-    def get_role_bindings(self):
-        return iam_service_role_bindings()
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -449,18 +384,21 @@ class IamExtension(ExtensionProtocol):
             return
         self._engine = db_protocol.engine
 
-        # Seed default policies (idempotent)
+        # Seed default policies (idempotent).
+        # This call handles the core platform defaults (sysadmin_full_access,
+        # public_access, self_service_access) and the sysadmin-role survival
+        # row. The IAM extension's own service policies (admin_authorization_api,
+        # self_service_authorization_api) are no longer seeded here — they are
+        # now applied via the iam_baseline preset. A fresh install is
+        # non-functional for IAM-specific routes until a sysadmin applies
+        # iam_baseline, which is intentional (see umbrella #1412).
+        # REMOVED IN PR-5: provision_default_policies call moves to preset.
         try:
             # Seed both global (iam) and system (catalog) schemas
             await self._policy_service.provision_default_policies(catalog_id=None)
             await self._policy_service.provision_default_policies(catalog_id="_system_")
         except Exception as e:
             logger.error(f"Failed to seed default policies: {e}")
-
-        # IAM's own service policies are declared via PolicyContributor
-        # (IamExtension.get_policies / get_role_bindings) and picked up by
-        # the contributor loop below alongside every other plugin's
-        # declarations — same single registration site.
 
         # Register the IAM-side PageVisibilityFilter implementation so
         # web routes can delegate nav-list filtering without naming any
@@ -490,6 +428,9 @@ class IamExtension(ExtensionProtocol):
         # never touch PermissionProtocol directly — they declare here and
         # IAM forwards centrally. Keeps IAM/auth concepts isolated from
         # the rest of the platform.
+        # REMOVED IN PR-5: this entire contributor-discovery block and
+        # the PolicyContributor protocol are deleted once every contributor
+        # has been converted to a registered Preset.
         try:
             from dynastore.models.protocols.policy_contributor import PolicyContributor
             contributors = get_protocols(PolicyContributor)
