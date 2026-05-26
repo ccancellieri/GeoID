@@ -860,6 +860,261 @@ class AdminService(ExtensionProtocol):
             )
         return result
 
+    # ---- Platform / catalog scope bindings (#1346 — same generic binding
+    #      shape as the collection-scope endpoint below, but the resource
+    #      dimension is fixed to NULL — i.e. whole-platform / whole-catalog).
+    #      Adding these unblocks the Admin UI from the "role-allow only"
+    #      ceiling of the legacy `/admin/.../roles` endpoints: operators can
+    #      now author `effect=deny` grants, `valid_from`/`valid_until` time
+    #      windows, direct `object_kind=policy` bindings, and per-binding
+    #      `quota` at platform / catalog scope without dropping to SQL.
+    #
+    #      The legacy `/admin/platform/principals/{pid}/roles` and
+    #      `/admin/catalogs/{cid}/principals/{pid}/roles` endpoints stay as
+    #      backcompat wrappers (allow-only role grant); both write the same
+    #      `iam.grants` / `{cat}.grants` row a binding here would write with
+    #      defaults, so the two surfaces are exchangeable for existing
+    #      callers and identical at the storage layer.
+
+    @router.post(
+        "/platform/grants",
+        status_code=201,
+        summary="Create a platform-scope binding (role|policy) for a principal",
+    )
+    async def create_platform_binding(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        body: CreateBindingRequest,
+    ):
+        mgr = _iam()
+        if body.object_kind == "role":
+            # Same escalation gate the legacy `/platform/.../roles` POST applies.
+            await ensure_privileged_role_assignment(request, body.object_ref)
+        p = await mgr.get_principal(body.subject_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="Principal not found.")
+        if body.object_kind == "role":
+            registered = await mgr.list_roles(catalog_id=None)
+            if not any(r.name == body.object_ref for r in registered):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Role '{body.object_ref}' is not registered in the "
+                        f"platform role registry."
+                    ),
+                )
+        else:
+            perm = get_protocol(PermissionProtocol)
+            pol = (
+                await perm.get_policy(body.object_ref, catalog_id=None)
+                if perm is not None
+                else None
+            )
+            if pol is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Policy '{body.object_ref}' not found at platform scope."
+                    ),
+                )
+        granted_by = getattr(getattr(request.state, "principal", None), "id", None)
+        try:
+            grant_id = await mgr.storage.grant(
+                scope_schema="iam",
+                subject_kind="principal",
+                subject_ref=str(body.subject_id),
+                object_kind=body.object_kind,
+                object_ref=body.object_ref,
+                effect=body.effect,
+                valid_from=body.valid_from,
+                valid_until=body.valid_until,
+                quota=body.quota,
+                granted_by=granted_by,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "id": str(grant_id) if grant_id else None,
+            "subject_id": str(body.subject_id),
+            "object_kind": body.object_kind,
+            "object_ref": body.object_ref,
+            "effect": body.effect,
+            "resource_kind": None,
+            "resource_ref": None,
+        }
+
+    @router.get(
+        "/platform/grants",
+        summary="List a principal's platform-scope bindings",
+    )
+    async def list_platform_grants(
+        principal_id: UUID = Query(  # type: ignore[reportGeneralTypeIssues]
+            ..., description="Principal whose platform-scope bindings to list."
+        ),
+    ):
+        mgr = _iam()
+        p = await mgr.get_principal(principal_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="Principal not found.")
+        return await mgr.storage.list_grants_for_subject(
+            scope_schema="iam",
+            subject_kind="principal",
+            subject_ref=str(principal_id),
+        )
+
+    @router.delete(
+        "/platform/grants",
+        status_code=204,
+        summary="Revoke a platform-scope binding (by match)",
+    )
+    async def revoke_platform_binding(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        subject_id: UUID = Query(..., description="Principal whose binding is revoked."),
+        object_kind: Literal["role", "policy"] = Query(...),
+        object_ref: str = Query(...),
+        effect: Literal["allow", "deny"] = Query("allow"),
+    ):
+        mgr = _iam()
+        if object_kind == "role":
+            await ensure_privileged_role_assignment(request, object_ref)
+        try:
+            await mgr.storage.revoke_by_match(
+                scope_schema="iam",
+                subject_kind="principal",
+                subject_ref=str(subject_id),
+                object_kind=object_kind,
+                object_ref=object_ref,
+                effect=effect,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/catalogs/{catalog_id}/grants",
+        status_code=201,
+        summary="Create a catalog-scope binding (role|policy) for a principal",
+    )
+    async def create_catalog_binding(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
+        body: CreateBindingRequest,
+    ):
+        mgr = _iam()
+        if body.object_kind == "role":
+            # Match `grant_catalog_role`'s narrowed guard: platform-tier names
+            # are blocked here, catalog-tier admin grants stay open to catalog
+            # admins (the #723 "appoint a co-admin of the same catalog" path).
+            await ensure_privileged_role_assignment(
+                request, body.object_ref,
+                protected_roles=IamRolesConfig().platform_admin_tier_role_set,
+            )
+        await _assert_catalog_exists(catalog_id)
+        p = await mgr.get_principal(body.subject_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="Principal not found.")
+        if body.object_kind == "role":
+            registered = await mgr.list_roles(catalog_id=catalog_id)
+            if not any(r.name == body.object_ref for r in registered):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Role '{body.object_ref}' is not registered for "
+                        f"catalog '{catalog_id}'."
+                    ),
+                )
+        else:
+            perm = get_protocol(PermissionProtocol)
+            pol = (
+                await perm.get_policy(body.object_ref, catalog_id=catalog_id)
+                if perm is not None
+                else None
+            )
+            if pol is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Policy '{body.object_ref}' not found for "
+                        f"catalog '{catalog_id}'."
+                    ),
+                )
+        granted_by = getattr(getattr(request.state, "principal", None), "id", None)
+        try:
+            grant_id = await mgr.storage.grant(
+                scope_schema=await mgr.resolve_schema(catalog_id),
+                subject_kind="principal",
+                subject_ref=str(body.subject_id),
+                object_kind=body.object_kind,
+                object_ref=body.object_ref,
+                effect=body.effect,
+                valid_from=body.valid_from,
+                valid_until=body.valid_until,
+                quota=body.quota,
+                granted_by=granted_by,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "id": str(grant_id) if grant_id else None,
+            "subject_id": str(body.subject_id),
+            "object_kind": body.object_kind,
+            "object_ref": body.object_ref,
+            "effect": body.effect,
+            "resource_kind": None,
+            "resource_ref": None,
+        }
+
+    @router.get(
+        "/catalogs/{catalog_id}/grants",
+        summary="List a principal's catalog-scope bindings",
+    )
+    async def list_catalog_grants(
+        catalog_id: str,  # type: ignore[reportGeneralTypeIssues]
+        principal_id: UUID = Query(
+            ..., description="Principal whose catalog-scope bindings to list."
+        ),
+    ):
+        mgr = _iam()
+        await _assert_catalog_exists(catalog_id)
+        p = await mgr.get_principal(principal_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="Principal not found.")
+        return await mgr.storage.list_grants_for_subject(
+            scope_schema=await mgr.resolve_schema(catalog_id),
+            subject_kind="principal",
+            subject_ref=str(principal_id),
+        )
+
+    @router.delete(
+        "/catalogs/{catalog_id}/grants",
+        status_code=204,
+        summary="Revoke a catalog-scope binding (by match)",
+    )
+    async def revoke_catalog_binding(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
+        subject_id: UUID = Query(..., description="Principal whose binding is revoked."),
+        object_kind: Literal["role", "policy"] = Query(...),
+        object_ref: str = Query(...),
+        effect: Literal["allow", "deny"] = Query("allow"),
+    ):
+        mgr = _iam()
+        if object_kind == "role":
+            await ensure_privileged_role_assignment(
+                request, object_ref,
+                protected_roles=IamRolesConfig().platform_admin_tier_role_set,
+            )
+        await _assert_catalog_exists(catalog_id)
+        try:
+            await mgr.storage.revoke_by_match(
+                scope_schema=await mgr.resolve_schema(catalog_id),
+                subject_kind="principal",
+                subject_ref=str(subject_id),
+                object_kind=object_kind,
+                object_ref=object_ref,
+                effect=effect,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
     # ---- Collection-scope bindings (#1342 — generic role|policy grant
     #      with effect / validity / per-binding quota, scoped to a
     #      collection via the unified `grants` table) -----------------------
