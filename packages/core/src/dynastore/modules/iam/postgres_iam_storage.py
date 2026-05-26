@@ -307,7 +307,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         conn: Optional[DbResource] = None,
     ) -> Optional[Principal]:
         async with managed_transaction(conn or self.engine) as db:
-            return await UPDATE_PRINCIPAL.execute(
+            result = await UPDATE_PRINCIPAL.execute(
                 db,
                 schema="iam",
                 id=principal.id,
@@ -321,6 +321,13 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 ),
                 attributes=json.dumps(principal.attributes),
             )
+        # A principal edit (is_active flip, custom_policies, expiry) is a
+        # binding-affecting mutation: invalidate the phantom-token cache so a
+        # deactivation / expiry propagates on the next request, not only at TTL.
+        # Principals live in the platform ("iam") schema, whose version is part
+        # of every resolution key, so this invalidates every schema's entries.
+        await self._bump_binding_version("iam")
+        return result
 
     async def get_principal_by_identifier(
         self, identifier: str, conn: Optional[DbResource] = None,
@@ -393,6 +400,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 db, schema=schema, parent_role=parent_role, child_role=child_role
             )
             self.invalidate_role_hierarchy_cache(schema)
+        await self._bump_binding_version(schema)
 
     async def remove_role_hierarchy(
         self,
@@ -406,7 +414,8 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 db, schema=schema, parent_role=parent_role, child_role=child_role
             )
             self.invalidate_role_hierarchy_cache(schema)
-            return count > 0
+        await self._bump_binding_version(schema)
+        return count > 0
 
     def invalidate_role_hierarchy_cache(self, schema: str = "iam") -> None:
         """Clear role hierarchy cache entries for a schema (call on role CRUD)."""
@@ -642,6 +651,15 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             )
             return count > 0
 
+    async def _bump_binding_version(self, schema: str) -> None:
+        """Best-effort invalidation of the phantom-token cache (#1343).
+
+        No-op unless the phantom cache is active (Valkey + flag); never raises.
+        """
+        from dynastore.modules.iam.phantom_token import bump_binding_version
+
+        await bump_binding_version(schema)
+
     # ------------------------------------------------------------------
     # Role definitions — per-scope. `schema=` here denotes the role
     # registry (iam for platform, tenant schema for catalog roles).
@@ -651,7 +669,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         self, role: Role, conn: Optional[DbResource] = None, schema: str = "iam"
     ) -> Role:
         async with managed_transaction(conn or self.engine) as db:
-            return await INSERT_ROLE.execute(
+            result = await INSERT_ROLE.execute(
                 db,
                 schema=schema,
                 id=role.id,
@@ -662,6 +680,8 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 parent_roles=json.dumps(role.parent_roles),
                 policies=json.dumps(role.policies),
             )
+        await self._bump_binding_version(schema)
+        return result
 
     async def get_role(
         self, role_id: str, conn: Optional[DbResource] = None, schema: str = "iam"
@@ -682,7 +702,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         self, role: Role, conn: Optional[DbResource] = None, schema: str = "iam"
     ) -> Optional[Role]:
         async with managed_transaction(conn or self.engine) as db:
-            return await UPDATE_ROLE.execute(
+            result = await UPDATE_ROLE.execute(
                 db,
                 schema=schema,
                 name=role.name,
@@ -692,13 +712,16 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 parent_roles=json.dumps(role.parent_roles),
                 policies=json.dumps(role.policies),
             )
+        await self._bump_binding_version(schema)
+        return result
 
     async def delete_role(
         self, role_id: str, cascade: bool = False, conn: Optional[DbResource] = None, schema: str = "iam"
     ) -> bool:
         async with managed_transaction(conn or self.engine) as db:
             await DELETE_ROLE.execute(db, schema=schema, name=role_id)
-            return True
+        await self._bump_binding_version(schema)
+        return True
 
     # ------------------------------------------------------------------
     # Principal-backed compatibility methods (replaced IAG tables in v1.0)
@@ -779,7 +802,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         grant — the historical behaviour.
         """
         async with managed_transaction(conn or self.engine) as db:
-            return await INSERT_GRANT.execute(
+            result = await INSERT_GRANT.execute(
                 db,
                 schema=scope_schema,
                 subject_kind=subject_kind,
@@ -795,6 +818,8 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 resource_kind=resource_kind,
                 resource_ref=resource_ref,
             )
+        await self._bump_binding_version(scope_schema)
+        return result
 
     async def revoke(
         self,
@@ -807,7 +832,8 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             count = await DELETE_GRANT_BY_ID.execute(
                 db, schema=scope_schema, id=grant_id
             )
-            return count > 0
+        await self._bump_binding_version(scope_schema)
+        return count > 0
 
     async def revoke_by_match(
         self,
@@ -830,7 +856,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         the whole-catalog row intact.
         """
         async with managed_transaction(conn or self.engine) as db:
-            return await DELETE_GRANTS_BY_MATCH.execute(
+            result = await DELETE_GRANTS_BY_MATCH.execute(
                 db,
                 schema=scope_schema,
                 subject_kind=subject_kind,
@@ -841,6 +867,8 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 resource_kind=resource_kind,
                 resource_ref=resource_ref,
             )
+        await self._bump_binding_version(scope_schema)
+        return result
 
     async def list_grants_for_subject(
         self,

@@ -867,6 +867,39 @@ class IamService:
         schema = await self._resolve_schema(catalog_id)
         return await self.storage.run_maintenance(schema=schema)
 
+    # --- Token revocation (phantom-token denylist, #1343) ---
+
+    async def revoke_token(self, jti: str) -> None:
+        """Deny a single token by its ``jti`` until the denylist TTL elapses.
+
+        Immediate revocation ahead of natural token expiry; enforced by the
+        denylist check in :meth:`authenticate_and_get_role` when
+        ``denylist_enabled``. No-op unless a distributed backend is present.
+        """
+        from dynastore.modules.iam import phantom_token
+        from dynastore.modules.iam.scale_config import get_iam_scale_config
+
+        cfg = await get_iam_scale_config()
+        await phantom_token.deny(
+            str(jti), ttl_seconds=int(getattr(cfg, "denylist_ttl_seconds", 300))
+        )
+
+    async def revoke_principal(self, subject_id: str) -> None:
+        """Deny every currently-issued token for a subject until the TTL.
+
+        Uses the ``sub:`` denylist namespace matched by the auth path. The
+        subject re-authenticates fine once the denylist entry expires (or
+        sooner via a new token whose ``jti`` is not denied).
+        """
+        from dynastore.modules.iam import phantom_token
+        from dynastore.modules.iam.scale_config import get_iam_scale_config
+
+        cfg = await get_iam_scale_config()
+        await phantom_token.deny(
+            "sub:" + str(subject_id),
+            ttl_seconds=int(getattr(cfg, "denylist_ttl_seconds", 300)),
+        )
+
     # --- Middleware Helpers ---
 
     def extract_token_from_request(self, request: Any) -> Optional[str]:
@@ -933,6 +966,80 @@ class IamService:
             tenant_expanded = []
         return list(set(platform_expanded) | set(tenant_expanded))
 
+    async def _resolve_effective_identity(
+        self, identity: Dict[str, Any], catalog_id: Optional[str], schema: str
+    ) -> "Optional[Tuple[List[str], Principal]]":
+        """Authoritative (DB) resolution of a validated identity.
+
+        Returns ``(effective_roles, principal)`` or ``None`` when the identity
+        maps to no principal (the caller then tries the next provider / falls
+        through to 401). Extracted so the phantom-token cache (#1343) can wrap
+        it without duplicating the resolution.
+        """
+        principal = await self.authenticate_and_get_principal(
+            identity=identity,
+            target_schema=catalog_id or "_system_",
+            auto_register=True,
+        )
+        if not principal:
+            return None
+        roles = self._normalize_authenticated_roles(principal.roles)
+        effective_roles = await self._expand_role_hierarchy_dual_scope(roles, schema)
+        return effective_roles, principal
+
+    async def _resolve_identity_maybe_cached(
+        self,
+        identity: Dict[str, Any],
+        catalog_id: Optional[str],
+        schema: str,
+        scale_cfg: Any,
+    ) -> "Optional[Tuple[List[str], Principal]]":
+        """Resolve a validated identity, via the phantom-token tier when active.
+
+        When ``phantom_token_active`` (the #1343 flag is on AND a distributed
+        Valkey backend is present), the ``(roles, principal)`` resolution is
+        served from the shared, version-keyed L1+L2 tier instead of re-querying
+        Postgres on every request; otherwise the authoritative DB path runs.
+        Returns ``None`` when the identity maps to no principal.
+        """
+        from dynastore.modules.iam import phantom_token
+
+        subject_id = str(identity.get("sub") or "")
+        provider_name = str(identity.get("provider") or "")
+        if not (subject_id and phantom_token.phantom_token_active(scale_cfg)):
+            return await self._resolve_effective_identity(identity, catalog_id, schema)
+
+        async def _resolver() -> Optional[Dict[str, Any]]:
+            res = await self._resolve_effective_identity(identity, catalog_id, schema)
+            if res is None:
+                return None
+            eff, principal = res
+            # Cache a JSON-safe projection; rehydrated below on a hit.
+            return {"roles": eff, "principal": principal.model_dump(mode="json")}
+
+        cached = await phantom_token.resolve_bindings_cached(
+            provider=provider_name,
+            subject_id=subject_id,
+            schema=schema,
+            resolver=_resolver,
+            cfg=scale_cfg,
+        )
+        if cached is None:
+            return None
+        principal = Principal.model_validate(cached["principal"])
+        # Re-apply the account-state gates on every cache hit. A positive entry
+        # was cached while the principal was active and unexpired; ``valid_until``
+        # expiry is caught here immediately, and an ``is_active`` flip is honoured
+        # via the binding-version bump on ``update_principal`` (+ the TTL backstop)
+        # — never serve a deactivated / expired principal from a warm cache.
+        if not principal.is_active:
+            logger.warning("Principal %s is inactive (cache hit)", principal.id)
+            return None
+        if principal.valid_until and principal.valid_until < datetime.now(timezone.utc):
+            logger.warning("Principal %s has expired (cache hit)", principal.id)
+            return None
+        return list(cached.get("roles") or []), principal
+
     async def authenticate_and_get_role(
         self, request: Any
     ) -> Tuple[List[str], Optional[Principal]]:
@@ -951,29 +1058,49 @@ class IamService:
         # Authenticate via registered Identity Providers (OAuth2 / OIDC)
         identity_providers = self.get_identity_providers()
         logger.debug("Checking %d identity providers", len(identity_providers))
+        scale_cfg: Any = None
         for provider in identity_providers:
             provider_id = provider.get_provider_id()
             try:
                 logger.debug("Trying provider %s", provider_id)
                 identity = await provider.validate_token(token)
-                if identity:
-                    logger.debug("Identity found via provider %s", provider_id)
-                    # Resolve identity to Principal with contextual roles
-                    principal = await self.authenticate_and_get_principal(
-                        identity=identity,
-                        target_schema=catalog_id or "_system_",
-                        auto_register=True,
+                if not identity:
+                    continue
+                logger.debug("Identity found via provider %s", provider_id)
+                # Resolve the scale config once (drives the #1343 hot path).
+                if scale_cfg is None:
+                    from dynastore.modules.iam.scale_config import (
+                        get_iam_scale_config,
                     )
-                    if principal:
-                        roles = self._normalize_authenticated_roles(principal.roles)
-                        effective_roles = await self._expand_role_hierarchy_dual_scope(
-                            roles, schema,
+
+                    scale_cfg = await get_iam_scale_config()
+                # Immediate revocation: reject a validated token whose jti / sub
+                # is on the Valkey denylist (opt-in, #1343).
+                if getattr(scale_cfg, "denylist_enabled", False):
+                    from dynastore.modules.iam import phantom_token
+
+                    subj = str(identity.get("sub") or "")
+                    jti = identity.get("jti")
+                    if (jti is not None and await phantom_token.is_denied(str(jti))) or (
+                        subj and await phantom_token.is_denied("sub:" + subj)
+                    ):
+                        raise InvalidAuthTokenError(
+                            "Authorization token has been revoked"
                         )
-                        return effective_roles, principal
-                    else:
-                        logger.debug(
-                            "Principal not found for identity via provider %s", provider_id
-                        )
+                # Resolve identity to Principal with contextual roles — served
+                # from the phantom-token L1+L2 tier when active, else from DB.
+                resolved = await self._resolve_identity_maybe_cached(
+                    identity, catalog_id, schema, scale_cfg
+                )
+                if resolved is not None:
+                    return resolved
+                logger.debug(
+                    "Principal not found for identity via provider %s", provider_id
+                )
+            except InvalidAuthTokenError:
+                # A revoked token (or other explicit auth failure) must surface,
+                # not be swallowed as a provider error and degrade to anonymous.
+                raise
             except Exception as e:
                 logger.error(
                     f"Provider {provider_id} failed to validate token: {e}",

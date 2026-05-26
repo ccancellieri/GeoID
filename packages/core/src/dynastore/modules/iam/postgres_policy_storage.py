@@ -195,9 +195,18 @@ class PostgresPolicyStorage(AbstractPolicyStorage):
         ddl = f'CREATE TABLE IF NOT EXISTS {{schema}}."{partition_table}" PARTITION OF {{schema}}.policies FOR VALUES IN (\'{safe_key}\');'
         await DDLQuery(ddl).execute(conn, schema=schema)
 
+    async def _bump_binding_version(self, schema: str) -> None:
+        """Best-effort invalidation of the phantom-token cache (#1343).
+
+        No-op unless the phantom cache is active (Valkey + flag); never raises.
+        """
+        from dynastore.modules.iam.phantom_token import bump_binding_version
+
+        await bump_binding_version(schema)
+
     async def create_policy(self, policy: Policy, conn: Optional[DbResource] = None, schema: str = "iam") -> Policy:
         async with managed_transaction(conn or self.engine) as db:
-            return await INSERT_POLICY.execute(
+            result = await INSERT_POLICY.execute(
                 db,
                 schema=schema.strip('"'),
                 id=policy.id,
@@ -210,6 +219,8 @@ class PostgresPolicyStorage(AbstractPolicyStorage):
                 conditions=json.dumps([c.model_dump() for c in policy.conditions]) if policy.conditions else "[]",
                 partition_key=policy.partition_key or "global"
             )
+        await self._bump_binding_version(schema)
+        return result
 
 
 
@@ -232,7 +243,7 @@ class PostgresPolicyStorage(AbstractPolicyStorage):
             # multi-service boot the same default policy IDs ping-pong
             # between partition_keys, the unfiltered DELETE wiped every
             # partition's copy, and concurrent reads saw Deny-by-Default.
-            return await UPSERT_POLICY.execute(
+            result = await UPSERT_POLICY.execute(
                 db,
                 schema=schema.strip('"'),
                 id=policy.id,
@@ -245,6 +256,8 @@ class PostgresPolicyStorage(AbstractPolicyStorage):
                 conditions=json.dumps([c.model_dump() for c in policy.conditions]) if policy.conditions else "[]",
                 partition_key=policy.partition_key or "global"
             )
+        await self._bump_binding_version(schema)
+        return result
 
     async def delete_policy(self, policy_id: str, conn: Optional[DbResource] = None, schema: str = "iam", partition_key: str = "global") -> bool:
         async with managed_transaction(conn or self.engine) as db:
@@ -252,7 +265,8 @@ class PostgresPolicyStorage(AbstractPolicyStorage):
                 db, schema=schema.strip('"'), policy_id=policy_id
             )
             count = await DELETE_POLICY.execute(db, schema=schema.strip('"'), id=policy_id, partition_key=partition_key)
-            return count > 0
+        await self._bump_binding_version(schema)
+        return count > 0
 
     async def list_policies(self, partition_key: Optional[str] = None, limit: int = 100, offset: int = 0, conn: Optional[DbResource] = None, schema: str = "iam") -> List[Policy]:
         async with managed_transaction(conn or self.engine) as db:

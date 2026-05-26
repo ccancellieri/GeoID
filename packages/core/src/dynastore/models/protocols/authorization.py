@@ -301,10 +301,12 @@ class IamScaleConfig(PluginConfig):
     """Runtime-editable IAM scale knobs (counter / quota tier).
 
     Introduced for the per-binding quota + Valkey-mandatory counter work
-    (#1344). The zero-DB hot-path knobs (token TTL, power-user threshold,
-    compiled-rule cache TTL, denylist) are added by #1343 onto this same
-    class — only fields that are actually consumed are declared here so
-    the Configuration Hub never surfaces a dead knob.
+    (#1344); extended by #1343 with the zero-DB hot-path knobs (the phantom
+    -token resolution tier flag + its cache TTL, and the revocation denylist
+    flag + TTL). Only fields that are actually consumed are declared here so
+    the Configuration Hub never surfaces a dead knob — the remaining design
+    knobs (compiled-rule cache TTL, power-user / HS256 baked-claim split)
+    land with the code that consumes them.
 
     Every field is read per-request via ``get_iam_scale_config`` so a
     runtime PATCH applies on the next request without a redeploy, except
@@ -362,6 +364,59 @@ class IamScaleConfig(PluginConfig):
             "carries no ``quota.max_count`` of its own. Shape mirrors the "
             "``max_count`` condition config, e.g. ``{\"limit\": 100000, "
             "\"scope\": \"principal\"}``. None (default) = no implicit quota."
+        ),
+    )
+    phantom_token_resolution_enabled: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Master switch for the #1343 phantom-token hot path. When true "
+            "AND a distributed CountingCacheBackend (Valkey) is active, "
+            "identity→(roles, principal) resolution is served from a shared, "
+            "version-keyed Valkey tier instead of re-querying Postgres on "
+            "every request: after warm, a validated request costs one token "
+            "verify + two Valkey reads (binding version + resolution) and "
+            "zero DB round-trips. Keyed by ``(provider, subject_id, schema, "
+            "platform_version, catalog_version)`` so a binding mutation that "
+            "bumps the version invalidates every pod's cache without pub/sub. "
+            "Default false keeps the per-request DB resolution path untouched "
+            "(A/B against the live path); the cache is an optimization layer — "
+            "on any cache miss or backend error it falls through to the "
+            "authoritative DB resolver."
+        ),
+    )
+    binding_resolution_ttl_seconds: Mutable[int] = Field(
+        default=300,
+        ge=1,
+        description=(
+            "TTL (seconds) for a phantom-token resolution entry in Valkey. "
+            "Bounds staleness for the rare case where a binding mutation fails "
+            "to bump the version counter; the version key is the primary "
+            "invalidation signal, this TTL is the backstop. Mirrors the 5-min "
+            "access-token TTL (D-B)."
+        ),
+    )
+    denylist_enabled: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Enable the Valkey revocation denylist for immediate token / "
+            "principal kill ahead of natural token expiry. When true, the "
+            "auth path rejects a validated token whose ``jti`` or "
+            "``sub`` is present in the denylist. Independent of the phantom "
+            "-token tier (a deployment may want revocation without the "
+            "resolution cache). Default false. A denylist read error fails "
+            "open (logged): the token still expires on its own TTL and a "
+            "binding-version bump still invalidates cached bindings, so a "
+            "transient Valkey blip must not lock every caller out."
+        ),
+    )
+    denylist_ttl_seconds: Mutable[int] = Field(
+        default=300,
+        ge=1,
+        description=(
+            "TTL (seconds) for a denylist entry. Set >= the access-token TTL "
+            "so a revoked token cannot outlive its denylist entry; a longer "
+            "value is harmless (the token is already expired) but wastes "
+            "Valkey memory."
         ),
     )
 
