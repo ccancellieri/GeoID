@@ -953,7 +953,7 @@ class AdminService(ExtensionProtocol):
         if body.object_kind == "role":
             # Same escalation gate the legacy `/platform/.../roles` POST applies.
             await ensure_privileged_role_assignment(request, body.object_ref)
-        p = await mgr.get_principal(body.subject_id)
+        p = await mgr.get_principal(body.principal_id)
         if not p:
             raise HTTPException(status_code=404, detail="Principal not found.")
         if body.object_kind == "role":
@@ -985,7 +985,7 @@ class AdminService(ExtensionProtocol):
             grant_id = await mgr.storage.grant(
                 scope_schema="iam",
                 subject_kind="principal",
-                subject_ref=str(body.subject_id),
+                subject_ref=str(body.principal_id),
                 object_kind=body.object_kind,
                 object_ref=body.object_ref,
                 effect=body.effect,
@@ -998,7 +998,7 @@ class AdminService(ExtensionProtocol):
             raise HTTPException(status_code=500, detail=str(e))
         return {
             "id": str(grant_id) if grant_id else None,
-            "subject_id": str(body.subject_id),
+            "principal_id": str(body.principal_id),
             "object_kind": body.object_kind,
             "object_ref": body.object_ref,
             "effect": body.effect,
@@ -1032,7 +1032,7 @@ class AdminService(ExtensionProtocol):
     )
     async def revoke_platform_binding(
         request: Request,  # type: ignore[reportGeneralTypeIssues]
-        subject_id: UUID = Query(..., description="Principal whose binding is revoked."),
+        principal_id: UUID = Query(..., description="Principal whose binding is revoked."),
         object_kind: Literal["role", "policy"] = Query(...),
         object_ref: str = Query(...),
         effect: Literal["allow", "deny"] = Query("allow"),
@@ -1044,7 +1044,7 @@ class AdminService(ExtensionProtocol):
             await mgr.storage.revoke_by_match(
                 scope_schema="iam",
                 subject_kind="principal",
-                subject_ref=str(subject_id),
+                subject_ref=str(principal_id),
                 object_kind=object_kind,
                 object_ref=object_ref,
                 effect=effect,
@@ -1072,7 +1072,7 @@ class AdminService(ExtensionProtocol):
                 protected_roles=IamRolesConfig().platform_admin_tier_role_set,
             )
         await _assert_catalog_exists(catalog_id)
-        p = await mgr.get_principal(body.subject_id)
+        p = await mgr.get_principal(body.principal_id)
         if not p:
             raise HTTPException(status_code=404, detail="Principal not found.")
         if body.object_kind == "role":
@@ -1105,7 +1105,7 @@ class AdminService(ExtensionProtocol):
             grant_id = await mgr.storage.grant(
                 scope_schema=await mgr.resolve_schema(catalog_id),
                 subject_kind="principal",
-                subject_ref=str(body.subject_id),
+                subject_ref=str(body.principal_id),
                 object_kind=body.object_kind,
                 object_ref=body.object_ref,
                 effect=body.effect,
@@ -1118,7 +1118,7 @@ class AdminService(ExtensionProtocol):
             raise HTTPException(status_code=500, detail=str(e))
         return {
             "id": str(grant_id) if grant_id else None,
-            "subject_id": str(body.subject_id),
+            "principal_id": str(body.principal_id),
             "object_kind": body.object_kind,
             "object_ref": body.object_ref,
             "effect": body.effect,
@@ -1155,7 +1155,7 @@ class AdminService(ExtensionProtocol):
     async def revoke_catalog_binding(
         request: Request,  # type: ignore[reportGeneralTypeIssues]
         catalog_id: str,
-        subject_id: UUID = Query(..., description="Principal whose binding is revoked."),
+        principal_id: UUID = Query(..., description="Principal whose binding is revoked."),
         object_kind: Literal["role", "policy"] = Query(...),
         object_ref: str = Query(...),
         effect: Literal["allow", "deny"] = Query("allow"),
@@ -1171,7 +1171,7 @@ class AdminService(ExtensionProtocol):
             await mgr.storage.revoke_by_match(
                 scope_schema=await mgr.resolve_schema(catalog_id),
                 subject_kind="principal",
-                subject_ref=str(subject_id),
+                subject_ref=str(principal_id),
                 object_kind=object_kind,
                 object_ref=object_ref,
                 effect=effect,
@@ -1497,7 +1497,7 @@ class AdminService(ExtensionProtocol):
             )
         await _assert_catalog_exists(catalog_id)
         await _assert_collection_exists(catalog_id, collection_id)
-        p = await mgr.get_principal(body.subject_id)
+        p = await mgr.get_principal(body.principal_id)
         if not p:
             raise HTTPException(status_code=404, detail="Principal not found.")
         # The bound object must exist in this catalog scope.
@@ -1531,7 +1531,7 @@ class AdminService(ExtensionProtocol):
             grant_id = await mgr.storage.grant(
                 scope_schema=await mgr.resolve_schema(catalog_id),
                 subject_kind="principal",
-                subject_ref=str(body.subject_id),
+                subject_ref=str(body.principal_id),
                 object_kind=body.object_kind,
                 object_ref=body.object_ref,
                 effect=body.effect,
@@ -1546,7 +1546,7 @@ class AdminService(ExtensionProtocol):
             raise HTTPException(status_code=500, detail=str(e))
         return {
             "id": str(grant_id) if grant_id else None,
-            "subject_id": str(body.subject_id),
+            "principal_id": str(body.principal_id),
             "object_kind": body.object_kind,
             "object_ref": body.object_ref,
             "effect": body.effect,
@@ -1600,7 +1600,7 @@ class AdminService(ExtensionProtocol):
         request: Request,  # type: ignore[reportGeneralTypeIssues]
         catalog_id: str,
         collection_id: str,
-        subject_id: UUID = Query(..., description="Principal whose binding is revoked."),
+        principal_id: UUID = Query(..., description="Principal whose binding is revoked."),
         object_kind: Literal["role", "policy"] = Query(...),
         object_ref: str = Query(...),
         effect: Literal["allow", "deny"] = Query("allow"),
@@ -1617,7 +1617,7 @@ class AdminService(ExtensionProtocol):
             await mgr.storage.revoke_by_match(
                 scope_schema=await mgr.resolve_schema(catalog_id),
                 subject_kind="principal",
-                subject_ref=str(subject_id),
+                subject_ref=str(principal_id),
                 object_kind=object_kind,
                 object_ref=object_ref,
                 effect=effect,

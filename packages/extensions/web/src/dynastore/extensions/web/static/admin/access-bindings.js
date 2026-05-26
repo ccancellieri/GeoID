@@ -270,7 +270,7 @@ function renderBindingsTable(parent, rows, allowDelete) {
       btn.type = "button";
       btn.className = "btn btn-danger btn-xs binding-revoke";
       btn.textContent = "Revoke";
-      btn.dataset.subjectId = r.subject_ref || "";
+      btn.dataset.principalId = r.subject_ref || "";
       btn.dataset.objectKind = r.object_kind || "role";
       btn.dataset.objectRef = r.object_ref || "";
       btn.dataset.effect = effect;
@@ -297,7 +297,7 @@ async function createBinding(ev) {
     return;
   }
   const body = {
-    subject_id: state.principalId,
+    principal_id: state.principalId,
     object_kind: $("#binding-object-kind").value,
     object_ref: $("#binding-object-ref").value.trim(),
     effect: $("#binding-effect").value,
@@ -332,7 +332,7 @@ async function createBinding(ev) {
 async function revokeBinding(row) {
   if (!state.catalogId || !state.collectionId) return;
   const params = new URLSearchParams({
-    subject_id: row.dataset.subjectId,
+    principal_id: row.dataset.principalId,
     object_kind: row.dataset.objectKind,
     object_ref: row.dataset.objectRef,
     effect: row.dataset.effect,

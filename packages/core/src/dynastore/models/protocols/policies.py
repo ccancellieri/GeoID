@@ -93,12 +93,23 @@ class CreateBindingRequest(BaseModel):
     The resource scope (``resource_kind`` / ``resource_ref``) is taken from
     the route path, not the body, so a request can only ever bind within the
     URL it targets. The body declares *what* is bound (a ``role`` or a
-    ``policy``) to *whom* (``subject_id``), with the binding's effect,
+    ``policy``) to *whom* (``principal_id``), with the binding's effect,
     validity window, and optional per-binding ``quota`` (rate-limit /
     lifetime-quota spec consumed by the IAM counter conditions).
+
+    ``principal_id`` is the internal ``principal.id`` UUID, NOT the OIDC
+    ``subject_id`` carried on the identity link — the two are different
+    fields on :class:`PrincipalResponse` and conflating them returned a
+    confusing "Principal not found" 404 (geoid#1399). Resolve the principal
+    via ``GET /admin/principals?subject_id=...`` first, then bind by id.
     """
 
-    subject_id: UUID = Field(description="Principal that receives the binding.")
+    principal_id: UUID = Field(
+        description=(
+            "Internal principal UUID that receives the binding (NOT the OIDC "
+            "``subject_id``)."
+        ),
+    )
     object_kind: Literal["role", "policy"] = Field(
         description="Whether the binding grants a role or a direct policy."
     )

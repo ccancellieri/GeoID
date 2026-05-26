@@ -98,7 +98,7 @@ def test_binding_writes_hit_new_grants_endpoints_not_legacy_roles(governance_js:
 def test_binding_form_submits_full_create_binding_request(governance_js: str) -> None:
     """The submit handler must build a CreateBindingRequest body with the
     new fields, not a legacy {role: ...} payload."""
-    assert "subject_id" in governance_js
+    assert "principal_id" in governance_js
     assert "object_kind" in governance_js
     assert "object_ref" in governance_js
     assert "effect" in governance_js

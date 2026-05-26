@@ -118,7 +118,7 @@ async def test_platform_create_role_binding_with_deny_validity_quota():
     pid = uuid4()
     valid_until = datetime.now(timezone.utc) + timedelta(days=7)
     body = CreateBindingRequest(
-        subject_id=pid, object_kind="role", object_ref="editor",
+        principal_id=pid, object_kind="role", object_ref="editor",
         effect="deny",
         valid_until=valid_until,
         quota={"rate_limit": {"limit": 50, "window_seconds": 60}},
@@ -143,7 +143,7 @@ async def test_platform_create_policy_binding_validates_against_platform_scope()
     req = _req(roles=["sysadmin"])
     mgr = _mgr()
     body = CreateBindingRequest(
-        subject_id=uuid4(), object_kind="policy", object_ref="exp42",
+        principal_id=uuid4(), object_kind="policy", object_ref="exp42",
     )
     with _patch_protocols(mgr, policy_exists=True) as _:
         await _create_pf(req, body=body)
@@ -156,7 +156,7 @@ async def test_platform_create_policy_binding_missing_policy_422():
     req = _req(roles=["sysadmin"])
     mgr = _mgr()
     body = CreateBindingRequest(
-        subject_id=uuid4(), object_kind="policy", object_ref="ghost",
+        principal_id=uuid4(), object_kind="policy", object_ref="ghost",
     )
     with _patch_protocols(mgr, policy_exists=False):
         with pytest.raises(HTTPException) as exc:
@@ -170,7 +170,7 @@ async def test_platform_create_role_binding_unregistered_role_422():
     req = _req(roles=["sysadmin"])
     mgr = _mgr()
     body = CreateBindingRequest(
-        subject_id=uuid4(), object_kind="role", object_ref="nope",
+        principal_id=uuid4(), object_kind="role", object_ref="nope",
     )
     with _patch_protocols(mgr):
         with pytest.raises(HTTPException) as exc:
@@ -187,7 +187,7 @@ async def test_platform_create_role_binding_sysadmin_target_blocked_for_non_sysa
     mgr = _mgr()
     mgr.list_roles = AsyncMock(return_value=[SimpleNamespace(name="sysadmin")])
     body = CreateBindingRequest(
-        subject_id=uuid4(), object_kind="role", object_ref="sysadmin",
+        principal_id=uuid4(), object_kind="role", object_ref="sysadmin",
     )
     with _patch_protocols(mgr):
         with pytest.raises(HTTPException) as exc:
@@ -220,7 +220,7 @@ async def test_platform_revoke_by_match_scopes_to_iam():
     with _patch_protocols(mgr):
         await _revoke_pf(
             req,
-            subject_id=pid, object_kind="role", object_ref="editor", effect="allow",
+            principal_id=pid, object_kind="role", object_ref="editor", effect="allow",
         )
     kwargs = mgr.storage.revoke_by_match.await_args.kwargs
     assert kwargs["scope_schema"] == "iam"
@@ -237,7 +237,7 @@ async def test_platform_revoke_privileged_role_blocked_for_non_sysadmin():
         with pytest.raises(HTTPException) as exc:
             await _revoke_pf(
                 req,
-                subject_id=uuid4(), object_kind="role", object_ref="sysadmin",
+                principal_id=uuid4(), object_kind="role", object_ref="sysadmin",
                 effect="allow",
             )
     assert exc.value.status_code == 403
@@ -253,7 +253,7 @@ async def test_catalog_create_role_binding_writes_catalog_wide_grant():
     mgr = _mgr()
     pid = uuid4()
     body = CreateBindingRequest(
-        subject_id=pid, object_kind="role", object_ref="editor",
+        principal_id=pid, object_kind="role", object_ref="editor",
         effect="deny",
     )
     with _patch_protocols(mgr):
@@ -272,7 +272,7 @@ async def test_catalog_create_policy_binding_validates_catalog_scoped():
     req = _req(roles=["sysadmin"])
     mgr = _mgr()
     body = CreateBindingRequest(
-        subject_id=uuid4(), object_kind="policy", object_ref="exp42",
+        principal_id=uuid4(), object_kind="policy", object_ref="exp42",
     )
     with _patch_protocols(mgr, policy_exists=True):
         await _create_cat(req, catalog_id=_CATALOG, body=body)
@@ -286,7 +286,7 @@ async def test_catalog_admin_can_bind_catalog_tier_role():
     the guard only narrows on platform-tier role names (the #723 case)."""
     req = _req(roles=["catalog_admin"])
     mgr = _mgr()
-    body = CreateBindingRequest(subject_id=uuid4(), object_kind="role", object_ref="admin")
+    body = CreateBindingRequest(principal_id=uuid4(), object_kind="role", object_ref="admin")
     with _patch_protocols(mgr):
         await _create_cat(req, catalog_id=_CATALOG, body=body)
     mgr.storage.grant.assert_awaited_once()
@@ -297,7 +297,7 @@ async def test_catalog_admin_cannot_bind_platform_tier_role():
     req = _req(roles=["catalog_admin"])
     mgr = _mgr()
     mgr.list_roles = AsyncMock(return_value=[SimpleNamespace(name="sysadmin")])
-    body = CreateBindingRequest(subject_id=uuid4(), object_kind="role", object_ref="sysadmin")
+    body = CreateBindingRequest(principal_id=uuid4(), object_kind="role", object_ref="sysadmin")
     with _patch_protocols(mgr):
         with pytest.raises(HTTPException) as exc:
             await _create_cat(req, catalog_id=_CATALOG, body=body)
@@ -328,7 +328,7 @@ async def test_catalog_revoke_by_match_scopes_to_catalog_schema():
     with _patch_protocols(mgr):
         await _revoke_cat(
             req, catalog_id=_CATALOG,
-            subject_id=pid, object_kind="role", object_ref="editor", effect="allow",
+            principal_id=pid, object_kind="role", object_ref="editor", effect="allow",
         )
     kwargs = mgr.storage.revoke_by_match.await_args.kwargs
     assert kwargs["scope_schema"] == _SCHEMA
@@ -343,7 +343,7 @@ async def test_catalog_revoke_platform_tier_role_blocked():
         with pytest.raises(HTTPException) as exc:
             await _revoke_cat(
                 req, catalog_id=_CATALOG,
-                subject_id=uuid4(), object_kind="role", object_ref="sysadmin",
+                principal_id=uuid4(), object_kind="role", object_ref="sysadmin",
                 effect="allow",
             )
     assert exc.value.status_code == 403

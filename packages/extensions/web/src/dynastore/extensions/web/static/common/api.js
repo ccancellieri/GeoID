@@ -277,18 +277,19 @@ function grantsBasePath(scope) {
 export const listGrants = (scope, principalId) =>
   getJSON(`${grantsBasePath(scope)}${qs({ principal_id: principalId })}`);
 
-// Create a binding. `body` is a CreateBindingRequest payload — subject_id,
-// object_kind ("role"|"policy"), object_ref, effect ("allow"|"deny"),
-// optional valid_from / valid_until (ISO-8601), optional quota (JSON object).
+// Create a binding. `body` is a CreateBindingRequest payload — principal_id
+// (internal UUID, NOT the OIDC subject_id), object_kind ("role"|"policy"),
+// object_ref, effect ("allow"|"deny"), optional valid_from / valid_until
+// (ISO-8601), optional quota (JSON object).
 export const createGrant = (scope, body) =>
   postJSON(grantsBasePath(scope), body);
 
 // Revoke a binding by match — see admin_service.py revoke_*_binding query
-// params: subject_id, object_kind, object_ref, effect.
-export const deleteGrant = (scope, { subjectId, objectKind, objectRef, effect = "allow" }) =>
+// params: principal_id, object_kind, object_ref, effect.
+export const deleteGrant = (scope, { principalId, objectKind, objectRef, effect = "allow" }) =>
   deleteJSON(
     `${grantsBasePath(scope)}${qs({
-      subject_id: subjectId,
+      principal_id: principalId,
       object_kind: objectKind,
       object_ref: objectRef,
       effect,

@@ -706,7 +706,7 @@ async function onSubmitBinding(e) {
     return;
   }
   const body = {
-    subject_id: state.bindingSubject.id,
+    principal_id: state.bindingSubject.id,
     object_kind: $("#binding-object-kind").value,
     object_ref: objectRef,
     effect: $("#binding-effect").value,
@@ -739,7 +739,7 @@ async function revokeBinding(row) {
   if (!confirm(`Revoke ${label} (${row.effect || "allow"}) from ${state.bindingSubject.label}?`)) return;
   try {
     await deleteGrant(currentGrantScope(), {
-      subjectId: state.bindingSubject.id,
+      principalId: state.bindingSubject.id,
       objectKind: row.object_kind || "role",
       objectRef: row.object_ref,
       effect: row.effect || "allow",
