@@ -102,11 +102,10 @@ async function refreshRoles() {
     pols.textContent = (r.policies || []).join(", ");
 
     const actions = document.createElement("td");
-    actions.style.textAlign = "right";
+    actions.className = "table-actions";
     const edit = document.createElement("button");
     edit.className = "btn btn-secondary btn-xs";
     edit.textContent = "Edit";
-    edit.style.marginRight = "4px";
     edit.disabled = !canWrite;
     edit.addEventListener("click", () => enterEditRoleMode(r));
     actions.appendChild(edit);
@@ -297,7 +296,7 @@ function renderPolicies() {
     prioInput.step = "1";
     prioInput.value = String(p.priority ?? 0);
     prioInput.disabled = !canWrite;
-    prioInput.style.width = "84px";
+    prioInput.className = "input-num";
     prioInput.title = "Higher wins; ties → DENY. Range [-1000, 1000].";
     prioInput.addEventListener("change", async () => {
       const next = Number(prioInput.value);
@@ -322,16 +321,12 @@ function renderPolicies() {
     acts.className = "muted";
     acts.textContent = (p.actions || []).join(", ");
     const res = document.createElement("td");
-    res.className = "muted";
-    res.style.maxWidth = "420px";
-    res.style.overflow = "hidden";
-    res.style.textOverflow = "ellipsis";
-    res.style.whiteSpace = "nowrap";
+    res.className = "muted cell-truncate";
     res.textContent = (p.resources || []).join(", ");
     res.title = (p.resources || []).join("\n");
 
     const actions = document.createElement("td");
-    actions.style.textAlign = "right";
+    actions.className = "table-actions";
     const del = document.createElement("button");
     del.className = "btn btn-danger btn-xs";
     del.textContent = "Delete";
@@ -452,7 +447,7 @@ function renderPrincipals() {
     }
 
     const actions = document.createElement("td");
-    actions.style.textAlign = "right";
+    actions.className = "table-actions";
     const pick = document.createElement("button");
     pick.className = "btn btn-secondary btn-xs";
     pick.textContent = pickedId === p.id ? "Editing" : "Manage bindings";
@@ -614,10 +609,10 @@ function renderBindings() {
     const tr = document.createElement("tr");
     const effect = row.effect || "allow";
     if (effect === "deny") {
-      // Deny rows: distinct, terracotta-tinted, faint left border so they
-      // pop visually against allow rows in a long list.
-      tr.style.background = "rgba(196, 78, 50, 0.06)";
-      tr.style.borderLeft = "3px solid var(--terracotta-deep, #c44e32)";
+      // Deny rows: terracotta-tinted with a faint left border so they pop
+      // visually against allow rows in a long list. Styling is centralised
+      // in admin.css under .row-deny — we just toggle the class here.
+      tr.className = "row-deny";
     }
 
     const kind = document.createElement("td");
@@ -649,7 +644,7 @@ function renderBindings() {
       // Render via <pre>textContent so any operator-supplied JSON cannot
       // smuggle markup into the table.
       const pre = document.createElement("pre");
-      pre.style.cssText = "margin:0;font-size:11px;white-space:pre-wrap;max-width:280px;";
+      pre.className = "cell-json";
       pre.textContent = typeof row.quota === "object"
         ? JSON.stringify(row.quota)
         : String(row.quota);
@@ -657,7 +652,7 @@ function renderBindings() {
     }
 
     const actions = document.createElement("td");
-    actions.style.textAlign = "right";
+    actions.className = "table-actions";
     const del = document.createElement("button");
     del.className = "btn btn-danger btn-xs";
     del.textContent = "Revoke";

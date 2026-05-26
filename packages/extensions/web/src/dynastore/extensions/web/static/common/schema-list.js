@@ -49,15 +49,8 @@ export function mountSchemaList(container, { schemas, onSelect, selected }) {
 
   const search = document.createElement("input");
   search.type = "search";
-  search.placeholder = "Search plugins...";
+  search.placeholder = "Search plugins…";
   search.className = "schema-list-search";
-  search.style.width = "100%";
-  search.style.marginBottom = "12px";
-  search.style.padding = "6px 10px";
-  search.style.background = "var(--surface2, #21262d)";
-  search.style.color = "inherit";
-  search.style.border = "1px solid var(--border, #30363d)";
-  search.style.borderRadius = "6px";
   container.appendChild(search);
 
   const list = document.createElement("div");
@@ -95,12 +88,6 @@ export function mountSchemaList(container, { schemas, onSelect, selected }) {
       const header = document.createElement("div");
       header.className = "schema-list-group-header";
       header.textContent = CATEGORY_LABELS[cat] || cat;
-      header.style.fontSize = "0.7rem";
-      header.style.fontWeight = "600";
-      header.style.textTransform = "uppercase";
-      header.style.letterSpacing = "0.05em";
-      header.style.color = "var(--text-dim, #8b949e)";
-      header.style.padding = "10px 4px 4px";
       group.appendChild(header);
 
       for (const { classKey, entry } of entries) {
@@ -108,49 +95,23 @@ export function mountSchemaList(container, { schemas, onSelect, selected }) {
         item.type = "button";
         item.className = "schema-list-item";
         item.dataset.classKey = classKey;
-        item.style.display = "block";
-        item.style.width = "100%";
-        item.style.textAlign = "left";
-        item.style.padding = "6px 10px";
-        item.style.background = "transparent";
-        item.style.color = "inherit";
-        item.style.border = "1px solid transparent";
-        item.style.borderRadius = "6px";
-        item.style.marginBottom = "2px";
-        item.style.cursor = "pointer";
-        item.style.fontSize = "0.82rem";
+        if (state.selected === classKey) item.classList.add("selected");
 
         const title = document.createElement("div");
+        title.className = "item-title";
         title.textContent = labelOf(entry, classKey);
-        title.style.fontWeight = "500";
 
         const desc = document.createElement("div");
+        desc.className = "item-desc";
         desc.textContent = descOf(entry).slice(0, 100);
-        desc.style.fontSize = "0.7rem";
-        desc.style.color = "var(--text-dim, #8b949e)";
-        desc.style.marginTop = "2px";
-        desc.style.whiteSpace = "nowrap";
-        desc.style.overflow = "hidden";
-        desc.style.textOverflow = "ellipsis";
 
         item.appendChild(title);
         if (desc.textContent) item.appendChild(desc);
-
-        if (state.selected === classKey) {
-          item.style.background = "var(--surface2, #21262d)";
-          item.style.borderColor = "var(--primary, #58a6ff)";
-        }
 
         item.addEventListener("click", () => {
           state.selected = classKey;
           render();
           if (typeof onSelect === "function") onSelect(classKey);
-        });
-        item.addEventListener("mouseover", () => {
-          if (state.selected !== classKey) item.style.background = "var(--surface2, #21262d)";
-        });
-        item.addEventListener("mouseout", () => {
-          if (state.selected !== classKey) item.style.background = "transparent";
         });
 
         group.appendChild(item);
@@ -159,10 +120,8 @@ export function mountSchemaList(container, { schemas, onSelect, selected }) {
     }
     if (!list.firstChild) {
       const empty = document.createElement("div");
+      empty.className = "schema-list-empty";
       empty.textContent = "No matching plugins.";
-      empty.style.color = "var(--text-dim, #8b949e)";
-      empty.style.fontSize = "0.8rem";
-      empty.style.padding = "16px 4px";
       list.appendChild(empty);
     }
   }

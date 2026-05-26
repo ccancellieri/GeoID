@@ -58,7 +58,7 @@
               <input id="role-policies" type="text" placeholder="policy.read, policy.write">
             </div>
           </div>
-          <div class="row">
+          <div class="form-actions">
             <button class="btn" type="submit" id="role-submit-btn">Charter</button>
             <button class="btn btn-secondary" type="button" id="role-cancel-btn" style="display:none">Cancel</button>
             <span id="role-status" class="status"></span>
@@ -123,7 +123,7 @@
               <input id="policy-resources" type="text" placeholder="/catalogs/.*">
             </div>
           </div>
-          <div class="row">
+          <div class="form-actions">
             <button class="btn" type="submit">Charter</button>
             <span id="policy-status" class="status"></span>
           </div>
@@ -134,7 +134,7 @@
         <div class="plate-header">
           <h3>Existing policies</h3>
           <div class="plate-meta">
-            <input id="policies-query" type="search" placeholder="Filter by ID, description, action, or resource…" style="max-width:280px">
+            <input id="policies-query" type="search" class="input-medium" placeholder="Filter by ID, description, action, or resource…">
             <button class="btn btn-secondary btn-xs" id="policies-refresh" type="button">Refresh</button>
           </div>
         </div>
@@ -155,7 +155,7 @@
           <div class="plate-meta">GET /admin/principals?q=&amp;role=&amp;catalog_id=</div>
         </div>
         <div class="row">
-          <input id="principals-query" type="search" placeholder="Identifier, subject, or email…" style="max-width:320px">
+          <input id="principals-query" type="search" class="input-large" placeholder="Identifier, subject, or email…">
           <button class="btn btn-secondary btn-xs" id="principals-refresh" type="button">Search</button>
           <span id="principals-status" class="status"></span>
         </div>
@@ -176,7 +176,7 @@
           <h3 id="binding-form-title">Grant a binding</h3>
           <div class="plate-meta" id="binding-form-route">POST /admin/platform/grants</div>
         </div>
-        <p class="muted" id="binding-form-subject" style="margin-top:0"></p>
+        <p class="muted" id="binding-form-subject"></p>
         <form id="binding-create">
           <div class="form-row">
             <div>
@@ -223,7 +223,7 @@
               <input id="binding-quota-json" type="text" placeholder='{"rate_limit":{"limit":100,"window_seconds":60}}'>
             </div>
           </div>
-          <div class="row">
+          <div class="form-actions">
             <button class="btn" type="submit" id="binding-submit-btn">Grant</button>
             <button class="btn btn-secondary" type="button" id="binding-cancel-btn">Close</button>
             <span id="binding-status" class="status"></span>
@@ -231,7 +231,7 @@
         </form>
 
         <hr class="rule">
-        <h4 style="margin:0 0 8px 0">Existing bindings</h4>
+        <h4 class="ci-subhead">Existing bindings</h4>
         <table id="bindings-table">
           <thead>
             <tr>
@@ -257,47 +257,47 @@
           <div class="plate-meta">GET /admin/catalogs/{catalog_id}</div>
         </div>
         <div class="row">
-          <input id="prov-catalog-id" type="text" placeholder="Catalog ID" style="max-width:320px">
+          <input id="prov-catalog-id" type="text" class="input-large" placeholder="Catalog ID">
           <button class="btn btn-secondary btn-xs" id="prov-check-btn" type="button">Check</button>
           <span id="prov-status" class="status"></span>
         </div>
         <hr class="rule">
         <div id="prov-result" style="display:none">
-          <table style="width:100%;border-collapse:collapse">
+          <table class="kv-table">
             <tbody>
               <tr>
-                <td style="padding:6px 0;font-weight:600;width:160px">Status</td>
-                <td><span id="prov-badge" class="chip"></span></td>
+                <td class="kv-label">Status</td>
+                <td class="kv-value"><span id="prov-badge" class="chip"></span></td>
               </tr>
               <tr>
-                <td style="padding:6px 0;font-weight:600">Physical schema</td>
-                <td><code id="prov-schema" class="muted"></code></td>
+                <td class="kv-label">Physical schema</td>
+                <td class="kv-value"><code id="prov-schema" class="muted"></code></td>
               </tr>
             </tbody>
           </table>
-          <div id="prov-task-block" style="display:none;margin-top:12px">
-            <h4 style="margin-bottom:6px">Most recent provision task</h4>
-            <table style="width:100%;border-collapse:collapse">
+          <div id="prov-task-block" style="display:none">
+            <h4 class="ci-subhead">Most recent provision task</h4>
+            <table class="kv-table">
               <tbody>
                 <tr>
-                  <td style="padding:4px 0;font-weight:600;width:160px">Task ID</td>
-                  <td><code id="prov-task-id" class="muted"></code></td>
+                  <td class="kv-label">Task ID</td>
+                  <td class="kv-value"><code id="prov-task-id" class="muted"></code></td>
                 </tr>
                 <tr>
-                  <td style="padding:4px 0;font-weight:600">Task status</td>
-                  <td><span id="prov-task-badge" class="chip"></span></td>
+                  <td class="kv-label">Task status</td>
+                  <td class="kv-value"><span id="prov-task-badge" class="chip"></span></td>
                 </tr>
                 <tr>
-                  <td style="padding:4px 0;font-weight:600">Retries</td>
-                  <td id="prov-task-retries" class="muted"></td>
+                  <td class="kv-label">Retries</td>
+                  <td class="kv-value muted" id="prov-task-retries"></td>
                 </tr>
                 <tr>
-                  <td style="padding:4px 0;font-weight:600">Last updated</td>
-                  <td id="prov-task-updated" class="muted"></td>
+                  <td class="kv-label">Last updated</td>
+                  <td class="kv-value muted" id="prov-task-updated"></td>
                 </tr>
-                <tr id="prov-task-error-row" style="display:none">
-                  <td style="padding:4px 0;font-weight:600;vertical-align:top">Error</td>
-                  <td><code id="prov-task-error" style="color:var(--clr-danger,#b91c1c);word-break:break-all"></code></td>
+                <tr id="prov-task-error-row" class="kv-error" style="display:none">
+                  <td class="kv-label">Error</td>
+                  <td class="kv-value"><code id="prov-task-error"></code></td>
                 </tr>
               </tbody>
             </table>

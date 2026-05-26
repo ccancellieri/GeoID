@@ -137,6 +137,7 @@ import { apiUrl } from "../common/url.js";
   function selectThreeWay(key, current) {
     const s = document.createElement("select");
     s.dataset.key = key;
+    s.className = "threeway-select";
 
     const opts = [
       ["inherit", "inherit"],
@@ -166,7 +167,28 @@ import { apiUrl } from "../common/url.js";
     const body = $("#exposure-grid tbody");
     while (body.firstChild) body.removeChild(body.firstChild);
 
-    for (const [key, val] of Object.entries(state.resolved)) {
+    const meta = $("#exposure-meta");
+    if (meta) {
+      meta.textContent = state.scope === "platform"
+        ? "PLATFORM"
+        : `CATALOG · ${state.catalog || "—"}`;
+    }
+
+    const rows = Object.entries(state.resolved);
+    if (!rows.length) {
+      const tr = document.createElement("tr");
+      tr.className = "empty-row";
+      const td = document.createElement("td");
+      td.colSpan = 4;
+      td.textContent = state.scope === "catalog" && !state.catalog
+        ? "Select a catalog to view extension exposure."
+        : "No extensions registered at this scope.";
+      tr.appendChild(td);
+      body.appendChild(tr);
+      return;
+    }
+
+    for (const [key, val] of rows) {
       if (!val || typeof val.enabled !== "boolean") continue;
 
       const platformEnabled = val.enabled;
@@ -199,8 +221,13 @@ import { apiUrl } from "../common/url.js";
         row.appendChild(td("-"));
       }
 
-      // Effective column
-      row.appendChild(td(effective ? "on" : "off"));
+      // Effective column — chip-styled to match the rest of the admin UI.
+      const eff = document.createElement("td");
+      const chip = document.createElement("span");
+      chip.className = effective ? "chip effect-ALLOW" : "chip effect-DENY";
+      chip.textContent = effective ? "on" : "off";
+      eff.appendChild(chip);
+      row.appendChild(eff);
 
       body.appendChild(row);
     }
@@ -221,11 +248,12 @@ import { apiUrl } from "../common/url.js";
     render();
   }
 
-  // Set status message
-  function setStatus(msg, cls = null) {
+  // Set status message — uses the shared .status / .status.ok / .status.err
+  // / .status.warn classes from admin.css.
+  function setStatus(msg, cls = "") {
     const s = $("#status");
-    s.textContent = msg;
-    s.className = cls || "";
+    s.textContent = msg || "";
+    s.className = "status" + (cls ? ` ${cls}` : "");
   }
 
   // Apply changes
@@ -239,10 +267,10 @@ import { apiUrl } from "../common/url.js";
       ? "/configs"
       : `/configs/catalogs/${encodeURIComponent(state.catalog)}`;
 
-    setStatus("Applying...", "");
+    setStatus("Applying…", "");
     try {
       await patchJSON(url, state.dirty);
-      setStatus("Applied successfully.", "ok");
+      setStatus("Applied.", "ok");
       await loadMatrix();
     } catch (err) {
       setStatus(`Error: ${err.message}`, "err");

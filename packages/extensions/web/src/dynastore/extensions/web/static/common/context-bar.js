@@ -64,17 +64,10 @@ export function mountContextBar(container, { onChange } = {}) {
 
   const fieldset = document.createElement("fieldset");
   fieldset.className = "scope-kind";
-  fieldset.style.display = "flex";
-  fieldset.style.gap = "16px";
-  fieldset.style.alignItems = "center";
 
   const mkRadio = (value, label) => {
     const wrap = document.createElement("label");
     wrap.className = "scope-radio";
-    wrap.style.display = "inline-flex";
-    wrap.style.gap = "6px";
-    wrap.style.alignItems = "center";
-    wrap.style.cursor = "pointer";
     const input = document.createElement("input");
     input.type = "radio";
     input.name = "scope-kind";

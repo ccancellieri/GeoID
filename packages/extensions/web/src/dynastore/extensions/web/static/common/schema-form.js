@@ -102,7 +102,6 @@ function renderPrimitive(root, node, value, { readonly } = {}) {
     input = document.createElement("textarea");
     input.rows = 6;
     input.dataset.widget = "json";
-    input.style.fontFamily = "ui-monospace, monospace";
     try {
       input.value = value == null ? "" : JSON.stringify(value, null, 2);
     } catch {
@@ -119,13 +118,8 @@ function renderPrimitive(root, node, value, { readonly } = {}) {
     else input.readOnly = true;
     input.dataset.readonly = "true";
   }
-  input.style.width = "100%";
-  input.style.padding = "6px 10px";
-  input.style.background = "var(--surface2, #21262d)";
-  input.style.color = "inherit";
-  input.style.border = "1px solid var(--border, #30363d)";
-  input.style.borderRadius = "6px";
-  input.style.fontSize = "0.85rem";
+  // Styling comes from .schema-form .field-wrap rules in admin.css — no
+  // inline overrides, so the form inherits the page typography.
 
   wrap.appendChild(input);
 
@@ -177,9 +171,6 @@ function renderArray(root, node, value, { readonly, onChange } = {}) {
 
   const wrap = document.createElement("div");
   wrap.className = "array-wrap";
-  wrap.style.border = "1px solid var(--border, #30363d)";
-  wrap.style.borderRadius = "6px";
-  wrap.style.padding = "8px";
 
   const rows = document.createElement("div");
   wrap.appendChild(rows);
@@ -187,8 +178,7 @@ function renderArray(root, node, value, { readonly, onChange } = {}) {
   const addBtn = document.createElement("button");
   addBtn.type = "button";
   addBtn.textContent = "+ Add";
-  addBtn.className = "btn btn-secondary";
-  addBtn.style.marginTop = "8px";
+  addBtn.className = "btn btn-secondary btn-xs";
   if (effReadonly) addBtn.disabled = true;
   wrap.appendChild(addBtn);
 
@@ -199,13 +189,10 @@ function renderArray(root, node, value, { readonly, onChange } = {}) {
     renderers.length = 0;
     items.forEach((itemVal, idx) => {
       const row = document.createElement("div");
-      row.style.display = "flex";
-      row.style.gap = "8px";
-      row.style.alignItems = "flex-start";
-      row.style.marginBottom = "6px";
+      row.className = "array-row";
 
       const content = document.createElement("div");
-      content.style.flex = "1";
+      content.className = "array-row-body";
 
       const renderer = renderAny(root, itemSchema, itemVal, { readonly: effReadonly });
       content.appendChild(renderer.el);
@@ -215,7 +202,7 @@ function renderArray(root, node, value, { readonly, onChange } = {}) {
       rm.type = "button";
       rm.textContent = "×";
       rm.className = "btn btn-secondary";
-      rm.style.padding = "2px 8px";
+      rm.title = "Remove this row";
       rm.disabled = effReadonly;
       rm.addEventListener("click", () => {
         items.splice(idx, 1);
@@ -274,14 +261,10 @@ function renderObject(root, node, value, { readonly } = {}) {
 
   const wrap = document.createElement("div");
   wrap.className = "object-wrap";
-  wrap.style.display = "grid";
-  wrap.style.gap = "12px";
 
   const sections = new Map(); // section name → container
   const defaultSection = document.createElement("div");
   defaultSection.className = "form-section-default";
-  defaultSection.style.display = "grid";
-  defaultSection.style.gap = "10px";
   wrap.appendChild(defaultSection);
   sections.set("__default__", defaultSection);
 
@@ -302,17 +285,8 @@ function renderObject(root, node, value, { readonly } = {}) {
     if (!sectionContainer) {
       const block = document.createElement("fieldset");
       block.className = "form-section";
-      block.style.border = "1px solid var(--border, #30363d)";
-      block.style.borderRadius = "6px";
-      block.style.padding = "10px 12px";
-      block.style.display = "grid";
-      block.style.gap = "10px";
       const legend = document.createElement("legend");
       legend.textContent = sectionName;
-      legend.style.padding = "0 6px";
-      legend.style.fontSize = "0.75rem";
-      legend.style.color = "var(--text-dim, #8b949e)";
-      legend.style.textTransform = "uppercase";
       block.appendChild(legend);
       wrap.appendChild(block);
       sections.set(sectionName, block);
@@ -324,26 +298,18 @@ function renderObject(root, node, value, { readonly } = {}) {
 
     const label = document.createElement("label");
     label.textContent = fieldName + (required.has(fieldName) ? " *" : "");
-    label.style.display = "block";
-    label.style.fontSize = "0.8rem";
-    label.style.fontWeight = "500";
-    label.style.marginBottom = "4px";
     fieldWrap.appendChild(label);
 
     if (sub.description) {
       const desc = document.createElement("div");
+      desc.className = "field-desc";
       desc.textContent = sub.description;
-      desc.style.fontSize = "0.72rem";
-      desc.style.color = "var(--text-dim, #8b949e)";
-      desc.style.marginBottom = "4px";
       fieldWrap.appendChild(desc);
     }
     if (hints.hint) {
       const h = document.createElement("div");
+      h.className = "field-hint";
       h.textContent = hints.hint;
-      h.style.fontSize = "0.72rem";
-      h.style.color = "var(--text-dim, #8b949e)";
-      h.style.marginBottom = "4px";
       fieldWrap.appendChild(h);
     }
 
@@ -385,24 +351,12 @@ function renderAny(root, schema, value, opts) {
 function buildInheritPill(fieldWrap, { isExplicit, inheritedValue, onSetExplicit, onInherit }) {
   const pill = document.createElement("div");
   pill.className = "inherit-pill";
-  pill.style.display = "inline-flex";
-  pill.style.gap = "2px";
-  pill.style.marginLeft = "8px";
-  pill.style.fontSize = "0.65rem";
-  pill.style.border = "1px solid var(--border, #30363d)";
-  pill.style.borderRadius = "4px";
-  pill.style.overflow = "hidden";
 
   const mkPart = (label, active, handler) => {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.textContent = label;
-    btn.style.padding = "1px 6px";
-    btn.style.background = active ? "var(--primary-dark, #1f6feb)" : "transparent";
-    btn.style.color = active ? "#fff" : "var(--text-dim, #8b949e)";
-    btn.style.border = "none";
-    btn.style.cursor = "pointer";
-    btn.style.fontSize = "0.65rem";
+    if (active) btn.className = "active";
     btn.addEventListener("click", handler);
     return btn;
   };
@@ -425,10 +379,8 @@ export function mountSchemaForm(container, {
 
   if (!schema) {
     const msg = document.createElement("p");
+    msg.className = "empty-hint";
     msg.textContent = "Select a plugin from the list to edit its configuration.";
-    msg.style.color = "var(--text-dim, #8b949e)";
-    msg.style.fontSize = "0.85rem";
-    msg.style.padding = "24px";
     container.appendChild(msg);
     return { getPatch: () => ({}), reset: () => {} };
   }

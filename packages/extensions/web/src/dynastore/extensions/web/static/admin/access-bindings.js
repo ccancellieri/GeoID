@@ -207,7 +207,6 @@ function renderBindingsTable(parent, rows, allowDelete) {
     return;
   }
   const table = document.createElement("table");
-  table.className = "ds-table";
   const thead = document.createElement("thead");
   const trh = document.createElement("tr");
   for (const h of [
@@ -231,6 +230,8 @@ function renderBindingsTable(parent, rows, allowDelete) {
   for (const r of rows) {
     const effect = r.effect || "allow";
     const tr = document.createElement("tr");
+    if (effect === "deny") tr.className = "row-deny";
+
     const subj = document.createElement("td");
     const subjCode = document.createElement("code");
     subjCode.textContent = r.subject_ref || "—";
@@ -245,10 +246,10 @@ function renderBindingsTable(parent, rows, allowDelete) {
     tr.appendChild(obj);
 
     const eff = document.createElement("td");
-    const effSpan = document.createElement("span");
-    effSpan.className = `effect-${effect}`;
-    effSpan.textContent = effect;
-    eff.appendChild(effSpan);
+    const effChip = document.createElement("span");
+    effChip.className = `chip effect-${effect === "deny" ? "DENY" : "ALLOW"}`;
+    effChip.textContent = effect;
+    eff.appendChild(effChip);
     tr.appendChild(eff);
 
     const vf = document.createElement("td");
@@ -264,9 +265,10 @@ function renderBindingsTable(parent, rows, allowDelete) {
 
     if (allowDelete) {
       const act = document.createElement("td");
+      act.className = "table-actions";
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "binding-revoke";
+      btn.className = "btn btn-danger btn-xs binding-revoke";
       btn.textContent = "Revoke";
       btn.dataset.subjectId = r.subject_ref || "";
       btn.dataset.objectKind = r.object_kind || "role";

@@ -46,7 +46,7 @@ function renderFileList() {
         ? `${f.features} feature${f.features === 1 ? "" : "s"}`
         : (f.error ? `error: ${f.error}` : "parsing…");
     li.textContent = `— ${f.name} (${(f.size / 1024).toFixed(1)} KB) · ${count}`;
-    if (f.error) li.style.color = "var(--terracotta-deep)";
+    if (f.error) li.className = "file-err";
     ul.appendChild(li);
   }
 }

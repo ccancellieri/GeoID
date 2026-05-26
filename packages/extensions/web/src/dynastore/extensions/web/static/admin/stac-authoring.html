@@ -37,7 +37,7 @@
           <h3>Charter a catalog</h3>
           <div class="plate-meta">POST /catalogs</div>
         </div>
-        <p class="muted" style="margin-bottom:14px">
+        <p class="muted plate-note">
           <em>Sysadmin only.</em> Creates a new tenant schema with its own
           configurations, collections, and role-bindings.
         </p>
@@ -54,7 +54,7 @@
             </div>
           </div>
           <div class="form-row">
-            <div style="grid-column:1/-1">
+            <div class="field-full">
               <label for="cat-description">Description</label>
               <textarea id="cat-description" placeholder="One-paragraph provenance…"></textarea>
             </div>
@@ -69,7 +69,7 @@
               <input id="cat-keywords" type="text" placeholder="agriculture, drought">
             </div>
           </div>
-          <div class="row">
+          <div class="form-actions">
             <button class="btn" type="submit">Charter catalog</button>
             <span id="cat-status" class="status"></span>
           </div>
@@ -118,7 +118,7 @@
             </div>
           </div>
           <div class="form-row">
-            <div style="grid-column:1/-1">
+            <div class="field-full">
               <label for="col-description">Description</label>
               <textarea id="col-description" required placeholder="One-paragraph provenance…"></textarea>
             </div>
@@ -133,7 +133,7 @@
               <input id="col-temporal" type="text" placeholder="2010-01-01/null">
             </div>
           </div>
-          <div class="row">
+          <div class="form-actions">
             <button class="btn" type="submit">Commission collection</button>
             <span id="col-status" class="status"></span>
           </div>
@@ -147,7 +147,7 @@
         </div>
         <p class="muted">
           Once a collection exists, drag-and-drop GeoJSON into the
-          <a href="ingest" style="color:var(--terracotta);text-decoration:none;border-bottom:1px dotted">Ingest</a>
+          <a href="ingest" class="link-terra">Ingest</a>
           page to populate it. Failed features are reported per-row.
         </p>
       </div>

@@ -70,7 +70,7 @@
           </div>
           <div>
             <label>&nbsp;</label>
-            <button id="principal-search-btn" type="button">Search</button>
+            <button class="btn btn-secondary" id="principal-search-btn" type="button">Search</button>
           </div>
         </div>
         <div id="principal-results" class="results"></div>
@@ -126,7 +126,7 @@
             </div>
           </div>
           <div class="form-actions">
-            <button type="submit">Grant binding</button>
+            <button class="btn" type="submit">Grant binding</button>
             <span id="binding-create-status" class="hint"></span>
           </div>
         </form>
@@ -150,6 +150,10 @@
     </section>
   </main>
 
+  <script>
+    document.getElementById("masthead-stamp").textContent =
+      `FOLIO ${new Date().toISOString().slice(0, 10)}\nREV. ${Math.floor(Math.random()*900+100)}`;
+  </script>
   <script type="module" src="../static/admin/access-bindings.js"></script>
 </body>
 </html>

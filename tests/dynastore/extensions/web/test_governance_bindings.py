@@ -110,9 +110,36 @@ def test_binding_form_submits_full_create_binding_request(governance_js: str) ->
 def test_deny_rows_are_visually_distinct(governance_js: str) -> None:
     """Deny bindings must be styled differently from allow ones — operators
     have to spot a deny in a long mixed list at a glance."""
-    # We mark deny rows with a left border + tinted background.
+    # Deny rows are marked with the canonical .row-deny class; the actual
+    # left-border + tint live in common/admin.css so the treatment is shared
+    # across pages.
     assert 'effect === "deny"' in governance_js
-    assert "borderLeft" in governance_js
+    assert '"row-deny"' in governance_js
+
+
+def test_deny_row_style_lives_in_shared_css() -> None:
+    """The .row-deny treatment is centralised in common/admin.css so that the
+    deny look is consistent across every bindings/grants table. The rule set
+    must include both the tinted background and the terracotta left border so
+    deny rows pop visually."""
+    css_path = Path(__file__).resolve().parents[3].parent / (
+        "packages/extensions/web/src/dynastore/extensions/web/static/common/admin.css"
+    )
+    css = css_path.read_text(encoding="utf-8")
+    assert "tr.row-deny" in css
+    # Grab every rule selector that mentions .row-deny and concatenate the
+    # rule bodies. The treatment must include both a tinted background and a
+    # left border accent.
+    bodies: list[str] = []
+    cursor = css
+    while "row-deny" in cursor:
+        head, rest = cursor.split("row-deny", 1)
+        body, after = rest.split("}", 1)
+        bodies.append(body)
+        cursor = after
+    joined = "\n".join(bodies)
+    assert "background" in joined
+    assert "border-left" in joined
 
 
 def test_no_unsafe_dom_string_sink(governance_js: str) -> None:

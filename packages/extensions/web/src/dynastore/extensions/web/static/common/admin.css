@@ -220,6 +220,13 @@ select { cursor: pointer; }
   margin-bottom: 14px;
 }
 
+/* Span the full grid width — for description / textarea fields that need
+ * to stretch across the .form-row two-column layout. */
+.form-row > .field-full { grid-column: 1 / -1; }
+
+/* Note paragraph used inside a plate, above a form. */
+.plate-note { margin-bottom: 14px; }
+
 /* --- Buttons ---------------------------------------------------------- */
 
 .btn {
@@ -311,6 +318,30 @@ tbody tr:hover td { background: rgba(180, 71, 43, 0.04); }
   font-style: italic;
   padding: 24px 10px;
   font-size: 0.88rem;
+}
+
+/* Action cell — buttons (edit / delete / pick…) clustered to the right. */
+td.table-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+td.table-actions .btn + .btn { margin-left: 4px; }
+
+/* Narrow numeric input (priority pickers, in-row counters). */
+.input-num { width: 84px; }
+
+/* Medium / large search inputs used in plate headers — the natural width is
+ * 100%; clamp them to a sensible value beside refresh buttons. */
+.input-medium { max-width: 280px; }
+.input-large  { max-width: 320px; }
+
+/* Truncating cell — keeps long CSV / regex lists on one line; full content
+ * remains accessible via the cell's `title` attribute. */
+td.cell-truncate {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* --- Chips & status --------------------------------------------------- */
@@ -718,6 +749,308 @@ tbody tr:hover td { background: rgba(180, 71, 43, 0.04); }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .spacer { flex: 1; }
 hr.rule { border: 0; border-top: 1px solid var(--rule-hair); margin: 16px 0; }
+
+/* In-text accent link used in subtitles and footnotes. */
+.link-terra {
+  color: var(--terracotta);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--terracotta);
+}
+.link-terra:hover { color: var(--terracotta-deep); border-bottom-style: solid; }
+
+/* --- Schema form / list canonical surface ----------------------------
+ *
+ * Both common/schema-form.js and common/schema-list.js render into the
+ * Configuration Hub plate. Previously they shipped with inline styles that
+ * targeted a long-gone GitHub-dark fallback palette (--surface2, --primary).
+ * The rules below give them first-class atlas treatment instead.
+ */
+
+.schema-form { display: block; }
+.schema-form .object-wrap { display: grid; gap: 12px; }
+.schema-form .form-section-default { display: grid; gap: 10px; }
+
+.schema-form .form-section {
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+}
+.schema-form .form-section > legend {
+  padding: 0 6px;
+  font-family: var(--font-ui);
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.schema-form .field-row { display: block; }
+.schema-form .field-row > label {
+  display: block;
+  margin-bottom: 4px;
+}
+.schema-form .field-desc,
+.schema-form .field-hint {
+  font-size: 0.72rem;
+  color: var(--ink-dim);
+  font-style: italic;
+  margin: 2px 0 6px;
+  line-height: 1.5;
+}
+.schema-form .field-wrap input,
+.schema-form .field-wrap select,
+.schema-form .field-wrap textarea {
+  width: 100%;
+}
+.schema-form .field-wrap textarea[data-widget="json"] {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  min-height: 120px;
+}
+
+.schema-form .array-wrap {
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  padding: 10px 12px;
+}
+.schema-form .array-wrap .array-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 6px;
+}
+.schema-form .array-wrap .array-row > .array-row-body { flex: 1; }
+.schema-form .array-wrap .array-row > .btn { padding: 4px 8px; }
+
+/* Per-field inherit / override pill — non-platform scopes only. */
+.inherit-pill {
+  display: inline-flex;
+  gap: 0;
+  margin-left: 10px;
+  border: 1px solid var(--rule);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.inherit-pill button {
+  padding: 1px 8px;
+  background: transparent;
+  color: var(--ink-dim);
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transition: background 0.1s, color 0.1s;
+}
+.inherit-pill button:hover { color: var(--ink); }
+.inherit-pill button.active {
+  background: var(--terracotta);
+  color: var(--paper);
+}
+
+/* Left rail. */
+.schema-list { list-style: none; }
+.schema-list .schema-list-search {
+  width: 100%;
+  margin-bottom: 12px;
+}
+.schema-list .schema-list-group { margin-bottom: 6px; }
+.schema-list .schema-list-group-header {
+  font-family: var(--font-ui);
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  margin: 14px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--rule-hair);
+}
+.schema-list .schema-list-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  background: transparent;
+  color: var(--ink-soft);
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+  margin-bottom: 2px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.schema-list .schema-list-item:hover {
+  background: rgba(180, 71, 43, 0.06);
+  color: var(--ink);
+}
+.schema-list .schema-list-item.selected {
+  background: rgba(180, 71, 43, 0.08);
+  color: var(--terracotta-deep);
+  border-left-color: var(--terracotta);
+}
+.schema-list .schema-list-item .item-title {
+  font-family: var(--font-ui);
+  font-weight: 500;
+  color: var(--ink);
+}
+.schema-list .schema-list-item .item-desc {
+  font-size: 0.7rem;
+  color: var(--ink-dim);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.schema-list .schema-list-empty {
+  color: var(--ink-dim);
+  font-size: 0.82rem;
+  font-style: italic;
+  padding: 16px 4px;
+}
+
+/* Empty / hint blocks used by the form host and config tabs. */
+.empty-hint {
+  color: var(--ink-dim);
+  font-size: 0.85rem;
+  font-style: italic;
+  padding: 18px 4px;
+  line-height: 1.55;
+}
+
+/* The hint line under inputs and below tables. */
+.hint {
+  color: var(--ink-dim);
+  font-size: 0.82rem;
+  margin-top: 6px;
+  font-family: var(--font-ui);
+}
+.hint[data-level="error"] { color: var(--terracotta-deep); }
+.hint[data-level="warn"]  { color: var(--amber); }
+.hint[data-level="ok"]    { color: var(--olive); }
+
+/* --- Principal search results (access-bindings) ----------------------- */
+
+.results { display: grid; gap: 6px; margin-top: 8px; }
+.result-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--rule-hair);
+  background: var(--paper);
+}
+.result-row .result-id { font-family: var(--font-ui); font-weight: 500; }
+.result-row .result-meta { font-family: var(--font-mono); font-size: 0.74rem; color: var(--ink-dim); }
+.result-row .result-pick {
+  padding: 4px 10px;
+  font-family: var(--font-ui);
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+.result-row .result-pick:hover { background: var(--ink); color: var(--paper); }
+
+/* --- Scope picker chrome (context-bar internals) ---------------------- */
+
+.context-bar .scope-kind {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  flex-wrap: wrap;
+  border: 0;
+  padding: 0;
+}
+.context-bar .scope-radio {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  margin-bottom: 0;
+}
+.context-bar .scope-radio:hover { color: var(--ink); }
+.context-bar .scope-radio input[type="radio"] { accent-color: var(--terracotta); cursor: pointer; }
+
+/* --- Form action bar -------------------------------------------------- */
+
+.form-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+/* --- Row treatments --------------------------------------------------- */
+
+/* Deny rows in a binding/grant table — terracotta-tinted left edge so a
+ * deny pops visually against allow rows in long lists. */
+tbody tr.row-deny td { background: rgba(196, 78, 50, 0.06); }
+tbody tr.row-deny > td:first-child {
+  border-left: 3px solid var(--terracotta-deep);
+  padding-left: 8px;
+}
+
+/* JSON cell — compact, wraps long values, monospace. */
+.cell-json {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  white-space: pre-wrap;
+  max-width: 280px;
+  color: var(--ink-soft);
+}
+
+/* File-list under the ingest dropzone — replaces the inline ad-hoc style. */
+.file-list {
+  list-style: none;
+  margin-top: 10px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--ink-dim);
+}
+.file-list li { padding: 2px 0; }
+.file-list li.file-err { color: var(--terracotta-deep); }
+
+/* --- Provisioning panel (governance) ---------------------------------- */
+
+.kv-table { width: 100%; border-collapse: collapse; }
+.kv-table td { padding: 4px 0; vertical-align: top; }
+.kv-table td.kv-label {
+  width: 160px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.kv-table td.kv-value { color: var(--ink-soft); font-family: var(--font-mono); }
+.kv-table td.kv-value code { color: var(--ink-soft); }
+.kv-table .kv-error code { color: var(--terracotta-deep); word-break: break-all; }
+
+/* Three-way (inherit / on / off) select used by Service Exposure. */
+.threeway-select {
+  width: auto;
+  min-width: 110px;
+  padding: 4px 8px;
+  font-size: 0.78rem;
+}
 
 /* Accessibility: respect reduced motion */
 @media (prefers-reduced-motion: reduce) {
