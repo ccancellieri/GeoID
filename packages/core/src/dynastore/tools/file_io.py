@@ -724,31 +724,6 @@ def get_features_as_byte_stream(
     return formatter["writer"](feature_dicts, target_srid, encoding=encoding)
 
 
-class GeneratorStream(object):
-    """
-    Wraps a generator of bytes into a file-like object with a read() method.
-    Useful for integrating generators with APIs that expect a file-like object (e.g. GCS upload).
-    """
-
-    def __init__(self, generator: Iterator[bytes]):
-        self.generator = generator
-        self.buffer = b""
-
-    def read(self, size: Optional[int] = None) -> bytes:
-        if size is None:  # Read all
-            return self.buffer + b"".join(self.generator)
-
-        while len(self.buffer) < size:
-            try:
-                chunk = next(self.generator)
-                self.buffer += chunk
-            except StopIteration:
-                break
-
-        result = self.buffer[:size]
-        self.buffer = self.buffer[size:]
-        return result
-
 
 async def write_geojson_async(
     features_async_iter: AsyncIterator[Dict], encoding: str = "utf-8"

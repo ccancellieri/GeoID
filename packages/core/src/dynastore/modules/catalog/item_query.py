@@ -6,6 +6,7 @@ Extracted from item_service.py to reduce file size.  All methods access
 inherits from this mixin.
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional, Any, Dict, Tuple, AsyncIterator
@@ -18,6 +19,7 @@ from dynastore.modules.db_config.query_executor import (
     DbResource,
     ResultHandler,
     managed_transaction,
+    is_async_resource,
 )
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,
@@ -1145,17 +1147,75 @@ class ItemQueryMixin:
         # Stream Generator (O(1) Memory)
         lang = (request.raw_params or {}).get("lang", "en")
         read_policy = await self._resolve_read_policy(catalog_id, collection_id)
+        _engine = self.engine  # capture to narrow type for the branch below
         async def feature_stream():
             # Open a fresh connection/transaction for streaming to ensure isolation and avoid leaks
-            async with managed_transaction(self.engine) as stream_conn:
-                # Use a buffer for higher throughput but still O(1) memory
-                stream = await stream_conn.stream(text(sql), params)  # type: ignore[union-attr]
-                async for row in stream:
-                    feature_ctx = FeaturePipelineContext(lang=lang, consumer=consumer)
-                    yield self.map_row_to_feature(
-                        dict(row._mapping), col_config, context=feature_ctx,
-                        read_policy=read_policy,
-                    )
+            if _engine is not None and is_async_resource(_engine):
+                async with managed_transaction(_engine) as stream_conn:
+                    # AsyncConnection.stream() yields rows server-side without buffering
+                    from sqlalchemy.ext.asyncio import AsyncConnection as _AsyncConn
+                    _ac = stream_conn  # type: ignore[assignment]
+                    stream = await _ac.stream(text(sql), params)  # type: ignore[union-attr]
+                    async for row in stream:
+                        feature_ctx = FeaturePipelineContext(lang=lang, consumer=consumer)
+                        yield self.map_row_to_feature(
+                            dict(row._mapping), col_config, context=feature_ctx,
+                            read_policy=read_policy,
+                        )
+            else:
+                # Sync engine path (e.g. Cloud Run export job): use a server-side
+                # cursor so we still stream O(1) memory without buffering the full
+                # result set.  We open the connection in a thread and batch-fetch
+                # rows to avoid blocking the event loop per-row.
+                _BATCH = 500
+                from sqlalchemy.engine import Engine as _SyncEngine
+
+                def _open_cursor() -> dict:
+                    _sync_eng: _SyncEngine = _engine  # type: ignore[assignment]
+                    conn = _sync_eng.connect()
+                    conn = conn.execution_options(stream_results=True, yield_per=_BATCH)
+                    result = conn.execute(text(sql), params)
+                    return {"conn": conn, "result": result, "error": None}
+
+                def _fetch_batch(state: dict) -> list:
+                    try:
+                        return state["result"].fetchmany(_BATCH)
+                    except Exception as exc:
+                        state["error"] = exc
+                        return []
+
+                def _close_cursor(state: dict) -> None:
+                    try:
+                        state["result"].close()
+                    except Exception:
+                        pass
+                    try:
+                        state["conn"].close()
+                    except Exception:
+                        pass
+
+                state = await asyncio.to_thread(_open_cursor)
+                try:
+                    while True:
+                        rows = await asyncio.to_thread(_fetch_batch, state)
+                        if state["error"]:
+                            raise state["error"]
+                        if not rows:
+                            break
+                        for row in rows:
+                            feature_ctx = FeaturePipelineContext(lang=lang, consumer=consumer)
+                            yield self.map_row_to_feature(
+                                dict(row._mapping), col_config, context=feature_ctx,
+                                read_policy=read_policy,
+                            )
+                finally:
+                    # Synchronous close: result.close() / conn.close() are fast
+                    # protocol-level operations and do not block the event loop
+                    # for meaningful time.  Using asyncio.to_thread here would
+                    # schedule the close AFTER aclose() returns (Python limitation
+                    # on await inside async generator finally), leaving the cursor
+                    # open until the thread runs — so we close synchronously instead.
+                    _close_cursor(state)
 
         return QueryResponse(
             items=_apply_item_pipeline(feature_stream(), catalog_id, collection_id),
