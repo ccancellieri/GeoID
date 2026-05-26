@@ -251,7 +251,52 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         conn: AsyncConnection = Depends(get_async_connection),
         limit: int = Query(10, ge=1, le=1000, description="Maximum number of records to return."),
         offset: int = Query(0, ge=0, description="Offset of the first record to return."),
-        filter: Optional[str] = Query(None, description="CQL2-TEXT filter expression."),
+        filter: Optional[str] = Query(
+            None,
+            description=(
+                "CQL2 filter expression; encoding controlled by ``filter-lang``."
+            ),
+        ),
+        filter_lang: str = Query(
+            "cql2-text",
+            alias="filter-lang",
+            description="Filter encoding: 'cql2-text' (default) or 'cql2-json'.",
+        ),
+        filter_crs: Optional[str] = Query(
+            None,
+            alias="filter-crs",
+            description=(
+                "URI of the CRS the geometric values in ``filter=`` are "
+                "expressed in. Default = CRS84."
+            ),
+        ),
+        properties: Optional[str] = Query(
+            None,
+            description=(
+                "Comma-separated property names; unknown name → 400, empty "
+                "value strips all attribute properties. Orthogonal to "
+                "``skipGeometry``."
+            ),
+        ),
+        skip_geometry: Optional[bool] = Query(
+            None,
+            alias="skipGeometry",
+            description=(
+                "When true, returned records carry ``geometry: null`` and "
+                "the resolved driver omits the geometry from its projection. "
+                "De-facto pygeoapi convention. Mutually exclusive with "
+                "``returnGeometry`` unless both are consistent. Default: false."
+            ),
+        ),
+        return_geometry: Optional[bool] = Query(
+            None,
+            alias="returnGeometry",
+            description=(
+                "ESRI de-facto alias for ``skipGeometry``. "
+                "``returnGeometry=false`` is equivalent to ``skipGeometry=true``. "
+                "Passing both with conflicting values returns HTTP 400."
+            ),
+        ),
         sortby: Optional[str] = Query(None, description="Sort order (e.g., '-title,+created')."),
         q: Optional[str] = Query(None, description="Free-text search query."),
     ) -> Response:
@@ -265,6 +310,76 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             parse_ogc_query_request,
             maybe_dispatch_items_to_search_driver,
         )
+        from dynastore.tools.discovery import get_protocol
+
+        # ``filter-lang`` validation (Phase 1 of #1385 — accept cql2-json).
+        # Defensive normalisation: when ``get_records`` is invoked directly
+        # (unit tests bypass FastAPI), ``filter_lang`` may still be a
+        # ``Query(...)`` sentinel — coerce non-strings to the default.
+        fl_normalised = (
+            filter_lang.lower()
+            if isinstance(filter_lang, str) and filter_lang
+            else "cql2-text"
+        )
+        if fl_normalised not in ("cql2-text", "cql2-json"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported filter-lang '{filter_lang}'. "
+                    "Supported: 'cql2-text', 'cql2-json'."
+                ),
+            )
+
+        # ``filter-crs`` resolution. Records does not expose a CRSProtocol
+        # dependency (no per-collection projected geometries), so resolution
+        # is the lightweight regex form: ``EPSG:<n>`` / ``CRS84`` literals
+        # only. Unknown URIs leave the SRID as ``None`` (= CRS84 default).
+        filter_crs_srid: Optional[int] = None
+        if isinstance(filter_crs, str) and filter_crs:
+            up = filter_crs.upper()
+            if "CRS84" in up:
+                filter_crs_srid = 4326
+            else:
+                import re as _re
+                m = _re.search(r"[/|:](\d+)$", filter_crs)
+                if m:
+                    filter_crs_srid = int(m.group(1))
+
+        # ``properties`` validation. Reuses ``ItemsProtocol.get_collection_fields``
+        # (same source as the Features queryables endpoint) so the
+        # validator surface is identical across services.
+        select_fields: Optional[List[str]] = None
+        if isinstance(properties, str):
+            requested = [p.strip() for p in properties.split(",") if p.strip()]
+            if properties == "" or not requested:
+                select_fields = []
+            else:
+                valid_props: set = set()
+                items_svc = get_protocol(ItemsProtocol)
+                if items_svc is not None:
+                    try:
+                        all_fields = await items_svc.get_collection_fields(
+                            catalog_id, collection_id
+                        )
+                        for fd in all_fields.values():
+                            if not getattr(fd, "expose", True):
+                                continue
+                            final_name = getattr(fd, "alias", None) or getattr(fd, "name", None)
+                            if final_name and final_name not in ("geoid", "geom"):
+                                valid_props.add(final_name)
+                    except Exception:
+                        valid_props = set()
+                if valid_props:
+                    unknown = [p for p in requested if p not in valid_props]
+                    if unknown:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Unknown properties: {', '.join(sorted(unknown))}. "
+                                f"Available: {', '.join(sorted(valid_props))}."
+                            ),
+                        )
+                select_fields = requested
 
         # ── Routing-aware items SEARCH-driver dispatch (#1047) ────────────
         # Mirror STAC ``/search``: for a structural-only listing (no CQL2
@@ -288,6 +403,14 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                 request=request,
             )
 
+        # Resolve skipGeometry/returnGeometry from the two accepted forms.
+        # Unit-test direct calls may pass ``Query(...)`` sentinels — normalise
+        # non-bools/non-None to None before resolution.
+        _sg = skip_geometry if isinstance(skip_geometry, bool) else None
+        _rg = return_geometry if isinstance(return_geometry, bool) else None
+        from dynastore.extensions.tools.query import resolve_geometry_flag
+        skip_geom_bool = resolve_geometry_flag(_sg, _rg)
+
         request_obj = parse_ogc_query_request(
             bbox=None,
             datetime_param=None,
@@ -296,6 +419,10 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             limit=limit,
             offset=offset,
             include_total_count=True,
+            filter_lang=fl_normalised,
+            filter_crs_srid=filter_crs_srid,
+            select_fields=select_fields,
+            skip_geometry=skip_geom_bool,
         )
 
         # Free-text search — add as CQL2 LIKE filter on title if present
@@ -331,8 +458,32 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         )
         read_policy = await resolve_items_read_policy(catalog_id, collection_id)
 
+        # Per-feature post-fetch projection — covers drivers that ignore
+        # ``QueryRequest.select`` (e.g. ES) and the empty-properties case.
+        projection_set: Optional[set] = None
+        if select_fields is not None:
+            projection_set = set(select_fields)
+
         records: List[rm.Record] = []
         async for feature in query_response:
+            if projection_set is not None:
+                props = getattr(feature, "properties", None)
+                if isinstance(props, dict):
+                    for key in list(props.keys()):
+                        if key not in projection_set:
+                            props.pop(key, None)
+            # ``Record`` already emits ``geometry: null`` by construction
+            # (records_generator builds ``rm.Record(geometry=None, ...)``),
+            # so ``skip_geometry`` is mainly a hint to the driver layer here
+            # (PG drops the geom SELECT, ES adds ``geometry`` to
+            # ``_source.excludes``). The Feature-level normalisation below
+            # keeps the contract honest if the generator ever evolves to
+            # carry a geometry.
+            if skip_geom_bool and hasattr(feature, "geometry"):
+                try:
+                    feature.geometry = None
+                except Exception:
+                    pass
             records.append(gen.db_row_to_record(feature, catalog_id, collection_id, root_url, layer_config, read_policy=read_policy))
 
         # Pagination links

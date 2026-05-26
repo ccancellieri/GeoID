@@ -606,6 +606,70 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         return {"query": inner}
 
     @staticmethod
+    def _build_source_filter(request: Optional[QueryRequest]) -> Optional[Dict[str, Any]]:
+        """Build the ES ``_source`` clause for an items search, honouring
+        ``QueryRequest.skip_geometry`` and ``QueryRequest.select``.
+
+        Two orthogonal push-downs:
+
+        * ``skip_geometry=True`` → ``_source.excludes`` includes
+          ``"geometry"`` (the STAC/GeoJSON structural geometry member on
+          every items index — see
+          :func:`~dynastore.modules.elasticsearch.items_projection.project_item_for_es`)
+          so ES does not return the geometry bytes at all. The service-layer
+          normaliser still forces ``Feature.geometry = null`` as a safety
+          net for hits that arrived from elsewhere.
+        * Explicit ``select`` (any selection other than the default ``*``)
+          → ``_source.includes`` lists the requested property names
+          (under ``properties.*``) plus the GeoJSON/STAC structural
+          members so the doc still round-trips through
+          :func:`unproject_item_from_es`. Geometry is added unless
+          ``skip_geometry`` also excludes it.
+
+        Returns ``None`` (no ``_source`` filtering) for the default browse
+        (``select=[*]``, ``skip_geometry=False``).
+        """
+        if request is None:
+            return None
+
+        skip_geom = bool(getattr(request, "skip_geometry", False))
+        sel = list(request.select or [])
+        explicit_select = bool(sel) and not any(s.field == "*" for s in sel)
+
+        source: Dict[str, Any] = {}
+
+        if explicit_select:
+            # Round-trip-safe includes: the structural members that
+            # ``unproject_item_from_es`` rehydrates at the top level, plus the
+            # requested property names addressed under ``properties.*`` and
+            # ``properties.extras.*`` (the write path tucks unknowns into
+            # ``extras``).
+            structural = ["id", "type", "bbox", "collection", "links",
+                          "assets", "stac_version", "stac_extensions",
+                          "_external_id", "geoid", "external_id",
+                          "collection_id"]
+            if not skip_geom:
+                structural.append("geometry")
+            prop_paths: list = []
+            for s in sel:
+                name = s.field
+                if not name or name == "*":
+                    continue
+                if name.startswith("properties."):
+                    prop_paths.append(name)
+                else:
+                    prop_paths.append(f"properties.{name}")
+                    prop_paths.append(f"properties.extras.{name}")
+            source["includes"] = structural + prop_paths
+
+        if skip_geom:
+            source.setdefault("excludes", [])
+            if "geometry" not in source["excludes"]:
+                source["excludes"].append("geometry")
+
+        return source or None
+
+    @staticmethod
     def _build_read_search_body(
         collection_id: str,
         request: Optional[QueryRequest],
@@ -622,6 +686,12 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         already scopes via a ``terms`` filter, so query all shards with no
         single-collection routing. ``fields`` selects the index's envelope
         field names (see :meth:`_query_request_to_es`).
+
+        Projection push-down (#1385): if the request carries
+        ``skip_geometry=True`` or an explicit ``select``, the ES body adds a
+        ``_source`` clause so ES omits the heavy ``geometry`` bytes / narrows
+        the returned source to the requested properties. The service-layer
+        post-fetch projection remains the universal safety net.
         """
         base = (
             _ItemsElasticsearchBase._query_request_to_es(request, fields)
@@ -633,9 +703,14 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         from_ = offset if request is None or request.offset is None else request.offset
         params: Dict[str, Any] = {"size": str(size), "from": str(from_)}
 
+        source_filter = _ItemsElasticsearchBase._build_source_filter(request)
+
         if request is not None and request.collections:
             # Multi-collection: scoping is already in base_query's terms filter.
-            return {"query": base_query}, params
+            body: Dict[str, Any] = {"query": base_query}
+            if source_filter is not None:
+                body["_source"] = source_filter
+            return body, params
 
         collection_filter = {"term": {fields.collection: collection_id}}
         body = {
@@ -646,6 +721,8 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
                 }
             }
         }
+        if source_filter is not None:
+            body["_source"] = source_filter
         params["routing"] = collection_id
         return body, params
 

@@ -626,6 +626,14 @@ class GeometriesSidecar(SidecarProtocol):
         """Returns SELECT field expressions for geometry sidecar."""
         alias = sidecar_alias or f"sc_{self.sidecar_id}"
 
+        # OGC API Features ``skipGeometry=true`` (de-facto pygeoapi convention)
+        # asks the driver to omit Feature.geometry from the response. The
+        # column is geometry-sidecar territory, so we suppress it here at the
+        # SELECT level rather than projecting it away post-fetch. Bbox / H3 /
+        # S2 / statistics columns are unaffected — they are distinct
+        # OGC outputs that survive a geometry-skip.
+        skip_geom = bool(request is not None and getattr(request, "skip_geometry", False))
+
         fields = []
 
         if request is not None and not include_all:
@@ -634,8 +642,13 @@ class GeometriesSidecar(SidecarProtocol):
             filter_fields = {f.field for f in request.filters} if hasattr(request, "filters") and request.filters else set()
             sort_fields = {s.field for s in (request.sort or [])} if hasattr(request, "sort") and request.sort else set()
             all_needed = requested | filter_fields | sort_fields
-            
-            if self.config.geom_column in all_needed or "geometry" in all_needed or "*" in requested or not requested:
+
+            if not skip_geom and (
+                self.config.geom_column in all_needed
+                or "geometry" in all_needed
+                or "*" in requested
+                or not requested
+            ):
                 fields.append(f"ST_AsGeoJSON({alias}.{self.config.geom_column})::jsonb as {self.config.geom_column}")
 
             if self.config.bbox_column and ("bbox" in all_needed or self.config.bbox_column in all_needed or "*" in requested):
@@ -669,7 +682,7 @@ class GeometriesSidecar(SidecarProtocol):
 
         else:
             # Full mode (existing behavior)
-            if request is not None:
+            if request is not None and not skip_geom:
                 # Default to GeoJSON for optimization/consistency in API responses
                 fields.append(f"ST_AsGeoJSON({alias}.{self.config.geom_column})::jsonb as {self.config.geom_column}")
 

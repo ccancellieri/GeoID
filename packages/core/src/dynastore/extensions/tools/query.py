@@ -300,6 +300,39 @@ def combine_cql_filters(
     return " AND ".join(f"({c})" for c in cql_parts)
 
 
+def resolve_geometry_flag(
+    skip_geometry: Optional[bool],
+    return_geometry: Optional[bool],
+) -> bool:
+    """
+    Resolve the geometry-omission flag from the two accepted query params.
+
+    ``skipGeometry`` (pygeoapi de-facto) and ``returnGeometry`` (ESRI de-facto)
+    express the same toggle from opposite poles. Either may be passed; passing
+    both is allowed only when they agree. Contradiction → HTTP 400.
+
+    Returns the canonical ``skip_geometry`` boolean (True = omit geometry).
+    """
+    if skip_geometry is None and return_geometry is None:
+        return False
+    if skip_geometry is not None and return_geometry is not None:
+        if skip_geometry == (not return_geometry):
+            return skip_geometry
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Conflicting geometry flags: skipGeometry={skip_geometry} "
+                f"and returnGeometry={return_geometry}. Pass only one, or "
+                "ensure they are mutually consistent "
+                "(skipGeometry == not returnGeometry)."
+            ),
+        )
+    if skip_geometry is not None:
+        return skip_geometry
+    assert return_geometry is not None
+    return not return_geometry
+
+
 def parse_ogc_query_request(
     bbox: Optional[str] = None,
     datetime_param: Optional[str] = None,
@@ -311,6 +344,10 @@ def parse_ogc_query_request(
     bbox_crs_srid: Optional[int] = None,
     include_total_count: bool = True,
     extra_filters: Optional[Dict[str, str]] = None,
+    filter_lang: str = "cql2-text",
+    filter_crs_srid: Optional[int] = None,
+    select_fields: Optional[List[str]] = None,
+    skip_geometry: bool = False,
 ) -> QueryRequest:
     """
     Unifies OGC parameter parsing into a structured QueryRequest.
@@ -320,11 +357,26 @@ def parse_ogc_query_request(
     CQL2-Text equality clauses and combined with any explicit ``filter`` so both
     paths share the same validation, identifier safety, and parameter binding.
     """
+    from dynastore.models.query_builder import FieldSelection
+
+    select: Optional[List[FieldSelection]] = None
+    if select_fields:
+        # Narrow the driver-level projection to exactly the requested names.
+        # An empty selection is intentionally NOT wired into ``select`` here
+        # because :pyfunc:`QueryRequest.validate_select` would re-expand ``[]``
+        # to ``[FieldSelection(field="*")]``; the service-layer post-fetch
+        # projection handles the empty case by stripping every attribute.
+        select = [FieldSelection(field=name) for name in select_fields]
+
     request_obj = QueryRequest(
         limit=limit,
         offset=offset,
         include_total_count=include_total_count,
         filters=[],
+        filter_lang=filter_lang,
+        filter_crs_srid=filter_crs_srid,
+        skip_geometry=skip_geometry,
+        **({"select": select} if select is not None else {}),
     )
 
     # 0. Item IDs

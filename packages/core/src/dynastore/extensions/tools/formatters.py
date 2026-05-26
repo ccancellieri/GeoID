@@ -132,12 +132,23 @@ async def _stream_ogc_json(
     async for item in items:
         if not is_first:
             yield b","
-        
+
         if hasattr(item, "model_dump"):
             feat_dict = item.model_dump(exclude_none=True, by_alias=True)
+            # RFC 7946: a GeoJSON Feature MUST carry a ``geometry`` member,
+            # even when it is ``null`` (an "unlocated Feature"). ``exclude_none``
+            # would drop a ``None`` geometry from the dump; restore it here so
+            # the wire shape stays spec-compliant and ``skipGeometry=true``
+            # emits the documented ``"geometry": null``.
+            if (
+                is_geojson
+                and feat_dict.get("type") == "Feature"
+                and "geometry" not in feat_dict
+            ):
+                feat_dict["geometry"] = None
         else:
             feat_dict = item
-            
+
         yield orjson.dumps(feat_dict, default=orjson_default)
         is_first = False
         returned_count += 1

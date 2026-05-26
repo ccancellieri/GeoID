@@ -364,6 +364,40 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 return crs_def.srid
         return None
 
+    async def _resolve_property_names(
+        self, catalog_id: str, collection_id: str
+    ) -> set:
+        """Return the set of valid property names for a collection.
+
+        Reuses :pymeth:`ItemsProtocol.get_collection_fields` (the same source
+        the Queryables endpoint consumes) so the ``properties`` query
+        parameter is validated against exactly the catalogue's published
+        queryable surface — no parallel validator. Each field's exposed name
+        is its ``alias`` (preferred) or ``name``.
+
+        Returns an empty set when the protocol is unavailable; the caller
+        treats that as "permissive" and skips validation rather than failing
+        every request when the introspection backend is offline.
+        """
+        items_svc = get_protocol(ItemsProtocol)
+        if items_svc is None:
+            return set()
+        try:
+            all_fields = await items_svc.get_collection_fields(
+                catalog_id, collection_id
+            )
+        except Exception:
+            return set()
+        names: set = set()
+        for fd in all_fields.values():
+            if not getattr(fd, "expose", True):
+                continue
+            final_name = getattr(fd, "alias", None) or getattr(fd, "name", None)
+            if not final_name or final_name in ("geoid", "geom"):
+                continue
+            names.add(final_name)
+        return names
+
     async def get_landing_page(
         self, request: Request, language: str = Depends(get_language)
     ):
@@ -846,11 +880,63 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
             description="Temporal filter. A single datetime or a '/' separated interval.",
         ),
         filter: Optional[str] = Query(
-            None, description="A CQL2-TEXT filter expression."
+            None,
+            description=(
+                "A CQL2 filter expression. Encoding controlled by "
+                "``filter-lang`` (``cql2-text`` default, ``cql2-json`` "
+                "for a JSON-encoded payload)."
+            ),
         ),
         filter_lang: str = Query(
             "cql2-text",
-            description="Language of the filter expression. Only 'cql2-text' is supported.",
+            alias="filter-lang",
+            description=(
+                "Language of the filter expression. Supported: 'cql2-text' "
+                "(default) and 'cql2-json'."
+            ),
+        ),
+        filter_crs: Optional[str] = Query(
+            None,
+            alias="filter-crs",
+            description=(
+                "URI of the CRS the geometric values in ``filter=`` are "
+                "expressed in. Default = CRS84 (EPSG:4326)."
+            ),
+        ),
+        properties: Optional[str] = Query(
+            None,
+            description=(
+                "Comma-separated attribute names selecting which feature "
+                "properties are returned. Each name must be a queryable "
+                "property of the collection — unknown names return HTTP 400. "
+                "An empty value (``?properties=``) returns only the "
+                "OGC-mandatory fields (id, geometry, type, links). "
+                "Omitted = all properties returned. Orthogonal to "
+                "``skipGeometry``: ``properties`` narrows Feature.properties, "
+                "``skipGeometry`` controls Feature.geometry. ``geom`` is not "
+                "an accepted ``properties`` name."
+            ),
+        ),
+        skip_geometry: Optional[bool] = Query(
+            None,
+            alias="skipGeometry",
+            description=(
+                "When true, the returned Features carry ``geometry: null`` "
+                "and the resolved driver omits the geometry from its "
+                "projection (PG drops the SELECT, ES adds ``geometry`` to "
+                "``_source.excludes``). De-facto pygeoapi convention. "
+                "Mutually exclusive with ``returnGeometry`` unless both are "
+                "consistent. Default: false."
+            ),
+        ),
+        return_geometry: Optional[bool] = Query(
+            None,
+            alias="returnGeometry",
+            description=(
+                "ESRI de-facto alias for ``skipGeometry``. ``returnGeometry=false`` "
+                "is equivalent to ``skipGeometry=true``. Passing both with "
+                "conflicting values returns HTTP 400."
+            ),
         ),
         crs: Optional[str] = Query(None, description="CRS URI for output geometry."),
         bbox_crs: Optional[str] = Query(
@@ -903,6 +989,62 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
 
             target_crs_srid = await self._resolve_crs_srid(conn, catalog_id, crs)
             bbox_crs_srid = await self._resolve_crs_srid(conn, catalog_id, bbox_crs)
+            # Coerce non-string defaults (Query(...) sentinels seen in direct
+            # unit-test calls) to ``None`` before SRID resolution.
+            _filter_crs_arg = filter_crs if isinstance(filter_crs, str) else None
+            filter_crs_srid = await self._resolve_crs_srid(
+                conn, catalog_id, _filter_crs_arg
+            )
+
+            # --- ``filter-lang`` validation ----------------------------
+            # OGC API Features Part 3 defines cql2-text + cql2-json. Anything
+            # else is a client error — keep the existing 400 path but accept
+            # cql2-json now (#1385). Coerce non-strings (FastAPI ``Query(...)``
+            # sentinels seen when ``get_items`` is invoked directly in unit
+            # tests) to the documented default.
+            fl_normalised = (
+                filter_lang.lower()
+                if isinstance(filter_lang, str) and filter_lang
+                else "cql2-text"
+            )
+            if fl_normalised not in ("cql2-text", "cql2-json"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unsupported filter-lang '{filter_lang}'. "
+                        "Supported: 'cql2-text', 'cql2-json'."
+                    ),
+                )
+
+            # --- ``properties`` validation -----------------------------
+            # Comma-separated attribute names. Validated against the
+            # collection's queryable surface (same source as the Queryables
+            # endpoint); unknown name → 400. Empty value (``?properties=``)
+            # is an explicit request to strip all attribute properties down
+            # to the OGC-mandatory fields — leaves ``select_fields`` as an
+            # empty list, which the post-fetch projection honours.
+            select_fields: Optional[List[str]] = None
+            project_only_mandatory = False
+            if isinstance(properties, str):
+                requested = [p.strip() for p in properties.split(",") if p.strip()]
+                if properties == "" or not requested:
+                    project_only_mandatory = True
+                    select_fields = []
+                else:
+                    valid = await self._resolve_property_names(
+                        catalog_id, collection_id
+                    )
+                    if valid:
+                        unknown = [p for p in requested if p not in valid]
+                        if unknown:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=(
+                                    f"Unknown properties: {', '.join(sorted(unknown))}. "
+                                    f"Available: {', '.join(sorted(valid))}."
+                                ),
+                            )
+                    select_fields = requested
 
             # Single-field equality shorthand: any query parameter that is not a
             # reserved OGC parameter is treated as a `?{property}={value}` filter
@@ -961,6 +1103,14 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                     request=request,
                 )
 
+            # Resolve skipGeometry/returnGeometry from the two accepted forms.
+            # FastAPI direct-call unit tests may pass literal ``Query(...)``
+            # sentinels — normalise non-bools/non-None to None before resolution.
+            _sg = skip_geometry if isinstance(skip_geometry, bool) else None
+            _rg = return_geometry if isinstance(return_geometry, bool) else None
+            from dynastore.extensions.tools.query import resolve_geometry_flag
+            skip_geom_bool = resolve_geometry_flag(_sg, _rg)
+
             request_obj = parse_ogc_query_request(
                 bbox=bbox,
                 datetime_param=datetime_param,
@@ -971,6 +1121,10 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 bbox_crs_srid=bbox_crs_srid,
                 include_total_count=True,
                 extra_filters=extra_filters,
+                filter_lang=fl_normalised,
+                filter_crs_srid=filter_crs_srid,
+                select_fields=select_fields,
+                skip_geometry=skip_geom_bool,
             )
 
             # Execute search via protocol (streaming)
@@ -1018,12 +1172,41 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 f"/collections/{collection_id}"
             )
 
+            # Resolve the projection set once per request. The post-fetch
+            # narrowing is the universal fallback for drivers that do not
+            # honour ``QueryRequest.select`` (e.g. Elasticsearch returns the
+            # whole ``_source`` when the index has no source-filter mapping)
+            # and for nested ``properties.foo`` paths that the SQL projection
+            # cannot narrow. The driver-layer ``select`` threaded above
+            # remains the fast path for PG; the ES driver pushes the same
+            # projection down via ``_source.includes/excludes``.
+            _projection_set: Optional[set] = None
+            if select_fields is not None:
+                _projection_set = set(select_fields)
+
             async def _ogc_post_process(items):
                 async for feature in items:
                     if feature.properties:
                         # Map validity → start_datetime / end_datetime
                         _map_validity_to_ogc(feature.properties)
                         feature.properties.pop("_total_count", None)
+
+                        # Per-feature property projection — applied uniformly
+                        # regardless of which driver served the listing.
+                        if _projection_set is not None:
+                            for key in list(feature.properties.keys()):
+                                if key not in _projection_set:
+                                    feature.properties.pop(key, None)
+
+                    # ``skipGeometry`` normalises Feature.geometry to ``null``
+                    # at the service boundary. PG already drops the SELECT and
+                    # ES adds ``geometry`` to ``_source.excludes``, so this is
+                    # the safety net for hits that arrived from any path that
+                    # missed the push-down (multi-driver pipelines, mocks, or
+                    # cached/legacy index shapes). RFC 7946 explicitly permits
+                    # ``"geometry": null`` on a Feature.
+                    if skip_geom_bool:
+                        feature.geometry = None
 
                     # Add OGC self/collection links
                     feature_id = feature.id

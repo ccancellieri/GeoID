@@ -208,7 +208,7 @@ def _extract_property_names(node) -> Set[str]:
     # Guard against Attribute being None if import failed
     if Attribute and isinstance(node, Attribute):
         props.add(node.name)
-    
+
     # Recursively check standard pygeofilter AST attributes
     # Binary/Spatial nodes: lhs, rhs
     # Not node: node
@@ -216,22 +216,70 @@ def _extract_property_names(node) -> Set[str]:
         child = getattr(node, attr, None)
         if child:
             props.update(_extract_property_names(child))
-            
+
     # Logical nodes / Functions: nodes, sub_nodes, arguments
     for attr in ['nodes', 'sub_nodes', 'arguments']:
         children = getattr(node, attr, None)
         if children:
             for child in children:
                 props.update(_extract_property_names(child))
-    
+
     return props
+
+
+def _stamp_geometry_srid(node: Any, srid: int) -> None:
+    """Stamp an explicit CRS on every ``Geometry`` literal in a parsed AST.
+
+    pygeofilter's SQLAlchemy backend reads the SRID from the GeoJSON ``crs``
+    member on the geometry dict (defaulting to 4326 / CRS84 when absent) and
+    emits ``ST_GeomFromEWKT('SRID=<srid>;<wkt>')``. To honour the OGC API
+    Features ``filter-crs`` query parameter we walk the AST and inject a
+    ``crs`` member on each ``Geometry`` node's dict and a ``crs`` attribute
+    on each ``BBox`` node when the caller has specified one — this is the
+    only knob the bundled grammar exposes for per-literal CRS overrides.
+
+    Already-set explicit CRSes (in input WKT/EWKT) are not overridden.
+    """
+    if node is None or isinstance(node, (str, bytes, int, float, bool)):
+        return
+    geom_attr = getattr(node, "geometry", None)
+    # pygeofilter's ``values.Geometry`` carries the geojson dict on the
+    # ``geometry`` attribute; ``BBox`` AST nodes carry a ``crs`` directly.
+    if isinstance(geom_attr, dict):
+        # Only stamp when no explicit CRS member is already present.
+        if "crs" not in geom_attr:
+            geom_attr["crs"] = {
+                "type": "name",
+                "properties": {"name": f"urn:ogc:def:crs:EPSG::{srid}"},
+            }
+    # BBox nodes: stamp crs attribute if missing or default.
+    if Attribute is not None and type(node).__name__ == "BBox":
+        existing = getattr(node, "crs", None)
+        if existing in (None, "", 4326) or (
+            isinstance(existing, str) and "4326" in existing
+        ):
+            try:
+                setattr(node, "crs", srid)
+            except (AttributeError, TypeError):
+                pass
+
+    fields = getattr(node, "__dict__", None)
+    if not fields:
+        return
+    for value in list(fields.values()):
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                _stamp_geometry_srid(child, srid)
+        else:
+            _stamp_geometry_srid(value, srid)
 
 
 def parse_cql_filter(
     cql_text: str,
     field_mapping: Optional[Dict[str, Any]] = None,
     valid_props: Optional[Set[str]] = None,
-    parser_type: str = 'cql2'
+    parser_type: str = 'cql2',
+    geometry_srid: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Parses a CQL filter string (CQL2 or ECQL) and converts it to a SQLAlchemy-safe
@@ -244,6 +292,12 @@ def parse_cql_filter(
         valid_props: A set of valid property names to validate the filter against.
                      If None, validation against `field_mapping` keys is performed if provided.
         parser_type: 'cql2' (default) or 'ecql'.
+        geometry_srid: Optional CRS to stamp on geometry literals (and bbox
+                       nodes) that do not carry an explicit CRS. Used to wire
+                       the OGC API Features ``filter-crs`` query parameter
+                       through to ``ST_GeomFromEWKT('SRID=<srid>;...')``. When
+                       ``None`` the pygeofilter default (CRS84 / EPSG:4326) is
+                       used.
 
     Returns:
         A tuple containing:
@@ -276,6 +330,13 @@ def parse_cql_filter(
             ast = parse_ecql(cql_text)
         else:
             raise ValueError(f"Unknown parser type: {parser_type}")
+
+        # Stamp the requested CRS on every geometry literal so the backend
+        # emits ``ST_GeomFromEWKT('SRID=<srid>;...')`` rather than defaulting
+        # to 4326. Honours the OGC API Features ``filter-crs`` parameter; a
+        # literal that already carries an explicit CRS is left untouched.
+        if geometry_srid is not None:
+            _stamp_geometry_srid(ast, geometry_srid)
 
         # 2. Validation (Optional but recommended)
         if valid_props is None and field_mapping:
@@ -333,9 +394,10 @@ def parse_cql_filter(
 
 
 def parse_cql2_json_filter(
-    cql_json: Dict[str, Any],
+    cql_json: Union[str, Dict[str, Any]],
     field_mapping: Optional[Dict[str, Any]] = None,
     valid_props: Optional[Set[str]] = None,
+    geometry_srid: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Parses a CQL2-JSON filter dict and converts it to a SQLAlchemy-safe
     SQL string with bind parameters.
@@ -363,6 +425,9 @@ def parse_cql2_json_filter(
 
     try:
         ast = parse_cql2_json(cql_json)
+
+        if geometry_srid is not None:
+            _stamp_geometry_srid(ast, geometry_srid)
 
         if valid_props is None and field_mapping:
             valid_props = set(field_mapping.keys())

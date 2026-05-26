@@ -505,11 +505,27 @@ class ItemQueryMixin:
                 field_mapping["validity"] = literal_column("NULL::tstzrange")
 
             try:
-                cql_where, cql_params = parse_cql_filter(
-                    query_request.cql_filter,
-                    field_mapping=field_mapping,
-                    parser_type="cql2",  # OGC API Features uses CQL2 by default
-                )
+                filter_lang = (
+                    getattr(query_request, "filter_lang", "cql2-text") or "cql2-text"
+                ).lower()
+                geometry_srid = getattr(query_request, "filter_crs_srid", None)
+                if filter_lang == "cql2-json":
+                    # OGC API Features Part 3 allows the JSON encoding of CQL2;
+                    # route through the dedicated JSON parser so callers can
+                    # POST a structured filter (or pass a JSON string on GET).
+                    from dynastore.modules.tools.cql import parse_cql2_json_filter
+                    cql_where, cql_params = parse_cql2_json_filter(
+                        query_request.cql_filter,
+                        field_mapping=field_mapping,
+                        geometry_srid=geometry_srid,
+                    )
+                else:
+                    cql_where, cql_params = parse_cql_filter(
+                        query_request.cql_filter,
+                        field_mapping=field_mapping,
+                        parser_type="cql2",  # OGC API Features uses CQL2 by default
+                        geometry_srid=geometry_srid,
+                    )
 
                 if cql_where:
                     if query_request.raw_where:
