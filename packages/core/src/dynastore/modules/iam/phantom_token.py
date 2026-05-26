@@ -37,8 +37,8 @@ from __future__ import annotations
 
 import json
 import logging
-from time import monotonic
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Tuple
+from time import monotonic, time as _now
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from dynastore.models.protocols.authorization import IamScaleConfig
@@ -250,17 +250,32 @@ async def resolve_bindings_cached(
     return result
 
 
-async def deny(token_id: str, *, ttl_seconds: int) -> None:
+async def deny(
+    token_id: str,
+    *,
+    ttl_seconds: int,
+    reason: Optional[str] = None,
+) -> None:
     """Add a token id to the revocation denylist for ``ttl_seconds``.
 
     Writes straight to L2 (not the tiered backend): a revocation must be
     visible to every pod at once, so it is never cached in an L1 tier.
+
+    The value payload is ``b"1"`` for compatibility with the historical
+    write shape, OR a JSON document ``{"r": "<reason>"}`` when the caller
+    supplies one (the admin REST surface, #1343). The hot-path check
+    (:func:`is_denied`) does ``EXISTS`` only, so the payload shape is
+    immaterial to revocation correctness.
     """
     backend = _distributed_backend()
     if backend is None:
         return
     try:
-        await backend.set(_DENYLIST_PREFIX + token_id, b"1", ttl=float(ttl_seconds))
+        if reason:
+            payload = json.dumps({"r": reason}).encode("utf-8")
+        else:
+            payload = b"1"
+        await backend.set(_DENYLIST_PREFIX + token_id, payload, ttl=float(ttl_seconds))
     except Exception:
         logger.warning("phantom_token: deny failed for %s", token_id, exc_info=True)
 
@@ -281,3 +296,147 @@ async def is_denied(token_id: str) -> bool:
         # FAIL OPEN: a denylist read error must not deny legitimate callers.
         logger.warning("phantom_token: is_denied failed for %s", token_id, exc_info=True)
         return False
+
+
+# --------------------------------------------------------------------------- #
+# Admin (#1343 follow-up): operator-facing inspect / remove primitives.
+#
+# These intentionally FAIL CLOSED — the admin surface treats a backend outage
+# as "cannot confirm" (503), unlike the hot path which fails OPEN to keep
+# legitimate traffic flowing. The hot path is a security wall ("am I revoked?")
+# where a Valkey blip must not lock everyone out; the admin path is an
+# operator transaction ("did my revocation land?") where a silent no-op would
+# leave a believed-revoked token live.
+# --------------------------------------------------------------------------- #
+
+
+def denylist_backend_available() -> bool:
+    """True iff a distributed backend (Valkey) is currently reachable.
+
+    Cheap synchronous probe — the resolver itself never raises, so a False
+    return is the normal "no L2 in this deployment / Valkey is down" signal.
+    Admin write/read paths use this to decide between operating and returning
+    503; the hot path does not consult it (the hot path's fail-open contract
+    handles a transient blip on its own).
+    """
+    return _distributed_backend() is not None
+
+
+class DenylistBackendUnavailable(RuntimeError):
+    """Raised by the admin denylist primitives when L2 is unreachable.
+
+    The hot path NEVER raises this — its contract is fail-open. Only the
+    operator-facing admin REST surface should catch this and surface 503.
+    """
+
+
+async def undeny(token_id: str) -> bool:
+    """Remove a token id from the denylist. Returns True iff an entry existed.
+
+    Raises :class:`DenylistBackendUnavailable` when the distributed backend
+    is absent so the admin REST surface can return 503 ("can't confirm the
+    removal landed") instead of silently no-op'ing.
+    """
+    backend = _distributed_backend()
+    if backend is None:
+        raise DenylistBackendUnavailable("denylist backend unavailable")
+    try:
+        return bool(await backend.clear(key=_DENYLIST_PREFIX + token_id))
+    except Exception as exc:
+        logger.warning("phantom_token: undeny failed for %s", token_id, exc_info=True)
+        raise DenylistBackendUnavailable(str(exc)) from exc
+
+
+async def list_denied(
+    *,
+    prefix: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Return active denylist entries, optionally filtered by token-id prefix.
+
+    Each entry is ``{"token_id": str, "reason": Optional[str],
+    "expires_at": Optional[float]}`` (``expires_at`` is the absolute Unix
+    epoch second the entry expires; ``None`` when the backend cannot report
+    per-key TTL). The list is capped at ``limit`` entries — Valkey may hold
+    many more, so the admin surface paginates / narrows by prefix.
+
+    Raises :class:`DenylistBackendUnavailable` when L2 is absent (the admin
+    REST surface translates to 503).
+
+    Best-effort backend probing: prefers the raw client's ``scan_iter`` +
+    ``pttl`` so we can return TTLs cheaply; falls back to an empty list when
+    the underlying backend does not expose either (a degraded but harmless
+    behaviour — the entries still exist and still kill the token).
+    """
+    backend = _distributed_backend()
+    if backend is None:
+        raise DenylistBackendUnavailable("denylist backend unavailable")
+
+    client = getattr(backend, "_client", None)
+    key_prefix = getattr(backend, "_prefix", "")
+    if client is None or not hasattr(client, "scan_iter"):
+        # Non-Valkey distributed backend (currently none in tree); return an
+        # empty listing rather than fabricate one — the entries still enforce
+        # via the hot path's ``EXISTS`` check.
+        return []
+
+    match = f"{key_prefix}{_DENYLIST_PREFIX}{prefix or ''}*"
+    out: List[Dict[str, Any]] = []
+    try:
+        async for raw_key in client.scan_iter(match=match, count=200):
+            if len(out) >= limit:
+                break
+            key_str = (
+                raw_key.decode("utf-8")
+                if isinstance(raw_key, (bytes, bytearray))
+                else str(raw_key)
+            )
+            if not key_str.startswith(key_prefix + _DENYLIST_PREFIX):
+                continue
+            token_id = key_str[len(key_prefix) + len(_DENYLIST_PREFIX):]
+
+            reason: Optional[str] = None
+            try:
+                raw_val = await client.get(key_str)
+                if raw_val is not None and raw_val != b"1":
+                    text = (
+                        raw_val.decode("utf-8")
+                        if isinstance(raw_val, (bytes, bytearray))
+                        else str(raw_val)
+                    )
+                    decoded = json.loads(text)
+                    if isinstance(decoded, dict):
+                        r = decoded.get("r")
+                        if isinstance(r, str):
+                            reason = r
+            except Exception:
+                logger.debug(
+                    "phantom_token: list_denied value-decode failed for %s",
+                    key_str,
+                    exc_info=True,
+                )
+
+            expires_at: Optional[float] = None
+            pttl = getattr(client, "pttl", None)
+            if pttl is not None:
+                try:
+                    ms = await pttl(key_str)
+                    if ms is not None and int(ms) > 0:
+                        expires_at = _now() + (int(ms) / 1000.0)
+                except Exception:
+                    logger.debug(
+                        "phantom_token: list_denied pttl failed for %s",
+                        key_str,
+                        exc_info=True,
+                    )
+
+            out.append(
+                {"token_id": token_id, "reason": reason, "expires_at": expires_at}
+            )
+    except Exception as exc:
+        logger.warning(
+            "phantom_token: list_denied scan failed (prefix=%s)", prefix, exc_info=True
+        )
+        raise DenylistBackendUnavailable(str(exc)) from exc
+
+    return out

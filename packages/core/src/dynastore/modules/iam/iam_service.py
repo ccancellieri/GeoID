@@ -900,6 +900,59 @@ class IamService:
             ttl_seconds=int(getattr(cfg, "denylist_ttl_seconds", 300)),
         )
 
+    # --- Token revocation: admin-facing inspect / remove (#1343) ---
+
+    async def deny_subject(
+        self,
+        subject: str,
+        *,
+        ttl_seconds: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> int:
+        """Add an admin-authored denylist entry. Returns the effective TTL.
+
+        ``subject`` is the storage-form token id (a raw ``jti`` for token kill
+        or ``sub:<subject-id>`` for principal-wide kill). The route layer
+        translates the wire ``jti:<id>`` / ``principal:<id>`` form into one of
+        these before calling. The requested TTL is clamped to the
+        ``IamScaleConfig.denylist_ttl_seconds`` ceiling: an operator cannot
+        keep an entry alive longer than the configured maximum (otherwise
+        Valkey would accumulate dead rows for stale tokens).
+
+        Raises :class:`phantom_token.DenylistBackendUnavailable` when L2 is
+        absent so the REST surface returns 503 ("can't confirm the kill
+        landed") rather than silently no-op'ing.
+        """
+        from dynastore.modules.iam import phantom_token
+        from dynastore.modules.iam.scale_config import get_iam_scale_config
+
+        cfg = await get_iam_scale_config()
+        ceiling = int(getattr(cfg, "denylist_ttl_seconds", 300))
+        if ttl_seconds is None or int(ttl_seconds) <= 0:
+            effective = ceiling
+        else:
+            effective = min(int(ttl_seconds), ceiling)
+        if not phantom_token.denylist_backend_available():
+            raise phantom_token.DenylistBackendUnavailable(
+                "denylist backend unavailable"
+            )
+        await phantom_token.deny(subject, ttl_seconds=effective, reason=reason)
+        return effective
+
+    async def undeny_subject(self, subject: str) -> bool:
+        """Remove a denylist entry. Returns True iff an entry existed."""
+        from dynastore.modules.iam import phantom_token
+
+        return await phantom_token.undeny(subject)
+
+    async def list_denylist(
+        self, *, prefix: Optional[str] = None, limit: int = 100,
+    ) -> list:
+        """Return active denylist entries (capped, optionally prefix-filtered)."""
+        from dynastore.modules.iam import phantom_token
+
+        return await phantom_token.list_denied(prefix=prefix, limit=limit)
+
     # --- Middleware Helpers ---
 
     def extract_token_from_request(self, request: Any) -> Optional[str]:

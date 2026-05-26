@@ -34,10 +34,16 @@ from dynastore.models.protocols.policies import (
     Policy, Role, Principal,
     RoleCreate, RoleUpdate, RoleResponse,
     PrincipalResponse, AssignRoleRequest, CreateBindingRequest,
+    DenylistEntryRequest, DenylistEntryResponse,
     PermissionProtocol,
 )
 
-from dynastore.extensions.iam.guards import ensure_privileged_role_assignment
+from dynastore.extensions.iam.guards import (
+    ensure_privileged_role_assignment,
+    security_context_from_request,
+)
+from dynastore.models.protocols.authorization import Permission
+from dynastore.modules.iam.authorization import require_permission
 
 from dynastore.models.protocols.policies import (
     PolicyCreate, PolicyUpdate, PolicyResponse,
@@ -77,6 +83,59 @@ def _iam() -> IamService:
     if mgr is None:
         raise HTTPException(status_code=503, detail="Auth service not available.")
     return mgr
+
+
+def _denylist_subject_to_storage(subject: str) -> str:
+    """Translate a wire-form denylist subject to its storage key.
+
+    The hot path (``authenticate_and_get_role``) probes the denylist with
+    the raw ``jti`` for token kills and the ``sub:<subject-id>`` prefix for
+    principal-wide kills (matching ``revoke_principal``). The admin REST
+    surface accepts an explicit kind prefix on the wire so the operator
+    can never ambiguously kill the wrong thing:
+
+    * ``"jti:<id>"``       → ``"<id>"``         (raw jti, hot-path
+                                                ``is_denied(jti)``)
+    * ``"principal:<id>"`` → ``"sub:<id>"``     (hot-path
+                                                ``is_denied("sub:" + sub)``)
+    """
+    if subject.startswith("jti:"):
+        return subject[len("jti:"):]
+    if subject.startswith("principal:"):
+        return "sub:" + subject[len("principal:"):]
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            "Denylist subject must be prefixed with 'jti:' (token id) "
+            "or 'principal:' (subject id)."
+        ),
+    )
+
+
+def _denylist_storage_to_subject(storage_key: str) -> str:
+    """Inverse of :func:`_denylist_subject_to_storage` for GET responses."""
+    if storage_key.startswith("sub:"):
+        return "principal:" + storage_key[len("sub:"):]
+    return "jti:" + storage_key
+
+
+async def _ensure_sysadmin(request: Request) -> None:
+    """Hard sysadmin-only guard for security-sensitive admin surfaces.
+
+    Distinct from :func:`ensure_privileged_role_assignment` (which is
+    target-role-conditional — it only kicks in when the bound role is
+    privileged): denylist mutations carry no target role, every call must be
+    sysadmin regardless. The wider ``admin_access`` policy allowing
+    ``admin`` + ``sysadmin`` is therefore *not* enough for these routes.
+    """
+    ctx = security_context_from_request(request)
+    try:
+        await require_permission(ctx, Permission.SYSADMIN)
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only System Administrators can manage this resource.",
+        )
 
 
 async def _is_catalog_only_admin(request: Request) -> bool:
@@ -1114,6 +1173,123 @@ class AdminService(ExtensionProtocol):
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+    # ---- IAM phantom-token denylist (#1343 — operator-facing immediate
+    #      revocation surface). Sysadmin-only: every route below adds an
+    #      explicit gate via ``_ensure_sysadmin``; the wider ``admin_access``
+    #      policy that opens this extension to platform admins is *not*
+    #      enough — a token kill is a security-sensitive action and the
+    #      catalog-admin tier must not reach it. Mutations FAIL CLOSED on
+    #      Valkey unreachable: an operator must know whether their kill
+    #      landed (POST → 503) and whether their un-deny landed (DELETE →
+    #      503), so the path here deliberately diverges from the hot path's
+    #      fail-open contract (a denylist read miss must not lock every
+    #      caller out, but a denylist write miss must not silently no-op).
+
+    @router.post(
+        "/iam/denylist",
+        status_code=201,
+        summary="Add an entry to the phantom-token revocation denylist",
+        response_model=DenylistEntryResponse,
+    )
+    async def add_denylist_entry(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        body: DenylistEntryRequest,
+    ):
+        await _ensure_sysadmin(request)
+        storage_subject = _denylist_subject_to_storage(body.subject)
+        mgr = _iam()
+        from dynastore.modules.iam.phantom_token import DenylistBackendUnavailable
+        try:
+            effective_ttl = await mgr.deny_subject(
+                storage_subject, ttl_seconds=body.ttl_seconds, reason=body.reason,
+            )
+        except DenylistBackendUnavailable:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Denylist backend (Valkey) is unavailable; "
+                    "cannot confirm the revocation landed."
+                ),
+            )
+        from time import time as _t
+        return DenylistEntryResponse(
+            subject=body.subject,
+            reason=body.reason,
+            expires_at=_t() + float(effective_ttl),
+        )
+
+    @router.get(
+        "/iam/denylist",
+        summary="List active phantom-token denylist entries",
+    )
+    async def list_denylist_entries(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        subject: Optional[str] = Query(
+            None,
+            description=(
+                "Optional subject prefix filter, in wire form "
+                "(``jti:<id>`` / ``principal:<id>`` or any leading substring)."
+            ),
+        ),
+        limit: int = Query(100, ge=1, le=500),
+    ):
+        await _ensure_sysadmin(request)
+        mgr = _iam()
+        storage_prefix: Optional[str] = None
+        if subject:
+            # Translate the wire-form prefix to the storage-form prefix so
+            # the scan matches. A naked prefix that does not pick a kind is
+            # passed through verbatim (operators occasionally want to scan
+            # everything beginning with a literal jti substring).
+            if subject.startswith("principal:"):
+                storage_prefix = "sub:" + subject[len("principal:"):]
+            elif subject.startswith("jti:"):
+                storage_prefix = subject[len("jti:"):]
+            else:
+                storage_prefix = subject
+        from dynastore.modules.iam.phantom_token import DenylistBackendUnavailable
+        try:
+            rows = await mgr.list_denylist(prefix=storage_prefix, limit=limit)
+        except DenylistBackendUnavailable:
+            raise HTTPException(
+                status_code=503,
+                detail="Denylist backend (Valkey) is unavailable.",
+            )
+        return [
+            DenylistEntryResponse(
+                subject=_denylist_storage_to_subject(r["token_id"]),
+                reason=r.get("reason"),
+                expires_at=r.get("expires_at"),
+            )
+            for r in rows
+        ]
+
+    @router.delete(
+        "/iam/denylist/{subject:path}",
+        status_code=204,
+        summary="Remove an entry from the phantom-token revocation denylist",
+    )
+    async def remove_denylist_entry(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        subject: str,
+    ):
+        await _ensure_sysadmin(request)
+        mgr = _iam()
+        storage_subject = _denylist_subject_to_storage(subject)
+        from dynastore.modules.iam.phantom_token import DenylistBackendUnavailable
+        try:
+            await mgr.undeny_subject(storage_subject)
+        except DenylistBackendUnavailable:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Denylist backend (Valkey) is unavailable; "
+                    "cannot confirm the removal landed."
+                ),
+            )
+        # DELETE is idempotent: whether or not an entry actually existed,
+        # the post-condition ("entry is absent") holds → 204.
 
     # ---- Collection-scope bindings (#1342 — generic role|policy grant
     #      with effect / validity / per-binding quota, scoped to a

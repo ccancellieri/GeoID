@@ -46,10 +46,14 @@ __all__ = [
     "RoleUpdate",
     "RoleResponse",
     "AssignRoleRequest",
+    "CreateBindingRequest",
     "PrincipalResponse",
     "PolicyCreate",
     "PolicyUpdate",
     "PolicyResponse",
+    # Phantom-token denylist admin DTOs (#1343).
+    "DenylistEntryRequest",
+    "DenylistEntryResponse",
 ]
 
 
@@ -124,6 +128,70 @@ class PrincipalResponse(BaseModel):
     display_name: Optional[str] = None
     roles: List[str] = Field(default_factory=list)
     is_active: bool = True
+
+
+# --- Phantom-token denylist admin DTOs (#1343) ---
+#
+# The denylist is the immediate-revocation companion to the phantom-token
+# resolution cache: until the natural access-token TTL elapses, a validated
+# token can be killed platform-wide by adding its ``jti`` (or, for a
+# principal-wide kill, its ``sub``) to the Valkey denylist. The hot path
+# rejects with 401 on every pod within one Valkey ``EXISTS`` round-trip.
+# This admin surface lets an operator add / inspect / clear those entries
+# without poking the cache directly.
+
+
+class DenylistEntryRequest(BaseModel):
+    """An operator-authored token revocation.
+
+    ``subject`` MUST be one of:
+
+    * ``"jti:<token-id>"`` — revoke one specific token by its ``jti`` claim.
+    * ``"principal:<subject-id>"`` — revoke every currently-issued token for
+      a principal (subject id, as it appears in the JWT ``sub`` claim).
+
+    ``ttl_seconds`` is clamped server-side to the
+    :attr:`IamScaleConfig.denylist_ttl_seconds` ceiling — an operator cannot
+    keep a kill alive longer than the configured maximum. ``None`` defaults
+    to the ceiling, which is normally aligned with the access-token TTL so
+    the entry expires alongside the token it kills.
+
+    ``reason`` is a free-form audit string surfaced by ``GET`` listings;
+    it has no enforcement effect.
+    """
+
+    subject: str = Field(
+        description=(
+            "Revocation subject: ``jti:<token-id>`` for a single token "
+            "or ``principal:<subject-id>`` for every token of a principal."
+        ),
+        min_length=5,
+    )
+    ttl_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Requested TTL (seconds). Clamped to "
+            "``IamScaleConfig.denylist_ttl_seconds``; default = ceiling."
+        ),
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        max_length=512,
+        description="Free-form audit reason surfaced by GET listings.",
+    )
+
+
+class DenylistEntryResponse(BaseModel):
+    """An active denylist entry as returned by ``GET /admin/iam/denylist``.
+
+    ``expires_at`` is the absolute Unix epoch second the entry will be
+    auto-purged; ``None`` when the backend cannot report per-key TTL.
+    """
+
+    subject: str
+    reason: Optional[str] = None
+    expires_at: Optional[float] = None
 
 
 # --- Policy wire DTOs ---

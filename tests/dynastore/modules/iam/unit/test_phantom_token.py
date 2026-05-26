@@ -449,6 +449,143 @@ async def test_deny_no_backend_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 12b. denylist admin primitives (#1343 follow-up: REST surface)
+# --------------------------------------------------------------------------- #
+class _FakeAdminBackend(FakeCountingBackend):
+    """FakeCountingBackend + ``clear(key=)`` and a stub ``_client.scan_iter``
+    so the admin primitives can be exercised without a real Valkey."""
+
+    def __init__(self, *, ttls_ms: Optional[Dict[str, int]] = None) -> None:
+        super().__init__()
+        self._ttls_ms = ttls_ms or {}
+        self._prefix = ""
+        self._client = self  # we play both roles
+        self.raise_on_clear = False
+        self.raise_on_scan = False
+
+    async def clear(
+        self,
+        *,
+        key: Optional[str] = None,
+        namespace: Optional[str] = None,
+        tags: Optional[Any] = None,
+    ) -> bool:
+        if self.raise_on_clear:
+            raise RuntimeError("boom-clear")
+        if key is not None:
+            return self.store.pop(key, None) is not None
+        return False
+
+    # _client.scan_iter / pttl / get surface — admin LIST uses these.
+    async def scan_iter(self, *, match: str, count: int = 100):  # noqa: D401
+        if self.raise_on_scan:
+            raise RuntimeError("boom-scan")
+        # very small glob: only the trailing "*" wildcard
+        if match.endswith("*"):
+            prefix = match[:-1]
+            for k in list(self.store.keys()):
+                if k.startswith(prefix):
+                    yield k.encode("utf-8")
+        else:
+            if match in self.store:
+                yield match.encode("utf-8")
+
+    async def pttl(self, key: str) -> Optional[int]:
+        return self._ttls_ms.get(key)
+
+
+@pytest.mark.asyncio
+async def test_denylist_backend_available_reflects_l2(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, None)
+    assert phantom_token.denylist_backend_available() is False
+    _install(monkeypatch, _FakeAdminBackend())
+    assert phantom_token.denylist_backend_available() is True
+
+
+@pytest.mark.asyncio
+async def test_undeny_returns_true_when_entry_existed(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _FakeAdminBackend()
+    _install(monkeypatch, backend)
+    await phantom_token.deny("tok1", ttl_seconds=300)
+    assert await phantom_token.undeny("tok1") is True
+    assert await phantom_token.is_denied("tok1") is False
+
+
+@pytest.mark.asyncio
+async def test_undeny_returns_false_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _FakeAdminBackend()
+    _install(monkeypatch, backend)
+    assert await phantom_token.undeny("nope") is False
+
+
+@pytest.mark.asyncio
+async def test_undeny_no_backend_raises_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, None)
+    with pytest.raises(phantom_token.DenylistBackendUnavailable):
+        await phantom_token.undeny("tok1")
+
+
+@pytest.mark.asyncio
+async def test_undeny_backend_error_raises_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _FakeAdminBackend()
+    backend.raise_on_clear = True
+    _install(monkeypatch, backend)
+    with pytest.raises(phantom_token.DenylistBackendUnavailable):
+        await phantom_token.undeny("tok1")
+
+
+@pytest.mark.asyncio
+async def test_list_denied_with_reason_and_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _FakeAdminBackend(ttls_ms={"iam:denylist:tok1": 250_000})
+    _install(monkeypatch, backend)
+    await phantom_token.deny("tok1", ttl_seconds=300, reason="leaked")
+    rows = await phantom_token.list_denied()
+    assert len(rows) == 1
+    assert rows[0]["token_id"] == "tok1"
+    assert rows[0]["reason"] == "leaked"
+    assert rows[0]["expires_at"] is not None and rows[0]["expires_at"] > 0
+
+
+@pytest.mark.asyncio
+async def test_list_denied_prefix_filters_at_scan_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _FakeAdminBackend()
+    _install(monkeypatch, backend)
+    await phantom_token.deny("tok-A", ttl_seconds=300)
+    await phantom_token.deny("sub:user-1", ttl_seconds=300)
+    rows = await phantom_token.list_denied(prefix="sub:")
+    assert [r["token_id"] for r in rows] == ["sub:user-1"]
+
+
+@pytest.mark.asyncio
+async def test_list_denied_no_backend_raises_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, None)
+    with pytest.raises(phantom_token.DenylistBackendUnavailable):
+        await phantom_token.list_denied()
+
+
+@pytest.mark.asyncio
+async def test_list_denied_scan_error_raises_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _FakeAdminBackend()
+    backend.raise_on_scan = True
+    _install(monkeypatch, backend)
+    with pytest.raises(phantom_token.DenylistBackendUnavailable):
+        await phantom_token.list_denied()
+
+
+@pytest.mark.asyncio
+async def test_list_denied_empty_when_backend_has_no_scan_iter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Valkey distributed backend (no ``_client.scan_iter``) returns an
+    empty listing rather than synthesise one — entries still enforce via the
+    hot path's EXISTS check."""
+    backend = FakeCountingBackend()  # plain — no ``_client`` attribute
+    _install(monkeypatch, backend)
+    rows = await phantom_token.list_denied()
+    assert rows == []
+
+
+# --------------------------------------------------------------------------- #
 # 13. _resolution_backend wiring — builds a memoized tiered backend over L2
 # --------------------------------------------------------------------------- #
 def test_resolution_backend_is_tiered_and_memoized(monkeypatch: pytest.MonkeyPatch) -> None:
