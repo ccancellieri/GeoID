@@ -87,18 +87,59 @@ async def get_service_account_token(
 
 def is_keycloak_available(issuer_url: str | None = None) -> bool:
     """
-    Synchronous check whether Keycloak is reachable.
+    Decide whether Keycloak integration tests should run.
+
+    These tests need both a reachable Keycloak sidecar AND a test
+    application wired to trust the same issuer/JWKS — the latter is
+    not guaranteed by the default in-process ``app_lifespan`` fixture,
+    so a reachable sidecar is necessary but not sufficient.
+
+    Gating rules (fail-closed, fast, no flakiness):
+      1. Opt-in env: ``KEYCLOAK_INTEGRATION=1`` must be set. Without it,
+         tests skip even if Keycloak is up — avoids spurious 401s when
+         the test app's OIDC config does not match the local sidecar's
+         issuer URL.
+      2. The realm's ``.well-known/openid-configuration`` endpoint must
+         return 200 within a 2 s timeout (sidecar is up and realm is
+         imported).
+      3. A ``client_credentials`` token grant against the test client
+         must succeed (client exists, secret matches).
+
+    On any failure (env unset, network error, 404 realm, bad secret,
+    timeout) returns False so dependent integration tests SKIP with a
+    clear reason rather than fail with an opaque 401.
 
     Use as a pytest skip marker::
 
         pytestmark = pytest.mark.skipif(
             not is_keycloak_available(),
-            reason="Keycloak not available"
+            reason="Keycloak sidecar not reachable / usable",
         )
     """
+    if os.getenv("KEYCLOAK_INTEGRATION", "").strip() not in {"1", "true", "True"}:
+        return False
+
     url = (issuer_url or _DEFAULT_ISSUER).rstrip("/")
     try:
-        resp = httpx.get(f"{url}/.well-known/openid-configuration", timeout=5.0)
-        return resp.status_code == 200
+        resp = httpx.get(
+            f"{url}/.well-known/openid-configuration", timeout=2.0
+        )
+        if resp.status_code != 200:
+            return False
+    except Exception:
+        return False
+
+    # Reachable — but also confirm the realm/client is wired for tokens.
+    try:
+        token_resp = httpx.post(
+            f"{url}/protocol/openid-connect/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": _DEFAULT_CLIENT_ID,
+                "client_secret": _DEFAULT_CLIENT_SECRET,
+            },
+            timeout=2.0,
+        )
+        return token_resp.status_code == 200
     except Exception:
         return False

@@ -10,6 +10,7 @@ import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 
 from tests.dynastore.test_utils.keycloak import (
+    _DEFAULT_ISSUER,
     get_user_token,
     get_service_account_token,
     is_keycloak_available,
@@ -17,7 +18,10 @@ from tests.dynastore.test_utils.keycloak import (
 
 pytestmark = pytest.mark.skipif(
     not is_keycloak_available(),
-    reason="Keycloak not available",
+    reason=(
+        f"Keycloak integration disabled: set KEYCLOAK_INTEGRATION=1 and "
+        f"ensure Keycloak is reachable at {_DEFAULT_ISSUER}"
+    ),
 )
 
 
