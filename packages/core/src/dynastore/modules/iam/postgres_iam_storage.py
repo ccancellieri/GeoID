@@ -87,12 +87,17 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         refresh tokens, policies (partitioned), audit log, and the
         nightly prune cron job.
 
-        Tenant schemas only get the per-scope role registry + grants
-        table; principals/identity_links/refresh_tokens/audit live
-        platform-only. The catalog provisioning lifecycle hook
-        (`catalog_service._build_tenant_core_ddl_batch`) is responsible
-        for the tenant-side bootstrap; this method covers the platform
-        side.
+        Tenant schemas only get the per-scope IAM tables — `roles`,
+        `role_hierarchy`, `grants`, and the partitioned `policies` table
+        (consumed via `PolicyService._resolve_schema(catalog_id)`).
+        `principals` / `identity_links` / `refresh_tokens` / `audit_log` /
+        `usage_counters` live platform-only: every read/write path pins
+        `schema="iam"`, so the tenant copies were dead weight. The
+        catalog provisioning lifecycle hook
+        (`catalog_service._build_tenant_core_ddl_batch`) bootstraps the
+        tenant subset; this method overlaps with it (idempotent CREATE
+        TABLE IF NOT EXISTS) and adds the `policies` table that the
+        catalog hook doesn't.
 
         Uses DDLBatch sentinel check — on warm start, 1 query confirms
         all tables exist.
@@ -128,21 +133,47 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         # once the table exists, so existing flat tables stay flat.
         from .scale_config import usage_counter_hash_partitions
 
-        _hash_parts = usage_counter_hash_partitions() if schema == "iam" else 1
-        _usage_counter_steps = build_usage_counters_steps(_hash_parts)
-        await DDLBatch(
-            sentinel=CREATE_USAGE_COUNTERS_TABLE,
-            steps=[
+        # Split platform-only DDL from per-tenant DDL. Tenant schemas only
+        # need the per-scope IAM tables (`roles`, `role_hierarchy`,
+        # `grants`, `policies`); identity / token / audit / counter tables
+        # are platform-global and live exclusively in `iam`. Historically
+        # this batch ran unconditionally for every schema, which left a
+        # set of empty `{tenant}.principals` / `identity_links` /
+        # `refresh_tokens` / `audit_log` / `usage_counters` tables in
+        # every catalog schema — never written, never read (every code
+        # path pins `schema="iam"`). Splitting here eliminates them on
+        # fresh DBs.
+        is_platform = schema == "iam"
+
+        tenant_steps = [
+            CREATE_ROLES_TABLE,
+            CREATE_ROLE_HIERARCHY_TABLE,
+            CREATE_GRANTS_TABLE,
+            CREATE_POLICIES_TABLE,
+        ]
+
+        if is_platform:
+            _hash_parts = usage_counter_hash_partitions()
+            _usage_counter_steps = build_usage_counters_steps(_hash_parts)
+            platform_steps = [
                 CREATE_PRINCIPALS_TABLE,
                 CREATE_IDENTITY_LINKS_TABLE,
-                CREATE_ROLES_TABLE,
-                CREATE_ROLE_HIERARCHY_TABLE,
-                CREATE_GRANTS_TABLE,
                 CREATE_REFRESH_TOKENS_TABLE,
-                CREATE_POLICIES_TABLE,
                 CREATE_AUDIT_LOG_TABLE,
                 *_usage_counter_steps,
-            ],
+            ]
+            sentinel = CREATE_USAGE_COUNTERS_TABLE
+        else:
+            platform_steps = []
+            # Tenant sentinel: `grants` is the newest of the per-scope
+            # tables; if it exists the whole batch can be skipped on warm
+            # DBs (mirrors the cold-cut rationale above, scoped to the
+            # tenant set).
+            sentinel = CREATE_GRANTS_TABLE
+
+        await DDLBatch(
+            sentinel=sentinel,
+            steps=[*tenant_steps, *platform_steps],
         ).execute(conn, schema=schema)
 
         # 1b. Grants indexes — the unique index expresses the (subject,
