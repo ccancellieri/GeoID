@@ -282,6 +282,20 @@ select { cursor: pointer; }
   letter-spacing: 0.1em;
 }
 
+/* Ghost variant — used for low-emphasis, read-only affordances next to
+ * primary / danger actions (e.g. the "Why?" explainer on a binding row
+ * sits beside Revoke without competing for attention). */
+.btn-ghost {
+  background: transparent;
+  color: var(--ink-soft);
+  border: 1px solid transparent;
+}
+.btn-ghost:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--rule);
+  background: var(--paper);
+}
+
 /* --- Tables ----------------------------------------------------------- */
 
 table {
@@ -1009,6 +1023,17 @@ tbody tr.row-deny > td:first-child {
   padding-left: 8px;
 }
 
+/* Winning grant in the effective-permissions explainer trace — subtle
+ * background tint so the deciding row pops without overriding .row-deny
+ * for deny winners (both classes coexist on the same <tr>). */
+tbody tr.row-winner td {
+  background: rgba(127, 127, 60, 0.10);
+  font-weight: 600;
+}
+tbody tr.row-winner.row-deny td {
+  background: rgba(196, 78, 50, 0.14);
+}
+
 /* JSON cell — compact, wraps long values, monospace. */
 .cell-json {
   margin: 0;
@@ -1050,6 +1075,41 @@ tbody tr.row-deny > td:first-child {
   min-width: 110px;
   padding: 4px 8px;
   font-size: 0.78rem;
+}
+
+/* --- Effective-permissions explainer modal (#1390) -------------------- */
+
+/* Native <dialog> for the per-row "Why?" affordance. Sized generously so
+ * the grants-considered trace table breathes; the inner .plate carries
+ * the page's typography so the dialog matches the rest of the surface. */
+.explainer-modal {
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  padding: 0;
+  max-width: 980px;
+  width: 92vw;
+  max-height: 90vh;
+  overflow: auto;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+.explainer-modal::backdrop {
+  background: rgba(20, 18, 16, 0.45);
+}
+.explainer-plate { margin: 0; border: 0; }
+
+.explainer-verdict {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 4px;
+}
+.explainer-reason {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  margin: 6px 0 12px;
+  word-break: break-word;
 }
 
 /* Accessibility: respect reduced motion */

@@ -295,6 +295,38 @@ export const deleteGrant = (scope, { subjectId, objectKind, objectRef, effect = 
     })}`,
   );
 
+// ----- IAM effective-permissions explainer (#1390 frontend half) -----
+//
+// Diagnostic: "why can / can't principal P perform action A on resource R?".
+// Mirrors the backend GET /admin/iam/effective contract (#1389). Every
+// query value is run through encodeURIComponent explicitly so principal
+// ids, catalog ids and resource refs containing unusual characters
+// (spaces, ampersands, slashes) can't smuggle extra query keys or path
+// fragments past the server's typed query params. Sysadmin-only on the
+// server; we let the 403 surface to the page rather than gating here.
+export const fetchEffectivePermissions = ({
+  principalId,
+  catalogId,
+  collectionId,
+  action,
+  resourceKind,
+  resourceRef,
+} = {}) => {
+  const parts = [];
+  const push = (key, value) => {
+    if (value == null || value === "") return;
+    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+  };
+  push("principal_id", principalId);
+  push("action", action);
+  push("catalog_id", catalogId);
+  push("collection_id", collectionId);
+  push("resource_kind", resourceKind);
+  push("resource_ref", resourceRef);
+  const query = parts.length ? `?${parts.join("&")}` : "";
+  return getJSON(`/admin/iam/effective${query}`);
+};
+
 // ----- STAC write endpoints (create catalog / collection / features) -----
 
 export const createStacCatalog = (definition) => postJSON(`/catalogs`, definition);

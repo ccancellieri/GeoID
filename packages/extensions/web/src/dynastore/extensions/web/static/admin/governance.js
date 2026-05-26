@@ -8,6 +8,7 @@ import {
   listPolicies, createPolicy, updatePolicy, deletePolicy,
   searchPrincipals,
   listGrants, createGrant, deleteGrant,
+  fetchEffectivePermissions,
   getCatalogProvisioning,
 } from "../common/api.js";
 import { mountContextBar } from "../common/context-bar.js";
@@ -653,6 +654,17 @@ function renderBindings() {
 
     const actions = document.createElement("td");
     actions.className = "table-actions";
+    // "Why?" affordance — opens the effective-permissions explainer
+    // pre-seeded with this binding's scope. Available regardless of
+    // canWrite: it's a read-only diagnostic, useful exactly when the
+    // operator can't mutate but needs to understand the verdict.
+    const why = document.createElement("button");
+    why.type = "button";
+    why.className = "btn btn-ghost btn-xs";
+    why.textContent = "Why?";
+    why.setAttribute("aria-label", "Explain effective permissions for this binding");
+    why.addEventListener("click", () => openExplainer(row));
+    actions.appendChild(why);
     const del = document.createElement("button");
     del.className = "btn btn-danger btn-xs";
     del.textContent = "Revoke";
@@ -725,6 +737,213 @@ async function revokeBinding(row) {
   } catch (e) {
     setStatus("#binding-status", `Revoke failed: ${e.message}`, "err");
   }
+}
+
+// ---- Effective-permissions explainer (#1390) ----------------------------
+//
+// "Why?" per binding row → opens a dialog that asks for the action verb,
+// then calls GET /admin/iam/effective and renders the trace returned by
+// the same evaluate_access walk the hot path uses. Every server-derived
+// field is set via textContent — no innerHTML on response data.
+
+// Scope captured from the row at click time; the modal carries it across
+// the "Re-run with different action" loop.
+const explainer = {
+  principalId: null,
+  principalLabel: null,
+  catalogId: null,
+  collectionId: null,
+  resourceKind: null,
+  resourceRef: null,
+};
+
+function openExplainer(row) {
+  if (!state.bindingSubject) return;
+  explainer.principalId = state.bindingSubject.id;
+  explainer.principalLabel = state.bindingSubject.label;
+  // Scope = the same axis the bindings table is scoped to (platform vs
+  // catalog), not the binding's own resource scope. resource_kind /
+  // resource_ref reflect the binding's narrower scope when present so
+  // the trace lines up with a collection-scoped grant.
+  explainer.catalogId = scopeCatalogId();
+  explainer.collectionId = (row && row.resource_kind === "collection")
+    ? (row.resource_ref || null)
+    : null;
+  explainer.resourceKind = (row && row.resource_kind) || null;
+  explainer.resourceRef = (row && row.resource_ref) || null;
+
+  const subjectLine =
+    `Subject: ${explainer.principalLabel}  (${explainer.principalId})`
+    + (explainer.catalogId ? `  ·  catalog ${explainer.catalogId}` : "  ·  platform")
+    + (explainer.resourceKind && explainer.resourceRef
+        ? `  ·  ${explainer.resourceKind} ${explainer.resourceRef}`
+        : "");
+  $("#explainer-subject").textContent = subjectLine;
+  $("#explainer-action").value = "GET";
+  $("#explainer-action-custom").value = "";
+  $("#explainer-action-custom").disabled = true;
+  $("#explainer-result").style.display = "none";
+  clearNode($("#explainer-grants tbody"));
+  setStatus("#explainer-status", "", "");
+
+  const dlg = $("#explainer-modal");
+  if (typeof dlg.showModal === "function") dlg.showModal();
+  else dlg.setAttribute("open", "");
+}
+
+function closeExplainer() {
+  const dlg = $("#explainer-modal");
+  if (typeof dlg.close === "function") dlg.close();
+  else dlg.removeAttribute("open");
+}
+
+function selectedExplainerAction() {
+  const sel = $("#explainer-action").value;
+  if (sel === "__custom__") return $("#explainer-action-custom").value.trim();
+  return sel;
+}
+
+async function runExplainer(e) {
+  if (e) e.preventDefault();
+  const action = selectedExplainerAction();
+  if (!action) {
+    setStatus("#explainer-status", "Pick or type an action to evaluate.", "err");
+    return;
+  }
+  setStatus("#explainer-status", "Evaluating…", "");
+  try {
+    const data = await fetchEffectivePermissions({
+      principalId: explainer.principalId,
+      catalogId: explainer.catalogId,
+      collectionId: explainer.collectionId,
+      action,
+      resourceKind: explainer.resourceKind,
+      resourceRef: explainer.resourceRef,
+    });
+    setStatus("#explainer-status", "", "");
+    renderExplainerResult(data);
+  } catch (err) {
+    setStatus("#explainer-status", `Failed: ${err.message}`, "err");
+  }
+}
+
+// Returns the index of the winning grant in `grants_considered`, or -1
+// if no grant matched. When deny_precedence_applied=true the winner is
+// the first matched DENY; otherwise it's the first matched ALLOW. This
+// mirrors the same ranking the engine logs as the decision reason.
+function findWinningGrantIndex(data) {
+  if (!data || !Array.isArray(data.grants_considered)) return -1;
+  const winnerEffect = (data.decision === "deny"
+                        && data.deny_precedence_applied)
+    ? "deny"
+    : (data.decision === "allow" ? "allow" : null);
+  if (!winnerEffect) return -1;
+  for (let i = 0; i < data.grants_considered.length; i++) {
+    const g = data.grants_considered[i];
+    if (g.matched && (g.effect || "allow") === winnerEffect) return i;
+  }
+  return -1;
+}
+
+function renderExplainerResult(data) {
+  const result = $("#explainer-result");
+  result.style.display = "";
+
+  const verdict = data.decision === "allow" ? "ALLOW" : "DENY";
+  const chip = $("#explainer-verdict-chip");
+  chip.textContent = verdict;
+  chip.className = `chip effect-${verdict}`;
+
+  $("#explainer-deny-note").style.display =
+    data.deny_precedence_applied ? "" : "none";
+
+  // decision_reason is server-derived — textContent only.
+  $("#explainer-reason").textContent = data.decision_reason || "";
+
+  const tbody = $("#explainer-grants tbody");
+  clearNode(tbody);
+  const grants = Array.isArray(data.grants_considered) ? data.grants_considered : [];
+  if (!grants.length) {
+    const tr = document.createElement("tr");
+    tr.className = "empty-row";
+    const td = document.createElement("td");
+    td.colSpan = 8;
+    td.textContent = "No grants were walked for this request.";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  const winnerIdx = findWinningGrantIndex(data);
+  grants.forEach((g, idx) => {
+    const tr = document.createElement("tr");
+    const effect = (g.effect === "deny") ? "deny" : "allow";
+    if (idx === winnerIdx) {
+      // Mark the deciding grant. row-deny already exists for deny rows;
+      // row-winner is an additive highlight so the operator can spot the
+      // chosen row at a glance regardless of effect.
+      tr.classList.add("row-winner");
+      if (effect === "deny") tr.classList.add("row-deny");
+    }
+
+    const kindCell = document.createElement("td");
+    kindCell.textContent = g.object_kind || "policy";
+
+    const refCell = document.createElement("td");
+    const refCode = document.createElement("code");
+    refCode.textContent = g.object_ref || "—";
+    refCell.appendChild(refCode);
+
+    const effCell = document.createElement("td");
+    const effChip = document.createElement("span");
+    effChip.className = `chip effect-${effect === "deny" ? "DENY" : "ALLOW"}`;
+    effChip.textContent = effect;
+    effCell.appendChild(effChip);
+
+    const scopeCell = document.createElement("td");
+    if (g.resource_kind && g.resource_ref) {
+      scopeCell.textContent = `${g.resource_kind} ${g.resource_ref}`;
+    } else {
+      scopeCell.className = "muted";
+      scopeCell.textContent = "whole-catalog";
+    }
+
+    const matchedCell = document.createElement("td");
+    matchedCell.textContent = g.matched ? "✓" : "✗";
+    matchedCell.className = g.matched ? "" : "muted";
+
+    const whyCell = document.createElement("td");
+    whyCell.className = "muted";
+    whyCell.textContent = g.why_not || "";
+
+    const validityCell = document.createElement("td");
+    validityCell.className = "muted";
+    if (!g.valid_from && !g.valid_until) {
+      validityCell.textContent = "—";
+    } else {
+      const inWin = g.in_validity_window !== false;
+      validityCell.textContent = `${fmtDateTime(g.valid_from)} → ${fmtDateTime(g.valid_until)}`
+        + (inWin ? "" : " (out of window)");
+    }
+
+    const condCell = document.createElement("td");
+    const conds = Array.isArray(g.conditions_evaluated) ? g.conditions_evaluated : [];
+    if (!conds.length) {
+      condCell.className = "muted";
+      condCell.textContent = "—";
+    } else {
+      const pre = document.createElement("pre");
+      pre.className = "cell-json";
+      // Server-derived condition trace: pretty-print as JSON via
+      // textContent so neither the type strings nor the handler
+      // detail can carry markup into the DOM.
+      pre.textContent = JSON.stringify(conds, null, 2);
+      condCell.appendChild(pre);
+    }
+
+    tr.append(kindCell, refCell, effCell, scopeCell, matchedCell,
+              whyCell, validityCell, condCell);
+    tbody.appendChild(tr);
+  });
 }
 
 // --- Provisioning -------------------------------------------------------
@@ -913,6 +1132,20 @@ async function boot() {
       checkProvisioning();
     }
   });
+
+  // Explainer modal (#1390) — submit triggers the GET, close button
+  // dismisses, action select toggles the free-text fallback.
+  const explainerForm = $("#explainer-form");
+  if (explainerForm) {
+    explainerForm.addEventListener("submit", runExplainer);
+    $("#explainer-close-btn").addEventListener("click", closeExplainer);
+    $("#explainer-action").addEventListener("change", () => {
+      const custom = $("#explainer-action").value === "__custom__";
+      const input = $("#explainer-action-custom");
+      input.disabled = !custom;
+      if (custom) input.focus();
+    });
+  }
 }
 
 boot();

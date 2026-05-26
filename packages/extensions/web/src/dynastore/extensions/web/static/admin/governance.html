@@ -312,6 +312,79 @@
       currently no-ops; the corresponding UI is intentionally omitted until
       persistence lands. Tracked as a separate follow-up.
     </div>
+
+    <!-- Effective-permissions explainer (#1390) — per-row "Why?" affordance
+         on the bindings table opens this dialog, picks an action, then calls
+         GET /admin/iam/effective and renders the full trace returned by the
+         backend (#1389). Native <dialog> with the existing plate idiom. -->
+    <dialog id="explainer-modal" class="explainer-modal"
+            aria-labelledby="explainer-title">
+      <div class="plate explainer-plate">
+        <div class="plate-header">
+          <h3 id="explainer-title">Explain effective permission</h3>
+          <div class="plate-meta">GET /admin/iam/effective</div>
+        </div>
+        <p class="muted" id="explainer-subject"></p>
+        <form id="explainer-form" method="dialog">
+          <div class="form-row">
+            <div>
+              <label for="explainer-action">Action to evaluate</label>
+              <select id="explainer-action">
+                <option value="GET">GET</option>
+                <option value="POST">POST</option>
+                <option value="PUT">PUT</option>
+                <option value="PATCH">PATCH</option>
+                <option value="DELETE">DELETE</option>
+                <option value="__custom__">Custom…</option>
+              </select>
+            </div>
+            <div>
+              <label for="explainer-action-custom">
+                Custom action (HTTP verb or Action enum)
+              </label>
+              <input id="explainer-action-custom" type="text"
+                     placeholder="SEARCH" disabled>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn" type="submit" id="explainer-run-btn">
+              Explain
+            </button>
+            <button class="btn btn-secondary" type="button"
+                    id="explainer-close-btn">Close</button>
+            <span id="explainer-status" class="status"></span>
+          </div>
+        </form>
+
+        <div id="explainer-result" style="display:none">
+          <hr class="rule">
+          <div class="explainer-verdict">
+            <span id="explainer-verdict-chip" class="chip"></span>
+            <span id="explainer-deny-note" class="muted" style="display:none">
+              deny-precedence applied
+            </span>
+          </div>
+          <p id="explainer-reason" class="explainer-reason"></p>
+
+          <h4 class="ci-subhead">Grants considered (walk order)</h4>
+          <table id="explainer-grants">
+            <thead>
+              <tr>
+                <th>Object</th>
+                <th>Ref</th>
+                <th>Effect</th>
+                <th>Scope</th>
+                <th>Matched</th>
+                <th>Why not</th>
+                <th>Validity</th>
+                <th>Conditions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </dialog>
   </main>
 
   <script>
