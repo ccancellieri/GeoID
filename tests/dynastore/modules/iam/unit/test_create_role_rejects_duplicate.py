@@ -3,8 +3,8 @@
 `POST /admin/roles` previously routed straight to
 ``IamStorage.create_role`` whose SQL is ``INSERT ... ON CONFLICT (id) DO
 UPDATE SET ...``. That meant a second POST with the same role name
-silently overwrote ``policies`` + ``parent_roles`` of the existing role
-— easy to mistake for "create" and lose grant data.
+silently overwrote ``policies`` of the existing role — easy to mistake
+for "create" and lose grant data.
 
 After #631, ``IamService.create_role`` checks for an existing role
 first and raises ``ValueError`` if one is found, mirroring the
@@ -43,10 +43,10 @@ def _make_service(existing_role: Role | None) -> IamService:
 
 @pytest.mark.asyncio
 async def test_create_role_rejects_duplicate_name():
-    existing = Role(name="editor", description="seed", policies=[], parent_roles=[])
+    existing = Role(name="editor", description="seed", policies=[])
     svc = _make_service(existing_role=existing)
 
-    new = Role(name="editor", description="caller-supplied", policies=["p1"], parent_roles=["admin"])
+    new = Role(name="editor", description="caller-supplied", policies=["p1"])
     with pytest.raises(ValueError, match=r"Role 'editor' already exists"):
         await svc.create_role(new)
 
@@ -57,7 +57,7 @@ async def test_create_role_rejects_duplicate_name():
 async def test_create_role_inserts_when_name_is_free():
     svc = _make_service(existing_role=None)
 
-    new = Role(name="reviewer", description="d", policies=[], parent_roles=[])
+    new = Role(name="reviewer", description="d", policies=[])
     out = await svc.create_role(new)
 
     assert out.name == "reviewer"

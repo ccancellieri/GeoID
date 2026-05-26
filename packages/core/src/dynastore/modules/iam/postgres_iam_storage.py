@@ -145,18 +145,15 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             ],
         ).execute(conn, schema=schema)
 
-        # 1b. Grants resource-scope migration (always-run, idempotent).
-        #
-        # The CREATE TABLE batch above is skipped on warm DBs (sentinel
-        # hit), so these steps run unconditionally to bring existing
-        # grants tables up to the resource-scoped shape. Order matters:
-        #   add columns → drop the old auto-named UNIQUE constraint →
-        #   create the resource-aware UNIQUE index → create the lookup
-        #   index. The DROP is a str.format template (its {schema} sits in
-        #   a SQL string literal that the DDLQuery identifier-quoter would
-        #   mangle), wrapped in a fresh DDLQuery — same pattern as the
-        #   prune-function DDL below.
-        await ADD_GRANTS_RESOURCE_COLUMNS.execute(conn, schema=schema)
+        # 1b. Grants indexes — the unique index expresses the (subject,
+        # object, effect, resource) constraint and the partial index
+        # covers the resource-scoped lookup path. The DROP cleans up a
+        # pre-resource-scope auto-named UNIQUE constraint if one is
+        # carried in from an older snapshot; on a fresh DB it finds no
+        # matching constraint and is a no-op. The DROP is a str.format
+        # template (its {schema} sits in a SQL string literal that the
+        # DDLQuery identifier-quoter would mangle), wrapped in a fresh
+        # DDLQuery — same pattern as the prune-function DDL below.
         await DDLQuery(DROP_OLD_GRANTS_UNIQUE.format(schema=schema)).execute(conn)
         await CREATE_GRANTS_UNIQUE_WITH_RESOURCE.execute(conn, schema=schema)
         await CREATE_IDX_GRANTS_RESOURCE.execute(conn, schema=schema)
@@ -290,7 +287,6 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                     [p.model_dump() for p in principal.custom_policies]
                 ),
                 attributes=json.dumps(principal.attributes),
-                policy=None,  # Legacy policy field
             )
 
     async def get_principal(
@@ -315,7 +311,6 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 display_name=principal.display_name,
                 is_active=principal.is_active,
                 metadata=json.dumps(getattr(principal, "metadata", {})),
-                policy=None,
                 custom_policies=json.dumps(
                     [p.model_dump() for p in principal.custom_policies]
                 ),
@@ -568,7 +563,6 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                     principal, "identifier", principal.display_name
                 ),
                 metadata=json.dumps(getattr(principal, "metadata", {})),
-                policy=None,
             )
 
             await INSERT_IDENTITY_LINK.execute(
@@ -675,9 +669,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 id=role.id,
                 name=role.name,
                 description=role.description,
-                level=0,  # Legacy support
                 metadata=json.dumps(role.metadata),
-                parent_roles=json.dumps(role.parent_roles),
                 policies=json.dumps(role.policies),
             )
         await self._bump_binding_version(schema)
@@ -707,9 +699,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 schema=schema,
                 name=role.name,
                 description=role.description,
-                level=0,
                 metadata=json.dumps(role.metadata),
-                parent_roles=json.dumps(role.parent_roles),
                 policies=json.dumps(role.policies),
             )
         await self._bump_binding_version(schema)

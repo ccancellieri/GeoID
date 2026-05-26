@@ -50,8 +50,6 @@ CREATE_POLICIES_TABLE = DDLQuery("""
 
 
 CREATE_PARTITION_GLOBAL = DDLQuery('CREATE TABLE IF NOT EXISTS {schema}.policies_global PARTITION OF {schema}.policies FOR VALUES IN (\'global\');')
-CREATE_PARTITION_SYSADMIN = DDLQuery('CREATE TABLE IF NOT EXISTS {schema}.policies_sysadmin PARTITION OF {schema}.policies FOR VALUES IN (\'sysadmin\');')
-CREATE_PARTITION_AUTH = DDLQuery('CREATE TABLE IF NOT EXISTS {schema}.policies_auth PARTITION OF {schema}.policies FOR VALUES IN (\'auth\');')
 CREATE_PARTITION_DEFAULT = DDLQuery('CREATE TABLE IF NOT EXISTS {schema}.policies_default PARTITION OF {schema}.policies DEFAULT;')
 
 INSERT_POLICY = DQLQuery(
@@ -181,8 +179,6 @@ class PostgresPolicyStorage(AbstractPolicyStorage):
 
         # 2. Partitions (IF NOT EXISTS in SQL handles idempotency)
         await CREATE_PARTITION_GLOBAL.execute(conn, schema=schema)
-        await CREATE_PARTITION_SYSADMIN.execute(conn, schema=schema)
-        await CREATE_PARTITION_AUTH.execute(conn, schema=schema)
         await CREATE_PARTITION_DEFAULT.execute(conn, schema=schema)
 
     async def ensure_policy_partition(self, conn: DbResource, partition_key: str, schema: str = "iam"):

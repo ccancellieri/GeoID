@@ -63,20 +63,17 @@ class RoleCreate(BaseModel):
     name: str
     description: Optional[str] = None
     policies: List[str] = Field(default_factory=list)
-    parent_roles: List[str] = Field(default_factory=list)
 
 
 class RoleUpdate(BaseModel):
     description: Optional[str] = None
     policies: Optional[List[str]] = None
-    parent_roles: Optional[List[str]] = None
 
 
 class RoleResponse(BaseModel):
     name: str
     description: Optional[str] = None
     policies: List[str] = Field(default_factory=list)
-    parent_roles: List[str] = Field(default_factory=list)
 
 
 # --- Principal / assignment wire DTOs ---

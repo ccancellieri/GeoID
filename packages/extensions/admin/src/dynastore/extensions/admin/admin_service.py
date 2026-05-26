@@ -1475,7 +1475,6 @@ class AdminService(ExtensionProtocol):
                 name=r.name,
                 description=r.description,
                 policies=r.policies or [],
-                parent_roles=r.parent_roles or [],
             )
             for r in roles
         ]
@@ -1491,7 +1490,6 @@ class AdminService(ExtensionProtocol):
             name=role.name,
             description=role.description,
             policies=role.policies or [],
-            parent_roles=role.parent_roles or [],
         )
 
     @router.post("/roles", summary="Create a new role", status_code=201)
@@ -1501,7 +1499,6 @@ class AdminService(ExtensionProtocol):
             name=body.name,
             description=body.description,
             policies=body.policies,
-            parent_roles=body.parent_roles,
         )
         try:
             created = await mgr.create_role(role, catalog_id=catalog_id)
@@ -1509,7 +1506,7 @@ class AdminService(ExtensionProtocol):
             raise HTTPException(status_code=409, detail=str(e))
         return RoleResponse(
             name=created.name, description=created.description,
-            policies=created.policies or [], parent_roles=created.parent_roles or [],
+            policies=created.policies or [],
         )
 
     @router.put("/roles/{role_name}", summary="Update a role")
@@ -1527,14 +1524,12 @@ class AdminService(ExtensionProtocol):
             existing.description = body.description
         if body.policies is not None:
             existing.policies = body.policies
-        if body.parent_roles is not None:
-            existing.parent_roles = body.parent_roles
         updated = await mgr.update_role(existing, catalog_id=catalog_id)
         if updated is None:
             raise HTTPException(status_code=404, detail="Role not found after update.")
         return RoleResponse(
             name=updated.name, description=updated.description,
-            policies=updated.policies or [], parent_roles=updated.parent_roles or [],
+            policies=updated.policies or [],
         )
 
     @router.delete("/roles/{role_name}", status_code=204, summary="Delete a role")

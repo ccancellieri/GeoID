@@ -13,10 +13,10 @@ the per-extension ``*_public_access`` policies, but the seed-declared
 ``public_access`` (the policy that actually whitelists ``/health``) was
 clobbered.
 
-Fix: on conflict, ``policies`` and ``parent_roles`` are recomputed as
-the UNION of the existing JSONB array and EXCLUDED's. These tests pin
-the SQL fragments so a future refactor can't silently flip the clause
-back to replace-on-conflict.
+Fix: on conflict, ``policies`` is recomputed as the UNION of the
+existing JSONB array and EXCLUDED's. These tests pin the SQL fragments
+so a future refactor can't silently flip the clause back to
+replace-on-conflict.
 """
 
 from __future__ import annotations
@@ -70,23 +70,6 @@ def test_insert_role_unions_policies_on_conflict() -> None:
         "Additive UNION must dedupe the merged array so repeated seeds "
         "don't accumulate duplicate policy IDs."
     )
-
-
-def test_insert_role_unions_parent_roles_on_conflict() -> None:
-    """Same additive treatment for ``parent_roles`` — concurrent seeds
-    on the role hierarchy must not lose edges."""
-    from dynastore.modules.iam.iam_queries import INSERT_ROLE
-
-    sql = _normalize(INSERT_ROLE.template)
-
-    assert "parent_roles = EXCLUDED.parent_roles" not in sql, (
-        "INSERT_ROLE must NOT assign parent_roles = EXCLUDED.parent_roles "
-        "on conflict — racing seeds can clobber hierarchy edges added "
-        "by the other caller. Use the jsonb_array_elements_text UNION "
-        "pattern (same as policies)."
-    )
-    assert "roles.parent_roles" in sql
-    assert "EXCLUDED.parent_roles" in sql
 
 
 def test_update_role_remains_replace_on_policies() -> None:

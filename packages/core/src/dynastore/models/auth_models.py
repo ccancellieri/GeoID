@@ -60,18 +60,18 @@ class Role(BaseModel):
     """
     A reusable collection of Policies.
     Stored in DB: {schema}.roles
+
+    Role inheritance is expressed in the ``role_hierarchy`` table and
+    managed via the ``/admin/hierarchies`` endpoints — it is not a
+    column on the role itself.
     """
     id: Optional[str] = Field(default=None, description="Unique slug, e.g., 'catalog_editor'")
     name: str
     description: Optional[str] = None
-    level: int = 0
-    
-    # Inheritance: Allows creating "Super Roles" without duplicating policy logic
-    parent_roles: List[str] = Field(default_factory=list, description="List of Role IDs this role inherits from")
-    
+
     # Composition: Direct links to policies defined in the system
     policies: List[str] = Field(default_factory=list, description="List of Policy IDs directly assigned")
-    
+
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

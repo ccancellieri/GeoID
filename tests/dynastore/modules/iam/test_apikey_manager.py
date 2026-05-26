@@ -47,14 +47,14 @@ async def test_role_hierarchy(iam_manager):
     """Test role hierarchy resolution."""
     try:
         await iam_manager.storage.create_role(
-            Role(name="viewer", level=10), schema="iam"
+            Role(name="viewer"), schema="iam"
         )
     except Exception:
         pass  # Ignore if role already exists
 
     try:
         await iam_manager.storage.create_role(
-            Role(name="editor", level=20), schema="iam"
+            Role(name="editor"), schema="iam"
         )
     except Exception:
         pass

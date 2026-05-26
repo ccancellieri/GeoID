@@ -262,7 +262,6 @@
     <div class="form-row"><label>Name *</label><input id="rm-name" placeholder="e.g. data_editor"/></div>
     <div class="form-row"><label>Description</label><input id="rm-desc" placeholder="Brief description"/></div>
     <div class="form-row"><label>Policies (comma-separated IDs)</label><input id="rm-policies" placeholder="e.g. stac_public_access, web_public_access"/></div>
-    <div class="form-row"><label>Parent Roles (comma-separated)</label><input id="rm-parents" placeholder="e.g. user"/></div>
     <div class="form-actions">
       <button class="btn" onclick="document.getElementById('role-modal').classList.add('hidden')" style="color:var(--text-dim)">Cancel</button>
       <button class="btn btn-primary" onclick="createRole()"><i class="fa-solid fa-check"></i> Create</button>
@@ -665,10 +664,9 @@ async function createRole() {
   const name = document.getElementById('rm-name').value.trim();
   const description = document.getElementById('rm-desc').value.trim();
   const policies = csvToList(document.getElementById('rm-policies').value);
-  const parent_roles = csvToList(document.getElementById('rm-parents').value);
   if (!name) { toast('Role name is required.', false); return; }
   try {
-    await apiFetch('/roles', { method:'POST', body: JSON.stringify({name,description,policies,parent_roles}) });
+    await apiFetch('/roles', { method:'POST', body: JSON.stringify({name,description,policies}) });
     toast('Role created.'); document.getElementById('role-modal').classList.add('hidden'); loadRoles();
   } catch(e) { toast(e.message, false); }
 }

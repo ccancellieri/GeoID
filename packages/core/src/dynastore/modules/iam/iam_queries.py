@@ -41,7 +41,6 @@ CREATE_PRINCIPALS_TABLE = DDLQuery("""
         custom_policies JSONB DEFAULT '[]'::jsonb,
         attributes JSONB DEFAULT '{}'::jsonb,
         metadata JSONB DEFAULT '{}'::jsonb,
-        policy JSONB,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(identifier)
@@ -71,8 +70,6 @@ CREATE_ROLES_TABLE = DDLQuery("""
         id VARCHAR(128) PRIMARY KEY,
         name VARCHAR(128) NOT NULL,
         description TEXT,
-        level INTEGER DEFAULT 0,
-        parent_roles JSONB DEFAULT '[]'::jsonb,
         policies JSONB DEFAULT '[]'::jsonb,
         metadata JSONB DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ DEFAULT NOW()
@@ -119,13 +116,12 @@ CREATE_ROLE_HIERARCHY_TABLE = DDLQuery("""
 # NULL/NULL = whole-catalog grant (the historical behaviour). Enforcement:
 # explicit DENY at any scope wins; ALLOWs are additive across scopes.
 #
-# NOTE: the old inline UNIQUE(subject_kind, subject_ref, object_kind,
-# object_ref, effect) constraint is intentionally REMOVED here — uniqueness
-# now includes the resource columns and is expressed by the functional
-# unique index ``uq_grants_subject_object_resource`` (see
-# CREATE_GRANTS_UNIQUE_WITH_RESOURCE below). The index uses COALESCE so two
-# NULL resource columns collapse to a single key, preserving the old
-# whole-catalog uniqueness while allowing one grant per (…, collection).
+# Uniqueness is expressed by the functional unique index below
+# (``uq_grants_subject_object_resource`` — see
+# CREATE_GRANTS_UNIQUE_WITH_RESOURCE). It uses COALESCE so two NULL
+# resource columns collapse to a single key, giving the (NULL, NULL)
+# whole-catalog row a single-row uniqueness while distinct collections
+# each get their own row.
 CREATE_GRANTS_TABLE = DDLQuery("""
     CREATE TABLE IF NOT EXISTS {schema}.grants (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -151,15 +147,6 @@ CREATE_GRANTS_TABLE = DDLQuery("""
     CREATE INDEX IF NOT EXISTS idx_grants_validity
         ON {schema}.grants (valid_until) WHERE valid_until IS NOT NULL;
 """)
-
-# Idempotent column-add for existing DBs created before the resource-scope
-# columns landed. Always-run (paired with the unique-index swap) by
-# ``_initialize_schema`` after the CREATE TABLE batch.
-ADD_GRANTS_RESOURCE_COLUMNS = DDLQuery(
-    "ALTER TABLE {schema}.grants "
-    "ADD COLUMN IF NOT EXISTS resource_kind VARCHAR(32), "
-    "ADD COLUMN IF NOT EXISTS resource_ref VARCHAR(256);"
-)
 
 # Lookup index for resource-scoped grants (partial — only rows that carry a
 # resource scope are indexed; whole-catalog rows already covered by
@@ -428,9 +415,9 @@ INSERT_PRINCIPAL = DQLQuery(
     # duplicate-identifier unique-constraint as a 401.
     """
     INSERT INTO {schema}.principals
-    (id, identifier, display_name, is_active, valid_until, custom_policies, attributes, metadata, policy)
+    (id, identifier, display_name, is_active, valid_until, custom_policies, attributes, metadata)
     VALUES
-    (:id, :identifier, :display_name, :is_active, :valid_until, :custom_policies, :attributes, :metadata, :policy)
+    (:id, :identifier, :display_name, :is_active, :valid_until, :custom_policies, :attributes, :metadata)
     ON CONFLICT (identifier) DO UPDATE SET
         display_name = EXCLUDED.display_name,
         is_active = EXCLUDED.is_active,
@@ -452,7 +439,6 @@ UPDATE_PRINCIPAL = DQLQuery(
         display_name = :display_name,
         is_active = :is_active,
         metadata = :metadata,
-        policy = :policy,
         custom_policies = :custom_policies,
         attributes = :attributes
     WHERE id = :id
@@ -538,12 +524,12 @@ DELETE_PRINCIPAL = DQLQuery(
 
 # --- Role & Hierarchy Queries ---
 
-# ON CONFLICT semantics are ADDITIVE on ``policies`` and ``parent_roles``
-# (closes geoid#902). The cold-boot path seeds the catalog-tier
-# ``unauthenticated`` role via this query with ``policies=["public_access"]``,
-# then the contributor lifespan loop (web, stac, records, maps, edr, …)
-# re-issues ``register_role(Role(name="unauthenticated", policies=[…])``
-# which buffers an in-memory union and ultimately calls ``update_role``
+# ON CONFLICT semantics are ADDITIVE on ``policies`` (closes geoid#902).
+# The cold-boot path seeds the catalog-tier ``unauthenticated`` role via
+# this query with ``policies=["public_access"]``, then the contributor
+# lifespan loop (web, stac, records, maps, edr, …) re-issues
+# ``register_role(Role(name="unauthenticated", policies=[…])`` which
+# buffers an in-memory union and ultimately calls ``update_role``
 # (REPLACE — operator intent). The merge logic in
 # ``IamModule.flush_pending_registrations`` reads-modifies-writes against
 # the DB so the buffered union is unioned with the seed before the
@@ -560,27 +546,19 @@ DELETE_PRINCIPAL = DQLQuery(
 # ``/health`` 403 in geoid#902 (the seed-declared ``public_access`` was
 # the binding being clobbered).
 #
-# Fix: on conflict, ``policies`` and ``parent_roles`` are recomputed as
-# the UNION of the existing JSONB array and EXCLUDED's. Operator REPLACE
-# remains available via UPDATE_ROLE (used by ``PATCH /admin/roles`` and
-# the merge branch of ``flush_pending_registrations``); the additive
+# Fix: on conflict, ``policies`` is recomputed as the UNION of the
+# existing JSONB array and EXCLUDED's. Operator REPLACE remains
+# available via UPDATE_ROLE (used by ``PATCH /admin/roles`` and the
+# merge branch of ``flush_pending_registrations``); the additive
 # semantics only kick in when two callers ``create_role`` the same name.
 INSERT_ROLE = DQLQuery(
     """
-    INSERT INTO {schema}.roles (id, name, description, level, metadata, parent_roles, policies)
-    VALUES (:id, :name, :description, :level, :metadata, :parent_roles, :policies)
+    INSERT INTO {schema}.roles (id, name, description, metadata, policies)
+    VALUES (:id, :name, :description, :metadata, :policies)
     ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         description = EXCLUDED.description,
-        level = EXCLUDED.level,
         metadata = EXCLUDED.metadata,
-        parent_roles = (
-            SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
-            FROM jsonb_array_elements_text(
-                COALESCE(roles.parent_roles, '[]'::jsonb)
-                || COALESCE(EXCLUDED.parent_roles, '[]'::jsonb)
-            ) AS arr(value)
-        ),
         policies = (
             SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
             FROM jsonb_array_elements_text(
@@ -601,7 +579,7 @@ GET_ROLE = DQLQuery(
 )
 
 LIST_ROLES = DQLQuery(
-    "SELECT * FROM {schema}.roles ORDER BY level DESC, name ASC;",
+    "SELECT * FROM {schema}.roles ORDER BY name ASC;",
     result_handler=ResultHandler.ALL_DICTS,
     post_processor=lambda rows: [Role(**row) for row in rows],
 )
@@ -627,9 +605,7 @@ UPDATE_ROLE = DQLQuery(
     """
     UPDATE {schema}.roles
     SET description = :description,
-        level = :level,
         metadata = :metadata,
-        parent_roles = :parent_roles,
         policies = :policies
     WHERE id = :name OR name = :name
     RETURNING *;

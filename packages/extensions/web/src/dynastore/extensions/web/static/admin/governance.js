@@ -66,7 +66,7 @@ async function refreshRoles() {
   const loading = document.createElement("tr");
   loading.className = "empty-row";
   const td = document.createElement("td");
-  td.colSpan = 5;
+  td.colSpan = 4;
   td.textContent = "Loading…";
   loading.appendChild(td);
   tbody.appendChild(loading);
@@ -83,7 +83,7 @@ async function refreshRoles() {
     const tr = document.createElement("tr");
     tr.className = "empty-row";
     const td = document.createElement("td");
-    td.colSpan = 5;
+    td.colSpan = 4;
     td.textContent = "No roles at this scope.";
     tr.appendChild(td);
     tbody.appendChild(tr);
@@ -100,9 +100,6 @@ async function refreshRoles() {
     const pols = document.createElement("td");
     pols.className = "muted";
     pols.textContent = (r.policies || []).join(", ");
-    const parents = document.createElement("td");
-    parents.className = "muted";
-    parents.textContent = (r.parent_roles || []).join(", ");
 
     const actions = document.createElement("td");
     actions.style.textAlign = "right";
@@ -131,7 +128,7 @@ async function refreshRoles() {
     });
     actions.appendChild(del);
 
-    tr.append(name, desc, pols, parents, actions);
+    tr.append(name, desc, pols, actions);
     tbody.appendChild(tr);
   }
 }
@@ -142,7 +139,6 @@ function enterEditRoleMode(r) {
   $("#role-name").readOnly = true;
   $("#role-description").value = r.description || "";
   $("#role-policies").value = (r.policies || []).join(", ");
-  $("#role-parents").value = (r.parent_roles || []).join(", ");
   $("#role-form-title").textContent = `Edit role '${r.name}'`;
   $("#role-form-route").textContent = `PUT /admin/roles/${r.name}`;
   $("#role-submit-btn").textContent = "Update";
@@ -172,7 +168,6 @@ async function onSubmitRole(e) {
     const patch = {
       description: $("#role-description").value.trim() || null,
       policies: csv($("#role-policies").value),
-      parent_roles: csv($("#role-parents").value),
     };
     try {
       await updateRole(editing, patch, scopeCatalogId());
@@ -188,7 +183,6 @@ async function onSubmitRole(e) {
     name: $("#role-name").value.trim(),
     description: $("#role-description").value.trim() || null,
     policies: csv($("#role-policies").value),
-    parent_roles: csv($("#role-parents").value),
   };
   if (!body.name) {
     setStatus("#role-status", "Name is required.", "err");
