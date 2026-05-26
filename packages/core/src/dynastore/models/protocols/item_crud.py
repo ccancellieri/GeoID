@@ -66,8 +66,14 @@ class ItemCrudProtocol(Protocol):
         collection_id: str,
         item_id: str,
         ctx: Optional["DriverContext"] = None,
+        caller_id: Optional[str] = None,
     ) -> int:
-        """Soft-delete all versions of an item by its external ID."""
+        """Soft-delete all versions of an item by its external ID.
+
+        ``caller_id`` records the originating principal so write-reactive
+        tile-cache invalidation tasks are attributed to the user who issued
+        the delete (mirror of the create/update path — see #1404/#1407).
+        """
         ...
 
     async def delete_item_language(

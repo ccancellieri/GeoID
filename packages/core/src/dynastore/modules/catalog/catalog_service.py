@@ -1885,10 +1885,11 @@ class CatalogService(CatalogsProtocol):
         collection_id: str,
         item_id: str,
         ctx: Optional[DriverContext] = None,
+        caller_id: Optional[str] = None,
     ) -> int:
         # Resolves ID internally in ItemService
         return await self._item_svc.delete_item(
-            catalog_id, collection_id, item_id, ctx=ctx
+            catalog_id, collection_id, item_id, ctx=ctx, caller_id=caller_id
         )
 
     async def delete_item_language(

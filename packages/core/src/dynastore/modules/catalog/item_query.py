@@ -810,6 +810,7 @@ class ItemQueryMixin:
         collection_id: str,
         item_id: str,
         ctx: Optional[DriverContext] = None,
+        caller_id: Optional[str] = None,
     ) -> int:
         from dynastore.modules.catalog.tools import recalculate_and_update_extents
 
@@ -946,6 +947,7 @@ class ItemQueryMixin:
                             engine=db_resource or self.engine,
                             schema=phys_schema,
                             prior_bboxes=[prior_bbox],
+                            caller_id=caller_id,
                         )
                     except Exception as exc:  # noqa: BLE001 — never break delete
                         logger.warning(
