@@ -109,8 +109,10 @@ class PrivateIndexTask(TaskProtocol):
             build_tenant_feature_doc,
         )
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            TENANT_FEATURE_MAPPING,
+            build_private_item_mapping,
             get_private_index_name,
+            project_private_doc,
+            resolve_catalog_private_known_fields,
         )
         from dynastore.modules.storage.driver_config import (
             ItemsElasticsearchPrivateDriverConfig,
@@ -121,11 +123,17 @@ class PrivateIndexTask(TaskProtocol):
         inputs = PrivateIndexInputs.model_validate(payload.inputs)
         index_name = get_private_index_name(_get_index_prefix(), inputs.catalog_id)
 
+        # Tenant-scoped manual mapping overlay (#1295 slice 3). Resolved
+        # once up front and reused for both index-create and projection.
+        known_fields = await resolve_catalog_private_known_fields(
+            inputs.catalog_id,
+        )
+
         es = _build_es_client()
         if not await es.indices.exists(index=index_name):
             await es.indices.create(
                 index=index_name,
-                body={"mappings": TENANT_FEATURE_MAPPING},
+                body={"mappings": build_private_item_mapping(known_fields)},
             )
 
         # Fetch the full feature so we can persist geometry + properties.
@@ -165,6 +173,7 @@ class PrivateIndexTask(TaskProtocol):
         doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
         doc["simplification_factor"] = factor
         doc["simplification_mode"] = mode
+        doc = project_private_doc(doc, known_fields)
 
         await es.index(index=index_name, id=inputs.geoid, body=doc)
         return {"geoid": inputs.geoid, "index": index_name, "status": "indexed"}

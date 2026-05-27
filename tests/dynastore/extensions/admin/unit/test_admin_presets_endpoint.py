@@ -316,14 +316,15 @@ def test_delete_geoid_preset_walks_audiences_leaf_first(
     assert _patched_protocols_with_persistence._store == {}
 
 
-def test_delete_preset_with_diverged_row_returns_409_and_keeps_store(
+def test_delete_preset_with_diverged_row_skips_diverged_and_deletes_matches(
     _patched_protocols_with_persistence,
 ):
-    """Persisted row that no longer matches the preset bundle blocks
-    rollback with 409 and the store is left fully intact — partial
-    rollback would leave the catalog in a half-preset state."""
+    """Persisted row that no longer matches the preset bundle is left in
+    place (operator edits are preserved); matching slots are still deleted.
+    Each diverged slot is reported in ``skipped`` with reason ``diverged``."""
     from dynastore.modules.storage.routing_config import (
         CatalogRoutingConfig,
+        CollectionRoutingConfig,
         ItemsRoutingConfig,
     )
 
@@ -336,23 +337,24 @@ def test_delete_preset_with_diverged_row_returns_409_and_keeps_store(
     drifted = dict(store[ItemsRoutingConfig])
     drifted["__drift_marker__"] = "operator-edit"
     store[ItemsRoutingConfig] = drifted
-    pre_snapshot = {k: dict(v) for k, v in store.items()}
 
     del_resp = client.delete("/admin/catalogs/cat-drift/presets/public_catalog")
-    assert del_resp.status_code == 409
-    detail = del_resp.json()["detail"]
-    assert "cannot be rolled back" in detail["message"]
-    diverged = detail["diverged"]
-    assert len(diverged) == 1
-    assert diverged[0]["slot"] == "items_template"
-    assert diverged[0]["class"] == "ItemsRoutingConfig"
+    assert del_resp.status_code == 200, del_resp.text
+    body = del_resp.json()
+    # Matching slots were removed, diverged slot retained.
+    assert body["deleted"] == ["collection_template", "catalog_routing"]
+    skipped = body["skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["slot"] == "items_template"
+    assert skipped[0]["class"] == "ItemsRoutingConfig"
+    assert skipped[0]["reason"] == "diverged"
+    assert "persisted" in skipped[0] and "expected" in skipped[0]
 
-    # Nothing was deleted — the matching catalog_routing + collection_template
-    # rows are still present.
-    assert store == pre_snapshot
-    _patched_protocols_with_persistence.delete_config.assert_not_awaited()
-    # Sanity: catalog_routing was a matching slot but stayed put.
-    assert CatalogRoutingConfig in store
+    # The diverged row stays, the matching rows are gone.
+    assert ItemsRoutingConfig in store
+    assert store[ItemsRoutingConfig].get("__drift_marker__") == "operator-edit"
+    assert CatalogRoutingConfig not in store
+    assert CollectionRoutingConfig not in store
 
 
 def test_delete_preset_skips_missing_slots(_patched_protocols_with_persistence):

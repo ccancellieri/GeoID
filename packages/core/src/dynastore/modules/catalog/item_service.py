@@ -1163,10 +1163,19 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     # geoid); external_id / asset_id were stamped onto the
                     # shared item_context by the sidecars during Phase 2.
                     item_ctx = plan["item_context"]
+                    hub_payload = plan["hub_payload"]
                     generated_stats.append({
                         "geoid": new_row.get("geoid", plan["geoid"]),
                         "external_id": item_ctx.get("external_id"),
                         "asset_id": item_ctx.get("asset_id"),
+                        # Lifecycle fields from the hub row. ``validity`` is
+                        # present only when the collection's temporal sidecar
+                        # contributes it as a partition key (see Phase 2 merge
+                        # of ``partition_values`` into ``hub_payload``); a
+                        # ``None`` here is dropped by ``_build_report_envelope``.
+                        "transaction_time": hub_payload.get("transaction_time"),
+                        "deleted_at": hub_payload.get("deleted_at"),
+                        "validity": hub_payload.get("validity"),
                         "stats": _collect_generated_stats(
                             plan["sidecar_payloads"], stat_names
                         ),

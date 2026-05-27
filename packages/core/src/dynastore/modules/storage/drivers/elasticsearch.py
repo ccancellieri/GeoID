@@ -1304,7 +1304,10 @@ class ItemsElasticsearchDriver(
         from dynastore.modules.elasticsearch.aliases import (
             add_index_to_public_alias,
         )
-        from dynastore.modules.elasticsearch.mappings import build_item_mapping
+        from dynastore.modules.elasticsearch.mappings import (
+            ITEMS_INDEX_CAP_SAFE_MAPPING_PATCH,
+            build_item_mapping,
+        )
         from dynastore.modules.elasticsearch.items_projection import (
             resolve_catalog_known_fields,
         )
@@ -1350,6 +1353,24 @@ class ItemsElasticsearchDriver(
                     "ItemsElasticsearchDriver.ensure_storage: create('%s') "
                     "lost race to a concurrent create — proceeding",
                     index_name,
+                )
+        else:
+            # Best-effort: ensure an older index (pre-#1295, `extras:
+            # object,dynamic:true`) at least has the new `_search_text`
+            # root field so writes carrying it aren't rejected by the
+            # strict root mapping. The `extras` field itself can't be
+            # retyped from `object` to `flattened` in place — that
+            # needs a reindex, tracked as the migration follow-up.
+            try:
+                await es.indices.put_mapping(
+                    index=index_name,
+                    body=ITEMS_INDEX_CAP_SAFE_MAPPING_PATCH,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ItemsElasticsearchDriver.ensure_storage: put_mapping "
+                    "cap-safe patch on existing index '%s' failed: %s",
+                    index_name, exc,
                 )
 
         # Idempotent — safe even if the index was already a member.

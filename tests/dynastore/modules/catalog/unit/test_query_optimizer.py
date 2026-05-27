@@ -536,3 +536,189 @@ def test_attributes_sidecar_config_drops_external_id_as_feature_id() -> None:
     # The storage-layout property is preserved (column name is unrelated to
     # the wire-shape decision).
     assert c.feature_id_field_name == "external_id"
+
+
+def test_star_expansion_skips_sidecar_field_when_explicit_override_present(
+    mock_col_config, mock_registry
+):
+    """When query.select contains an explicit FieldSelection(field='geom', …) PLUS
+    FieldSelection(field='*'), the * expansion must NOT include the sidecar's
+    own geom projection — that would produce two ``AS geom`` aliases and a
+    PostgreSQL syntax error.
+
+    The optimizer detects the collision by comparing the logical alias extracted
+    from the sidecar SQL string against the set of explicitly overridden field
+    names.
+    """
+    # _serves_active_consumer calls type(sc).serves_consumers() — a classmethod
+    # that plain MagicMock does not carry.  Create a thin MagicMock subclass
+    # that adds the classmethod on the class itself, so type(instance) resolves it.
+    class _SidecarMock(MagicMock):
+        @classmethod
+        def serves_consumers(cls):
+            return None  # consumer-agnostic (same as the base SidecarProtocol default)
+
+    mock_geom = _SidecarMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.SPATIAL],
+            data_type="geometry(Geometry,4326)",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        'LEFT JOIN "schema"."table_geometries" sc_geometries '
+        "ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+    mock_geom.get_main_geometry_field.return_value = "geom"
+    # Sidecar returns its own SQL string for geom — note the "AS geom" alias.
+    mock_geom.get_select_fields.return_value = [
+        "ST_AsGeoJSON(sc_geometries.geom)::jsonb as geom"
+    ]
+
+    mock_attr = _SidecarMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {}
+    mock_attr.get_join_clause.return_value = (
+        'LEFT JOIN "schema"."table_attributes" sc_attributes '
+        "ON h.geoid = sc_attributes.geoid"
+    )
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.get_main_geometry_field.return_value = None
+    mock_attr.get_select_fields.return_value = []
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom
+        if getattr(sc, "sidecar_type", "") == "geometries"
+        else mock_attr
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    # Simulate what stream_features emits when target_srid is set:
+    # explicit ST_Transform(geom) + wildcard *
+    req = QueryRequest(
+        select=[
+            FieldSelection(
+                field="geom",
+                transformation="ST_Transform",
+                transform_args={"srid": 3857},
+            ),
+            FieldSelection(field="*"),
+        ],
+        raw_where=None,
+        include_total_count=False,
+    )
+
+    sql, _ = optimizer.build_optimized_query(req, "schema", "table")
+
+    # The explicit ST_Transform expression must appear exactly once.
+    # The optimizer renders lowercase "as" aliases.
+    sql_lower = sql.lower()
+    geom_occurrences = sql_lower.count(" as geom")
+    assert geom_occurrences == 1, (
+        f"Expected exactly 1 'as geom' in SQL, found {geom_occurrences}.\nSQL:\n{sql}"
+    )
+    # Verify it is the ST_Transform variant, not the raw sidecar projection.
+    assert "st_transform" in sql_lower, f"Expected ST_Transform in SQL:\n{sql}"
+
+
+def test_star_expansion_skips_sidecar_field_when_raw_select_override_present(
+    mock_col_config, mock_registry
+):
+    """MVT-path regression: when the caller injects an MVT geom projection via
+    ``query.raw_selects`` (``ST_AsMVTGeom(...) AS geom``) together with
+    ``FieldSelection(field="*")``, the * expansion must NOT also emit the
+    sidecar's own ``... AS geom`` — that would produce two ``AS geom`` aliases
+    in the inner SELECT, and the wrapping ``SELECT "geom" FROM (...)`` (added
+    by ``MVTQueryTransform.post_process_sql``) would fail with PostgreSQL
+    ``column reference "geom" is ambiguous``.
+
+    This mirrors the explicit-FieldSelection case above but exercises the
+    raw_selects branch used by the tile path.
+    """
+    class _SidecarMock(MagicMock):
+        @classmethod
+        def serves_consumers(cls):
+            return None
+
+    mock_geom = _SidecarMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.SPATIAL],
+            data_type="geometry(Geometry,4326)",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        'LEFT JOIN "schema"."table_geometries" sc_geometries '
+        "ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+    mock_geom.get_main_geometry_field.return_value = "geom"
+    mock_geom.get_select_fields.return_value = [
+        "ST_AsGeoJSON(sc_geometries.geom)::jsonb as geom"
+    ]
+
+    mock_attr = _SidecarMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {}
+    mock_attr.get_join_clause.return_value = (
+        'LEFT JOIN "schema"."table_attributes" sc_attributes '
+        "ON h.geoid = sc_attributes.geoid"
+    )
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.get_main_geometry_field.return_value = None
+    mock_attr.get_select_fields.return_value = []
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom
+        if getattr(sc, "sidecar_type", "") == "geometries"
+        else mock_attr
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    # Simulate what MVTQueryTransform emits: strip geom from select (leaving
+    # only the wildcard) and inject the MVT geometry expression into
+    # raw_selects.
+    req = QueryRequest(
+        select=[FieldSelection(field="*")],
+        raw_where=None,
+        include_total_count=False,
+    )
+    req.raw_selects.append(
+        "ST_AsMVTGeom(sc_geometries.geom, "
+        "ST_SetSRID(ST_GeomFromWKB(:tile_wkb), CAST(:target_srid AS INTEGER)), "
+        "4096, 256, true) AS geom"
+    )
+
+    sql, _ = optimizer.build_optimized_query(req, "schema", "table")
+
+    sql_lower = sql.lower()
+    geom_occurrences = sql_lower.count(" as geom")
+    assert geom_occurrences == 1, (
+        f"Expected exactly 1 'as geom' in SQL, found {geom_occurrences}.\nSQL:\n{sql}"
+    )
+    assert "st_asmvtgeom" in sql_lower, f"Expected ST_AsMVTGeom in SQL:\n{sql}"
+    # The sidecar's ST_AsGeoJSON(...)::jsonb projection must have been skipped.
+    assert "st_asgeojson" not in sql_lower, (
+        f"Sidecar ST_AsGeoJSON projection should have been skipped:\n{sql}"
+    )

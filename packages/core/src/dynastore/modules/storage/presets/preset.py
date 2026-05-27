@@ -1,0 +1,316 @@
+#    Copyright 2026 FAO
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+"""Generalised Preset protocol and supporting types.
+
+A ``Preset`` is a named, parameterised, reversible platform action. It can
+grant IAM policies, write config, seed data, spawn tasks, or register cron
+jobs — anything reachable through the ``PresetContext``.
+
+Key types:
+
+* ``Preset``          — structural protocol every preset must satisfy.
+* ``CompositePreset`` — base class for presets that delegate to child presets.
+* ``PresetContext``   — the narrow surface a preset is allowed to touch.
+* ``AppliedDescriptor`` — opaque JSON payload stored in the audit row; used
+  by ``revoke`` to undo exactly what ``apply`` introduced.
+* ``TaskHandle``      — returned by async presets instead of an
+  ``AppliedDescriptor``; the worker callback fills in the final descriptor.
+* ``PresetPlan``      — dry-run output describing what ``apply`` would do.
+* ``NoParams``        — default empty Pydantic params model.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    Optional,
+    Protocol,
+    Tuple,
+    Type,
+    runtime_checkable,
+)
+from uuid import UUID
+
+from pydantic import BaseModel
+
+from .protocol import PresetTier
+
+
+# ---------------------------------------------------------------------------
+# Parameter model default
+# ---------------------------------------------------------------------------
+
+class NoParams(BaseModel):
+    """Empty Pydantic model used as the default ``params_model`` for presets
+    that accept no structured parameters."""
+
+
+# ---------------------------------------------------------------------------
+# Result types
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AppliedDescriptor:
+    """Opaque payload produced by a synchronous ``apply`` call.
+
+    Stored verbatim in ``iam.applied_presets.revoke_descriptor``; handed
+    back to ``revoke`` to undo exactly what ``apply`` introduced.
+    ``payload`` is arbitrary JSON-serialisable data — the shape is private
+    to each preset implementation.
+    """
+
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> Dict[str, Any]:
+        return self.payload
+
+    @classmethod
+    def from_json(cls, data: Optional[Dict[str, Any]]) -> "AppliedDescriptor":
+        return cls(payload=data or {})
+
+
+@dataclass(frozen=True)
+class TaskHandle:
+    """Returned by async presets; the worker callback populates the final
+    descriptor when the background task finishes.
+
+    ``task_id`` is the task row PK in ``tasks.tasks``.
+    ``revoke_descriptor`` is ``None`` until the task completes.
+    """
+
+    task_id: UUID
+    revoke_descriptor: Optional[AppliedDescriptor] = None
+
+
+# ---------------------------------------------------------------------------
+# Dry-run plan
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PresetPlanEntry:
+    """One proposed change in a ``PresetPlan``."""
+
+    kind: str          # e.g. "create_policy", "delete_role", "set_config"
+    target: str        # human-readable identity of the thing being changed
+    detail: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PresetPlan:
+    """Dry-run output — what ``apply`` would do without any writes."""
+
+    preset_name: str
+    scope_key: str
+    entries: Tuple[PresetPlanEntry, ...] = field(default_factory=tuple)
+    warnings: Tuple[str, ...] = field(default_factory=tuple)
+
+
+# ---------------------------------------------------------------------------
+# Preset context
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PresetContext:
+    """Narrow surface a preset is allowed to touch.
+
+    All fields are injected by the lifecycle layer; presets receive this
+    context on every ``dry_run`` / ``apply`` / ``revoke`` call.
+
+    In unit tests the fields can be mocked freely — no preset should reach
+    into globals.
+    """
+
+    # DB engine reference — use with managed_transaction / DDLQuery / DQLQuery.
+    db: Any  # AsyncEngine or connection-compatible resource
+
+    # IamService — roles + hierarchy.
+    iam: Any  # IamService
+
+    # PolicyService — policy CRUD.
+    policy: Any  # PolicyService
+
+    # ConfigsProtocol reader + writer.
+    config: Any  # ConfigsProtocol
+
+    # Task creation wrapper — auto-fills caller_id.
+    tasks: Any  # _TaskCtx (see below)
+
+    # Cron helpers — require an active conn from ctx.db.
+    cron: Any  # _CronCtx (see below)
+
+    # Curated library handles (opt-in per preset; not used by core IAM presets).
+    libs: Any  # Optional dict / namespace of library handles
+
+    # The caller's principal — used for audit and the self-lockout check.
+    principal: Any  # Principal or None for system calls
+
+    # Resolved scope string, e.g. "platform", "catalog:cat-7",
+    # "catalog:cat-7/collection:coll-3".
+    scope: str
+
+
+# ---------------------------------------------------------------------------
+# Preset protocol
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class Preset(Protocol):
+    """Structural protocol every generalised preset must satisfy.
+
+    Class variables are the static metadata; instance methods perform the
+    work. All methods are async to allow DB I/O inside them without thread
+    pinning.
+
+    ``"iam" in keywords`` triggers the self-lockout guard on DELETE. No
+    separate flag is needed — keywords are the classifier.
+    ``is_async=True`` means ``apply`` / ``revoke`` return a ``TaskHandle``
+    instead of an ``AppliedDescriptor``; the audit lifecycle differs.
+    """
+
+    name: ClassVar[str]
+    description: ClassVar[str]
+    keywords: ClassVar[Tuple[str, ...]]
+    tier: ClassVar[PresetTier]
+    catalog_scopable: ClassVar[bool]
+    params_model: ClassVar[Type[BaseModel]]
+    is_async: ClassVar[bool]
+
+    async def dry_run(
+        self,
+        params: BaseModel,
+        scope: str,
+        ctx: PresetContext,
+    ) -> PresetPlan: ...
+
+    async def apply(
+        self,
+        params: BaseModel,
+        scope: str,
+        ctx: PresetContext,
+    ) -> "AppliedDescriptor | TaskHandle": ...
+
+    async def revoke(
+        self,
+        applied_descriptor: AppliedDescriptor,
+        ctx: PresetContext,
+    ) -> "None | TaskHandle": ...
+
+
+# ---------------------------------------------------------------------------
+# Composite preset
+# ---------------------------------------------------------------------------
+
+class CompositePreset:
+    """Base class for presets that delegate to child presets.
+
+    Subclasses declare ``compose`` with an ordered tuple of child preset
+    names. The base implementation:
+
+    * ``apply``:  iterates children forward; rolls back prior children on
+      sync failure.
+    * ``revoke``: iterates children in reverse.
+    * ``dry_run``: collects child plans without writing.
+
+    ``compose`` references are validated at registration time by the
+    registry — an unknown child name raises ``ValueError``.
+
+    Async children cause the composite to transition to ``state=partial``
+    on failure (not auto-rollback); see spec section on async composites.
+    """
+
+    name: ClassVar[str]
+    description: ClassVar[str]
+    keywords: ClassVar[Tuple[str, ...]] = ()
+    tier: ClassVar[PresetTier]
+    catalog_scopable: ClassVar[bool] = False
+    params_model: ClassVar[Type[BaseModel]] = NoParams
+    is_async: ClassVar[bool] = False
+    compose: ClassVar[Tuple[str, ...]]
+
+    async def dry_run(
+        self,
+        params: BaseModel,
+        scope: str,
+        ctx: PresetContext,
+    ) -> PresetPlan:
+        from .registry import find_preset
+
+        all_entries: list[PresetPlanEntry] = []
+        warnings: list[str] = []
+
+        for child_name in self.compose:
+            child = find_preset(child_name)
+            child_plan = await child.dry_run(params, scope, ctx)
+            all_entries.extend(child_plan.entries)
+            warnings.extend(child_plan.warnings)
+
+        return PresetPlan(
+            preset_name=self.name,
+            scope_key=scope,
+            entries=tuple(all_entries),
+            warnings=tuple(warnings),
+        )
+
+    async def apply(
+        self,
+        params: BaseModel,
+        scope: str,
+        ctx: PresetContext,
+    ) -> "AppliedDescriptor | TaskHandle":
+        from .registry import find_preset
+
+        applied_children: list[tuple[str, AppliedDescriptor | TaskHandle]] = []
+
+        for child_name in self.compose:
+            child = find_preset(child_name)
+            try:
+                result = await child.apply(params, scope, ctx)
+                applied_children.append((child_name, result))
+            except Exception as exc:
+                # Synchronous failure: reverse-rollback all prior children.
+                for prior_name, prior_result in reversed(applied_children):
+                    if isinstance(prior_result, AppliedDescriptor):
+                        prior_child = find_preset(prior_name)
+                        try:
+                            await prior_child.revoke(prior_result, ctx)
+                        except Exception:
+                            pass  # best-effort
+                raise exc
+
+        # Build composite descriptor listing successful children.
+        child_pairs = [
+            {"name": name, "descriptor": res.payload if isinstance(res, AppliedDescriptor) else {"task_id": str(res.task_id)}}
+            for name, res in applied_children
+        ]
+        return AppliedDescriptor(payload={"children": child_pairs, "scope": scope})
+
+    async def revoke(
+        self,
+        applied_descriptor: AppliedDescriptor,
+        ctx: PresetContext,
+    ) -> "None | TaskHandle":
+        from .registry import find_preset
+
+        children = applied_descriptor.payload.get("children", [])
+        for child_entry in reversed(children):
+            child_name = child_entry["name"]
+            child_descriptor = AppliedDescriptor(
+                payload=child_entry.get("descriptor", {})
+            )
+            child = find_preset(child_name)
+            await child.revoke(child_descriptor, ctx)
+        return None

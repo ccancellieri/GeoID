@@ -11,16 +11,17 @@ Used by export tasks, WFS service, and other components that need to stream feat
 """
 
 import logging
-from typing import AsyncIterator, Dict, Any, Optional, List, Set
+from typing import AsyncIterator, Dict, Any, Optional, List
 from pydantic import BaseModel, Field
 from sqlalchemy import literal_column
-from sqlalchemy.sql import column as sql_column
 
-from dynastore.modules.db_config.query_executor import DbResource, managed_transaction
-from dynastore.modules.db_config import shared_queries
+from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.models.driver_context import DriverContext
-from dynastore.tools.db import validate_sql_identifier
-from dynastore.modules.tools.cql import parse_cql_filter, PYGEOFILTER_AVAILABLE
+from dynastore.models.protocols import ItemsProtocol
+from dynastore.models.query_builder import QueryRequest, FieldSelection
+from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
+from dynastore.modules.tools.cql import parse_cql_filter
+from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +45,6 @@ class FeatureStreamConfig(BaseModel):
     target_srid: Optional[int] = Field(
         None, description="Target SRID for geometry transformation"
     )
-
-
-from dynastore.tools.discovery import get_protocol
-from dynastore.models.protocols import ItemsProtocol, CatalogsProtocol
-from dynastore.models.query_builder import QueryRequest, FieldSelection
 
 
 async def stream_features(
@@ -122,22 +118,18 @@ async def stream_features(
                 selects.append(FieldSelection(field="geom"))
     else:
         # Select all *
-        # But we need to handle geometry transformation if srid is set
-        if config.include_geometry:
-            if config.target_srid:
-                selects.append(
-                    FieldSelection(
-                        field="geom",
-                        transformation="ST_Transform",
-                        transform_args={"srid": config.target_srid},
-                    )
+        # When a target SRID is requested, emit an explicit ST_Transform for geom
+        # so the optimizer knows to skip the sidecar's raw geom projection when
+        # expanding *.  Without a SRID override, * alone is sufficient because
+        # the geometry sidecar expansion already includes the raw geom column.
+        if config.include_geometry and config.target_srid:
+            selects.append(
+                FieldSelection(
+                    field="geom",
+                    transformation="ST_Transform",
+                    transform_args={"srid": config.target_srid},
                 )
-            else:
-                selects.append(FieldSelection(field="geom"))
-
-        # We also want all attributes.
-        # '*' in QueryRequest.select handles this (expands to all sidecar fields).
-        # But we already added 'geom'.
+            )
         selects.append(FieldSelection(field="*"))
 
     # 2. Build Request
@@ -192,6 +184,7 @@ async def stream_features(
             collection_id=config.collection,
             request=req,
             ctx=DriverContext(db_resource=db_resource) if db_resource else None,
+            consumer=ConsumerType.OGC_FEATURES,
         )
         async for item in response.items:
             yield item
@@ -200,130 +193,3 @@ async def stream_features(
         raise
 
 
-def _build_select_expressions(
-    config: FeatureStreamConfig, available_columns: List[str]
-) -> List[str]:
-    """
-    Build SELECT expressions based on property projection and geometry settings.
-
-    Args:
-        config: Feature stream configuration
-        available_columns: List of available column names in the table
-
-    Returns:
-        List of SQL select expressions
-    """
-    select_expressions = []
-
-    # Handle geometry
-    if config.include_geometry and "geom" in available_columns:
-        if config.target_srid:
-            select_expressions.append(
-                f"ST_Transform(geom, {config.target_srid}) AS geom"
-            )
-        else:
-            select_expressions.append("geom")
-
-    # Handle property projection
-    if config.property_names:
-        # Specific properties requested
-        for prop in config.property_names:
-            if prop == "geom":
-                continue  # Already handled above
-
-            if prop in available_columns:
-                # Direct column
-                if prop == "bbox_geom" and "bbox_geom" in available_columns:
-                    if config.target_srid:
-                        select_expressions.append(
-                            f"ST_Transform(bbox_geom, {config.target_srid}) AS bbox_geom"
-                        )
-                    else:
-                        select_expressions.append("bbox_geom")
-                else:
-                    select_expressions.append(f'"{prop}"')
-            else:
-                # Assume it's in JSONB attributes column
-                if "attributes" in available_columns:
-                    select_expressions.append(f"(attributes->>'{prop}') AS \"{prop}\"")
-    else:
-        # No projection - select all non-geometry columns
-        for col in available_columns:
-            if col == "geom":
-                continue  # Already handled
-            if col == "bbox_geom":
-                if config.target_srid:
-                    select_expressions.append(
-                        f"ST_Transform(bbox_geom, {config.target_srid}) AS bbox_geom"
-                    )
-                else:
-                    select_expressions.append("bbox_geom")
-            else:
-                select_expressions.append(f'"{col}"')
-
-    # Fallback to * if nothing selected
-    if not select_expressions:
-        select_expressions = ["*"]
-
-    return select_expressions
-
-
-def _build_where_clause(
-    config: FeatureStreamConfig, available_columns: List[str]
-) -> tuple[str, Dict[str, Any]]:
-    """
-    Build WHERE clause from CQL filter.
-
-    Args:
-        config: Feature stream configuration
-        available_columns: List of available column names
-
-    Returns:
-        Tuple of (where_clause_string, bind_parameters)
-
-    Raises:
-        ValueError: If CQL filter is invalid
-    """
-    if not config.cql_filter:
-        return "", {}
-
-    if not PYGEOFILTER_AVAILABLE:
-        raise ValueError(
-            "CQL filtering requires pygeofilter to be installed. "
-            "Install with: pip install pygeofilter"
-        )
-
-    # Build field mapping for CQL parser
-    # Map property names to SQL expressions
-    field_mapping = {}
-
-    # Direct columns
-    for col in available_columns:
-        if col == "geom":
-            # Geometry column - use PostGIS functions
-            field_mapping[col] = sql_column("geom")
-        elif col == "attributes":
-            # JSONB column - handle separately for nested properties
-            continue
-        else:
-            field_mapping[col] = sql_column(col)
-
-    # For attributes in JSONB, we need to handle them dynamically
-    # The CQL parser will validate against valid_props
-    # For now, we'll add common JSONB attribute access patterns
-    # This is a simplified approach - a full implementation would introspect the schema
-
-    # Valid properties include all columns
-    valid_props = set(available_columns)
-
-    try:
-        where_sql, bind_params = parse_cql_filter(
-            cql_text=config.cql_filter,
-            field_mapping=field_mapping,
-            valid_props=valid_props,
-            parser_type="cql2",
-        )
-        return where_sql, bind_params
-    except Exception as e:
-        logger.error(f"CQL filter parsing failed: {e}")
-        raise ValueError(f"Invalid CQL filter: {e}") from e

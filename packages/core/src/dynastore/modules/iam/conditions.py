@@ -697,6 +697,24 @@ class CatalogAdminConditionConfig(BaseModel):
         default=True,
         description="When True, principals holding ``sysadmin_role`` bypass.",
     )
+    allowed_preset_names: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional safe-subset guard for catalog-scoped preset "
+            "delegation. When set, requests against "
+            "``/admin/catalogs/{cat}/presets/{name}`` are denied unless "
+            "``{name}`` appears in the list. None disables the guard "
+            "(handler keeps legacy role-only behaviour). Sysadmin and "
+            "platform-grant bypasses are NOT subject to the allowlist."
+        ),
+    )
+
+
+# Path shape for catalog-scoped preset endpoints; captures the preset name.
+# Matches POST/DELETE /admin/catalogs/{cat}/presets/{name} exactly.
+_CATALOG_PRESET_PATH_RE = re.compile(
+    r"^/admin/catalogs/[^/]+/presets/([^/]+)$"
+)
 
 
 class CatalogAdminHandler(ConditionHandler):
@@ -733,6 +751,14 @@ class CatalogAdminHandler(ConditionHandler):
       - ``sysadmin_role`` (str, default ``DefaultRole.SYSADMIN.value``)
                             — name of the platform-tier super-user role
                             for the bypass check.
+      - ``allowed_preset_names`` (list[str], optional) — safe-subset
+                            allowlist for ``/admin/catalogs/{cat}/presets/{name}``
+                            requests. When set, role-matched principals can
+                            POST/DELETE only the named presets at their
+                            catalog scope. Sysadmin and platform-grant
+                            bypasses skip this guard. None (default) keeps
+                            the legacy role-only behaviour. Non-preset
+                            paths are unaffected regardless of value.
 
     A policy that supplies neither ``required_roles`` nor ``required_role``
     will deny on the catalog-role match step (sysadmin/platform bypasses
@@ -780,7 +806,20 @@ class CatalogAdminHandler(ConditionHandler):
         if not cfg.required_roles:
             return False
         catalog_roles_for_cat = (membership.get("catalog_roles") or {}).get(catalog_id) or []
-        return any(r in catalog_roles_for_cat for r in cfg.required_roles)
+        role_match = any(r in catalog_roles_for_cat for r in cfg.required_roles)
+        if not role_match:
+            return False
+        # Safe-subset allowlist for catalog-scoped preset routes only.
+        # None disables the guard. Non-preset paths pass through unchanged
+        # so the same policy may legally gate broader catalog-admin routes
+        # without unintended side effects.
+        if cfg.allowed_preset_names is not None:
+            match = _CATALOG_PRESET_PATH_RE.match(ctx.path or "")
+            if match is not None:
+                preset_name = match.group(1)
+                if preset_name not in cfg.allowed_preset_names:
+                    return False
+        return True
 
 
 class CatalogMembershipHandler(ConditionHandler):

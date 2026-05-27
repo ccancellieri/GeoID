@@ -38,7 +38,18 @@ from .protocol import (  # noqa: F401
     PresetTier,
     RoutingPreset,
 )
-from .registry import get_preset, list_presets, register_preset  # noqa: F401
+from .preset import (  # noqa: F401
+    AppliedDescriptor,
+    CompositePreset,
+    NoParams,
+    Preset,
+    PresetContext,
+    PresetPlan,
+    PresetPlanEntry,
+    TaskHandle,
+)
+from .registry import find_preset, get_preset, list_presets, register_preset, search_presets  # noqa: F401
+from .routing_adapter import RoutingPresetAdapter  # noqa: F401
 
 # Built-in presets — auto-register on import.
 from .defaults_postgres import DefaultsPostgresPreset  # noqa: E402
@@ -53,17 +64,41 @@ register_preset(DefaultsPostgresPreset())
 register_preset(PrivateCollectionPreset())
 register_preset(ItemsEsPrivatePreset())
 
+# Curated composite presets — imported after all routing presets so their
+# children are already registered when the composites/__init__.py runs.
+# The composites subpackage handles its own graceful-degradation: a missing
+# child (e.g. IAM extension not installed) logs an info line and skips that
+# composite without raising.
+try:
+    from . import composites as composites  # noqa: F401
+except Exception:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        "presets.composites subpackage failed to import — no composites registered"
+    )
+
 __all__ = [
+    "AppliedDescriptor",
+    "CompositePreset",
     "DefaultsPostgresPreset",
     "ItemsEsPrivatePreset",
+    "NoParams",
+    "Preset",
     "PresetBundle",
     "PresetBundleEntry",
+    "PresetContext",
+    "PresetPlan",
+    "PresetPlanEntry",
     "PresetTier",
     "PrivateCatalogPreset",
     "PrivateCollectionPreset",
     "PublicCatalogPreset",
     "RoutingPreset",
+    "RoutingPresetAdapter",
+    "TaskHandle",
+    "find_preset",
     "get_preset",
     "list_presets",
     "register_preset",
+    "search_presets",
 ]

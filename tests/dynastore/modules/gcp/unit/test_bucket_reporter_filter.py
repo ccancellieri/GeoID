@@ -80,8 +80,6 @@ def test_pydantic_feature_record_is_normalized_and_geometry_excluded() -> None:
 
 
 def test_legacy_flat_record_geom_still_excluded() -> None:
-    # Legacy DWH dict path: ``asset_id`` rides inside ``system`` since the D1
-    # envelope split, so the legacy ``asset_code`` alias derives from there.
     legacy = {
         "system": {"asset_id": "ITAL1_01"},
         "geom": "0101...",
@@ -91,7 +89,8 @@ def test_legacy_flat_record_geom_still_excluded() -> None:
         {"status": "SUCCESS", "record": legacy}
     )
     assert "geom" not in out["record"]
-    assert out["record"]["asset_code"] == "ITAL1_01"
+    assert "asset_code" not in out["record"]
+    assert out["record"]["system"]["asset_id"] == "ITAL1_01"
 
 
 def _feature_record_with_top_level_echo() -> dict:
@@ -125,15 +124,16 @@ def test_top_level_attribute_echo_is_deduplicated() -> None:
     assert rec["id"] == "1621"
 
 
-def test_dedup_preserves_legacy_asset_code_top_level() -> None:
-    """The reporter's own legacy DWH field ``asset_code`` is not a duplicate of
-    ``properties`` and must survive the top-level dedup."""
+def test_dedup_keeps_system_envelope_drops_top_level_echo() -> None:
+    """Top-level dedup strips the attribute echo while preserving the
+    ``system`` envelope sibling (asset_id lives there, not at the top)."""
     record = _feature_record_with_top_level_echo()
     record["system"] = {"asset_id": "ITAL1_01"}
     out = _reporter(include_geometry=False)._filter_result_for_reporting(
         {"status": "SUCCESS", "record": record}
     )
-    assert out["record"]["asset_code"] == "ITAL1_01"
+    assert out["record"]["system"] == {"asset_id": "ITAL1_01"}
+    assert "asset_code" not in out["record"]
     assert "CODE" not in out["record"]
 
 
@@ -155,7 +155,7 @@ def _enriched_record() -> dict:
     }
 
 
-def test_system_envelope_kept_with_legacy_asset_code_alias() -> None:
+def test_system_envelope_is_the_only_identity_carrier() -> None:
     out = _reporter(include_geometry=False)._filter_result_for_reporting(
         {"status": "SUCCESS", "record": _enriched_record()}
     )
@@ -165,8 +165,7 @@ def test_system_envelope_kept_with_legacy_asset_code_alias() -> None:
         "external_id": "1621",
         "asset_id": "ITAL1_01",
     }
-    assert rec["asset_code"] == "ITAL1_01"  # legacy alias derived from system
-    # Identity must no longer appear at the GeoJSON top level.
+    assert "asset_code" not in rec
     for key in ("geoid", "external_id", "asset_id"):
         assert key not in rec
 
@@ -199,7 +198,7 @@ def test_include_external_id_false_suppresses_external_id_in_system() -> None:
     assert rec["system"]["geoid"] == "geoid-1621"
 
 
-def test_include_asset_id_false_suppresses_asset_id_and_legacy_alias() -> None:
+def test_include_asset_id_false_suppresses_asset_id() -> None:
     out = _reporter(
         include_geometry=False, include_asset_id=False
     )._filter_result_for_reporting({"status": "SUCCESS", "record": _enriched_record()})

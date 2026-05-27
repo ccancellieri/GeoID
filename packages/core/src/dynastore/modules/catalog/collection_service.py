@@ -40,6 +40,7 @@ from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.async_utils import signal_bus
 from dynastore.tools.json import CustomJSONEncoder
 from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry, LifecycleContext
+from dynastore.modules.catalog.event_service import CatalogEventType, emit_event
 from dynastore.modules.db_config import shared_queries
 
 logger = logging.getLogger(__name__)
@@ -951,6 +952,23 @@ class CollectionService:
                         f"Failed to capture config snapshot for '{catalog_id}:{collection_id}': {e}"
                     )
 
+                # Lifecycle: BEFORE -> _purge_collection_storage -> HARD_DELETION
+                # -> AFTER. Mirrors CatalogService.delete_catalog so the
+                # subscribers wired to these events actually fire — most
+                # importantly catalog_module._on_collection_hard_deletion
+                # (cascade to AssetsProtocol.delete_assets), plus the GCP
+                # per-collection blob-prefix cleanup task, the tile cache
+                # invalidator, and the webhook fan-out. Without the emits the
+                # assets table rows and storage blobs are left orphaned on
+                # hard-delete (#1438).
+                await emit_event(
+                    CatalogEventType.BEFORE_COLLECTION_HARD_DELETION,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    db_resource=conn,
+                    physical_schema=phys_schema,
+                )
+
                 logger.info(
                     f"[LIFECYCLE] Hard deleting collection '{catalog_id}:{collection_id}'"
                 )
@@ -959,6 +977,23 @@ class CollectionService:
                 )
                 logger.info(
                     f"[LIFECYCLE] Hard deleted collection '{catalog_id}:{collection_id}' successfully"
+                )
+
+                await emit_event(
+                    CatalogEventType.COLLECTION_HARD_DELETION,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    db_resource=conn,
+                    physical_schema=phys_schema,
+                    physical_table=phys_table,
+                )
+                await emit_event(
+                    CatalogEventType.AFTER_COLLECTION_HARD_DELETION,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    db_resource=conn,
+                    physical_schema=phys_schema,
+                    physical_table=phys_table,
                 )
             else:
                 # Soft delete: tombstone the registry row only. The physical
@@ -969,9 +1004,20 @@ class CollectionService:
                 # clean reset (#317). Retained configs are inert while the row
                 # is tombstoned (every read filters deleted_at IS NULL).
                 soft_delete_sql = f'UPDATE "{phys_schema}".collections SET deleted_at = NOW() WHERE id = :id AND deleted_at IS NULL;'
-                await DQLQuery(
+                rows = await DQLQuery(
                     soft_delete_sql, result_handler=ResultHandler.ROWCOUNT
                 ).execute(conn, id=collection_id)
+                # Only emit on a real state transition; an idempotent re-call
+                # against an already-tombstoned row is a no-op and would
+                # otherwise re-trigger cascade subscribers spuriously.
+                if rows:
+                    await emit_event(
+                        CatalogEventType.COLLECTION_DELETION,
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        db_resource=conn,
+                        physical_schema=phys_schema,
+                    )
                 logger.info(
                     f"[LIFECYCLE] Soft deleted collection '{catalog_id}:{collection_id}'"
                 )

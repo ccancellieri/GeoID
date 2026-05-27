@@ -18,12 +18,12 @@
 
 from __future__ import annotations
 
-from enum import Enum, StrEnum
+from enum import StrEnum
 import os
 import logging
 import io
 import asyncio
-from typing import TYPE_CHECKING, Optional, List, Tuple, Iterator
+from typing import TYPE_CHECKING, Optional, Tuple, Iterator
 if TYPE_CHECKING:
     from google.cloud import storage
     from google.api_core.exceptions import NotFound, Conflict, Forbidden, GoogleAPICallError
@@ -353,33 +353,35 @@ def upload_stream_to_gcs(
     byte_stream: Iterator[bytes],
     destination_uri: str,
     content_type: str = "application/octet-stream",
-    client: Optional[storage.Client] = None
-):
-    """
-    Uploads a byte stream (generator) to a GCS destination.
-    
+    client: Optional[storage.Client] = None,
+) -> None:
+    """Upload a byte-stream generator to a GCS destination.
+
+    Uses ``blob.open("wb")`` (resumable upload) so the caller does not need to
+    provide a seekable file-like object.  Generators are consumed chunk-by-chunk
+    without buffering the entire payload in memory.
+
     Args:
-        byte_stream: Iterator yielding bytes
-        destination_uri: Full GCS URI (gs://...)
-        content_type: Media type for the blob
-        client: Optional GCS client
+        byte_stream: Iterator yielding bytes chunks.
+        destination_uri: Full GCS URI (``gs://bucket/path``).
+        content_type: MIME type for the uploaded blob.
+        client: Optional pre-built GCS client; uses the shared client otherwise.
     """
     if not destination_uri.startswith("gs://"):
         raise ValueError(f"Invalid GCS URI: {destination_uri}")
 
-    from dynastore.tools.file_io import GeneratorStream
-    
     storage_client = client or _get_shared_gcs_client()
     bucket_name, blob_name = destination_uri.replace("gs://", "").split("/", 1)
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
 
-    stream_wrapper = GeneratorStream(byte_stream)
-
     try:
         logger.info(f"Uploading stream to {destination_uri} (content_type={content_type})...")
-        blob.upload_from_file(stream_wrapper, content_type=content_type)
+        with blob.open("wb", content_type=content_type) as writer:
+            for chunk in byte_stream:
+                if chunk:
+                    writer.write(chunk)  # type: ignore[arg-type]  # BlobWriter stubs type write as str in text mode
         logger.info(f"Successfully uploaded to {destination_uri}.")
     except Exception as e:
         logger.error(f"Failed to upload to {destination_uri}: {e}", exc_info=True)
-        raise e
+        raise

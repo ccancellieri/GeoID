@@ -17,8 +17,12 @@ ItemsElasticsearchPrivateDriver — tenant-scoped ES storage driver.
 
 Writes the full feature (geometry + properties + external_id) into a
 per-tenant index whose name is owned by this subpackage
-(``{prefix}-{catalog_id}-private-items``). Driver-private mapping
-(``TENANT_FEATURE_MAPPING``) lives in :mod:`.mappings`.
+(``{prefix}-{catalog_id}-private-items``). The mapping is built by
+:func:`~dynastore.modules.storage.drivers.elasticsearch_private.mappings.build_private_item_mapping`
+from the tenant-scoped operator overlay
+(:attr:`~dynastore.modules.storage.driver_config.ItemsElasticsearchPrivateDriverConfig.mapping`,
+#1295 slice 3); an empty overlay keeps the legacy fully-dynamic shape
+(:data:`~dynastore.modules.storage.drivers.elasticsearch_private.mappings.TENANT_FEATURE_MAPPING`).
 
 Manages DENY access policies in its own lifecycle. Inherits the shared
 :class:`_ItemsElasticsearchBase` surface (structural search, the index-name
@@ -66,9 +70,13 @@ class ItemsElasticsearchPrivateDriver(
 
     Writes the full feature (geometry + properties + external_id) into a
     per-tenant index ``{prefix}-{catalog_id}-private-items`` shared across all
-    collections of the catalog. The mapping is `TENANT_FEATURE_MAPPING`
-    (root ``dynamic: false`` to reject smuggled fields; ``properties.*``
-    is dynamic so tenant attributes index without mapping churn).
+    collections of the catalog. The mapping is built by
+    :func:`build_private_item_mapping` from the tenant-scoped operator
+    overlay (#1295 slice 3): an empty overlay keeps the legacy fully-dynamic
+    ``properties.*`` sub-tree (``TENANT_FEATURE_MAPPING``); a non-empty
+    overlay produces a strict typed mapping for declared keys plus a
+    cap-safe ``properties.extras`` (``flattened``) + root ``_search_text``
+    lane for undeclared keys.
 
     Docs that would exceed the ES 10MB per-doc limit are shrunk by
     `simplify_to_fit` (`tools/geometry_simplify.py`); the resulting
@@ -207,7 +215,9 @@ class ItemsElasticsearchPrivateDriver(
             build_tenant_feature_doc,
         )
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            TENANT_FEATURE_MAPPING,
+            build_private_item_mapping,
+            project_private_doc,
+            resolve_catalog_private_known_fields,
         )
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
@@ -223,6 +233,10 @@ class ItemsElasticsearchPrivateDriver(
             catalog_id, collection_id, db_resource=db_resource,
         )
 
+        # Tenant-scoped manual mapping overlay (#1295 slice 3). Empty
+        # overlay → legacy fully-dynamic ``properties`` sub-tree.
+        known_fields = await resolve_catalog_private_known_fields(catalog_id)
+
         # Ingestion-context asset identity (mirrors the public driver's
         # ``_asset_id`` tracking field) — projected onto the private doc as
         # a top-level ``asset_id`` keyword for the WRITE path.
@@ -235,7 +249,7 @@ class ItemsElasticsearchPrivateDriver(
                     index=index_name,
                     body={
                         "settings": await get_private_items_index_settings(),
-                        "mappings": TENANT_FEATURE_MAPPING,
+                        "mappings": build_private_item_mapping(known_fields),
                     },
                 )
             except Exception as exc:
@@ -256,6 +270,7 @@ class ItemsElasticsearchPrivateDriver(
             )
             doc["simplification_factor"] = factor
             doc["simplification_mode"] = mode
+            doc = project_private_doc(doc, known_fields)
             bulk_body.append({"index": {"_index": index_name, "_id": geoid}})
             bulk_body.append(doc)
 
@@ -390,7 +405,8 @@ class ItemsElasticsearchPrivateDriver(
         **kwargs,
     ) -> None:
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            TENANT_FEATURE_MAPPING,
+            build_private_item_mapping,
+            resolve_catalog_private_known_fields,
         )
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
@@ -400,12 +416,18 @@ class ItemsElasticsearchPrivateDriver(
         es = self._get_client()
 
         if not await es.indices.exists(index=index_name):
+            # Snapshot the tenant-scoped operator overlay at index-create
+            # time. Live edits to ``mapping`` do not retro-patch ES
+            # (ES disallows tightening a live mapping); they take effect
+            # on the next index rebuild — same contract as the public
+            # driver's Tier-2 overlay.
+            known_fields = await resolve_catalog_private_known_fields(catalog_id)
             try:
                 await es.indices.create(
                     index=index_name,
                     body={
                         "settings": await get_private_items_index_settings(),
-                        "mappings": TENANT_FEATURE_MAPPING,
+                        "mappings": build_private_item_mapping(known_fields),
                     },
                 )
             except Exception as exc:
@@ -453,8 +475,9 @@ class ItemsElasticsearchPrivateDriver(
     async def ensure_indexer(self, ctx) -> None:
         """Idempotent bootstrap for the private per-tenant index.
 
-        Creates ``{prefix}-{catalog_id}-private-items`` with
-        ``TENANT_FEATURE_MAPPING`` if missing, then re-applies the
+        Creates ``{prefix}-{catalog_id}-private-items`` with the mapping
+        built from the tenant-scoped overlay (legacy fully-dynamic shape
+        when the overlay is empty) if missing, then re-applies the
         catalog's DENY policies (recovers in-memory IAM state on cold
         boot — same recovery path as :meth:`ensure_storage`).
 
@@ -481,9 +504,6 @@ class ItemsElasticsearchPrivateDriver(
                 "ItemsElasticsearchPrivateDriver.index: collection required for item ops",
             )
 
-        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            TENANT_FEATURE_MAPPING,
-        )
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
         )
@@ -502,7 +522,14 @@ class ItemsElasticsearchPrivateDriver(
         from dynastore.modules.storage.drivers.elasticsearch_private.doc_builder import (
             build_tenant_feature_doc,
         )
+        from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
+            build_private_item_mapping,
+            project_private_doc,
+            resolve_catalog_private_known_fields,
+        )
         from dynastore.tools.geometry_simplify import maybe_simplify_for_es
+
+        known_fields = await resolve_catalog_private_known_fields(ctx.catalog)
 
         if not await es.indices.exists(index=index_name):
             try:
@@ -510,7 +537,7 @@ class ItemsElasticsearchPrivateDriver(
                     index=index_name,
                     body={
                         "settings": await get_private_items_index_settings(),
-                        "mappings": TENANT_FEATURE_MAPPING,
+                        "mappings": build_private_item_mapping(known_fields),
                     },
                 )
             except Exception as exc:
@@ -529,6 +556,7 @@ class ItemsElasticsearchPrivateDriver(
         doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
         doc["simplification_factor"] = factor
         doc["simplification_mode"] = mode
+        doc = project_private_doc(doc, known_fields)
         await es.index(index=index_name, id=op.entity_id, body=doc)
 
     async def index_bulk(self, ctx, ops):
@@ -538,7 +566,9 @@ class ItemsElasticsearchPrivateDriver(
             build_tenant_feature_doc,
         )
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
-            TENANT_FEATURE_MAPPING,
+            build_private_item_mapping,
+            project_private_doc,
+            resolve_catalog_private_known_fields,
         )
         from dynastore.modules.elasticsearch.index_config import (
             get_private_items_index_settings,
@@ -557,6 +587,9 @@ class ItemsElasticsearchPrivateDriver(
             ctx.catalog, ctx.collection,
         )
 
+        # Tenant-scoped manual mapping overlay (#1295 slice 3).
+        known_fields = await resolve_catalog_private_known_fields(ctx.catalog)
+
         index_name = self._items_index_name(ctx.catalog)
         es = self._get_client()
 
@@ -566,7 +599,7 @@ class ItemsElasticsearchPrivateDriver(
                     index=index_name,
                     body={
                         "settings": await get_private_items_index_settings(),
-                        "mappings": TENANT_FEATURE_MAPPING,
+                        "mappings": build_private_item_mapping(known_fields),
                     },
                 )
             except Exception as exc:
@@ -590,6 +623,7 @@ class ItemsElasticsearchPrivateDriver(
             )
             doc["simplification_factor"] = factor
             doc["simplification_mode"] = mode
+            doc = project_private_doc(doc, known_fields)
             body.append({"index": {"_index": index_name, "_id": op.entity_id}})
             body.append(doc)
 

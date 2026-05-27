@@ -33,70 +33,14 @@ from fastapi.responses import HTMLResponse
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.modules.iam.iam_service import IamService
-from dynastore.tools.discovery import get_protocol, get_protocols
+from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config.query_executor import DbResource
 
-from dynastore.modules.iam.models import (
-    Role,
-    Policy,
-)
 from dynastore.models.protocols.policies import PermissionProtocol
 from dynastore.extensions.iam.middleware import IamMiddleware
 from dynastore.extensions.iam.authorization_api import me_router
 logger = logging.getLogger(__name__)
 
-
-def iam_service_policies():
-    """Pure declaration of IAM service policies (admin + self-service auth API).
-
-    Returned to IAM via ``IamExtension.get_policies``. Same pattern as
-    every other plugin in the SCOPE matrix — no direct
-    ``register_policy`` call. IAM consuming its own contribution is the
-    canonical case for this Protocol; treating it the same way as
-    other plugins keeps the registration site singular and the seeding
-    logic uniform.
-    """
-    return [
-        Policy(
-            id="admin_authorization_api",
-            description="Allows admin users to manage user roles and permissions",
-            actions=["GET", "POST", "PUT", "DELETE", "PATCH"],
-            resources=["/admin/principals/.*", "/admin/roles/.*", "/admin/policies/.*"],
-            effect="ALLOW",
-            partition_key="global",
-        ),
-        Policy(
-            id="self_service_authorization_api",
-            description="Allows authenticated users to view their own roles and catalog access",
-            actions=["GET"],
-            # me_router is mounted at /iam/me; resources must include the
-            # /iam/ prefix because the matcher is start-anchored. The bare
-            # /iam/me path needs its own entry — `.*` requires ≥1 trailing
-            # char and would not match `/iam/me`.
-            resources=["/iam/me", "/iam/me/.*", "/auth/userinfo"],
-            effect="ALLOW",
-            partition_key="global",
-        ),
-    ]
-
-
-def iam_service_role_bindings(
-    sysadmin_role_name=None,
-    admin_role_name=None,
-    user_role_name=None,
-):
-    """Pure declaration of role bindings for IAM service policies.
-
-    Role names default from the active ``IamRolesConfig`` so seed-time
-    bindings track operator-renamed deployments without explicit args.
-    """
-    from dynastore.models.protocols.authorization import IamRolesConfig
-    cfg = IamRolesConfig()
-    return [
-        Role(name=admin_role_name or cfg.admin_role_name, policies=["admin_authorization_api"]),
-        Role(name=sysadmin_role_name or cfg.sysadmin_role_name, policies=["admin_authorization_api"]),
-        Role(name=user_role_name or cfg.default_user_role_name, policies=["self_service_authorization_api"]),
-    ]
 
 
 def _build_oauth2_endpoints() -> tuple[str, str]:
@@ -260,15 +204,6 @@ class IamExtension(ExtensionProtocol):
     def get_web_pages(self):
         from dynastore.extensions.tools.web_collect import collect_web_pages
         return collect_web_pages(self)
-
-    # PolicyContributor: declare IAM's own service policies; the lifespan
-    # contributor loop forwards them to PermissionProtocol — same path as
-    # every other plugin in the SCOPE matrix.
-    def get_policies(self):
-        return iam_service_policies()
-
-    def get_role_bindings(self):
-        return iam_service_role_bindings()
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -447,20 +382,8 @@ class IamExtension(ExtensionProtocol):
             )
             yield
             return
+        assert db_protocol is not None  # narrowed: missing-list guard returns above
         self._engine = db_protocol.engine
-
-        # Seed default policies (idempotent)
-        try:
-            # Seed both global (iam) and system (catalog) schemas
-            await self._policy_service.provision_default_policies(catalog_id=None)
-            await self._policy_service.provision_default_policies(catalog_id="_system_")
-        except Exception as e:
-            logger.error(f"Failed to seed default policies: {e}")
-
-        # IAM's own service policies are declared via PolicyContributor
-        # (IamExtension.get_policies / get_role_bindings) and picked up by
-        # the contributor loop below alongside every other plugin's
-        # declarations — same single registration site.
 
         # Register the IAM-side PageVisibilityFilter implementation so
         # web routes can delegate nav-list filtering without naming any
@@ -485,33 +408,6 @@ class IamExtension(ExtensionProtocol):
             logger.error(
                 "IamExtension: failed to register MembershipCacheProvider: %s", e
             )
-
-        # Discover plugin-declared policies via PolicyContributor. Plugins
-        # never touch PermissionProtocol directly — they declare here and
-        # IAM forwards centrally. Keeps IAM/auth concepts isolated from
-        # the rest of the platform.
-        try:
-            from dynastore.models.protocols.policy_contributor import PolicyContributor
-            contributors = get_protocols(PolicyContributor)
-            for contributor in contributors:
-                origin = type(contributor).__name__
-                try:
-                    for policy in contributor.get_policies() or []:
-                        self._policy_service.register_policy(policy)
-                    for role in contributor.get_role_bindings() or []:
-                        self._policy_service.register_role(role)
-                    logger.debug(
-                        "IamExtension: registered policies/bindings from %s",
-                        origin,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "IamExtension: %s contributor failed: %s",
-                        origin,
-                        e,
-                    )
-        except Exception as e:
-            logger.error("IamExtension: PolicyContributor discovery failed: %s", e)
 
         yield
 

@@ -15,3 +15,7 @@
 #    Author: Carlo Cancellieri (ccancellieri@gmail.com)
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
+
+# Register IAM presets at module load time so they appear in GET /admin/presets
+# before any request is served.
+from dynastore.modules.iam import presets as _iam_presets  # noqa: F401

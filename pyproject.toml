@@ -284,9 +284,12 @@ index_grp = ["dynastore[elasticsearch,task_elasticsearch_indexer_deps]"]
 drivers_grp = ["dynastore[module_storage_postgresql,module_storage_duckdb,module_storage_iceberg,module_storage_elasticsearch,module_storage_elasticsearch_private,module_storage_elasticsearch_assets,module_collection_elasticsearch,module_catalog_elasticsearch]"]
 
 # ==========================================================================
-# TASK GROUPINGS (sync-db)
+# TASK GROUPINGS
 # ==========================================================================
 task_base = ["dynastore[db_sync,module_tasks,module_events,extension_processes]"]
+# Mirror of task_base for I/O-bound streaming workers. db_async INSTEAD of db_sync.
+# See #1420 for rationale; #909 documents why CPU-bound workers stay on task_base.
+task_base_async = ["dynastore[module_db,module_tasks,module_events,extension_processes]"]
 ingestion = ["dynastore[task_base,module_gcp,task_ingestion_deps]"]
 # outbox_drain — generic per-driver outbox consumer used by indexer worker
 # Cloud Run Jobs. Only depends on task_base; the concrete BulkIndexer
@@ -294,10 +297,21 @@ ingestion = ["dynastore[task_base,module_gcp,task_ingestion_deps]"]
 # worker also pulls in module_elasticsearch).
 outbox_drain = ["dynastore[task_base]"]
 
-# ---- Worker / Cloud Run Job task extras (heavy; sync-db via task_base).
+# ---- Worker / Cloud Run Job task extras (heavy).
 # One extras per task. Each Cloud Run Job is deployed with
 # SCOPE=worker_task_<name> — a single unambiguous identifier the catalog's
 # gcp_cloud_runner uses to map discovered jobs back to task entry-points.
+#
+# Worker DB convention split (see #909 and #1420):
+#   task_base        — CPU-bound workers (sync psycopg2 only, no asyncpg in image).
+#                      Preserves #909: ingestion, gdal, tiles_preseed,
+#                      dimensions_materialize, elasticsearch_indexer.
+#   task_base_async  — I/O-bound streaming workers (asyncpg + psycopg3 via
+#                      module_events; psycopg2-binary absent: db_sync/module_datastore
+#                      not included, module_storage_postgresql is an empty marker,
+#                      pyiceberg[sql-postgres] not pulled here; DatastoreModule
+#                      plugin gracefully no-loads same as on async-only test runs).
+#                      export_features, dwh_join.
 #
 # `module_catalog` audit (2026-04-29, B6 + Phase H follow-ups):
 #   - dwh_join: original audit assumed raw SQL only, but Phase H container
@@ -328,14 +342,14 @@ outbox_drain = ["dynastore[task_base]"]
 # every worker scope must therefore declare it can host the PG items driver
 # class even when the task itself does not exercise items WRITE — module
 # imports still resolve through ItemsRoutingConfig instantiation.
-worker_task_dwh_join = ["dynastore[task_base,module_catalog,module_crs,dwh,module_storage_postgresql]"]
+worker_task_dwh_join = ["dynastore[task_base_async,module_catalog,module_crs,dwh,module_storage_postgresql]"]
 worker_task_ingestion = ["dynastore[ingestion,catalog_grp,google_grp,gdal,drivers_grp]"]
 # export_features: writes feature output to GCS (`gs://...` destination_uri)
 # via dynastore.modules.gcp clients. Without module_gcp the worker raises
 # at task run time: "GCPModule has not been initialized or failed to
 # create a storage client." Confirmed by 019dda8e-a239-7bd8-...
 # OGC poll on 2026-04-29.
-worker_task_export_features = ["dynastore[task_base,module_gcp,stac,geospatial_core,module_storage_postgresql]"]
+worker_task_export_features = ["dynastore[task_base_async,module_gcp,stac,geospatial_core,module_storage_postgresql]"]
 worker_task_tiles_preseed = ["dynastore[task_base,module_catalog,tiles,crs,module_storage_postgresql]", "morecantile>=7.0.3,<8"]
 worker_task_gdal = ["dynastore[task_base,module_catalog,gdal,module_storage_postgresql]"]
 worker_task_dimensions_materialize = ["dynastore[task_base,module_catalog,extension_dimensions,module_storage_postgresql]"]

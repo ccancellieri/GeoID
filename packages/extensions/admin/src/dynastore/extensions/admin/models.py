@@ -169,3 +169,43 @@ class GrantUsageView(BaseModel):
         ),
     )
     fetched_at: str = Field(description="ISO 8601 timestamp the response was assembled.")
+
+
+# --- Applied-presets bulk list (#1425) ------------------------------------
+
+
+class AppliedRowResponse(BaseModel):
+    """One row from ``iam.applied_presets`` for a given scope."""
+
+    preset_name: str
+    scope_key: str
+    state: str
+    applied_at: Optional[str] = Field(
+        default=None,
+        description="ISO 8601 timestamp when the preset reached 'applied' state.",
+    )
+    applied_by: Optional[str] = Field(
+        default=None, description="UUID of the principal that triggered the apply."
+    )
+    params_snapshot: Optional[Dict[str, Any]] = Field(
+        default=None, description="Parameter snapshot captured at apply time."
+    )
+    last_error: Optional[str] = Field(
+        default=None, description="Last error message when state is 'failed' or 'revoke_failed'."
+    )
+    updated_at: Optional[str] = Field(
+        default=None, description="ISO 8601 timestamp of the last state-machine transition."
+    )
+
+
+class AppliedPresetsPage(BaseModel):
+    """Paginated response for ``GET /admin/presets/applied``."""
+
+    rows: List[AppliedRowResponse]
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description=(
+            "Opaque keyset cursor. Pass as ``cursor`` on the next request "
+            "to retrieve the following page. ``null`` when this is the last page."
+        ),
+    )

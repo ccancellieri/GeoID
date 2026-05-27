@@ -1105,22 +1105,51 @@ class ItemsElasticsearchPrivateDriverConfig(CollectionDriverConfig):
 
     The driver currently reads its index prefix from the platform-wide
     env var ``STAC_ITEMS_INDEX_PREFIX`` via
-    ``modules.elasticsearch.client.get_index_prefix``.  No per-collection
-    field is exposed today; the config exists primarily as the TypedDriver
-    identity marker so the driver appears in
-    :func:`list_registered_configs` and the ``/configs/registry`` /
-    ``/configs/.../plugins/items_elasticsearch_private_driver`` deep-view
-    routes — fixing the visibility gap that previously hid this driver
-    from the operator's deep view.
+    ``modules.elasticsearch.client.get_index_prefix``.
+
+    Per-tenant operator knob — :attr:`mapping` is a tenant-scoped manual
+    mapping overlay merged into the per-tenant private index at
+    index-create time. Unlike the public driver's Tier-2 overlay, there
+    is no platform-wide Tier-1 set for the private driver: the index is
+    not aliased cross-tenant and the operator declares exactly which
+    extension keys deserve a typed mapping. Unknown keys keep landing in
+    the cap-safe ``properties.extras`` lane + ``_search_text`` root
+    field (same defence-in-depth shape as the public per-catalog index,
+    #1295). Snapshot at index-create; live edits take effect on next
+    index rebuild (ES does not allow tightening a live mapping).
+
+    The freeze tier is ``"catalog"``: the manual mapping governs the
+    per-tenant index, not any one collection.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
-    _freeze_at: ClassVar[Optional[str]] = "collection"
+    # Tenant-scoped: the per-tenant index is shared across all collections
+    # of a catalog, so the mapping snapshot is meaningful at the catalog
+    # tier (not collection). Operators set ``mapping`` at the catalog
+    # tier; the immutability gate freezes once the catalog has any
+    # collection provisioned.
+    _freeze_at: ClassVar[Optional[str]] = "catalog"
 
     required_engine_class: ClassVar[str] = "elasticsearch_engine"
 
     model_config = ConfigDict(extra="allow")
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({DriverCapability.ASYNC})
+    mapping: Mutable[Dict[str, Dict[str, Any]]] = Field(
+        default_factory=dict,
+        description=(
+            "Tenant-scoped manual mapping overlay: ``{stac_field: {ES "
+            "field-type definition}}``. Merged into the per-tenant "
+            "private index at index-create time, under "
+            "``properties.<key>``. When non-empty, the index uses the "
+            "strict cap-safe shape: declared keys land at their typed "
+            "path, undeclared keys route to ``properties.extras`` "
+            "(``flattened``) + the ``_search_text`` root analyzed "
+            "catch-all. When empty (default), the legacy fully-dynamic "
+            "``properties`` sub-tree is kept for backward compatibility. "
+            "Snapshot at index-create; live edits take effect on next "
+            "index rebuild (ES does not allow tightening a live mapping)."
+        ),
+    )
     # Issue #1248: exact geometry by default — see
     # ``ItemsElasticsearchDriverConfig.simplify_geometry`` for the full
     # rationale. The private driver shares the same opt-in semantics.
@@ -1690,6 +1719,78 @@ async def _validate_items_es_driver_config(
 
 
 ItemsElasticsearchDriverConfig.register_validate_handler(_validate_items_es_driver_config)
+
+
+# ---------------------------------------------------------------------------
+# Validate handler — ItemsElasticsearchPrivateDriverConfig.mapping overlay
+# ---------------------------------------------------------------------------
+
+
+# Reserved root keys of TENANT_FEATURE_MAPPING that the operator overlay
+# must never try to retype — they live at the doc root, not under
+# ``properties.``. Kept as a tuple here so the validator doesn't import
+# the driver-private mapping module (which would create a config →
+# driver layering inversion).
+_PRIVATE_RESERVED_ROOT_FIELDS: Tuple[str, ...] = (
+    "geoid",
+    "catalog_id",
+    "collection_id",
+    "external_id",
+    "asset_id",
+    "geometry",
+    "bbox",
+    "simplification_factor",
+    "simplification_mode",
+    "properties",
+    "extras",
+)
+
+
+async def _validate_items_es_private_driver_config(
+    config: PluginConfig,
+    catalog_id: "Optional[str]",
+    collection_id: "Optional[str]",
+    db_resource: "Optional[Any]",
+) -> None:
+    """Reject malformed ``mapping`` overlays on the private driver config.
+
+    The private driver's manual mapping is tenant-scoped (one index per
+    catalog), so unlike the public Tier-2 there is no platform-wide
+    Tier-1 to collide with. Validation focuses on shape (every entry
+    must be a dict carrying ``"type"``) and on rejecting overlays that
+    try to retype reserved root keys of ``TENANT_FEATURE_MAPPING``
+    (``geoid``, ``catalog_id``, ``geometry``, …) — those keys live at
+    the document root, not under ``properties.``.
+    """
+    if not isinstance(config, ItemsElasticsearchPrivateDriverConfig):
+        return
+    overlay = getattr(config, "mapping", None)
+    if not isinstance(overlay, dict):
+        raise ValueError(
+            "ItemsElasticsearchPrivateDriverConfig.mapping must be a dict "
+            "of {stac_field: {ES field-type definition}}."
+        )
+    if not overlay:
+        return
+    for key, value in overlay.items():
+        if not isinstance(value, dict) or "type" not in value:
+            raise ValueError(
+                "ItemsElasticsearchPrivateDriverConfig.mapping["
+                f"{key!r}] must be a dict with at least a 'type' field; "
+                f"got {type(value).__name__}."
+            )
+        if key in _PRIVATE_RESERVED_ROOT_FIELDS:
+            raise ValueError(
+                "ItemsElasticsearchPrivateDriverConfig.mapping["
+                f"{key!r}] collides with a reserved root field of the "
+                "tenant feature mapping. The overlay applies under "
+                "``properties.<key>`` only — pick a property name."
+            )
+
+
+ItemsElasticsearchPrivateDriverConfig.register_validate_handler(
+    _validate_items_es_private_driver_config,
+)
 
 
 # Resolve the forward reference on IdentityRule.on_match now that

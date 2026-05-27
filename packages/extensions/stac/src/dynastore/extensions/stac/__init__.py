@@ -27,3 +27,6 @@ from dynastore.extensions.stac import (  # noqa: F401
     stac_items_sidecar as _stac_items_sidecar,      # SidecarRegistry
 )
 
+# Register the stac_enable preset into the global preset registry on import.
+from dynastore.extensions.stac import presets as _stac_presets  # noqa: F401
+

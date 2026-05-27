@@ -792,3 +792,241 @@ class TestIcebergLifespan:
         async with driver.lifespan(object()):
             pass
         assert driver._catalog_cache == {}
+
+
+# ---------------------------------------------------------------------------
+# Schema built from the cross-driver field projection (#1295)
+# ---------------------------------------------------------------------------
+
+
+class TestIcebergSchemaFromProjection:
+    """Pin the Iceberg schema that :func:`_build_iceberg_schema_from_projection`
+    derives from :func:`materialize_feature_fields`.
+
+    The projection is the single source of truth for "what fields does this
+    collection materialise" — author-declared :class:`ItemsSchema.fields`
+    plus :class:`ItemsWritePolicy`-derived special fields (``external_id``,
+    ``asset_id``, validity bounds, hashes, spatial cells, geometry / attribute
+    statistics). Adoption here means new Iceberg tables carry the full
+    projected column set instead of the legacy three-column envelope.
+    """
+
+    def test_empty_projection_yields_envelope_only(self):
+        from dynastore.modules.storage.drivers.iceberg import (
+            _build_iceberg_schema_from_projection,
+        )
+
+        schema = _build_iceberg_schema_from_projection({})
+        names = [f.name for f in schema.fields]
+        assert names == ["id", "geometry", "properties"]
+        # Envelope ids 1..3 are stable (existing-table backwards compatibility).
+        ids = [f.field_id for f in schema.fields]
+        assert ids == [1, 2, 3]
+        # ``id`` is required; ``geometry``/``properties`` are optional.
+        assert schema.fields[0].required is True
+        assert schema.fields[1].required is False
+        assert schema.fields[2].required is False
+
+    def test_schema_fields_become_columns_with_canonical_iceberg_types(self):
+        """``materialize_feature_fields`` should drive the Iceberg type for each
+        author-declared schema field that materialises as a column."""
+        from dynastore.models.protocols.field_definition import (
+            FieldCapability,
+            FieldDefinition,
+        )
+        from dynastore.modules.storage.driver_config import ItemsSchema, ItemsWritePolicy
+        from dynastore.modules.storage.drivers.iceberg import (
+            _build_iceberg_schema_from_projection,
+        )
+        from dynastore.modules.storage.field_projection import (
+            materialize_feature_fields,
+        )
+        from pyiceberg.types import (
+            BooleanType, DateType, DoubleType, IntegerType, LongType,
+            StringType, TimestamptzType,
+        )
+
+        schema_cfg = ItemsSchema(
+            fields={
+                "title":       FieldDefinition(name="title", data_type="string", capabilities=[FieldCapability.FILTERABLE]),
+                "count":       FieldDefinition(name="count", data_type="integer", capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE]),
+                "population":  FieldDefinition(name="population", data_type="bigint", capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE]),
+                "area_km2":    FieldDefinition(name="area_km2", data_type="double", capabilities=[FieldCapability.FILTERABLE]),
+                "active":      FieldDefinition(name="active", data_type="boolean", capabilities=[FieldCapability.FILTERABLE]),
+                "observed_at": FieldDefinition(name="observed_at", data_type="timestamp", capabilities=[FieldCapability.FILTERABLE]),
+                "observed_on": FieldDefinition(name="observed_on", data_type="date", capabilities=[FieldCapability.FILTERABLE]),
+                # Geometry is owned by the envelope ``geometry`` column / geometry
+                # sidecar; the projection skips it and the schema builder skips
+                # it too (defence in depth).
+                "geom":        FieldDefinition(name="geom", data_type="geometry", capabilities=[]),
+            }
+        )
+
+        projected = materialize_feature_fields(schema_cfg, ItemsWritePolicy())
+        schema = _build_iceberg_schema_from_projection(projected)
+
+        names = {f.name for f in schema.fields}
+        # Envelope is always present, geom is filtered out, every column-eligible
+        # schema field shows up as an Iceberg column.
+        assert {"id", "geometry", "properties"}.issubset(names)
+        assert "geom" not in names  # geometry skipped
+        assert {"title", "count", "population", "area_km2", "active", "observed_at", "observed_on"}.issubset(names)
+
+        by_name = {f.name: f for f in schema.fields}
+        assert isinstance(by_name["title"].field_type, StringType)
+        assert isinstance(by_name["count"].field_type, IntegerType)
+        assert isinstance(by_name["population"].field_type, LongType)
+        assert isinstance(by_name["area_km2"].field_type, DoubleType)
+        assert isinstance(by_name["active"].field_type, BooleanType)
+        assert isinstance(by_name["observed_at"].field_type, TimestamptzType)
+        assert isinstance(by_name["observed_on"].field_type, DateType)
+
+    def test_required_flag_flows_through(self):
+        from dynastore.models.protocols.field_definition import FieldDefinition
+        from dynastore.modules.storage.driver_config import ItemsSchema, ItemsWritePolicy
+        from dynastore.modules.storage.drivers.iceberg import (
+            _build_iceberg_schema_from_projection,
+        )
+        from dynastore.modules.storage.field_projection import (
+            materialize_feature_fields,
+        )
+
+        schema_cfg = ItemsSchema(
+            fields={
+                "code": FieldDefinition(name="code", data_type="string", required=True),
+            }
+        )
+        projected = materialize_feature_fields(schema_cfg, ItemsWritePolicy())
+        schema = _build_iceberg_schema_from_projection(projected)
+        code = next(f for f in schema.fields if f.name == "code")
+        assert code.required is True
+
+    def test_policy_special_fields_use_legacy_underscore_prefix(self):
+        """``external_id`` / ``asset_id`` / ``valid_from`` / ``valid_to`` from
+        the projection MUST land as the legacy underscore-prefixed Iceberg
+        columns the write path writes to (``_external_id`` etc.)."""
+        from dynastore.modules.storage.driver_config import (
+            DeriveSpec, ItemsWritePolicy, ValiditySpec,
+        )
+        from dynastore.modules.storage.drivers.iceberg import (
+            _build_iceberg_schema_from_projection,
+        )
+        from dynastore.modules.storage.field_projection import (
+            materialize_feature_fields,
+        )
+
+        policy = ItemsWritePolicy(
+            derive=DeriveSpec(external_id="properties.code"),
+            track_asset_id=True,
+            validity=ValiditySpec(),
+        )
+        projected = materialize_feature_fields(None, policy)
+        # Sanity: projection uses the un-prefixed canonical names.
+        assert "external_id" in projected
+        assert "asset_id" in projected
+        assert "valid_from" in projected
+        assert "valid_to" in projected
+
+        schema = _build_iceberg_schema_from_projection(projected)
+        names = {f.name for f in schema.fields}
+        # Driver-side underscore-prefixed names land on the table.
+        assert "_external_id" in names
+        assert "_asset_id" in names
+        assert "_valid_from" in names
+        assert "_valid_to" in names
+        # And the canonical un-prefixed names do NOT appear (the remap is the
+        # only place they should turn into prefixed columns).
+        assert "external_id" not in names
+        assert "asset_id" not in names
+
+    def test_envelope_collision_envelope_wins(self):
+        """A schema field named ``id`` / ``geometry`` / ``properties`` does not
+        clobber the envelope column."""
+        from dynastore.models.protocols.field_definition import (
+            FieldCapability, FieldDefinition,
+        )
+        from dynastore.modules.storage.driver_config import ItemsSchema, ItemsWritePolicy
+        from dynastore.modules.storage.drivers.iceberg import (
+            _build_iceberg_schema_from_projection,
+        )
+        from dynastore.modules.storage.field_projection import (
+            materialize_feature_fields,
+        )
+
+        schema_cfg = ItemsSchema(
+            fields={
+                # ``id`` declared as bigint in the schema — must NOT shadow the
+                # envelope ``id`` StringType column.
+                "id": FieldDefinition(name="id", data_type="bigint", capabilities=[FieldCapability.FILTERABLE]),
+                "label": FieldDefinition(name="label", data_type="string", capabilities=[FieldCapability.FILTERABLE]),
+            }
+        )
+        projected = materialize_feature_fields(schema_cfg, ItemsWritePolicy())
+        schema = _build_iceberg_schema_from_projection(projected)
+        envelope_id = next(f for f in schema.fields if f.name == "id")
+        # Envelope ``id`` keeps id=1 / StringType / required=True regardless of
+        # the schema-author declaration.
+        assert envelope_id.field_id == 1
+        assert isinstance(envelope_id.field_type, StringType)
+        assert envelope_id.required is True
+        # ``label`` still lands.
+        assert any(f.name == "label" for f in schema.fields)
+
+
+class TestCanonicalToIcebergType:
+    """Pin :func:`_canonical_to_iceberg_type` for the canonical vocabulary
+    (see :mod:`dynastore.models.field_types`)."""
+
+    def test_string(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("string"), StringType)
+
+    def test_integer_is_int32(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("integer"), IntegerType)
+
+    def test_bigint_is_long(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("bigint"), LongType)
+
+    def test_double(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("double"), DoubleType)
+
+    def test_numeric_widens_to_double(self):
+        # No precision on the canonical token → widen rather than guess.
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("numeric"), DoubleType)
+
+    def test_boolean(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("boolean"), BooleanType)
+
+    def test_date(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("date"), DateType)
+
+    def test_timestamp_is_timestamptz(self):
+        # Canonical ``timestamp`` is timezone-aware in dynastore.
+        from pyiceberg.types import TimestamptzType
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("timestamp"), TimestamptzType)
+
+    def test_jsonb_and_uuid_degrade_to_string(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("jsonb"), StringType)
+        assert isinstance(_canonical_to_iceberg_type("uuid"), StringType)
+
+    def test_time_degrades_to_string(self):
+        # Iceberg has no time-of-day primitive on the surface we use.
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("time"), StringType)
+
+    def test_geometry_variants_degrade_to_string(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("geometry"), StringType)
+        assert isinstance(_canonical_to_iceberg_type("geometry(Point,4326)"), StringType)
+
+    def test_unknown_degrades_to_string(self):
+        from dynastore.modules.storage.drivers.iceberg import _canonical_to_iceberg_type
+        assert isinstance(_canonical_to_iceberg_type("not_a_type"), StringType)

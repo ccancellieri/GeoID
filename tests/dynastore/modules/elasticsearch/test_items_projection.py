@@ -243,10 +243,12 @@ def test_item_mapping_is_strict_at_root_and_properties() -> None:
     assert ITEM_MAPPING["dynamic"] is False
     nested = ITEM_MAPPING["properties"]["properties"]
     assert nested["dynamic"] is False
-    # The extras lane must be dynamic so the long tail can land somewhere.
+    # The extras lane must be a single ``flattened`` field — the whole
+    # bucket counts as one mapping entry regardless of how many distinct
+    # leaf keys arrive across the collections sharing this per-catalog
+    # index (#1295 cap-safe long-tail).
     extras = nested["properties"]["extras"]
-    assert extras["type"] == "object"
-    assert extras["dynamic"] is True
+    assert extras == {"type": "flattened"}
 
 
 def test_item_mapping_includes_all_tier_1_fields() -> None:
@@ -274,6 +276,9 @@ def test_common_properties_includes_internal_write_trackers() -> None:
         "_valid_to",
         "_simplification_factor",
         "_simplification_mode",
+        # Cap-safe analyzed catch-all populated at write time from the
+        # ``properties.extras`` values (#1295).
+        "_search_text",
     ):
         assert required in COMMON_PROPERTIES, (
             f"{required} must be declared in COMMON_PROPERTIES so the "
@@ -283,6 +288,7 @@ def test_common_properties_includes_internal_write_trackers() -> None:
     root_props = ITEM_MAPPING["properties"]
     assert "_asset_id" in root_props
     assert "_simplification_factor" in root_props
+    assert root_props["_search_text"] == {"type": "text", "analyzer": "standard"}
 
 
 # --- e -----------------------------------------------------------------
@@ -334,8 +340,8 @@ def test_build_item_mapping_respects_custom_known_fields() -> None:
     nested = mapping["properties"]["properties"]["properties"]
     assert nested["fao:custom_score"] == {"type": "float"}
     assert nested["fao:custom_label"] == {"type": "keyword"}
-    # ``extras`` lane is always present.
-    assert nested["extras"]["dynamic"] is True
+    # ``extras`` lane is always present as a single ``flattened`` field.
+    assert nested["extras"] == {"type": "flattened"}
 
 
 @pytest.mark.parametrize(
@@ -458,3 +464,107 @@ def test_unproject_is_inverse_of_project() -> None:
 def test_unproject_non_dict_passthrough() -> None:
     assert unproject_item_from_es(None) is None
     assert unproject_item_from_es("x") == "x"
+
+
+# --- f: cap-safe long-tail (#1295) -----------------------------------------
+#
+# The ``extras`` lane is a single ``flattened`` field (exact-key only)
+# paired with a root ``_search_text`` analyzed catch-all populated at
+# write time from the same extras values. Together: "fulltext or
+# better" at exactly two mapping entries no matter how many distinct
+# extension keys arrive across the collections sharing the per-catalog
+# index.
+
+
+def test_project_populates_search_text_from_extras_values() -> None:
+    known = build_known_fields()
+    doc = {
+        "id": "x",
+        "properties": {
+            "datetime": "2026-01-01T00:00:00Z",  # Tier 1 — not in search_text
+            "vendor:label": "alpha beta",
+            "vendor:score": 0.42,
+            "vendor:flag": True,
+        },
+    }
+    out = project_item_for_es(doc, known)
+    assert "_search_text" in out
+    txt = out["_search_text"]
+    assert "alpha beta" in txt
+    assert "0.42" in txt
+    assert "true" in txt
+    # Tier-1 values do NOT bleed into the catch-all.
+    assert "2026-01-01T00:00:00Z" not in txt
+
+
+def test_project_no_extras_produces_no_search_text() -> None:
+    known = build_known_fields()
+    doc = {
+        "id": "x",
+        "properties": {
+            "datetime": "2026-01-01T00:00:00Z",
+            "eo:cloud_cover": 5.0,
+        },
+    }
+    out = project_item_for_es(doc, known)
+    assert "_search_text" not in out
+    assert "extras" not in out["properties"]
+
+
+def test_project_search_text_handles_nested_and_arrays() -> None:
+    known = build_known_fields()
+    doc = {
+        "id": "x",
+        "properties": {
+            "vendor:nested": {"deep": "hello"},
+            "vendor:tags": ["one", "two"],
+        },
+    }
+    out = project_item_for_es(doc, known)
+    txt = out["_search_text"]
+    assert "hello" in txt
+    assert "one" in txt
+    assert "two" in txt
+
+
+def test_project_search_text_skips_none() -> None:
+    known = build_known_fields()
+    doc = {
+        "id": "x",
+        "properties": {
+            "vendor:label": None,
+            "vendor:other": "kept",
+        },
+    }
+    out = project_item_for_es(doc, known)
+    assert "kept" in out["_search_text"]
+    # Empty extras-only doc still gets _search_text iff any value survives.
+
+
+def test_unproject_drops_search_text_from_response() -> None:
+    """``_search_text`` is an index-only artefact; it must not surface
+    on the read contract (it's not in ``_RESERVED_MEMBER_KEYS`` so the
+    existing unproject loop naturally drops it — this test pins that
+    behaviour against future refactors)."""
+    src = {
+        "type": "Feature",
+        "id": "x",
+        "geometry": None,
+        "properties": {"datetime": "2026-01-01T00:00:00Z"},
+        "_search_text": "vendor data noise",
+    }
+    out = unproject_item_from_es(src)
+    assert "_search_text" not in out
+
+
+def test_long_tail_keeps_mapping_entry_count_flat() -> None:
+    """500 distinct extras keys → still 2 mapping entries (extras +
+    _search_text). The whole point of #1295."""
+    known = build_known_fields()
+    props = {f"col_{i:04d}": f"v{i}" for i in range(500)}
+    doc = {"id": "x", "properties": props}
+    out = project_item_for_es(doc, known)
+    assert len(out["properties"]["extras"]) == 500
+    assert isinstance(out["_search_text"], str)
+    assert "v0" in out["_search_text"]
+    assert "v499" in out["_search_text"]

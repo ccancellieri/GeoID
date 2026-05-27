@@ -56,7 +56,6 @@ _FEATURE_STRUCTURAL_KEYS = frozenset(
         "stac_extensions",
     }
 )
-_REPORT_LEGACY_TOP_LEVEL_KEYS = frozenset({"asset_code"})
 # Sibling envelope keys to ``properties`` introduced by the reporter-shape
 # split (D1): ``stats`` is the flat platform-derived statistic bag (formerly
 # mixed into ``properties``); ``system`` carries identity + lifecycle fields
@@ -104,8 +103,8 @@ class GcsDetailedReporterConfig(BaseModel):
     )
     include_asset_id: Optional[bool] = Field(
         default=None,
-        description="Include the `asset_id` (and its legacy `asset_code` alias) "
-        "at the record top level. None/True = include when present; False = suppress.",
+        description="Include the `asset_id` under `record.system`. "
+        "None/True = include when present; False = suppress.",
     )
     report_content: Literal["ALL", "ONLY_SUCCESS", "ONLY_FAILURE"] = Field(
         default="ALL",
@@ -421,13 +420,6 @@ class GcsDetailedReporter(ReportingInterface[GcsDetailedReporterConfig]):
             else:
                 system = None
 
-            # legacy dwh contract: surface asset_id as asset_code (skipped when
-            # asset_id is suppressed so the alias doesn't smuggle it back in).
-            if self.config.include_asset_id is not False and isinstance(system, dict):
-                asset_id = system.get("asset_id")
-                if asset_id:
-                    record["asset_code"] = str(asset_id)
-
             # 1. Attribute allow-list — applies to the GeoJSON ``properties``
             #    bag and the legacy flat ``attributes`` bag alike. ``stats`` is
             #    its own sibling envelope key (platform-derived) and is not
@@ -457,12 +449,8 @@ class GcsDetailedReporter(ReportingInterface[GcsDetailedReporterConfig]):
             #    plus the envelope siblings ``stats``/``system`` so each
             #    attribute appears once, under ``properties``.
             allowed_top_level = (
-                set(_FEATURE_STRUCTURAL_KEYS)
-                | set(_REPORT_LEGACY_TOP_LEVEL_KEYS)
-                | set(_REPORT_ENVELOPE_KEYS)
+                set(_FEATURE_STRUCTURAL_KEYS) | set(_REPORT_ENVELOPE_KEYS)
             )
-            if self.config.include_asset_id is False:
-                allowed_top_level.discard("asset_code")
             record = {
                 key: value
                 for key, value in record.items()

@@ -9,6 +9,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from dynastore.modules.catalog.item_query import ItemQueryMixin
+from dynastore.modules.storage.computed_fields import FeatureType
 from dynastore.modules.storage.drivers.pg_sidecars import (
     FeatureAttributeSidecarConfig,
     GeometriesSidecarConfig,
@@ -107,3 +108,37 @@ def test_cql_filter_deferred_to_transform_path_not_parsed_with_null_mapping():
     # And it must NOT have been baked into raw_where here (that only happens
     # in the transform path, with the proper field_mapping).
     assert not req.raw_where
+
+
+def test_mvt_with_feature_type_sets_skip_geometry_to_avoid_geom_alias_collision():
+    """MVT branch must set ``skip_geometry=True``.
+
+    Otherwise the geometry sidecar emits ``ST_AsGeoJSON(geom)::jsonb AS geom``
+    alongside the MVT transform's ``ST_AsMVTGeom(...) AS geom``, producing two
+    inner-SELECT columns aliased ``geom`` — Postgres then fails the outer
+    ``SELECT "geom" FROM (_mvt_inner)`` wrap with
+    ``AmbiguousColumnError: column reference "geom" is ambiguous``
+    (live regression on glosisdemo/region6 v0.16.95).
+    """
+    cfg = SimpleNamespace(
+        sidecars=[GeometriesSidecarConfig(), FeatureAttributeSidecarConfig()]
+    )
+    req = _mixin()._build_base_query_request(
+        {"geom_format": "MVT", "feature_type": FeatureType(expose=["CODE"])},
+        cfg,
+    )
+    assert req.skip_geometry is True
+    # And the projection itself does not include a ``geom`` FieldSelection —
+    # the MVT geometry comes from raw_selects in MVTQueryTransform.
+    assert "geom" not in {s.field for s in req.select}
+
+
+def test_non_mvt_does_not_force_skip_geometry():
+    """Non-MVT paths must keep the default skip_geometry=False so the regular
+    /items GeoJSON projection still emits ``geometry``.
+    """
+    cfg = SimpleNamespace(
+        sidecars=[GeometriesSidecarConfig(), FeatureAttributeSidecarConfig()]
+    )
+    req = _mixin()._build_base_query_request({"geom_format": "WKB"}, cfg)
+    assert req.skip_geometry is False

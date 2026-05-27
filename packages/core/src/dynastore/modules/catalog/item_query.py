@@ -18,6 +18,7 @@ from dynastore.modules.db_config.query_executor import (
     DbResource,
     ResultHandler,
     managed_transaction,
+    is_async_resource,
 )
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,
@@ -404,12 +405,22 @@ class ItemQueryMixin:
                 project_select_for_feature_type,
             )
             selects = project_select_for_feature_type(feature_type)
+            # ``geom`` is reserved by ``MVTQueryTransform`` for the per-row
+            # ``ST_AsMVTGeom(...) AS geom`` projection that the wrapping
+            # ``ST_AsMVT(_, 'geom')`` aggregates. Without ``skip_geometry``,
+            # the geometry sidecar additionally emits
+            # ``ST_AsGeoJSON(geom)::jsonb AS geom`` whenever ``geom``/``geometry``
+            # is referenced by any selection/filter, producing two columns
+            # aliased ``geom`` — Postgres then fails the outer
+            # ``SELECT "geom" FROM (_mvt_inner)`` with
+            # ``AmbiguousColumnError`` (live tile crash, region6/glosisdemo).
             query_req = QueryRequest(
                 select=selects,
                 limit=params.get("limit"),
                 offset=params.get("offset"),
                 raw_where=params.get("where"),
                 raw_params=params.get("raw_params", {}),
+                skip_geometry=True,
             )
             if params.get("cql_filter"):
                 query_req.cql_filter = params["cql_filter"]
@@ -1146,9 +1157,17 @@ class ItemQueryMixin:
         lang = (request.raw_params or {}).get("lang", "en")
         read_policy = await self._resolve_read_policy(catalog_id, collection_id)
         async def feature_stream():
+            # Require async engine: I/O-bound worker SCOPEs (export_features,
+            # dwh_join) must include module_db so DatastoreModule.engine resolves
+            # to the asyncpg AsyncEngine, enabling server-side streaming.
+            if self.engine is None or not is_async_resource(self.engine):
+                raise RuntimeError(
+                    "feature_stream requires async engine; configure `module_db` "
+                    "in SCOPE — see #1420"
+                )
             # Open a fresh connection/transaction for streaming to ensure isolation and avoid leaks
             async with managed_transaction(self.engine) as stream_conn:
-                # Use a buffer for higher throughput but still O(1) memory
+                # AsyncConnection.stream() yields rows server-side without buffering
                 stream = await stream_conn.stream(text(sql), params)  # type: ignore[union-attr]
                 async for row in stream:
                     feature_ctx = FeaturePipelineContext(lang=lang, consumer=consumer)

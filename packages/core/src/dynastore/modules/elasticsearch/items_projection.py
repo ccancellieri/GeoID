@@ -13,11 +13,15 @@ Three-tier model:
   (introduced in the follow-up commit). Additive only: collisions with
   Tier 1 are rejected at config-validate time. Snapshot at index-create;
   live edits take effect on next index rebuild.
-* **Tier 3** — ``properties.extras`` per-index dynamic lane. Anything not
-  in Tier 1 ∪ Tier 2 lands here, indexed with per-index dynamic mapping
-  (first-write-wins types). Searchable via the existing full-text
-  ``properties.*`` wildcard; first-class filter/sort works locally but
-  not cross-catalog.
+* **Tier 3** — ``properties.extras`` long-tail lane. Anything not in
+  Tier 1 ∪ Tier 2 lands here. Mapped as a single ``flattened`` field —
+  the whole bucket is one mapping entry regardless of how many distinct
+  leaf keys arrive across the collections sharing the per-catalog
+  index (#1295). ``flattened`` leaves are keyword-exact (good for
+  per-key term/exists filters, no analysis); a sibling root field
+  ``_search_text`` populated at write time from the same extras values
+  carries the analyzed full-text view of the tail. Two mapping entries
+  total for the unknown long tail; nothing per-leaf.
 
 The module exposes a small, pure-Python API consumed by the items
 driver write path and the search service sort path:
@@ -37,7 +41,8 @@ survive the reshape.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import json
+from typing import Any, Dict, Iterable, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -445,12 +450,60 @@ def project_item_for_es(doc: Dict[str, Any], known_fields: Dict[str, Dict[str, A
         else:
             extras[k] = v
 
+    out = dict(doc)
     if extras:
         new_props["extras"] = extras
-
-    out = dict(doc)
+        # Populate the analyzed catch-all so the ``flattened`` extras
+        # lane (exact-key only) is paired with a real fulltext field
+        # for the unknown-property tail (#1295). The two together =
+        # "fulltext or better" at two mapping entries flat, regardless
+        # of how many distinct extension keys arrive.
+        search_text = _flatten_extras_for_search(extras)
+        if search_text:
+            out["_search_text"] = search_text
     out["properties"] = new_props
     return out
+
+
+def _flatten_extras_for_search(extras: Dict[str, Any]) -> str:
+    """Flatten an ``extras`` bucket to a single whitespace-joined string.
+
+    Feeds the root ``_search_text`` ES ``text`` field (standard
+    analyzer). Strings/numbers/booleans pass through ``str``; nested
+    dicts / lists are emitted as their compact JSON encoding so every
+    leaf value contributes a token — JSON punctuation tokenizes
+    harmlessly under the standard analyzer. ``None`` is skipped.
+
+    Pure function; the input is not mutated.
+    """
+    tokens: List[str] = []
+    _collect_search_tokens(extras.values(), tokens)
+    return " ".join(t for t in tokens if t)
+
+
+def _collect_search_tokens(values: Iterable[Any], out: List[str]) -> None:
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, bool):
+            # ``bool`` before ``int`` — ``bool`` is an ``int`` subclass.
+            out.append("true" if v else "false")
+        elif isinstance(v, (int, float)):
+            out.append(str(v))
+        elif isinstance(v, dict):
+            try:
+                out.append(json.dumps(v, separators=(",", ":"), ensure_ascii=False))
+            except (TypeError, ValueError):
+                _collect_search_tokens(v.values(), out)
+        elif isinstance(v, (list, tuple)):
+            try:
+                out.append(json.dumps(list(v), separators=(",", ":"), ensure_ascii=False))
+            except (TypeError, ValueError):
+                _collect_search_tokens(v, out)
+        else:
+            out.append(str(v))
 
 
 def unproject_item_from_es(source: Dict[str, Any]) -> Dict[str, Any]:

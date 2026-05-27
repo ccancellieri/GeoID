@@ -15,3 +15,20 @@
 #    Author: Carlo Cancellieri (ccancellieri@gmail.com)
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
+
+# Register IAM extension presets into the global registry on import.
+# Importing the subpackage has no DB side-effects — only in-memory registration.
+from dynastore.extensions.iam import presets as _iam_presets  # noqa: F401
+
+# After registering iam_baseline (above), retry composite registration so
+# that composites which depend on IAM presets (iam_baseline,
+# default_roles_baseline) get a second attempt.  The function is a no-op for
+# composites already registered and logs an info line for any that still
+# cannot satisfy their children.
+try:
+    from dynastore.modules.storage.presets.composites import (  # noqa: F401
+        retry_composite_registration as _retry,
+    )
+    _retry()
+except Exception:  # noqa: BLE001
+    pass

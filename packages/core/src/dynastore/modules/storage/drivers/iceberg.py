@@ -128,6 +128,134 @@ def _resolve_iceberg_type(type_str: str):
     }.get(type_str, StringType())
 
 
+def _canonical_to_iceberg_type(data_type: str):
+    """Map a canonical ``FieldDefinition.data_type`` token to a PyIceberg type.
+
+    The canonical vocabulary (see :mod:`dynastore.models.field_types`) is the
+    single token a driver gets from
+    :func:`...field_projection.materialize_feature_fields`. The mapping below is
+    the Iceberg-side counterpart of e.g. ``CANONICAL_TO_PG_DDL`` — tokens that
+    Iceberg can express natively map to a concrete primitive; everything else
+    (notably ``geometry`` / ``jsonb`` / ``uuid`` / ``time``) falls back to
+    ``StringType`` so the column is creatable and the existing driver semantics
+    (geometry as a WKT/WKB string blob) are preserved.
+
+    FULLTEXT vs FILTERABLE has no Iceberg-native distinction (Iceberg has no
+    analyzed text primitive); both surface as ``StringType``. The capability is
+    preserved on the projected ``FieldDefinition`` for downstream consumers
+    (e.g. introspection / queryables responses).
+    """
+    from pyiceberg.types import (
+        BooleanType,
+        BinaryType,
+        DateType,
+        DoubleType,
+        IntegerType,
+        LongType,
+        StringType,
+        TimestamptzType,
+    )
+    dt = (data_type or "").lower()
+    # Parametrized geometry (``geometry(Point,4326)``) — keep as a string blob,
+    # matching the legacy hard-coded ``geometry: StringType`` envelope.
+    if dt.startswith("geometry") or dt.startswith("geography"):
+        return StringType()
+    return {
+        "string": StringType(),
+        "uuid": StringType(),     # Iceberg has no UUID primitive in the public stable surface here.
+        "jsonb": StringType(),    # Stored as a JSON string blob.
+        "integer": IntegerType(),
+        "bigint": LongType(),
+        "double": DoubleType(),
+        "numeric": DoubleType(),  # Iceberg has DecimalType(precision, scale); we have no precision on the canonical token, so widen to double.
+        "boolean": BooleanType(),
+        "date": DateType(),
+        "time": StringType(),     # Iceberg has no time-of-day primitive.
+        "timestamp": TimestamptzType(),
+        "binary": BinaryType(),
+    }.get(dt, StringType())
+
+
+# Legacy underscore-prefixed Iceberg column names for the four policy-derived
+# special fields. The driver's write path (``write_entities``) and conflict
+# handling (``REFUSE``/``UPDATE``/``In("_external_id", ...)``) all reference
+# these prefixed names — they must keep matching the on-disk column names so
+# existing collections continue to read and so newly-projected columns line up
+# with what ``write_entities`` actually writes. The projection
+# (``materialize_feature_fields``) emits the un-prefixed canonical names; this
+# table remaps them at schema-build time only.
+_PROJECTION_TO_ICEBERG_COLUMN = {
+    "external_id": "_external_id",
+    "asset_id": "_asset_id",
+    "valid_from": "_valid_from",
+    "valid_to": "_valid_to",
+}
+
+
+def _build_iceberg_schema_from_projection(
+    projected: "Dict[str, Any]",
+):
+    """Build the Iceberg ``Schema`` for a collection from a projected field set.
+
+    ``projected`` is the ``{name: FieldDefinition}`` map returned by
+    :func:`...field_projection.materialize_feature_fields` — the single
+    cross-driver SSOT for "what fields does this collection materialise".
+
+    The Iceberg schema produced here has, in order:
+
+    1. **Envelope columns** (always present, fixed field-ids 1..3 for backwards
+       compatibility with existing tables created by the legacy hard-coded
+       schema):
+         * ``id`` (StringType, required)
+         * ``geometry`` (StringType, optional) — WKT/WKB string blob; matches
+           the legacy hard-coded column even when the projection also describes
+           a separate per-field geometry (which it filters out as owned by the
+           geometry sidecar).
+         * ``properties`` (StringType, optional) — JSON blob for non-materialised
+           feature properties.
+    2. **Projection columns** — one column per ``FieldDefinition`` in
+       ``projected``, in projection order, with the canonical ``data_type``
+       mapped to Iceberg via :func:`_canonical_to_iceberg_type`. Field
+       ``required`` flows through; geometry fields are skipped (the projection
+       already excludes them, but the guard is defence in depth).
+
+    Field ids are assigned sequentially starting at 4 for projection columns.
+    Iceberg requires stable, unique ids; sequential assignment within a single
+    ``create_table`` call is sufficient (id stability across schema evolution is
+    handled by the Iceberg catalog's ``update_schema`` semantics, not by us).
+    """
+    from pyiceberg.schema import Schema as IcebergSchema
+    from pyiceberg.types import NestedField, StringType
+
+    fields = [
+        NestedField(1, "id", StringType(), required=True),
+        NestedField(2, "geometry", StringType(), required=False),
+        NestedField(3, "properties", StringType(), required=False),
+    ]
+    next_id = 4
+    for name, fd in (projected or {}).items():
+        # Skip envelope-collision names (envelope wins) and geometry (owned by
+        # the envelope ``geometry`` column / geometry sidecar elsewhere).
+        if name in ("id", "geometry", "properties"):
+            continue
+        if (getattr(fd, "data_type", "") or "").lower().startswith("geometry"):
+            continue
+        # Apply the legacy-prefix remap for the four special policy fields so
+        # the on-disk column names match what ``write_entities`` writes.
+        column_name = _PROJECTION_TO_ICEBERG_COLUMN.get(name, name)
+        ib_type = _canonical_to_iceberg_type(getattr(fd, "data_type", "string"))
+        fields.append(
+            NestedField(
+                next_id,
+                column_name,
+                ib_type,
+                required=bool(getattr(fd, "required", False)),
+            )
+        )
+        next_id += 1
+    return IcebergSchema(*fields)
+
+
 class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
     """Iceberg storage driver — Open Table Format with full OTF capabilities.
 
@@ -594,6 +722,36 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         return ItemsWritePolicy()
 
     @staticmethod
+    async def _resolve_items_schema(catalog_id: str, collection_id: str):
+        """Resolve ``ItemsSchema`` from the config waterfall, or ``None``.
+
+        Mirrors :meth:`_resolve_write_policy`. The schema is consumed by the
+        cross-driver :func:`...field_projection.materialize_feature_fields` to
+        derive the full materialised field set for ``ensure_storage`` (#1295).
+        ``None`` is a valid return — the projection treats it as "no
+        author-declared fields", and only the policy-derived envelope columns
+        are materialised.
+        """
+        from dynastore.modules.storage.driver_config import ItemsSchema
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        try:
+            configs = get_protocol(ConfigsProtocol)
+            if configs is None:
+                return None
+            cfg = await configs.get_config(
+                ItemsSchema,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+            if isinstance(cfg, ItemsSchema):
+                return cfg
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def _extract_external_id(row: dict, field_path: Optional[str]) -> Optional[str]:
         """Extract external_id using dot-notation path from a row dict."""
         if not field_path:
@@ -869,13 +1027,25 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
             try:
                 await run_in_thread(catalog.load_table, table_id)
             except Exception:
-                from pyiceberg.schema import Schema as IcebergSchema
-                from pyiceberg.types import NestedField, StringType
-                iceberg_schema = IcebergSchema(
-                    NestedField(1, "id", StringType(), required=True),
-                    NestedField(2, "geometry", StringType(), required=False),
-                    NestedField(3, "properties", StringType(), required=False),
+                # Build the table schema from the driver-agnostic field
+                # projection (#1295). The projection is the SSOT for the full
+                # materialised field set — author-declared schema fields plus
+                # policy-derived special fields (external_id, asset_id,
+                # validity bounds, hashes, spatial cells, geometry/attribute
+                # statistics). Existing Iceberg tables are NOT touched here:
+                # ``load_table`` succeeded for them and they keep their on-disk
+                # schema. New tables are created with the full projection so
+                # writes to ``_external_id`` / ``_asset_id`` / ``_valid_from``
+                # / ``_valid_to`` (computed in ``write_entities``) survive
+                # ``write_entities``' schema-name filter instead of being
+                # silently dropped.
+                from dynastore.modules.storage.field_projection import (
+                    materialize_feature_fields,
                 )
+                schema_cfg = await self._resolve_items_schema(catalog_id, collection_id)
+                policy = await self._resolve_write_policy(catalog_id, collection_id)
+                projected = materialize_feature_fields(schema_cfg, policy)
+                iceberg_schema = _build_iceberg_schema_from_projection(projected)
                 await run_in_thread(catalog.create_table, table_id, schema=iceberg_schema)
 
             # Warn on unique=True fields — Iceberg has no native UNIQUE enforcement.

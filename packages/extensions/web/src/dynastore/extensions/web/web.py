@@ -1212,6 +1212,33 @@ async function demoAction(action) {
         return self._serve_html_template(html_path)
 
     @expose_web_page(
+        page_id="presets",
+        title="Presets",
+        icon="fa-wand-magic-sparkles",
+        description=(
+            "Apply, roll back, and inspect named configuration bundles "
+            "(presets) at platform, catalog, or collection scope."
+        ),
+        audience_policy_id="web_sysadmin_access",
+        section="admin",
+        priority=9,
+    )
+    async def presets_page(self, request: Request):
+        """Preset registry browser and lifecycle operator (#1412).
+
+        Discovers all registered presets dynamically via GET /admin/presets and
+        exposes apply / dry-run / rollback at platform, catalog, and collection
+        scope. Authorization is enforced server-side on every /admin/presets
+        mutation; the page is gated by web_sysadmin_access because preset apply
+        is a destructive configuration operation.
+        """
+        static_dir = os.path.join(os.path.dirname(__file__), "static", "admin")
+        html_path = os.path.join(static_dir, "presets.html")
+        if not os.path.exists(html_path):
+            raise HTTPException(status_code=404, detail="Presets page template not found.")
+        return self._serve_html_template(html_path)
+
+    @expose_web_page(
         page_id="ingest",
         title="Ingest Features",
         icon="fa-upload",
