@@ -33,7 +33,7 @@ from fastapi.responses import HTMLResponse
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.modules.iam.iam_service import IamService
-from dynastore.tools.discovery import get_protocol, get_protocols
+from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config.query_executor import DbResource
 
 from dynastore.models.protocols.policies import PermissionProtocol
@@ -382,23 +382,8 @@ class IamExtension(ExtensionProtocol):
             )
             yield
             return
+        assert db_protocol is not None  # narrowed: missing-list guard returns above
         self._engine = db_protocol.engine
-
-        # Seed default policies (idempotent).
-        # This call handles the core platform defaults (sysadmin_full_access,
-        # public_access, self_service_access) and the sysadmin-role survival
-        # row. The IAM extension's own service policies (admin_authorization_api,
-        # self_service_authorization_api) are no longer seeded here — they are
-        # now applied via the iam_baseline preset. A fresh install is
-        # non-functional for IAM-specific routes until a sysadmin applies
-        # iam_baseline, which is intentional (see umbrella #1412).
-        # REMOVED IN PR-5: provision_default_policies call moves to preset.
-        try:
-            # Seed both global (iam) and system (catalog) schemas
-            await self._policy_service.provision_default_policies(catalog_id=None)
-            await self._policy_service.provision_default_policies(catalog_id="_system_")
-        except Exception as e:
-            logger.error(f"Failed to seed default policies: {e}")
 
         # Register the IAM-side PageVisibilityFilter implementation so
         # web routes can delegate nav-list filtering without naming any
@@ -423,66 +408,6 @@ class IamExtension(ExtensionProtocol):
             logger.error(
                 "IamExtension: failed to register MembershipCacheProvider: %s", e
             )
-
-        # Discover plugin-declared policies via PolicyContributor. Plugins
-        # never touch PermissionProtocol directly — they declare here and
-        # IAM forwards centrally. Keeps IAM/auth concepts isolated from
-        # the rest of the platform.
-        # REMOVED IN PR-5: this entire contributor-discovery block and
-        # the PolicyContributor protocol are deleted once every contributor
-        # has been converted to a registered Preset.
-        #
-        # PR-3 narrowing: skip contributors whose class is already covered
-        # by a registered PolicyContributorPreset.  Those contributors are
-        # managed via the preset lifecycle (POST /admin/presets/{name}) and
-        # must not be auto-seeded at boot.  Any contributor without a
-        # matching preset still runs through this loop as a safety net until
-        # PR-5 removes it entirely.
-        try:
-            from dynastore.models.protocols.policy_contributor import PolicyContributor
-            from dynastore.modules.storage.presets.policy_contributor_adapter import (
-                PolicyContributorPreset,
-            )
-            from dynastore.modules.storage.presets.registry import list_presets, get_preset
-
-            # Build a set of contributor class types that now have a registered
-            # PolicyContributorPreset so we can skip them below.
-            _preset_covered_classes: set[type] = set()
-            for preset_name in list_presets():
-                try:
-                    preset = get_preset(preset_name)
-                    if isinstance(preset, PolicyContributorPreset):
-                        _preset_covered_classes.add(preset.contributor_class)
-                except Exception:
-                    pass
-
-            contributors = get_protocols(PolicyContributor)
-            for contributor in contributors:
-                contributor_cls = type(contributor)
-                origin = contributor_cls.__name__
-                if contributor_cls in _preset_covered_classes:
-                    logger.debug(
-                        "IamExtension: skipping %s — covered by a registered preset",
-                        origin,
-                    )
-                    continue
-                try:
-                    for policy in contributor.get_policies() or []:
-                        self._policy_service.register_policy(policy)
-                    for role in contributor.get_role_bindings() or []:
-                        self._policy_service.register_role(role)
-                    logger.debug(
-                        "IamExtension: registered policies/bindings from %s",
-                        origin,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "IamExtension: %s contributor failed: %s",
-                        origin,
-                        e,
-                    )
-        except Exception as e:
-            logger.error("IamExtension: PolicyContributor discovery failed: %s", e)
 
         yield
 

@@ -2223,22 +2223,6 @@ class AdminService(ExtensionProtocol):
                     })
         return {"rows": rows_out}
 
-    # -------------------------------------------------------------------------
-    # System Defaults (/admin/reset-defaults)
-    # -------------------------------------------------------------------------
-
-    @router.post("/reset-defaults", summary="Reset default policies and roles")
-    async def reset_defaults(
-        request: Request,  # type: ignore[reportGeneralTypeIssues]
-        catalog_id: Optional[str] = Query(None, description="Catalog ID for tenant-scoped reset, or None for global"),
-    ):
-        mgr = _iam()
-        pm = mgr.get_policy_service()
-        if not pm:
-            raise HTTPException(status_code=503, detail="Policy manager not available.")
-        await pm.provision_default_policies(catalog_id=catalog_id, force=True)
-        return {"message": "Default policies and roles have been reset.", "catalog_id": catalog_id or "global"}
-
     @router.post("/rotate-jwt-secret", summary="Rotate JWT signing secret")
     async def rotate_jwt_secret(request: Request):  # type: ignore[reportGeneralTypeIssues]
         mgr = _iam()

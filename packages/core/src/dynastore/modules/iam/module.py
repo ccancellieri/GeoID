@@ -70,9 +70,8 @@ from .iam_storage import AbstractIamStorage
 from .policies import PolicyService
 from .authorization.iam_authorizer import IamAuthorizer
 from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
-from dynastore.modules.db_config import maintenance_tools
 from dynastore.modules.db_config.query_executor import DbResource
-from typing import Optional, Any, AsyncGenerator, List, Tuple
+from typing import Optional, Any, AsyncGenerator, List, Tuple, cast
 from dynastore.tools.discovery import register_plugin, unregister_plugin
 
 logger = logging.getLogger(__name__)
@@ -148,9 +147,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     applied_svc = AppliedPresetsService(engine)
                     await applied_svc.ensure_table(conn=conn)
 
-                    # Provision default global policies
-                    await self._policy_service.provision_default_policies(conn=conn)
-
                     # Backfill: insert a synthetic iam_baseline audit row so
                     # that DELETE /admin/presets/iam_baseline works on upgraded
                     # deployments that had the contributor-loop seeding run.
@@ -180,13 +176,25 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                             _roles_bf_exc,
                         )
 
-                    # Self-heal guard: if the platform-tier sysadmin role
-                    # is still absent after normal provision (e.g. iam_storage
-                    # was None on first pass, or a DB reset happened before a
-                    # previous restart), force a full re-seed so the service
-                    # is never left in a locked-out state. Per geoid#643 the
-                    # platform tier collapses to {sysadmin} — catalog-tier
-                    # roles (admin/editor/user/unauthenticated) are seeded
+                    # One-shot migration: normalize the public_access policy
+                    # resource list — remove the stale /web/.* catch-all (fixed
+                    # in eaa8cbf89). With _ALWAYS_REFRESH gone from PR-5 the
+                    # old broken row would not be auto-corrected at boot without
+                    # this explicit migration step.
+                    try:
+                        from dynastore.modules.iam.migrations.normalize_public_access import run_migration as _run_normalize
+                        await _run_normalize(engine=engine)
+                    except Exception as _norm_exc:
+                        logger.warning(
+                            "IamModule: public_access normalize migration failed (non-fatal): %s",
+                            _norm_exc,
+                        )
+
+                    # Self-heal guard: if the platform-tier sysadmin role is
+                    # absent (e.g. a DB reset happened before this restart),
+                    # seed it directly so the service is never left in a
+                    # locked-out state. Per geoid#643 the platform tier
+                    # collapses to {sysadmin} — catalog-tier roles are seeded
                     # by the per-catalog lifecycle hook, not here.
                     sysadmin_name = role_config.sysadmin_role_name
                     sysadmin = await self.storage.get_role(
@@ -194,16 +202,25 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     )
                     if sysadmin is None:
                         logger.critical(
-                            "IamModule: %r role missing after provision — "
-                            "DB may have been reset. Forcing full re-seed.",
+                            "IamModule: %r role missing — "
+                            "DB may have been reset. Seeding sysadmin survival row.",
                             sysadmin_name,
                         )
-                        await self._policy_service.provision_default_policies(
-                            conn=conn, force=True
-                        )
+                        from dynastore.models.auth_models import Role as _Role
+                        _seed = _Role(name=sysadmin_name, policies=["sysadmin_full_access"])
+                        await self.storage.create_role(_seed, schema="iam", conn=conn)
 
             except Exception as e:
                 logger.error(f"Failed to initialize IamModule: {e}", exc_info=True)
+
+            # Seed OidcRoleSyncConfig — idempotent one-shot; skipped when a
+            # row already exists so operator PATCHes are preserved.
+            try:
+                db = get_protocol(DatabaseProtocol)
+                engine = db.engine if db else None
+                await _seed_oidc_role_sync_config(engine)
+            except Exception as e:
+                logger.warning("IamModule: OidcRoleSyncConfig seed failed (non-fatal): %s", e)
 
             # Register plugins
             register_plugin(self._iam_manager)
@@ -526,19 +543,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             catalog_id=catalog_id,
         )
 
-    async def provision_default_policies(
-        self,
-        catalog_id: Optional[str] = None,
-        conn: Optional[Any] = None,
-        schema: Optional[str] = None,
-        force: bool = False,
-    ) -> None:
-        if self._policy_service is None:
-            return
-        await self._policy_service.provision_default_policies(
-            catalog_id=catalog_id, conn=conn, schema=schema, force=force,
-        )
-
     async def _persist_policy(self, policy: Any):
         """Persist a policy to the database via storage upsert."""
         policy_service = self._policy_service
@@ -795,6 +799,88 @@ def _is_transient_serialization_failure(exc: BaseException) -> bool:
     return pgcode in ("40001", "40P01")
 
 
+async def _seed_oidc_role_sync_config(engine: Any) -> None:
+    """Idempotent one-shot seed of OidcRoleSyncConfig(reconcile_enabled=True).
+
+    Skipped when a row already exists so operator PATCHes are preserved.
+    Handles the cold-boot race where configs storage may not yet exist.
+    """
+    from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+    from .oidc_role_sync_config import OidcRoleSyncConfig
+
+    configs = get_protocol(PlatformConfigsProtocol)
+    if configs is None:
+        logger.debug("OidcRoleSyncConfig seed skipped: PlatformConfigsProtocol not registered.")
+        return
+
+    try:
+        persisted = await configs.list_configs()
+    except Exception:
+        try:
+            from dynastore.modules.db_config.platform_config_service import PlatformConfigService
+            await PlatformConfigService.initialize_storage(engine)
+            persisted = await configs.list_configs()
+        except Exception:
+            logger.warning(
+                "OidcRoleSyncConfig seed skipped: platform configs storage "
+                "unavailable after ensure-and-retry.",
+                exc_info=True,
+            )
+            return
+
+    existing = cast(Any, persisted.get(OidcRoleSyncConfig))
+    if existing is None:
+        seed = OidcRoleSyncConfig(reconcile_enabled=True)
+        try:
+            await configs.set_config(OidcRoleSyncConfig, seed)
+            logger.info("Seeded OidcRoleSyncConfig(reconcile_enabled=True).")
+        except Exception:
+            logger.warning("OidcRoleSyncConfig seed failed.", exc_info=True)
+        effective = seed
+    else:
+        effective = existing
+
+    # Warn operators when reconcile_enabled=True but no issuer_whitelist is
+    # set — the reconciler will accept tokens from any issuer for mapped roles,
+    # which is a security gap in multi-tenant deployments.
+    if getattr(effective, "reconcile_enabled", False) and not getattr(effective, "issuer_whitelist", None):
+        logger.warning(
+            "OidcRoleSyncConfig: reconcile_enabled=True but issuer_whitelist "
+            "is not set. OIDC role sync will accept tokens from any issuer. "
+            "Set issuer_whitelist to restrict mapped-role grants to trusted issuers."
+        )
+
+
+async def _seed_catalog_roles(conn: Any, schema: str, iam_storage: Any) -> None:
+    """Idempotent seed of per-catalog roles and hierarchy from IamRolesConfig.
+
+    Called by the catalog lifecycle initializer when a new tenant schema is
+    created. Seeds the catalog-tier role rows (admin, editor, user,
+    unauthenticated) and the role hierarchy edges so auth evaluations work
+    on first tenant access.
+    """
+    from dynastore.models.protocols.authorization import IamRolesConfig
+    from dynastore.models.auth_models import Role
+
+    role_config = IamRolesConfig()
+    for seed in role_config.catalog_roles:
+        role_def = Role(name=seed.name, description=seed.description, policies=list(seed.policies))
+        existing = await iam_storage.get_role(role_def.name, schema=schema, conn=conn)
+        if existing is None:
+            await iam_storage.create_role(role_def, schema=schema, conn=conn)
+
+    for seed in role_config.catalog_roles:
+        if seed.parent:
+            try:
+                await iam_storage.add_role_hierarchy(
+                    parent_role=seed.parent, child_role=seed.name, schema=schema, conn=conn,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_seed_catalog_roles: failed to seed hierarchy %r → %r in schema %r: %s",
+                    seed.parent, seed.name, schema, exc,
+                )
+
 
 @lifecycle_registry.sync_catalog_initializer()
 async def initialize_iam_tenant(conn: DbResource, schema: str, catalog_id: str):
@@ -812,12 +898,10 @@ async def initialize_iam_tenant(conn: DbResource, schema: str, catalog_id: str):
     await policy_storage._initialize_schema(conn, schema=schema)
     await storage._initialize_schema(conn, schema=schema)
 
-    # Provision default policies for the new tenant
-    from .policies import PolicyService
-
-    policy_service = PolicyService(
-        None, storage=policy_storage, iam_storage=storage
-    )  # app_state not strictly needed for provisioning with explicit conn
-    await policy_service.provision_default_policies(
-        catalog_id, conn=conn, schema=schema
-    )
+    # Seed per-catalog roles and role hierarchy idempotently.
+    # Platform-tier policies (sysadmin_full_access, public_access,
+    # self_service_access) are seeded during iam_baseline preset apply
+    # and are not auto-seeded here. Per-catalog role seeding mirrors
+    # the IamRolesConfig catalog_roles so auth evaluations work on first
+    # tenant access without requiring an explicit preset apply.
+    await _seed_catalog_roles(conn, schema=schema, iam_storage=storage)

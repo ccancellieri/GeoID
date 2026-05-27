@@ -12,29 +12,29 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-"""Generic adapter that turns any ``PolicyContributor`` into a ``Preset``.
+"""Generic adapter that wraps any policy-contributing object as a ``Preset``.
 
-Each extension that ships route-level policies implements the structural
-``PolicyContributor`` protocol (``get_policies`` / ``get_role_bindings``).
-This adapter wraps the contributor in the generalised ``Preset`` lifecycle
-so operators can ``POST /admin/presets/{ext}_enable`` instead of relying
-on boot-time automatic seeding.
+Extensions that ship route-level policies implement the structural duck-typing
+interface ``get_policies() -> Iterable[Policy]`` and
+``get_role_bindings() -> Iterable[Role]``.  This adapter wraps such an object
+in the generalised ``Preset`` lifecycle so operators can apply or revoke the
+extension's policies via ``POST /admin/presets/{ext}_enable``.
 
 The ``contributor_factory`` callable is invoked at ``apply`` / ``revoke``
-/ ``dry_run`` time, not at registration time, so the contributor class is
-constructed inside the preset call — avoiding module-load ordering
-surprises and ensuring each call operates on a fresh instance.
+/ ``dry_run`` time, not at registration time, so the contributor is
+constructed inside the operation call — no state is captured at registration
+time and no circular imports arise at module load.
 
-PR-3 of umbrella #1412.
+PR-3 of umbrella #1412.  PolicyContributor formal protocol deleted in PR-5;
+the adapter now relies on structural duck-typing (the factory must return an
+object with ``get_policies`` and ``get_role_bindings`` methods).
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, ClassVar, List, Tuple, Type, cast
+from typing import Any, Callable, ClassVar, List, Tuple, Type
 
 from pydantic import BaseModel
-
-from dynastore.models.protocols.policy_contributor import PolicyContributor
 
 from .preset import (
     AppliedDescriptor,
@@ -117,7 +117,7 @@ class PolicyContributorPreset:
         scope: str,
         ctx: PresetContext,
     ) -> PresetPlan:
-        contributor: PolicyContributor = cast(PolicyContributor, self._contributor_factory())
+        contributor: Any = self._contributor_factory()
         entries: List[PresetPlanEntry] = []
 
         for pol in (contributor.get_policies() or []):
@@ -146,7 +146,7 @@ class PolicyContributorPreset:
         scope: str,
         ctx: PresetContext,
     ) -> AppliedDescriptor:
-        contributor: PolicyContributor = cast(PolicyContributor, self._contributor_factory())
+        contributor: Any = self._contributor_factory()
 
         applied_policy_ids: List[str] = []
         applied_role_names: List[str] = []

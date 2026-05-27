@@ -473,14 +473,6 @@ class PermissionProtocol(Protocol):
         trace_collector: Optional[Any] = None,
     ) -> Tuple[bool, str]: ...
 
-    async def provision_default_policies(
-        self,
-        catalog_id: Optional[str] = None,
-        conn: Optional[Any] = None,
-        schema: Optional[str] = None,
-        force: bool = False,
-    ) -> None: ...
-
     async def compile_read_filter(
         self,
         principals: List[str],
