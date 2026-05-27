@@ -1319,32 +1319,27 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         catalog_id: str,
         collection_id: str,
         processing_context: Optional[Dict[str, Any]],
+        feature: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Resolve the access-envelope stamping values for an index dispatch.
 
-        Ship-first slice of the row-level-ABAC write seam (#1285). Returns the
-        ``{_visibility, _owner, _grant_subjects}`` values to stamp onto the
-        index payload, or ``None`` when the collection does NOT route to an
-        access-aware driver (the envelope driver, ``applies_access_filter=True``)
-        — in which case nothing is stamped and every other driver's stored doc
-        is byte-for-byte what it was before. Gating on the resolved WRITE driver
-        is what keeps the stamping provably harmless: the public projection
-        leaves top-level ``_*`` keys in the stored ``_source`` (it only reshapes
-        ``properties``), so stamping unconditionally could leak access fields
-        into public docs — gating prevents that.
+        Returns ``{_visibility, _owner, _attrs}`` to stamp onto the index
+        payload, or ``None`` when the collection does NOT route to an
+        access-aware driver (``applies_access_filter=True``) — nothing is
+        stamped in that case. ``_grant_subjects`` is no longer written (retired
+        by #1441; ``doc_builder`` retains read-tolerance for one release).
 
-        Sources (conservative — this is the ship-first slice, not a grant-graph
-        resolver):
+        Sources:
 
-        * ``_owner``          ← the creating principal's subject id from the
-          write/processing context (``owner`` / ``principal_id`` /
-          ``subject_id``), else ``None`` (omitted).
-        * ``_visibility``     ← the catalog's ``CatalogLookupAudience.is_public``
-          (``"public"`` when True, ``"private"`` when False). Defaults to
-          ``"private"`` when the config is unavailable — the envelope index is
-          tenant-isolated, so the safe default is the closed one.
-        * ``_grant_subjects`` ← an empty list for this slice. Follow-up seam: a
-          real grant-resolution engine fills this from the collection's grants.
+        * ``_owner``      ← creating principal's subject id from
+          ``processing_context`` (``owner`` / ``principal_id`` /
+          ``subject_id``).
+        * ``_visibility`` ← catalog's ``CatalogLookupAudience.is_public``
+          (``"public"`` / ``"private"``). Defaults to ``"private"``.
+        * ``_attrs``      ← per-collection ``AttributeStampingPolicy``.
+          When the policy is absent or ``attribute_paths`` is empty the key is
+          omitted entirely (behaviour unchanged vs. pre-#1441).  Only
+          ``$.properties.<field>`` paths are resolved in this slice.
         """
         if not await self._collection_uses_access_aware_driver(
             catalog_id, collection_id,
@@ -1369,13 +1364,66 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             # Missing/unavailable audience config → keep the closed default.
             pass
 
-        return {
+        envelope: Dict[str, Any] = {
             "_visibility": visibility,
             "_owner": str(owner) if owner is not None else None,
-            # Follow-up seam (#1285): empty until a grant-resolution engine
-            # populates per-document grant subjects.
-            "_grant_subjects": [],
         }
+
+        # --- Attribute stamping (#1441) -----------------------------------
+        attrs = await self._stamp_attrs(
+            catalog_id, collection_id, feature or pc,
+        )
+        if attrs:
+            envelope["_attrs"] = attrs
+        # ------------------------------------------------------------------
+
+        return envelope
+
+    async def _stamp_attrs(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        source: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Extract per-collection attribute values from ``source`` for ``_attrs``.
+
+        Reads :class:`~dynastore.modules.iam.stamping_config.AttributeStampingPolicy`
+        for the collection. For each declared path (only ``$.properties.<key>``
+        is supported in this slice) extracts the value from ``source`` (a raw
+        Feature dict or processing context dict).  Returns an empty dict when
+        the policy is absent or ``attribute_paths`` is empty.
+        """
+        try:
+            from dynastore.modules.iam.stamping_config import AttributeStampingPolicy
+
+            configs = get_protocol(ConfigsProtocol)
+            if configs is None:
+                return {}
+            policy = await configs.get_config(
+                AttributeStampingPolicy,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+            if policy is None:
+                return {}
+            paths: Dict[str, str] = getattr(policy, "attribute_paths", {}) or {}
+            if not paths:
+                return {}
+        except Exception:
+            return {}
+
+        props = source.get("properties") or {}
+        attrs: Dict[str, Any] = {}
+        _PREFIX = "$.properties."
+        for key, path in paths.items():
+            if not isinstance(path, str) or not path.startswith(_PREFIX):
+                continue
+            field_name = path[len(_PREFIX):]
+            if field_name and field_name in props:
+                val = props[field_name]
+                if val is not None:
+                    attrs[key] = val
+        return attrs
 
     async def _collection_uses_access_aware_driver(
         self,
@@ -1413,7 +1461,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         (:meth:`upsert_bulk`) so a collection populated via either path indexes
         the same canonical ``_external_id`` / ``_asset_id`` — and, when it
         routes WRITE to an access-aware driver, the same ``_visibility`` /
-        ``_owner`` / ``_grant_subjects``. See #1287.
+        ``_owner`` / ``_attrs``. See #1287 and #1441.
         """
         return _IndexStampContext(
             external_id_path=await self._resolve_external_id_path(
@@ -1438,6 +1486,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         field uses ``setdefault`` so an explicit value already on the payload
         wins. The ES read path strips these internal ``_*`` keys, so they never
         surface to clients.
+
+        ``_grant_subjects`` is no longer stamped (retired by #1441).  The doc
+        builder retains read-tolerance for existing docs for one release.
+        ``_attrs`` is stamped when the collection has an
+        :class:`~dynastore.modules.iam.stamping_config.AttributeStampingPolicy`
+        with a non-empty ``attribute_paths`` map.
         """
         if ctx.external_id_path:
             ext = self._extract_by_path(payload, ctx.external_id_path)
@@ -1452,9 +1506,10 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             payload.setdefault("_visibility", ctx.access_envelope["_visibility"])
             if ctx.access_envelope["_owner"] is not None:
                 payload.setdefault("_owner", ctx.access_envelope["_owner"])
-            payload.setdefault(
-                "_grant_subjects", ctx.access_envelope["_grant_subjects"],
-            )
+            # ``_attrs`` from the per-collection stamping policy (#1441).
+            attrs = ctx.access_envelope.get("_attrs")
+            if attrs:
+                payload.setdefault("_attrs", attrs)
         return payload
 
     async def _dispatch_index_upsert(

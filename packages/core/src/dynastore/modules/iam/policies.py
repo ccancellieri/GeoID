@@ -1085,6 +1085,33 @@ class PolicyService:
                 _scope_clause(list(result.predicates), catalog_id, collection_id)
             )
 
+        # --- Grant-level attribute predicates (#1441) --------------------- #
+        # Grants can carry ``attribute_predicates`` JSONB (per #1441).  Each
+        # grant with a non-empty predicate list contributes an additional ALLOW
+        # clause that is MORE restrictive than the base policy clause: scope
+        # predicates AND attribute predicates are ANDed together.  Grants with
+        # ``attribute_predicates = []`` behave exactly as before (the policy
+        # path above already covers them).  An uncompilable predicate op
+        # excludes the entire grant from the ALLOW set (fail-closed).
+        #
+        # Pure ABAC grants (no base policy match, only attribute predicates)
+        # WILL produce an ALLOW clause at the index/search layer.  That is
+        # intentional: the runtime engine re-evaluates per request so any
+        # actual GET on a matching item is still re-checked end-to-end;
+        # search returns only the items whose stored ``_attrs`` envelope
+        # admits the predicate, which is exactly the ABAC contract.
+        attr_allow_clauses, attr_uncompilable = await _compile_grant_attribute_clauses(
+            iam_storage=self.iam_storage,
+            principal_id=principal_id,
+            schema=schema,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+        )
+        allow_clauses.extend(attr_allow_clauses)
+        if attr_uncompilable:
+            uncompilable = True
+        # ------------------------------------------------------------------
+
         if allow_all:
             # Unconditional allow, minus any applicable DENY (deny-precedence
             # preserved structurally as ``must_not``).
@@ -1467,3 +1494,92 @@ def _scope_clause(
 ) -> AccessClause:
     """Build a clause = condition predicates AND the scope pin predicates."""
     return AccessClause(tuple(_scope_predicates(catalog_id, collection_id) + predicates))
+
+
+async def _compile_grant_attribute_clauses(
+    *,
+    iam_storage: Any,
+    principal_id: Optional[UUID],
+    schema: str,
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+) -> Tuple[List[AccessClause], bool]:
+    """Compile per-grant attribute predicates into ALLOW clauses.
+
+    Fetches grants for ``principal_id`` (when available) and converts each
+    grant's ``attribute_predicates`` JSONB into :class:`AccessClause` objects
+    that AND scope pins with document-attribute predicates.
+
+    Returns ``(clauses, uncompilable)`` — an empty list is returned safely when:
+    * ``principal_id`` is None (no DB identity to look up),
+    * ``iam_storage`` doesn't support ``resolve_effective_grants``,
+    * the grants table doesn't exist yet (``TableNotFoundError``), or
+    * any other storage error (fail-closed: log + return empty).
+
+    ``uncompilable=True`` propagates to the outer :class:`AccessFilter` so
+    callers and telemetry know that some grants could not be fully expressed.
+    """
+    if principal_id is None or iam_storage is None:
+        return [], False
+
+    resolve_grants = getattr(iam_storage, "resolve_effective_grants", None)
+    if resolve_grants is None:
+        return [], False
+
+    try:
+        grant_rows = await resolve_grants(
+            principal_id=principal_id,
+            catalog_schema=schema,
+            collection_id=collection_id,
+        ) or []
+    except Exception as exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "_compile_grant_attribute_clauses: resolve_effective_grants failed "
+            "(non-fatal, skipping attribute predicates): %s",
+            exc,
+        )
+        return [], False
+
+    from .attribute_predicates import (
+        AttributePredicate,
+        compile_attribute_predicates,
+    )
+
+    clauses: List[AccessClause] = []
+    uncompilable = False
+
+    for row in grant_rows:
+        raw_preds = row.get("attribute_predicates")
+        if not raw_preds:
+            # Empty list or absent: no attribute restriction — covered by
+            # the policy-based path, skip.
+            continue
+
+        # Deserialise if the JSONB arrived as a string (driver-dependent).
+        if isinstance(raw_preds, str):
+            try:
+                raw_preds = json.loads(raw_preds)
+            except (ValueError, TypeError):
+                raw_preds = []
+
+        if not isinstance(raw_preds, list) or not raw_preds:
+            continue
+
+        try:
+            preds = [AttributePredicate(**p) for p in raw_preds if isinstance(p, dict)]
+        except Exception:
+            # Malformed predicate row — exclude the grant (fail-closed).
+            uncompilable = True
+            continue
+
+        field_preds, unc = compile_attribute_predicates(preds)
+        if unc:
+            uncompilable = True
+            continue  # exclude this grant from the ALLOW set
+
+        clauses.append(
+            _scope_clause(field_preds, catalog_id, collection_id)
+        )
+
+    return clauses, uncompilable

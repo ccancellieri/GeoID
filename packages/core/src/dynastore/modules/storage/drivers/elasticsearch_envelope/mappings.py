@@ -61,7 +61,20 @@ ENVELOPE_FEATURE_MAPPING: Dict[str, Any] = {
         "owner":                 {"type": "keyword"},
         # ``grant_subjects`` is multi-valued (a keyword field in ES is
         # implicitly array-capable); a ``terms`` filter intersects it.
+        # Retained in the mapping for read-tolerance on pre-#1441 docs;
+        # new docs no longer populate this field.
         "grant_subjects":        {"type": "keyword"},
+        # ``attrs`` holds per-document ABAC attributes stamped at write time
+        # from the collection's AttributeStampingPolicy (#1441).  Sub-fields
+        # are declared dynamic ``keyword`` so a new attribute key is
+        # automatically mapped without a mapping update; the bounded
+        # ``AttributeStampingPolicy.attribute_paths`` config prevents the
+        # 1000-field explosion risk.
+        "attrs": {
+            "type": "object",
+            "dynamic": True,
+            "properties": {},  # sub-fields auto-mapped as keyword on first write
+        },
         # --- geometry + simplification bookkeeping ---
         "geometry":              {"type": "geo_shape"},
         "bbox":                  {"type": "float"},

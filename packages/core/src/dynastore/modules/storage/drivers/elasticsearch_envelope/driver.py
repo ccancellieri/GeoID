@@ -247,6 +247,7 @@ class ItemsElasticsearchEnvelopeDriver(
             visibility=ctx.get("visibility"),
             owner=ctx.get("owner"),
             grant_subjects=ctx.get("grant_subjects"),
+            attrs=ctx.get("attrs"),
         )
 
     async def _resolve_simplify_geometry(
