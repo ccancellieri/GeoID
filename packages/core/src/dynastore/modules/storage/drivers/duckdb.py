@@ -45,9 +45,11 @@ import queue
 import threading
 import uuid
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 if TYPE_CHECKING:
+    from dynastore.models.protocols.field_definition import FieldDefinition
+    from dynastore.modules.storage.driver_config import ItemsSchema, ItemsWritePolicy
     from dynastore.modules.storage.storage_location import StorageLocation
 
 from dynastore.models.ogc import Feature, FeatureCollection
@@ -69,6 +71,48 @@ _FORMAT_READERS: Dict[str, str] = {
     "json": "read_json_auto",
     "ndjson": "read_json_auto",
 }
+
+# Canonical ``data_type`` (see :mod:`dynastore.models.field_types`) → DuckDB
+# native type name. The SQLite write backend is reached via DuckDB's ``sqlite``
+# extension, which round-trips these tokens to their SQLite affinities (TEXT,
+# INTEGER, REAL, BLOB) so they are safe to use for both the parquet read path
+# and the SQLite write path. Geometry is intentionally absent — the geometry
+# column is owned by the driver (stored as GeoJSON ``VARCHAR`` in SQLite, read
+# back through the spatial extension when reading parquet); it is not a
+# projected field. Tolerant fallback: anything not in this map degrades to
+# ``VARCHAR`` rather than raising mid-DDL.
+_CANONICAL_TO_DUCKDB: Dict[str, str] = {
+    "string": "VARCHAR",
+    "uuid": "VARCHAR",       # DuckDB has UUID, but the SQLite extension lacks
+                              # a UUID affinity; VARCHAR keeps both backends happy
+    "integer": "INTEGER",
+    "bigint": "BIGINT",
+    "double": "DOUBLE",
+    "numeric": "DECIMAL",
+    "boolean": "BOOLEAN",
+    "date": "DATE",
+    "time": "TIME",
+    "timestamp": "TIMESTAMP",
+    "binary": "BLOB",
+    "jsonb": "VARCHAR",      # DuckDB JSON type isn't a SQLite affinity; store
+                              # as VARCHAR and let callers serialize/parse
+}
+
+
+def _canonical_to_duckdb(data_type: str) -> str:
+    """Map a canonical ``data_type`` token to a DuckDB native type name.
+
+    Tolerant: unknown / parametrized / geometry tokens fall back to ``VARCHAR``
+    rather than raising deep in DDL generation (the same posture as the PG
+    bridge in :func:`dynastore.modules.storage.field_constraints`).
+    """
+    low = (data_type or "").lower()
+    if low.startswith("geometry"):
+        # Geometry is owned by the geometry column, never an attribute column.
+        # If a projected attribute somehow names a geometry type, store the
+        # GeoJSON serialization the rest of the driver already uses.
+        return "VARCHAR"
+    return _CANONICAL_TO_DUCKDB.get(low, "VARCHAR")
 
 # ---------------------------------------------------------------------------
 # Module-level connection pool
@@ -543,13 +587,90 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                 )
                 return result.fetchone()[0] if result.description else len(entity_ids)
 
+    @staticmethod
+    def _build_table_columns(
+        projection: Dict[str, "FieldDefinition"],
+    ) -> List[Tuple[str, str]]:
+        """Project a ``materialize_feature_fields`` result onto SQLite columns.
+
+        Returns the ordered ``[(col_name, col_type), ...]`` the SQLite write
+        table must hold. The driver-owned scaffold (``id`` PK, ``geometry``
+        blob-as-text, ``properties`` JSON blob) is always present; every
+        projected field is appended with its canonical→DuckDB native type.
+        Projected names that collide with the scaffold (``id`` /
+        ``geometry`` / ``properties``) are skipped — the scaffold wins so the
+        existing row-shape contract stays stable.
+        """
+        scaffold: List[Tuple[str, str]] = [
+            ("id", "VARCHAR PRIMARY KEY"),
+            ("geometry", "VARCHAR"),
+            ("properties", "VARCHAR"),
+        ]
+        reserved = {name for name, _ in scaffold}
+        columns: List[Tuple[str, str]] = list(scaffold)
+        for name, fd in projection.items():
+            if name in reserved:
+                continue
+            columns.append((name, _canonical_to_duckdb(fd.data_type)))
+            reserved.add(name)
+        return columns
+
+    @staticmethod
+    def _existing_sqlite_columns(conn, alias: str, table: str) -> Set[str]:
+        """Return the current column-name set of a SQLite-attached table.
+
+        Empty if the table doesn't exist yet (the caller will create it).
+        SQLite stores column metadata in ``PRAGMA table_info(t)``; the DuckDB
+        sqlite extension forwards the pragma through the attached alias.
+        """
+        try:
+            rows = conn.execute(
+                f"PRAGMA table_info('{alias}.{table}')"
+            ).fetchall()
+        except Exception:
+            # Some DuckDB sqlite-extension versions don't forward the pragma
+            # against ``alias.table``; fall back to a DESCRIBE which works
+            # whether the table is empty or populated.
+            try:
+                rows = conn.execute(
+                    f"DESCRIBE {alias}.{table}"
+                ).fetchall()
+            except Exception:
+                return set()
+        names: Set[str] = set()
+        for row in rows or []:
+            # PRAGMA table_info → (cid, name, type, ...); DESCRIBE → (name, type, ...)
+            name = row[1] if len(row) >= 2 and isinstance(row[0], int) else row[0]
+            if name:
+                names.add(str(name))
+        return names
+
     def _ensure_storage_sync(
         self,
         loc: ItemsDuckdbDriverConfig,
         catalog_id: str,
         collection_id: Optional[str],
+        columns: Optional[List[Tuple[str, str]]] = None,
+        fast_columns: Optional[FrozenSet[str]] = None,
     ) -> None:
-        """Synchronous ensure_storage — runs inside thread pool."""
+        """Synchronous ensure_storage — runs inside thread pool.
+
+        ``columns`` is the projection-driven column list built by
+        :meth:`_build_table_columns` from
+        :func:`dynastore.modules.storage.field_projection.materialize_feature_fields`.
+        If unset (no schema/policy could be resolved), fall back to the legacy
+        scaffold so behaviour is unchanged for catalogs that never declared a
+        schema.
+
+        ``fast_columns`` are names the write policy asked the driver to optimise
+        for fast filtering/sorting (``FieldAccess.FAST``). SQLite is the current
+        write backend and has no bloom filters / row-group statistics; ``FAST``
+        is honoured as a SQLite index, which is the equivalent "make filters
+        cheap" mechanism the backend offers. For parquet writes the projection
+        still informs the read schema; bloom filters / row-group stats land
+        when a real parquet writer replaces the current ``COPY ... FORMAT
+        parquet`` path (which derives its schema from the row dicts).
+        """
         import os
 
         # --- SQLite write backend: create dir + table ---
@@ -563,20 +684,94 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                 from dynastore.tools.db import validate_sql_identifier
                 validate_sql_identifier(collection_id)
 
+                # Fall back to the historical 7-column shape when no
+                # projection was supplied — keeps legacy catalogs unchanged.
+                effective_columns = columns or [
+                    ("id", "VARCHAR PRIMARY KEY"),
+                    ("geometry", "VARCHAR"),
+                    ("properties", "VARCHAR"),
+                    ("external_id", "VARCHAR"),
+                    ("asset_id", "VARCHAR"),
+                    ("valid_from", "VARCHAR"),
+                    ("valid_to", "VARCHAR"),
+                ]
+                fast = fast_columns or frozenset()
+
                 with _borrow_conn(timeout=DuckDBConfig.write_timeout) as conn:
                     _try_load_extension_on(conn, "sqlite")
 
                     with _attach_sqlite(conn, loc.write_path) as alias:
-                        conn.execute(
-                            f"CREATE TABLE IF NOT EXISTS {alias}.{collection_id} "
-                            f"(id VARCHAR PRIMARY KEY, geometry VARCHAR, properties VARCHAR, "
-                            f"external_id VARCHAR, asset_id VARCHAR, "
-                            f"valid_from VARCHAR, valid_to VARCHAR)"
+                        # Validate every projected column name against the same
+                        # identifier rule the rest of the driver uses, so a
+                        # malicious schema can't smuggle DDL through the CREATE.
+                        for col_name, _ in effective_columns:
+                            validate_sql_identifier(col_name)
+                        existing = self._existing_sqlite_columns(
+                            conn, alias, collection_id
                         )
-                        logger.info(
-                            "DuckDB: initialised SQLite table '%s' in %s",
-                            collection_id, loc.write_path,
-                        )
+                        if not existing:
+                            col_decls = ", ".join(
+                                f'"{c}" {t}' for c, t in effective_columns
+                            )
+                            conn.execute(
+                                f"CREATE TABLE IF NOT EXISTS "
+                                f"{alias}.{collection_id} ({col_decls})"
+                            )
+                            logger.info(
+                                "DuckDB: initialised SQLite table '%s' in %s "
+                                "(%d columns)",
+                                collection_id, loc.write_path,
+                                len(effective_columns),
+                            )
+                        else:
+                            # Widen existing tables for newly-projected fields.
+                            # SQLite has no ADD COLUMN IF NOT EXISTS, so the
+                            # existence check above carries the idempotence.
+                            for col_name, col_type in effective_columns:
+                                if col_name in existing:
+                                    continue
+                                # Strip the PRIMARY KEY decoration — SQLite
+                                # rejects PK on ADD COLUMN. The id PK can only
+                                # come from the CREATE branch, so reaching here
+                                # for "id" would mean the existing table was
+                                # built without one; leave that alone.
+                                add_type = col_type.split(" PRIMARY KEY")[0]
+                                try:
+                                    conn.execute(
+                                        f"ALTER TABLE {alias}.{collection_id} "
+                                        f'ADD COLUMN "{col_name}" {add_type}'
+                                    )
+                                    logger.info(
+                                        "DuckDB: widened SQLite table '%s' "
+                                        "with column '%s' (%s)",
+                                        collection_id, col_name, add_type,
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "DuckDB: could not add column '%s' to "
+                                        "'%s': %s",
+                                        col_name, collection_id, exc,
+                                    )
+
+                        # FAST fields → SQLite indexes (closest equivalent the
+                        # write backend offers; bloom filters / row-group stats
+                        # are a parquet-writer concern, not SQLite).
+                        for col_name in fast:
+                            if col_name not in {c for c, _ in effective_columns}:
+                                continue
+                            idx_name = f"idx_{collection_id}_{col_name}"
+                            try:
+                                validate_sql_identifier(idx_name)
+                                conn.execute(
+                                    f"CREATE INDEX IF NOT EXISTS "
+                                    f'{alias}.{idx_name} '
+                                    f'ON {collection_id} ("{col_name}")'
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "DuckDB: could not create FAST index "
+                                    "'%s': %s", idx_name, exc,
+                                )
 
         # --- Read-only source: warn if local path missing ---
         if loc.path and not loc.path.startswith(("s3://", "gs://", "http")):
@@ -757,6 +952,54 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
             self._delete_entities_sync, loc, collection_id, entity_ids
         )
 
+    @staticmethod
+    async def _resolve_schema_and_policy(
+        catalog_id: str,
+        collection_id: Optional[str],
+    ) -> Tuple[Optional["ItemsSchema"], Optional["ItemsWritePolicy"]]:
+        """Fetch ``ItemsSchema`` and ``ItemsWritePolicy`` from the config waterfall.
+
+        Best-effort: both ``None`` is the historical state (no schema/policy
+        configured), which makes ``materialize_feature_fields`` return an
+        empty projection and ``_ensure_storage_sync`` fall back to the legacy
+        scaffold. Mirrors the pattern in
+        :meth:`dynastore.modules.storage.drivers.postgresql.ItemsPostgresqlDriver._resolve_write_policy`.
+        """
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.storage.driver_config import (
+            ItemsSchema, ItemsWritePolicy,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        schema: Optional[ItemsSchema] = None
+        policy: Optional[ItemsWritePolicy] = None
+        try:
+            configs = get_protocol(ConfigsProtocol)
+            if configs is not None:
+                try:
+                    cfg = await configs.get_config(
+                        ItemsSchema,
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                    )
+                    if isinstance(cfg, ItemsSchema):
+                        schema = cfg
+                except Exception:
+                    pass
+                try:
+                    cfg = await configs.get_config(
+                        ItemsWritePolicy,
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                    )
+                    if isinstance(cfg, ItemsWritePolicy):
+                        policy = cfg
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return schema, policy
+
     async def ensure_storage(
         self,
         catalog_id: str,
@@ -772,7 +1015,56 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
             )
             return
 
-        await run_in_thread(self._ensure_storage_sync, loc, catalog_id, collection_id)
+        # Project the materialised field set the storage backend must hold.
+        # This is the cross-driver SSOT (#1291, #1295) — the same projection
+        # PG consumes via the attributes-sidecar bridge. Falling back to
+        # ``None`` keeps catalogs without a schema/policy on the legacy
+        # 7-column scaffold so existing collections continue to read/write.
+        columns: Optional[List[Tuple[str, str]]] = None
+        fast_columns: Optional[FrozenSet[str]] = None
+        try:
+            schema, policy = await self._resolve_schema_and_policy(
+                catalog_id, collection_id
+            )
+            if schema is not None or policy is not None:
+                from dynastore.models.protocols.field_definition import (
+                    FieldAccess,
+                )
+                from dynastore.modules.storage.field_projection import (
+                    materialize_feature_fields,
+                )
+
+                projection = materialize_feature_fields(schema, policy)
+                columns = self._build_table_columns(projection)
+                # FAST = the field (or schema-wide default) asks the driver to
+                # optimise for filtering/sorting. The portable hint; the SQLite
+                # backend honours it as an INDEX, the parquet path will honour
+                # it as a bloom filter / row-group statistic.
+                schema_default_access = (
+                    getattr(schema, "default_access", FieldAccess.AUTO)
+                    if schema is not None else FieldAccess.AUTO
+                )
+                fast: Set[str] = set()
+                for name, fd in projection.items():
+                    field_access = getattr(fd, "access", FieldAccess.AUTO)
+                    effective = (
+                        field_access if field_access != FieldAccess.AUTO
+                        else schema_default_access
+                    )
+                    if effective == FieldAccess.FAST:
+                        fast.add(name)
+                fast_columns = frozenset(fast)
+        except Exception as exc:
+            logger.debug(
+                "DuckDB.ensure_storage: projection skipped for %s/%s: %s — "
+                "falling back to legacy scaffold",
+                catalog_id, collection_id, exc,
+            )
+
+        await run_in_thread(
+            self._ensure_storage_sync,
+            loc, catalog_id, collection_id, columns, fast_columns,
+        )
 
     async def drop_storage(
         self,
