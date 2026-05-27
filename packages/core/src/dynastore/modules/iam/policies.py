@@ -21,7 +21,7 @@ import enum
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Tuple, Any, Dict, cast
+from typing import List, Optional, Tuple, Any, Dict, Union, cast
 from uuid import UUID
 from dynastore.modules.iam.compiled_rule_cache import (
     get_compiled_rule_cache,
@@ -33,6 +33,7 @@ from dynastore.models.protocols.access_filter import (
     AccessClause,
     AccessFilter,
     FieldPredicate,
+    RangePredicate,
 )
 import json
 
@@ -1488,7 +1489,7 @@ def _scope_predicates(
 
 
 def _scope_clause(
-    predicates: List[FieldPredicate],
+    predicates: List[Union[FieldPredicate, RangePredicate]],
     catalog_id: Optional[str],
     collection_id: Optional[str],
 ) -> AccessClause:

@@ -44,7 +44,9 @@ neutral :class:`AccessFilter` / :class:`FieldPredicate` contracts.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from dynastore.models.protocols.access_filter import FieldPredicate, RangePredicate
 
 __all__ = ["access_filter_to_pg_clause"]
 
@@ -59,20 +61,79 @@ _FIRST_CLASS_COLS = frozenset(
 )
 
 
-def _field_predicate_to_sql(
-    predicate: Any,
+def _range_predicate_to_sql(
+    predicate: RangePredicate,
     param_prefix: str,
     params: Dict[str, Any],
     *,
     envelope_col: str,
 ) -> Optional[str]:
-    """Translate one :class:`FieldPredicate` to a SQL fragment.
+    """Translate one :class:`RangePredicate` to a SQL fragment.
+
+    Only ``_attrs.<key>`` predicates (JSONB path) are translated.  The bound
+    values are cast to NUMERIC (default) or TIMESTAMPTZ depending on
+    ``predicate.kind``.  Returns ``None`` for unrecognised fields (fail-safe).
+    """
+    field: str = predicate.field
+    if not field.startswith(_ATTRS_PREFIX):
+        return None
+
+    attr_key = field[len(_ATTRS_PREFIX):]
+    if not attr_key:
+        return None
+    if not _SAFE_ATTR_KEY_RE.fullmatch(attr_key):
+        return None
+
+    cast_type = "TIMESTAMPTZ" if predicate.kind == "timestamp" else "NUMERIC"
+    jsonb_path = f"({envelope_col}->'attrs'->>'{attr_key}')"
+
+    if predicate.op == "lte":
+        if len(predicate.bounds) != 1:
+            return None
+        p = f"{param_prefix}_{attr_key}_lte"
+        params[p] = predicate.bounds[0]
+        return f"CAST({jsonb_path} AS {cast_type}) <= CAST(:{p} AS {cast_type})"
+
+    if predicate.op == "gte":
+        if len(predicate.bounds) != 1:
+            return None
+        p = f"{param_prefix}_{attr_key}_gte"
+        params[p] = predicate.bounds[0]
+        return f"CAST({jsonb_path} AS {cast_type}) >= CAST(:{p} AS {cast_type})"
+
+    if predicate.op == "between":
+        if len(predicate.bounds) != 2:
+            return None
+        p_lo = f"{param_prefix}_{attr_key}_lo"
+        p_hi = f"{param_prefix}_{attr_key}_hi"
+        params[p_lo] = predicate.bounds[0]
+        params[p_hi] = predicate.bounds[1]
+        return (
+            f"CAST({jsonb_path} AS {cast_type}) "
+            f"BETWEEN CAST(:{p_lo} AS {cast_type}) AND CAST(:{p_hi} AS {cast_type})"
+        )
+
+    # Unknown op — skip (fail-safe, never widen).
+    return None
+
+
+def _field_predicate_to_sql(
+    predicate: Union[FieldPredicate, RangePredicate, Any],
+    param_prefix: str,
+    params: Dict[str, Any],
+    *,
+    envelope_col: str,
+) -> Optional[str]:
+    """Translate one :class:`FieldPredicate` or :class:`RangePredicate` to SQL.
 
     Only ``_attrs.<key>`` predicates (JSONB path) are translated.  All other
     field names (first-class columns and unknowns) are skipped (returns
     ``None``): the caller already handles them via existing column predicates,
     and skipping never widens access.
     """
+    if isinstance(predicate, RangePredicate):
+        return _range_predicate_to_sql(predicate, param_prefix, params, envelope_col=envelope_col)
+
     field: str = predicate.field
     values: Tuple[str, ...] = predicate.values
 

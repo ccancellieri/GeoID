@@ -26,6 +26,7 @@ from uuid import uuid4
 import pytest
 
 from dynastore.models.auth import Policy
+from dynastore.models.protocols.access_filter import RangePredicate
 from dynastore.modules.iam.models import Role
 from dynastore.modules.iam.policies import PolicyService
 from dynastore.modules.iam.scale_config import (
@@ -112,8 +113,9 @@ def _grant(
     resource_kind: Optional[str] = None,
     resource_ref: Optional[str] = None,
     quota: Optional[Dict[str, Any]] = None,
+    attribute_predicates: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    return {
+    row: Dict[str, Any] = {
         "id": grant_id,
         "object_kind": "role",
         "object_ref": role_name,
@@ -122,6 +124,9 @@ def _grant(
         "resource_ref": resource_ref,
         "quota": quota,
     }
+    if attribute_predicates is not None:
+        row["attribute_predicates"] = attribute_predicates
+    return row
 
 
 async def _call(svc: PolicyService, ctx: Any, *, collection_id: Optional[str], principal_id: Any):
@@ -320,3 +325,108 @@ async def test_no_request_context_skips_quota_stash() -> None:
         request_context=None,
     )
     assert any(p.id == "allow_pol" for p in policies)
+
+
+# ---------------------------------------------------------------------------
+# Co-existence: quota (request-time) + attribute_predicates (query-time)
+#
+# A grant row carrying BOTH ``quota`` and ``attribute_predicates`` must produce
+# two independent enforcement paths without interference:
+#
+#   - ``grants.quota``  → compiled to Condition objects by ``quota_to_conditions``
+#     and stashed on the request context by ``evaluate_access`` (step-5 middleware
+#     enforces them at request time via UsageCounterProtocol).
+#
+#   - ``grants.attribute_predicates`` → compiled to RangePredicate / FieldPredicate
+#     objects and wired into the AccessFilter by ``compile_read_filter`` (query-time
+#     row filter applied by storage drivers, not by the middleware).
+#
+# The two mechanisms share no mutable state and must not interfere.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_quota_and_attribute_predicates_coexist_without_interference() -> None:
+    """A grant with both quota and attribute_predicates produces independent paths.
+
+    - ``quota`` → stashed as request-time Condition(s) on ctx.extras
+    - ``attribute_predicates`` → compiled into an AccessFilter RangePredicate
+    - Neither path touches the other's output.
+    """
+    from uuid import uuid4 as _uuid4
+
+    from dynastore.models.auth import Principal
+
+    gid = "g-coexist"
+    pid = _uuid4()
+
+    storage = _FakeIamStorage(
+        grants=[
+            _grant(
+                gid,
+                "scoped_reader",
+                resource_kind="collection",
+                resource_ref=_COLL_A,
+                quota={"rate_limit": {"limit": 10, "window_seconds": 60}},
+                attribute_predicates=[
+                    {"key": "score", "op": "lte", "values": ["100"]},
+                ],
+            )
+        ],
+        roles={"scoped_reader": _role("scoped_reader", ["allow_pol"])},
+    )
+    svc = _service(storage, {"allow_pol": _allow_policy("allow_pol")})
+
+    # --- Path 1: evaluate_access (request-time quota enforcement) ---
+    ctx = _Ctx()
+    allowed, _ = await _call(svc, ctx, collection_id=_COLL_A, principal_id=pid)
+    assert allowed is True
+
+    # quota → stashed as Condition on context
+    quota_conds = ctx.extras.get("_grant_quota_conditions") or []
+    assert any(c.type == "rate_limit" for c in quota_conds), (
+        "quota rate_limit must be stashed on ctx by evaluate_access"
+    )
+
+    # --- Path 2: compile_read_filter (query-time row filter) ---
+    principal = Principal(
+        id=pid,
+        custom_policies=[_allow_policy("allow_pol")],
+    )
+    af = await svc.compile_read_filter(
+        principals=[],
+        catalog_id=_CATALOG_ID,
+        collection_id=_COLL_A,
+        principal=principal,
+        principal_id=pid,
+    )
+
+    # attribute_predicates → compiled into AccessFilter as RangePredicate clauses
+    assert not af.deny_all, "should not deny all when grant is present"
+    range_clauses = [
+        c for c in af.allow
+        if any(isinstance(p, RangePredicate) and p.op == "lte" for p in c.predicates)
+    ]
+    assert len(range_clauses) >= 1, (
+        "attribute_predicates lte should produce a RangePredicate in the AccessFilter"
+    )
+
+    # --- Non-interference: quota conditions are NOT in the AccessFilter ---
+    # The AccessFilter only holds FieldPredicate / RangePredicate (document-level).
+    # Condition objects (rate_limit) must NOT appear there.
+    from dynastore.models.auth import Condition
+
+    for clause in af.allow:
+        for pred in clause.predicates:
+            assert not isinstance(pred, Condition), (
+                "Condition objects (rate_limit/max_count) must not appear "
+                "inside AccessFilter predicates — they belong in ctx.extras"
+            )
+
+    # --- Non-interference: ctx.extras must NOT contain RangePredicate objects ---
+    # request-time extras should hold only Condition objects, not row predicates.
+    for v in ctx.extras.values():
+        if isinstance(v, list):
+            for item in v:
+                assert not isinstance(item, RangePredicate), (
+                    "RangePredicate must not appear in request-context extras"
+                )

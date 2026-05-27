@@ -49,15 +49,36 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from dynastore.models.protocols.access_filter import RangePredicate
+
 
 def _predicate_to_terms(predicate: Any) -> Dict[str, Any]:
-    """One :class:`FieldPredicate` → an ES ``terms`` clause.
+    """One :class:`FieldPredicate` or :class:`RangePredicate` → an ES clause.
 
+    For :class:`FieldPredicate`: emits an ES ``terms`` (set-membership) clause.
     ``terms`` membership matches the predicate's pure-Python semantics: a
     scalar field matches when its value is in ``values``; an array field
     matches when it intersects ``values``.
+
+    For :class:`RangePredicate`: emits an ES ``range`` clause. The ``kind``
+    field (numeric vs timestamp) is transparent to ES — both map to the same
+    ``range`` query shape; the index mapping determines the actual type cast.
     """
+    if isinstance(predicate, RangePredicate):
+        return _range_predicate_to_es(predicate)
     return {"terms": {predicate.field: list(predicate.values)}}
+
+
+def _range_predicate_to_es(predicate: RangePredicate) -> Dict[str, Any]:
+    """One :class:`RangePredicate` → an ES ``range`` clause."""
+    if predicate.op == "lte":
+        return {"range": {predicate.field: {"lte": predicate.bounds[0]}}}
+    if predicate.op == "gte":
+        return {"range": {predicate.field: {"gte": predicate.bounds[0]}}}
+    if predicate.op == "between":
+        return {"range": {predicate.field: {"gte": predicate.bounds[0], "lte": predicate.bounds[1]}}}
+    # Unknown op — emit match_none (fail closed, never widen).
+    return {"match_none": {}}
 
 
 def _clause_to_bool(clause: Any) -> Dict[str, Any]:

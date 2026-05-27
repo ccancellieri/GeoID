@@ -189,13 +189,17 @@ async def test_multiple_grants_produce_multiple_clauses():
 
 @pytest.mark.asyncio
 async def test_uncompilable_op_sets_uncompilable_flag():
-    """An unsupported op (lte) sets uncompilable=True on the AccessFilter."""
+    """An unsupported op sets uncompilable=True on the AccessFilter.
+
+    Uses ``"range"`` which is intentionally NOT a supported op (it was a
+    placeholder name in early design notes; the real ops are lte/gte/between).
+    """
     pid = uuid4()
     grant_rows = [
         {
             "id": str(uuid4()),
             "attribute_predicates": [
-                {"key": "sensitivity", "op": "lte", "values": ["3"]},
+                {"key": "sensitivity", "op": "range", "values": ["3"]},
             ],
         }
     ]
@@ -216,6 +220,38 @@ async def test_uncompilable_op_sets_uncompilable_flag():
         if any(p.field.startswith("_attrs.") for p in c.predicates)
     ]
     assert attrs_clauses == []
+
+
+@pytest.mark.asyncio
+async def test_lte_op_now_compiles_to_range_predicate():
+    """``lte`` op is now supported and produces a RangePredicate clause."""
+    from dynastore.models.protocols.access_filter import RangePredicate
+
+    pid = uuid4()
+    grant_rows = [
+        {
+            "id": str(uuid4()),
+            "attribute_predicates": [
+                {"key": "sensitivity", "op": "lte", "values": ["5"]},
+            ],
+        }
+    ]
+    svc = _service(grant_rows)
+    pol = _allow_all_policy()
+    principal = _principal_with_policy(pol, pid)
+
+    af = await svc.compile_read_filter(
+        principals=[], catalog_id="cat1", collection_id="col1",
+        principal=principal, principal_id=pid,
+    )
+
+    assert not af.deny_all
+    # At least one clause must contain a RangePredicate on _attrs.sensitivity.
+    range_clauses = [
+        c for c in af.allow
+        if any(isinstance(p, RangePredicate) and p.field == "_attrs.sensitivity" for p in c.predicates)
+    ]
+    assert len(range_clauses) >= 1
 
 
 @pytest.mark.asyncio

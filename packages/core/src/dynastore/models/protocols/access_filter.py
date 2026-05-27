@@ -63,10 +63,11 @@ The cardinal safety rule (proved by the drift guard property test):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence, Tuple
+from typing import Any, Literal, Mapping, Sequence, Tuple, Union
 
 __all__ = [
     "FieldPredicate",
+    "RangePredicate",
     "AccessClause",
     "AccessFilter",
 ]
@@ -100,15 +101,89 @@ class FieldPredicate:
 
 
 @dataclass(frozen=True)
+class RangePredicate:
+    """A single range constraint over one ``_attrs.<key>`` field.
+
+    Complements :class:`FieldPredicate` for numeric and ISO-8601 timestamp
+    comparisons that cannot be expressed as a set-membership test.
+
+    ``op`` is one of:
+
+    * ``"lte"`` — field ≤ bounds[0]
+    * ``"gte"`` — field ≥ bounds[0]
+    * ``"between"`` — bounds[0] ≤ field ≤ bounds[1]
+
+    ``kind`` distinguishes how the bound string is interpreted by PG:
+
+    * ``"numeric"`` (default) — cast to NUMERIC for the comparison.
+    * ``"timestamp"`` — cast to TIMESTAMPTZ for the comparison.
+
+    ES translates both identically (``range`` query on a keyword/date field);
+    the ``kind`` tag is only used by the PG SQL fragment builder.
+
+    ``bounds`` must contain exactly one element for ``"lte"``/``"gte"`` and
+    exactly two elements for ``"between"``. Violating this contract at
+    construction time is a programming error; the compilers enforce the arity
+    constraint before emitting a ``RangePredicate``.
+
+    Note on rate_limit / max_count:
+        Those are grant-level *request* conditions, not document-level row
+        predicates. They live in ``iam.grants.quota`` and are enforced by the
+        :class:`~dynastore.modules.iam.conditions.RateLimitHandler` middleware
+        (step-5) via ``quota_to_conditions``. They must NOT be added to
+        ``PREDICATE_REGISTRY`` and must NOT be expressed as ``RangePredicate``
+        entries in ``attribute_predicates``. The two mechanisms coexist on the
+        same grant row without interference: ``grants.quota`` is evaluated at
+        request time; ``grants.attribute_predicates`` produces row predicates
+        at query time. Both enforce orthogonal constraints on the same grant.
+    """
+
+    field: str
+    op: Literal["lte", "gte", "between"]
+    bounds: Tuple[str, ...]
+    kind: Literal["numeric", "timestamp"] = "numeric"
+
+    def matches(self, document: Mapping[str, Any]) -> bool:
+        """Pure-Python evaluation — used by the drift guard property test.
+
+        Attempts numeric conversion first so that ``"50" >= "5"`` is
+        correctly True for numeric-kind predicates. Falls back to
+        lexicographic string comparison (sufficient for timestamp ISO-8601
+        strings which sort correctly as text, and for the drift guard's
+        representative value sets).
+        """
+        actual = document.get(self.field)
+        if actual is None:
+            return False
+
+        def _cmp(a: str, b: str) -> int:
+            """-1 if a<b, 0 if a==b, 1 if a>b. Numeric-first."""
+            try:
+                fa, fb = float(a), float(b)
+                return (fa > fb) - (fa < fb)
+            except (ValueError, TypeError):
+                return (a > b) - (a < b)
+
+        actual_s = str(actual)
+        if self.op == "lte":
+            return _cmp(actual_s, self.bounds[0]) <= 0
+        if self.op == "gte":
+            return _cmp(actual_s, self.bounds[0]) >= 0
+        if self.op == "between":
+            return _cmp(actual_s, self.bounds[0]) >= 0 and _cmp(actual_s, self.bounds[1]) <= 0
+        return False  # unknown op — fail closed
+
+
+@dataclass(frozen=True)
 class AccessClause:
-    """A conjunction (AND) of :class:`FieldPredicate` s.
+    """A conjunction (AND) of :class:`FieldPredicate` / :class:`RangePredicate` s.
 
     A document satisfies the clause iff it satisfies *every* predicate. An
     empty clause matches every document (an unconditional grant within its
     resource scope).
     """
 
-    predicates: Tuple[FieldPredicate, ...] = ()
+    predicates: Tuple[Union[FieldPredicate, RangePredicate], ...] = ()
 
     def matches(self, document: Mapping[str, Any]) -> bool:
         return all(p.matches(document) for p in self.predicates)

@@ -27,11 +27,14 @@ from __future__ import annotations
 
 import pytest
 
-from dynastore.models.protocols.access_filter import FieldPredicate
+from dynastore.models.protocols.access_filter import FieldPredicate, RangePredicate
 from dynastore.modules.iam.attribute_predicates import (
     AttributePredicate,
+    BetweenCompiler,
     EqCompiler,
+    GteCompiler,
     InCompiler,
+    LteCompiler,
     PREDICATE_REGISTRY,
     compile_attribute_predicates,
 )
@@ -98,7 +101,7 @@ def test_registry_contains_in_and_eq():
 
 
 def test_unknown_op_not_in_registry():
-    assert "lte" not in PREDICATE_REGISTRY
+    # "range" is not a supported op; "lte", "gte", "between" are now supported.
     assert "range" not in PREDICATE_REGISTRY
 
 
@@ -139,7 +142,7 @@ def test_compile_multiple_predicates_and():
 
 def test_compile_unknown_op_uncompilable_and_excluded():
     """An unknown op must set uncompilable=True; the grant is excluded."""
-    preds = [AttributePredicate(key="sensitivity", op="lte", values=["3"])]
+    preds = [AttributePredicate(key="sensitivity", op="range", values=["3"])]
     fps, unc = compile_attribute_predicates(preds)
     assert unc is True
     assert fps == []
@@ -149,7 +152,7 @@ def test_compile_mixed_known_and_unknown_op_uncompilable():
     """Even one unknown op poisons the whole grant (fail-closed)."""
     preds = [
         AttributePredicate(key="dept", op="in", values=["finance"]),
-        AttributePredicate(key="sensitivity", op="lte", values=["3"]),
+        AttributePredicate(key="sensitivity", op="range", values=["3"]),
     ]
     fps, unc = compile_attribute_predicates(preds)
     assert unc is True
@@ -198,3 +201,241 @@ def test_attribute_predicate_key_accepts_safe_chars(good_key):
     """Valid identifier keys pass."""
     p = AttributePredicate(key=good_key, op="eq", values=["v"])
     assert p.key == good_key
+
+
+# ---------------------------------------------------------------------------
+# LteCompiler
+# ---------------------------------------------------------------------------
+
+def test_lte_compiler_happy_path():
+    fp, unc = LteCompiler().compile("score", ["100"])
+    assert unc is False
+    assert fp == RangePredicate("_attrs.score", "lte", ("100",))
+
+
+def test_lte_compiler_empty_values_uncompilable():
+    fp, unc = LteCompiler().compile("score", [])
+    assert unc is True
+    assert fp is None
+
+
+def test_lte_compiler_multiple_values_uncompilable():
+    fp, unc = LteCompiler().compile("score", ["10", "20"])
+    assert unc is True
+    assert fp is None
+
+
+def test_lte_compiler_field_name_prefixed():
+    fp, unc = LteCompiler().compile("priority", ["5"])
+    assert not unc
+    assert fp is not None
+    assert fp.field == "_attrs.priority"
+    assert fp.op == "lte"
+
+
+def test_lte_compiler_default_kind_is_numeric():
+    fp, unc = LteCompiler().compile("val", ["42"])
+    assert not unc
+    assert fp is not None
+    assert fp.kind == "numeric"
+
+
+# ---------------------------------------------------------------------------
+# GteCompiler
+# ---------------------------------------------------------------------------
+
+def test_gte_compiler_happy_path():
+    fp, unc = GteCompiler().compile("score", ["50"])
+    assert unc is False
+    assert fp == RangePredicate("_attrs.score", "gte", ("50",))
+
+
+def test_gte_compiler_empty_values_uncompilable():
+    fp, unc = GteCompiler().compile("score", [])
+    assert unc is True
+    assert fp is None
+
+
+def test_gte_compiler_multiple_values_uncompilable():
+    fp, unc = GteCompiler().compile("score", ["1", "2", "3"])
+    assert unc is True
+    assert fp is None
+
+
+def test_gte_compiler_default_kind_is_numeric():
+    fp, unc = GteCompiler().compile("val", ["10"])
+    assert not unc
+    assert fp is not None
+    assert fp.kind == "numeric"
+
+
+# ---------------------------------------------------------------------------
+# BetweenCompiler
+# ---------------------------------------------------------------------------
+
+def test_between_compiler_happy_path():
+    fp, unc = BetweenCompiler().compile("score", ["10", "90"])
+    assert unc is False
+    assert fp == RangePredicate("_attrs.score", "between", ("10", "90"))
+
+
+def test_between_compiler_one_value_uncompilable():
+    fp, unc = BetweenCompiler().compile("score", ["10"])
+    assert unc is True
+    assert fp is None
+
+
+def test_between_compiler_empty_values_uncompilable():
+    fp, unc = BetweenCompiler().compile("score", [])
+    assert unc is True
+    assert fp is None
+
+
+def test_between_compiler_three_values_uncompilable():
+    fp, unc = BetweenCompiler().compile("score", ["1", "2", "3"])
+    assert unc is True
+    assert fp is None
+
+
+def test_between_compiler_default_kind_is_numeric():
+    fp, unc = BetweenCompiler().compile("val", ["0", "100"])
+    assert not unc
+    assert fp is not None
+    assert fp.kind == "numeric"
+
+
+# ---------------------------------------------------------------------------
+# Timestamp variants via registry
+# ---------------------------------------------------------------------------
+
+def test_lte_timestamp_compiler_in_registry():
+    compiler = PREDICATE_REGISTRY.get("lte:timestamp")
+    assert compiler is not None
+    fp, unc = compiler.compile("ts", ["2026-01-01T00:00:00Z"])
+    assert not unc
+    assert fp is not None
+    assert fp.kind == "timestamp"
+    assert fp.op == "lte"
+
+
+def test_gte_timestamp_compiler_in_registry():
+    compiler = PREDICATE_REGISTRY.get("gte:timestamp")
+    assert compiler is not None
+    fp, unc = compiler.compile("ts", ["2025-01-01T00:00:00Z"])
+    assert not unc
+    assert fp is not None
+    assert fp.kind == "timestamp"
+    assert fp.op == "gte"
+
+
+def test_between_timestamp_compiler_in_registry():
+    compiler = PREDICATE_REGISTRY.get("between:timestamp")
+    assert compiler is not None
+    fp, unc = compiler.compile("ts", ["2025-01-01", "2026-01-01"])
+    assert not unc
+    assert fp is not None
+    assert fp.kind == "timestamp"
+    assert fp.op == "between"
+
+
+# ---------------------------------------------------------------------------
+# Registry: range ops now present
+# ---------------------------------------------------------------------------
+
+def test_registry_contains_range_ops():
+    for op in ("lte", "gte", "between"):
+        assert op in PREDICATE_REGISTRY, f"op '{op}' should be in registry"
+
+
+# ---------------------------------------------------------------------------
+# compile_attribute_predicates with range ops
+# ---------------------------------------------------------------------------
+
+def test_compile_lte_predicate():
+    preds = [AttributePredicate(key="score", op="lte", values=["100"])]
+    fps, unc = compile_attribute_predicates(preds)
+    assert not unc
+    assert len(fps) == 1
+    assert isinstance(fps[0], RangePredicate)
+    assert fps[0].op == "lte"
+    assert fps[0].bounds == ("100",)
+
+
+def test_compile_gte_predicate():
+    preds = [AttributePredicate(key="score", op="gte", values=["10"])]
+    fps, unc = compile_attribute_predicates(preds)
+    assert not unc
+    assert len(fps) == 1
+    assert isinstance(fps[0], RangePredicate)
+    assert fps[0].op == "gte"
+
+
+def test_compile_between_predicate():
+    preds = [AttributePredicate(key="score", op="between", values=["10", "90"])]
+    fps, unc = compile_attribute_predicates(preds)
+    assert not unc
+    assert len(fps) == 1
+    assert isinstance(fps[0], RangePredicate)
+    assert fps[0].op == "between"
+    assert fps[0].bounds == ("10", "90")
+
+
+def test_compile_mixed_eq_and_lte():
+    preds = [
+        AttributePredicate(key="dept", op="eq", values=["finance"]),
+        AttributePredicate(key="score", op="lte", values=["100"]),
+    ]
+    fps, unc = compile_attribute_predicates(preds)
+    assert not unc
+    assert len(fps) == 2
+    field_preds = [p for p in fps if isinstance(p, FieldPredicate)]
+    range_preds = [p for p in fps if isinstance(p, RangePredicate)]
+    assert len(field_preds) == 1
+    assert len(range_preds) == 1
+
+
+def test_compile_lte_wrong_arity_uncompilable():
+    preds = [AttributePredicate(key="score", op="lte", values=["10", "20"])]
+    fps, unc = compile_attribute_predicates(preds)
+    assert unc is True
+    assert fps == []
+
+
+def test_compile_between_wrong_arity_uncompilable():
+    preds = [AttributePredicate(key="score", op="between", values=["50"])]
+    fps, unc = compile_attribute_predicates(preds)
+    assert unc is True
+    assert fps == []
+
+
+# ---------------------------------------------------------------------------
+# RangePredicate.matches — pure-Python drift-guard semantics
+# ---------------------------------------------------------------------------
+
+def test_range_predicate_lte_matches():
+    p = RangePredicate("_attrs.score", "lte", ("100",))
+    assert p.matches({"_attrs.score": "50"}) is True
+    assert p.matches({"_attrs.score": "100"}) is True
+    assert p.matches({"_attrs.score": "101"}) is False
+
+
+def test_range_predicate_gte_matches():
+    p = RangePredicate("_attrs.score", "gte", ("50",))
+    assert p.matches({"_attrs.score": "100"}) is True
+    assert p.matches({"_attrs.score": "50"}) is True
+    assert p.matches({"_attrs.score": "49"}) is False
+
+
+def test_range_predicate_between_matches():
+    p = RangePredicate("_attrs.score", "between", ("10", "90"))
+    assert p.matches({"_attrs.score": "10"}) is True
+    assert p.matches({"_attrs.score": "50"}) is True
+    assert p.matches({"_attrs.score": "90"}) is True
+    assert p.matches({"_attrs.score": "9"}) is False
+    assert p.matches({"_attrs.score": "91"}) is False
+
+
+def test_range_predicate_missing_field_fails_closed():
+    p = RangePredicate("_attrs.score", "lte", ("100",))
+    assert p.matches({}) is False
+    assert p.matches({"_attrs.other": "50"}) is False

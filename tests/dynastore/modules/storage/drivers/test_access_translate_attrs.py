@@ -25,6 +25,7 @@ from dynastore.models.protocols.access_filter import (
     AccessClause,
     AccessFilter,
     FieldPredicate,
+    RangePredicate,
 )
 from dynastore.modules.storage.drivers.elasticsearch_envelope.access_translate import (
     access_filter_to_es,
@@ -92,3 +93,89 @@ def test_deny_all_attrs_filter():
     af = AccessFilter(deny_all=True)
     result = access_filter_to_es(af)
     assert result == {"match_none": {}}
+
+
+# ---------------------------------------------------------------------------
+# Range predicate tests (F3 additions)
+# ---------------------------------------------------------------------------
+
+def _filter_with_range_clause(
+    field: str, op: str, bounds: tuple, kind: str = "numeric"
+) -> AccessFilter:
+    rp = RangePredicate(field, op, bounds, kind=kind)  # type: ignore[arg-type]
+    clause = AccessClause(predicates=(rp,))
+    return AccessFilter(allow=(clause,))
+
+
+def test_lte_range_predicate_becomes_es_range_clause():
+    """``RangePredicate`` with op=lte → ES ``range`` with ``lte`` key."""
+    af = _filter_with_range_clause("_attrs.score", "lte", ("100",))
+    result = access_filter_to_es(af)
+
+    assert result is not None
+    should = result["bool"]["should"]
+    assert len(should) == 1
+    inner = should[0]["bool"]["filter"]
+    assert len(inner) == 1
+    range_clause = inner[0]
+    assert "range" in range_clause
+    assert "_attrs.score" in range_clause["range"]
+    assert range_clause["range"]["_attrs.score"] == {"lte": "100"}
+
+
+def test_gte_range_predicate_becomes_es_range_clause():
+    """``RangePredicate`` with op=gte → ES ``range`` with ``gte`` key."""
+    af = _filter_with_range_clause("_attrs.score", "gte", ("50",))
+    result = access_filter_to_es(af)
+
+    assert result is not None
+    should = result["bool"]["should"]
+    inner = should[0]["bool"]["filter"]
+    range_clause = inner[0]
+    assert "range" in range_clause
+    assert range_clause["range"]["_attrs.score"] == {"gte": "50"}
+
+
+def test_between_range_predicate_becomes_es_range_clause():
+    """``RangePredicate`` with op=between → ES ``range`` with both gte and lte."""
+    af = _filter_with_range_clause("_attrs.score", "between", ("10", "90"))
+    result = access_filter_to_es(af)
+
+    assert result is not None
+    should = result["bool"]["should"]
+    inner = should[0]["bool"]["filter"]
+    range_clause = inner[0]
+    assert "range" in range_clause
+    assert range_clause["range"]["_attrs.score"] == {"gte": "10", "lte": "90"}
+
+
+def test_range_predicate_timestamp_kind_same_shape():
+    """Timestamp kind produces the same ES ``range`` shape (ES index mapping handles casting)."""
+    af = _filter_with_range_clause(
+        "_attrs.observed_at", "lte", ("2026-01-01T00:00:00Z",), kind="timestamp"
+    )
+    result = access_filter_to_es(af)
+
+    assert result is not None
+    should = result["bool"]["should"]
+    inner = should[0]["bool"]["filter"]
+    range_clause = inner[0]
+    assert "range" in range_clause
+    assert range_clause["range"]["_attrs.observed_at"] == {"lte": "2026-01-01T00:00:00Z"}
+
+
+def test_mixed_field_and_range_predicates_in_one_clause():
+    """A clause mixing FieldPredicate (dept) and RangePredicate (score) generates both."""
+    fp = FieldPredicate("_attrs.dept", ("finance",))
+    rp = RangePredicate("_attrs.score", "gte", ("10",))
+    clause = AccessClause(predicates=(fp, rp))
+    af = AccessFilter(allow=(clause,))
+    result = access_filter_to_es(af)
+
+    assert result is not None
+    should = result["bool"]["should"]
+    inner = should[0]["bool"]["filter"]
+    assert len(inner) == 2
+    types = {list(c.keys())[0] for c in inner}
+    assert "terms" in types
+    assert "range" in types

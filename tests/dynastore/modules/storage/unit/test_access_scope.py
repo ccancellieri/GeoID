@@ -19,8 +19,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from dynastore.models.protocols.access_filter import AccessClause, AccessFilter, FieldPredicate
+from dynastore.models.protocols.access_filter import AccessClause, AccessFilter, FieldPredicate, RangePredicate
 from dynastore.modules.storage import access_scope
+from dynastore.modules.storage.access_filter_pg import access_filter_to_pg_clause
 
 
 class _FakePerms:
@@ -331,3 +332,101 @@ def test_principals_from_request_state_anonymous_scalar_role():
     principals, principal = access_scope.principals_from_request_state(request)
     assert principal is None
     assert principals == ["unauthenticated"]
+
+
+# ---------------------------------------------------------------------------
+# PG range predicate SQL fragment tests (F3 additions)
+# ---------------------------------------------------------------------------
+
+def _pg_clause(predicate):
+    """Helper: build a filter with one predicate and translate to PG SQL."""
+    clause = AccessClause(predicates=(predicate,))
+    af = AccessFilter(allow=(clause,))
+    return access_filter_to_pg_clause(af, envelope_col="env")
+
+
+def test_pg_lte_numeric_produces_cast_le_fragment():
+    sql, params = _pg_clause(RangePredicate("_attrs.score", "lte", ("100",)))
+    assert sql is not None
+    assert "CAST" in sql
+    assert "<=" in sql
+    assert "NUMERIC" in sql
+    # Bound is passed as a parameter, not inline.
+    assert any("score_lte" in k for k in params)
+
+
+def test_pg_gte_numeric_produces_cast_ge_fragment():
+    sql, params = _pg_clause(RangePredicate("_attrs.score", "gte", ("50",)))
+    assert sql is not None
+    assert ">=" in sql
+    assert "NUMERIC" in sql
+    assert any("score_gte" in k for k in params)
+
+
+def test_pg_between_numeric_produces_between_fragment():
+    sql, params = _pg_clause(RangePredicate("_attrs.score", "between", ("10", "90")))
+    assert sql is not None
+    assert "BETWEEN" in sql
+    assert "NUMERIC" in sql
+    lo_keys = [k for k in params if "lo" in k]
+    hi_keys = [k for k in params if "hi" in k]
+    assert len(lo_keys) == 1
+    assert len(hi_keys) == 1
+    assert params[lo_keys[0]] == "10"
+    assert params[hi_keys[0]] == "90"
+
+
+def test_pg_lte_timestamp_produces_timestamptz_cast():
+    sql, params = _pg_clause(
+        RangePredicate("_attrs.observed_at", "lte", ("2026-01-01T00:00:00Z",), kind="timestamp")
+    )
+    assert sql is not None
+    assert "TIMESTAMPTZ" in sql
+    assert "<=" in sql
+
+
+def test_pg_gte_timestamp_produces_timestamptz_cast():
+    sql, params = _pg_clause(
+        RangePredicate("_attrs.observed_at", "gte", ("2025-01-01T00:00:00Z",), kind="timestamp")
+    )
+    assert sql is not None
+    assert "TIMESTAMPTZ" in sql
+    assert ">=" in sql
+
+
+def test_pg_range_uses_envelope_col_name():
+    """The generated SQL references the given envelope column name."""
+    clause = AccessClause(predicates=(RangePredicate("_attrs.val", "lte", ("99",)),))
+    af = AccessFilter(allow=(clause,))
+    sql, _ = access_filter_to_pg_clause(af, envelope_col="my_envelope")
+    assert sql is not None
+    assert "my_envelope" in sql
+
+
+def test_pg_range_unknown_attr_key_skipped():
+    """A RangePredicate with unsafe attr key characters is skipped (fail-safe)."""
+    # We bypass the compiler-level key validation and construct directly.
+    rp = RangePredicate("_attrs.bad key!", "lte", ("10",))
+    sql, params = _pg_clause(rp)
+    # Should return None or FALSE — never produce SQL with the bad key.
+    assert sql is None or "bad key!" not in (sql or "")
+
+
+def test_pg_range_non_attrs_field_skipped():
+    """A RangePredicate on a non-_attrs field is skipped (first-class columns only)."""
+    sql, params = _pg_clause(RangePredicate("some_column", "lte", ("10",)))
+    assert sql is None
+
+
+def test_pg_field_and_range_predicate_in_same_clause():
+    """A clause with both a FieldPredicate and a RangePredicate generates both fragments."""
+    clause = AccessClause(predicates=(
+        FieldPredicate("_attrs.dept", ("finance",)),
+        RangePredicate("_attrs.score", "gte", ("20",)),
+    ))
+    af = AccessFilter(allow=(clause,))
+    sql, params = access_filter_to_pg_clause(af, envelope_col="env")
+    assert sql is not None
+    assert "ANY" in sql          # from FieldPredicate
+    assert ">=" in sql           # from RangePredicate
+    assert "AND" in sql          # both in same AND clause
