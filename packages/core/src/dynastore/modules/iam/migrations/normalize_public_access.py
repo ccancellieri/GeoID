@@ -59,7 +59,6 @@ _SAFE_WEB_PATHS: List[str] = [
     "/web/docs-content/.*",
     "/web/docs-manifest",
     "/web/config/.*",
-    "/web/health",
     "/web/dashboard/?$",
     "/web/lite/.*",
 ]

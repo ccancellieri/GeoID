@@ -196,7 +196,7 @@ async def test_dashboard_collections_endpoint(
 
 async def test_health_endpoint(sysadmin_in_process_client_module: AsyncClient):
     """Test the health endpoint returns ok status."""
-    response = await sysadmin_in_process_client_module.get("/web/health")
+    response = await sysadmin_in_process_client_module.get("/health")
     assert response.status_code == 200
     data = response.json()
     assert data.get("status") == "ok"
