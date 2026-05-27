@@ -147,6 +147,14 @@ COMMON_PROPERTIES: Dict[str, Any] = {
     "_valid_to":              {"type": "date"},
     "_simplification_factor": {"type": "float"},
     "_simplification_mode":   {"type": "keyword"},
+    # Analyzed catch-all populated at write time from ``properties.extras``
+    # values (see ``items_projection._flatten_extras_for_search``). Pairs
+    # with the ``flattened`` extras lane to give the unknown-property tail
+    # one analyzed-fulltext field plus one exact-per-key filter field —
+    # two mapping entries total no matter how many distinct extension
+    # keys arrive across the collections sharing this per-catalog index,
+    # keeping the 1000-field index cap predictable (#1295).
+    "_search_text":           {"type": "text", "analyzer": "standard"},
 }
 
 # STAC standard datetime fields shared with non-items entity types.
@@ -213,9 +221,15 @@ def build_item_mapping(known_fields: Dict[str, Dict[str, Any]]) -> Dict[str, Any
       accepted at the top level of the doc.
     * ``properties.dynamic = false`` — only keys in ``known_fields``
       survive as first-class typed paths; everything else must arrive
-      under ``properties.extras`` (the per-catalog dynamic lane).
-    * ``properties.extras.dynamic = true`` — per-index dynamic typing
-      for the long tail of extension / columnar fields.
+      under ``properties.extras``.
+    * ``properties.extras`` is a ``flattened`` field — the entire bucket
+      counts as **one** mapping entry regardless of how many distinct
+      leaf keys arrive across the collections sharing this per-catalog
+      index, capping field growth (#1295). ``flattened`` leaves are
+      exact-match (``keyword``-semantics) only; analyzed full-text on
+      the unknown tail rides on the root ``_search_text`` field, which
+      :func:`items_projection.project_item_for_es` populates from the
+      same extras values at write time.
 
     The projection helper (``items_projection.project_item_for_es``)
     enforces the shape at write time; ES enforces it at the mapping
@@ -233,7 +247,7 @@ def build_item_mapping(known_fields: Dict[str, Dict[str, Any]]) -> Dict[str, Any
                 "dynamic": False,
                 "properties": {
                     **known_fields,
-                    "extras": {"type": "object", "dynamic": True},
+                    "extras": {"type": "flattened"},
                 },
             },
         },
@@ -245,6 +259,19 @@ def build_item_mapping(known_fields: Dict[str, Dict[str, Any]]) -> Dict[str, Any
 # ``build_item_mapping(build_known_fields(cfg))`` once Tier 2 lands so
 # it picks up the operator overlay.
 ITEM_MAPPING: Dict[str, Any] = build_item_mapping(build_known_fields())
+
+
+# Just the new top-level fields a cap-safe items index needs that an
+# old ``object``-dynamic-extras index won't have. ``ensure_storage``
+# patches an existing index with these via ``put_mapping`` (ES allows
+# adding new fields to a live mapping). The ``extras`` field itself
+# cannot be retyped from ``object`` to ``flattened`` in place — that
+# needs a reindex, tracked as a separate follow-up to #1295.
+ITEMS_INDEX_CAP_SAFE_MAPPING_PATCH: Dict[str, Any] = {
+    "properties": {
+        "_search_text": COMMON_PROPERTIES["_search_text"],
+    },
+}
 
 ASSET_MAPPING: Dict[str, Any] = {
     "dynamic": True,

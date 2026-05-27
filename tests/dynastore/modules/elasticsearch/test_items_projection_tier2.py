@@ -58,8 +58,8 @@ def test_tier_2_overlay_in_built_mapping() -> None:
     mapping = build_item_mapping(build_known_fields(cfg))
     nested = mapping["properties"]["properties"]["properties"]
     assert nested["fao:custom_score"] == {"type": "float"}
-    # ``extras`` lane still present alongside.
-    assert nested["extras"]["dynamic"] is True
+    # ``extras`` lane still present alongside as a cap-safe flattened field (#1295).
+    assert nested["extras"] == {"type": "flattened"}
 
 
 def test_tier_2_overlay_routes_field_at_top_level_not_extras() -> None:
