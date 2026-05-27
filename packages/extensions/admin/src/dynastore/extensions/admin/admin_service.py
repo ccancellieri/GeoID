@@ -58,6 +58,7 @@ from .models import (
     CatalogProvisioningView, ProvisioningTaskView,
     GrantUsageView, GrantUsageEntry, GrantUsageCounters,
     GrantRateLimitCounter, GrantMaxCountCounter,
+    AppliedRowResponse, AppliedPresetsPage,
 )
 from .policies import admin_policies, admin_role_bindings
 
@@ -2308,6 +2309,126 @@ class AdminService(ExtensionProtocol):
         )
         # Legacy shape: also expose as "presets" list for back-compat.
         return {"presets": result["items"], "next_cursor": result["next_cursor"]}
+
+    @router.get(
+        "/presets/applied",
+        summary="List applied-presets audit rows for a given scope (#1425)",
+        response_model=AppliedPresetsPage,
+    )
+    async def list_applied_presets(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        scope_key: str = Query(
+            ...,
+            description=(
+                "Exact scope key to query. Accepted shapes: "
+                "``platform`` | ``catalog:<cat_id>`` | ``catalog:<cat_id>/collection:<coll_id>``"
+            ),
+        ),
+        state: str = Query(
+            "applied",
+            description="State filter. One of: applied, revoked, pending, failed, partial, …",
+        ),
+        limit: int = Query(50, ge=1, le=200),
+        cursor: Optional[str] = Query(None, description="Opaque keyset pagination cursor."),
+    ):
+        """Return paginated ``iam.applied_presets`` rows for an exact ``scope_key``.
+
+        Degrades cleanly to 503 when the IAM extension is not loaded (the
+        ``iam.applied_presets`` table does not exist without IAM).
+        """
+        import re
+
+        _SCOPE_RE = re.compile(
+            r"^(platform|catalog:[^/]+((/collection:[^/]+)?))$"
+        )
+        if not _SCOPE_RE.match(scope_key):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid scope_key {scope_key!r}. "
+                    "Expected: 'platform', 'catalog:<id>', or 'catalog:<id>/collection:<id>'."
+                ),
+            )
+
+        # IAM-optional: the iam.applied_presets table only exists when the
+        # IAM extension is installed.  Fail with 503 rather than 500 so the
+        # frontend can surface a clear "IAM not installed" message.
+        if get_protocol(IamService) is None:
+            raise HTTPException(
+                status_code=503,
+                detail="IAM extension not loaded; applied_presets history is unavailable.",
+            )
+
+        from dynastore.models.protocols import DatabaseProtocol
+        from dynastore.modules.iam.applied_presets_service import (
+            AppliedPresetsService,
+            _VALID_STATES,
+            _decode_cursor,
+        )
+
+        if state not in _VALID_STATES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown state {state!r}. Allowed: {sorted(_VALID_STATES)}",
+            )
+
+        if cursor is not None:
+            try:
+                _decode_cursor(cursor)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        db_proto = get_protocol(DatabaseProtocol)
+        if db_proto is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Database protocol unavailable.",
+            )
+        engine = db_proto.engine
+
+        svc = AppliedPresetsService(engine)
+        rows, next_cursor = await svc.list_for_scope(
+            scope_key=scope_key,
+            state=state,
+            cursor=cursor,
+            limit=limit,
+        )
+
+        def _ts_iso(val: object) -> Optional[str]:  # type: ignore[reportReturnType]
+            """Convert a datetime-like or string timestamp to ISO 8601 string."""
+            if val is None:
+                return None
+            if isinstance(val, str):
+                return val
+            iso = getattr(val, "isoformat", None)
+            if callable(iso):
+                return str(iso())
+            return str(val)
+
+        def _row_response(r: dict) -> AppliedRowResponse:
+            import json as _json
+
+            snap = r.get("params_snapshot")
+            if isinstance(snap, str):
+                try:
+                    snap = _json.loads(snap)
+                except Exception:
+                    snap = None
+            return AppliedRowResponse(
+                preset_name=r["preset_name"],
+                scope_key=r["scope_key"],
+                state=r["state"],
+                applied_at=_ts_iso(r.get("applied_at")),
+                applied_by=str(r["applied_by"]) if r.get("applied_by") else None,
+                params_snapshot=snap,
+                last_error=r.get("last_error"),
+                updated_at=_ts_iso(r.get("updated_at")),
+            )
+
+        return AppliedPresetsPage(
+            rows=[_row_response(r) for r in rows],
+            next_cursor=next_cursor,
+        )
 
     @router.get("/presets/{preset_name}", summary="Get a single preset definition")
     async def get_preset_detail(

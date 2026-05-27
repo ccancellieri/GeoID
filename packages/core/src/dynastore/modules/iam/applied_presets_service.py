@@ -21,8 +21,10 @@ semantics: SELECT … FOR UPDATE then transition in the same transaction).
 """
 from __future__ import annotations
 
+import base64
 import json
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from dynastore.modules.db_config.query_executor import DbResource
@@ -31,6 +33,48 @@ from . import applied_presets_queries as _q
 
 # Type alias for an audit row returned as a plain dict.
 AppliedRow = Dict[str, Any]
+
+_VALID_STATES = frozenset({
+    "pending", "in_progress", "applied",
+    "revoke_pending", "revoke_in_progress", "revoked",
+    "failed", "revoke_failed", "partial",
+})
+
+
+def _encode_cursor(applied_at_iso: Optional[str], preset_name: str) -> str:
+    """Encode an opaque keyset cursor from ``(applied_at_iso, preset_name)``."""
+    payload = json.dumps([applied_at_iso, preset_name])
+    return base64.urlsafe_b64encode(payload.encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> Tuple[Optional[str], str]:
+    """Decode a cursor produced by :func:`_encode_cursor`.
+
+    Returns ``(applied_at_iso, preset_name)``.  Raises ``ValueError`` on
+    malformed input so callers can surface a 400.
+    """
+    try:
+        payload = base64.urlsafe_b64decode(cursor.encode()).decode()
+        parts = json.loads(payload)
+        if not isinstance(parts, list) or len(parts) != 2:
+            raise ValueError("unexpected shape")
+        applied_at_iso, preset_name = parts
+        if not isinstance(preset_name, str):
+            raise ValueError("preset_name must be a string")
+        if applied_at_iso is not None:
+            if not isinstance(applied_at_iso, str):
+                raise ValueError("applied_at_iso must be a string or null")
+            # Validate ISO timestamp shape so a crafted cursor cannot reach PG
+            # as a malformed cast and surface as a 500.
+            try:
+                datetime.fromisoformat(applied_at_iso)
+            except ValueError as ts_exc:
+                raise ValueError(
+                    f"applied_at_iso is not a valid ISO 8601 timestamp: {ts_exc}"
+                ) from ts_exc
+        return applied_at_iso, preset_name
+    except Exception as exc:
+        raise ValueError(f"invalid cursor: {exc}") from exc
 
 
 class AppliedPresetsService:
@@ -89,6 +133,50 @@ class AppliedPresetsService:
             conn, preset_name=name, scope_key=scope_key
         )
         return dict(row._mapping) if row is not None else None
+
+    async def list_for_scope(
+        self,
+        *,
+        scope_key: str,
+        state: str = "applied",
+        cursor: Optional[str] = None,
+        limit: int = 50,
+        conn: Optional[Any] = None,
+    ) -> Tuple[List[AppliedRow], Optional[str]]:
+        """Return rows for an exact ``scope_key``, keyset-paginated on ``(applied_at DESC, preset_name)``.
+
+        ``limit`` is clamped to ``[1, 200]``.  ``state`` must be a valid
+        state-machine value; callers should validate before calling.
+        Returns ``(rows, next_cursor)`` where ``next_cursor`` is ``None``
+        when no further pages exist.
+        """
+        limit = max(1, min(limit, 200))
+        resource = self._resource(conn)
+        if cursor is not None:
+            applied_at_iso, cursor_name = _decode_cursor(cursor)
+            rows = await _q.LIST_FOR_SCOPE_CURSOR.execute(
+                resource,
+                scope_key=scope_key,
+                state=state,
+                cursor_applied_at=applied_at_iso,
+                cursor_preset_name=cursor_name,
+                limit=limit,
+            )
+        else:
+            rows = await _q.LIST_FOR_SCOPE.execute(
+                resource,
+                scope_key=scope_key,
+                state=state,
+                limit=limit,
+            )
+        rows = rows or []
+        next_cursor: Optional[str] = None
+        if len(rows) == limit:
+            last = rows[-1]
+            at_val = last.get("applied_at")
+            at_iso = at_val.isoformat() if hasattr(at_val, "isoformat") else (str(at_val) if at_val is not None else None)
+            next_cursor = _encode_cursor(at_iso, last["preset_name"])
+        return rows, next_cursor
 
     async def list(
         self,

@@ -249,3 +249,33 @@ LIST_BY_SCOPE_PREFIX_CURSOR = DQLQuery(
     """,
     result_handler=ResultHandler.ALL_DICTS,
 )
+
+# ---------------------------------------------------------------------------
+# DQL — list by exact scope, keyset on (applied_at DESC, preset_name)
+# ---------------------------------------------------------------------------
+
+LIST_FOR_SCOPE = DQLQuery(
+    """
+    SELECT * FROM iam.applied_presets
+    WHERE scope_key = :scope_key
+      AND state = :state
+    ORDER BY applied_at DESC NULLS LAST, preset_name
+    LIMIT :limit
+    """,
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
+LIST_FOR_SCOPE_CURSOR = DQLQuery(
+    """
+    SELECT * FROM iam.applied_presets
+    WHERE scope_key = :scope_key
+      AND state = :state
+      AND (
+          applied_at < :cursor_applied_at
+          OR (applied_at IS NOT DISTINCT FROM :cursor_applied_at AND preset_name > :cursor_preset_name)
+      )
+    ORDER BY applied_at DESC NULLS LAST, preset_name
+    LIMIT :limit
+    """,
+    result_handler=ResultHandler.ALL_DICTS,
+)
