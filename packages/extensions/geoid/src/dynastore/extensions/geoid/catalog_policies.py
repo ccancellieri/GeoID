@@ -199,7 +199,11 @@ async def register_geoid_policies_for_catalog(catalog_id: str) -> None:
                                 if existing:
                                     merged_policies = list(set(existing.policies + policy_ids))
                                     enriched_role = enriched_role.model_copy(
-                                        update={"policies": merged_policies}
+                                        update={
+                                            "policies": merged_policies,
+                                            "description": existing.description,
+                                            "metadata": existing.metadata,
+                                        }
                                     )
                                     await storage.update_role(
                                         enriched_role, 
