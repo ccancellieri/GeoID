@@ -3,7 +3,6 @@ from pydantic import ValidationError
 
 from dynastore.modules.catalog.catalog_config import (
     CollectionPluginConfig,
-    CollectionKind,
     CompositePartitionConfig,
 )
 from dynastore.modules.storage.driver_config import (
@@ -406,31 +405,31 @@ class TestAssetRoutingConfig:
         assert Operation.WRITE in cfg.operations
         assert cfg.operations[Operation.WRITE][0].driver_ref == "asset_postgresql_driver"
 
-    def test_write_es_secondary_is_async_outbox(self):
-        """#620: assets WRITE must route ES through OUTBOX, not WARN.
-        ES is the *index*, not parallel storage — losing an indexing
-        write as a single WARN line silently inverts the design intent
-        (READ later raises "not found" against an empty index).
+    def test_write_default_is_pg_only(self):
+        """Assets WRITE defaults to PG only — the ES asset driver is
+        no longer a hardcoded secondary. Operators who install an
+        ``AssetIndexer`` implementation get it appended via the
+        auto-augment path (``_self_register_indexers_into``); the
+        zero-config bare default is PG-only.
         """
         cfg = AssetRoutingConfig()
         write = cfg.operations[Operation.WRITE]
-        es_entry = next(
-            e for e in write if e.driver_ref == "asset_elasticsearch_driver"
+        assert write[0].driver_ref == "asset_postgresql_driver"
+        assert write[0].on_failure == FailurePolicy.FATAL
+        assert not any(
+            e.driver_ref == "asset_elasticsearch_driver" for e in write
         )
-        assert es_entry.on_failure == FailurePolicy.OUTBOX
-        assert es_entry.write_mode == WriteMode.ASYNC
 
-    def test_read_default_is_pg_first(self):
-        """#620: PG is the canonical SOR for assets; identity/existence
-        reads must consult PG first. ES-first turned a swallowed ES
-        write into a fatal "Asset not found" in ingestion.
+    def test_read_default_is_pg_only(self):
+        """Assets READ defaults to PG only. The ES asset driver is not
+        a hardcoded secondary on READ — operators pin it explicitly via
+        PluginConfig if they want simplified-geometry fallback.
         """
         cfg = AssetRoutingConfig()
         read = cfg.operations[Operation.READ]
         assert read[0].driver_ref == "asset_postgresql_driver"
         assert read[0].on_failure == FailurePolicy.FATAL
-        # ES still available as secondary for simplified-geometry hints.
-        assert any(
+        assert not any(
             e.driver_ref == "asset_elasticsearch_driver" for e in read
         )
 
