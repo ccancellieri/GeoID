@@ -72,6 +72,48 @@ def _get_es_client() -> Any:
     return client
 
 
+async def _revoke_deny_policy(catalog_id: str) -> None:
+    """Strip and delete the ``private_deny_{catalog_id}`` DENY policy.
+
+    Best-effort: logs WARNING on failure but does not propagate exceptions.
+    Mirrors the logic in
+    :meth:`~.driver.ItemsElasticsearchPrivateDriver._revoke_deny_policy`
+    so the cascade cleanup path and the legacy direct path stay in sync
+    without circular imports.
+    """
+    from dynastore.tools.discovery import get_protocol
+    try:
+        from dynastore.models.protocols.policies import PermissionProtocol
+    except ImportError:
+        return
+
+    perm = get_protocol(PermissionProtocol)
+    if not perm:
+        return
+
+    policy_id = f"private_deny_{catalog_id}"
+
+    try:
+        from dynastore.modules.iam.iam_service import IamService
+        iam = get_protocol(IamService)
+        if iam:
+            existing_roles = {r.name: r for r in await iam.list_roles()}
+            all_users = existing_roles.get("all_users")
+            if all_users is not None:
+                remaining = [p for p in all_users.policies if p != policy_id]
+                await iam.update_role(all_users.model_copy(update={"policies": remaining}))
+    except Exception as exc:
+        logger.warning(
+            "EsItemsIndexOwner: failed to strip deny policy %r from all_users role: %s",
+            policy_id, exc,
+        )
+
+    try:
+        await perm.delete_policy(policy_id)
+    except Exception:
+        pass
+
+
 class EsItemsIndexOwner(BaseResourceOwner):
     """Resource owner for the per-catalog private items ES index.
 
@@ -139,13 +181,33 @@ class EsItemsIndexOwner(BaseResourceOwner):
                 "EsItemsIndexOwner: deleted ES index %r (catalog_id=%r).",
                 ref.locator, ref.metadata.get("catalog_id"),
             )
-            return CleanupOutcome.DONE
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "EsItemsIndexOwner: failed to delete ES index %r: %s",
                 ref.locator, exc, exc_info=True,
             )
             return CleanupOutcome.RETRY
+
+        # Revoke the matching DENY policy after the index is gone.
+        # Ordering mirrors drop_storage: delete index first, then revoke policy.
+        # Best-effort: IAM hiccups must not trigger a RETRY of the entire cascade.
+        catalog_id: str = ref.metadata.get("catalog_id", "")
+        if catalog_id:
+            try:
+                await _revoke_deny_policy(catalog_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "EsItemsIndexOwner: failed to revoke DENY policy for catalog %r: %s",
+                    catalog_id, exc,
+                )
+        else:
+            logger.warning(
+                "EsItemsIndexOwner: catalog_id missing from CleanupRef metadata %r "
+                "— DENY policy not revoked.",
+                ref.locator,
+            )
+
+        return CleanupOutcome.DONE
 
 
 def register_owners(registry: "CascadeCleanupRegistry") -> None:

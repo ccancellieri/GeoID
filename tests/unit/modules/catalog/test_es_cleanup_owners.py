@@ -193,6 +193,113 @@ class TestEsItemsIndexOwnerCleanupOne:
 
 
 # ---------------------------------------------------------------------------
+# EsItemsIndexOwner.cleanup_one — DENY policy revocation (issue #1467)
+# ---------------------------------------------------------------------------
+
+
+class TestEsItemsIndexOwnerDenyPolicyRevocation:
+    """Verify that cleanup_one revokes the DENY policy on HARD delete.
+
+    The cascade path (EsItemsIndexOwner.cleanup_one) must call
+    _revoke_deny_policy so orphan IAM DENY policies are not left behind
+    after a catalog hard-delete.  This mirrors the legacy drop_storage
+    ordering: delete index first, then revoke policy.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hard_delete_calls_revoke_deny_policy(self) -> None:
+        """HARD mode: _revoke_deny_policy called after successful ES delete."""
+        es = _mock_es_client()
+        ref = CleanupRef(
+            kind="es_index",
+            locator=_EXPECTED_INDEX,
+            owner_id=EsItemsIndexOwner.owner_id,
+            metadata={"catalog_id": _CATALOG_ID},
+        )
+
+        with (
+            _patch_es_client(es),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch_private.cascade_owners._revoke_deny_policy",
+                new_callable=AsyncMock,
+            ) as mock_revoke,
+        ):
+            outcome = await EsItemsIndexOwner().cleanup_one(ref, CleanupMode.HARD)
+
+        mock_revoke.assert_awaited_once_with(_CATALOG_ID)
+        assert outcome == CleanupOutcome.DONE
+
+    @pytest.mark.asyncio
+    async def test_hard_delete_revoke_raises_still_returns_done(self) -> None:
+        """HARD mode: IAM revoke failure is best-effort — outcome is DONE, not RETRY."""
+        es = _mock_es_client()
+        ref = CleanupRef(
+            kind="es_index",
+            locator=_EXPECTED_INDEX,
+            owner_id=EsItemsIndexOwner.owner_id,
+            metadata={"catalog_id": _CATALOG_ID},
+        )
+
+        with (
+            _patch_es_client(es),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch_private.cascade_owners._revoke_deny_policy",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("IAM unavailable"),
+            ),
+        ):
+            outcome = await EsItemsIndexOwner().cleanup_one(ref, CleanupMode.HARD)
+
+        assert outcome == CleanupOutcome.DONE
+
+    @pytest.mark.asyncio
+    async def test_soft_delete_does_not_call_revoke_deny_policy(self) -> None:
+        """SOFT mode: _revoke_deny_policy must never be called."""
+        es = _mock_es_client()
+        ref = CleanupRef(
+            kind="es_index",
+            locator=_EXPECTED_INDEX,
+            owner_id=EsItemsIndexOwner.owner_id,
+            metadata={"catalog_id": _CATALOG_ID},
+        )
+
+        with (
+            _patch_es_client(es),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch_private.cascade_owners._revoke_deny_policy",
+                new_callable=AsyncMock,
+            ) as mock_revoke,
+        ):
+            outcome = await EsItemsIndexOwner().cleanup_one(ref, CleanupMode.SOFT)
+
+        mock_revoke.assert_not_awaited()
+        assert outcome == CleanupOutcome.DONE
+
+    @pytest.mark.asyncio
+    async def test_hard_delete_missing_catalog_id_still_returns_done(self) -> None:
+        """HARD mode with no catalog_id in metadata: revoke skipped, DONE returned."""
+        es = _mock_es_client()
+        # CleanupRef without catalog_id in metadata
+        ref = CleanupRef(
+            kind="es_index",
+            locator=_EXPECTED_INDEX,
+            owner_id=EsItemsIndexOwner.owner_id,
+        )
+
+        with (
+            _patch_es_client(es),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch_private.cascade_owners._revoke_deny_policy",
+                new_callable=AsyncMock,
+            ) as mock_revoke,
+        ):
+            outcome = await EsItemsIndexOwner().cleanup_one(ref, CleanupMode.HARD)
+
+        mock_revoke.assert_not_awaited()
+        assert outcome == CleanupOutcome.DONE
+
+
+# ---------------------------------------------------------------------------
 # register_owners
 # ---------------------------------------------------------------------------
 
