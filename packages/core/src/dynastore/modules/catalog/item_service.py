@@ -976,6 +976,21 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 _items_schema = None
             schema_validator = _build_write_validator(_items_schema)
 
+        # G1 (#1457): Pre-resolve the access envelope once for the whole batch.
+        # ``_resolve_access_envelope`` returns a non-None dict only when
+        # ``_collection_uses_access_aware_driver`` is True (G4 wires in PG-sidecar
+        # detection).  Resolving here — outside the per-item loop and outside any
+        # DB transaction — avoids repeated async calls and ensures the envelope is
+        # identical for every item in the batch (visibility + owner are batch-level
+        # properties, not per-item).  The result is injected into ``item_context``
+        # below so ``AccessEnvelopeSidecar.prepare_upsert_payload`` receives it
+        # via ``context["_access_envelope"]``.
+        _batch_access_envelope: Optional[Dict[str, Any]] = (
+            await self._resolve_access_envelope(
+                catalog_id, collection_id, processing_context,
+            )
+        )
+
         prepared: List[Dict[str, Any]] = []
         unique_partition_values: set = set()
         # Per-row preparation rejections. A single feature that fails value
@@ -1013,6 +1028,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     "_pristine_item": copy.deepcopy(raw_item),
                     "_items_write_policy": items_write_policy,
                     **(processing_context or {}),
+                    # G1 (#1457): inject the pre-resolved access envelope so
+                    # AccessEnvelopeSidecar.prepare_upsert_payload can build the
+                    # sub-table row.  None when the collection does not use an
+                    # access-aware driver; the sidecar skips the write in that case.
+                    **({"_access_envelope": _batch_access_envelope}
+                       if _batch_access_envelope is not None else {}),
                 }
                 hub_payload: Dict[str, Any] = {
                     "geoid": geoid,
@@ -1423,10 +1444,16 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
     ) -> bool:
         """True when any WRITE driver for the collection opts in to row-level ABAC.
 
-        Reads the resolved ``ItemsRoutingConfig.operations[WRITE]`` drivers and
-        checks each driver class for ``applies_access_filter=True`` (the
-        standardized envelope driver). Returns ``False`` on any resolution
-        error so a misconfigured collection never gets access fields stamped.
+        Two detection branches:
+
+        1. **ES-envelope** — the driver class carries ``applies_access_filter=True``
+           (the standardised attribute set by the private Elasticsearch driver).
+        2. **PG-sidecar** — the driver exposes a ``get_driver_config`` method (PG
+           drivers) and its per-collection config lists a sidecar with
+           ``sidecar_type == "access_envelope"`` (#1457 G4).
+
+        Returns ``False`` on any resolution error so a misconfigured collection
+        never gets access fields stamped.
         """
         try:
             from dynastore.modules.storage.router import get_write_drivers
@@ -1434,10 +1461,30 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             resolved = await get_write_drivers(catalog_id, collection_id)
         except Exception:
             return False
-        return any(
-            getattr(type(r.driver), "applies_access_filter", False)
-            for r in resolved
-        )
+
+        for r in resolved:
+            # Branch 1: ES-envelope driver (applies_access_filter class attr).
+            if getattr(type(r.driver), "applies_access_filter", False):
+                return True
+
+            # Branch 2: PG sidecar with sidecar_type == "access_envelope" (G4).
+            get_cfg = getattr(r.driver, "get_driver_config", None)
+            if callable(get_cfg):
+                try:
+                    from dynastore.modules.storage.drivers.pg_sidecars import (
+                        driver_sidecars,
+                    )
+
+                    drv_cfg = await get_cfg(catalog_id, collection_id)  # type: ignore[misc]
+                    if any(
+                        getattr(sc, "sidecar_type", None) == "access_envelope"
+                        for sc in driver_sidecars(drv_cfg)
+                    ):
+                        return True
+                except Exception:
+                    pass  # fail-open for this branch; ES check already handled above
+
+        return False
 
     async def _resolve_index_stamp_context(
         self,
