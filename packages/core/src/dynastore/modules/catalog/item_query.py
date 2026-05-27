@@ -396,15 +396,18 @@ class ItemQueryMixin:
         # MVT honours ``ItemsReadPolicy.feature_type`` as the wire-shape contract:
         # ST_AsMVT emits every selected column as a tile property, so a row-time
         # projection (the /items path) cannot be retro-fitted here — the SELECT
-        # list IS the projection. Anything not in ``feature_type.expose`` (plus
-        # the explicit ``expose_geoid``/``expose_created`` toggles) MUST NOT be
-        # selected, or it leaks into the tile (raw WKB, undeclared JSONB keys,
-        # geoid duplicates seen on the live tile path before this guard).
+        # list IS the projection. The trinary ``expose`` semantics
+        # (None = schema baseline, [] = nothing, list = schema + listed
+        # computed) live in ``project_select_for_feature_type``; we pass the
+        # collection's declared schema fields so the default surfaces the same
+        # property set the write schema declares.
         if is_mvt and feature_type is not None:
             from dynastore.modules.storage.read_policy import (
                 project_select_for_feature_type,
             )
-            selects = project_select_for_feature_type(feature_type)
+            selects = project_select_for_feature_type(
+                feature_type, params.get("schema_fields") or []
+            )
             # ``geom`` is reserved by ``MVTQueryTransform`` for the per-row
             # ``ST_AsMVTGeom(...) AS geom`` projection that the wrapping
             # ``ST_AsMVT(_, 'geom')`` aggregates. Without ``skip_geometry``,

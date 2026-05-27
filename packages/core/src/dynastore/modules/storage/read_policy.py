@@ -34,7 +34,7 @@ Collection-scoped only.
 """
 
 import logging
-from typing import Any, ClassVar, List, Optional, Tuple
+from typing import Any, ClassVar, Iterable, List, Optional, Tuple
 
 from pydantic import Field
 
@@ -108,7 +108,14 @@ async def _validate_read_policy(
     """
     if not isinstance(config, ItemsReadPolicy):
         return
-    expose = list(config.feature_type.expose or [])
+    # ``expose=None`` (default) is "surface all declared schema fields" — there
+    # is nothing additional to validate; the schema is its own SSOT. ``[]`` is
+    # "surface nothing" — also no names to validate. Only a non-empty list
+    # names computed/derived fields that the validator must resolve against
+    # ``ItemsWritePolicy.compute`` and ``ItemsSchema.fields``.
+    if config.feature_type.expose is None:
+        return
+    expose = list(config.feature_type.expose)
     if not expose or not (catalog_id and collection_id):
         return
 
@@ -181,7 +188,10 @@ async def _validate_read_policy(
 ItemsReadPolicy.register_validate_handler(_validate_read_policy)
 
 
-def project_select_for_feature_type(feature_type: FeatureType) -> List[Any]:
+def project_select_for_feature_type(
+    feature_type: FeatureType,
+    declared_fields: Optional[Iterable[str]] = None,
+) -> List[Any]:
     """Build the SELECT list a read path needs to honour ``feature_type``.
 
     Sibling SSOT to ``ItemService.map_row_to_feature``: the Python read path
@@ -192,9 +202,18 @@ def project_select_for_feature_type(feature_type: FeatureType) -> List[Any]:
     SELECT list. Both paths thus answer to a single declarative contract
     (``ItemsReadPolicy.feature_type``) — never two divergent code paths.
 
-    ``expose`` names are taken at face value; ``_validate_read_policy``
-    already rejects names that the collection cannot surface (unknown field
-    or unstored computed value) at config-save time.
+    ``expose`` is trinary (see :class:`FeatureType`):
+
+      * ``None`` (default) — surface every declared schema field
+        (``declared_fields`` supplied by the caller; usually
+        ``ItemsSchema.fields`` keys).
+      * ``[]`` (explicit empty) — surface no schema or computed properties;
+        the SELECT list contains only the ``expose_geoid`` / ``expose_created``
+        toggles (and the geometry, added separately by the tile transform).
+      * Non-empty list — additive: declared schema fields PLUS the listed
+        computed ``ComputedField.resolved_name`` values from
+        ``ItemsWritePolicy.compute``. ``_validate_read_policy`` already
+        rejects unknown / unstored names at config-save time.
     """
     from dynastore.models.query_builder import FieldSelection
 
@@ -206,8 +225,21 @@ def project_select_for_feature_type(feature_type: FeatureType) -> List[Any]:
     if feature_type.expose_created:
         selects.append(FieldSelection(field="transaction_time", alias="created"))
 
-    for name in feature_type.expose:
-        selects.append(FieldSelection(field=name))
+    schema = list(declared_fields or [])
+
+    if feature_type.expose is None:
+        # Default: mirror the write schema.
+        for name in schema:
+            selects.append(FieldSelection(field=name))
+    elif len(feature_type.expose) == 0:
+        # Explicit empty: surface nothing beyond the geoid/created toggles.
+        pass
+    else:
+        # Schema baseline + listed computed/derived (additive).
+        for name in schema:
+            selects.append(FieldSelection(field=name))
+        for name in feature_type.expose:
+            selects.append(FieldSelection(field=name))
 
     return selects
 

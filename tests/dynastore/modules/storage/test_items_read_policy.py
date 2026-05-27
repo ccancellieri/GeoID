@@ -34,7 +34,9 @@ class TestItemsReadPolicyShape:
     def test_default_feature_type(self) -> None:
         p = ItemsReadPolicy()
         assert p.feature_type.failure_mode == "best_effort"
-        assert p.feature_type.expose == []
+        # Trinary expose: ``None`` (default) = surface all declared schema
+        # fields; ``[]`` = surface nothing; non-empty list = schema + listed.
+        assert p.feature_type.expose is None
         # geoid is the default feature id (#1212)
         assert p.feature_type.external_id_as_feature_id is False
 
@@ -109,6 +111,6 @@ def test_reexports_present() -> None:
     cf = ComputedField(kind=ComputedKind.AREA)
     assert cf.resolved_name == "area"
     ft = FeatureType()
-    assert ft.expose == []
+    assert ft.expose is None  # default = surface declared schema
     rp = ItemsReadPolicy()
     assert isinstance(rp.feature_type, FeatureType)

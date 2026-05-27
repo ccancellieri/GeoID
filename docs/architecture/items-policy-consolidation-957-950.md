@@ -11,6 +11,11 @@
 > in `packages/core/src/dynastore/modules/storage/driver_config.py` and the
 > follow-up PRs listed above.
 
+> **STAC out of scope.** This policy governs data-oriented protocols (OGC API
+> Features, MVT tiles, EDR, Coverages). STAC items bypass `feature_type.expose`
+> entirely — their input shape passes straight through, because STAC items are
+> metadata documents, not properties-projected features.
+
 ## Problem
 
 The collection-tier write/read shape is currently split across **five** config surfaces, three of which are dead, all of which carry partial copies of the same concepts:
@@ -125,7 +130,17 @@ class ItemsWritePolicy(PluginConfig):
     geometries: GeometriesWriteBehavior = Field(default_factory=GeometriesWriteBehavior)
 
 class FeatureType(BaseModel):
-    expose: List[str] = []  # computed-field resolved_names to surface beyond the declared schema
+    # Trinary projection control for data-oriented protocols (Features, MVT, EDR,
+    # Coverages). STAC items bypass this — their input shape passes through.
+    #   None (default)  — surface ALL ItemsSchema.fields declared property fields.
+    #                     Wire shape mirrors the write schema.
+    #   []  (empty)     — surface NO properties (geometry-only MVT; empty
+    #                     `properties` on /items).
+    #   ["x","y"]       — schema-declared fields PLUS the listed
+    #                     ComputedField.resolved_name values from
+    #                     ItemsWritePolicy.compute. Listing is ADDITIVE to the
+    #                     schema baseline, never subtractive.
+    expose: Optional[List[str]] = None
     failure_mode: Literal["strict", "best_effort"] = "best_effort"
     external_id_as_feature_id: bool = True
 
@@ -169,7 +184,12 @@ A collection with no `items_schema` fields is permissive (a blob: no derived sch
 
 1. Driver returns the row plus its full set of materialised computed values.
 2. The response `properties` derive from `items_schema` (the declared fields). There is no `schema_ref` selector — the read shape always tracks the same source of truth as the write shape.
-3. Merge `feature_type.expose` (computed-field `resolved_name`s from `policy.compute`) into the response as additional read-only fields. The merge runs once at the read choke point (`SidecarProtocol.apply_exposed_computed_values`); each sidecar declares the names it can produce via `producible_computed_names` / `resolve_computed_value`. An exposed name with no produced value is skipped under `best_effort` and raises under `strict`.
+3. Project the response `properties` according to `feature_type.expose`:
+   - `expose=None` (default) — surface all `ItemsSchema.fields` declared property fields; no computed values merged.
+   - `expose=[]` — suppress both schema fields and computed values; response `properties` is empty (geometry-only MVT, empty `properties` on /items).
+   - `expose=["x","y"]` (non-empty list) — schema-declared fields still flow through as the baseline, **plus** the listed `ComputedField.resolved_name`s from `policy.compute` are merged in as additional read-only fields. The computed-value merge only runs in this case. The merge runs once at the read choke point (`SidecarProtocol.apply_exposed_computed_values`); each sidecar declares the names it can produce via `producible_computed_names` / `resolve_computed_value`. An exposed name with no produced value is skipped under `best_effort` and raises under `strict`.
+
+   This projection applies to OGC API Features, MVT, EDR, and Coverages. STAC items bypass it entirely.
 4. Transformer chains, when configured, run via the routing config's `output_transformers` (#950) — not the read policy.
 
 ### Driver responsibilities
@@ -308,6 +328,22 @@ That's all you need for "external_id at `properties.code`, validated shape, last
 }
 ```
 
+The `expose` value above is the additive case: schema-declared fields (`adm2_pcode`, `adm2_name`, …) still flow through, **plus** the listed computed resolved-names are merged in.
+
+The other two `expose` shapes:
+
+- **Default (schema-only)** — omit `expose` or set it to `null`. Response `properties` mirrors `ItemsSchema.fields` exactly; no computed values are merged.
+
+  ```json
+  "items_read_policy": { "feature_type": { "external_id_as_feature_id": true } }
+  ```
+
+- **Suppress-all (geometry-only)** — set `expose` to `[]`. No schema fields, no computed values; useful for geometry-only MVT tiles and minimal `/items` payloads.
+
+  ```json
+  "items_read_policy": { "feature_type": { "expose": [] } }
+  ```
+
 ## Test plan
 
 1. **Pydantic-level**:
@@ -326,9 +362,11 @@ That's all you need for "external_id at `properties.code`, validated shape, last
    - For each driver, with `compute=[h3@7, s2@10, area]`, write 5 features and assert: (a) per-driver column/field exists, (b) value matches `tools.geospatial.compute_derived_fields` reference, (c) read-back round-trip equal.
 
 4. **Read path**:
-   - `expose=[area]` → response feature has `area` on `properties`.
-   - `expose=[nonexistent]` under `best_effort` → field omitted; under `strict` → raises.
-   - Response `properties` validate against the schema derived from `items_schema`.
+   - `expose=None` (default) → response `properties` contains all `ItemsSchema.fields` declared fields; no computed values merged.
+   - `expose=[]` → response `properties` is empty (no schema fields, no computed values); geometry still flows through.
+   - `expose=["area"]` → response feature has schema fields **plus** `area` on `properties`.
+   - `expose=["nonexistent"]` under `best_effort` → field omitted (schema baseline still flows); under `strict` → raises.
+   - Response `properties` (under `expose=None` or non-empty list) validate against the schema derived from `items_schema`.
    - `external_id_as_feature_id=false` → `feature.id` stays the `geoid`, not the external id.
 
 5. **Migration**:
@@ -402,5 +440,5 @@ Each phase ships as its own PR; phase 4 is the irreversible cleanup and lands la
 ## Open questions
 
 1. Should the spatial-cell `resolution` accept a list (`[7, 8, 9]`) as sugar for three separate `ComputedField` entries? Tempting but adds non-orthogonal sugar. Recommend: no, write the three entries.
-2. `expose` is a flat list of names. Should it also accept a JSON-Pointer-style path so a transformer's nested output is selectable? Out of scope for this PR — revisit when the first real transformer needs it.
+2. `expose` is a flat list of names (or `None` for the default-schema case, or `[]` to suppress all properties). Should the non-empty-list form also accept a JSON-Pointer-style path so a transformer's nested output is selectable? Out of scope for this PR — revisit when the first real transformer needs it.
 3. Should `output_transformers` be a list of class keys (current `EntityTransformProtocol` registration model) or a richer list with per-entry config? List of keys is fine for v1; per-entry config can land as `output_transformers: List[TransformerSpec]` later without breaking the simpler shape.

@@ -124,8 +124,15 @@ async def _build_collection_subquery(
     # selected column as a tile property, so honouring feature_type at SELECT
     # time is the only way to prevent leaks (raw geometry WKB, undeclared
     # JSONB keys, geoid).
+    #
+    # ``schema_fields`` carries the ``ItemsSchema.fields`` keys down the MVT
+    # path so ``feature_type.expose=None`` (the default) can surface the
+    # declared schema as tile properties — matching the /items wire shape.
+    # See :func:`project_select_for_feature_type` for the trinary semantics.
     feature_type = None
+    schema_fields: List[str] = []
     try:
+        from dynastore.modules.storage.driver_config import ItemsSchema
         from dynastore.modules.storage.read_policy import ItemsReadPolicy
 
         configs = get_protocol(ConfigsProtocol)
@@ -136,6 +143,12 @@ async def _build_collection_subquery(
                 collection_id=collection_id,
             )
             feature_type = getattr(policy, "feature_type", None)
+            schema = await configs.get_config(
+                ItemsSchema,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+            schema_fields = list((getattr(schema, "fields", None) or {}).keys())
     except Exception as exc:  # noqa: BLE001 — read assembly must not break on config miss
         logger.debug(
             "tile read_policy resolution skipped for %s/%s: %s",
@@ -157,6 +170,7 @@ async def _build_collection_subquery(
         "cql_filter": cql_filter,
         "tile_wkb": tile_wkb,
         "feature_type": feature_type,
+        "schema_fields": schema_fields,
     }
 
     if subset_params:

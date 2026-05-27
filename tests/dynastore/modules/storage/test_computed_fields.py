@@ -116,7 +116,9 @@ class TestIdentityRule:
 class TestFeatureType:
     def test_defaults(self) -> None:
         ft = FeatureType()
-        assert ft.expose == []
+        # ``None`` (default) = surface all declared schema fields; ``[]`` =
+        # surface nothing; non-empty list = schema baseline + listed computed.
+        assert ft.expose is None
         assert ft.failure_mode == "best_effort"
         # geoid is the default feature id; created is opt-in (#1212)
         assert ft.external_id_as_feature_id is False

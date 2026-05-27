@@ -644,33 +644,61 @@ class IdentityRule(BaseModel):
 
 
 class FeatureType(BaseModel):
-    """Declarative wire-shape contract for the read path.
+    """Declarative wire-shape contract for the data-oriented read path.
 
-    Used by ``ItemsReadPolicy``. The produced feature's ``properties`` are
-    derived unconditionally from ``items_schema`` (the single source of
-    truth) plus the ``expose`` computed fields — there is no separate
-    schema-source selector.
+    Used by ``ItemsReadPolicy``. Applies to data-oriented protocols (OGC
+    API Features, MVT tiles, EDR, Coverages) that produce GeoJSON-style
+    features. **STAC items bypass this policy** — STAC items are metadata
+    documents (not properties-projected features), so the full input shape
+    passes straight through to the output.
 
-    ``expose`` enumerates ``ComputedField.resolved_name`` values from
-    ``ItemsWritePolicy.compute`` that should be surfaced as additional
-    output properties beyond the declared schema fields. ``failure_mode``
-    governs read-failure behaviour: ``best_effort`` (default) degrades to a
-    bare feature with the missing enriched fields silently absent;
-    ``strict`` raises. ``external_id_as_feature_id`` controls whether a
-    row's ``external_id`` (stored by the attributes sidecar) overrides the
-    default ``feature.id`` (``geoid``); purely a wire-shape decision and
-    **off by default** — the stable internal ``geoid`` is the id unless a
-    collection explicitly opts in. ``expose_created`` surfaces the storage
-    ``transaction_time`` as a ``created`` property; also **off by default**
-    so the read response mirrors the input feature 1:1 (only the id is
-    replaced by the geoid). ``expose_geoid`` optionally surfaces the internal
-    geoid as a ``geoid`` property — useful only when ``external_id`` is the id
-    (otherwise the id already is the geoid); a no-op in the default shape.
+    ``expose`` is the property allowlist with trinary semantics:
+
+      * ``None`` (default) — surface **all** property fields declared by
+        ``ItemsSchema.fields``. The read wire-shape mirrors the write
+        schema; no computed/derived fields are added.
+      * ``[]`` (explicit empty) — surface **no** properties. On MVT this
+        yields a geometry-only tile; on /items the response feature has an
+        empty ``properties`` object.
+      * ``["x", "y", …]`` — surface declared schema fields **plus** the
+        listed ``ComputedField.resolved_name`` values from
+        ``ItemsWritePolicy.compute``. Listing is **additive** to the
+        schema baseline; use ``[]`` to suppress schema fields entirely.
+
+    ``failure_mode`` governs read-failure behaviour: ``best_effort``
+    (default) degrades to a bare feature with the missing enriched fields
+    silently absent; ``strict`` raises.
+
+    ``external_id_as_feature_id`` controls whether a row's ``external_id``
+    (stored by the attributes sidecar) overrides the default ``feature.id``
+    (``geoid``); purely a wire-shape decision and **off by default** — the
+    stable internal ``geoid`` is the id unless a collection explicitly
+    opts in.
+
+    ``expose_created`` surfaces the storage ``transaction_time`` as a
+    ``created`` property; **off by default** so the read response mirrors
+    the input feature 1:1 (only the id is replaced by the geoid).
+
+    ``expose_geoid`` optionally surfaces the internal geoid as a ``geoid``
+    property — useful only when ``external_id`` is the id (otherwise the id
+    already is the geoid); a no-op in the default shape.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    expose: List[str] = Field(default_factory=list)
+    expose: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Property allowlist (data-oriented protocols only; ignored by "
+            "STAC). ``None`` (default) surfaces all ``ItemsSchema.fields`` "
+            "declared property fields. ``[]`` surfaces no properties (MVT "
+            "geometry-only / empty ``properties``). A non-empty list "
+            "surfaces declared schema fields PLUS the listed "
+            "``ComputedField.resolved_name`` values from "
+            "``ItemsWritePolicy.compute`` — listing is additive to the "
+            "schema baseline."
+        ),
+    )
     failure_mode: Literal["strict", "best_effort"] = "best_effort"
     external_id_as_feature_id: bool = False
     expose_created: bool = False
