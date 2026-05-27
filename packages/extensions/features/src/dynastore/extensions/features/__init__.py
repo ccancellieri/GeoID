@@ -18,5 +18,6 @@
 
 # Ensure the service is discoverable by the extension registry
 from .features_service import OGCFeaturesService
+from . import presets as _features_presets  # noqa: F401  -- preset registration side-effect
 
 __all__ = ["OGCFeaturesService"]

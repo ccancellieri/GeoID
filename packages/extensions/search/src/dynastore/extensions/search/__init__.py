@@ -46,6 +46,7 @@ class SearchExtension:
             app.state.conformance_classes = conformance
 
 
-from . import config  # noqa: F401  -- service-exposure plugin registration
+from . import config  # noqa: F401,E402  -- service-exposure plugin registration
+from . import presets as _search_presets  # noqa: F401,E402  -- preset registration side-effect
 
 __all__ = ["SearchExtension"]

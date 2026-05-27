@@ -49,7 +49,6 @@ from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.web import WebModuleProtocol, StaticFilesProtocol
 from dynastore.extensions.web.decorators import expose_static
 from dynastore.extensions.tools.db import get_async_connection
-from .policies import register_tiles_policies
 from dynastore.modules.db_config import shared_queries
 import dynastore.modules.catalog.catalog_module as catalog_manager
 import dynastore.modules.tiles.tiles_module as tms_manager
@@ -219,8 +218,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
         """Manages the Tiles Service configuration."""
-        register_tiles_policies()
-        logger.info("Tiles Service startup: policies registered.")
+        logger.info("Tiles Service startup.")
         yield
         logger.info("Tiles Service shutdown.")
 

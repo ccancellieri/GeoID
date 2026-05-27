@@ -141,11 +141,9 @@ class SearchService(ExtensionProtocol):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        from .policies import register_search_policies
         from dynastore.modules.elasticsearch.aliases import (
             ensure_public_alias_exists,
         )
-        register_search_policies()
         # Force-materialise the public items alias so a fresh deployment
         # with no catalog onboarded yet returns 200/empty on /search
         # instead of 404. Idempotent.

@@ -170,9 +170,6 @@ async def lifespan(app: FastAPI):
                     _scope,
                     os.environ.get("IDP_ISSUER_URL") or "<none>",
                 )
-            flush = getattr(pm, "flush_pending_registrations", None)
-            if flush is not None:
-                await flush()
             logger.info("--- [main.py] Web Extensions are active. Application is running. ---")
             yield
 

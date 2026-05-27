@@ -56,7 +56,6 @@ from dynastore.extensions.features.features_config import (
     FeaturesPluginConfig,
 )
 from dynastore.extensions.features import ogc_generator, ogc_models
-from .policies import register_features_policies
 
 from datetime import datetime, timezone, UTC
 from dynastore.models.shared_models import (
@@ -341,9 +340,6 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         except Exception:
             return []
         return build_contributions()
-
-    def register_policies(self):
-        register_features_policies()
 
     async def _resolve_crs_srid(
         self, conn: DbResource, catalog_id: str, crs_uri: Optional[str]

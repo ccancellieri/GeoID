@@ -1049,24 +1049,35 @@ async def app_lifespan(
                 f"Extension lifespan partially failed: {e}"
             )
 
-        # Mirror main.py: flush buffered policy/role registrations from
-        # extensions to the IAM store. Without this, policies registered
-        # via PermissionProtocol.register_policy(...) (e.g. STAC's
-        # ``stac_public_access`` policy granting anonymous GET access)
-        # stay in IamModule's in-memory pending buffer and never reach
-        # the DB — leaving every registered route unprotected (or
-        # relying on stale policies from a prior test session that DID
-        # flush). Same flush as ``app_lifespan_module`` below.
+        # Apply all registered PolicyContributorPresets so extension policies
+        # (e.g. STAC's stac_public_access, features_enable, auth_enable, …)
+        # land in the test DB — equivalent to the platform_demo apply that
+        # would run on a real deployment.
         try:
-            from dynastore.models.protocols.policies import PermissionProtocol
-            pm = modules.get_protocol(PermissionProtocol)
-            flush = getattr(pm, "flush_pending_registrations", None)
-            if flush is not None:
-                await flush()
+            import logging as _logging
+            from dynastore.modules.storage.presets.registry import find_preset, list_presets
+            from dynastore.modules.storage.presets.policy_contributor_adapter import PolicyContributorPreset
+            from dynastore.modules.storage.presets.preset import NoParams
+            from dynastore.modules.storage.presets.lifecycle import _build_context
+            from dynastore.models.protocols import DatabaseProtocol
+
+            _db = modules.get_protocol(DatabaseProtocol)
+            _engine = _db.engine if _db else None
+            _ctx = _build_context(_engine, None, "platform")
+
+            for _preset_name in list_presets():
+                try:
+                    _preset = find_preset(_preset_name)
+                    if isinstance(_preset, PolicyContributorPreset):
+                        await _preset.apply(NoParams(), "platform", _ctx)
+                except Exception as _pe:
+                    _logging.getLogger(__name__).warning(
+                        "Test fixture: preset '%s' apply failed: %s", _preset_name, _pe
+                    )
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(
-                f"Test fixture: flush_pending_registrations failed: {e}"
+                f"Test fixture: PolicyContributorPreset apply loop failed: {e}"
             )
 
         # Attach app to state for easy access in tests (e.g. for in-process AsyncClient)
@@ -1235,22 +1246,35 @@ async def app_lifespan_module(request):
             import logging
             logging.getLogger(__name__).warning(f"Extension lifespan partially failed: {e}")
 
-        # Mirror main.py: flush buffered policy/role registrations from
-        # extensions to the IAM store. Without this, policies registered
-        # via PermissionProtocol.register_policy(...) stay in IamModule's
-        # in-memory pending buffer and never reach the DB — leaving every
-        # registered route unprotected (or relying on stale policies from a
-        # prior test session that DID flush).
+        # Apply all registered PolicyContributorPresets so extension policies
+        # (e.g. STAC's stac_public_access, features_enable, auth_enable, …)
+        # land in the test DB — equivalent to the platform_demo apply that
+        # would run on a real deployment.
         try:
-            from dynastore.models.protocols.policies import PermissionProtocol
-            pm = modules.get_protocol(PermissionProtocol)
-            flush = getattr(pm, "flush_pending_registrations", None)
-            if flush is not None:
-                await flush()
+            import logging as _logging
+            from dynastore.modules.storage.presets.registry import find_preset, list_presets
+            from dynastore.modules.storage.presets.policy_contributor_adapter import PolicyContributorPreset
+            from dynastore.modules.storage.presets.preset import NoParams
+            from dynastore.modules.storage.presets.lifecycle import _build_context
+            from dynastore.models.protocols import DatabaseProtocol
+
+            _db = modules.get_protocol(DatabaseProtocol)
+            _engine = _db.engine if _db else None
+            _ctx = _build_context(_engine, None, "platform")
+
+            for _preset_name in list_presets():
+                try:
+                    _preset = find_preset(_preset_name)
+                    if isinstance(_preset, PolicyContributorPreset):
+                        await _preset.apply(NoParams(), "platform", _ctx)
+                except Exception as _pe:
+                    _logging.getLogger(__name__).warning(
+                        "Test fixture: preset '%s' apply failed: %s", _preset_name, _pe
+                    )
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(
-                f"Test fixture: flush_pending_registrations failed: {e}"
+                f"Test fixture: PolicyContributorPreset apply loop failed: {e}"
             )
 
         app.state.app = app

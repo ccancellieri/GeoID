@@ -16,3 +16,4 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+from . import presets as _tiles_presets  # noqa: F401  -- preset registration side-effect

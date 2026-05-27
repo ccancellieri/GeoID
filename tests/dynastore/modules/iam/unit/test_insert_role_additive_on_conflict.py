@@ -2,14 +2,13 @@
 
 The cold-boot auth path seeds the catalog-tier ``unauthenticated`` role
 via ``iam_storage.create_role(Role(policies=["public_access"]))`` and
-later re-issues the same role from multiple PolicyContributors with
-their own ``*_public_access`` policies. If two seed paths race past the
-``get_role`` check concurrently — or if the read-modify-write merge in
-``flush_pending_registrations`` is bypassed for any reason — the second
-INSERT_ROLE used to hit the original ``policies = EXCLUDED.policies``
-clause and silently drop the binding the first path wrote. That is what
-manifested as the ``/health`` 403 in geoid#902: the bound list grew with
-the per-extension ``*_public_access`` policies, but the seed-declared
+later re-issues the same role from multiple PolicyContributorPreset
+instances with their own ``*_public_access`` policies. If two seed paths
+race past the ``get_role`` check concurrently, the second INSERT_ROLE
+used to hit the original ``policies = EXCLUDED.policies`` clause and
+silently drop the binding the first path wrote. That is what manifested
+as the ``/health`` 403 in geoid#902: the bound list grew with the
+per-extension ``*_public_access`` policies, but the seed-declared
 ``public_access`` (the policy that actually whitelists ``/health``) was
 clobbered.
 
@@ -73,8 +72,9 @@ def test_insert_role_unions_policies_on_conflict() -> None:
 
 
 def test_update_role_remains_replace_on_policies() -> None:
-    """UPDATE_ROLE (used by ``PATCH /admin/roles`` and the merge branch
-    of ``flush_pending_registrations``) MUST stay replace-semantics.
+    """UPDATE_ROLE (used by ``PATCH /admin/roles`` and ``update_role``
+    callers such as PolicyContributorPreset.apply and the ES private
+    driver's all_users role binding) MUST stay replace-semantics.
 
     The additive treatment on INSERT_ROLE is for accidental races between
     callers that both intend to *create* the row. Operator-driven REPLACE

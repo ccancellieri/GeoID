@@ -10,13 +10,11 @@ from pydantic import BaseModel
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.web.decorators import expose_static
 from dynastore.extensions.tools.url import build_sibling_redirect, resolve_redirect_uri
-from dynastore.modules import get_protocol
 from dynastore.models.protocols import (
     CatalogsProtocol,
     ConfigsProtocol,
     PropertiesProtocol,
 )
-from dynastore.models.protocols.authorization import IamRolesConfig
 from contextlib import asynccontextmanager
 from starlette.middleware.sessions import SessionMiddleware
 import logging
@@ -349,28 +347,4 @@ class Authentication(ExtensionProtocol):
         self._setup_routes()
         logger.info("✓ Authentication routes configured")
 
-        # Register authentication policies via PermissionProtocol
-        try:
-            from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role
-
-            pm = get_protocol(PermissionProtocol)
-            if pm:
-                auth_policy = Policy(
-                    id="auth_extension_public",
-                    description="Public access to authentication endpoints.",
-                    actions=["GET", "POST"],
-                    resources=[r"/auth/.*", r"/web/auth/.*"],
-                    effect="ALLOW",
-                )
-                pm.register_policy(auth_policy)
-                pm.register_role(Role(name=IamRolesConfig().anonymous_role_name, policies=["auth_extension_public"]))
-                logger.info("Authentication policies registered via PermissionProtocol.")
-            else:
-                logger.warning("PermissionProtocol not available; auth policies not registered.")
-        except Exception as e:
-            logger.error(f"Failed to register authentication policies: {e}")
-
-        try:
-            yield
-        finally:
-            pass
+        yield

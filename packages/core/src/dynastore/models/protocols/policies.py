@@ -422,9 +422,8 @@ class PolicyResponse(BaseModel):
 class PermissionProtocol(Protocol):
     """Unified protocol for Policy, Role, and permission management/evaluation.
 
-    Extensions register their policies and roles via:
-        get_protocol(PermissionProtocol).register_policy(Policy(...))
-        get_protocol(PermissionProtocol).register_role(Role(...))
+    Policies are seeded via PolicyContributorPreset (see
+    modules/storage/presets/policy_contributor_adapter.py).
     """
 
     async def create_policy(
@@ -507,8 +506,3 @@ class PermissionProtocol(Protocol):
         """
         ...
 
-    # --- Extension injection points ---
-
-    def register_policy(self, policy: Policy) -> Policy: ...
-
-    def register_role(self, role: Role) -> Role: ...
