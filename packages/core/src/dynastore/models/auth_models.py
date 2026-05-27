@@ -72,6 +72,19 @@ class Role(BaseModel):
     # Composition: Direct links to policies defined in the system
     policies: List[str] = Field(default_factory=list, description="List of Policy IDs directly assigned")
 
+    # Deprecated: role hierarchy is managed exclusively via the ``role_hierarchy``
+    # table. This field is retained for backward-compatibility with older DTOs
+    # and serialized payloads but is never persisted or evaluated. Full removal
+    # is deferred until admin DTOs are separately deprecated.
+    parent_roles: Optional[List[str]] = Field(
+        default=None,
+        deprecated=True,
+        description=(
+            "Deprecated. Use the role_hierarchy table "
+            "(POST /admin/roles/{role}/parents) instead."
+        ),
+    )
+
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
