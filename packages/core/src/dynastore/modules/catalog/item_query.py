@@ -405,12 +405,22 @@ class ItemQueryMixin:
                 project_select_for_feature_type,
             )
             selects = project_select_for_feature_type(feature_type)
+            # ``geom`` is reserved by ``MVTQueryTransform`` for the per-row
+            # ``ST_AsMVTGeom(...) AS geom`` projection that the wrapping
+            # ``ST_AsMVT(_, 'geom')`` aggregates. Without ``skip_geometry``,
+            # the geometry sidecar additionally emits
+            # ``ST_AsGeoJSON(geom)::jsonb AS geom`` whenever ``geom``/``geometry``
+            # is referenced by any selection/filter, producing two columns
+            # aliased ``geom`` — Postgres then fails the outer
+            # ``SELECT "geom" FROM (_mvt_inner)`` with
+            # ``AmbiguousColumnError`` (live tile crash, region6/glosisdemo).
             query_req = QueryRequest(
                 select=selects,
                 limit=params.get("limit"),
                 offset=params.get("offset"),
                 raw_where=params.get("where"),
                 raw_params=params.get("raw_params", {}),
+                skip_geometry=True,
             )
             if params.get("cql_filter"):
                 query_req.cql_filter = params["cql_filter"]
