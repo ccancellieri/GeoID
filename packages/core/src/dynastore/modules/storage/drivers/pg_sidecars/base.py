@@ -424,7 +424,11 @@ class SidecarConfig(BaseModel):
         """
         Returns the standard sidecar_id for this config type.
         """
-        mapping = {"geometry": "geometry", "attributes": "attributes"}
+        mapping = {
+            "geometry": "geometry",
+            "attributes": "attributes",
+            "access_envelope": "access_envelope",
+        }
         return mapping.get(self.sidecar_type, self.sidecar_type)
 
     @property
@@ -461,7 +465,7 @@ class SidecarConfig(BaseModel):
 #
 # An extension that adds a new optional sidecar type MUST add its canonical
 # name here so slim services can round-trip configs that reference it.
-OPTIONAL_EXTENSION_SIDECAR_TYPES: frozenset = frozenset({"stac_metadata"})
+OPTIONAL_EXTENSION_SIDECAR_TYPES: frozenset = frozenset({"stac_metadata", "access_envelope"})
 
 
 def _coerce_pg_sidecar(v: Any) -> Any:

@@ -12,9 +12,11 @@ from .base import (
 from .geometries import GeometriesSidecar
 from .attributes import FeatureAttributeSidecar
 from .item_metadata import ItemMetadataSidecar
+from .access_envelope import AccessEnvelopeSidecar
 from .geometries_config import GeometriesSidecarConfig
 from .attributes_config import FeatureAttributeSidecarConfig
 from .item_metadata_config import ItemMetadataSidecarConfig
+from .access_envelope_config import AccessEnvelopeSidecarConfig
 from .registry import SidecarRegistry
 from .resolver import _effective_sidecars, resolve_stac_enabled
 
@@ -55,9 +57,11 @@ __all__ = [
     "GeometriesSidecar",
     "FeatureAttributeSidecar",
     "ItemMetadataSidecar",
+    "AccessEnvelopeSidecar",
     "GeometriesSidecarConfig",
     "FeatureAttributeSidecarConfig",
     "ItemMetadataSidecarConfig",
+    "AccessEnvelopeSidecarConfig",
     "SidecarRegistry",
     "_effective_sidecars",
     "resolve_stac_enabled",
