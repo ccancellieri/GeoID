@@ -264,6 +264,24 @@ class CatalogModule(ModuleProtocol):
 
             logger.info("Initialized CatalogModule services.")
 
+            # Register cascade cleanup owners before the registry is frozen.
+            # Each driver module that owns external resources contributes its
+            # owners here.  The registry is frozen after all registrations so
+            # no late registration can occur at request time.
+            from dynastore.modules.catalog.cascade_registry import cascade_cleanup_registry
+            try:
+                from dynastore.modules.storage.drivers.elasticsearch_private.cascade_owners import (
+                    register_owners as _register_es_private_owners,
+                )
+                _register_es_private_owners(cascade_cleanup_registry)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "CatalogModule: ES private cascade owner registration failed "
+                    "(non-fatal — driver may not be installed): %s", _exc,
+                )
+            cascade_cleanup_registry.freeze()
+            logger.info("CatalogModule: cascade_cleanup_registry frozen.")
+
             # Wire AssetEntitySyncSubscriber to drive AssetIndexer fan-out
             # from the events bus. Replaces the legacy per-driver listener
             # blocks (one less coupling between drivers and the events bus).

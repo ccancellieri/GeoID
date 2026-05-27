@@ -490,10 +490,14 @@ class CatalogService(CatalogsProtocol):
         engine: Optional[DbResource] = None,
         collection_service: Optional[CollectionService] = None,
         item_service: Optional[ItemService] = None,
+        cascade_orchestrator: Optional[Any] = None,
     ):
         self.engine = engine
         self._collection_service = collection_service
         self._item_service = item_service
+        # Lazy-import to avoid circular dependency at module load time.
+        # CascadeOrchestrator defaults to the process-global registry.
+        self._cascade_orchestrator = cascade_orchestrator
         
         # Initialize internal services if not provided, provided we have an engine
         if self.engine:
@@ -1559,6 +1563,30 @@ class CatalogService(CatalogsProtocol):
         ``lifecycle_registry.destroy_async_catalog``). Returns the old
         physical schema name (``None`` if the catalog had no schema recorded).
         """
+        from dynastore.modules.catalog.cascade_runtime import CascadeOrchestrator
+        from dynastore.modules.catalog.resource_owner import CleanupMode, ResourceScope, ScopeRef
+
+        # Snapshot CleanupRefs BEFORE the schema drop while DB rows are still
+        # readable.  The enqueue itself happens after the caller's transaction
+        # commits (create_task opens its own tx — see cascade_runtime docstring).
+        orchestrator: CascadeOrchestrator = (
+            self._cascade_orchestrator
+            if self._cascade_orchestrator is not None
+            else CascadeOrchestrator()
+        )
+        scope_ref = ScopeRef(scope=ResourceScope.CATALOG, catalog_id=catalog_id)
+        cascade_task_id: Optional[str] = None
+        try:
+            cascade_task_id = await orchestrator.snapshot_and_enqueue(
+                conn, scope_ref, CleanupMode.HARD
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_purge_catalog_storage: cascade snapshot failed for catalog %r "
+                "(non-fatal — proceeding with schema drop): %s",
+                catalog_id, exc, exc_info=True,
+            )
+
         # Resolve physical schema without deleted_at filter — works for
         # both live and tombstoned rows.
         old_physical_schema = await DQLQuery(
@@ -1588,6 +1616,13 @@ class CatalogService(CatalogsProtocol):
         # via their ON DELETE CASCADE FK, so no explicit metadata fan-out is
         # needed here.
         await _hard_delete_catalog_query.execute(conn, id=catalog_id)
+
+        if cascade_task_id is not None:
+            logger.info(
+                "Enqueued cascade cleanup task %s for catalog %r.",
+                cascade_task_id, catalog_id,
+            )
+
         return old_physical_schema
 
     async def delete_catalog(
