@@ -91,7 +91,7 @@ async def test_virtual_stac_endpoints(sysadmin_in_process_client, in_process_cli
     assert job_data["status"] == "successful"
 
     # 6. Verify Feature Tracking Config
-    resp = await in_process_client.get(
+    resp = await sysadmin_in_process_client.get(
         f"/configs/catalogs/{catalog_id}/collections/{collection_id}/plugins/stac_plugin_config"
     )
     assert resp.status_code == 200
