@@ -1,8 +1,9 @@
 """Unit tests for ``lifecycle.dispatch_preset``.
 
-Covers the #1473 Bug B fix: admin routes previously assumed every preset
-had a ``build()`` method (RoutingPreset). The dispatcher now picks the
-right branch based on whether the preset exposes ``build``.
+After the #1502 auto-wrap refactor all registered presets have ``apply``
+(routing presets are wrapped at registration time by ``register_preset``).
+The dispatcher no longer has a separate routing-bundle branch — it always
+goes through the audited lifecycle.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from dynastore.modules.storage.presets.preset import (
     NoParams,
 )
 from dynastore.modules.storage.presets.protocol import PresetTier
+from dynastore.modules.storage.presets.routing_adapter import RoutingPresetAdapter
 
 
 class _FakeGeneralisedPreset:
@@ -50,7 +52,7 @@ class _FakeGeneralisedPreset:
 
 
 class _FakeRoutingPreset:
-    """Has ``build`` — dispatcher must take the routing-bundle branch."""
+    """Has ``build`` but no ``apply`` — auto-wrapped by register_preset."""
 
     name = "routing_test"
 
@@ -75,21 +77,44 @@ def test_scope_from_base_normalises_tiers():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_routing_preset_goes_through_build():
-    """Preset with ``build`` → routing-bundle branch; ConfigsProtocol called."""
-    preset = _FakeRoutingPreset()
-    fake_configs = MagicMock()
-    fake_configs.set_config = AsyncMock()
+async def test_dispatch_routing_preset_uses_adapter():
+    """A routing preset is auto-wrapped on registration; dispatch_preset calls
+    apply() on the RoutingPresetAdapter (not the old _apply_routing_bundle path).
+    """
+    from dynastore.modules.storage.presets.registry import _REGISTRY, register_preset
+
+    raw_preset = _FakeRoutingPreset()
+    # Ensure clean registry slot.
+    _REGISTRY.pop("routing_test", None)
+    register_preset(raw_preset)
+
+    registered = _REGISTRY["routing_test"]
+    assert isinstance(registered, RoutingPresetAdapter), (
+        "routing preset must be wrapped in RoutingPresetAdapter after register_preset"
+    )
+
+    fake_db = MagicMock()
+    fake_db.engine = MagicMock()
+    fake_row = {"state": "applied"}
 
     with patch(
         "dynastore.modules.get_protocol",
-        return_value=fake_configs,
+        return_value=fake_db,
+    ), patch(
+        "dynastore.modules.storage.presets.lifecycle.apply_preset",
+        new=AsyncMock(return_value=fake_row),
+    ) as mock_apply, patch(
+        "dynastore.modules.storage.presets.lifecycle._build_context",
+        return_value=MagicMock(),
     ):
-        result = await dispatch_preset(preset, "apply", base_scope={})
+        result = await dispatch_preset(registered, "apply", base_scope={})
 
-    assert preset.build_called_with == {}
+    mock_apply.assert_awaited_once()
     assert result["preset"] == "routing_test"
-    assert result["applied"] == []
+    assert result["state"] == "applied"
+
+    # Cleanup.
+    _REGISTRY.pop("routing_test", None)
 
 
 @pytest.mark.asyncio
@@ -128,6 +153,12 @@ async def test_dispatch_generalised_preset_routes_through_lifecycle():
 
 @pytest.mark.asyncio
 async def test_dispatch_unknown_op_raises():
-    preset = _FakeRoutingPreset()
-    with pytest.raises(ValueError, match="Unknown preset op"):
-        await dispatch_preset(preset, "explode", base_scope={})  # type: ignore[arg-type]
+    preset = _FakeGeneralisedPreset()
+    fake_db = MagicMock()
+    fake_db.engine = MagicMock()
+    with patch("dynastore.modules.get_protocol", return_value=fake_db), patch(
+        "dynastore.modules.storage.presets.lifecycle._build_context",
+        return_value=MagicMock(),
+    ):
+        with pytest.raises(ValueError, match="Unknown preset op"):
+            await dispatch_preset(preset, "explode", base_scope={})  # type: ignore[arg-type]

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Awaitable, Callable, Literal, Mapping, Optional, cast
+from typing import Any, Literal, Mapping, Optional
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -257,27 +257,13 @@ async def dispatch_preset(
 ) -> dict:
     """Single entry point used by the admin layer.
 
-    Dispatches on the structural shape of *preset*:
+    Every registered preset exposes ``apply`` / ``revoke`` / ``dry_run``
+    (routing presets are auto-wrapped at registration time). Delegates to
+    the audited :func:`apply_preset` / :func:`revoke_preset` /
+    :func:`dry_run_preset` lifecycle.
 
-    * ``hasattr(preset, "build")`` → routing-config preset (PresetBundle /
-      ConfigsProtocol). Bundle slots are walked through ``set_config`` /
-      ``delete_config``.
-    * else → generalised ``Preset`` (``apply`` / ``revoke`` / ``dry_run``)
-      driven through the audited :func:`apply_preset` / :func:`revoke_preset`
-      / :func:`dry_run_preset` lifecycle.
-
-    Returns the operator-visible response dict (same shape both branches).
+    Returns the operator-visible response dict.
     """
-    if hasattr(preset, "build"):
-        if op == "apply":
-            return await _apply_routing_bundle(preset, dict(base_scope))
-        if op == "unapply":
-            return await _unapply_routing_bundle(preset, dict(base_scope))
-        if op == "dry_run":
-            return await _dry_run_routing_bundle(preset, dict(base_scope))
-        raise ValueError(f"Unknown preset op: {op!r}")
-
-    # Generalised Preset path — needs engine + AppliedPresetsService.
     from dynastore.modules import get_protocol
     from dynastore.models.protocols import DatabaseProtocol
 
@@ -337,103 +323,6 @@ def _scope_from_base(base_scope: Mapping[str, str]) -> str:
     if cat:
         return f"catalog:{cat}"
     return "platform"
-
-
-async def _apply_routing_bundle(preset: Any, base_scope: dict) -> dict:
-    """Walk a routing preset bundle through ``ConfigsProtocol.set_config``.
-
-    Moved verbatim from ``admin.admin_service._apply_preset_bundle``; the
-    admin layer now delegates here via :func:`dispatch_preset`.
-    """
-    from dynastore.modules import get_protocol
-    from dynastore.models.protocols.configs import ConfigsProtocol
-
-    configs = get_protocol(ConfigsProtocol)
-    if configs is None:
-        raise HTTPException(status_code=503, detail="Configs service unavailable.")
-
-    bundle = preset.build(**base_scope)
-    applied: list[str] = []
-    for entry in bundle.iter_apply():
-        scope = {**base_scope, **dict(entry.scope)}
-        await configs.set_config(entry.config_cls, entry.instance, **scope)
-        applied.append(entry.slot)
-
-    on_applied = getattr(preset, "on_applied", None)
-    if callable(on_applied):
-        try:
-            await cast(Callable[..., Awaitable[Any]], on_applied)(**base_scope)
-        except Exception as exc:  # noqa: BLE001 — hook errors must not abort apply
-            logger.error(
-                "preset=%s on_applied hook failed: %s",
-                preset.name, exc, exc_info=True,
-            )
-
-    return {"preset": preset.name, "applied": applied, **base_scope}
-
-
-async def _unapply_routing_bundle(preset: Any, base_scope: dict) -> dict:
-    """Rollback a routing preset bundle, leaf-first, lenient on divergence.
-
-    Moved verbatim from ``admin.admin_service._unapply_preset_bundle``.
-    """
-    from dynastore.modules import get_protocol
-    from dynastore.models.protocols.configs import ConfigsProtocol
-
-    configs = get_protocol(ConfigsProtocol)
-    if configs is None:
-        raise HTTPException(status_code=503, detail="Configs service unavailable.")
-
-    bundle = preset.build(**base_scope)
-    deleted: list[str] = []
-    skipped: list[dict] = []
-
-    for entry in bundle.iter_rollback():
-        scope = {**base_scope, **dict(entry.scope)}
-        persisted = await configs.get_persisted_config(entry.config_cls, **scope)
-        if persisted is None:
-            skipped.append({
-                "slot": entry.slot,
-                "class": entry.config_cls.__name__,
-                "reason": "missing",
-            })
-            continue
-        try:
-            persisted_norm = entry.config_cls.model_validate(persisted).model_dump(mode="json")
-        except Exception:  # noqa: BLE001 — surface the raw payload on validation failure
-            persisted_norm = persisted
-        expected_norm = entry.instance.model_dump(mode="json")
-        if persisted_norm == expected_norm:
-            await configs.delete_config(entry.config_cls, **scope)
-            deleted.append(entry.slot)
-        else:
-            logger.info(
-                "preset=%s scope=%s slot=%s diverged on revoke — leaving in place",
-                preset.name, base_scope, entry.slot,
-            )
-            skipped.append({
-                "slot": entry.slot,
-                "class": entry.config_cls.__name__,
-                "reason": "diverged",
-                "persisted": persisted_norm,
-                "expected": expected_norm,
-            })
-
-    return {"preset": preset.name, "deleted": deleted, "skipped": skipped, **base_scope}
-
-
-async def _dry_run_routing_bundle(preset: Any, base_scope: dict) -> dict:
-    """Dry-run a routing preset bundle — no writes performed."""
-    bundle = preset.build(**base_scope)
-    entries = [
-        {
-            "slot": e.slot,
-            "class": e.config_cls.__name__,
-            "scope": {**base_scope, **dict(e.scope)},
-        }
-        for e in bundle.iter_apply()
-    ]
-    return {"preset": preset.name, "entries": entries, **base_scope}
 
 
 def _check_self_lockout(

@@ -48,12 +48,20 @@ def register_preset(preset: Union[RoutingPreset, Any]) -> None:
     Unknown child names raise ``ValueError`` with a clear message so
     authors catch missing dependencies at import time rather than at
     apply time.
+
+    Shape-A routing presets (those with ``build`` but no ``apply``) are
+    automatically wrapped in a ``RoutingPresetAdapter`` so every registered
+    preset exposes the unified ``apply`` / ``revoke`` / ``dry_run`` interface.
     """
     if preset.name in _REGISTRY:
         raise ValueError(
             f"Preset {preset.name!r} already registered "
             f"(by {type(_REGISTRY[preset.name]).__name__})"
         )
+    # Auto-wrap Shape-A routing presets that have build() but no apply().
+    if hasattr(preset, "build") and not hasattr(preset, "apply"):
+        from .routing_adapter import RoutingPresetAdapter
+        preset = RoutingPresetAdapter(preset)
     # Validate CompositePreset.compose references.
     compose = getattr(preset, "compose", None)
     if compose:
