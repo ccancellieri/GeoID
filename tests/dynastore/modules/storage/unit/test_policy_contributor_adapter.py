@@ -89,6 +89,7 @@ class _MultiPolicyContributor:
 def _make_context(
     *,
     updated_policies: Optional[List[str]] = None,
+    bound_role_policies: Optional[List[Any]] = None,
     updated_roles: Optional[List[str]] = None,
     deleted_policies: Optional[List[str]] = None,
     deleted_roles: Optional[List[str]] = None,
@@ -96,6 +97,8 @@ def _make_context(
 ) -> PresetContext:
     if updated_policies is None:
         updated_policies = []
+    if bound_role_policies is None:
+        bound_role_policies = []
     if updated_roles is None:
         updated_roles = []
     if deleted_policies is None:
@@ -115,6 +118,13 @@ def _make_context(
     async def _delete_policy(pid: str, catalog_id: Any = None) -> bool:
         deleted_policies.append(pid)
         return True
+
+    async def _bind_policy_to_role(role_name: str, policy_entry: Any, **_: Any) -> None:
+        # Record both role_name and the policy id for assertions.
+        bound_role_policies.append((role_name, policy_entry.get("id") if isinstance(policy_entry, dict) else policy_entry))
+        # Also append role_name into updated_roles so existing callers that
+        # check `updated_roles` continue to work.
+        updated_roles.append(role_name)
 
     async def _update_role(role: Any) -> Any:
         updated_roles.append(role.name)
@@ -143,6 +153,7 @@ def _make_context(
 
     policy_svc.update_policy = _update_policy
     policy_svc.delete_policy = _delete_policy
+    iam_svc.bind_policy_to_role = _bind_policy_to_role
     iam_svc.update_role = _update_role
     iam_svc.list_roles = _list_roles
     iam_svc.delete_role = _delete_role
@@ -400,6 +411,9 @@ async def test_dry_run_no_writes():
     iam_svc = MagicMock()
     iam_svc.update_role = AsyncMock(
         side_effect=lambda r: write_calls.append("update_role") or r
+    )
+    iam_svc.bind_policy_to_role = AsyncMock(
+        side_effect=lambda rn, pe, **kw: write_calls.append("bind_policy_to_role") or None
     )
     iam_svc.delete_role = AsyncMock(
         side_effect=lambda n, **kw: write_calls.append("delete_role") or True

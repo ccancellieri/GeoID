@@ -824,6 +824,26 @@ class IamService:
         schema = await self._resolve_schema(catalog_id)
         return await self.storage.update_role(role, schema=schema)
 
+    async def bind_policy_to_role(
+        self,
+        role_name: str,
+        policy_entry: Dict[str, Any],
+        catalog_id: Optional[str] = None,
+    ) -> None:
+        """Atomically append *policy_entry* to the role, deduping by ``id``."""
+        schema = await self._resolve_schema(catalog_id)
+        await self.storage.bind_policy_to_role(role_name, policy_entry, schema=schema)
+
+    async def unbind_policy_from_role(
+        self,
+        role_name: str,
+        policy_id: str,
+        catalog_id: Optional[str] = None,
+    ) -> None:
+        """Atomically remove the entry with ``id == policy_id`` from the role."""
+        schema = await self._resolve_schema(catalog_id)
+        await self.storage.unbind_policy_from_role(role_name, policy_id, schema=schema)
+
     async def delete_role(
         self, name: str, cascade: bool = False, catalog_id: Optional[str] = None
     ) -> bool:

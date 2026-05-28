@@ -12,7 +12,7 @@
 
 """`RoleAdminProtocol` — role CRUD and hierarchy management."""
 
-from typing import Any, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -29,6 +29,18 @@ class RoleAdminProtocol(Protocol):
 
     async def update_role(self, role: Any, catalog_id: Optional[str] = None) -> Any:
         """Update an existing role."""
+        ...
+
+    async def bind_policy_to_role(
+        self, role_name: str, policy_entry: Dict[str, Any], catalog_id: Optional[str] = None
+    ) -> None:
+        """Atomically append policy_entry to the role, deduping by id."""
+        ...
+
+    async def unbind_policy_from_role(
+        self, role_name: str, policy_id: str, catalog_id: Optional[str] = None
+    ) -> None:
+        """Atomically remove the entry with id == policy_id from the role."""
         ...
 
     async def delete_role(

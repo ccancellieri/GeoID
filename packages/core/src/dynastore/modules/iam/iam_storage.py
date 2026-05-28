@@ -93,6 +93,28 @@ class AbstractIamStorage(abc.ABC):
     async def update_role(self, role: Role, conn: Optional[Any] = None, schema: str = "iam") -> Optional[Role]: ...
 
     @abc.abstractmethod
+    async def bind_policy_to_role(
+        self, role_name: str, policy_entry: Dict[str, Any], schema: str = "iam"
+    ) -> None:
+        """Append policy_entry[``id``] to roles.policies, deduping by that string value.
+
+        Single atomic SQL UPDATE — no Python read-modify-write.
+        ``policy_entry`` must have an ``"id"`` key; only the id string is persisted
+        (roles.policies stores plain string IDs, not dicts).
+        """
+        ...
+
+    @abc.abstractmethod
+    async def unbind_policy_from_role(
+        self, role_name: str, policy_id: str, schema: str = "iam"
+    ) -> None:
+        """Remove all entries where ``elem->>'id' == policy_id`` from roles.policies.
+
+        Single atomic SQL UPDATE — no Python read-modify-write.
+        """
+        ...
+
+    @abc.abstractmethod
     async def delete_role(self, name: str, cascade: bool = False, conn: Optional[Any] = None, schema: str = "iam") -> bool: ...
 
     @abc.abstractmethod

@@ -75,43 +75,13 @@ def _get_es_client() -> Any:
 async def _revoke_deny_policy(catalog_id: str) -> None:
     """Strip and delete the ``private_deny_{catalog_id}`` DENY policy.
 
-    Best-effort: logs WARNING on failure but does not propagate exceptions.
-    Mirrors the logic in
-    :meth:`~.driver.ItemsElasticsearchPrivateDriver._revoke_deny_policy`
-    so the cascade cleanup path and the legacy direct path stay in sync
-    without circular imports.
+    Delegates to the driver method so the atomic unbind primitive is used
+    in both the cascade cleanup path and the direct revoke path.
     """
-    from dynastore.tools.discovery import get_protocol
-    try:
-        from dynastore.models.protocols.policies import PermissionProtocol
-    except ImportError:
-        return
-
-    perm = get_protocol(PermissionProtocol)
-    if not perm:
-        return
-
-    policy_id = f"private_deny_{catalog_id}"
-
-    try:
-        from dynastore.modules.iam.iam_service import IamService
-        iam = get_protocol(IamService)
-        if iam:
-            existing_roles = {r.name: r for r in await iam.list_roles()}
-            all_users = existing_roles.get("all_users")
-            if all_users is not None:
-                remaining = [p for p in all_users.policies if p != policy_id]
-                await iam.update_role(all_users.model_copy(update={"policies": remaining}))
-    except Exception as exc:
-        logger.warning(
-            "EsItemsIndexOwner: failed to strip deny policy %r from all_users role: %s",
-            policy_id, exc,
-        )
-
-    try:
-        await perm.delete_policy(policy_id)
-    except Exception:
-        pass
+    from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
+        ItemsElasticsearchPrivateDriver,
+    )
+    await ItemsElasticsearchPrivateDriver._revoke_deny_policy(catalog_id)
 
 
 class EsItemsIndexOwner(BaseResourceOwner):

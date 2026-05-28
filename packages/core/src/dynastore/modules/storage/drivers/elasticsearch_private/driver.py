@@ -659,7 +659,7 @@ class ItemsElasticsearchPrivateDriver(
     async def _apply_deny_policy(catalog_id: str) -> None:
         from dynastore.tools.discovery import get_protocol
         try:
-            from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role
+            from dynastore.models.protocols.policies import PermissionProtocol, Policy
         except ImportError:
             return
 
@@ -703,18 +703,12 @@ class ItemsElasticsearchPrivateDriver(
                 logger.error("DENY policy persist failed for '%s': %s", catalog_id, e)
                 return
 
-        # Bind the deny policy to the all_users role via direct update — no pending buffer.
+        # Bind the deny policy to the all_users role atomically — no Python R-M-W.
         try:
             from dynastore.modules.iam.iam_service import IamService
             iam = get_protocol(IamService)
             if iam:
-                existing_roles = {r.name: r for r in await iam.list_roles()}
-                all_users = existing_roles.get("all_users")
-                if all_users is not None:
-                    merged = list(set(list(all_users.policies) + [policy_id]))
-                    await iam.update_role(all_users.model_copy(update={"policies": merged}))
-                else:
-                    await iam.update_role(Role(name="all_users", policies=[policy_id]))
+                await iam.bind_policy_to_role("all_users", {"id": policy_id})
         except Exception as e:
             logger.warning("Failed to bind deny policy '%s' to all_users role: %s", policy_id, e)
 
@@ -732,16 +726,12 @@ class ItemsElasticsearchPrivateDriver(
 
         policy_id = f"private_deny_{catalog_id}"
 
-        # Strip the deny policy from the all_users role before deleting it.
+        # Strip the deny policy from the all_users role atomically — no Python R-M-W.
         try:
             from dynastore.modules.iam.iam_service import IamService
             iam = get_protocol(IamService)
             if iam:
-                existing_roles = {r.name: r for r in await iam.list_roles()}
-                all_users = existing_roles.get("all_users")
-                if all_users is not None:
-                    remaining = [p for p in all_users.policies if p != policy_id]
-                    await iam.update_role(all_users.model_copy(update={"policies": remaining}))
+                await iam.unbind_policy_from_role("all_users", policy_id)
         except Exception as e:
             logger.warning("Failed to strip deny policy '%s' from all_users role: %s", policy_id, e)
 

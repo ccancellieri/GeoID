@@ -615,6 +615,44 @@ DELETE_ROLE = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
+# Atomic policy bind — appends policy_id string to roles.policies, replacing
+# any existing equal entry. roles.policies is a JSONB array of plain strings.
+# Single SQL UPDATE: no Python read-modify-write, no race window.
+# jsonb_agg over zero rows returns NULL → COALESCE to empty array.
+BIND_POLICY_TO_ROLE = DQLQuery(
+    """
+    UPDATE {schema}.roles
+    SET policies = COALESCE(
+        (
+            SELECT jsonb_agg(elem)
+            FROM jsonb_array_elements_text(COALESCE(policies, '[]'::jsonb)) AS elem
+            WHERE elem != :policy_id
+        ),
+        '[]'::jsonb
+    ) || jsonb_build_array(:policy_id::text)
+    WHERE id = :role_name OR name = :role_name;
+    """,
+    result_handler=ResultHandler.ROWCOUNT,
+)
+
+# Atomic policy unbind — removes all string entries equal to policy_id.
+# NULL jsonb_agg (zero matching rows) is coalesced to empty array.
+UNBIND_POLICY_FROM_ROLE = DQLQuery(
+    """
+    UPDATE {schema}.roles
+    SET policies = COALESCE(
+        (
+            SELECT jsonb_agg(elem)
+            FROM jsonb_array_elements_text(COALESCE(policies, '[]'::jsonb)) AS elem
+            WHERE elem != :policy_id
+        ),
+        '[]'::jsonb
+    )
+    WHERE id = :role_name OR name = :role_name;
+    """,
+    result_handler=ResultHandler.ROWCOUNT,
+)
+
 # Recursive CTE to find all child roles (descendants)
 GET_FULL_ROLE_HIERARCHY = DQLQuery(
     """

@@ -736,6 +736,25 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         await self._bump_binding_version(schema)
         return result
 
+    async def bind_policy_to_role(
+        self, role_name: str, policy_entry: Dict[str, Any], schema: str = "iam"
+    ) -> None:
+        policy_id: str = policy_entry["id"]
+        async with managed_transaction(self.engine) as db:
+            await BIND_POLICY_TO_ROLE.execute(
+                db, schema=schema, role_name=role_name, policy_id=policy_id,
+            )
+        await self._bump_binding_version(schema)
+
+    async def unbind_policy_from_role(
+        self, role_name: str, policy_id: str, schema: str = "iam"
+    ) -> None:
+        async with managed_transaction(self.engine) as db:
+            await UNBIND_POLICY_FROM_ROLE.execute(
+                db, schema=schema, role_name=role_name, policy_id=policy_id,
+            )
+        await self._bump_binding_version(schema)
+
     async def delete_role(
         self, role_id: str, cascade: bool = False, conn: Optional[DbResource] = None, schema: str = "iam"
     ) -> bool:

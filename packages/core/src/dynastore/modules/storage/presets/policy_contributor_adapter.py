@@ -157,9 +157,10 @@ class PolicyContributorPreset:
             logger.debug("%s: upserted policy %s", self.name, pol.id)
 
         for role in (contributor.get_role_bindings() or []):
-            await ctx.iam.update_role(role)
+            for pid in (role.policies or []):
+                await ctx.iam.bind_policy_to_role(role.name, {"id": pid})
             applied_role_names.append(role.name)
-            logger.debug("%s: upserted role binding %s", self.name, role.name)
+            logger.debug("%s: bound policies to role %s", self.name, role.name)
 
         return AppliedDescriptor(payload={
             "preset_name": self.name,
