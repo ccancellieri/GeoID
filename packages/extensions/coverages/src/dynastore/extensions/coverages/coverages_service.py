@@ -33,10 +33,6 @@ from dynastore.extensions.coverages.config import CoveragesConfig
 from dynastore.extensions.coverages.links import build_coverage_links
 from dynastore.extensions.ogc_base import OGCServiceMixin, ogc_asset_href
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.tools.ogc_policies import (
-    ogc_anonymous_role_binding,
-    ogc_public_access_policy,
-)
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.modules.coverages.domainset import build_domainset
 from dynastore.modules.coverages.rangetype import build_rangetype
@@ -270,12 +266,6 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         except Exception:
             return []
         return build_contributions()
-
-    def get_policies(self):
-        return [ogc_public_access_policy("coverages")]
-
-    def get_role_bindings(self):
-        return [ogc_anonymous_role_binding("coverages")]
 
     # ------------------------------------------------------------------
     # Route registration

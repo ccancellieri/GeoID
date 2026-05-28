@@ -46,7 +46,6 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
 
 from . import records_generator as gen
 from . import records_models as rm
-from .policies import records_policies, records_role_bindings
 from dynastore.models.driver_context import DriverContext
 
 logger = logging.getLogger(__name__)
@@ -108,12 +107,6 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         except Exception:
             return []
         return build_contributions()
-
-    def get_policies(self):
-        return records_policies()
-
-    def get_role_bindings(self):
-        return records_role_bindings()
 
     # ------------------------------------------------------------------
     # Route registration

@@ -21,10 +21,6 @@ from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.tools.ogc_policies import (
-    ogc_anonymous_role_binding,
-    ogc_public_access_policy,
-)
 from dynastore.models.ogc import Feature
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.joins.bq_secondary import stream_bigquery_secondary
@@ -133,14 +129,7 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        logger.info("JoinsService: policies registered.")
         yield
-
-    def get_policies(self):
-        return [ogc_public_access_policy("join")]
-
-    def get_role_bindings(self):
-        return [ogc_anonymous_role_binding("join")]
 
     def _register_routes(self) -> None:
         self.router.add_api_route(

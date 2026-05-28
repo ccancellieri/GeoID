@@ -33,10 +33,6 @@ from fastapi.responses import Response, StreamingResponse
 
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.tools.ogc_policies import (
-    ogc_anonymous_role_binding,
-    ogc_public_access_policy,
-)
 from dynastore.extensions.volumes.config import VolumesConfig
 from dynastore.models.protocols.bounds_source import (
     BoundsSourceProtocol,
@@ -112,14 +108,7 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        logger.info("VolumesService: policies registered.")
         yield
-
-    def get_policies(self):
-        return [ogc_public_access_policy("volumes")]
-
-    def get_role_bindings(self):
-        return [ogc_anonymous_role_binding("volumes")]
 
     def _register_routes(self) -> None:
         self.router.add_api_route(

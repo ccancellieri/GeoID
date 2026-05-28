@@ -14,7 +14,8 @@
 
 """Web extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
@@ -23,14 +24,19 @@ from dynastore.modules.storage.presets.policy_contributor_adapter import (
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_web() -> object:
-    from dynastore.extensions.web.web import Web
-    return Web.__new__(Web)
+class _WebPolicyContributor:
+    def get_policies(self):
+        from dynastore.extensions.web.web import _web_policies
+        return _web_policies()
+
+    def get_role_bindings(self):
+        from dynastore.extensions.web.web import _web_role_bindings
+        return _web_role_bindings()
 
 
 register_preset(PolicyContributorPreset(
     name="web_enable",
     description="Web extension IAM policies; public UI access + sysadmin + dashboard scoping",
     keywords=("iam", "web", "platform"),
-    contributor_factory=_make_web,
+    contributor_factory=_WebPolicyContributor,
 ))

@@ -14,23 +14,31 @@
 
 """Joins extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
     PolicyContributorPreset,
 )
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_joins() -> object:
-    from dynastore.extensions.joins.joins_service import JoinsService
-    return JoinsService.__new__(JoinsService)
+class _JoinsPolicyContributor:
+    def get_policies(self):
+        return [ogc_public_access_policy("join")]
+
+    def get_role_bindings(self):
+        return [ogc_anonymous_role_binding("join")]
 
 
 register_preset(PolicyContributorPreset(
     name="joins_enable",
     description="OGC Joins extension IAM policies + anonymous read access",
     keywords=("iam", "joins", "platform"),
-    contributor_factory=_make_joins,
+    contributor_factory=_JoinsPolicyContributor,
 ))

@@ -14,23 +14,31 @@
 
 """EDR extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
     PolicyContributorPreset,
 )
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_edr() -> object:
-    from dynastore.extensions.edr.edr_service import EDRService
-    return EDRService.__new__(EDRService)
+class _EDRPolicyContributor:
+    def get_policies(self):
+        return [ogc_public_access_policy("edr")]
+
+    def get_role_bindings(self):
+        return [ogc_anonymous_role_binding("edr")]
 
 
 register_preset(PolicyContributorPreset(
     name="edr_enable",
     description="OGC Environmental Data Retrieval extension IAM policies + anonymous read access",
     keywords=("iam", "edr", "platform"),
-    contributor_factory=_make_edr,
+    contributor_factory=_EDRPolicyContributor,
 ))

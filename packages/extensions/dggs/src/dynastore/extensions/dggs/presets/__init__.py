@@ -14,23 +14,31 @@
 
 """DGGS extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
     PolicyContributorPreset,
 )
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_dggs() -> object:
-    from dynastore.extensions.dggs.dggs_service import DGGSService
-    return DGGSService.__new__(DGGSService)
+class _DGGSPolicyContributor:
+    def get_policies(self):
+        return [ogc_public_access_policy("dggs")]
+
+    def get_role_bindings(self):
+        return [ogc_anonymous_role_binding("dggs")]
 
 
 register_preset(PolicyContributorPreset(
     name="dggs_enable",
     description="OGC DGGS extension IAM policies + anonymous read access",
     keywords=("iam", "dggs", "platform"),
-    contributor_factory=_make_dggs,
+    contributor_factory=_DGGSPolicyContributor,
 ))

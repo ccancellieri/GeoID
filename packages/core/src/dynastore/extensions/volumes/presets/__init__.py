@@ -14,23 +14,31 @@
 
 """3D GeoVolumes extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
     PolicyContributorPreset,
 )
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_volumes() -> object:
-    from dynastore.extensions.volumes.volumes_service import VolumesService
-    return VolumesService.__new__(VolumesService)
+class _VolumesPolicyContributor:
+    def get_policies(self):
+        return [ogc_public_access_policy("volumes")]
+
+    def get_role_bindings(self):
+        return [ogc_anonymous_role_binding("volumes")]
 
 
 register_preset(PolicyContributorPreset(
     name="volumes_enable",
     description="OGC 3D GeoVolumes extension IAM policies + anonymous read access",
     keywords=("iam", "volumes", "platform"),
-    contributor_factory=_make_volumes,
+    contributor_factory=_VolumesPolicyContributor,
 ))

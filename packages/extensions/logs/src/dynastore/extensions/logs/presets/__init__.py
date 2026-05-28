@@ -14,7 +14,8 @@
 
 """Logs extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
@@ -23,14 +24,35 @@ from dynastore.modules.storage.presets.policy_contributor_adapter import (
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_logs() -> object:
-    from dynastore.extensions.logs.log_extension import LogExtension
-    return LogExtension.__new__(LogExtension)
+class _LogsPolicyContributor:
+    def get_policies(self):
+        from dynastore.extensions.logs.log_extension import (
+            _logs_dashboard_policy,
+            _logs_per_catalog_policy,
+            _logs_system_policy,
+        )
+        return [
+            _logs_system_policy(),
+            _logs_dashboard_policy(),
+            _logs_per_catalog_policy(),
+        ]
+
+    def get_role_bindings(self):
+        from dynastore.extensions.logs.log_extension import (
+            _logs_dashboard_role_binding,
+            _logs_per_catalog_role_bindings,
+            _logs_system_role_binding,
+        )
+        return [
+            _logs_system_role_binding(),
+            _logs_dashboard_role_binding(),
+            *_logs_per_catalog_role_bindings(),
+        ]
 
 
 register_preset(PolicyContributorPreset(
     name="logs_enable",
     description="Logs extension IAM policies; system logs + dashboard + per-catalog access",
     keywords=("iam", "logs", "platform"),
-    contributor_factory=_make_logs,
+    contributor_factory=_LogsPolicyContributor,
 ))

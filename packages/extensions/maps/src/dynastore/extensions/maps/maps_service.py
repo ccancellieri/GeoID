@@ -43,7 +43,6 @@ from . import maps_db
 from dynastore.models.localization import LocalizedText
 from .maps_models import MapsLandingPage, DatasetMaps, MapContent, Link
 from .maps_config import MapsConfig
-from .policies import maps_policies, maps_role_bindings
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.ogc_common_models import Conformance
@@ -166,13 +165,6 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
     def get_static_assets(self):
         from dynastore.extensions.tools.web_collect import collect_static_assets
         return collect_static_assets(self)
-
-    # PolicyContributor: declare authz needs; IAM forwards centrally.
-    def get_policies(self):
-        return maps_policies()
-
-    def get_role_bindings(self):
-        return maps_role_bindings()
 
     def configure_app(self, app: FastAPI):
         """Early configuration for the Maps extension."""

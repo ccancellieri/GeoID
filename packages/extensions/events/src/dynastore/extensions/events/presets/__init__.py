@@ -14,23 +14,31 @@
 
 """Events extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
+from dynastore.extensions.events.policies import (
+    events_policies,
+    events_role_bindings,
+)
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
     PolicyContributorPreset,
 )
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_events() -> object:
-    from dynastore.extensions.events.extension import EventsExtension
-    return EventsExtension.__new__(EventsExtension)
+class _EventsPolicyContributor:
+    def get_policies(self):
+        return events_policies()
+
+    def get_role_bindings(self):
+        return events_role_bindings()
 
 
 register_preset(PolicyContributorPreset(
     name="events_enable",
     description="Events extension IAM policies; sysadmin platform surface + catalog-member per-catalog access",
     keywords=("iam", "events", "platform"),
-    contributor_factory=_make_events,
+    contributor_factory=_EventsPolicyContributor,
 ))

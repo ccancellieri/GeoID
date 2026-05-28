@@ -96,15 +96,6 @@ class StatsExtension(ExtensionProtocol, StatsProtocol):
             summary="Retrieve stats for a specific collection",
         )
 
-    # PolicyContributor: declare authz needs; IAM forwards centrally.
-    # No direct call to PermissionProtocol — keeps the plugin agnostic
-    # of the enforcement implementation.
-    def get_policies(self):
-        return [_stats_policy()]
-
-    def get_role_bindings(self):
-        return [_stats_role_binding()]
-
     def get_web_pages(self):
         # Skip nav registration in deployments without IAM — there are no
         # authenticated roles to gate the page on, so it would surface to

@@ -452,19 +452,8 @@ class Web(ExtensionProtocol, OGCServiceMixin):
         #     app.router.routes.insert(0, app.router.routes.pop())
         #     logger.info("WebService: No root ('/') endpoint found. Added redirect to '/web'.")
 
-    # PolicyContributor: declare authz needs; IAM forwards centrally.
-    # No direct call to PermissionProtocol — keeps the plugin agnostic
-    # of the enforcement implementation.
-    def get_policies(self):
-        return _web_policies()
-
-    def get_role_bindings(self):
-        return _web_role_bindings()
-
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        # Policies declared via PolicyContributor (get_policies +
-        # get_role_bindings); IAM picks them up centrally.
         _register_anonymous_principal()
 
         # Register push-based CORS config handler
@@ -1830,8 +1819,8 @@ async function demoAction(action) {
 
         # ------------------------------------------------------------------ #
         # Dashboard data endpoints — TWO TIERS, both gated declaratively by  #
-        # PermissionProtocol policies declared by Web.get_policies() +     #
-        # forwarded by IAM via PolicyContributor:                          #
+        # PermissionProtocol policies declared by web_enable preset and    #
+        # seeded by IAM via PolicyContributorPreset:                        #
         #                                                                     #
         #   Platform tier  : /web/dashboard/{stats|logs|events|tasks}        #
         #     Sysadmin-only via web_dashboard_platform_access policy.         #

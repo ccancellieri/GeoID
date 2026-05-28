@@ -14,7 +14,8 @@
 
 """Stats extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
@@ -23,14 +24,19 @@ from dynastore.modules.storage.presets.policy_contributor_adapter import (
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_stats() -> object:
-    from dynastore.extensions.stats.extension import StatsExtension
-    return StatsExtension.__new__(StatsExtension)
+class _StatsPolicyContributor:
+    def get_policies(self):
+        from dynastore.extensions.stats.extension import _stats_policy
+        return [_stats_policy()]
+
+    def get_role_bindings(self):
+        from dynastore.extensions.stats.extension import _stats_role_binding
+        return [_stats_role_binding()]
 
 
 register_preset(PolicyContributorPreset(
     name="stats_enable",
     description="Stats extension IAM policies; sysadmin-only platform stats access",
     keywords=("iam", "stats", "platform"),
-    contributor_factory=_make_stats,
+    contributor_factory=_StatsPolicyContributor,
 ))

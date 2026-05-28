@@ -14,23 +14,31 @@
 
 """Coverages extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
+from dynastore.extensions.tools.ogc_policies import (
+    ogc_anonymous_role_binding,
+    ogc_public_access_policy,
+)
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
     PolicyContributorPreset,
 )
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_coverages() -> object:
-    from dynastore.extensions.coverages.coverages_service import CoveragesService
-    return CoveragesService.__new__(CoveragesService)
+class _CoveragesPolicyContributor:
+    def get_policies(self):
+        return [ogc_public_access_policy("coverages")]
+
+    def get_role_bindings(self):
+        return [ogc_anonymous_role_binding("coverages")]
 
 
 register_preset(PolicyContributorPreset(
     name="coverages_enable",
     description="OGC Coverages extension IAM policies + anonymous read access",
     keywords=("iam", "coverages", "platform"),
-    contributor_factory=_make_coverages,
+    contributor_factory=_CoveragesPolicyContributor,
 ))

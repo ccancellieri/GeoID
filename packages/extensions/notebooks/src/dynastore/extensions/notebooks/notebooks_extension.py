@@ -65,18 +65,7 @@ class NotebooksExtension(ExtensionProtocol):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        # Policies are seeded centrally via ``notebooks_enable`` PolicyContributorPreset
-        # (see ``extensions/notebooks/presets/__init__.py``).
         yield
-
-    # PolicyContributor: declare authz needs; IAM forwards centrally.
-    def get_policies(self):
-        from .policies import notebooks_policies
-        return notebooks_policies()
-
-    def get_role_bindings(self):
-        from .policies import notebooks_role_bindings
-        return notebooks_role_bindings()
 
     def _register_routes(self):
         # Platform notebooks (global, cross-tenant)

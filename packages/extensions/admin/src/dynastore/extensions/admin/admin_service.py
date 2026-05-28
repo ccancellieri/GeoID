@@ -60,7 +60,6 @@ from .models import (
     GrantRateLimitCounter, GrantMaxCountCounter,
     AppliedRowResponse, AppliedPresetsPage,
 )
-from .policies import admin_policies, admin_role_bindings
 
 logger = logging.getLogger(__name__)
 
@@ -386,19 +385,8 @@ class AdminService(ExtensionProtocol):
         tags=["Authentication & Authorization"], prefix="/admin"
     )
 
-    # PolicyContributor: declare authz needs; IAM forwards centrally.
-    # No direct call to PermissionProtocol — keeps the plugin agnostic
-    # of the enforcement implementation.
-    def get_policies(self):
-        return admin_policies()
-
-    def get_role_bindings(self):
-        return admin_role_bindings()
-
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        # Policies declared via PolicyContributor (get_policies +
-        # get_role_bindings); IAM picks them up centrally.
         yield
 
     # -------------------------------------------------------------------------

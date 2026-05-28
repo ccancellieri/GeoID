@@ -14,23 +14,28 @@
 
 """Admin extension preset — auto-register on import.
 
-PR-3 of umbrella #1412.
+The contributor lives inside the preset, not on the service. Services
+don't mutate platform IAM state; presets do.
 """
 
+from dynastore.extensions.admin.policies import admin_policies, admin_role_bindings
 from dynastore.modules.storage.presets.policy_contributor_adapter import (
     PolicyContributorPreset,
 )
 from dynastore.modules.storage.presets.registry import register_preset
 
 
-def _make_admin() -> object:
-    from dynastore.extensions.admin.admin_service import AdminService
-    return AdminService.__new__(AdminService)
+class _AdminPolicyContributor:
+    def get_policies(self):
+        return admin_policies()
+
+    def get_role_bindings(self):
+        return admin_role_bindings()
 
 
 register_preset(PolicyContributorPreset(
     name="admin_enable",
     description="Admin extension IAM policies; broad /admin access + catalog-admin delegation",
     keywords=("iam", "admin", "platform"),
-    contributor_factory=_make_admin,
+    contributor_factory=_AdminPolicyContributor,
 ))

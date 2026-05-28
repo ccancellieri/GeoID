@@ -57,7 +57,6 @@ from .dto import (
 )
 from .config_api_dto import PatchConfigBody
 from .config_api_service import ConfigApiService
-from .policies import configs_policies, configs_role_bindings
 from . import problem_details
 from . import presets as _configs_presets  # noqa: F401  -- preset registration side-effect
 
@@ -103,18 +102,8 @@ class ConfigsService(ExtensionProtocol):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        # Policies are seeded centrally via ``configs_enable`` PolicyContributorPreset
-        # (see ``extensions/configs/presets/__init__.py``).
         problem_details.register(app)
-        logger.info("ConfigsService: RFC 9457 handler registered.")
         yield
-
-    # PolicyContributor: declare authz needs; IAM forwards centrally.
-    def get_policies(self):
-        return configs_policies()
-
-    def get_role_bindings(self):
-        return configs_role_bindings()
 
     def _setup_routes(self):
         # ---- Discovery: registry (plugin classes) + driver instances ----

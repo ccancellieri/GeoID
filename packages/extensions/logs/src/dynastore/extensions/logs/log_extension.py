@@ -431,28 +431,8 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
     def database(self) -> DatabaseProtocol:
         return self.get_protocol(DatabaseProtocol)  # type: ignore[return-value]
 
-    # PolicyContributor: declare authz needs; IAM forwards centrally.
-    # No direct call to PermissionProtocol — keeps the plugin agnostic
-    # of the enforcement implementation.
-    def get_policies(self):
-        return [
-            _logs_system_policy(),
-            _logs_dashboard_policy(),
-            _logs_per_catalog_policy(),
-        ]
-
-    def get_role_bindings(self):
-        return [
-            _logs_system_role_binding(),
-            _logs_dashboard_role_binding(),
-            *_logs_per_catalog_role_bindings(),
-        ]
-
     @asynccontextmanager
     async def lifespan(self, app: Any):
-        # Policies declared via PolicyContributor (get_policies +
-        # get_role_bindings); IAM picks them up centrally.
-
         db = self.database
         if db:
             self.engine = db.engine
