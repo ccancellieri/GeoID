@@ -53,6 +53,12 @@ async def db_reset_session():
     The clone is already clean, so the worker-side reset is a no-op — we skip
     it here. The master gis_dev DB is reset by the controller (master mode)
     or by the boot-tier ``db_reset.sh`` before the test stack reports healthy.
+
+    After cleanup the controller also bootstraps the two foundational tables
+    (``configs.platform_configs`` and ``iam.applied_presets``) so that xdist
+    worker databases cloned from ``gis_dev`` already contain them — module
+    lifespans recreate these tables on every startup, but the template clone
+    happens *before* any lifespan runs.
     """
     try:
         from tests.dynastore.test_utils.cleanup_db import cleanup_db as cleanup
@@ -69,6 +75,37 @@ async def db_reset_session():
     if cleanup:
         print("\n[DB RESET] Dropping existing schemas...")
         await cleanup(skip_if_clean=True)
+
+    # Bootstrap foundational tables so xdist worker-DBs (cloned from gis_dev
+    # as a TEMPLATE before any lifespan runs) already contain them.  Idempotent
+    # — all DDL uses CREATE … IF NOT EXISTS.  DDL stays inside each owning
+    # module (PlatformConfigService / AppliedPresetsService); we only call
+    # the existing idempotent bootstrap methods.
+    try:
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from sqlalchemy.pool import NullPool
+        from dynastore.modules.db_config.platform_config_service import (
+            PlatformConfigService,
+        )
+        from dynastore.modules.iam.applied_presets_service import AppliedPresetsService
+        from dynastore.modules.db_config.maintenance_tools import ensure_schema_exists
+        from dynastore.modules.db_config.query_executor import managed_transaction
+
+        _db_url = os.environ.get(
+            "DATABASE_URL",
+            "postgresql://testuser:testpassword@localhost:54320/gis_dev",
+        ).replace("postgresql://", "postgresql+asyncpg://")
+        _engine = create_async_engine(_db_url, poolclass=NullPool)
+        try:
+            await PlatformConfigService.initialize_storage(_engine)
+            async with managed_transaction(_engine) as _conn:
+                await ensure_schema_exists(_conn, "iam")
+                await AppliedPresetsService(_engine).ensure_table(conn=_conn)
+            print("[DB RESET] Foundational schemas bootstrapped.\n")
+        finally:
+            await _engine.dispose()
+    except Exception as _exc:
+        print(f"[DB RESET] Warning: foundational schema bootstrap failed (non-fatal): {_exc}\n")
 
     print("[DB RESET] Complete.\n")
 
