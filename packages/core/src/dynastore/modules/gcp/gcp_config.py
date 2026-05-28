@@ -16,8 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from pathlib import PurePosixPath
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Annotated, Any, Callable, ClassVar, Dict, List, Literal, Optional, TYPE_CHECKING, Tuple, Union
 from datetime import date
 from dynastore.models.mutability import Immutable, Mutable
@@ -298,69 +297,6 @@ class GcpEventingConfig(PluginConfig):
         default_factory=dict, 
         description="A registry of reusable action templates. Keys are IDs (e.g., 'ingestion') that can be referenced in collection configs."
     )
-
-
-# This model is not a plugin config, but a simple data structure.
-# It's being moved here to consolidate GCP configuration-related models.
-class UploadOptions(BaseModel):
-    """Optional parameters for controlling GCS upload behavior."""
-
-    size: Optional[int] = Field(default=None, description="The maximum number of bytes that can be uploaded using this session. If not known, leave blank.")
-    content_type: Optional[str] = Field(default=None, description="Type of content being uploaded. Overrides the default if provided.")
-    origin: Optional[str] = Field(default=None, description="If set, the upload can only be completed by a user-agent that uploads from the given origin.")
-    checksum: Optional[GcsChecksumType] = Field(default=None, description="The type of checksum to compute to verify the integrity of the object ('md5', 'crc32c', 'auto').")
-    predefined_acl: Optional[GcsPredefinedAcl] = Field(default=None, description="Predefined access control list to apply to the uploaded object.")
-    if_generation_match: Optional[int] = Field(default=None, description="Makes the operation conditional on the object's generation matching this value.")
-    if_generation_not_match: Optional[int] = Field(default=None, description="Makes the operation conditional on the object's generation not matching this value.")
-    if_metageneration_match: Optional[int] = Field(default=None, description="Makes the operation conditional on the object's metageneration matching this value.")
-    if_metageneration_not_match: Optional[int] = Field(default=None, description="Makes the operation conditional on the object's metageneration not matching this value.")
-    timeout: Optional[int] = Field(default=60, description="The amount of time, in seconds, to wait for the server response for the initiation request.")
-    retry: Optional[GcsRetryOptions] = Field(default=None, description="Custom retry policy parameters for the upload initiation RPC.")
-
-
-class InitiateUploadRequest(BaseModel):
-    """Request model for initiating a file upload."""
-    content_type: str
-    catalog_id: Optional[str] = None
-    collection_id: Optional[str] = None
-    filename: str = Field(
-        ...,
-        description=(
-            "The name of the file to be uploaded, INCLUDING its extension "
-            "(e.g. 'aoi_oasis.zip', 'gadm_adm2_italy.geojson', "
-            "'LC08_…_T1.tif').  The extension is the source of truth for "
-            "format detection at ingestion time, so a bare filename is "
-            "rejected with HTTP 422."
-        ),
-    )
-    # Embed the AssetBase model to carry all asset information.
-    # The URI will be automatically populated by the system.
-    asset: "AssetUploadDefinition"
-    upload_options: Optional[UploadOptions] = Field(default=None, description="Advanced options for GCS upload behavior.")
-
-    @field_validator("filename")
-    @classmethod
-    def _filename_must_have_extension(cls, value: str) -> str:
-        # Use PurePosixPath so behaviour is platform-independent (the
-        # filename is going to a Unix-shaped GCS object key anyway).
-        if not value or not PurePosixPath(value).suffix:
-            raise ValueError(
-                f"filename {value!r} must include an extension "
-                "(e.g. .zip, .shp, .geoparquet, .fgb, .geojson, .gpkg, "
-                ".csv, .kml). The extension drives format detection at "
-                "ingestion time."
-            )
-        return value
-
-class InitiateUploadResponse(BaseModel):
-    """Response model for initiating a file upload."""
-    upload_id: str
-    upload_uri: str
-    status: str = "initiated"
-    message: str = "Upload session initiated. Use the upload_uri for direct GCS upload."
-
-from dynastore.modules.catalog.asset_service import AssetUploadDefinition
-InitiateUploadRequest.model_rebuild()
 
 
 # ---------------------------------------------------------------------------

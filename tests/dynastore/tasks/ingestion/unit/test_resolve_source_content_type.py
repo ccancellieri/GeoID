@@ -35,7 +35,7 @@ def test_metadata_contentType_camelCase_also_recognised():
 
 
 def test_falls_back_to_gcs_head_for_legacy_bare_uri():
-    """Legacy assets uploaded before _prepare_blob_metadata persisted
+    """Legacy assets uploaded before GcpStorageOpsMixin.initiate_upload persisted
     content_type into custom metadata: recover via GCS HEAD."""
     asset = _asset(
         "gs://d88971-test-catalog-19/collections/test_collection_19/aoi_oasis",

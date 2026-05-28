@@ -239,6 +239,9 @@ class GcpStorageOpsMixin:
 
         final_metadata["asset_id"] = asset_def.asset_id
         final_metadata["asset_type"] = asset_def.asset_type.value if hasattr(asset_def.asset_type, "value") else str(asset_def.asset_type)
+        # TODO: Consider making content_type injection configurable via GcpCollectionBucketConfig
+        # if content_type:
+        #     final_metadata["content_type"] = content_type
         blob.metadata = {k: str(v) if not isinstance(v, str) else v for k, v in final_metadata.items()}
 
         try:

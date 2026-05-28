@@ -262,7 +262,7 @@ def _resolve_source_content_type(asset: Asset) -> Optional[str]:
     """Best-effort MIME-type lookup used by reader resolution.
 
     1. ``asset.metadata['content_type']`` — populated by
-       :func:`BucketService._prepare_blob_metadata` for every new GCS
+       :meth:`GcpStorageOpsMixin.initiate_upload` for every new GCS
        upload, so the happy path is one in-memory dict read.
     2. For legacy assets whose metadata pre-dates the injection (or
        non-GCS uploads), do a single ``storage.objects.get`` to read
@@ -497,7 +497,7 @@ async def run_ingestion_task(
         # no recognisable suffix (legacy bare-filename uploads).  Source
         # of truth: the asset row's metadata; falls back to a single GCS
         # object HEAD for legacy rows whose metadata pre-dates the
-        # ``content_type`` injection in ``_prepare_blob_metadata``.
+        # ``content_type`` injection in ``GcpStorageOpsMixin.initiate_upload``.
         source_content_type = _resolve_source_content_type(asset)
 
         # --- Process and Ingest Features ---
