@@ -263,6 +263,9 @@ collection uses the one driver instance and its declared sidecars.
 
 - `docs/components/storage_drivers.md` — driver classes, routing,
   hint-based dispatch
+- `docs/components/items_schema.md` — the driver-agnostic field
+  declaration these sidecars physically realize (the write-side bridge
+  promotes its fields to COLUMNAR columns)
 - `docs/components/platform_engines.md` — engine layer + lifecycle
   policy
 - `src/dynastore/modules/storage/drivers/pg_sidecars/` — sidecar

@@ -122,35 +122,16 @@ Admin clicks "Apply" in dashboard
 
 ---
 
-## Relationship to Schema Evolution
+## Relationship to per-collection schema
 
-Structural migrations handle DDL changes to **shared** infrastructure tables. Per-collection schema evolution (adding columns to a specific collection's physical table) is a separate concern handled by the `SchemaEvolutionEngine`. See [Schema Evolution](../components/schema_evolution.md).
-
----
-
-## Safe Data Migration (Export-Import Pipeline)
-
-Structural migrations handle DDL for shared infrastructure tables. When a **collection's physical table** must change in a way that is unsafe (column type change, partition key change, column removal), a separate pipeline handles the data:
-
-```
-1. Lock collection (provisioning_status = "migrating")
-2. Export hub + sidecar tables → Parquet files (WKB hex for geometry)
-3. Rename originals to {table}_bkp_{timestamp} (never dropped)
-4. Recreate tables with new schema
-5. Import from Parquet (column-mapped, geometry re-encoded via ST_GeomFromEWKB)
-6. Verify row counts match
-7. Update schema hash in collection_configs
-8. Release lock (provisioning_status = "ready")
-On failure: restore backup names → set provisioning_status = "migration_failed"
-```
-
-This pipeline is implemented as `SchemaMigrationTask` in `src/dynastore/tasks/schema_migration/`.
-
-Backup tables are **never auto-dropped**. Explicit cleanup:
-
-```
-DELETE /admin/schemas/{catalog_id}/{collection_id}/backups/{timestamp}
-```
+This document covers DDL for **shared** infrastructure tables. A
+collection's *own* physical table is a separate concern: its columns are
+created once at provisioning (`CREATE TABLE IF NOT EXISTS`), and the
+application never issues in-place `ALTER TABLE` against it. Drift between
+a collection's declared schema and its physical table is reconciled
+read-only; adding a column for real requires a fresh (re)provision. See
+[Schema Evolution & Drift](../components/schema_evolution.md) and
+[Items Schema](../components/items_schema.md).
 
 ---
 

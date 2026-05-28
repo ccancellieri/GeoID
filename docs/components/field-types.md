@@ -176,3 +176,9 @@ still translated to `double` at derive time via `_OGR_TYPE`, and always will be.
 | Deprecated alias table (temporary) | `src/dynastore/models/legacy_type_aliases.py` |
 | `FieldDefinition` (the schema field model) | `src/dynastore/models/protocols/field_definition.py` |
 | `gdalinfo` → schema derive | `src/dynastore/tasks/ingestion/schema_from_gdalinfo.py` |
+
+## See also
+
+- [Items Schema](items_schema.md) — the `items_schema` config that
+  *uses* this `data_type` vocabulary: the full field surface, access
+  intent, constraints, and validate-time guards.

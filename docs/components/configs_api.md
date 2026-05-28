@@ -93,7 +93,7 @@ configs.platform.{
         drivers.{items_postgresql_driver: {sidecars}, items_elasticsearch_driver, ...}
         policy.{items_write_policy: {...}}
         routing.{items_routing_config: {operations}}
-        schema.{items_schema: {...}}
+        schema.{items_schema: {version, level, fields, default_access, strict_unknown_fields, constraints, ...}}
       }
     }
   }
@@ -316,7 +316,7 @@ GET /configs/catalogs/demo/collections/sample?resolved=true
                 }
               }
             },
-            "schema":  { "items_schema": {…, "_meta": {"tier": "collection", "source": "collection"}} }
+            "schema":  { "items_schema": { "version": 1, "fields": {…}, "default_access": "auto", "strict_unknown_fields": false, "constraints": [], "_meta": {"tier": "collection", "source": "collection"} } }
           }
         }
       },
@@ -441,6 +441,11 @@ pointing operators at the discriminator field.
   dispatch
 - `docs/components/platform_engines.md` — engines layer, lifecycle,
   the `EngineInstanceCache` contract
+- `docs/components/items_schema.md` — the `items_schema` config field
+  surface (top-level fields, the `FieldDefinition` object, access intent,
+  constraints, validate-time guards)
+- `docs/components/field-types.md` — the `data_type` / `subtype`
+  vocabulary referenced by `items_schema.fields`
 - `docs/components/sidecar_configs.md` — sidecar configurations on PG-
   backed items drivers (full default field surface)
 - `notebook_showcase/notebooks/cycle_f_use_cases/` — four worked
