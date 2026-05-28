@@ -282,6 +282,14 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         context: Optional[Dict[str, Any]] = None,
         db_resource: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
+        from dynastore.modules.storage.routing_config import (
+            get_output_transformers_for_search,
+        )
+        from dynastore.modules.storage.transform_runtime import (
+            restore_transform_chain,
+        )
+        from dynastore.tools.typed_store.base import _to_snake
+
         client = self._get_client()
         if not client:
             return None
@@ -293,9 +301,25 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 id=_doc_id(catalog_id, collection_id),
                 params={"routing": catalog_id},
             )
-            return self._unenrich_doc(resp["_source"])
+            doc = self._unenrich_doc(resp["_source"])
         except Exception:
             return None
+
+        restore_chain = await get_output_transformers_for_search(
+            catalog_id,
+            entity="collection",
+            collection_id=collection_id,
+            driver_ref=_to_snake(type(self).__name__),
+        )
+        if restore_chain:
+            doc = await restore_transform_chain(
+                doc,
+                restore_chain,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                entity_kind="collection",
+            )
+        return doc
 
     async def upsert_metadata(
         self,
@@ -546,6 +570,15 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             "sort": [{"_score": "desc"}, {"id": "asc"}],
         }
 
+        from dynastore.modules.storage.routing_config import (
+            get_output_transformers_for_search,
+        )
+        from dynastore.modules.storage.transform_runtime import (
+            restore_transform_chain,
+        )
+        from dynastore.tools.typed_store.base import _to_snake
+
+        driver_ref = _to_snake(type(self).__name__)
         try:
             resp = await client.search(
                 index=index_name,
@@ -555,10 +588,28 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             hits = resp.get("hits", {})
             total = hits.get("total", {})
             total_count = total.get("value", 0) if isinstance(total, dict) else total
-            results = [
-                self._unenrich_doc(hit["_source"])
-                for hit in hits.get("hits", [])
-            ]
+            # Resolve the output-transformer chain once for this search
+            # (collection_id is unknown at the catalog-wide search level; each
+            # hit carries its own id which could be used for per-collection
+            # resolution, but a catalog-level chain suffices for now).
+            restore_chain = await get_output_transformers_for_search(
+                catalog_id,
+                entity="collection",
+                collection_id=None,
+                driver_ref=driver_ref,
+            )
+            results: List[Dict[str, Any]] = []
+            for hit in hits.get("hits", []):
+                doc = self._unenrich_doc(hit["_source"])
+                if restore_chain:
+                    doc = await restore_transform_chain(
+                        doc,
+                        restore_chain,
+                        catalog_id=catalog_id,
+                        collection_id=None,
+                        entity_kind="collection",
+                    )
+                results.append(doc)
             return results, total_count
         except Exception as e:
             logger.warning("search_metadata ES error for %s: %s", catalog_id, e)

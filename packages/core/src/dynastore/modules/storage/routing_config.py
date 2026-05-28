@@ -594,6 +594,10 @@ class ItemsRoutingConfig(_RoutingConfigBase):
     # default (e.g. a routing preset) must surface in the catalog view even
     # though the immutability gate stays collection-scoped (``_freeze_at``).
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
+    # ItemsElasticsearchDriver.read_entities and the envelope/private siblings
+    # invoke get_output_transformers_for_search + restore_transform_chain, so
+    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -778,6 +782,10 @@ class CollectionRoutingConfig(_RoutingConfigBase):
     # catalog-tier default must surface in the catalog view while the
     # immutability gate stays collection-scoped (``_freeze_at``).
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
+    # CollectionElasticsearchDriver.get_metadata and search_metadata invoke
+    # get_output_transformers_for_search + restore_transform_chain, so
+    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -966,7 +974,10 @@ class CatalogRoutingConfig(_RoutingConfigBase):
     # no longer depends on the unimplemented ``_freeze_at="catalog"`` hide-
     # at-collection rule.
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog")
-
+    # CatalogElasticsearchDriver.get_catalog_metadata invokes
+    # get_output_transformers_for_search + restore_transform_chain, so
+    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {

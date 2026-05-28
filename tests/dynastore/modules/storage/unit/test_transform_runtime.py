@@ -349,11 +349,11 @@ def test_deferred_hop_warns_once_for_read_input_transformers(caplog):
     assert matches == [], "Second load must not re-emit; dedupe failed"
 
 
-def test_search_output_transformers_warn_on_non_asset_tier(caplog):
-    """geoid#1567: read-side restore_from_index is wired only for the asset
-    tier, so SEARCH ``output_transformers`` on a collection/items tier validate
-    but never run. The validator must WARN (not silently accept) so the no-op
-    surfaces at config-load."""
+def test_search_output_transformers_silent_on_collection_tier(caplog):
+    """geoid#1574: CollectionElasticsearchDriver.get_metadata and search_metadata
+    now invoke the restore chain, so ``_wired_output_search_hop=True`` on
+    CollectionRoutingConfig. A SEARCH ``output_transformers`` declaration there
+    must NOT emit a deferred-hop WARN — it is fully wired."""
     from dynastore.modules.storage.routing_config import (
         CollectionRoutingConfig,
         Operation,
@@ -382,11 +382,10 @@ def test_search_output_transformers_warn_on_non_asset_tier(caplog):
     matches = [
         rec for rec in caplog.records
         if "output_transformers declared on operation 'SEARCH'" in rec.message
-        and "restore_from_index is wired only for the asset tier" in rec.message
     ]
-    assert len(matches) == 1, (
-        "Expected exactly one SEARCH-output deferred-hop WARN on a non-asset "
-        "tier; got %d" % len(matches)
+    assert matches == [], (
+        "Collection tier SEARCH output_transformers is wired (geoid#1574) — "
+        "must not warn; got %d WARN(s)" % len(matches)
     )
 
 
@@ -520,3 +519,471 @@ async def test_per_item_failure_isolation_with_transformer_at_index_hop():
     assert received_ids == ["ok-1", "ok-2"]
     for op in indexer.received:
         assert op.payload is not None and op.payload.get("seen") is True
+
+
+# ---------------------------------------------------------------------------
+# geoid#1574 — Wire read-side restore into collection/catalog/items ES drivers
+# ---------------------------------------------------------------------------
+
+
+class _PrefixTransformer:
+    """Test transformer: adds/removes a sentinel key on apply/restore.
+
+    Operates on dict entities: ``apply`` adds ``{"_t": tag}``; ``restore``
+    removes it. Used to verify the restore hook fires (key gone from result)
+    vs. does not fire (key still present).
+    """
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    async def transform_for_index(
+        self, entity, *, catalog_id, collection_id, entity_kind,
+    ):
+        out = dict(entity)
+        out["_t"] = self.tag
+        return out
+
+    async def restore_from_index(
+        self, doc, *, catalog_id, collection_id, entity_kind,
+    ):
+        out = dict(doc)
+        out.pop("_t", None)
+        return out
+
+
+# ---  ItemsElasticsearchDriver.read_entities (entity="item") ---------------
+
+
+@pytest.mark.asyncio
+async def test_items_es_driver_read_entities_no_op_when_chain_empty():
+    """Empty output_transformer chain leaves each yielded item byte-identical."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_hit = {"id": "item-1", "type": "Feature", "geometry": None, "properties": {}}
+
+    fake_es = MagicMock()
+    fake_es.indices = MagicMock()
+    fake_es.indices.exists = AsyncMock(return_value=True)
+    fake_es.search = AsyncMock(return_value={
+        "hits": {"hits": [{"_source": raw_hit}]},
+    })
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([]),
+    ) as _mock, patch(
+        "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+        return_value=fake_es,
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch.ItemsElasticsearchDriver"
+        "._resolve_read_policy",
+        new_callable=AsyncMock,
+        return_value=None,
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch.ItemsElasticsearchDriver"
+        "._build_read_search_body",
+        return_value=({"query": {}}, {}),
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch.ItemsElasticsearchDriver"
+        "._es_source_to_feature",
+        side_effect=lambda src, _rp: src,
+    ):
+        from dynastore.modules.storage.drivers.elasticsearch import ItemsElasticsearchDriver
+        from dynastore.models.query_builder import QueryRequest
+
+        driver = ItemsElasticsearchDriver.__new__(ItemsElasticsearchDriver)
+        request = MagicMock(spec=QueryRequest)
+        results = [
+            item async for item in driver.read_entities(
+                "cat", "col", request=request, limit=10,
+            )
+        ]
+
+    # No transformer fired — raw_hit must come back unchanged.
+    assert results == [raw_hit]
+
+
+@pytest.mark.asyncio
+async def test_items_es_driver_read_entities_applies_restore_chain():
+    """Configured output_transformer.restore_from_index runs per yielded item."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_hit = {"id": "item-1", "_t": "X", "type": "Feature", "geometry": None, "properties": {}}
+    transformer = _PrefixTransformer("X")
+
+    fake_es = MagicMock()
+    fake_es.indices = MagicMock()
+    fake_es.indices.exists = AsyncMock(return_value=True)
+    fake_es.search = AsyncMock(return_value={
+        "hits": {"hits": [{"_source": raw_hit}]},
+    })
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([transformer]),
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+        return_value=fake_es,
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch.ItemsElasticsearchDriver"
+        "._resolve_read_policy",
+        new_callable=AsyncMock,
+        return_value=None,
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch.ItemsElasticsearchDriver"
+        "._build_read_search_body",
+        return_value=({"query": {}}, {}),
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch.ItemsElasticsearchDriver"
+        "._es_source_to_feature",
+        side_effect=lambda src, _rp: src,
+    ):
+        from dynastore.modules.storage.drivers.elasticsearch import ItemsElasticsearchDriver
+        from dynastore.models.query_builder import QueryRequest
+
+        driver = ItemsElasticsearchDriver.__new__(ItemsElasticsearchDriver)
+        request = MagicMock(spec=QueryRequest)
+        results = [
+            item async for item in driver.read_entities(
+                "cat", "col", request=request, limit=10,
+            )
+        ]
+
+    assert len(results) == 1
+    # restore_from_index must have stripped the sentinel "_t" key.
+    assert "_t" not in results[0]
+
+
+# ---  ItemsElasticsearchEnvelopeDriver.read_entities (entity="item") -------
+
+
+@pytest.mark.asyncio
+async def test_envelope_driver_read_entities_no_op_when_chain_empty():
+    """Empty chain leaves items unchanged in the envelope driver."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_src = {"id": "e-1", "type": "Feature", "geoid": "e-1", "geometry": None}
+
+    fake_es = MagicMock()
+    fake_es.indices = MagicMock()
+    fake_es.indices.exists = AsyncMock(return_value=True)
+    fake_es.search = AsyncMock(return_value={
+        "hits": {"hits": [{"_source": raw_src}]},
+    })
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([]),
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch_envelope.driver"
+        ".ItemsElasticsearchEnvelopeDriver._items_index_name",
+        return_value="test-cat-envelope-items",
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch_envelope.driver"
+        ".ItemsElasticsearchEnvelopeDriver._get_client",
+        return_value=fake_es,
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch_envelope.driver"
+        ".ItemsElasticsearchEnvelopeDriver._build_read_search_body",
+        return_value=({"query": {}}, {}),
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch_envelope.driver"
+        ".ItemsElasticsearchEnvelopeDriver._envelope_source_to_feature",
+        side_effect=lambda src, cat, col, geoid: src,
+    ):
+        from dynastore.modules.storage.drivers.elasticsearch_envelope.driver import (
+            ItemsElasticsearchEnvelopeDriver,
+        )
+        from dynastore.models.query_builder import QueryRequest
+
+        driver = ItemsElasticsearchEnvelopeDriver.__new__(ItemsElasticsearchEnvelopeDriver)
+        request = MagicMock(spec=QueryRequest)
+        results = [
+            item async for item in driver.read_entities(
+                "cat", "col", request=request, limit=10,
+            )
+        ]
+
+    assert results == [raw_src]
+
+
+@pytest.mark.asyncio
+async def test_envelope_driver_read_entities_applies_restore_chain():
+    """Configured transformer's restore_from_index runs per yielded item."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_src = {"id": "e-1", "_t": "X", "geoid": "e-1"}
+    transformer = _PrefixTransformer("X")
+
+    fake_es = MagicMock()
+    fake_es.indices = MagicMock()
+    fake_es.indices.exists = AsyncMock(return_value=True)
+    fake_es.search = AsyncMock(return_value={
+        "hits": {"hits": [{"_source": raw_src}]},
+    })
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([transformer]),
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch_envelope.driver"
+        ".ItemsElasticsearchEnvelopeDriver._items_index_name",
+        return_value="test-cat-envelope-items",
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch_envelope.driver"
+        ".ItemsElasticsearchEnvelopeDriver._get_client",
+        return_value=fake_es,
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch_envelope.driver"
+        ".ItemsElasticsearchEnvelopeDriver._build_read_search_body",
+        return_value=({"query": {}}, {}),
+    ), patch(
+        "dynastore.modules.storage.drivers.elasticsearch_envelope.driver"
+        ".ItemsElasticsearchEnvelopeDriver._envelope_source_to_feature",
+        side_effect=lambda src, cat, col, geoid: src,
+    ):
+        from dynastore.modules.storage.drivers.elasticsearch_envelope.driver import (
+            ItemsElasticsearchEnvelopeDriver,
+        )
+        from dynastore.models.query_builder import QueryRequest
+
+        driver = ItemsElasticsearchEnvelopeDriver.__new__(ItemsElasticsearchEnvelopeDriver)
+        request = MagicMock(spec=QueryRequest)
+        results = [
+            item async for item in driver.read_entities(
+                "cat", "col", request=request, limit=10,
+            )
+        ]
+
+    assert len(results) == 1
+    assert "_t" not in results[0]
+
+
+# ---  CollectionElasticsearchDriver.get_metadata (entity="collection") -----
+
+
+@pytest.mark.asyncio
+async def test_collection_es_driver_get_metadata_no_op_when_chain_empty():
+    """Empty chain → collection metadata passes through _unenrich_doc unchanged."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_doc = {"id": "col-1", "description": "desc"}
+
+    fake_client = MagicMock()
+    fake_client.get = AsyncMock(return_value={"_source": raw_doc})
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([]),
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._get_client",
+        return_value=fake_client,
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._index_name",
+        return_value="test-collections",
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._unenrich_doc",
+        side_effect=lambda d: d,
+    ):
+        from dynastore.modules.elasticsearch.collection_es_driver import CollectionElasticsearchDriver
+
+        driver = CollectionElasticsearchDriver.__new__(CollectionElasticsearchDriver)
+        result = await driver.get_metadata("cat", "col-1")
+
+    assert result == raw_doc
+
+
+@pytest.mark.asyncio
+async def test_collection_es_driver_get_metadata_applies_restore_chain():
+    """Configured transformer restores each collection metadata document."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_doc = {"id": "col-1", "_t": "X", "description": "desc"}
+    transformer = _PrefixTransformer("X")
+
+    fake_client = MagicMock()
+    fake_client.get = AsyncMock(return_value={"_source": raw_doc})
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([transformer]),
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._get_client",
+        return_value=fake_client,
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._index_name",
+        return_value="test-collections",
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._unenrich_doc",
+        side_effect=lambda d: d,
+    ):
+        from dynastore.modules.elasticsearch.collection_es_driver import CollectionElasticsearchDriver
+
+        driver = CollectionElasticsearchDriver.__new__(CollectionElasticsearchDriver)
+        result = await driver.get_metadata("cat", "col-1")
+
+    assert result is not None
+    assert "_t" not in result
+
+
+# ---  CollectionElasticsearchDriver.search_metadata (entity="collection") --
+
+
+@pytest.mark.asyncio
+async def test_collection_es_driver_search_metadata_no_op_when_chain_empty():
+    """Empty chain → search_metadata results pass through unchanged."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_doc = {"id": "col-1", "description": "desc"}
+
+    fake_client = MagicMock()
+    fake_client.search = AsyncMock(return_value={
+        "hits": {"hits": [{"_source": raw_doc}], "total": {"value": 1}},
+    })
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([]),
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._get_client",
+        return_value=fake_client,
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._index_name",
+        return_value="test-collections",
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._unenrich_doc",
+        side_effect=lambda d: d,
+    ):
+        from dynastore.modules.elasticsearch.collection_es_driver import CollectionElasticsearchDriver
+
+        driver = CollectionElasticsearchDriver.__new__(CollectionElasticsearchDriver)
+        results, total = await driver.search_metadata("cat", limit=10)
+
+    assert results == [raw_doc]
+    assert total == 1
+
+
+@pytest.mark.asyncio
+async def test_collection_es_driver_search_metadata_applies_restore_chain():
+    """Configured transformer restores each hit returned by search_metadata."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_doc = {"id": "col-1", "_t": "X", "description": "desc"}
+    transformer = _PrefixTransformer("X")
+
+    fake_client = MagicMock()
+    fake_client.search = AsyncMock(return_value={
+        "hits": {"hits": [{"_source": raw_doc}], "total": {"value": 1}},
+    })
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([transformer]),
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._get_client",
+        return_value=fake_client,
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._index_name",
+        return_value="test-collections",
+    ), patch(
+        "dynastore.modules.elasticsearch.collection_es_driver"
+        ".CollectionElasticsearchDriver._unenrich_doc",
+        side_effect=lambda d: d,
+    ):
+        from dynastore.modules.elasticsearch.collection_es_driver import CollectionElasticsearchDriver
+
+        driver = CollectionElasticsearchDriver.__new__(CollectionElasticsearchDriver)
+        results, total = await driver.search_metadata("cat", limit=10)
+
+    assert len(results) == 1
+    assert "_t" not in results[0]
+
+
+# ---  CatalogElasticsearchDriver.get_catalog_metadata (entity="catalog") ---
+
+
+@pytest.mark.asyncio
+async def test_catalog_es_driver_get_metadata_no_op_when_chain_empty():
+    """Empty chain → catalog metadata passes through unchanged."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_doc = {"id": "cat-1", "description": "catalog"}
+
+    fake_client = MagicMock()
+    fake_client.indices = MagicMock()
+    fake_client.indices.exists = AsyncMock(return_value=True)
+    fake_client.get = AsyncMock(return_value={"_source": raw_doc})
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([]),
+    ), patch(
+        "dynastore.modules.elasticsearch.catalog_es_driver"
+        ".CatalogElasticsearchDriver._get_client",
+        return_value=fake_client,
+    ), patch(
+        "dynastore.modules.elasticsearch.catalog_es_driver"
+        ".CatalogElasticsearchDriver._index_name",
+        return_value="test-catalog-meta",
+    ):
+        from dynastore.modules.elasticsearch.catalog_es_driver import CatalogElasticsearchDriver
+
+        driver = CatalogElasticsearchDriver.__new__(CatalogElasticsearchDriver)
+        result = await driver.get_catalog_metadata("cat-1")
+
+    assert result == raw_doc
+
+
+@pytest.mark.asyncio
+async def test_catalog_es_driver_get_metadata_applies_restore_chain():
+    """Configured transformer restores the catalog metadata document."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    raw_doc = {"id": "cat-1", "_t": "X", "description": "catalog"}
+    transformer = _PrefixTransformer("X")
+
+    fake_client = MagicMock()
+    fake_client.indices = MagicMock()
+    fake_client.indices.exists = AsyncMock(return_value=True)
+    fake_client.get = AsyncMock(return_value={"_source": raw_doc})
+
+    with patch(
+        "dynastore.modules.storage.routing_config.get_output_transformers_for_search",
+        new_callable=lambda: lambda *a, **kw: _async_return([transformer]),
+    ), patch(
+        "dynastore.modules.elasticsearch.catalog_es_driver"
+        ".CatalogElasticsearchDriver._get_client",
+        return_value=fake_client,
+    ), patch(
+        "dynastore.modules.elasticsearch.catalog_es_driver"
+        ".CatalogElasticsearchDriver._index_name",
+        return_value="test-catalog-meta",
+    ):
+        from dynastore.modules.elasticsearch.catalog_es_driver import CatalogElasticsearchDriver
+
+        driver = CatalogElasticsearchDriver.__new__(CatalogElasticsearchDriver)
+        result = await driver.get_catalog_metadata("cat-1")
+
+    assert result is not None
+    assert "_t" not in result
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+async def _async_return(value):
+    """Coroutine that returns ``value`` — used as a patch side_effect."""
+    return value
