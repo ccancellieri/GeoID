@@ -705,6 +705,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             "+ %s sidecars",
             schema, physical_table, len(col_config.sidecars),
         )
+        reconciled_sidecars: List[Any] = []
         async with managed_transaction(db_resource) as conn:
             await DDLQuery(create_hub_sql).execute(conn)
 
@@ -715,6 +716,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                 try:
                     sidecar_impl = SidecarRegistry.get_sidecar(sidecar_config)
                     if sidecar_impl is None:
+                        reconciled_sidecars.append(sidecar_config)
                         continue
                     sc_has_validity = sidecar_impl.has_validity()
                     ddl_statements = sidecar_impl.get_ddl(
@@ -727,8 +729,32 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     await sidecar_impl.setup_lifecycle_hooks(
                         conn, schema, f"{physical_table}_{sidecar_impl.sidecar_id}"
                     )
+                    # The bridge force-promotes every items_schema field to a
+                    # COLUMNAR attribute_schema entry, but ``CREATE TABLE IF NOT
+                    # EXISTS`` above is a no-op on an already-materialised
+                    # collection — so a newly-promoted column never reaches the
+                    # table. Persisting it would make the sidecar advertise a
+                    # SELECT of a non-existent column → UndefinedColumnError at
+                    # read time (#1491 crash class). Reconcile the config down to
+                    # the columns that physically exist; the missing field then
+                    # degrades to the read-side silent-skip + WARN path. Adding
+                    # the column requires a fresh (re)provision — the app never
+                    # ALTERs an existing table.
+                    sidecar_config = await self._reconcile_columnar_attribute_schema(
+                        conn,
+                        schema=schema,
+                        physical_table=physical_table,
+                        sidecar_config=sidecar_config,
+                        sidecar_impl=sidecar_impl,
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                    )
+                    reconciled_sidecars.append(sidecar_config)
                 except ValueError as e:
                     logger.warning("Skipping sidecar table creation: %s", e)
+                    reconciled_sidecars.append(sidecar_config)
+
+        col_config = col_config.model_copy(update={"sidecars": reconciled_sidecars})
 
         # --- Store physical_table in driver config ---
         from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
@@ -754,6 +780,89 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             "ItemsPostgresqlDriver.ensure_storage: created hub '%s' + sidecars for %s/%s",
             physical_table, catalog_id, collection_id,
         )
+
+    async def _reconcile_columnar_attribute_schema(
+        self,
+        conn: Any,
+        *,
+        schema: str,
+        physical_table: str,
+        sidecar_config: Any,
+        sidecar_impl: Any,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Any:
+        """Drop COLUMNAR attribute entries whose physical column is absent.
+
+        Read-only reconciliation (no DDL): introspects the materialised sidecar
+        table and removes any ``attribute_schema`` entry that has no physical
+        column, so the persisted config can never advertise a column the table
+        lacks (which the sidecar would emit as ``SELECT "<col>"`` →
+        ``UndefinedColumnError``; the #1491 crash class). Honours
+        ``feedback_never_migrate_db`` — the missing column is only ever added by
+        a fresh (re)provision, never by ``ALTER TABLE`` from the app.
+
+        Fails open: any introspection error leaves the config untouched (the
+        column-creation path normally succeeds on a fresh table, so the only
+        config that can diverge is one whose table predates the new field).
+        """
+        from dynastore.modules.storage.drivers.pg_sidecars.attributes import (
+            FeatureAttributeSidecar,
+        )
+        from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+            AttributeStorageMode,
+        )
+
+        if not isinstance(sidecar_impl, FeatureAttributeSidecar):
+            return sidecar_config
+        if sidecar_impl.resolved_storage_mode != AttributeStorageMode.COLUMNAR:
+            # JSONB blob catches every un-promoted field — nothing to verify.
+            return sidecar_config
+        entries = list(getattr(sidecar_config, "attribute_schema", None) or [])
+        if not entries:
+            return sidecar_config
+
+        from dynastore.modules.db_config import shared_queries
+        from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+        from dynastore.modules.storage.field_constraints import (
+            reconcile_attribute_schema_to_columns,
+        )
+
+        attr_table = f"{physical_table}_{sidecar_impl.sidecar_id}"
+        try:
+            exists = await shared_queries.table_exists_query.execute(
+                conn, schema=schema, table=attr_table
+            )
+            if not exists:
+                # Table was not created (e.g. a lenient skip above); leaving the
+                # config intact is correct — there is nothing to diverge from.
+                return sidecar_config
+            rows = await DQLQuery(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table",
+                result_handler=ResultHandler.ALL_DICTS,
+            ).execute(conn, schema=schema, table=attr_table)
+        except Exception as exc:  # introspection failure → fail open
+            logger.warning(
+                "Could not introspect '%s.%s' to reconcile attribute_schema for "
+                "%s/%s (%s); leaving sidecar config unchanged.",
+                schema, attr_table, catalog_id, collection_id, exc,
+            )
+            return sidecar_config
+
+        physical_cols = {r["column_name"] for r in (rows or [])}
+        kept, dropped = reconcile_attribute_schema_to_columns(entries, physical_cols)
+        if not dropped:
+            return sidecar_config
+        logger.warning(
+            "Collection %s/%s: %d attribute(s) declared in items_schema are "
+            "absent from the already-materialised COLUMNAR sidecar '%s' and were "
+            "dropped from the persisted config to avoid emitting SELECTs against "
+            "non-existent columns: %s. Re-provision the collection (fresh table) "
+            "to add these columns — the app does not ALTER existing tables.",
+            catalog_id, collection_id, len(dropped), attr_table, sorted(dropped),
+        )
+        return sidecar_config.model_copy(update={"attribute_schema": kept})
 
     # Collection-metadata CRUD has moved to the domain-scoped drivers +
     # :mod:`dynastore.modules.catalog.collection_router`.  The

@@ -299,6 +299,38 @@ def bridge_schema_to_attribute_sidecar(
     return sidecar.model_copy(update={"attribute_schema": merged})
 
 
+def reconcile_attribute_schema_to_columns(
+    entries: "list[Any]",
+    physical_columns: "set[str]",
+) -> "tuple[list[Any], list[str]]":
+    """Drop advertised attribute columns that are not physically present.
+
+    The write-side inverse of :func:`bridge_schema_to_attribute_sidecar`.
+    The bridge *adds* an ``AttributeSchemaEntry`` for every items_schema field
+    when a sidecar resolves COLUMNAR-only; this *removes* any entry whose
+    physical column does not actually exist in the materialised sidecar table.
+
+    Why this is needed (#1489 follow-up on #1488/#1491): ``ensure_storage``
+    emits the sidecar table with ``CREATE TABLE IF NOT EXISTS``. On an
+    already-materialised collection that DDL is a no-op, so a column the bridge
+    newly promoted into ``attribute_schema`` never reaches the table. Persisting
+    that config anyway makes the sidecar advertise a ``SELECT`` of a column that
+    does not exist → ``UndefinedColumnError`` at read time (the #1491 crash
+    class). The app may not ``ALTER TABLE ADD COLUMN`` to heal it (no in-place
+    DDL), so the config is reconciled down to physical reality instead: the
+    field then degrades to the read-side silent-skip + WARN path, and a fresh
+    (re)provision remains the only way to actually add the column.
+
+    Column names are compared exactly — sidecar columns are created with quoted
+    identifiers, so PostgreSQL preserves their case in ``information_schema``.
+
+    Returns ``(kept_entries, dropped_names)`` preserving the input order.
+    """
+    kept = [e for e in entries if e.name in physical_columns]
+    dropped = [e.name for e in entries if e.name not in physical_columns]
+    return kept, dropped
+
+
 def overlay_schema_flags(
     schema: "Optional[ItemsSchema]",
     fields: Dict[str, FieldDefinition],

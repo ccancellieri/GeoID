@@ -95,26 +95,6 @@ Unsafe operations are never executed by `apply_safe_ops` — they require the fu
 
 ---
 
-## Sidecar Evolution Hook
-
-Sidecar classes (subclasses of `SidecarProtocol`) can optionally implement `get_evolution_ddl()` to produce custom `ALTER TABLE` DDL for their own sidecar table:
-
-```python
-def get_evolution_ddl(
-    self,
-    physical_table: str,
-    current_columns: Set[str],
-    target_columns: Dict[str, str],
-    partition_keys: List[str] = [],
-    partition_key_types: Dict[str, str] = {},
-) -> Optional[str]:
-    """Return ALTER TABLE DDL for safe column additions, or None if unsafe."""
-```
-
-Default implementation adds new columns (`ADD COLUMN IF NOT EXISTS`) if no columns are being removed. If any column removal is detected it returns `None`, signalling that an export-import is required for this sidecar table. Sidecar subclasses may override this to provide more specific logic.
-
----
-
 ## Schema Hash (Drift Detection)
 
 After a collection is physically created, `collection_service.py` computes:
@@ -175,7 +155,6 @@ DELETE /admin/schemas/{catalog_id}/{collection_id}/backups/{timestamp}  — expl
 | Path | Purpose |
 |------|---------|
 | `src/dynastore/modules/catalog/schema_evolution.py` | `SchemaEvolutionEngine`, `EvolutionPlan`, `SchemaOp`, `ItemsSchema` |
-| `src/dynastore/modules/catalog/sidecars/base.py` | `SidecarProtocol.get_evolution_ddl()` hook |
 | `src/dynastore/modules/catalog/collection_service.py` | Schema hash storage after physical table creation |
 | `src/dynastore/extensions/admin/migration_routes.py` | Schema health + evolve API endpoints |
 | `tests/dynastore/modules/catalog/unit/test_schema_evolution.py` | Unit tests: diff, type compat, safe/unsafe classification |

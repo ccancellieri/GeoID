@@ -659,55 +659,6 @@ class SidecarProtocol(ABC):
         """
         pass
 
-    def get_evolution_ddl(
-        self,
-        physical_table: str,
-        current_columns: Set[str],
-        target_columns: Dict[str, str],
-        partition_keys: List[str] = [],
-        partition_key_types: Dict[str, str] = {},
-    ) -> Optional[str]:
-        """
-        Returns ALTER TABLE DDL for safe schema evolution, or None if
-        the changes require a full export-import (unsafe).
-
-        Override in sidecar implementations to provide custom evolution
-        logic (e.g. adding H3 index columns at a new resolution).
-
-        Default implementation: returns ADD COLUMN statements for new
-        columns, or None if any column was removed or changed type.
-
-        Args:
-            physical_table:    Base physical table name (hub).
-            current_columns:   Set of column names currently in the DB.
-            target_columns:    Dict of column_name → SQL type spec from config.
-            partition_keys:    Active partition keys.
-            partition_key_types: Map of partition key → SQL type.
-
-        Returns:
-            SQL string with safe ALTER TABLE statements, or None if
-            export-import is required.
-        """
-        new_cols = set(target_columns.keys()) - current_columns
-        removed_cols = current_columns - set(target_columns.keys())
-
-        # If columns were removed, we can't do it safely
-        if removed_cols:
-            return None
-
-        if not new_cols:
-            return None  # Nothing to do
-
-        sidecar_table = f"{physical_table}_{self.sidecar_id}"
-        stmts: List[str] = []
-        for col_name in sorted(new_cols):
-            col_spec = target_columns[col_name]
-            stmts.append(
-                f'ALTER TABLE "{{schema}}"."{sidecar_table}" '
-                f'ADD COLUMN IF NOT EXISTS "{col_name}" {col_spec};'
-            )
-        return "\n".join(stmts)
-
     @abstractmethod
     async def setup_lifecycle_hooks(
         self, conn: DbResource, schema: str, table_name: str
