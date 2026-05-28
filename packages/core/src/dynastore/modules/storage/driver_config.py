@@ -1712,13 +1712,24 @@ async def _validate_items_schema_reserved_names(
         return
     if not config.fields:
         return
-    collisions = [name for name in config.fields if name in _PRIVATE_RESERVED_ROOT_FIELDS]
-    if collisions:
+    # A field collides whether the reserved name is used as the declared key
+    # (``name``) OR as the read-time rename (``alias``): an alias of e.g.
+    # ``geometry`` would shadow the system field on the wire exactly as a
+    # like-named key would in storage (#1489 item 3). Both are reported in one
+    # error so the operator fixes every offender in a single pass.
+    collisions = sorted(n for n in config.fields if n in _PRIVATE_RESERVED_ROOT_FIELDS)
+    alias_collisions = sorted(
+        f"{n} (alias={fd.alias!r})"
+        for n, fd in config.fields.items()
+        if fd.alias and fd.alias in _PRIVATE_RESERVED_ROOT_FIELDS
+    )
+    if collisions or alias_collisions:
+        offenders = collisions + alias_collisions
         raise ValueError(
-            f"ItemsSchema.fields declares reserved root name(s) {sorted(collisions)} "
+            f"ItemsSchema.fields declares reserved root name(s) {offenders} "
             f"— these collide with the tenant feature mapping at the document root. "
             f"Reserved names: {sorted(_PRIVATE_RESERVED_ROOT_FIELDS)}. "
-            f"Rename the property (e.g. add a domain prefix)."
+            f"Rename the property/alias (e.g. add a domain prefix)."
         )
 
 
@@ -1746,8 +1757,14 @@ async def _validate_items_schema_storage_realizable(
     fire under correct code. It is the backstop: if a future regression
     weakens the bridge, the operator hears about it at config-save instead
     of discovering empty MVT tiles weeks later (see #1488 / #1491).
-    Best-effort sibling lookup: if the PG driver config is not yet present
-    (first-save case), the validator skips silently.
+
+    Coverage holds from the FIRST save (#1489 follow-up): when no PG driver
+    config exists yet — the typical first-save case, before the collection
+    materialises — the bridge is simulated against a default AUTOMATIC sidecar
+    rather than skipped. The realizability invariant is therefore enforced
+    before any DDL is ever emitted, not only once a driver config is present.
+    Simulation is config-only (pure :func:`bridge_schema_to_attribute_sidecar`,
+    no ``ALTER TABLE``), so it honours ``feedback_never_migrate_db``.
     """
     if not isinstance(config, ItemsSchema):
         return
@@ -1768,31 +1785,32 @@ async def _validate_items_schema_storage_realizable(
         )
         from dynastore.tools.discovery import get_protocol
 
-        configs = get_protocol(ConfigsProtocol)
-        if not configs:
-            return
-
-        try:
-            driver_cfg = await configs.get_config(
-                CollectionPostgresqlDriverConfig,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-            )
-        except Exception:
-            # No driver config yet (typical at first ItemsSchema save) —
-            # nothing to validate against. The realizability check fires the
-            # next time either side is touched.
-            return
-        if driver_cfg is None:
-            return
-
+        # Resolve the sidecar config to simulate the bridge against. Prefer the
+        # already-persisted PG driver config (post-provisioning reality). When it
+        # is absent — first ItemsSchema save, before the collection materialises,
+        # or no ConfigsProtocol registered — fall back to a default AUTOMATIC
+        # sidecar so the realizability invariant is enforced from the first save.
+        # The default is the most permissive resolution (AUTOMATIC + no columns →
+        # the bridge either promotes every field under COLUMNAR or resolves JSONB),
+        # so this fallback never rejects a schema the real provisioning bridge
+        # would have accepted — it only catches a genuine bridge regression.
         sidecar_cfg: "Optional[FeatureAttributeSidecarConfig]" = None
-        for sc in getattr(driver_cfg, "sidecars", None) or []:
-            if isinstance(sc, FeatureAttributeSidecarConfig):
-                sidecar_cfg = sc
-                break
+        configs = get_protocol(ConfigsProtocol)
+        if configs is not None:
+            try:
+                driver_cfg = await configs.get_config(
+                    CollectionPostgresqlDriverConfig,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+            except Exception:
+                driver_cfg = None
+            for sc in getattr(driver_cfg, "sidecars", None) or []:
+                if isinstance(sc, FeatureAttributeSidecarConfig):
+                    sidecar_cfg = sc
+                    break
         if sidecar_cfg is None:
-            return
+            sidecar_cfg = FeatureAttributeSidecarConfig()
 
         # Simulate the bridge against this items_schema; check the resulting
         # resolved mode the same way ``attributes.py`` does at DDL time.
