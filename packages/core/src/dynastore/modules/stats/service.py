@@ -18,13 +18,10 @@
 
 import os
 import logging
-import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime, timezone, date
+from typing import Optional, Dict, Any
+from datetime import datetime, timezone
 
-from dynastore.modules import get_protocol
-from dynastore.models.protocols import DatabaseProtocol
 from dynastore.modules.stats.storage import (
     AbstractStatsDriver,
     AccessRecord,

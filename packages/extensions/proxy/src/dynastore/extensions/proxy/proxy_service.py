@@ -30,7 +30,7 @@ from fastapi import (
     Query,
 )
 from fastapi.responses import RedirectResponse, StreamingResponse
-from typing import Optional, List
+from typing import Optional
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from dynastore.tools.cache import cached
@@ -39,9 +39,7 @@ from dynastore.modules.proxy.proxy_module import (
     get_long_url,
     get_analytics,
     delete_short_url,
-    get_urls_by_collection,
     log_redirect,
-    _get_proxy_module,
 )
 from dynastore.modules.concurrency import run_in_background
 from dynastore.modules.proxy.models import ShortURL, AnalyticsPage
@@ -52,8 +50,6 @@ from dynastore.models.protocols.stats import StatsProtocol
 from dynastore.tools.discovery import get_protocol
 from .models import ProxyRequest
 
-from . import hooks
-from . import tenant_initialization  # Registration trigger
 
 logger = logging.getLogger(__name__)
 
