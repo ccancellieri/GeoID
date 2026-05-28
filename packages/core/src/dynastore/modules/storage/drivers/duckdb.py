@@ -398,7 +398,10 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                             geo_col = col_name
                             break
                 except Exception:
-                    pass
+                    logger.debug(
+                        "duckdb: geometry-column detection failed; proceeding without it",
+                        exc_info=True,
+                    )
 
             if geo_col:
                 schema_cols = [row[0] for row in conn.execute(
@@ -894,7 +897,9 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                 if _p is not None:
                     policy = _p
         except Exception:
-            pass
+            logger.debug(
+                "duckdb: write-policy resolution failed; using default", exc_info=True
+            )
         ctx["_resolved_policy"] = policy
 
         return await run_in_thread(
@@ -985,7 +990,10 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                     if isinstance(cfg, ItemsSchema):
                         schema = cfg
                 except Exception:
-                    pass
+                    logger.debug(
+                        "duckdb: ItemsSchema config lookup failed; using default",
+                        exc_info=True,
+                    )
                 try:
                     cfg = await configs.get_config(
                         ItemsWritePolicy,
@@ -995,9 +1003,15 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                     if isinstance(cfg, ItemsWritePolicy):
                         policy = cfg
                 except Exception:
-                    pass
+                    logger.debug(
+                        "duckdb: ItemsWritePolicy config lookup failed; using default",
+                        exc_info=True,
+                    )
         except Exception:
-            pass
+            logger.debug(
+                "duckdb: config-protocol resolution unavailable; using defaults",
+                exc_info=True,
+            )
         return schema, policy
 
     async def ensure_storage(
@@ -1159,7 +1173,7 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                     )
                     result = overlay_schema_flags(schema_cfg, result)
             except Exception:
-                pass
+                logger.debug("duckdb: schema-flags overlay failed", exc_info=True)
             return result
         except Exception:
             return {}
@@ -1225,7 +1239,10 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                                 geo_col = col_name
                                 break
                     except Exception:
-                        pass
+                        logger.debug(
+                            "duckdb: geometry-column detection for extents failed",
+                            exc_info=True,
+                        )
 
                 extents: Dict[str, Any] = {}
 
@@ -1242,7 +1259,9 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                                 "bbox": [[float(row[0]), float(row[1]), float(row[2]), float(row[3])]]
                             }
                     except Exception:
-                        pass
+                        logger.debug(
+                            "duckdb: spatial-extent computation failed", exc_info=True
+                        )
 
                 try:
                     schema_rows = conn.execute(
@@ -1264,7 +1283,9 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
                                 "interval": [[str(row[0]), str(row[1]) if row[1] else None]]
                             }
                 except Exception:
-                    pass
+                    logger.debug(
+                        "duckdb: temporal-extent computation failed", exc_info=True
+                    )
 
                 return extents if extents else None
 
