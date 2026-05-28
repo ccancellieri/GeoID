@@ -2,6 +2,7 @@ from pathlib import Path
 
 from dynastore.modules.notebooks.example_registry import register_platform_notebook
 from . import config  # noqa: F401  -- service-exposure plugin registration
+from . import presets as _dimensions_presets  # noqa: F401 -- preset registration side-effect
 
 _examples_dir = Path(__file__).parent / "examples"
 

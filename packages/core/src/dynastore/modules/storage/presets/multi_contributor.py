@@ -29,10 +29,21 @@ subset — only the methods present are invoked):
                              ``ctx.iam.bind_policy_to_role``
   - ConfigContributor   : ``get_configs()``
                           -> ``ctx.config.set_config(type(c), c, scope...)``
+  - DataContributor     : ``get_data() -> Iterable[DataSeed]``
+                          -> ``ctx.catalogs`` ensures each seed's catalog +
+                             collection exist (created only when absent) and
+                             upserts the seed items.  Revoke removes only what
+                             apply created — items are always pulled back out,
+                             but a catalog/collection is deleted only if THIS
+                             apply created it and ``DataSeed.manage_catalog`` /
+                             ``manage_collection`` allow it (never a shared or
+                             pre-existing one).
 
-Routing / data contributor kinds are reserved for future expansion —
-add the new ``get_routing()`` / ``get_data()`` branches alongside the
-existing two when their backing ``PresetContext`` surface lands.
+The routing contributor kind (``get_routing()``) is still reserved for
+future expansion — add it alongside the others when its backing
+``PresetContext`` surface lands.  ``DataContributor`` requires
+``PresetContext.catalogs`` (the ``CatalogsProtocol``): a preset that ships a
+data contributor must run where that service is registered.
 
 ``PolicyContributorPreset`` (single-policy adapter, predates this
 module) remains the simpler tool for IAM-only presets.  Use
@@ -152,6 +163,120 @@ async def _apply_config_kind(
         applied_config_qualnames.append(qualname)
 
 
+async def _apply_data_kind(
+    preset_name: str,
+    contributor: Any,
+    ctx: PresetContext,
+    applied_data: List[dict],
+) -> None:
+    """Apply a data contributor: ensure catalog + collection exist, upsert items.
+
+    Each ``DataSeed`` is applied idempotently — the catalog and collection are
+    created only when absent (existence probed via ``get_catalog_model`` /
+    ``get_collection``). What this call actually created is recorded in
+    ``applied_data`` so ``revoke`` can undo exactly that and nothing the
+    operator owns.
+    """
+    if not hasattr(contributor, "get_data"):
+        return
+    if ctx.catalogs is None:
+        raise RuntimeError(
+            f"{preset_name}: data contributor present but PresetContext.catalogs "
+            "is None — the catalogs service is not registered in this context."
+        )
+    catalogs = ctx.catalogs
+    for seed in (contributor.get_data() or []):
+        record: dict = {
+            "catalog_id": seed.catalog_id,
+            "collection_id": seed.collection_id,
+            "created_catalog": False,
+            "created_collection": False,
+            "item_ids": [],
+            "manage_catalog": seed.manage_catalog,
+            "manage_collection": seed.manage_collection,
+        }
+
+        # --- Catalog (create only if absent) ---
+        existing_catalog = await catalogs.get_catalog_model(seed.catalog_id)
+        if existing_catalog is None:
+            cat_payload = dict(seed.catalog_data)
+            cat_payload.setdefault("id", seed.catalog_id)
+            await catalogs.create_catalog(cat_payload, lang=seed.lang)
+            record["created_catalog"] = True
+
+        # --- Collection (create only if absent) ---
+        existing_collection = await catalogs.get_collection(
+            seed.catalog_id, seed.collection_id, lang=seed.lang,
+        )
+        if existing_collection is None:
+            coll_payload = dict(seed.collection_data)
+            coll_payload.setdefault("id", seed.collection_id)
+            await catalogs.create_collection(
+                seed.catalog_id, coll_payload, lang=seed.lang,
+            )
+            record["created_collection"] = True
+
+        # --- Items ---
+        if seed.items:
+            await catalogs.upsert(
+                seed.catalog_id, seed.collection_id, list(seed.items),
+            )
+            record["item_ids"] = [
+                it["id"] for it in seed.items if isinstance(it, dict) and "id" in it
+            ]
+
+        applied_data.append(record)
+
+
+async def _revoke_data_kind(
+    preset_name: str,
+    ctx: PresetContext,
+    data_records: List[dict],
+) -> None:
+    """Undo a data contributor's seeds — items first, then collection, then
+    catalog, but only the catalog/collection rows THIS preset created and is
+    allowed to manage.  Reverse-iterates so later seeds unwind before earlier
+    ones (e.g. the seed that created a shared catalog is processed last)."""
+    if ctx.catalogs is None:
+        logger.warning(
+            "%s: cannot revoke data seeds — PresetContext.catalogs is None", preset_name,
+        )
+        return
+    catalogs = ctx.catalogs
+    for record in reversed(data_records):
+        catalog_id = record["catalog_id"]
+        collection_id = record["collection_id"]
+
+        # --- Items ---
+        for item_id in record.get("item_ids", []):
+            try:
+                await catalogs.delete_item(catalog_id, collection_id, item_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: delete_item %s/%s/%s failed: %s",
+                    preset_name, catalog_id, collection_id, item_id, exc,
+                )
+
+        # --- Collection (only if we created it and may manage it) ---
+        if record.get("created_collection") and record.get("manage_collection", True):
+            try:
+                await catalogs.delete_collection(catalog_id, collection_id, force=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: delete_collection %s/%s failed: %s",
+                    preset_name, catalog_id, collection_id, exc,
+                )
+
+        # --- Catalog (only if we created it and may manage it) ---
+        if record.get("created_catalog") and record.get("manage_catalog", True):
+            try:
+                await catalogs.delete_catalog(catalog_id, force=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: delete_catalog %s failed: %s", preset_name, catalog_id, exc,
+                )
+
+
 def _resolve_config_class(qualname: str) -> Any:
     """Import a config class by its ``module.QualName`` string.
 
@@ -261,6 +386,13 @@ class MultiContributorPreset:
                         target=qualname,
                         detail={"scope": scope},
                     ))
+            if hasattr(contributor, "get_data"):
+                for seed in (contributor.get_data() or []):
+                    entries.append(PresetPlanEntry(
+                        kind="seed_data",
+                        target=f"{seed.catalog_id}/{seed.collection_id}",
+                        detail={"items": len(seed.items)},
+                    ))
         return PresetPlan(
             preset_name=self.name,
             scope_key=scope,
@@ -276,6 +408,7 @@ class MultiContributorPreset:
         applied_policy_ids: List[str] = []
         applied_role_names: List[str] = []
         applied_config_qualnames: List[str] = []
+        applied_data: List[dict] = []
 
         for contributor in self._contributors_factory():
             await _apply_policy_kind(
@@ -287,12 +420,16 @@ class MultiContributorPreset:
             await _apply_config_kind(
                 self.name, contributor, ctx, scope, applied_config_qualnames,
             )
+            await _apply_data_kind(
+                self.name, contributor, ctx, applied_data,
+            )
 
         return AppliedDescriptor(payload={
             "preset_name": self.name,
             "policy_ids": applied_policy_ids,
             "role_names": applied_role_names,
             "config_qualnames": applied_config_qualnames,
+            "data": applied_data,
             "scope": scope,
         })
 
@@ -305,10 +442,14 @@ class MultiContributorPreset:
         policy_ids: List[str] = payload.get("policy_ids", [])
         role_names: List[str] = payload.get("role_names", [])
         config_qualnames: List[str] = payload.get("config_qualnames", [])
+        data_records: List[dict] = payload.get("data", [])
         scope: str = payload.get("scope", "platform")
 
         # Reverse the apply order so unwinding mirrors application:
-        # configs first, then role bindings, then policies.
+        # data first, then configs, then role bindings, then policies.
+
+        # --- Data seeds ---
+        await _revoke_data_kind(self.name, ctx, data_records)
 
         # --- Configs ---
         catalog_id, collection_id = _scope_to_catalog_collection(scope)

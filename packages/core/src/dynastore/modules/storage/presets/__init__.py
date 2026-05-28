@@ -53,6 +53,7 @@ from .routing_adapter import RoutingPresetAdapter  # noqa: F401
 
 # Built-in presets — auto-register on import.
 from .defaults_postgres import DefaultsPostgresPreset  # noqa: E402
+from .demo_data import DEMO_DATA_PRESET  # noqa: E402
 from .items_es_private import ItemsEsPrivatePreset  # noqa: E402
 from .private_catalog import PrivateCatalogPreset  # noqa: E402
 from .private_collection import PrivateCollectionPreset  # noqa: E402
@@ -63,6 +64,7 @@ register_preset(PrivateCatalogPreset())
 register_preset(DefaultsPostgresPreset())
 register_preset(PrivateCollectionPreset())
 register_preset(ItemsEsPrivatePreset())
+register_preset(DEMO_DATA_PRESET)
 
 # Curated composite presets — imported after all routing presets so their
 # children are already registered when the composites/__init__.py runs.

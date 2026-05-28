@@ -62,6 +62,7 @@ def _build_context(
     from dynastore.modules.iam.iam_service import IamService
     from dynastore.models.protocols.policies import PermissionProtocol
     from dynastore.models.protocols.configs import ConfigsProtocol
+    from dynastore.models.protocols import CatalogsProtocol
 
     return PresetContext(
         db=engine,
@@ -73,6 +74,9 @@ def _build_context(
         libs=None,
         principal=principal,
         scope=scope,
+        # Data-contributor surface — None when the catalogs service is not
+        # registered (e.g. IAM-only unit boots); data-seeding presets require it.
+        catalogs=get_protocol(CatalogsProtocol),
     )
 
 
