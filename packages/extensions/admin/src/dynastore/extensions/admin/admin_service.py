@@ -41,7 +41,7 @@ from dynastore.models.protocols.policies import (
     PermissionProtocol,
 )
 
-from dynastore.extensions.iam.guards import (
+from dynastore.extensions.tools.auth_guards import (
     ensure_privileged_role_assignment,
     security_context_from_request,
 )
