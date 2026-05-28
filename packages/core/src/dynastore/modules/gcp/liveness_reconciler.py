@@ -133,8 +133,13 @@ class GcpLivenessReconciler:
         self._task.cancel()
         try:
             await self._task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001 — teardown
-            pass
+        except asyncio.CancelledError:
+            pass  # expected — we just cancelled it
+        except Exception:
+            logger.warning(
+                "GCPLivenessReconciler: loop task errored during teardown",
+                exc_info=True,
+            )
         self._task = None
 
     # --- loop --------------------------------------------------------------

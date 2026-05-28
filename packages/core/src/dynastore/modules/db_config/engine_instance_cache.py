@@ -369,8 +369,13 @@ class EngineInstanceCache:
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            except asyncio.CancelledError:
+                pass  # expected — we just cancelled it
+            except Exception:
+                logger.warning(
+                    "Engine instance-cache sweep task errored during close",
+                    exc_info=True,
+                )
         for engine_ref in list(self._entries):
             await self.evict(engine_ref)
 

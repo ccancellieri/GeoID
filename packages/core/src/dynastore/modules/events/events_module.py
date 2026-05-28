@@ -625,8 +625,13 @@ class EventsModule(ModuleProtocol):
             backlog_task.cancel()
             try:
                 await backlog_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            except asyncio.CancelledError:
+                pass  # expected — we just cancelled it
+            except Exception:
+                logger.warning(
+                    "EventsModule: backlog-monitor task errored during shutdown",
+                    exc_info=True,
+                )
             logger.info("EventsModule: Shutdown complete.")
 
     # ------------------------------------------------------------------

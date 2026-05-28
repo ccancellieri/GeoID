@@ -352,8 +352,12 @@ async def start_background_refresh(
             existing.cancel()
             try:
                 await existing
-            except (asyncio.CancelledError, Exception):
-                pass
+            except asyncio.CancelledError:
+                pass  # expected — we just cancelled it
+            except Exception:
+                logger.warning(
+                    "IAM rule-refresher task errored during shutdown", exc_info=True
+                )
 
         return _stop_existing
 
@@ -364,8 +368,12 @@ async def start_background_refresh(
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):
-            pass
+        except asyncio.CancelledError:
+            pass  # expected — we just cancelled it
+        except Exception:
+            logger.warning(
+                "IAM rule-refresher task errored during shutdown", exc_info=True
+            )
 
     return _stop
 

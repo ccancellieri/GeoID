@@ -120,8 +120,12 @@ class DBConfigModule(ModuleProtocol):
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+        except asyncio.CancelledError:
+            pass  # expected — we just cancelled it
+        except Exception:
+            logger.warning(
+                "Engine snapshot refresh task errored during teardown", exc_info=True
+            )
 
     @staticmethod
     async def _clear_refresh_task_ref(app_state: DBConfigAppState) -> None:

@@ -724,14 +724,17 @@ class EventService(EventBusProtocol):
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
-                # Expected on cancel; also swallow any shutdown-time
-                # exception (a partially-executed consume loop can raise
-                # on reconnect-retry paths).  The caller's fixture
-                # teardown MUST still continue — an unhandled shutdown
-                # error masking a test's real failure is worse than a
-                # logged one.
-                pass
+            except asyncio.CancelledError:
+                pass  # expected — we just cancelled it
+            except Exception:
+                # A partially-executed consume loop can raise on reconnect-retry
+                # paths.  Teardown MUST continue (an unhandled shutdown error
+                # masking a test's real failure is worse), but the error is
+                # logged rather than silently swallowed.
+                logger.warning(
+                    "EventService: durable consumer task errored during shutdown",
+                    exc_info=True,
+                )
             self._consumer_task = None
             logger.info("EventService: Durable event consumer task cancelled.")
 
