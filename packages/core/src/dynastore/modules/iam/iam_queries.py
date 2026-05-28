@@ -138,7 +138,8 @@ CREATE_GRANTS_TABLE = DDLQuery("""
         granted_by UUID,
         granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         resource_kind VARCHAR(32),
-        resource_ref VARCHAR(256)
+        resource_ref VARCHAR(256),
+        attribute_predicates JSONB NOT NULL DEFAULT '[]'
     );
     CREATE INDEX IF NOT EXISTS idx_grants_subject
         ON {schema}.grants (subject_kind, subject_ref);

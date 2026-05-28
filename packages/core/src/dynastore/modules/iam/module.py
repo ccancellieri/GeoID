@@ -70,33 +70,6 @@ from dynastore.tools.discovery import register_plugin, unregister_plugin
 
 logger = logging.getLogger(__name__)
 
-# Module-level DQLQuery objects used by _bootstrap_public_access_baseline so
-# that tests can patch them without fighting inline construction.
-from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler  # noqa: E402
-
-_BOOTSTRAP_SELECT_SENTINEL = DQLQuery(
-    """
-    SELECT 1 FROM iam.applied_presets
-    WHERE preset_name = 'public_access_baseline'
-      AND scope_key   = 'platform'
-    """,
-    result_handler=ResultHandler.ONE_OR_NONE,
-)
-
-_BOOTSTRAP_INSERT_SENTINEL = DQLQuery(
-    """
-    INSERT INTO iam.applied_presets
-        (preset_name, scope_key, state, applied_at, applied_by,
-         params_snapshot, revoke_descriptor, updated_at)
-    VALUES
-        ('public_access_baseline', 'platform', 'applied', NOW(), NULL,
-         :params_snapshot, :revoke_descriptor, NOW())
-    ON CONFLICT (preset_name, scope_key) DO NOTHING
-    """,
-    result_handler=ResultHandler.ONE_OR_NONE,
-)
-
-
 from dynastore.models.protocols.policies import PermissionProtocol
 class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, PermissionProtocol):
     priority: int = 100
@@ -161,84 +134,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     applied_svc = AppliedPresetsService(engine)
                     await applied_svc.ensure_table(conn=conn)
 
-                    # Backfill: insert a synthetic iam_baseline audit row so
-                    # that DELETE /admin/presets/iam_baseline works on upgraded
-                    # deployments that had the contributor-loop seeding run.
-                    # Idempotent — no-op when the row already exists.
-                    try:
-                        from dynastore.modules.iam.migrations.backfill_iam_baseline_audit import run_backfill
-                        await run_backfill(
-                            engine=engine,
-                            policy_storage=policy_storage,
-                            iam_storage=self.storage,
-                        )
-                    except Exception as _bf_exc:
-                        logger.warning(
-                            "IamModule: iam_baseline backfill failed (non-fatal): %s",
-                            _bf_exc,
-                        )
-
-                    # Backfill: insert a synthetic default_roles_baseline audit row
-                    # so that DELETE /admin/presets/default_roles_baseline works on
-                    # upgraded deployments. Idempotent — no-op when row already exists.
-                    try:
-                        from dynastore.modules.iam.migrations.backfill_default_roles_baseline_audit import run_backfill as _run_roles_bf
-                        await _run_roles_bf(engine=engine)
-                    except Exception as _roles_bf_exc:
-                        logger.warning(
-                            "IamModule: default_roles_baseline backfill failed (non-fatal): %s",
-                            _roles_bf_exc,
-                        )
-
-                    # One-shot migration: backfill the allowed_preset_names
-                    # safe-subset on the catalog_preset_delegation policy
-                    # (#1426). Pre-fix iam_baseline shipped without the
-                    # allowlist, leaving catalog admins able to POST/DELETE
-                    # any registered preset at their scope.
-                    try:
-                        from dynastore.modules.iam.migrations.tighten_catalog_preset_allowlist import run_migration as _run_tighten
-                        await _run_tighten(engine=engine)
-                    except Exception as _tighten_exc:
-                        logger.warning(
-                            "IamModule: catalog_preset_delegation allowlist "
-                            "migration failed (non-fatal): %s",
-                            _tighten_exc,
-                        )
-
-                    # One-shot migration: add attribute_predicates JSONB
-                    # column to every grants table (#1441).  Existing rows
-                    # default to '[]' — full backwards compatibility with
-                    # the pure-RBAC path.
-                    try:
-                        from dynastore.modules.iam.migrations.add_grants_attribute_predicates import run_migration as _run_attr_preds
-                        await _run_attr_preds(engine=engine)
-                    except Exception as _attr_exc:
-                        logger.warning(
-                            "IamModule: add_grants_attribute_predicates "
-                            "migration failed (non-fatal): %s",
-                            _attr_exc,
-                        )
-
-                    # Self-heal guard: if the platform-tier sysadmin role is
-                    # absent (e.g. a DB reset happened before this restart),
-                    # seed it directly so the service is never left in a
-                    # locked-out state. Per geoid#643 the platform tier
-                    # collapses to {sysadmin} — catalog-tier roles are seeded
-                    # by the per-catalog lifecycle hook, not here.
-                    sysadmin_name = role_config.sysadmin_role_name
-                    sysadmin = await self.storage.get_role(
-                        sysadmin_name, schema="iam", conn=conn
-                    )
-                    if sysadmin is None:
-                        logger.critical(
-                            "IamModule: %r role missing — "
-                            "DB may have been reset. Seeding sysadmin survival row.",
-                            sysadmin_name,
-                        )
-                        from dynastore.models.auth_models import Role as _Role
-                        _seed = _Role(name=sysadmin_name, policies=["sysadmin_full_access"])
-                        await self.storage.create_role(_seed, schema="iam", conn=conn)
-
             except Exception as e:
                 logger.error(f"Failed to initialize IamModule: {e}", exc_info=True)
 
@@ -258,21 +153,22 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             # or restricting ABAC access silently.
             await _warn_jwt_attr_no_issuer_allowlist()
 
-            # Cold-boot fallback for headless infrastructure (#1412 follow-up).
-            # Issue #1412 moved all extension policies into operator-applied presets but
-            # headless infra probes (Cloud Run /health startup probe) run BEFORE any
-            # operator can log in. Apply `public_access_baseline` ONCE per DB to land the
-            # minimal anon-allow Policy. Sentinel: iam.applied_presets row.
-            # On restart, the row is present and this block no-ops. Sysadmin DELETE of
-            # the preset removes both the Policy and the audit row, re-enabling re-apply.
+            # Cold-boot preset bootstrapping: apply each foundational preset
+            # exactly once per DB. Each call is idempotent — an
+            # iam.applied_presets sentinel prevents re-application on restarts.
+            # Sysadmin DELETE of a preset removes the sentinel, re-arming
+            # the bootstrap on the next restart.
             try:
                 db = get_protocol(DatabaseProtocol)
                 engine = db.engine if db else None
-                await self._bootstrap_public_access_baseline(engine)
+                from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
+                await bootstrap_preset_if_absent(engine, preset_name="default_roles_baseline")
+                await bootstrap_preset_if_absent(engine, preset_name="iam_baseline")
+                await bootstrap_preset_if_absent(engine, preset_name="public_access_baseline")
             except Exception as exc:
                 logger.error(
-                    "public_access_baseline bootstrap failed; /health may 403 until "
-                    "operator applies it manually via POST /admin/presets/public_access_baseline/apply: %s",
+                    "IamModule: cold-boot preset bootstrap failed; /health may 403 "
+                    "until operator applies presets manually: %s",
                     exc,
                 )
 
@@ -372,63 +268,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
         
         # Finally unregister self
         unregister_plugin(self)
-
-    async def _bootstrap_public_access_baseline(self, engine: Any) -> None:
-        """Apply ``public_access_baseline`` once per DB on cold-boot.
-
-        Uses iam.applied_presets as a sentinel so subsequent restarts no-op.
-        Sysadmin DELETE of the preset removes the sentinel row and re-arms
-        this block on the next restart.
-        """
-        import json
-
-        from dynastore.modules.db_config.locking_tools import acquire_startup_lock
-        from dynastore.modules.storage.presets.preset import NoParams, PresetContext
-        from dynastore.modules.storage.presets.registry import find_preset
-        from dynastore.modules.iam.iam_service import IamService
-
-        async with acquire_startup_lock(engine, "iam_seed:public_access_baseline") as conn:
-            if conn is None:
-                # Another worker holds the lock and is performing the bootstrap.
-                return
-
-            row = await _BOOTSTRAP_SELECT_SENTINEL.execute(conn)
-            if row is not None:
-                logger.debug(
-                    "public_access_baseline bootstrap: sentinel present — skipping"
-                )
-                return
-
-            preset = find_preset("public_access_baseline")
-            if preset is None:
-                logger.warning(
-                    "public_access_baseline bootstrap: preset not registered — skipping"
-                )
-                return
-
-            ctx = PresetContext(
-                db=engine,
-                iam=get_protocol(IamService),
-                policy=self,
-                config=None,
-                tasks=None,
-                cron=None,
-                libs=None,
-                principal=None,
-                scope="platform",
-            )
-
-            descriptor = await preset.apply(NoParams(), "platform", ctx)
-
-            await _BOOTSTRAP_INSERT_SENTINEL.execute(
-                conn,
-                params_snapshot=json.dumps({}),
-                revoke_descriptor=json.dumps(descriptor.payload),
-            )
-            logger.info(
-                "public_access_baseline preset applied on cold-boot — "
-                "anon /health probe enabled"
-            )
 
     async def _register_usage_counter_drivers(self, stack: AsyncExitStack) -> None:
         """Wire a :class:`UsageCounterProtocol` driver for rate-limit / quota.
