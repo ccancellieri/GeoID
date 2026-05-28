@@ -127,8 +127,8 @@ class AccessEnvelopeSidecar(SidecarProtocol):
     def get_ddl(
         self,
         physical_table: str,
-        partition_keys: List[str] = [],
-        partition_key_types: Dict[str, str] = {},
+        partition_keys: Optional[List[str]] = None,
+        partition_key_types: Optional[Dict[str, str]] = None,
         has_validity: bool = False,
     ) -> str:
         """Create the ``{table}_access_envelope`` sub-table and optional GIN index.

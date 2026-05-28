@@ -636,8 +636,8 @@ class SidecarProtocol(ABC):
     def get_ddl(
         self,
         physical_table: str,
-        partition_keys: List[str] = [],
-        partition_key_types: Dict[str, str] = {},
+        partition_keys: Optional[List[str]] = None,
+        partition_key_types: Optional[Dict[str, str]] = None,
         has_validity: bool = False,
     ) -> str:
         """

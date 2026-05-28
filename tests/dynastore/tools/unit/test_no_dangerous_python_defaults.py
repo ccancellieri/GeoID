@@ -6,12 +6,10 @@
 2. **``time.sleep()`` inside ``async def``** — blocks the whole event loop,
    stalling every coroutine on that loop. Use ``await asyncio.sleep()``.
 
-Both are scanned across all package source. The blocking-sleep check is clean
-today (no allowlist). The mutable-default check grandfathers a small set of
-pre-existing, *provably benign* sidecar ``get_ddl`` methods (their
-``partition_keys``/``partition_key_types`` defaults are read-only and never
-mutated; tracked for cleanup during sidecar consolidation) — any NEW mutable
-default fails the build.
+Both are scanned across all package source and both are clean today (no
+allowlist). The sidecar ``get_ddl`` mutable defaults that were previously
+grandfathered here have been normalised to a ``None`` sentinel (#1561); any
+mutable default now fails the build.
 """
 from __future__ import annotations
 
@@ -19,18 +17,9 @@ import ast
 
 from tests._repo_paths import CORE_SRC, EXTENSIONS_ROOTS
 
-# Grandfathered benign sites, keyed ``<filename>:<funcname>`` (line-shift-proof).
-# These are sidecar get_ddl methods whose list/dict defaults are read-only.
-_MUTABLE_DEFAULT_ALLOWLIST = frozenset(
-    {
-        "attributes.py:get_ddl",
-        "item_metadata.py:get_ddl",
-        "access_envelope.py:get_ddl",
-        "geometries.py:get_ddl",
-        "base.py:get_ddl",
-        "stac_items_sidecar.py:get_ddl",
-    }
-)
+# No grandfathered sites: the sidecar get_ddl mutable defaults were normalised
+# to a None sentinel (#1561). Any mutable default now fails the build.
+_MUTABLE_DEFAULT_ALLOWLIST: frozenset[str] = frozenset()
 
 
 def _iter_source_files():
