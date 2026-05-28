@@ -2,9 +2,9 @@
 import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import APIRouter, FastAPI, Depends, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from typing import List, Optional, Any, Dict, Tuple
+from typing import List, Optional, Any, Dict
 from fastapi import Query
 
 from dynastore.extensions.protocols import ExtensionProtocol

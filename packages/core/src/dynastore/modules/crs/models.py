@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from pydantic import BaseModel, Field, model_validator, field_validator, AliasChoices, ConfigDict
+from pydantic import BaseModel, Field, model_validator, field_validator
 from typing import Optional, Annotated
 from datetime import datetime
 from enum import Enum

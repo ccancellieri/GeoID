@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 from re import error as RegexError
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request

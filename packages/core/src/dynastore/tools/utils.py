@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import Any, Optional
+from typing import Any
 
 def safe_get(obj: Any, key: str, default: Any = None) -> Any:
     """
