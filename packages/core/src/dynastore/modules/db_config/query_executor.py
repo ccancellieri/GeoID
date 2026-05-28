@@ -128,6 +128,38 @@ def _is_transient_asyncpg_error(exc: Optional[BaseException]) -> bool:
     msg = str(exc)
     return any(fragment in msg for fragment in _TRANSIENT_ASYNCPG_MESSAGE_FRAGMENTS)
 
+
+# PG SQLSTATEs that signal "object already exists" — fired when a concurrent
+# worker created the same DDL object between our existence check and our
+# CREATE attempt. PG's IF NOT EXISTS clause is not perfectly race-free at the
+# system catalog level (pg_namespace / pg_class), and 23505 surfaces when two
+# workers race past the advisory-lock coordination on snapshot-visibility
+# edge cases. See issue #821.
+_DUPLICATE_OBJECT_PGCODES = frozenset({
+    "42P06",  # duplicate_schema
+    "42P07",  # duplicate_table
+    "42710",  # duplicate_object (general — types, functions, etc.)
+    "23505",  # unique_violation (catches pg_namespace_nspname_index races)
+})
+
+
+def _is_duplicate_object_error(exc: Optional[BaseException]) -> bool:
+    """Return True if ``exc`` signals an already-exists DDL conflict from PG.
+
+    Walks the SQLAlchemy ``.orig`` chain so asyncpg-raised pgcodes are still
+    detected when wrapped in ``DBAPIError``. Also accepts asyncpg's
+    ``.sqlstate`` attribute as a fallback.
+    """
+    seen: set[int] = set()
+    candidate: Optional[BaseException] = exc
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        pgcode = getattr(candidate, "pgcode", None) or getattr(candidate, "sqlstate", None)
+        if pgcode in _DUPLICATE_OBJECT_PGCODES:
+            return True
+        candidate = getattr(candidate, "orig", None) or getattr(candidate, "__cause__", None)
+    return False
+
 # --- Type Definitions ---
 DbSyncConnection = Union[SAConnection, SASession]
 DbAsyncConnection = Union[AsyncConnection, AsyncSession]
@@ -806,6 +838,59 @@ class DDLExecutor(BaseExecutor):
                 res = asyncio.run(_consume())
         return bool(res)
 
+    # #821 peer-race recovery. A concurrent worker may have created the DDL
+    # object between our post-wait re-check and our CREATE. PG's IF NOT
+    # EXISTS is not perfectly race-free at the catalog level
+    # (pg_namespace / pg_class) and the advisory-lock coordination can miss
+    # the peer's commit under specific snapshot-visibility conditions.
+    # Re-check on the outer conn (fresh statement-level snapshot under
+    # READ COMMITTED): if the object now exists, treat as success rather
+    # than failing module init.
+    async def _try_peer_race_recovery_async(
+        self, conn: DbAsyncConnection, params: dict, exc: BaseException
+    ) -> bool:
+        """Return True iff the failed DDL was a duplicate-object race the
+        peer already won and the outer-conn re-check now reports success."""
+        if not self.existence_check or not _is_duplicate_object_error(exc):
+            return False
+        try:
+            if await self._call_existence_check(conn, params):
+                pgcode = (
+                    getattr(getattr(exc, "orig", None), "pgcode", None)
+                    or getattr(exc, "pgcode", None)
+                    or getattr(exc, "sqlstate", None)
+                )
+                logger.info(
+                    "DDL peer-race resolved: object exists after concurrent creation (pgcode=%s).",
+                    pgcode,
+                )
+                return True
+        except Exception as recheck_exc:
+            logger.warning(
+                "DDL peer-race recheck failed: %s; surfacing original error.",
+                recheck_exc,
+            )
+        return False
+
+    def _try_peer_race_recovery_sync(
+        self, conn: DbSyncConnection, params: dict, exc: BaseException
+    ) -> bool:
+        """Sync sibling of :meth:`_try_peer_race_recovery_async`."""
+        if not self.existence_check or not _is_duplicate_object_error(exc):
+            return False
+        try:
+            if self._call_existence_check_sync(conn, params):
+                logger.info(
+                    "DDL peer-race resolved (sync): object exists after concurrent creation."
+                )
+                return True
+        except Exception as recheck_exc:
+            logger.warning(
+                "DDL peer-race recheck failed (sync): %s; surfacing original error.",
+                recheck_exc,
+            )
+        return False
+
     def _execute_sync(self, conn: DbSyncConnection, query_obj: TextClause, params: dict):
         """Execute DDL with centralized coordination and timeout guards."""
         from .locking_tools import sync_acquire_startup_lock
@@ -865,6 +950,8 @@ class DDLExecutor(BaseExecutor):
                         else:
                             _active.execute(query_obj, params)
                     except Exception as e:
+                        if self._try_peer_race_recovery_sync(conn, params, e):
+                            return self._apply_post_processing_sync(None)
                         self._handle_db_exception(e)
         return self._apply_post_processing_sync(None)
 
@@ -993,6 +1080,8 @@ class DDLExecutor(BaseExecutor):
             await _attempt_ddl()
             return await self._apply_post_processing_async(None)
         except Exception as e:
+            if await self._try_peer_race_recovery_async(conn, params, e):
+                return await self._apply_post_processing_async(None)
             self._handle_db_exception(e)
 
 
