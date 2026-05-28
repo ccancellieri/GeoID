@@ -45,8 +45,6 @@ class ContentTypeInspectorOperation(IngestionOperationInterface):
     Analyzes raw bytes from a GCP blob (standard or zipped) to guess encoding.
     Specifically targets .dbf files for Shapefiles.
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
 
     async def pre_op(self, catalog: Any, collection: Any, asset: Any) -> Any:
         uri = asset.uri

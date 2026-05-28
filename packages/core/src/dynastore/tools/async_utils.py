@@ -43,6 +43,60 @@ class SyncQueueIterator:
             logger.error(f"Error retrieving item from queue: {e}")
             raise StopIteration
 
+class LoopLocalLock:
+    """An ``asyncio.Lock`` proxy that is safe to instantiate at module-level or
+    class-body scope.
+
+    A raw ``asyncio.Lock()`` created at import time binds to whichever event
+    loop first awaits it and then raises ``RuntimeError`` if reused from a
+    different loop. That breaks under multiple loops (tests spin up a fresh
+    loop per case; multi-worker processes likewise) and silently shares one
+    lock object across every instance/loop — false cross-instance safety in a
+    distributed-stateless runtime where only PG/ES/Valkey are shared.
+
+    This proxy keeps one real lock *per running loop*, created lazily on first
+    use, so a single module- or class-level instance is correct across loops
+    while still serialising work within each loop. Usage is drop-in::
+
+        _GUARD = LoopLocalLock()        # safe at module/class-body scope
+        async def f():
+            async with _GUARD:
+                ...
+    """
+
+    __slots__ = ("_locks",)
+
+    def __init__(self) -> None:
+        self._locks: Dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+
+    def _for_running_loop(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[loop] = lock
+        return lock
+
+    async def __aenter__(self) -> "LoopLocalLock":
+        await self._for_running_loop().acquire()
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        # Runs in the same task and loop as ``__aenter__``, so this resolves to
+        # the very lock that was acquired.
+        self._for_running_loop().release()
+
+    def locked(self) -> bool:
+        """True if the current running loop's lock is held. False if no loop
+        is running or the lock for this loop has not been created yet."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        lock = self._locks.get(loop)
+        return lock.locked() if lock is not None else False
+
+
 class AsyncBufferAggregator:
     """
     Generic aggregator that buffers items and flushes them in batches.

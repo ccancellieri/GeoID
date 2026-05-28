@@ -1070,16 +1070,6 @@ class SidecarProtocol(ABC):
         Handles SRID transforms, simplification, and MVT/GeoJSON/GML formatting.
         """
         return None
-        """
-        Returns list of fields that can be used in ORDER BY clauses.
-
-        Args:
-            sidecar_alias: Alias for sidecar table
-
-        Returns:
-            List of field names that support ordering (e.g., ["external_id", "asset_id"])
-        """
-        return []
 
     def get_group_by_fields(self, sidecar_alias: Optional[str] = None) -> List[str]:
         """

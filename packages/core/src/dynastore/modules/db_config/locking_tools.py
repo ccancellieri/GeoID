@@ -25,6 +25,7 @@ from contextvars import ContextVar
 from typing import Optional, Callable, Awaitable, Any, TypeVar, Dict, AsyncGenerator, Iterator, Set, cast
 from sqlalchemy import text, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from dynastore.tools.async_utils import LoopLocalLock
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     DDLQuery,
@@ -101,7 +102,7 @@ def retry_on_lock_conflict(max_retries: int = 5, base_delay: float = 0.5):
 # Global coordinator to dedupe identical startup tasks within the same process.
 class _StartupCoordinator:
     _tasks: Dict[str, asyncio.Future] = {}
-    _lock = asyncio.Lock()
+    _lock = LoopLocalLock()
     # Strong refs for the fire-and-forget ``_cleanup`` tasks. Without this,
     # asyncio only keeps weak refs and a GC sweep can collect the cleanup
     # mid-sleep — the cached future would never be evicted and a later
