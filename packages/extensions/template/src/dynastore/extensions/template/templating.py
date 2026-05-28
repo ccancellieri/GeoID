@@ -17,36 +17,30 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 """titiler Templating Extensions."""
-import time
 import json
 from typing import Optional, List, Tuple, cast
-from attrs import define
-from jinja2 import Template, Environment
-from pydantic import BaseModel, HttpUrl, types
-from itertools import zip_longest
-from fastapi import Query, HTTPException, Header
+from jinja2 import Environment
+from pydantic import BaseModel, HttpUrl
+from fastapi import Query, HTTPException
 from fastapi.responses import StreamingResponse, Response
 import ast
 import asyncio
-from aiohttp.client_exceptions import ContentTypeError
 from typing_extensions import Annotated
 from dynastore.tools.pydantic import FlexibleDictParam, TemplateParam
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, Query, status, Request, Body, Depends, APIRouter
-from typing import Optional, Dict, Any, AsyncGenerator, Union
+from fastapi import FastAPI, HTTPException, Query, status, Request, Body, APIRouter
+from typing import Optional, Dict, Any, AsyncGenerator
 import xml.sax
 import xml.sax.handler
-from xml.sax.handler import ContentHandler
 import httpx
-from pydantic import AnyUrl, confloat, HttpUrl
+from pydantic import AnyUrl, HttpUrl
 from contextlib import asynccontextmanager
 # LooseHeaders / LooseCookies from aiohttp are incompatible with httpx; define as plain dict aliases
 LooseHeaders = Dict[str, Any]
 LooseCookies = Dict[str, Any]
 
 import xml.etree.ElementTree as ET
-import dynastore.extensions.httpx.httpx_service as httpx_service
-from pydantic import AnyUrl, confloat
+from pydantic import AnyUrl
 from dynastore.tools.cache import cached
 from dynastore.extensions.protocols import ExtensionProtocol
 
