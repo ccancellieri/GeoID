@@ -718,7 +718,9 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
                 if isinstance(cfg, ItemsWritePolicy):
                     return cfg
         except Exception:
-            pass
+            logger.debug(
+                "iceberg: write-policy resolution failed; using default", exc_info=True
+            )
         return ItemsWritePolicy()
 
     @staticmethod
@@ -748,7 +750,10 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
             if isinstance(cfg, ItemsSchema):
                 return cfg
         except Exception:
-            pass
+            logger.debug(
+                "iceberg: ItemsSchema resolution failed; treating as no declared schema",
+                exc_info=True,
+            )
         return None
 
     @staticmethod
@@ -844,7 +849,7 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
                     )
                     result = overlay_schema_flags(schema_cfg, result)
             except Exception:
-                pass
+                logger.debug("iceberg: schema-flags overlay failed", exc_info=True)
             return result
         except Exception:
             return {}
@@ -996,7 +1001,10 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
             try:
                 await run_in_thread(table.compact)
             except (AttributeError, NotImplementedError):
-                pass
+                logger.debug(
+                    "iceberg: table.compact not supported by this catalog impl; skipping",
+                    exc_info=True,
+                )
 
         return len(entity_ids)
 
@@ -1020,7 +1028,13 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         try:
             await run_in_thread(catalog.create_namespace, namespace)
         except Exception:
-            pass  # namespace may already exist
+            # Namespace most likely already exists; a failure for any other
+            # reason will surface on the subsequent table operations.
+            logger.debug(
+                "iceberg: create_namespace(%s) did not succeed (likely already exists)",
+                namespace,
+                exc_info=True,
+            )
 
         if collection_id:
             table_id = self._table_identifier(loc, catalog_id, collection_id)
@@ -1074,7 +1088,9 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
                                 unique_fields, catalog_id, collection_id,
                             )
             except Exception:
-                pass
+                logger.debug(
+                    "iceberg: unique-field advisory check failed", exc_info=True
+                )
 
     async def drop_storage(
         self,
