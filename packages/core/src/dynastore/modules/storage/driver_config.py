@@ -1693,6 +1693,38 @@ async def _validate_items_schema(
 ItemsSchema.register_validate_handler(_validate_items_schema)
 
 
+async def _validate_items_schema_reserved_names(
+    config: PluginConfig,
+    catalog_id: "Optional[str]",
+    collection_id: "Optional[str]",
+    db_resource: "Optional[Any]",
+) -> None:
+    """Reject ``ItemsSchema.fields`` keys that collide with reserved root names.
+
+    Reserved names live at the document root of the tenant feature mapping
+    (``geoid``, ``geometry``, ``bbox``, ``asset_id`` …) — declaring a property
+    by one of these names would either silently shadow the system field or
+    fail downstream in opaque ways (DDL collision, JSONB extract returning
+    the system value, sidecar config rebuild loops). Fail loud at config-save
+    so the operator picks a different name before any write hits the driver.
+    """
+    if not isinstance(config, ItemsSchema):
+        return
+    if not config.fields:
+        return
+    collisions = [name for name in config.fields if name in _PRIVATE_RESERVED_ROOT_FIELDS]
+    if collisions:
+        raise ValueError(
+            f"ItemsSchema.fields declares reserved root name(s) {sorted(collisions)} "
+            f"— these collide with the tenant feature mapping at the document root. "
+            f"Reserved names: {sorted(_PRIVATE_RESERVED_ROOT_FIELDS)}. "
+            f"Rename the property (e.g. add a domain prefix)."
+        )
+
+
+ItemsSchema.register_validate_handler(_validate_items_schema_reserved_names)
+
+
 # ---------------------------------------------------------------------------
 # Validate handler — ItemsElasticsearchDriverConfig.mapping Tier-2 overlay
 # ---------------------------------------------------------------------------

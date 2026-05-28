@@ -509,8 +509,17 @@ class ItemQueryMixin:
         if query_request.cql_filter:
             from dynastore.modules.tools.cql import parse_cql_filter
 
-            # Use a temporary optimizer to get all available fields for validation
-            temp_optimizer = QueryOptimizer(col_config, consumer=consumer)
+            # Use a temporary optimizer to get all available fields for validation.
+            # Thread the collection's ``ItemsSchema.fields`` (already carried on
+            # the params dict by the MVT path, ``tiles_db._build_collection_subquery``)
+            # so JSONB-only schema fields (e.g. ``START_DATE`` on a VECTOR
+            # collection with no columnar storage for them) resolve to a typed
+            # JSONB extraction instead of being rejected as ``Unknown field``.
+            temp_optimizer = QueryOptimizer(
+                col_config,
+                consumer=consumer,
+                schema_fields=context.get("schema_fields"),
+            )
             queryable_fields = temp_optimizer.get_all_queryable_fields()
 
             # Create mapping for CQL parser.
@@ -598,7 +607,11 @@ class ItemQueryMixin:
                 f"db_resource={'passed' if db_resource is not None else 'absent'})"
             )
 
-        optimizer = QueryOptimizer(col_config, consumer=consumer)
+        optimizer = QueryOptimizer(
+            col_config,
+            consumer=consumer,
+            schema_fields=context.get("schema_fields"),
+        )
         sql, params = optimizer.build_optimized_query(
             query_request, schema=phys_schema, table=phys_table
         )

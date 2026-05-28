@@ -189,11 +189,9 @@ async def _validate_read_policy(
 ItemsReadPolicy.register_validate_handler(_validate_read_policy)
 
 
-def _readable_schema_field_names(
-    declared_schema: Optional[Mapping[str, FieldDefinition]],
-) -> List[str]:
-    """Filter ``ItemsSchema.fields`` down to the names safe to project as
-    attribute properties on a read path.
+def is_user_readable_schema_field(fd: FieldDefinition) -> bool:
+    """SSOT predicate for "is this ``ItemsSchema`` field projectable as a
+    user-visible attribute property on a read path".
 
     Two skip rules — the read-side mirror of the write-side SSOTs in
     :mod:`dynastore.modules.storage.field_constraints`:
@@ -210,18 +208,30 @@ def _readable_schema_field_names(
         the field stays declared (so writes still validate against it) but
         does not surface on the wire.
 
+    Shared with :class:`...catalog.QueryOptimizer` so the SELECT projection
+    (``project_select_for_feature_type``) and the queryable-field index
+    enrichment apply the same rule — items_schema is the single source of
+    truth for "what does this collection expose on the wire".
+    """
+    if (getattr(fd, "data_type", "") or "").lower().startswith("geometry"):
+        return False
+    if not getattr(fd, "expose", True):
+        return False
+    return True
+
+
+def _readable_schema_field_names(
+    declared_schema: Optional[Mapping[str, FieldDefinition]],
+) -> List[str]:
+    """Filter ``ItemsSchema.fields`` down to the names safe to project as
+    attribute properties on a read path.
+
     Names only — callers feed the result into ``FieldSelection(field=name)``.
+    Delegates the per-field rule to :func:`is_user_readable_schema_field`.
     """
     if not declared_schema:
         return []
-    out: List[str] = []
-    for name, fd in declared_schema.items():
-        if (getattr(fd, "data_type", "") or "").lower().startswith("geometry"):
-            continue
-        if not getattr(fd, "expose", True):
-            continue
-        out.append(name)
-    return out
+    return [name for name, fd in declared_schema.items() if is_user_readable_schema_field(fd)]
 
 
 def project_select_for_feature_type(
@@ -286,4 +296,8 @@ def project_select_for_feature_type(
     return selects
 
 
-__all__ = ["ItemsReadPolicy", "project_select_for_feature_type"]
+__all__ = [
+    "ItemsReadPolicy",
+    "project_select_for_feature_type",
+    "is_user_readable_schema_field",
+]

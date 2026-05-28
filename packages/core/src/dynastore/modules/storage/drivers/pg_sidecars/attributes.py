@@ -36,6 +36,7 @@ from dynastore.modules.db_config.query_executor import DbResource, DDLQuery, DQL
 from dynastore.models.protocols import ConfigsProtocol, AssetsProtocol
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config.tools import map_pg_to_json_type
+from dynastore.models.field_types import CANONICAL_TO_PG_DDL
 from dynastore.modules.storage.field_constraints import pg_native_to_canonical
 from dynastore.tools.json import CustomJSONEncoder
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
@@ -1083,6 +1084,44 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             )
 
         return fields
+
+    def jsonb_property_field(
+        self,
+        name: str,
+        fd: FieldDefinition,
+        *,
+        sidecar_alias: Optional[str] = None,
+    ) -> FieldDefinition:
+        """Build a ``FieldDefinition`` that resolves ``name`` via JSONB extraction.
+
+        Used by :class:`...catalog.QueryOptimizer` to enrich its field index
+        from ``ItemsSchema.fields`` — schema is the SSOT for what a collection
+        exposes; entries not materialised as a native column live in the JSONB
+        attributes blob. The cast token is derived from ``fd.data_type`` via
+        the canonical SSOT (:data:`CANONICAL_TO_PG_DDL`), so a typed compare
+        (e.g. ``start_date <= now()``) parses correctly instead of producing
+        a text-vs-date error at execution time.
+        """
+        alias = sidecar_alias or f"sc_{self.sidecar_id}"
+        canonical = (fd.data_type or "string").lower()
+        pg_type = CANONICAL_TO_PG_DDL.get(canonical, "TEXT")
+        sql_expr = (
+            f"({alias}.{self.config.jsonb_column_name}->>'{name}')::{pg_type}"
+        )
+        caps = [
+            FieldCapability.FILTERABLE,
+            FieldCapability.SORTABLE,
+            FieldCapability.GROUPABLE,
+        ]
+        return FieldDefinition(
+            name=name,
+            sql_expression=sql_expr,
+            capabilities=caps,
+            data_type=canonical,
+            expose=getattr(fd, "expose", True),
+            title=getattr(fd, "title", None),
+            description=getattr(fd, "description", None),
+        )
 
     def get_dynamic_field_definition(
         self, field_name: str, sidecar_alias: Optional[str] = None
