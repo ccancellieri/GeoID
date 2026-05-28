@@ -44,6 +44,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 from dynastore.modules.protocols import ModuleProtocol
+from dynastore.tools.async_utils import LoopLocalLock
 
 if TYPE_CHECKING:
     from dynastore.modules.cache.cache_config import CachePluginConfig
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 # Set during CacheModule.lifespan; used by _on_valkey_engine_config_change.
 _current_backend: Optional[Any] = None
 _app_state: Optional[Any] = None
-_apply_lock: asyncio.Lock = asyncio.Lock()
+_apply_lock: LoopLocalLock = LoopLocalLock()
 
 # Bounded LocalAsyncCacheBackend fallback log (#629).
 # The "CACHE BACKEND: LOCAL" fall-back path is hit on every cold start when

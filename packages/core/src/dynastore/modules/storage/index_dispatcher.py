@@ -54,7 +54,6 @@ Phases
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -67,9 +66,9 @@ from dynastore.models.protocols.indexer import (
     IndexOp,
 )
 from dynastore.models.protocols.indexing import IndexableOp, OutboxStore
+from dynastore.tools.async_utils import LoopLocalLock
 from dynastore.modules.storage.routing_config import (
     FailurePolicy,
-    Operation,
     OperationDriverEntry,
 )
 
@@ -379,7 +378,7 @@ _DEFAULT_DISPATCHER: Optional["IndexDispatcher"] = None
 # OUTBOX path, so production traffic is bounded by the dispatch rate
 # rather than the request rate.
 _OUTBOX_POOL: Any = None
-_OUTBOX_POOL_LOCK = asyncio.Lock()
+_OUTBOX_POOL_LOCK = LoopLocalLock()
 
 
 def _log_dispatch_path(

@@ -58,7 +58,6 @@ Connection lifecycle:
   - **Shutdown**: catalog reference cleared in ``lifespan()`` on app shutdown.
 """
 
-import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -75,6 +74,7 @@ from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.modules.protocols import ModuleProtocol
+from dynastore.tools.async_utils import LoopLocalLock
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.driver_config import (
@@ -302,9 +302,9 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         Hint.STATISTICS,
     })
 
-    # Thread-safe catalog cache: loc_key → catalog instance, protected by asyncio.Lock.
+    # Thread-safe catalog cache: loc_key → catalog instance, protected by a per-loop lock.
     _catalog_cache: Dict[str, Any] = {}
-    _catalog_lock: asyncio.Lock = asyncio.Lock()
+    _catalog_lock: ClassVar[LoopLocalLock] = LoopLocalLock()
 
     def is_available(self) -> bool:
         return _pyiceberg_available()
