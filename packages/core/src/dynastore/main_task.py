@@ -301,8 +301,14 @@ async def main(task_name: str, payload: dict, schema: str):
                         hb_task.cancel()
                         try:
                             await hb_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                        except asyncio.CancelledError:
+                            pass  # expected: we just cancelled it
+                        except Exception:
+                            logger.warning(
+                                "Heartbeat task errored during shutdown for task %s",
+                                task_id_uuid,
+                                exc_info=True,
+                            )
         except asyncio.CancelledError:
             raise
         except Exception as e:

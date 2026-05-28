@@ -566,8 +566,11 @@ async def run_ingestion_task(
 
                     try:
                         geometry = shapely_mapping(loads(wkt))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to parse WKT geometry; leaving feature geometry empty: %s",
+                            exc,
+                        )
             elif mapping.geometry_wkb:
                 wkb = _get_raw_val(mapping.geometry_wkb)
                 if wkb:
@@ -580,8 +583,11 @@ async def run_ingestion_task(
 
                         try:
                             geometry = shapely_mapping(loads(wkb))
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to parse WKB geometry; leaving feature geometry empty: %s",
+                                exc,
+                            )
                 # If geometry_wkb column produced nothing, fall through to the
                 # standard ``geometry`` key (e.g. GDAL stores it there).
                 if geometry is None:
@@ -790,8 +796,12 @@ async def run_ingestion_task(
                 await run_post_operations(
                     post_ops, catalog, collection, asset, "FAILED", error_message=str(e)
                 )
-            except Exception:
-                pass
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Post-operations for FAILED state errored "
+                    "(original failure is preserved and re-raised below): %s",
+                    cleanup_exc,
+                )
 
         # Re-raise the exception to ensure the caller (and tests) know the task failed.
         # The database status has already been updated to FAILED above.
