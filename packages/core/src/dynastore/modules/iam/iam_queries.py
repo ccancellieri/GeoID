@@ -629,7 +629,7 @@ BIND_POLICY_TO_ROLE = DQLQuery(
             WHERE elem != :policy_id
         ),
         '[]'::jsonb
-    ) || jsonb_build_array(:policy_id::text)
+    ) || jsonb_build_array(:policy_id)
     WHERE id = :role_name OR name = :role_name;
     """,
     result_handler=ResultHandler.ROWCOUNT,

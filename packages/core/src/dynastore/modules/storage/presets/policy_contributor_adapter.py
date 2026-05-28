@@ -36,6 +36,8 @@ from typing import Any, Callable, ClassVar, List, Tuple, Type
 
 from pydantic import BaseModel
 
+from dynastore.models.auth_models import Role
+
 from .preset import (
     AppliedDescriptor,
     NoParams,
@@ -157,6 +159,16 @@ class PolicyContributorPreset:
             logger.debug("%s: upserted policy %s", self.name, pol.id)
 
         for role in (contributor.get_role_bindings() or []):
+            # bind_policy_to_role is an additive UPDATE that no-ops on absent rows.
+            # Sentinel roles (catalog_admin etc.) may not exist yet; create-then-bind.
+            # Shared roles (sysadmin, admin, user) already exist — create raises
+            # ValueError, which we swallow; the bind that follows preserves their
+            # existing policy list and appends ours.
+            try:
+                await ctx.iam.create_role(Role(name=role.name, policies=[]))
+                logger.debug("%s: created sentinel role %s", self.name, role.name)
+            except ValueError:
+                pass
             for pid in (role.policies or []):
                 await ctx.iam.bind_policy_to_role(role.name, {"id": pid})
             applied_role_names.append(role.name)

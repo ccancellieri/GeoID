@@ -58,13 +58,13 @@ def _build_context(
     """Construct a ``PresetContext`` from available protocols."""
     from dynastore.modules import get_protocol
     from dynastore.modules.iam.iam_service import IamService
-    from dynastore.modules.iam.policies import PolicyService
+    from dynastore.models.protocols.policies import PermissionProtocol
     from dynastore.models.protocols.configs import ConfigsProtocol
 
     return PresetContext(
         db=engine,
         iam=get_protocol(IamService),
-        policy=get_protocol(PolicyService),
+        policy=get_protocol(PermissionProtocol),
         config=get_protocol(ConfigsProtocol),
         tasks=None,   # not wired in v1 core; presets that need tasks import directly
         cron=None,    # same

@@ -1085,8 +1085,8 @@ async def app_lifespan(
                 f"Extension lifespan partially failed: {e}"
             )
 
-        # Apply all registered PolicyContributorPresets so extension policies
-        # (e.g. STAC's stac_public_access, features_enable, auth_enable, …)
+        # Apply foundational presets then all PolicyContributorPresets so that
+        # platform policies (sysadmin_full_access, role seeds, extension ACLs)
         # land in the test DB — equivalent to the platform_demo apply that
         # would run on a real deployment.
         try:
@@ -1100,6 +1100,18 @@ async def app_lifespan(
             _db = modules.get_protocol(DatabaseProtocol)
             _engine = _db.engine if _db else None
             _ctx = _build_context(_engine, None, "platform")
+
+            # Apply foundational IAM presets first so sysadmin_full_access and
+            # default roles exist before extension contributor presets run.
+            for _foundation_name in ("default_roles_baseline", "iam_baseline"):
+                try:
+                    _fp = find_preset(_foundation_name)
+                    if _fp is not None:
+                        await _fp.apply(NoParams(), "platform", _ctx)
+                except Exception as _pe:
+                    _logging.getLogger(__name__).warning(
+                        "Test fixture: preset '%s' apply failed: %s", _foundation_name, _pe
+                    )
 
             for _preset_name in list_presets():
                 try:
@@ -1282,8 +1294,8 @@ async def app_lifespan_module(request):
             import logging
             logging.getLogger(__name__).warning(f"Extension lifespan partially failed: {e}")
 
-        # Apply all registered PolicyContributorPresets so extension policies
-        # (e.g. STAC's stac_public_access, features_enable, auth_enable, …)
+        # Apply foundational presets then all PolicyContributorPresets so that
+        # platform policies (sysadmin_full_access, role seeds, extension ACLs)
         # land in the test DB — equivalent to the platform_demo apply that
         # would run on a real deployment.
         try:
@@ -1297,6 +1309,18 @@ async def app_lifespan_module(request):
             _db = modules.get_protocol(DatabaseProtocol)
             _engine = _db.engine if _db else None
             _ctx = _build_context(_engine, None, "platform")
+
+            # Apply foundational IAM presets first so sysadmin_full_access and
+            # default roles exist before extension contributor presets run.
+            for _foundation_name in ("default_roles_baseline", "iam_baseline"):
+                try:
+                    _fp = find_preset(_foundation_name)
+                    if _fp is not None:
+                        await _fp.apply(NoParams(), "platform", _ctx)
+                except Exception as _pe:
+                    _logging.getLogger(__name__).warning(
+                        "Test fixture: preset '%s' apply failed: %s", _foundation_name, _pe
+                    )
 
             for _preset_name in list_presets():
                 try:

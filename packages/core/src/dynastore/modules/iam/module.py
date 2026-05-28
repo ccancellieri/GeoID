@@ -386,7 +386,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
         from dynastore.modules.storage.presets.preset import NoParams, PresetContext
         from dynastore.modules.storage.presets.registry import find_preset
         from dynastore.modules.iam.iam_service import IamService
-        from dynastore.modules.iam.policies import PolicyService
 
         async with acquire_startup_lock(engine, "iam_seed:public_access_baseline") as conn:
             if conn is None:
@@ -410,7 +409,7 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             ctx = PresetContext(
                 db=engine,
                 iam=get_protocol(IamService),
-                policy=get_protocol(PolicyService),
+                policy=self,
                 config=None,
                 tasks=None,
                 cron=None,
@@ -743,17 +742,22 @@ async def _seed_catalog_roles(conn: Any, schema: str, iam_storage: Any) -> None:
     unauthenticated) and the role hierarchy edges so auth evaluations work
     on first tenant access.
     """
-    from dynastore.models.protocols.authorization import IamRolesConfig
+    from dynastore.models.protocols.authorization import IamRolesConfig, _canonical_role_seeds
     from dynastore.models.auth_models import Role
 
     role_config = IamRolesConfig()
-    for seed in role_config.catalog_roles:
+    _, canonical_catalog = _canonical_role_seeds()
+    # Merge canonical catalog-tier seeds with any operator-defined extras.
+    # role_config.catalog_roles is the operator extra field (default []);
+    # canonical_catalog contains the platform defaults (admin, editor, user, unauthenticated).
+    all_catalog_seeds = list(canonical_catalog) + list(role_config.catalog_roles)
+    for seed in all_catalog_seeds:
         role_def = Role(name=seed.name, description=seed.description, policies=list(seed.policies))
         existing = await iam_storage.get_role(role_def.name, schema=schema, conn=conn)
         if existing is None:
             await iam_storage.create_role(role_def, schema=schema, conn=conn)
 
-    for seed in role_config.catalog_roles:
+    for seed in all_catalog_seeds:
         if seed.parent:
             try:
                 await iam_storage.add_role_hierarchy(

@@ -163,7 +163,7 @@ async def test_language_conflict_detection(sysadmin_in_process_client, catalog_i
 
 @pytest.mark.asyncio
 @pytest.mark.enable_extensions("stac", "assets", "features", "logs")
-async def test_accept_language_header_only(sysadmin_in_process_client, in_process_client, catalog_id):
+async def test_accept_language_header_only(sysadmin_in_process_client, catalog_id):
     """Test using Accept-Language header without query param."""
     payload = {
         "id": catalog_id,
@@ -177,11 +177,11 @@ async def test_accept_language_header_only(sysadmin_in_process_client, in_proces
         json=payload,
         headers={"Accept-Language": "de-DE,de;q=0.9"}
     )
-    
+
     assert r.status_code == 201
-    
-    # Retrieve with German header
-    r = await in_process_client.get(
+
+    # Retrieve with German header (authenticated — DENY-by-default baseline)
+    r = await sysadmin_in_process_client.get(
         f"/stac/catalogs/{catalog_id}",
         headers={"Accept-Language": "de-DE"}
     )

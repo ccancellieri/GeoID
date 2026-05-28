@@ -99,6 +99,14 @@ def _iam_service_policies() -> List[Policy]:
     """Pure declaration of the IAM extension's own service policies."""
     return [
         Policy(
+            id="sysadmin_full_access",
+            description="Unrestricted access for system administrators.",
+            actions=["*"],
+            resources=[".*"],
+            effect="ALLOW",
+            partition_key="global",
+        ),
+        Policy(
             id="admin_authorization_api",
             description="Allows admin users to manage user roles and permissions",
             actions=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -124,7 +132,10 @@ def _iam_service_role_bindings() -> List[Role]:
     cfg = IamRolesConfig()
     return [
         Role(name=cfg.admin_role_name, policies=["admin_authorization_api"]),
-        Role(name=cfg.sysadmin_role_name, policies=["admin_authorization_api"]),
+        # sysadmin_full_access must be included here so that update_role
+        # (which replaces the policies list entirely) retains it alongside
+        # the admin_authorization_api binding that this preset introduces.
+        Role(name=cfg.sysadmin_role_name, policies=["sysadmin_full_access", "admin_authorization_api"]),
         Role(name=cfg.default_user_role_name, policies=["self_service_authorization_api"]),
     ]
 

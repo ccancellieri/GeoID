@@ -2,8 +2,7 @@
 #    Licensed under the Apache License, Version 2.0 (the "License").
 
 import logging
-from dynastore.models.protocols.authorization import IamRolesConfig
-from dynastore.models.protocols.policies import Policy, Role
+from dynastore.models.protocols.policies import Policy
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
@@ -31,9 +30,5 @@ def register_configs_policies():
         effect="ALLOW",
     )
     pm.register_policy(configs_policy)
-
-    pm.register_role(
-        Role(name=IamRolesConfig().sysadmin_role_name, policies=["configs_access"])
-    )
 
     logger.debug("Configs policies registered via PermissionProtocol.")
