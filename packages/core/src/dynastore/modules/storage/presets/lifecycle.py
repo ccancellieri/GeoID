@@ -36,7 +36,7 @@ from typing import Any, Literal, Mapping, Optional
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from dynastore.modules.db_config.query_executor import managed_transaction, DbResource
+from dynastore.modules.db_config.query_executor import managed_transaction, DbResource, DQLQuery, ResultHandler
 from dynastore.modules.iam.applied_presets_service import AppliedPresetsService, AppliedRow
 
 from .preset import AppliedDescriptor, PresetContext, PresetPlan, TaskHandle
@@ -323,6 +323,90 @@ def _scope_from_base(base_scope: Mapping[str, str]) -> str:
     if cat:
         return f"catalog:{cat}"
     return "platform"
+
+
+async def bootstrap_preset_if_absent(
+    engine: Any,
+    *,
+    preset_name: str,
+    scope_key: str = "platform",
+    lock_key: Optional[str] = None,
+) -> bool:
+    """Apply a preset once per DB on cold-boot if no sentinel row exists.
+
+    Uses ``iam.applied_presets`` as a sentinel so subsequent restarts are
+    no-ops.  A PostgreSQL advisory lock serialises concurrent first boots.
+
+    Returns ``True`` if the preset was applied this call, ``False`` if a
+    sentinel already existed (idempotent no-op).
+    """
+    from dynastore.modules.db_config.locking_tools import acquire_startup_lock
+    from dynastore.modules.storage.presets.preset import NoParams
+
+    _select_sentinel = DQLQuery(
+        """
+        SELECT 1 FROM iam.applied_presets
+        WHERE preset_name = :preset_name
+          AND scope_key   = :scope_key
+        """,
+        result_handler=ResultHandler.ONE_OR_NONE,
+    )
+
+    _insert_sentinel = DQLQuery(
+        """
+        INSERT INTO iam.applied_presets
+            (preset_name, scope_key, state, applied_at, applied_by,
+             params_snapshot, revoke_descriptor, updated_at)
+        VALUES
+            (:preset_name, :scope_key, 'applied', NOW(), NULL,
+             :params_snapshot, :revoke_descriptor, NOW())
+        ON CONFLICT (preset_name, scope_key) DO NOTHING
+        """,
+        result_handler=ResultHandler.ONE_OR_NONE,
+    )
+
+    _lock_key = lock_key or f"iam_seed:{preset_name}:{scope_key}"
+
+    async with acquire_startup_lock(engine, _lock_key) as conn:
+        if conn is None:
+            return False
+
+        row = await _select_sentinel.execute(conn, preset_name=preset_name, scope_key=scope_key)
+        if row is not None:
+            logger.debug(
+                "bootstrap_preset_if_absent: sentinel present for %r at %r — skipping",
+                preset_name,
+                scope_key,
+            )
+            return False
+
+        preset = find_preset(preset_name)
+        if preset is None:
+            logger.warning(
+                "bootstrap_preset_if_absent: preset %r not registered — skipping",
+                preset_name,
+            )
+            return False
+
+        ctx = _build_context(engine, principal=None, scope=scope_key)
+        params = preset.params_model() if callable(getattr(preset, "params_model", None)) else NoParams()
+
+        descriptor = await preset.apply(params, scope_key, ctx)
+
+        payload = descriptor.payload if hasattr(descriptor, "payload") else {}
+        await _insert_sentinel.execute(
+            conn,
+            preset_name=preset_name,
+            scope_key=scope_key,
+            params_snapshot=json.dumps({}),
+            revoke_descriptor=json.dumps(payload),
+        )
+        logger.info(
+            "bootstrap_preset_if_absent: preset %r applied at scope %r on cold-boot",
+            preset_name,
+            scope_key,
+        )
+        return True
 
 
 def _check_self_lockout(

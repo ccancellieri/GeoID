@@ -219,23 +219,14 @@ async def test_dry_run_emits_two_entries() -> None:
 
 @pytest.mark.asyncio
 async def test_bootstrap_runs_when_sentinel_absent() -> None:
-    """Bootstrap applies preset + writes sentinel when iam.applied_presets is empty."""
-    from dynastore.modules.iam.module import IamModule
-
-    mod = IamModule()
+    """bootstrap_preset_if_absent applies preset + writes sentinel when absent."""
+    from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
 
     existing_role = Role(name=_ROLE_NAME, policies=["auth_extension_public"])
     iam_svc = _make_iam(existing_roles={_ROLE_NAME: existing_role})
     policy_svc = _make_policy_svc()
 
     insert_calls: list = []
-
-    async def _select_absent(conn: Any, **_kw: Any) -> None:
-        return None  # sentinel absent
-
-    async def _insert_record(conn: Any, **kw: Any) -> None:
-        insert_calls.append(kw)
-        return None
 
     class _FakeLock:
         def __init__(self, *_a: Any, **_kw: Any) -> None:
@@ -247,24 +238,38 @@ async def test_bootstrap_runs_when_sentinel_absent() -> None:
         async def __aexit__(self, *_: Any) -> bool:
             return False
 
+    call_count = [0]
+
+    async def _mock_dql_execute(conn: Any, **kw: Any) -> Any:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return None  # SELECT sentinel → absent
+        insert_calls.append(kw)
+        return None  # INSERT sentinel
+
+    class _MockDQL:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        execute = AsyncMock(side_effect=_mock_dql_execute)
+
     with patch(
         "dynastore.modules.db_config.locking_tools.acquire_startup_lock", _FakeLock
     ), patch(
-        "dynastore.modules.iam.module._BOOTSTRAP_SELECT_SENTINEL"
-    ) as mock_select, patch(
-        "dynastore.modules.iam.module._BOOTSTRAP_INSERT_SENTINEL"
-    ) as mock_insert, patch(
-        "dynastore.modules.iam.module.get_protocol",
-        side_effect=lambda proto: iam_svc if "IamService" in str(proto) else policy_svc,
-    ), patch(
-        "dynastore.modules.storage.presets.registry.find_preset",
+        "dynastore.modules.storage.presets.lifecycle.find_preset",
         return_value=_PRESET,
+    ), patch(
+        "dynastore.modules.storage.presets.lifecycle._build_context",
+        return_value=_make_ctx(iam_svc, policy_svc),
+    ), patch(
+        "dynastore.modules.storage.presets.lifecycle.DQLQuery",
+        _MockDQL,
     ):
-        mock_select.execute = AsyncMock(side_effect=_select_absent)
-        mock_insert.execute = AsyncMock(side_effect=_insert_record)
+        result = await bootstrap_preset_if_absent(
+            MagicMock(), preset_name="public_access_baseline"
+        )
 
-        await mod._bootstrap_public_access_baseline(engine=MagicMock())
-
+    assert result is True
     # Sentinel was inserted.
     assert len(insert_calls) == 1
     # The preset ran — policy was created (update returned None → create).
@@ -277,15 +282,11 @@ async def test_bootstrap_runs_when_sentinel_absent() -> None:
 
 @pytest.mark.asyncio
 async def test_bootstrap_skips_when_sentinel_present() -> None:
-    """Bootstrap no-ops when iam.applied_presets sentinel row already exists."""
-    from dynastore.modules.iam.module import IamModule
+    """bootstrap_preset_if_absent no-ops when sentinel row already exists."""
+    from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
 
-    mod = IamModule()
     policy_svc = _make_policy_svc()
     iam_svc = _make_iam()
-
-    async def _select_present(conn: Any, **_kw: Any) -> object:
-        return (1,)  # truthy sentinel row
 
     class _FakeLock:
         def __init__(self, *_a: Any, **_kw: Any) -> None:
@@ -297,18 +298,29 @@ async def test_bootstrap_skips_when_sentinel_present() -> None:
         async def __aexit__(self, *_: Any) -> bool:
             return False
 
+    async def _select_present(conn: Any, **kw: Any) -> Any:
+        return (1,)  # SELECT sentinel → present
+
+    class _MockDQL:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        execute = AsyncMock(side_effect=_select_present)
+
     with patch(
         "dynastore.modules.db_config.locking_tools.acquire_startup_lock", _FakeLock
     ), patch(
-        "dynastore.modules.iam.module._BOOTSTRAP_SELECT_SENTINEL"
-    ) as mock_select, patch(
-        "dynastore.modules.iam.module.get_protocol",
-        side_effect=lambda proto: iam_svc if "IamService" in str(proto) else policy_svc,
+        "dynastore.modules.storage.presets.lifecycle.find_preset",
+        return_value=_PRESET,
+    ), patch(
+        "dynastore.modules.storage.presets.lifecycle.DQLQuery",
+        _MockDQL,
     ):
-        mock_select.execute = AsyncMock(side_effect=_select_present)
+        result = await bootstrap_preset_if_absent(
+            MagicMock(), preset_name="public_access_baseline"
+        )
 
-        await mod._bootstrap_public_access_baseline(engine=MagicMock())
-
+    assert result is False
     # Sentinel present → no preset apply ran.
     policy_svc.create_policy.assert_not_called()
     policy_svc.update_policy.assert_not_called()
@@ -321,10 +333,9 @@ async def test_bootstrap_skips_when_sentinel_present() -> None:
 
 @pytest.mark.asyncio
 async def test_bootstrap_skips_on_lock_timeout() -> None:
-    """Bootstrap returns without writing when acquire_startup_lock yields None."""
-    from dynastore.modules.iam.module import IamModule
+    """bootstrap_preset_if_absent returns False without writing when lock times out."""
+    from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
 
-    mod = IamModule()
     policy_svc = _make_policy_svc()
     iam_svc = _make_iam()
 
@@ -341,11 +352,14 @@ async def test_bootstrap_skips_on_lock_timeout() -> None:
     with patch(
         "dynastore.modules.db_config.locking_tools.acquire_startup_lock", _TimedOutLock
     ), patch(
-        "dynastore.modules.iam.module.get_protocol",
-        side_effect=lambda proto: iam_svc if "IamService" in str(proto) else policy_svc,
+        "dynastore.modules.storage.presets.lifecycle.find_preset",
+        return_value=_PRESET,
     ):
-        await mod._bootstrap_public_access_baseline(engine=MagicMock())
+        result = await bootstrap_preset_if_absent(
+            MagicMock(), preset_name="public_access_baseline"
+        )
 
+    assert result is False
     # Nothing written — lock was not acquired.
     policy_svc.create_policy.assert_not_called()
     policy_svc.update_policy.assert_not_called()
