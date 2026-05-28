@@ -31,19 +31,13 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
-from enum import Enum
-from pydantic import Field
-from shapely.geometry import shape, mapping
-from shapely import wkb
 from geojson_pydantic import Feature
 from geojson_pydantic.geometries import Geometry
 from dynastore.models.query_builder import QueryRequest
 
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarProtocol,
-    SidecarConfig,
     FeaturePipelineContext,
-    ValidationResult,
     FieldDefinition,
     FieldCapability,
 )
@@ -58,15 +52,9 @@ from dynastore.modules.storage.computed_fields import (
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     GeometriesSidecarConfig,
     TargetDimension,
-    InvalidGeometryPolicy,
-    SridMismatchPolicy,
     SimplificationAlgorithm,
-    GeometryPartitionStrategyPreset,
 )
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
-from dynastore.tools.geospatial_exceptions import (
-    GeometryProcessingError,
-)
 
 logger = logging.getLogger(__name__)
 
