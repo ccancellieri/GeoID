@@ -15,19 +15,29 @@ async def get_valid_properties(conn: DbResource, catalog_id: str, collection_id:
     from dynastore.modules.storage.routing_config import Operation
     from dynastore.models.protocols.storage_driver import Capability
 
-    # 1. Get physical columns via driver introspection
+    # 1. Resolve the driver — required for both introspection and config below.
+    # (Previously this was inside the introspection try/except, so a get_driver
+    # failure was swallowed and then re-surfaced as a confusing NameError on the
+    # `driver.get_driver_config` call below.)
+    driver = await get_driver(Operation.READ, catalog_id, collection_id)
+
+    # 2. Physical columns via driver introspection (best-effort).
     physical_columns: Set[str] = set()
-    try:
-        driver = await get_driver(Operation.READ, catalog_id, collection_id)
-        if hasattr(driver, "capabilities") and Capability.INTROSPECTION in driver.capabilities:
+    if hasattr(driver, "capabilities") and Capability.INTROSPECTION in driver.capabilities:
+        try:
             schema_info = await driver.introspect_schema(
                 catalog_id, collection_id, db_resource=conn
             )
             physical_columns = {entry.name for entry in schema_info} if schema_info else set()
-    except (ValueError, Exception):
-        pass
+        except Exception as e:
+            logger.warning(
+                "Schema introspection failed for %s.%s; proceeding without physical columns: %s",
+                catalog_id,
+                collection_id,
+                e,
+            )
 
-    # 2. Get driver config (sidecars, partitioning, etc.)
+    # 3. Get driver config (sidecars, partitioning, etc.)
     config = await driver.get_driver_config(catalog_id, collection_id, db_resource=conn)
 
     schema_properties = set()
