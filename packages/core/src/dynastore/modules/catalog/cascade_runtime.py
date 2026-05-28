@@ -98,7 +98,26 @@ class CascadeOrchestrator:
         all_refs: list[dict[str, Any]] = []
 
         for owner in owners:
-            refs = await owner.describe_scope(scope_ref, conn)
+            try:
+                refs = await owner.describe_scope(scope_ref, conn)
+            except Exception as exc:
+                # Fail-closed (#1456/#1469): re-raise so the caller's
+                # transaction rolls back and the schema drop is aborted.
+                # Log first with full owner context — without this signal
+                # the operator sees only the rolled-back delete and has
+                # no way to attribute the failure to a specific owner.
+                logger.error(
+                    "cascade_describe_scope_failed: owner_id=%r scope=%r "
+                    "catalog_id=%r collection_id=%r mode=%r error=%s — "
+                    "snapshot aborted; caller transaction will roll back "
+                    "and the schema drop will NOT proceed (fail-closed). "
+                    "Fix the owner or unregister it to unblock the delete.",
+                    owner.owner_id, scope_ref.scope.value,
+                    scope_ref.catalog_id, scope_ref.collection_id,
+                    mode.value, exc,
+                    exc_info=True,
+                )
+                raise
             for ref in refs:
                 all_refs.append(ref.to_json())
 
@@ -110,7 +129,24 @@ class CascadeOrchestrator:
             )
             return None
 
-        task_id = await self._enqueue(scope_ref, mode, all_refs)
+        try:
+            task_id = await self._enqueue(scope_ref, mode, all_refs)
+        except Exception as exc:
+            # Fail-closed (#1456/#1469): re-raise. The schema drop will be
+            # aborted, but every CleanupRef captured this round is lost
+            # because the caller's transaction rolls back. The operator
+            # needs the ref count to assess blast radius on retry.
+            logger.error(
+                "cascade_enqueue_failed: scope=%r catalog_id=%r mode=%r "
+                "ref_count=%d error=%s — task INSERT failed; caller "
+                "transaction will roll back and the schema drop will NOT "
+                "proceed (fail-closed). Investigate the task storage "
+                "before retrying the delete.",
+                scope_ref.scope.value, scope_ref.catalog_id, mode.value,
+                len(all_refs), exc,
+                exc_info=True,
+            )
+            raise
         logger.info(
             "cascade_runtime: enqueued cascade_cleanup task %s "
             "(%d ref(s)) for scope %r catalog_id=%r.",

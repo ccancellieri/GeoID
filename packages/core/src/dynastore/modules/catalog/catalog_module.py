@@ -86,6 +86,59 @@ from dynastore.modules.catalog.log_manager import LogService, initialize_system_
 
 logger = logging.getLogger(__name__)
 
+
+def _register_cascade_owners(
+    registry: Any,
+    owner_modules: List[tuple[str, str]],
+) -> None:
+    """Import each cascade-owner module and call its ``register_owners(registry)``.
+
+    Three outcomes per module, each with a distinct log signal so missed
+    registrations cannot leak silently (#1469):
+
+    * ``ModuleNotFoundError`` on import → DEBUG. Expected when an optional
+      extension wheel is not installed in this SCOPE.
+    * Any other ``Exception`` on import → ERROR (``cascade_owner_import_failed``).
+      The module is supposed to be present; cleanup of that resource type
+      will be skipped on catalog hard-delete and resources will leak.
+    * ``register_owners`` itself raises after a clean import → ERROR
+      (``cascade_owner_registration_failed``). Same leak risk.
+    """
+    import importlib
+
+    for module_path, label in owner_modules:
+        try:
+            mod = importlib.import_module(module_path)
+        except ModuleNotFoundError:
+            logger.debug(
+                "CatalogModule: %s cascade owner module %r not installed; "
+                "skipping registration.",
+                label, module_path,
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "cascade_owner_import_failed: module=%r label=%r error=%s "
+                "— owner NOT registered; cleanup of %s resources will be "
+                "skipped on catalog hard-delete and those resources WILL "
+                "LEAK. Fix the import error.",
+                module_path, label, exc, label,
+                exc_info=True,
+            )
+            continue
+        try:
+            mod.register_owners(registry)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "cascade_owner_registration_failed: module=%r label=%r "
+                "error=%s — owner NOT registered; cleanup of %s resources "
+                "will be skipped on catalog hard-delete and those resources "
+                "WILL LEAK.",
+                module_path, label, exc, label,
+                exc_info=True,
+            )
+
+
 # --- Asset event bridge: AssetEventType → CatalogEventType via EventsProtocol ---
 
 _ASSET_EVENT_MAP = {
@@ -300,17 +353,7 @@ class CatalogModule(ModuleProtocol):
                     "proxy short URLs",
                 ),
             ]
-            for _module_path, _label in _owner_modules:
-                try:
-                    import importlib as _importlib
-                    _mod = _importlib.import_module(_module_path)
-                    _mod.register_owners(cascade_cleanup_registry)
-                except Exception as _exc:  # noqa: BLE001
-                    logger.warning(
-                        "CatalogModule: %s cascade owner registration failed "
-                        "(non-fatal — module may not be installed): %s",
-                        _label, _exc,
-                    )
+            _register_cascade_owners(cascade_cleanup_registry, _owner_modules)
 
             cascade_cleanup_registry.freeze()
             logger.info("CatalogModule: cascade_cleanup_registry frozen.")

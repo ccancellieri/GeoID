@@ -208,6 +208,66 @@ class TestOrchestratorSnapshotAndEnqueue:
             )
 
 
+class TestObservabilityOnSilentLossPaths:
+    """Regression guards for #1469: ERROR-level structured logs at the
+    silent-loss points so operators can attribute fail-closed rollbacks
+    to a specific owner."""
+
+    @pytest.mark.asyncio
+    async def test_describe_scope_failure_emits_error_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = CascadeCleanupRegistry()
+        reg.register(_make_raising_owner("owner-broken"))
+        reg.freeze()
+        orch = _make_orchestrator(reg)
+
+        with caplog.at_level("ERROR", logger="dynastore.modules.catalog.cascade_runtime"):
+            with pytest.raises(RuntimeError, match="simulated owner failure"):
+                await orch.snapshot_and_enqueue(
+                    MagicMock(),
+                    ScopeRef(scope=ResourceScope.CATALOG, catalog_id="cat-9"),
+                    CleanupMode.HARD,
+                )
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert error_records, "expected ERROR log on describe_scope failure"
+        msg = error_records[0].getMessage()
+        assert "cascade_describe_scope_failed" in msg
+        assert "owner-broken" in msg
+        assert "cat-9" in msg
+        assert "fail-closed" in msg.lower() or "rolls back" in msg.lower() or "roll back" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_enqueue_failure_emits_error_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        ref = CleanupRef(kind="es_index", locator="idx-x", owner_id="owner-ok")
+        reg = CascadeCleanupRegistry()
+        reg.register(_make_owner("owner-ok", [ref]))
+        reg.freeze()
+        orch = _make_orchestrator(reg)
+
+        async def _boom(*_args: Any, **_kwargs: Any) -> str:
+            raise RuntimeError("task storage unavailable")
+
+        with caplog.at_level("ERROR", logger="dynastore.modules.catalog.cascade_runtime"):
+            with patch.object(orch, "_enqueue", new=_boom):
+                with pytest.raises(RuntimeError, match="task storage unavailable"):
+                    await orch.snapshot_and_enqueue(
+                        MagicMock(),
+                        ScopeRef(scope=ResourceScope.CATALOG, catalog_id="cat-enq"),
+                        CleanupMode.HARD,
+                    )
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert error_records, "expected ERROR log on enqueue failure"
+        msg = error_records[0].getMessage()
+        assert "cascade_enqueue_failed" in msg
+        assert "cat-enq" in msg
+        assert "ref_count=1" in msg
+
+
 class TestPurgeCatalogStorageOrdering:
     """Regression guard for #1470: snapshot_and_enqueue precedes schema drop."""
 
