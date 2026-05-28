@@ -30,45 +30,6 @@ from dynastore.extensions.documentation._fastapi_docs import custom_swagger_ui_h
 
 logger = logging.getLogger(__name__)
 
-# Styling for the standalone rendered-README page served at ``/_help/{name}``.
-# Kept as a module-level constant (rather than inline in the handler) so the
-# look-and-feel lives in one place; intentionally a plain string — no
-# templating engine is warranted for a single static stylesheet.
-_HELP_PAGE_CSS = """
-                    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 900px; margin: 0 auto; padding: 20px; background-color: #f9f9f9; }
-                    header { margin-bottom: 30px; padding-bottom: 10px; border-bottom: 1px solid #eaeaea; }
-                    a { color: #007bff; text-decoration: none; }
-                    a:hover { text-decoration: underline; }
-                    pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 5px; overflow-x: auto; }
-                    code { background: #eaeaea; padding: 2px 5px; border-radius: 3px; font-family: monospace; font-size: 0.9em; }
-                    pre code { background: transparent; color: inherit; padding: 0; }
-                    table { border-collapse: collapse; width: 100%; margin: 20px 0; background: white; }
-                    th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-                    th { background-color: #f2f2f2; font-weight: 600; }
-                    blockquote { border-left: 4px solid #007bff; margin: 0; padding-left: 15px; color: #555; }
-                    img { max-width: 100%; height: auto; }
-"""
-
-# Wraps the markdown-rendered README in a full HTML document. Placeholders:
-# ``{title}`` (page title), ``{css}`` (the stylesheet above), ``{docs_url}``
-# (link back to the main API docs) and ``{body}`` (rendered markdown).
-_HELP_PAGE_TEMPLATE = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>{title}</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <style>{css}</style>
-            </head>
-            <body>
-                <header>
-                    <p><a href="#" onclick="window.close(); return false;">&larr; Close Window</a> | <a href="{docs_url}">Back to Main API Docs</a></p>
-                </header>
-                {body}
-            </body>
-            </html>
-            """
-
 # Markdown extensions used wherever a README is rendered to HTML.
 _MARKDOWN_EXTENSIONS = ["fenced_code", "tables"]
 
@@ -197,45 +158,6 @@ def configure_swagger_ui(app: FastAPI):
         _oauth2_redirect_handler,
         include_in_schema=False,
     )
-
-
-def setup_global_help_endpoint(app: FastAPI):
-    """
-    Sets up the generic /_help/{name} endpoint that renders Markdown.
-    """
-    if not hasattr(app.state, "extension_docs_registry"):
-        app.state.extension_docs_registry = {}
-
-    async def global_extension_help_handler(request: Request, name: str):
-        from dynastore.extensions.tools.url import get_root_url
-
-        registry = getattr(request.app.state, "extension_docs_registry", {})
-        try:
-            body = render_extension_readme_body(registry, name)
-        except RendererUnavailable:
-            return HTMLResponse("<h1>Documentation renderer (markdown) not installed</h1>", status_code=500)
-        except ReadmeNotFound:
-            return HTMLResponse("<h1>Documentation not found</h1>", status_code=404)
-        except Exception as e:
-            return HTMLResponse(content=f"Error reading docs: {e}", status_code=500)
-
-        html_content = _HELP_PAGE_TEMPLATE.format(
-            title=f"{name.capitalize()} Extension Help",
-            css=_HELP_PAGE_CSS,
-            docs_url=f"{get_root_url(request=request)}/docs",
-            body=body,
-        )
-        return HTMLResponse(content=html_content)
-
-    # Register hidden route
-    route_path = "/_help/{name}"
-    if not any(getattr(route, "path", None) == route_path for route in app.routes):
-        app.add_api_route(
-            route_path,
-            global_extension_help_handler,
-            methods=["GET"],
-            include_in_schema=False,
-        )
 
 
 def enrich_extension_metadata(app: FastAPI, config: ExtensionConfig, router: APIRouter):

@@ -18,12 +18,10 @@
 
 from dynastore.extensions.documentation.service import (
     configure_swagger_ui,
-    setup_global_help_endpoint,
     enrich_extension_metadata,
 )
 
 __all__ = [
     "configure_swagger_ui",
-    "setup_global_help_endpoint",
     "enrich_extension_metadata",
 ]

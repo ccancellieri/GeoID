@@ -34,7 +34,6 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.registry import ExtensionConfig
 from dynastore.extensions.documentation import (
     configure_swagger_ui,
-    setup_global_help_endpoint,
     enrich_extension_metadata,
 )
 from dynastore.extensions.tools.exposure_matrix import ExposureMatrix
@@ -84,9 +83,6 @@ async def lifespan(app: FastAPI):
         logger.warning("Lifespan: No extensions enabled/instantiated.")
         yield
         return
-
-    # 1. Setup the global help infrastructure
-    setup_global_help_endpoint(app)
 
     logger.info(f"Activating {len(configs)} extensions...")
 
