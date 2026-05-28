@@ -44,6 +44,7 @@ def configure_swagger_ui(app: FastAPI):
         "persistAuthorization": True,
         "deepLinking": True,
         "displayOperationId": False,
+        "tagsSorter": "alpha",
     })
 
     # Build the OAuth init dict from environment. ``IDP_CLIENT_ID`` is the
