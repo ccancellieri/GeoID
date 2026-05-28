@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Dict, List, Any, Mapping, Tuple, Set, Optional
+from typing import Dict, List, Any, Mapping, Tuple, Optional
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 from dynastore.modules.storage.read_policy import (
     ItemsReadPolicy,
@@ -33,10 +33,7 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import (
 )
 from dynastore.models.query_builder import (
     QueryRequest,
-    FieldSelection,
-    FilterCondition,
     FilterOperator,
-    SortOrder,
 )
 from dynastore.models.ogc import Feature
 from dynastore.tools.discovery import get_protocol

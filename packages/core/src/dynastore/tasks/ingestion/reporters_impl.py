@@ -19,15 +19,13 @@
 # dynastore/modules/ingestion/reporters_impl.py
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from sqlalchemy.engine import Engine
 
-from dynastore.modules.db_config.query_executor import managed_transaction, run_in_event_loop
+from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.tasks import tasks_module
 from dynastore.modules.tasks.models import TaskUpdate, TaskStatusEnum
 
-from dynastore.tools.json import CustomJSONEncoder
 from dynastore.tasks.reporters import ReportingInterface
 from dynastore.tasks.ingestion.reporters import ingestion_reporter
 

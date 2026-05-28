@@ -20,8 +20,8 @@
 import logging
 import importlib.resources
 import uuid
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status, FastAPI
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncConnection
 from dynastore.extensions.tools.db import get_async_connection
@@ -30,7 +30,6 @@ from dynastore.extensions.tools.db import get_async_connection
 from dynastore.modules.tasks import tasks_module
 from dynastore.modules.tasks.models import Task
 from dynastore.extensions.protocols import ExtensionProtocol
-from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 logger = logging.getLogger(__name__)
 class TasksService(ExtensionProtocol):

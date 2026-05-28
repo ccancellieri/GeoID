@@ -18,17 +18,15 @@
 
 import logging
 import asyncio
-from contextlib import asynccontextmanager
 from typing import Optional, Tuple, Union
 
 from fastapi import (
-    APIRouter, Depends, HTTPException, Query, Request, Response, status, FastAPI
+    APIRouter, HTTPException, Query, status, FastAPI
 )
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.models.protocols import CloudStorageClientProtocol
 from dynastore.modules import get_protocol
-from dynastore.extensions.httpx.httpx_service import get_client
 from dynastore.modules.gdal.models import RasterInfo, VectorInfo
 from dynastore.modules.gdal.gdal_module import GdalModule
 from dynastore.modules.gdal.service import FileType, get_raster_info, get_vector_info

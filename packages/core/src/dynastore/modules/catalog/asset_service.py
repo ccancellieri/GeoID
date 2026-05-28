@@ -150,7 +150,6 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Dict, Any, Union, Cal
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.router import ResolvedDriver
-from sqlalchemy import text
 from dynastore.tools.cache import cached
 from pydantic import BaseModel, Field, ConfigDict, StringConstraints, model_validator
 
@@ -162,11 +161,9 @@ from dynastore.modules.db_config.query_executor import (
     DbResource,
     DbConnection,
 )
-from dynastore.tools.json import CustomJSONEncoder
-from dynastore.modules.catalog.models import AssetReferenceType, CoreAssetReferenceType, EventType
+from dynastore.modules.catalog.models import AssetReferenceType, EventType
 from dynastore.models.shared_models import Link
 from dynastore.models.protocols.assets import AssetsProtocol
-from dynastore.models.protocols.asset_driver import AssetStore
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.query_builder import AssetFilter
 from enum import Enum
@@ -1232,7 +1229,7 @@ class AssetService(AssetsProtocol):
 
         # Fan-out hard-deletes to write driver (if non-PG) and secondary drivers
         if hard:
-            from dynastore.modules.storage.routing_config import FailurePolicy, WriteMode
+            from dynastore.modules.storage.routing_config import FailurePolicy
 
             write_driver = await get_asset_driver("WRITE", catalog_id, collection_id)
             secondaries = await self._get_secondary_drivers(catalog_id, collection_id)

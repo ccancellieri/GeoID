@@ -17,17 +17,15 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import asyncio
 import os
 from contextlib import asynccontextmanager
 import json
 from dynastore.tools.json import CustomJSONEncoder
 from typing import Optional, Dict, Any, List, AsyncGenerator
 from datetime import datetime, timezone
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict
 
 from dynastore.tools.plugin import ProtocolPlugin
-from dynastore.modules.db_config.db_config import DBConfig
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
@@ -46,9 +44,7 @@ from dynastore.modules.db_config.maintenance_tools import (
     register_cron_job,
 )
 from dynastore.modules.db_config.locking_tools import (
-    acquire_lock_if_needed,
     check_table_exists,
-    check_function_exists,
     safe_drop_relation,
 )
 from dynastore.models.protocols import LogsProtocol, CatalogsProtocol
