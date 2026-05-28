@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import ClassVar, Protocol, Optional, Any, TYPE_CHECKING, runtime_checkable, AsyncGenerator, List, Tuple
+from typing import ClassVar, Any, TYPE_CHECKING, AsyncGenerator
 
 if TYPE_CHECKING:
     from fastapi import FastAPI, APIRouter
