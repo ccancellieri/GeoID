@@ -1562,6 +1562,11 @@ class CatalogService(CatalogsProtocol):
         The caller owns any async external-resource destroy (e.g.
         ``lifecycle_registry.destroy_async_catalog``). Returns the old
         physical schema name (``None`` if the catalog had no schema recorded).
+
+        Fail-closed: any exception from ``snapshot_and_enqueue`` propagates
+        to the caller, rolling back the ``managed_transaction`` and aborting
+        the schema drop.  This ensures external resources are never orphaned
+        silently — the operator must fix the underlying issue and retry.
         """
         from dynastore.modules.catalog.cascade_runtime import CascadeOrchestrator
         from dynastore.modules.catalog.resource_owner import CleanupMode, ResourceScope, ScopeRef
@@ -1575,17 +1580,9 @@ class CatalogService(CatalogsProtocol):
             else CascadeOrchestrator()
         )
         scope_ref = ScopeRef(scope=ResourceScope.CATALOG, catalog_id=catalog_id)
-        cascade_task_id: Optional[str] = None
-        try:
-            cascade_task_id = await orchestrator.snapshot_and_enqueue(
-                conn, scope_ref, CleanupMode.HARD
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "_purge_catalog_storage: cascade snapshot failed for catalog %r "
-                "(non-fatal — proceeding with schema drop): %s",
-                catalog_id, exc, exc_info=True,
-            )
+        cascade_task_id = await orchestrator.snapshot_and_enqueue(
+            conn, scope_ref, CleanupMode.HARD
+        )
 
         # Resolve physical schema without deleted_at filter — works for
         # both live and tombstoned rows.

@@ -137,9 +137,6 @@ class ProxyService(ExtensionProtocol):
                 "ProxyService: 'httpx' extension not found. The anonymizing proxy endpoint /p/{short_key} will be disabled."
             )
 
-        # Register automated cleanup hooks
-        hooks.register_proxy_listeners()
-
         yield
 
     @router.post(

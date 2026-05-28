@@ -175,7 +175,8 @@ class TestOrchestratorSnapshotAndEnqueue:
         assert captured["refs"][0]["owner_id"] == "owner-a"
 
     @pytest.mark.asyncio
-    async def test_owner_exception_swallowed_others_proceed(self) -> None:
+    async def test_owner_exception_propagates_fail_closed(self) -> None:
+        """Fail-closed: any owner exception must propagate so the caller rolls back."""
         ref_b = CleanupRef(kind="gcs_prefix", locator="gs://b", owner_id="owner-b")
         reg = CascadeCleanupRegistry()
         reg.register(_make_raising_owner("owner-a"))
@@ -184,38 +185,27 @@ class TestOrchestratorSnapshotAndEnqueue:
         orch = _make_orchestrator(reg)
 
         with patch.object(orch, "_enqueue", new=AsyncMock(return_value="task-x")):
-            result = await orch.snapshot_and_enqueue(
-                MagicMock(),
-                ScopeRef(scope=ResourceScope.CATALOG, catalog_id="cat-x"),
-                CleanupMode.HARD,
-            )
-        assert result == "task-x"
+            with pytest.raises(RuntimeError, match="simulated owner failure"):
+                await orch.snapshot_and_enqueue(
+                    MagicMock(),
+                    ScopeRef(scope=ResourceScope.CATALOG, catalog_id="cat-x"),
+                    CleanupMode.HARD,
+                )
 
     @pytest.mark.asyncio
-    async def test_raising_owner_alone_returns_none(self) -> None:
+    async def test_raising_owner_alone_propagates(self) -> None:
+        """Fail-closed: single raising owner propagates; caller's transaction rolls back."""
         reg = CascadeCleanupRegistry()
         reg.register(_make_raising_owner("owner-a"))
         reg.freeze()
         orch = _make_orchestrator(reg)
 
-        result = await orch.snapshot_and_enqueue(
-            MagicMock(),
-            ScopeRef(scope=ResourceScope.CATALOG, catalog_id="cat-x"),
-            CleanupMode.HARD,
-        )
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
-# Ordering invariant: snapshot_and_enqueue BEFORE _drop_schema_query.execute
-# ---------------------------------------------------------------------------
-#
-# _purge_catalog_storage must capture the pre-drop DB state before the schema
-# is gone.  If the order ever flips the snapshot reads an empty schema and
-# cascade replay / dead-letter queues lose all refs — silent data loss.
-# This test pins the call order structurally so any future reordering breaks
-# loudly in CI.
-# ---------------------------------------------------------------------------
+        with pytest.raises(RuntimeError, match="simulated owner failure"):
+            await orch.snapshot_and_enqueue(
+                MagicMock(),
+                ScopeRef(scope=ResourceScope.CATALOG, catalog_id="cat-x"),
+                CleanupMode.HARD,
+            )
 
 
 class TestPurgeCatalogStorageOrdering:
@@ -227,33 +217,23 @@ class TestPurgeCatalogStorageOrdering:
         import dynastore.modules.catalog.catalog_service as cs_mod
         from dynastore.modules.catalog.catalog_service import CatalogService
 
-        # --- fake conn -------------------------------------------------------
         conn = MagicMock()
 
-        # --- orchestrator with a trackable snapshot_and_enqueue --------------
         mock_orchestrator = MagicMock()
         snapshot_mock = AsyncMock(return_value="task-id-test")
         mock_orchestrator.snapshot_and_enqueue = snapshot_mock
 
-        # --- parent mock that records ordering across both targets -----------
         parent = Mock()
         parent.attach_mock(snapshot_mock, "snapshot_and_enqueue")
 
-        # --- _drop_schema_query.execute mock ---------------------------------
         drop_execute_mock = AsyncMock(return_value=None)
         parent.attach_mock(drop_execute_mock, "drop_execute")
 
-        # --- inline DQLQuery for physical_schema lookup ----------------------
-        # The method constructs DQLQuery(SQL).execute(conn, ...) inline.
-        # We patch the class so any instantiation returns a mock whose execute
-        # returns the fake schema name.
         fake_dql_instance = MagicMock()
         fake_dql_instance.execute = AsyncMock(return_value="s_test_schema")
 
-        # --- _hard_delete_catalog_query.execute ------------------------------
         hard_delete_execute_mock = AsyncMock(return_value=1)
 
-        # --- managed_nested_transaction no-op context manager ---------------
         @asynccontextmanager
         async def _fake_nested_tx(conn_arg: Any):  # noqa: ANN001
             yield MagicMock()
@@ -274,19 +254,12 @@ class TestPurgeCatalogStorageOrdering:
         ):
             await service._purge_catalog_storage(conn, "cat-ordering-test")
 
-        # Both methods must have been called exactly once.
         snapshot_mock.assert_awaited_once()
         drop_execute_mock.assert_awaited_once()
 
-        # Ordering: snapshot_and_enqueue must appear BEFORE drop_execute in
-        # the parent mock's call list.
         call_names = [c[0] for c in parent.mock_calls]
-        assert "snapshot_and_enqueue" in call_names, (
-            "snapshot_and_enqueue was not called — cascade snapshot is missing"
-        )
-        assert "drop_execute" in call_names, (
-            "_drop_schema_query.execute was not called — schema was never dropped"
-        )
+        assert "snapshot_and_enqueue" in call_names
+        assert "drop_execute" in call_names
         snapshot_pos = call_names.index("snapshot_and_enqueue")
         drop_pos = call_names.index("drop_execute")
         assert snapshot_pos < drop_pos, (

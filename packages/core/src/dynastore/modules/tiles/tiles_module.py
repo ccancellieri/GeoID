@@ -60,10 +60,6 @@ from dynastore.modules.tiles.tiles_config import (
     TilesConfig,
 )
 from dynastore.models.protocols import CatalogsProtocol, DatabaseProtocol
-from dynastore.modules.catalog.catalog_module import (
-    CatalogEventType,
-    register_event_listener as register_catalog_event_listener,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -187,10 +183,8 @@ class TilesModule(ModuleProtocol, DatabaseProtocol):
                 unregister_plugin(obj)
                 setattr(self, attr, None)
 
-        # --- REGISTER LISTENERS ---
-        # Register in-process listeners to cleanup tile resources when a collection deletion event occurs.
-        logger.info("TilesModule: Registering event listeners.")
-        register_listeners()
+        # Hard-deletion tile cleanup is now handled by TilePreseedOwner
+        # registered in the cascade cleanup registry.  No event listener needed.
 
 
 # --- Tile Storage Protocols ---
@@ -1242,41 +1236,6 @@ async def invalidate_catalog_tiles(catalog_id: str):
             await provider.delete_storage_for_catalog(catalog_id)
         except Exception as exc:
             logger.error(f"Error during catalog tile invalidation: {exc}")
-
-
-# --- Event Handlers & Listeners ---
-
-
-async def on_collection_hard_deletion(catalog_id: str, collection_id: str, **kwargs):
-    """
-    Handler to cleanup tile caches when a collection is hard-deleted.
-    This function is triggered by an internal catalog event.
-    """
-    logger.info(
-        f"TilesModule: Event 'collection_hard_deletion' received for '{catalog_id}:{collection_id}'. Purging associated tiles."
-    )
-    await invalidate_collection_tiles(catalog_id, collection_id)
-
-
-async def on_catalog_hard_deletion(catalog_id: str, **kwargs):
-    """
-    Handler to cleanup tile infrastructure when a catalog is hard-deleted.
-    This function is triggered by an internal catalog event.
-    """
-    logger.info(
-        f"TilesModule: Event 'catalog_hard_deletion' received for '{catalog_id}'. Purging associated tile storage."
-    )
-    await invalidate_catalog_tiles(catalog_id)
-
-
-def register_listeners():
-    """Subscribes the Tiles module to internal catalog events."""
-    register_catalog_event_listener(
-        CatalogEventType.COLLECTION_HARD_DELETION, on_collection_hard_deletion
-    )
-    register_catalog_event_listener(
-        CatalogEventType.CATALOG_HARD_DELETION, on_catalog_hard_deletion
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -98,16 +98,9 @@ class CascadeOrchestrator:
         all_refs: list[dict[str, Any]] = []
 
         for owner in owners:
-            try:
-                refs = await owner.describe_scope(scope_ref, conn)
-                for ref in refs:
-                    all_refs.append(ref.to_json())
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "cascade_runtime: owner %r raised during describe_scope "
-                    "for %r — skipping its refs: %s",
-                    owner.owner_id, scope_ref, exc, exc_info=True,
-                )
+            refs = await owner.describe_scope(scope_ref, conn)
+            for ref in refs:
+                all_refs.append(ref.to_json())
 
         if not all_refs:
             logger.debug(

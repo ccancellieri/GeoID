@@ -265,20 +265,53 @@ class CatalogModule(ModuleProtocol):
             logger.info("Initialized CatalogModule services.")
 
             # Register cascade cleanup owners before the registry is frozen.
-            # Each driver module that owns external resources contributes its
-            # owners here.  The registry is frozen after all registrations so
-            # no late registration can occur at request time.
+            # Each driver module or extension that owns external resources
+            # contributes its owners here.  The registry is frozen after all
+            # registrations so no late registration can occur at request time.
             from dynastore.modules.catalog.cascade_registry import cascade_cleanup_registry
-            try:
-                from dynastore.modules.storage.drivers.elasticsearch_private.cascade_owners import (
-                    register_owners as _register_es_private_owners,
-                )
-                _register_es_private_owners(cascade_cleanup_registry)
-            except Exception as _exc:  # noqa: BLE001
-                logger.warning(
-                    "CatalogModule: ES private cascade owner registration failed "
-                    "(non-fatal — driver may not be installed): %s", _exc,
-                )
+
+            _owner_modules = [
+                (
+                    "dynastore.modules.storage.drivers.elasticsearch_private.cascade_owners",
+                    "ES private items",
+                ),
+                (
+                    "dynastore.modules.storage.drivers.elasticsearch_cascade_owners",
+                    "ES public items + assets",
+                ),
+                (
+                    "dynastore.modules.storage.drivers.elasticsearch_envelope.cascade_owners",
+                    "ES envelope items",
+                ),
+                (
+                    "dynastore.modules.iam.cascade_owner",
+                    "IAM catalog-scoped policies",
+                ),
+                (
+                    "dynastore.modules.tiles.cascade_owner",
+                    "tile preseed",
+                ),
+                (
+                    "dynastore.extensions.gcp.cascade_owner",
+                    "GCS bucket/prefix",
+                ),
+                (
+                    "dynastore.extensions.proxy.cascade_owner",
+                    "proxy short URLs",
+                ),
+            ]
+            for _module_path, _label in _owner_modules:
+                try:
+                    import importlib as _importlib
+                    _mod = _importlib.import_module(_module_path)
+                    _mod.register_owners(cascade_cleanup_registry)
+                except Exception as _exc:  # noqa: BLE001
+                    logger.warning(
+                        "CatalogModule: %s cascade owner registration failed "
+                        "(non-fatal — module may not be installed): %s",
+                        _label, _exc,
+                    )
+
             cascade_cleanup_registry.freeze()
             logger.info("CatalogModule: cascade_cleanup_registry frozen.")
 

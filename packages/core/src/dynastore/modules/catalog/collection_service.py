@@ -952,15 +952,32 @@ class CollectionService:
                         f"Failed to capture config snapshot for '{catalog_id}:{collection_id}': {e}"
                     )
 
+                # Snapshot CleanupRefs BEFORE any state is torn down so that
+                # describe_scope can read live rows.  Fail-closed: any exception
+                # here propagates, rolling back the managed_transaction and
+                # aborting the delete.
+                from dynastore.modules.catalog.cascade_runtime import CascadeOrchestrator
+                from dynastore.modules.catalog.resource_owner import (
+                    CleanupMode,
+                    ResourceScope,
+                    ScopeRef,
+                )
+                _cascade_orchestrator = CascadeOrchestrator()
+                _scope_ref = ScopeRef(
+                    scope=ResourceScope.COLLECTION,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+                await _cascade_orchestrator.snapshot_and_enqueue(
+                    conn, _scope_ref, CleanupMode.HARD
+                )
+
                 # Lifecycle: BEFORE -> _purge_collection_storage -> HARD_DELETION
                 # -> AFTER. Mirrors CatalogService.delete_catalog so the
                 # subscribers wired to these events actually fire — most
                 # importantly catalog_module._on_collection_hard_deletion
-                # (cascade to AssetsProtocol.delete_assets), plus the GCP
-                # per-collection blob-prefix cleanup task, the tile cache
-                # invalidator, and the webhook fan-out. Without the emits the
-                # assets table rows and storage blobs are left orphaned on
-                # hard-delete (#1438).
+                # (cascade to AssetsProtocol.delete_assets), plus the tile cache
+                # invalidator, and the webhook fan-out.
                 await emit_event(
                     CatalogEventType.BEFORE_COLLECTION_HARD_DELETION,
                     catalog_id=catalog_id,

@@ -51,7 +51,7 @@ from dynastore.modules.gcp.gcp_config import (
     GcsNotificationEventType,
     TriggeredAction,
 )
-from dynastore.modules.catalog.event_service import CatalogEventType, register_event_listener
+from dynastore.modules.catalog.event_service import CatalogEventType
 from dynastore.modules.events.models import (
     API_KEY_NAME,
     AuthConfigAPIKey,
@@ -567,126 +567,6 @@ async def _trigger_configured_actions(
 
 
 # --- In-Process Listener Adapters ---
-# These adapters bridge the gap between the Catalog Module's internal event arguments
-# and the logic defined above (which expects a standard payload dict and engine).
-
-
-async def _adapter_catalog_hard_deletion(catalog_id: str, **kwargs):
-    """Enqueues a GcpCatalogCleanupTask when a catalog is hard-deleted.
-
-    Fires on BEFORE_CATALOG_HARD_DELETION — the schema is still intact,
-    so we pre-resolve the bucket name and pass it in the task inputs.
-    This way the cleanup task works even after the schema is dropped.
-    """
-    from dynastore.models.protocols import DatabaseProtocol, StorageProtocol
-    from dynastore.models.tasks import TaskCreate
-    from dynastore.modules.tasks.tasks_module import create_task_for_catalog
-    from dynastore.tasks.gcp.gcp_catalog_cleanup_task import CleanupScope
-
-    db = get_protocol(DatabaseProtocol)
-    if not db:
-        logger.warning("_adapter_catalog_hard_deletion: DatabaseProtocol not available.")
-        return
-
-    # Pre-resolve bucket name while schema is still available
-    bucket_name = None
-    storage = get_protocol(StorageProtocol)
-    if storage:
-        try:
-            bucket_name = await storage.get_storage_identifier(catalog_id)
-        except Exception as e:
-            logger.debug(f"Could not pre-resolve bucket name for '{catalog_id}': {e}")
-
-    try:
-        task_data = TaskCreate(
-            task_type="gcp_catalog_cleanup",
-            caller_id="gcp_events:catalog_hard_deletion",
-            inputs={
-                "scope": CleanupScope.CATALOG.value,
-                "catalog_id": catalog_id,
-                "bucket_name": bucket_name,
-            },
-            dedup_key=f"catalog_cleanup:CATALOG:{catalog_id}",
-        )
-        task = await create_task_for_catalog(db.engine, task_data, catalog_id)
-        if task is None:
-            logger.info(
-                f"Dedup: GcpCatalogCleanupTask[CATALOG] for '{catalog_id}' already in flight."
-            )
-        else:
-            logger.info(
-                f"Enqueued GcpCatalogCleanupTask[CATALOG] for catalog '{catalog_id}'."
-            )
-    except Exception as e:
-        logger.error(
-            f"Failed to enqueue GcpCatalogCleanupTask for catalog '{catalog_id}': {e}",
-            exc_info=True,
-        )
-
-
-async def _adapter_collection_hard_deletion(
-    catalog_id: str, collection_id: str, **kwargs
-):
-    """Enqueues a GcpCatalogCleanupTask when a collection is hard-deleted.
-
-    Fires on BEFORE_COLLECTION_HARD_DELETION — the catalog state is
-    still intact, so we pre-resolve the bucket name and pass it in the
-    task inputs (mirrors :func:`_adapter_catalog_hard_deletion`). This
-    keeps cleanup robust if the parent catalog configuration is mutated
-    or torn down between event emission and task execution.
-    """
-    from dynastore.models.protocols import DatabaseProtocol, StorageProtocol
-    from dynastore.models.tasks import TaskCreate
-    from dynastore.modules.tasks.tasks_module import create_task_for_catalog
-    from dynastore.tasks.gcp.gcp_catalog_cleanup_task import CleanupScope
-
-    db = get_protocol(DatabaseProtocol)
-    if not db:
-        logger.warning("_adapter_collection_hard_deletion: DatabaseProtocol not available.")
-        return
-
-    bucket_name = None
-    storage = get_protocol(StorageProtocol)
-    if storage:
-        try:
-            bucket_name = await storage.get_storage_identifier(catalog_id)
-        except Exception as e:
-            logger.debug(
-                f"Could not pre-resolve bucket name for "
-                f"'{catalog_id}:{collection_id}': {e}"
-            )
-
-    try:
-        task_data = TaskCreate(
-            task_type="gcp_catalog_cleanup",
-            caller_id="gcp_events:collection_hard_deletion",
-            inputs={
-                "scope": CleanupScope.COLLECTION.value,
-                "catalog_id": catalog_id,
-                "collection_id": collection_id,
-                "bucket_name": bucket_name,
-            },
-            dedup_key=f"catalog_cleanup:COLLECTION:{catalog_id}:{collection_id}",
-        )
-        task = await create_task_for_catalog(db.engine, task_data, catalog_id)
-        if task is None:
-            logger.info(
-                f"Dedup: GcpCatalogCleanupTask[COLLECTION] for "
-                f"'{catalog_id}:{collection_id}' already in flight."
-            )
-        else:
-            logger.info(
-                f"Enqueued GcpCatalogCleanupTask[COLLECTION] for "
-                f"'{catalog_id}:{collection_id}'."
-            )
-    except Exception as e:
-        logger.error(
-            f"Failed to enqueue GcpCatalogCleanupTask for collection "
-            f"'{catalog_id}:{collection_id}': {e}",
-            exc_info=True,
-        )
-
-
 # --- Reactive Hooks for storage events ASSETS ---
 
 
@@ -791,17 +671,13 @@ def register_listeners():
     """
     Subscribes the GCP module to internal catalog events.
     This enables 'in-process' synchronization without needing an external webhook.
+
+    Hard-deletion cleanup (BEFORE_CATALOG_HARD_DELETION,
+    BEFORE_COLLECTION_HARD_DELETION) is handled by GcsCatalogPrefixOwner /
+    GcsCollectionPrefixOwner registered in the cascade cleanup registry, so
+    those event listeners are intentionally absent here.
     """
-    logger.info("Registering GCP module as a listener for Catalog events...")
-
-    register_event_listener(
-        CatalogEventType.BEFORE_CATALOG_HARD_DELETION, _adapter_catalog_hard_deletion
-    )
-
-    register_event_listener(
-        CatalogEventType.BEFORE_COLLECTION_HARD_DELETION,
-        _adapter_collection_hard_deletion,
-    )
+    logger.info("Registering GCP module as a listener for Catalog events.")
     logger.info("GCP module successfully subscribed to Catalog events.")
 
 
