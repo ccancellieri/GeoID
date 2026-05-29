@@ -87,12 +87,25 @@ class DBConfig:
     # TCP keepalive tunables (#655). The egress path silently drops the
     # established-connection mapping after an idle window; without keepalive
     # probes the pool hands out a dead-at-the-wire socket whose replacement
-    # handshake costs 8-22s. NOTE (#710): these are server-side GUCs only —
-    # they do not arm SO_KEEPALIVE on the client socket; pool_recycle above
-    # is the load-bearing mitigation until client-side keepalives land.
+    # handshake costs 8-22s. As of #710 these values drive BOTH the
+    # server-side GUC probes (passed via asyncpg server_settings) AND the
+    # client-side SO_KEEPALIVE socket options that db_service arms on every
+    # connection — asyncpg exposes no libpq client keepalive params, so the
+    # client socket had to be armed directly. pool_recycle remains a backstop.
+    # Keep idle BELOW the deployment's idle-drop window (lower it per-env where
+    # idle periods are common) so a probe refreshes the mapping in time.
     tcp_keepalives_idle: int = _env_int("DB_TCP_KEEPALIVES_IDLE", 300)
     tcp_keepalives_interval: int = _env_int("DB_TCP_KEEPALIVES_INTERVAL", 30)
     tcp_keepalives_count: int = _env_int("DB_TCP_KEEPALIVES_COUNT", 5)
+    # TCP_USER_TIMEOUT (ms) — caps how long transmitted data may stay
+    # unacknowledged before the kernel tears the connection down (#710).
+    # Armed on the client socket alongside SO_KEEPALIVE in db_service. This is
+    # what bounds a pool_pre_ping probe that lands on a silently-dropped
+    # socket: without it the probe blocks up to connect_timeout; with it the
+    # dead connection is detected and replaced within this window. Healthy
+    # queries are unaffected — every ACK resets the timer. Linux-only; ignored
+    # where the socket option is unavailable (e.g. macOS dev).
+    tcp_user_timeout_ms: int = _env_int("DB_TCP_USER_TIMEOUT_MS", 20000)
     # Lock-safety GUCs — applied as server_settings on EVERY connection (see
     # db_service). They make it impossible for one statement, or a leaked /
     # interrupted transaction, to freeze the whole application:

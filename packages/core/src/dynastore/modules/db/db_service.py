@@ -18,6 +18,7 @@
 
 import logging
 import os
+import socket
 from contextlib import asynccontextmanager
 
 # Hard-import the async PG driver at module load.  When SCOPE excludes
@@ -33,6 +34,7 @@ from contextlib import asynccontextmanager
 # tasks.  Same fix family as project_geoid_task_routing_config v0.5.86–89.
 import asyncpg  # noqa: F401  — gate the entry-point on the async driver
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 from typing import Optional, Any, Protocol, runtime_checkable
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -47,6 +49,59 @@ from dynastore.modules.db_config.tools import (
 from dynastore.models.protocols import DatabaseProtocol
 
 logger = logging.getLogger(__name__)
+
+
+def _arm_client_socket_keepalive(engine: AsyncEngine, db_config: DBConfig) -> None:
+    """Arm SO_KEEPALIVE + TCP_USER_TIMEOUT on every asyncpg client socket (#710).
+
+    asyncpg exposes no libpq client-side keepalive params, so the keepalive
+    GUCs we pass via ``server_settings`` only make the *server* probe the
+    *client*. They never arm ``SO_KEEPALIVE`` on the client socket, so a
+    connection silently dropped by the VPC-egress path is discovered only when
+    ``pool_pre_ping`` borrows the dead socket — and that probe then blocks up
+    to ``connect_timeout`` (the seconds-long ``db_pool_acquire`` waits seen in
+    review). Arming the client socket lets the kernel detect the dead peer in
+    keepalive / ``TCP_USER_TIMEOUT`` time instead, and the periodic probes keep
+    the egress mapping warm so idle connections stop dying in the first place.
+
+    Reuses the same ``DBConfig.tcp_keepalives_*`` values as the server-side
+    GUCs so one set of knobs governs both directions. Linux-only socket
+    options are applied best-effort; options missing on the platform (e.g.
+    macOS dev) and any error are swallowed so connection creation never fails.
+    """
+    socket_opts: list[tuple[int, int]] = []
+    for opt_name, value in (
+        ("TCP_KEEPIDLE", db_config.tcp_keepalives_idle),
+        ("TCP_KEEPINTVL", db_config.tcp_keepalives_interval),
+        ("TCP_KEEPCNT", db_config.tcp_keepalives_count),
+        ("TCP_USER_TIMEOUT", db_config.tcp_user_timeout_ms),
+    ):
+        opt = getattr(socket, opt_name, None)
+        if opt is not None:
+            socket_opts.append((opt, int(value)))
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _on_connect(dbapi_connection: Any, _record: Any) -> None:
+        try:
+            raw = getattr(dbapi_connection, "driver_connection", None)
+            transport = getattr(raw, "_transport", None)
+            sock = (
+                transport.get_extra_info("socket")
+                if transport is not None
+                else None
+            )
+            if sock is None:
+                return
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt, value in socket_opts:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except Exception:
+            # Best-effort hardening — never let socket tuning break a
+            # connection. The pool_recycle backstop still covers stale slots.
+            logger.debug(
+                "DBService: client-side TCP keepalive arming skipped",
+                exc_info=True,
+            )
 
 
 @runtime_checkable
@@ -188,6 +243,10 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                         },
                     },
                 )
+                # Arm client-side TCP keepalive on every asyncpg socket so a
+                # silently-dropped idle connection is detected fast instead of
+                # hanging the next pool_pre_ping for connect_timeout (#710).
+                _arm_client_socket_keepalive(app_state.engine, db_config)
                 engine_created_by_service = True
                 logger.info(
                     "DBService: ASYNC Database connection pool established successfully."
