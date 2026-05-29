@@ -87,7 +87,9 @@ _OGC_COLLECTION_EXAMPLES = [
 ]
 
 
-# Canonical Conformance — single source in ogc_common_models
+# Canonical Conformance — single source in ogc_common_models; re-exported here
+# (referenced at runtime as ``ogc_models.Conformance``).
+from dynastore.extensions.tools.ogc_common_models import Conformance  # noqa: F401
 
 
 class CatalogDefinition(BaseModel):
@@ -167,7 +169,9 @@ class CollectionDefinition(BaseModel):
     )
 
 
-# Canonical LandingPage — single source in ogc_common_models
+# Canonical LandingPage — single source in ogc_common_models; re-exported here
+# (referenced at runtime as ``ogc_models.LandingPage``).
+from dynastore.extensions.tools.ogc_common_models import LandingPage  # noqa: F401
 
 
 class OGCCollection(BaseModel):
