@@ -553,6 +553,129 @@ def create_hits_response(
     return _prettify_xml(root)
 
 
+# --- GeoJSON -> GML 3.2 geometry conversion ------------------------------------
+# The unified streaming read path (``stream_items``) yields geometry as RFC 7946
+# GeoJSON (always WGS84 lon/lat) and no longer populates the legacy ``geom_gml``
+# ``ST_AsGML`` column. WFS GML responses therefore build their geometry fragments
+# here. Coordinate order is X Y (lon lat) with a short ``srsName="EPSG:4326"`` to
+# match the historical ``ST_AsGML(3, geom, 15, 6)`` output that QGIS and other
+# clients were field-tested against (#1646).
+
+_GML_SRS = "EPSG:4326"
+
+
+def _gml_tag(name: str) -> str:
+    return f"{{{NS['gml']}}}{name}"
+
+
+def _fmt_coord(value: Any) -> str:
+    # 15 significant digits mirrors ST_AsGML's maxdecimaldigits and avoids
+    # scientific notation for the lon/lat range.
+    return "%.15g" % float(value)
+
+
+def _pos(coord: Iterable[Any]) -> str:
+    return " ".join(_fmt_coord(c) for c in coord)
+
+
+def _pos_list(coords: Iterable[Iterable[Any]]) -> str:
+    return " ".join(_pos(c) for c in coords)
+
+
+def _build_point(coords: Any) -> Element:
+    el = Element(_gml_tag("Point"))
+    SubElement(el, _gml_tag("pos")).text = _pos(coords)
+    return el
+
+
+def _build_linestring(coords: Any) -> Element:
+    el = Element(_gml_tag("LineString"))
+    SubElement(el, _gml_tag("posList")).text = _pos_list(coords)
+    return el
+
+
+def _build_linear_ring(coords: Any) -> Element:
+    ring = Element(_gml_tag("LinearRing"))
+    SubElement(ring, _gml_tag("posList")).text = _pos_list(coords)
+    return ring
+
+
+def _build_polygon(coords: Any) -> Element:
+    el = Element(_gml_tag("Polygon"))
+    rings = list(coords)
+    if rings:
+        SubElement(el, _gml_tag("exterior")).append(_build_linear_ring(rings[0]))
+        for hole in rings[1:]:
+            SubElement(el, _gml_tag("interior")).append(_build_linear_ring(hole))
+    return el
+
+
+def _build_multipoint(coords: Any) -> Element:
+    el = Element(_gml_tag("MultiPoint"))
+    for pt in coords:
+        SubElement(el, _gml_tag("pointMember")).append(_build_point(pt))
+    return el
+
+
+def _build_multilinestring(coords: Any) -> Element:
+    el = Element(_gml_tag("MultiCurve"))
+    for line in coords:
+        SubElement(el, _gml_tag("curveMember")).append(_build_linestring(line))
+    return el
+
+
+def _build_multipolygon(coords: Any) -> Element:
+    el = Element(_gml_tag("MultiSurface"))
+    for poly in coords:
+        SubElement(el, _gml_tag("surfaceMember")).append(_build_polygon(poly))
+    return el
+
+
+_GML_BUILDERS = {
+    "Point": _build_point,
+    "LineString": _build_linestring,
+    "Polygon": _build_polygon,
+    "MultiPoint": _build_multipoint,
+    "MultiLineString": _build_multilinestring,
+    "MultiPolygon": _build_multipolygon,
+}
+
+
+def geojson_geometry_to_gml(geom: Any) -> Optional[Element]:
+    """Convert an RFC 7946 GeoJSON geometry dict into a GML 3.2 ``Element``.
+
+    Returns ``None`` for unsupported / malformed input (the caller then emits a
+    feature with no geometry rather than leaking a Python ``repr``). See #1646.
+    """
+    if geom is not None and not isinstance(geom, dict) and hasattr(geom, "model_dump"):
+        # Normalise a pydantic geometry model to a plain GeoJSON dict.
+        geom = geom.model_dump()
+    if not isinstance(geom, dict):
+        return None
+    gtype = geom.get("type")
+    if not gtype:
+        return None
+
+    if gtype == "GeometryCollection":
+        root = Element(_gml_tag("MultiGeometry"), {"srsName": _GML_SRS})
+        for sub in geom.get("geometries") or []:
+            child = geojson_geometry_to_gml(sub)
+            if child is not None:
+                SubElement(root, _gml_tag("geometryMember")).append(child)
+        return root
+
+    coords = geom.get("coordinates")
+    if coords is None:
+        return None
+    builder = _GML_BUILDERS.get(gtype)
+    if builder is None:
+        logger.warning("Unsupported GeoJSON geometry type for GML conversion: %s", gtype)
+        return None
+    root = builder(coords)
+    root.set("srsName", _GML_SRS)
+    return root
+
+
 def create_feature_collection_response(
     features: Iterable[Any],
     schema_prefix: str,
@@ -636,38 +759,51 @@ def create_feature_collection_response(
             member, ft_tag, {f"{{{NS['gml']}}}id": f"{typename}.{feat_id or ''}"}
         )
 
-        # Inject the raw GML geometry fragment retrieved from PostGIS (using ST_AsGML).
+        # --- Geometry ---
+        # Prefer a pre-rendered GML fragment (legacy ``geom_gml`` ST_AsGML column,
+        # if a driver still supplies one); otherwise build GML 3.2 from the
+        # streamed GeoJSON geometry. The unified streaming path yields GeoJSON and
+        # never populates ``geom_gml``, so the GeoJSON branch is what actually
+        # feeds geometry to GML/WFS clients such as QGIS (#1646).
+        # Combine fixed fields and dynamic attributes into a single dictionary for
+        # rendering. The geometry is lifted out of this dump (and skipped below) so
+        # the GeoJSON geometry never falls through to ``str(value)`` as a text
+        # property — the dict-repr leak fixed in #1646. Sourcing geometry from the
+        # dump (rather than ``getattr``) also normalises a pydantic geometry model
+        # to a plain dict for the GML builder.
+        attributes_to_render = feature.model_dump(
+            exclude={"geom_gml", "geom", "properties"}, exclude_none=True
+        )
+        geojson_geom = attributes_to_render.pop("geometry", None)
+
+        geom_element: Optional[Element] = None
         gml_geom_str = getattr(feature, "geom_gml", None)
         if gml_geom_str:
             try:
-                # 1. The string from the DB might be HTML-escaped. Unescape it.
+                # The string from the DB might be HTML-escaped. Unescape it, then
+                # wrap it so the parser has the 'gml' prefix in scope.
                 gml_geom_str = html.unescape(gml_geom_str)
-                # 2. The fragment is wrapped to provide namespace context during parsing.
-                #    We must register the 'gml' prefix for the parser here!
-                gml_fragment = fromstring(
+                geom_element = fromstring(
                     f'<root xmlns:gml="{NS["gml"]}">{gml_geom_str}</root>'
                 )[0]
-
-                # 3. Create the <...:geom> property element that will contain the geometry.
-
-                # Use Clark notation
-                geom_tag = f"{{{target_namespace}}}geom"
-                geom_property_element = SubElement(ft_element, geom_tag)
-
-                # 4. Append the parsed geometry fragment into our new property element.
-                geom_property_element.append(gml_fragment)
-
             except Exception as e:
                 logger.error(
                     f"Failed to parse GML geometry fragment for feature {feat_id}: {e}. Fragment: {gml_geom_str}"
                 )
+        elif geojson_geom is not None:
+            try:
+                geom_element = geojson_geometry_to_gml(geojson_geom)
+            except Exception as e:
+                logger.error(
+                    f"Failed to build GML geometry for feature {feat_id}: {e}. Geometry: {geojson_geom!r}"
+                )
 
-        # Combine fixed fields and dynamic attributes into a single dictionary for rendering.
+        if geom_element is not None:
+            # Wrap in the feature-type-namespaced <...:geom> property element.
+            geom_property_element = SubElement(ft_element, f"{{{target_namespace}}}geom")
+            geom_property_element.append(geom_element)
+
         from ...tools.features import FeatureProperties
-
-        attributes_to_render = feature.model_dump(
-            exclude={"geom_gml", "geom", "properties"}, exclude_none=True
-        )
         for field_name in FeatureProperties.model_fields:
             if hasattr(feature, field_name):
                 val = getattr(feature, field_name)
@@ -684,8 +820,9 @@ def create_feature_collection_response(
             attributes_to_render.update(feature.properties.model_dump(exclude_none=True))
 
         for key, value in attributes_to_render.items():
-            # Explicitly skip the raw GML field and the geometry property name to avoid duplicating it as a text property.
-            if key not in ("geom_gml", "geom"):
+            # Explicitly skip the raw GML field and the geometry members to avoid
+            # duplicating geometry as a text property (or leaking a dict repr).
+            if key not in ("geom_gml", "geom", "geometry"):
                 # Use Clark notation
                 attr_tag = f"{{{target_namespace}}}{key}"
                 # Ensure value is a string for XML serialization
