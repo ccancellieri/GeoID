@@ -175,14 +175,12 @@ def is_immutable_field(field_info: "FieldInfo") -> bool:
         args = get_args(field_info.annotation)
         if ImmutableMarker in args or Immutable in args:
             return True
-    if any(
+    return any(
         item is ImmutableMarker
         or item is Immutable
         or (isinstance(item, type) and issubclass(item, ImmutableMarker))
         for item in field_info.metadata
-    ):
-        return True
-    return False
+    )
 
 
 def is_write_once_field(field_info: "FieldInfo") -> bool:
@@ -190,14 +188,12 @@ def is_write_once_field(field_info: "FieldInfo") -> bool:
         args = get_args(field_info.annotation)
         if WriteOnceMarker in args or WriteOnce in args:
             return True
-    if any(
+    return any(
         item is WriteOnceMarker
         or item is WriteOnce
         or (isinstance(item, type) and issubclass(item, WriteOnceMarker))
         for item in field_info.metadata
-    ):
-        return True
-    return False
+    )
 
 
 def is_computed_field(field_info: "FieldInfo") -> bool:
@@ -209,14 +205,12 @@ def is_computed_field(field_info: "FieldInfo") -> bool:
         args = get_args(field_info.annotation)
         if ComputedMarker in args or Computed in args:
             return True
-    if any(
+    return any(
         item is ComputedMarker
         or item is Computed
         or (isinstance(item, type) and issubclass(item, ComputedMarker))
         for item in field_info.metadata
-    ):
-        return True
-    return False
+    )
 
 
 # ---------------------------------------------------------------------------
