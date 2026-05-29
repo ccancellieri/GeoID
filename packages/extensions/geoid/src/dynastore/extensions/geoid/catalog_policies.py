@@ -15,8 +15,32 @@ from dynastore.tools.discovery import get_protocol
 logger = logging.getLogger(__name__)
 
 # Policy conditions
+#
+# ``_LOOKUP_PUBLIC_CONDITION`` gates the lookup-only posture on the catalog
+# having opted in (``CatalogLookupAudience.is_public``). It is SHARED by the
+# enumeration-DENY policies below, so it must stay a pure public-mode gate:
+# adding a request-shape predicate (e.g. ``lookup_only_search``) here would make
+# the DENY policies match only *needle* requests — a broadening enumeration
+# request would then skip the DENY entirely and fall through, inverting the
+# block into a leak. Request-shape guards for the ALLOW live in
+# ``_ANON_LOOKUP_ALLOW_CONDITION`` instead.
 _LOOKUP_PUBLIC_CONDITION = [{"type": "catalog_lookup_public_allowed"}]
 _COLLECTION_WRITE_CONDITION = [{"type": "collection_write_anonymous_allowed"}]
+
+# Conditions for the anonymous *lookup* ALLOW only. Beyond the public-mode gate,
+# the IAM layer itself enforces that the request is a needle lookup — it must
+# carry a ``geoid`` / ``external_id`` and no broadening ``bbox`` / ``intersects``
+# / ``datetime`` / ``filter`` / ``q`` field (the ``lookup_only_search`` handler).
+# The route handler also validates the body; enforcing it declaratively here is
+# defence-in-depth, so a future route refactor cannot silently turn the public
+# lookup surface into an enumeration surface (un-fao/GeoID#1204 P2-R7). Order
+# matters: ``evaluate_all`` is short-circuit AND, so the cheap public-mode gate
+# runs first and a broadening request is rejected (the ALLOW simply does not
+# match → deny-by-default) before the body is inspected.
+_ANON_LOOKUP_ALLOW_CONDITION = [
+    {"type": "catalog_lookup_public_allowed"},
+    {"type": "lookup_only_search"},
+]
 
 
 async def register_geoid_policies_for_catalog(catalog_id: str) -> None:
@@ -63,7 +87,7 @@ async def register_geoid_policies_for_catalog(catalog_id: str) -> None:
                 ),
                 actions=["POST"],
                 resources=[r"/search/catalogs/[^/]+/items-search(/.*)?"],
-                conditions=_LOOKUP_PUBLIC_CONDITION,
+                conditions=_ANON_LOOKUP_ALLOW_CONDITION,
                 effect="ALLOW",
             ),
             Policy(
