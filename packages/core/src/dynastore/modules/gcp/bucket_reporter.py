@@ -26,12 +26,23 @@ from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING
 
 from dynastore.tools.json import CustomJSONEncoder
 from dynastore.modules import get_protocol
+from dynastore.modules.concurrency import run_in_thread
 from dynastore.tasks.ingestion.ingestion_models import TaskIngestionRequest
 from dynastore.tasks.reporters import ReportingInterface
 from dynastore.tasks.ingestion.reporters import ingestion_reporter
 from dynastore.tools.path import insert_before_extension
 
 logger = logging.getLogger(__name__)
+
+
+def _gzip_compress(src_path: str, dst_path: str) -> None:
+    """Gzip-compress ``src_path`` to ``dst_path``.
+
+    Blocking (whole-file read + gzip); call via ``run_in_thread`` from async
+    code so the event loop is not stalled for the duration of the compress.
+    """
+    with open(src_path, "rb") as f_in, gzip.open(dst_path, "wb") as f_out:
+        f_out.writelines(f_in)
 
 from pydantic import BaseModel, Field
 from typing import Optional, Literal, List, Any, Dict
@@ -363,11 +374,7 @@ class GcsDetailedReporter(ReportingInterface[GcsDetailedReporterConfig]):
         if self.config.compress_output:
             chunk_report_path += ".gz"
             gzipped_file_path = temp_chunk_file_path + ".gz"
-            with (
-                open(temp_chunk_file_path, "rb") as f_in,
-                gzip.open(gzipped_file_path, "wb") as f_out,
-            ):
-                f_out.writelines(f_in)
+            await run_in_thread(_gzip_compress, temp_chunk_file_path, gzipped_file_path)
             upload_file_path = gzipped_file_path
             content_type = "application/gzip"
 
@@ -506,9 +513,7 @@ class GcsDetailedReporter(ReportingInterface[GcsDetailedReporterConfig]):
             report_path += ".gz"
             gzipped_file_path = self._temp_report_file.name + ".gz"
 
-            with open(self._temp_report_file.name, "rb") as f_in:
-                with gzip.open(gzipped_file_path, "wb") as f_out:
-                    f_out.writelines(f_in)
+            await run_in_thread(_gzip_compress, self._temp_report_file.name, gzipped_file_path)
 
             upload_file_path = gzipped_file_path
             content_type = "application/gzip"
