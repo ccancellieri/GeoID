@@ -39,9 +39,12 @@ class _FakeCatalogs:
     """Minimal in-memory stand-in for the slice of CatalogsProtocol the
     data-contributor dispatch touches."""
 
-    def __init__(self, existing_catalogs=(), existing_collections=()):
+    def __init__(self, existing_catalogs=(), existing_collections=(), nonempty=()):
         self._catalogs = set(existing_catalogs)
         self._collections = set(existing_collections)  # (catalog_id, collection_id)
+        # (catalog_id, collection_id) pairs the emptiness probe should report as
+        # still holding items (e.g. members materialised after apply).
+        self._nonempty = set(nonempty)
         self.calls: List[tuple] = []
 
     async def get_catalog_model(self, catalog_id, ctx=None):
@@ -82,6 +85,17 @@ class _FakeCatalogs:
         self.calls.append(("delete_catalog", catalog_id))
         self._catalogs.discard(catalog_id)
         return True
+
+    async def search_items(self, catalog_id, collection_id, request, **kw):
+        # Emptiness probe used by the revoke guard: report items only for
+        # collections explicitly seeded as non-empty.
+        self.calls.append(("search_items", catalog_id, collection_id))
+        return [{"id": "x"}] if (catalog_id, collection_id) in self._nonempty else []
+
+    async def list_collections(self, catalog_id, limit=10, offset=0, lang="en", ctx=None, q=None):
+        # Catalog emptiness probe: reflect the collections currently present.
+        self.calls.append(("list_collections", catalog_id))
+        return [cid for (cat, cid) in self._collections if cat == catalog_id]
 
 
 def _ctx(catalogs: Any) -> Any:
@@ -190,6 +204,33 @@ def test_revoke_leaves_preexisting_catalog_and_collection():
 
     # The item we upserted is still removed, but neither pre-existing row is.
     assert ("delete_item", "demo_catalog", "demo_collection", "a") in catalogs.calls
+    assert "delete_collection" not in _names(catalogs)
+    assert "delete_catalog" not in _names(catalogs)
+
+
+def test_revoke_keeps_created_collection_and_catalog_that_still_hold_items():
+    # Mirrors common_dimensions after the materialize job runs: the preset
+    # created the skeleton collection, but it now holds members — revoke must
+    # remove only the items it seeded and leave the (non-empty) collection AND
+    # its parent catalog in place.
+    catalogs = _FakeCatalogs(
+        nonempty=(("demo_catalog", "demo_collection"),),
+    )
+    seed = DataSeed(
+        catalog_id="demo_catalog",
+        collection_id="demo_collection",
+        items=({"id": "a"},),
+        manage_catalog=True,
+        manage_collection=True,
+    )
+    preset = _preset([seed])
+    descriptor = asyncio.run(preset.apply(NoParams(), "platform", _ctx(catalogs)))
+    catalogs.calls.clear()
+    asyncio.run(preset.revoke(descriptor, _ctx(catalogs)))
+
+    # The seeded item is still pulled back out...
+    assert ("delete_item", "demo_catalog", "demo_collection", "a") in catalogs.calls
+    # ...but neither the non-empty collection nor its catalog is deleted.
     assert "delete_collection" not in _names(catalogs)
     assert "delete_catalog" not in _names(catalogs)
 

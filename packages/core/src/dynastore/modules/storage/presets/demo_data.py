@@ -20,13 +20,17 @@ recommended way to deliver built-in seed data: declare a
 ``DataContributor``, wrap it in a ``MultiContributorPreset``, and
 register it.
 
-This preset supersedes the manual ``tools/demo/populate.py`` CLI path
-(which carried a TODO to expose the same data through the preset API).
-Running ``apply`` is idempotent — the catalog and collection are created
-only when absent, and items are upserted.  Running ``revoke`` removes the
-items and, because ``manage_catalog`` / ``manage_collection`` are both
-``True``, deletes the catalog and collection only when this preset
-created them.
+This preset replaces the manual demo-data CLI that previously lived under
+``tools/demo`` (deleted in favour of the preset API).  Running ``apply`` is
+idempotent — the catalog and collection are created only when absent, and
+items are upserted.  Running ``revoke`` removes the items and, because
+``manage_catalog`` / ``manage_collection`` are both ``True``, deletes the
+catalog and collection only when this preset created them and the collection
+is empty.
+
+Note: the ``POST /admin/demo/populate`` web endpoint still inlines its own
+(richer) demo content; aligning it to delegate to this preset is tracked as a
+follow-up so the two stay a single source of truth.
 """
 from __future__ import annotations
 
@@ -36,8 +40,7 @@ from .multi_contributor import MultiContributorPreset
 from .preset import DataSeed
 
 # ---------------------------------------------------------------------------
-# Catalog / collection / item payloads — lifted verbatim from
-# tools/demo/populate.py so the two paths stay consistent.
+# Catalog / collection / item payloads for the demo seed.
 # ---------------------------------------------------------------------------
 
 _CATALOG_DATA = {

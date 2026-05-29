@@ -218,6 +218,50 @@ def test_seeds_are_dataseed_instances() -> None:
         )
 
 
+def test_get_tasks_triggers_dimensions_materialize() -> None:
+    """get_tasks() yields a single TaskSeed that triggers the
+    dimensions_materialize OGC Process (the async fill job)."""
+    from dynastore.extensions.dimensions.presets import _CommonDimensionsContributor
+    from dynastore.modules.storage.presets.preset import TaskSeed
+
+    tasks = list(_CommonDimensionsContributor().get_tasks())
+
+    assert len(tasks) == 1
+    assert isinstance(tasks[0], TaskSeed)
+    assert tasks[0].process_id == "dimensions_materialize"
+    assert tasks[0].async_mode is True
+    # A dedup_key collapses repeated applies onto a single in-flight job.
+    assert tasks[0].dedup_key
+
+
+def test_seeds_carry_rich_dimensions_catalog_data() -> None:
+    """Each seed's ``catalog_data`` for the shared ``_dimensions_`` catalog must
+    carry a title + description, not a bare id (dynastore#307)."""
+    from dynastore.extensions.dimensions.presets import _CommonDimensionsContributor
+
+    seeds = list(_CommonDimensionsContributor().get_data())
+
+    for seed in seeds:
+        assert seed.catalog_data.get("id") == DIMENSIONS_CATALOG_ID
+        assert seed.catalog_data.get("title"), "catalog_data must carry a title"
+        assert seed.catalog_data.get("description"), "catalog_data must carry a description"
+
+
+def test_get_data_fail_fast_when_no_dimensions_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D4: an empty provider registry must raise (fail fast) rather than
+    silently registering zero dimensions."""
+    monkeypatch.setattr(
+        "dynastore.extensions.dimensions.dimensions_extension.get_registered_dimensions",
+        lambda: {},
+    )
+    from dynastore.extensions.dimensions.presets import _CommonDimensionsContributor
+
+    with pytest.raises(RuntimeError, match="no dimensions are registered"):
+        list(_CommonDimensionsContributor().get_data())
+
+
 def test_common_dimensions_preset_is_registered() -> None:
     """Importing the presets module must register ``common_dimensions`` in the
     global preset registry (side-effect import contract)."""

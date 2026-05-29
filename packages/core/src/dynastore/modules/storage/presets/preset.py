@@ -129,6 +129,39 @@ class DataSeed:
     lang: str = "*"
 
 
+@dataclass(frozen=True)
+class TaskSeed:
+    """One background job a *task contributor* asks a preset to trigger.
+
+    A task contributor exposes ``get_tasks() -> Iterable[TaskSeed]`` (see
+    ``MultiContributorPreset``). At apply time — after every synchronous
+    contribution (policies, configs, seed data) is in place — the preset
+    submits each ``process_id`` to the OGC Process execution engine and records
+    the returned job id in its ``AppliedDescriptor`` so callers can poll the
+    job's status.
+
+    This is how a *synchronous* preset delegates heavy work to the *existing*
+    async OGC Process machinery without itself becoming an async preset: it
+    kicks the job off, records the reference, and returns ``applied``. The job
+    runs in the background with its own status lifecycle, queryable through the
+    normal task-status endpoint.
+
+    ``revoke`` does NOT cancel or undo a triggered job — a job that has already
+    run cannot be un-run. Any data the job produced is governed by the
+    data-seed revoke rules (a collection that still holds items is never
+    deleted; see ``DataSeed``).
+
+    ``async_mode`` picks ``ASYNC_EXECUTE`` (default) vs ``SYNC_EXECUTE`` as the
+    preferred execution mode. ``dedup_key`` collapses redelivered triggers onto
+    a single in-flight job (the execution engine returns no new job on a hit).
+    """
+
+    process_id: str
+    inputs: Dict[str, Any] = field(default_factory=dict)
+    async_mode: bool = True
+    dedup_key: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Dry-run plan
 # ---------------------------------------------------------------------------
