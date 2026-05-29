@@ -1110,6 +1110,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 consumer=ConsumerType.OGC_FEATURES,
                 search_dispatch=search_dispatch,
                 ctx=None,
+                request=request,
             )
 
             count = query_response.total_count or 0
@@ -1222,9 +1223,29 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalogs_svc = await self._get_catalogs_service()
         items_protocol = cast(ItemsProtocol, catalogs_svc)
 
+        # PG row-level ABAC: compile and inject access_filter when the collection
+        # carries an access_envelope sidecar (user-facing single-item read).
+        from dynastore.modules.storage.access_scope import (
+            collection_uses_pg_access_envelope,
+            compile_read_access_filter,
+            principals_from_request_state,
+        )
+
+        af = None
+        if await collection_uses_pg_access_envelope(catalog_id, collection_id):
+            principals, principal = principals_from_request_state(request)
+            af = await compile_read_access_filter(
+                catalog_id=catalog_id,
+                collections=[collection_id],
+                principals=principals,
+                principal=principal,
+            )
+
         # Use ItemsProtocol to get the unified feature
         feature = await items_protocol.get_item(
-            catalog_id, collection_id, item_id, ctx=DriverContext(db_resource=conn)
+            catalog_id, collection_id, item_id,
+            ctx=DriverContext(db_resource=conn),
+            access_filter=af,
         )
 
         if not feature:

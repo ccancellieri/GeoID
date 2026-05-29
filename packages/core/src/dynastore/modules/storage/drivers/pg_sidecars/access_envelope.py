@@ -165,6 +165,33 @@ class AccessEnvelopeSidecar(SidecarProtocol):
                 f'ON {{schema}}."{table_name}" USING GIN ({col_name});\n'
             )
 
+        # Per-attr btree expression indexes (#1453). The ABAC read filter emits
+        # ``(<col>->'attrs'->>'<key>') = ANY(:p)`` and CAST(...) range
+        # comparisons (see ``access_filter_pg.py``); a btree index on the SAME
+        # JSONB expression accelerates both — without promoting attrs to real
+        # columns (the rejected #1450 approach). Opt-in via ``btree_attrs_index``
+        # plus the operator-declared ``known_attrs_keys``. Additive only
+        # (CREATE INDEX IF NOT EXISTS) — no ALTER / migration, replay-safe.
+        if self.config.btree_attrs_index and self.config.known_attrs_keys:
+            import re as _re
+
+            for key in self.config.known_attrs_keys:
+                # Keys come from config, not request input, but an operator typo
+                # must never produce injectable or invalid DDL — restrict to a
+                # safe identifier charset and skip (with a warning) otherwise.
+                if not _re.fullmatch(r"[A-Za-z0-9_]+", key):
+                    logger.warning(
+                        "AccessEnvelopeSidecar.get_ddl: skipping btree index for "
+                        "attrs key %r — only [A-Za-z0-9_] is allowed",
+                        key,
+                    )
+                    continue
+                ddl += (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_attrs_{key}" '
+                    f'ON {{schema}}."{table_name}" '
+                    f"(({col_name}->'attrs'->>'{key}'));\n"
+                )
+
         return ddl
 
     # ── Query building ────────────────────────────────────────────────────────

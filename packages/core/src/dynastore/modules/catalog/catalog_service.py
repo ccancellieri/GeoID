@@ -1899,9 +1899,11 @@ class CatalogService(CatalogsProtocol):
         ctx: Optional[DriverContext] = None,
         lang: str = "en",
         context: Optional[Any] = None,
+        access_filter: Optional[Any] = None,
     ):
         return await self._item_svc.get_item(
-            catalog_id, collection_id, item_id, ctx=ctx, lang=lang, context=context
+            catalog_id, collection_id, item_id,
+            ctx=ctx, lang=lang, context=context, access_filter=access_filter,
         )
 
     async def delete_item(
@@ -2022,9 +2024,11 @@ class CatalogService(CatalogsProtocol):
         col_config: Any,
         params: Dict[str, Any],
         param_suffix: str = "",
+        access_filter: Optional[Any] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         return await self._item_svc.get_features_query(
-            conn, catalog_id, collection_id, col_config, params, param_suffix
+            conn, catalog_id, collection_id, col_config, params, param_suffix,
+            access_filter=access_filter,
         )
 
     async def search_items(

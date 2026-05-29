@@ -731,9 +731,13 @@ class CatalogModule(ModuleProtocol):
         collection_id: str,
         item_id: str,
         ctx: Optional[DriverContext] = None,
+        lang: str = "en",
+        context: Optional[Any] = None,
+        access_filter: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         return await self._item_svc.get_item(  # type: ignore[return-value]
-            catalog_id, collection_id, item_id, ctx=ctx
+            catalog_id, collection_id, item_id,
+            ctx=ctx, lang=lang, context=context, access_filter=access_filter,
         )
 
     async def delete_item(

@@ -1652,7 +1652,13 @@ class ItemsElasticsearchDriver(
             if not item_svc:
                 item_svc = ItemService(engine=_cast4(Optional[DbResource], db))
 
-            feature = await item_svc.get_item(catalog_id, collection_id, item_id)
+            # Privileged system read: ES indexer serialization has no end-user
+            # principal; allow all rows from the envelope JOIN.
+            from dynastore.models.protocols.access_filter import AccessFilter
+            feature = await item_svc.get_item(
+                catalog_id, collection_id, item_id,
+                access_filter=AccessFilter.allow_everything(),
+            )
             if feature is None:
                 return None
 

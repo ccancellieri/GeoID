@@ -126,6 +126,7 @@ class ItemQueryProtocol(Protocol):
         col_config: Any,
         params: Dict[str, Any],
         param_suffix: str = "",
+        access_filter: Optional[Any] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Return the raw SQL string and bind parameters for a feature query.
@@ -133,5 +134,9 @@ class ItemQueryProtocol(Protocol):
         Used by the Tiles/MVT extension to embed the feature SQL as a
         sub-query inside a larger ST_AsMVT() expression.  Callers are
         responsible for executing the returned SQL.
+
+        ``access_filter``: privileged/system callers (tile rendering, DWH)
+        should pass ``AccessFilter.allow_everything()`` so the
+        ``access_envelope`` JOIN does not fail closed without a user principal.
         """
         ...

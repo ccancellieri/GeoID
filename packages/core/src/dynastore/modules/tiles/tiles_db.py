@@ -182,6 +182,9 @@ async def _build_collection_subquery(
     # 3. Get Query from ItemService
     # We pass tile_wkb via params so GeometrySidecar can use it as bind param
 
+    # Privileged system read: tile rendering is a server-side operation with no
+    # end-user principal; allow all rows from the envelope JOIN.
+    from dynastore.models.protocols.access_filter import AccessFilter
     try:
         sql, bind_params = await items_svc.get_features_query(
             conn,
@@ -190,6 +193,7 @@ async def _build_collection_subquery(
             col_config=col_config,
             params=params,
             param_suffix=f"_{index_i}",
+            access_filter=AccessFilter.allow_everything(),
         )
     except ValueError as exc:
         # Storage resolution failed mid-pipeline (e.g. driver config has no

@@ -56,8 +56,18 @@ class ItemCrudProtocol(Protocol):
         ctx: Optional["DriverContext"] = None,
         lang: str = "en",
         context: Optional[Any] = None,
+        access_filter: Optional[Any] = None,
     ) -> Optional[Feature]:
-        """Retrieve a specific item by its internal geoid or feature ID."""
+        """Retrieve a specific item by its internal geoid or feature ID.
+
+        ``access_filter``: when the collection uses a PG ``access_envelope``
+        sidecar, callers MUST supply this.  User-facing reads compile it from
+        request state via ``compile_read_access_filter``; privileged/system
+        reads pass ``AccessFilter.allow_everything()`` to avoid a fail-closed
+        blackout.  ``None`` is accepted for backward compatibility with callers
+        that route through the non-PG driver dispatch path (which ignores the
+        field).
+        """
         ...
 
     async def delete_item(

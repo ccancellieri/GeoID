@@ -141,8 +141,12 @@ class PrivateIndexTask(TaskProtocol):
         items_proto = get_protocol(ItemCrudProtocol)
         if items_proto:
             try:
+                # Privileged system read: private-index task has no end-user
+                # principal; allow all rows from the envelope JOIN.
+                from dynastore.models.protocols.access_filter import AccessFilter
                 fetched = await items_proto.get_item(
                     inputs.catalog_id, inputs.collection_id, inputs.geoid,
+                    access_filter=AccessFilter.allow_everything(),
                 )
                 if fetched is not None:
                     feature = fetched

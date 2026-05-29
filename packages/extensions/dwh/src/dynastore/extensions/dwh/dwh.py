@@ -240,12 +240,35 @@ class DwhService(ExtensionProtocol):
             select=selects, limit=req.limit, offset=req.offset
         )
 
+        # PG row-level ABAC: the DWH join is a user-facing HTTP route, so the
+        # caller's per-row read scope MUST be enforced — joining external DWH
+        # data does not exempt the source collection from its access_envelope.
+        # Compile and inject the principal's read filter when the collection
+        # carries the sidecar; non-ABAC collections leave access_filter unset
+        # (the optimiser does not force-include the sidecar for them).
+        from dynastore.modules.storage.access_scope import (
+            collection_uses_pg_access_envelope,
+            compile_read_access_filter,
+            principals_from_request_state,
+        )
+
+        if await collection_uses_pg_access_envelope(catalog_id, req.collection):
+            principals, principal = principals_from_request_state(request)
+            query_req.access_filter = await compile_read_access_filter(
+                catalog_id=catalog_id,
+                collections=[req.collection],
+                principals=principals,
+                principal=principal,
+            )
+
         # Stream via ItemService. Force the full-precision PG read path with
         # Hint.JOIN: the public default routing puts Elasticsearch first for
         # READ, but ES only carries simplified geometry and cannot run the
         # ST_Transform projection this join builds into the request — only the
         # PG driver advertises Hint.JOIN, so resolution selects it (and, being
         # the read-primary fallback, hands the read to the inline PG SQL path).
+        # The access_filter set above rides along on query_req into the
+        # optimiser, so the forced PG path stays per-row ABAC-enforced.
         query_context = await items_svc.stream_items(
             catalog_id=catalog_id,
             collection_id=req.collection,
@@ -473,6 +496,26 @@ class DwhService(ExtensionProtocol):
         # We do both: tile filter AND join keys filter (if feasible).
         # query_req.raw_where += f' AND "{req.join_column}" = ANY(:join_keys)'
         # Using FieldSelection for join_column alias might be needed if it's different.
+
+        # PG row-level ABAC: the tiled DWH join is a user-facing HTTP route and
+        # the emitted MVT carries per-feature attributes, so an unfiltered read
+        # would leak ABAC-protected row attributes into the vector tile. Compile
+        # and inject the principal's read filter when the collection carries the
+        # access_envelope sidecar; non-ABAC collections leave access_filter unset.
+        from dynastore.modules.storage.access_scope import (
+            collection_uses_pg_access_envelope,
+            compile_read_access_filter,
+            principals_from_request_state,
+        )
+
+        if await collection_uses_pg_access_envelope(catalog_id, req.collection):
+            principals, principal = principals_from_request_state(request)
+            query_req.access_filter = await compile_read_access_filter(
+                catalog_id=catalog_id,
+                collections=[req.collection],
+                principals=principals,
+                principal=principal,
+            )
 
         query_context = await items_svc.stream_items(
             catalog_id=catalog_id,

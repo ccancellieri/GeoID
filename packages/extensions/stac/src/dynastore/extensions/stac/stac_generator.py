@@ -1125,6 +1125,7 @@ async def create_item_collection(
         items_rows, item_count = await stac_db.get_stac_items_paginated(
             conn, catalog_id, collection_id, limit, offset, stac_config,
             cql_filter=cql_filter,
+            request=request,
         )
 
     stac_items_tasks = [

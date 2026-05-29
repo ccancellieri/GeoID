@@ -2233,9 +2233,14 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             if not phys_schema or not phys_table:
                 return 0
 
+            # Privileged system read: delete_item_language is a write-path
+            # operation with no end-user principal; allow all rows.
+            from dynastore.models.protocols.access_filter import AccessFilter
             # Fetch the item to identify localized fields in attributes
             item = await self.get_item(
-                catalog_id, collection_id, item_id, ctx=DriverContext(db_resource=conn)
+                catalog_id, collection_id, item_id,
+                ctx=DriverContext(db_resource=conn),
+                access_filter=AccessFilter.allow_everything(),
             )
             if not item:
                 return 0

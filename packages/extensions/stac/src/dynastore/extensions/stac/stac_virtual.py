@@ -410,6 +410,23 @@ class StacVirtualMixin(_Host):
 
             # Fetch features using ItemService.stream_items to get QueryResponse
             if query_res is None:
+                # PG row-level ABAC: compile and inject access_filter when the
+                # collection carries an access_envelope sidecar (user-facing read).
+                from dynastore.modules.storage.access_scope import (
+                    collection_uses_pg_access_envelope,
+                    compile_read_access_filter,
+                    principals_from_request_state,
+                )
+
+                if await collection_uses_pg_access_envelope(catalog_id, collection_id):
+                    principals, principal = principals_from_request_state(request)
+                    query_req.access_filter = await compile_read_access_filter(
+                        catalog_id=catalog_id,
+                        collections=[collection_id],
+                        principals=principals,
+                        principal=principal,
+                    )
+
                 query_res = await items_svc.stream_items(
                     catalog_id, collection_id, request=query_req,
                     ctx=DriverContext(db_resource=conn) if conn is not None else None,

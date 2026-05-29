@@ -420,6 +420,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             consumer=ConsumerType.OGC_RECORDS,
             search_dispatch=search_dispatch,
             ctx=DriverContext(db_resource=conn) if conn is not None else None,
+            request=request,
         )
 
         count = query_response.total_count or 0
@@ -485,8 +486,28 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         catalogs_svc = await self._get_catalogs_service()
         items_protocol = cast(ItemsProtocol, catalogs_svc)
 
+        # PG row-level ABAC: compile access_filter for user-facing single-item
+        # reads when the collection carries an access_envelope sidecar.
+        from dynastore.modules.storage.access_scope import (
+            collection_uses_pg_access_envelope,
+            compile_read_access_filter,
+            principals_from_request_state,
+        )
+
+        af = None
+        if await collection_uses_pg_access_envelope(catalog_id, collection_id):
+            principals, principal = principals_from_request_state(request)
+            af = await compile_read_access_filter(
+                catalog_id=catalog_id,
+                collections=[collection_id],
+                principals=principals,
+                principal=principal,
+            )
+
         feature = await items_protocol.get_item(
-            catalog_id, collection_id, record_id, ctx=DriverContext(db_resource=conn),
+            catalog_id, collection_id, record_id,
+            ctx=DriverContext(db_resource=conn),
+            access_filter=af,
         )
         if not feature:
             raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found.")

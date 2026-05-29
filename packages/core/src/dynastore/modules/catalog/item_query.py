@@ -352,13 +352,27 @@ class ItemQueryMixin:
         col_config: ItemsPostgresqlDriverConfig,
         params: Dict[str, Any],
         param_suffix: str = "",
+        access_filter: Optional[Any] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Exposes the underlying query generation for features (used by Tiles/MVT).
         Now uses pluggable query transformations.
+
+        ``access_filter`` is injected by callers that already know the read
+        scope.  Privileged system callers (tile rendering, DWH) should pass
+        ``AccessFilter.allow_everything()`` so the access_envelope JOIN does not
+        fail closed when no user principal is present.  User-facing callers that
+        carry an HTTP request should compile the filter via
+        ``compile_read_access_filter`` before calling this helper.
         """
         # 1. Build base QueryRequest from params
         query_request = self._build_base_query_request(params, col_config)
+
+        # Inject the caller-supplied access_filter so the query optimizer's
+        # access_envelope sidecar enforcement uses it (system reads pass
+        # allow_everything(); user-facing reads pass a compiled principal scope).
+        if access_filter is not None:
+            query_request.access_filter = access_filter
 
         # 2. Apply transformations and generate SQL
         context = {
@@ -656,6 +670,7 @@ class ItemQueryMixin:
         ctx: Optional[DriverContext] = None,
         lang: str = "en",
         context: Optional[Any] = None,
+        access_filter: Optional[Any] = None,
     ) -> Optional[Feature]:
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
@@ -689,6 +704,11 @@ class ItemQueryMixin:
                 limit=1,
                 select=[FieldSelection(field="*")],
             )
+            # Inject the caller-supplied access_filter (user-facing reads compile
+            # this from request state via compile_read_access_filter; system reads
+            # pass AccessFilter.allow_everything() to avoid a fail-closed blackout).
+            if access_filter is not None:
+                request.access_filter = access_filter
             query_ctx: Dict[str, Any] = {
                 "catalog_id": catalog_id,
                 "collection_id": collection_id,
@@ -829,8 +849,13 @@ class ItemQueryMixin:
 
             if not await is_tile_cache_active(catalog_id, collection_id):
                 return None
+
+            # Privileged system read: tile-cache pre-delete bbox capture is a
+            # server-side operation with no end-user principal; allow all rows.
+            from dynastore.models.protocols.access_filter import AccessFilter
             existing = await self.get_item(
                 catalog_id, collection_id, item_id, ctx=ctx,
+                access_filter=AccessFilter.allow_everything(),
             )
             if existing is None:
                 return None

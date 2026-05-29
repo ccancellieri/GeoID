@@ -16,16 +16,19 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import logging
+from typing import TYPE_CHECKING, Any, Optional, Tuple
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
+
 from dynastore.models.protocols import ItemsProtocol
 from dynastore.models.query_builder import QueryRequest
 from dynastore.models.driver_context import DriverContext
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.stac.stac_config import StacPluginConfig
-import logging
 
 logger = logging.getLogger(__name__)
-
-from typing import Any, List, Optional, Tuple
 
 
 async def get_stac_items_paginated(
@@ -36,6 +39,7 @@ async def get_stac_items_paginated(
     offset: int,
     stac_config: Optional[StacPluginConfig] = None,
     cql_filter: Optional[str] = None,
+    request: "Optional[Request]" = None,
 ) -> Tuple[list, int]:
     """
     Fetches a paginated list of items for STAC using the optimised QueryOptimizer path.
@@ -48,6 +52,14 @@ async def get_stac_items_paginated(
     explicit ``filter`` and ``?{property}={value}`` shorthand). It is validated
     and parameter-bound by the shared QueryOptimizer CQL path; an unknown
     property raises ``ValueError`` (surfaced as 400 by the route handler).
+
+    ``request`` is threaded from the route handler for PG row-level ABAC: when
+    the collection carries an ``access_envelope`` sidecar, the caller's read
+    scope is compiled from request state and injected into the QueryRequest before
+    ``stream_items``. System/internal callers pass ``request=None`` and instead
+    explicitly set ``access_filter=AccessFilter.allow_everything()`` on the
+    QueryRequest they supply to a higher-level call; this path skips the check and
+    is thus safe for both user-facing and privileged reads.
     """
     items_svc = get_protocol(ItemsProtocol)
     if not items_svc:
@@ -57,7 +69,7 @@ async def get_stac_items_paginated(
     if stac_config and stac_config.simplification:
         simplification = stac_config.simplification.default_tolerance
 
-    request = QueryRequest(
+    query_request = QueryRequest(
         limit=limit,
         offset=offset,
         include_total_count=True,
@@ -69,11 +81,29 @@ async def get_stac_items_paginated(
         },
     )
 
+    # PG row-level ABAC: compile and inject access_filter when the collection
+    # uses the PG access_envelope sidecar and an HTTP request is available.
+    if request is not None:
+        from dynastore.modules.storage.access_scope import (
+            collection_uses_pg_access_envelope,
+            compile_read_access_filter,
+            principals_from_request_state,
+        )
+
+        if await collection_uses_pg_access_envelope(catalog_id, collection_id):
+            principals, principal = principals_from_request_state(request)
+            query_request.access_filter = await compile_read_access_filter(
+                catalog_id=catalog_id,
+                collections=[collection_id],
+                principals=principals,
+                principal=principal,
+            )
+
     from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
     query_response = await items_svc.stream_items(
         catalog_id=catalog_id,
         collection_id=collection_id,
-        request=request,
+        request=query_request,
         ctx=DriverContext(db_resource=conn) if conn is not None else None,
         consumer=ConsumerType.STAC,
     )

@@ -380,6 +380,7 @@ async def dispatch_or_stream_items(
     consumer: Any,
     search_dispatch: Optional[QueryResponse] = None,
     ctx: Any = None,
+    request: Optional[Request] = None,
 ) -> QueryResponse:
     """Return the routed SEARCH-driver response, or stream from the items protocol.
 
@@ -390,9 +391,36 @@ async def dispatch_or_stream_items(
     properties / fields) to HTTP 400. Callers supply their own ``consumer``
     (``OGC_FEATURES`` / ``OGC_RECORDS``) and ``ctx`` (Features decouples with
     ``None`` for background streaming; Records threads the request connection).
+
+    Row-level ABAC (PG path): when ``request`` is supplied and the collection
+    carries a PG ``access_envelope`` sidecar, the caller's read scope is compiled
+    from request state and set on ``query_request.access_filter`` before the PG
+    ``stream_items`` call. The envelope sidecar fails closed (zero rows) when the
+    filter is absent, so un-wired callers can only under-return, never leak.
+    Guarded on ``collection_uses_pg_access_envelope`` (fail-closed to False) so
+    this is a no-op for ordinary collections and for system reads (no request).
     """
     if search_dispatch is not None:
         return search_dispatch
+
+    # PG row-level ABAC: compile and inject access_filter when the collection
+    # uses the PG access_envelope sidecar and the HTTP request is available.
+    if request is not None:
+        from dynastore.modules.storage.access_scope import (
+            collection_uses_pg_access_envelope,
+            compile_read_access_filter,
+            principals_from_request_state,
+        )
+
+        if await collection_uses_pg_access_envelope(catalog_id, collection_id):
+            principals, principal = principals_from_request_state(request)
+            query_request.access_filter = await compile_read_access_filter(
+                catalog_id=catalog_id,
+                collections=[collection_id],
+                principals=principals,
+                principal=principal,
+            )
+
     try:
         return await items_protocol.stream_items(
             catalog_id=catalog_id,

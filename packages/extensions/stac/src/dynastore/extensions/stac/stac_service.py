@@ -847,12 +847,32 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         item_id: str,
         language: str,
         conn: Any,
+        request: Optional[Request] = None,
     ) -> Tuple[Optional[Feature], Dict[str, Any]]:
         """Utility to get an item and its raw row via FeaturePipelineContext."""
         from dynastore.modules.storage.drivers.pg_sidecars.base import (
             FeaturePipelineContext,
             ConsumerType,
         )
+
+        # PG row-level ABAC: compile access_filter for user-facing single-item
+        # reads when the collection carries an access_envelope sidecar.
+        af = None
+        if request is not None:
+            from dynastore.modules.storage.access_scope import (
+                collection_uses_pg_access_envelope,
+                compile_read_access_filter,
+                principals_from_request_state,
+            )
+
+            if await collection_uses_pg_access_envelope(catalog_id, collection_id):
+                principals, principal = principals_from_request_state(request)
+                af = await compile_read_access_filter(
+                    catalog_id=catalog_id,
+                    collections=[collection_id],
+                    principals=principals,
+                    principal=principal,
+                )
 
         context = FeaturePipelineContext(lang=language, consumer=ConsumerType.STAC)
         item = await items_svc.get_item(
@@ -862,6 +882,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ctx=DriverContext(db_resource=conn),
             lang=language,
             context=context,
+            access_filter=af,
         )
         if not item:
             return None, {}
@@ -914,7 +935,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
             items_svc = get_protocol(ItemsProtocol)
             item, row = await self._get_item_with_row(
-                items_svc, catalog_id, collection_id, item_id, language, conn
+                items_svc, catalog_id, collection_id, item_id, language, conn,
+                request=request,
             )
 
             if not item:

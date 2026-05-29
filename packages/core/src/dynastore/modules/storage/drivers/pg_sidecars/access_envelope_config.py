@@ -60,26 +60,30 @@ class AccessEnvelopeSidecarConfig(SidecarConfig):
     The envelope is **never** projected into ``Feature.properties``; it is only
     used in the SQL ``WHERE`` clause by :meth:`AccessEnvelopeSidecar.apply_query_context`.
 
-    KNOWN GAPS (see tracking issue: #1457)
+    ROW-LEVEL ABAC STATUS (tracking issue: #1457)
     ----------------------------------------------
-    G1: ``_access_envelope`` is NOT yet populated in ``item_context`` by
-        ``ItemService.upsert_bulk`` for PG-sidecar collections — only
-        ES-envelope collections trigger the async ``_resolve_access_envelope``.
-        Until that wiring lands, sidecar writes are no-ops (sidecar receives
-        ``None``, skips write).
+    The PG access-envelope path is enforced end-to-end:
 
-    G2: ``QueryRequest.access_filter`` is NOT yet populated by the PG read
-        dispatch path.  Until that lands, sidecar reads fail-closed (return
-        zero rows).
+    * Writes stamp the envelope.  ``ItemService`` resolves ``_access_envelope``
+      for any collection whose WRITE driver opts in to row-level ABAC, which now
+      includes PG ``access_envelope`` sidecars — detected by
+      ``_collection_uses_access_aware_driver`` (branch 2).  [#1457 G1/G4]
 
-    G3: ``access_filter_to_pg_clause`` does not handle the ``AccessFilter.union``
-        field (multi-collection differential ABAC).  Single-collection reads are
-        correct; multi-collection PG reads via the sidecar will under-return
-        (safe — matches the equal-or-stricter invariant from ``access_filter.py``).
+    * Reads enforce the envelope.  The PG read dispatch compiles the caller's
+      read scope and sets ``QueryRequest.access_filter`` before the query
+      optimiser runs; the optimiser force-includes this sidecar for ABAC
+      collections, so an unset filter fails closed (zero rows) and never leaks.
+      [#1457 G2]
 
-    G4: ``_collection_uses_access_aware_driver`` (at ``item_service.py``) does
-        not detect PG sidecar presence — must be extended to also check for
-        ``sidecar_type == "access_envelope"`` in any active PG driver config.
+    REMAINING LIMITATION
+    --------------------
+    ``access_filter_to_pg_clause`` does not translate the
+    ``AccessFilter.union`` field (multi-collection differential ABAC).  A
+    single-collection read is exact; a multi-collection PG read whose principal
+    has *different* grants per collection under-returns — safe, matching the
+    equal-or-stricter invariant in ``access_filter.py``.  The union node is
+    honoured by ``AccessFilter.union_of`` and the ES path; only the PG-clause
+    translation is pending.  [#1457 G3]
     """
 
     sidecar_type: Literal["access_envelope"] = "access_envelope"
@@ -91,10 +95,16 @@ class AccessEnvelopeSidecarConfig(SidecarConfig):
     """Create a GIN index on the JSONB envelope column for fast containment queries."""
 
     btree_attrs_index: bool = False
-    """Create a btree index on individual top-level attrs keys (reserved for future use)."""
+    """Emit a btree expression index per ``known_attrs_keys`` entry on the JSONB
+    path ``access_envelope->'attrs'->>'<key>'`` (#1453). Accelerates the ABAC
+    read filter's equality/range predicates without promoting attrs to real
+    columns. No-op unless ``known_attrs_keys`` is also non-empty."""
 
     known_attrs_keys: List[str] = []
-    """Declared attribute keys for documentation / schema hints (not enforced at DB level)."""
+    """Attribute keys to index when ``btree_attrs_index`` is True. Each becomes a
+    btree expression index matching the read filter's ``->'attrs'->>'<key>'``
+    access pattern. Keys must be ``[A-Za-z0-9_]`` identifiers; others are skipped
+    with a warning at DDL build time."""
 
 
 SidecarConfigRegistry.register("access_envelope", AccessEnvelopeSidecarConfig)

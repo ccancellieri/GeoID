@@ -592,6 +592,24 @@ class QueryOptimizer:
                 if sidecar and sidecar.get_main_geometry_field() is not None:
                     required_sidecars.add(sc_config.sidecar_id)
 
+        # Row-level ABAC (#1457): force-include the access_envelope sidecar
+        # whenever the collection declares it, regardless of whether any field
+        # of it appears in SELECT / filters / sort. The envelope exposes no
+        # SELECT fields (expose=False), so the heuristics above never pick it up
+        # on an explicit-projection query — yet it MUST always JOIN so its WHERE
+        # clause runs. ``apply_query_context`` fails closed (appends ``FALSE``)
+        # when ``request.access_filter`` is unset, so a read that forgets to
+        # compile a scope returns zero rows rather than leaking the whole table.
+        # A user-facing read sets ``access_filter`` via
+        # ``access_scope.compile_read_access_filter``; a privileged/system read
+        # must pass ``AccessFilter.allow_everything()`` explicitly to opt out.
+        # (The
+        # ``select=*`` path already includes the sidecar via the consumer-serving
+        # branch above; this closes the explicit-projection gap.)
+        for sc_config in driver_sidecars(self.col_config):
+            if getattr(sc_config, "sidecar_type", None) == "access_envelope":
+                required_sidecars.add(sc_config.sidecar_id)
+
         # Return only required sidecar configs, preserving declaration order
         return [
             sc for sc in driver_sidecars(self.col_config) if sc.sidecar_id in required_sidecars

@@ -187,6 +187,11 @@ async def stream_features(
             logger.error(f"CQL parse error: {e}")
             raise ValueError(f"Invalid CQL filter: {e}")
 
+    # Privileged system read (exporter): this path is driven by server-side
+    # export config with no end-user principal; allow all rows from the envelope JOIN.
+    from dynastore.models.protocols.access_filter import AccessFilter
+    req.access_filter = AccessFilter.allow_everything()
+
     # 4. Stream
     try:
         response = await items_svc.stream_items(

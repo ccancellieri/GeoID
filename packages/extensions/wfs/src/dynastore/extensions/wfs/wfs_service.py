@@ -530,6 +530,24 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
 
         # Execute search via ItemsProtocol (Streaming support)
         items_svc = cast(ItemsProtocol, catalogs_svc)
+
+        # PG row-level ABAC: compile and inject access_filter when the collection
+        # carries an access_envelope sidecar (user-facing read).
+        from dynastore.modules.storage.access_scope import (
+            collection_uses_pg_access_envelope,
+            compile_read_access_filter,
+            principals_from_request_state,
+        )
+
+        if await collection_uses_pg_access_envelope(schema_prefix, collection_id):
+            principals, principal = principals_from_request_state(request)
+            request_obj.access_filter = await compile_read_access_filter(
+                catalog_id=schema_prefix,
+                collections=[collection_id],
+                principals=principals,
+                principal=principal,
+            )
+
         try:
             query_response = await items_svc.stream_items(
                 catalog_id=schema_prefix,

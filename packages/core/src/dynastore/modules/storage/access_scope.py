@@ -41,7 +41,11 @@ if TYPE_CHECKING:
     from dynastore.models.auth import Principal
     from dynastore.models.protocols.access_filter import AccessFilter
 
-__all__ = ["compile_read_access_filter", "principals_from_request_state"]
+__all__ = [
+    "collection_uses_pg_access_envelope",
+    "compile_read_access_filter",
+    "principals_from_request_state",
+]
 
 
 def principals_from_request_state(
@@ -137,3 +141,46 @@ async def compile_read_access_filter(
         for collection in collections
     ]
     return AccessFilter.union_of(sub_filters)
+
+
+async def collection_uses_pg_access_envelope(
+    catalog_id: str, collection_id: str
+) -> bool:
+    """True when a WRITE driver for the collection carries the PG ``access_envelope`` sidecar.
+
+    This is the PG-sidecar half of ``ItemService._collection_uses_access_aware_driver``
+    (the ES-envelope half is handled by the search-driver dispatch's
+    ``applies_access_filter`` marker). The PG ``stream_items`` fallback uses it to
+    decide whether to compile + attach a row-level ``access_filter`` before the
+    query optimiser runs: when True, an unset filter makes the envelope sidecar
+    fail closed (zero rows), so the caller MUST compile one for user-facing reads.
+
+    Fail-closed for the *detection* itself: any resolution error returns ``False``
+    so a non-ABAC collection is never needlessly forced through the envelope JOIN
+    (a transient error must not blackout an ordinary collection's reads). For a
+    genuine ABAC collection the optimiser's force-include + the sidecar's
+    ``FALSE`` default still guarantee no rows leak when the filter is absent.
+    """
+    try:
+        from dynastore.modules.storage.router import get_write_drivers
+
+        resolved = await get_write_drivers(catalog_id, collection_id)
+    except Exception:
+        return False
+
+    for r in resolved:
+        get_cfg = getattr(r.driver, "get_driver_config", None)
+        if not callable(get_cfg):
+            continue
+        try:
+            from dynastore.modules.storage.drivers.pg_sidecars import driver_sidecars
+
+            drv_cfg = await get_cfg(catalog_id, collection_id)  # type: ignore[misc]
+            if any(
+                getattr(sc, "sidecar_type", None) == "access_envelope"
+                for sc in driver_sidecars(drv_cfg)
+            ):
+                return True
+        except Exception:
+            continue
+    return False
