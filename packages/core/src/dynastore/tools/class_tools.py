@@ -35,7 +35,7 @@ def __repr__(self, sensitive_attrs=None, private_attrs=None) -> str:
         private_attrs = []
     attrs_to_show = []
     # Iterate over all annotated attributes
-    for attr_name in self.__class__.__annotations__.keys():
+    for attr_name in self.__class__.__annotations__:
         is_public = not attr_name.startswith('_')
         is_explicitly_included = attr_name in private_attrs
 
