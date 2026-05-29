@@ -155,7 +155,8 @@ def get_file_reader(
         # A simple heuristic: if it smells like text, it might be CSV.
         try:
             file_path_or_buffer.seek(0)
-            is_text = file_path_or_buffer.read(1024).decode("utf-8")
+            # Probe: decode raises UnicodeDecodeError on binary content (caught below).
+            file_path_or_buffer.read(1024).decode("utf-8")
             file_path_or_buffer.seek(0)
             ext = ".csv"  # Assume CSV for text-like buffers
         except (UnicodeDecodeError, AttributeError):

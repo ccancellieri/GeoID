@@ -1013,10 +1013,6 @@ def cached(
         except Exception:
             pass
 
-        # Detect instance method (first param is 'self')
-        params = list(sig.parameters.keys())
-        is_method = len(params) > 0 and params[0] == "self"
-
         # Lazy backend resolution — deferred to first cache access so that
         # CacheModule has time to register Valkey during its lifespan.
         _is_named_backend = backend is not None

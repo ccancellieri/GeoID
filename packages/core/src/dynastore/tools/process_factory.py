@@ -54,7 +54,6 @@ def create_process_definition(
     """
     schema = input_model.model_json_schema()
     properties = schema.get("properties", {})
-    required = schema.get("required", [])
 
     inputs = {}
     # Map Pydantic properties to OGC ProcessInput

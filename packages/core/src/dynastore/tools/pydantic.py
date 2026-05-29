@@ -27,7 +27,7 @@ def parse_template(value: str) -> Union[str, dict]:
                 raise ValueError("Input must be a dictionary")
             return parsed
         except Exception as e:
-            logging.warning(f"Unable to load template as a json, using plain/text")
+            logging.warning("Unable to load template as JSON (%s), using plain text", e)
         return value
 
 

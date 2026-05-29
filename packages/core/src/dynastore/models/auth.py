@@ -118,7 +118,7 @@ class Policy(BaseModel):
         _REDOS_PATTERN = re.compile(r"(\(.+\+\)\+|\(.+\*\)\*|\(.+\+\)\*|\(.+\*\)\+)")
         for pattern in v:
             try:
-                compiled = re.compile(pattern)
+                re.compile(pattern)
             except re.error:
                 raise ValueError(f"Invalid regex in policy pattern: {pattern}")
             if _REDOS_PATTERN.search(pattern):
