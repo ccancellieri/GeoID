@@ -914,19 +914,6 @@ def get_cache_manager() -> CacheManager:
     return _cache_manager
 
 
-def _register_cache_manager_as_plugin() -> None:
-    """Register CacheManager with the plugin discovery system.
-
-    Called lazily on first ``@cached`` usage to avoid circular imports.
-    """
-    try:
-        from dynastore.tools.discovery import register_plugin
-        manager = get_cache_manager()
-        register_plugin(manager)
-    except ImportError:
-        pass
-
-
 # ---------------------------------------------------------------------------
 #  Backend upgrade tracking
 # ---------------------------------------------------------------------------
