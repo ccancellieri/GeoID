@@ -26,7 +26,6 @@ except ImportError:
         from typing import Any as JSONResponse
 
 from dynastore.tools.json import CustomJSONEncoder, orjson_default
-from typing import Any
 import orjson
 import json
 
