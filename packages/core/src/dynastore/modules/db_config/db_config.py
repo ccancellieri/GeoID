@@ -37,15 +37,45 @@ SAFE_POOL_MIN_FLOOR: int = 5
 SAFE_POOL_TOTAL_FLOOR: int = 5
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int from env var ``name``, tolerating mis-templated values.
+
+    The failure mode behind #1581: a deploy templates the var through (e.g.
+    ``iac.yml``) but leaves it undefined, so the container receives the literal
+    ``${DB_POOL_RECYCLE}`` (or an empty string) rather than a number. A bare
+    ``int(os.getenv(name, "1800"))`` only uses the default when the var is
+    *unset* — a non-numeric literal makes ``int()`` raise ``ValueError`` at
+    import, the gunicorn worker dies, and the Cloud Run startup probe fails the
+    whole revision rollout. Treating any empty / non-numeric value as the
+    default (with a WARN) makes a mis-templated env impossible to crash on.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except (ValueError, TypeError):
+        logger.warning(
+            "%s=%r is not a valid integer (commonly an unsubstituted ${...} "
+            "placeholder or an empty value from the deploy env); falling back "
+            "to the default %d. Set %s to a numeric value to silence this.",
+            name,
+            raw,
+            default,
+            name,
+        )
+        return default
+
+
 class DBConfig:
     database_url: str = os.getenv(
         "DATABASE_URL", "postgresql://testuser:testpassword@db:5432/gis_dev"
     )
-    pool_min_size: int = int(os.getenv("DB_POOL_MIN_SIZE", "5"))
-    pool_max_size: int = int(os.getenv("DB_POOL_MAX_SIZE", "100"))
-    pool_max_queries: int = int(os.getenv("DB_POOL_MAX_QUERIES", "50000"))
-    pool_command_timeout: int = int(os.getenv("DB_POOL_COMMAND_TIMEOUT", "60"))
-    connect_timeout: int = int(os.getenv("DB_CONNECT_TIMEOUT", "30"))
+    pool_min_size: int = _env_int("DB_POOL_MIN_SIZE", 5)
+    pool_max_size: int = _env_int("DB_POOL_MAX_SIZE", 100)
+    pool_max_queries: int = _env_int("DB_POOL_MAX_QUERIES", 50000)
+    pool_command_timeout: int = _env_int("DB_POOL_COMMAND_TIMEOUT", 60)
+    connect_timeout: int = _env_int("DB_CONNECT_TIMEOUT", 30)
     # SQLAlchemy retires a pooled connection once it reaches this age (#729).
     # On serverless deployments the VPC-egress path silently drops a TCP
     # connection that has been idle past its window; once dropped, the next
@@ -53,16 +83,16 @@ class DBConfig:
     # Recycling proactively — while the path is still warm — keeps reconnects
     # sub-second. Keep this BELOW the deployment's idle-drop window (set a
     # lower DB_POOL_RECYCLE per-environment where idle periods are common).
-    pool_recycle: int = int(os.getenv("DB_POOL_RECYCLE", "1800"))
+    pool_recycle: int = _env_int("DB_POOL_RECYCLE", 1800)
     # TCP keepalive tunables (#655). The egress path silently drops the
     # established-connection mapping after an idle window; without keepalive
     # probes the pool hands out a dead-at-the-wire socket whose replacement
     # handshake costs 8-22s. NOTE (#710): these are server-side GUCs only —
     # they do not arm SO_KEEPALIVE on the client socket; pool_recycle above
     # is the load-bearing mitigation until client-side keepalives land.
-    tcp_keepalives_idle: int = int(os.getenv("DB_TCP_KEEPALIVES_IDLE", "300"))
-    tcp_keepalives_interval: int = int(os.getenv("DB_TCP_KEEPALIVES_INTERVAL", "30"))
-    tcp_keepalives_count: int = int(os.getenv("DB_TCP_KEEPALIVES_COUNT", "5"))
+    tcp_keepalives_idle: int = _env_int("DB_TCP_KEEPALIVES_IDLE", 300)
+    tcp_keepalives_interval: int = _env_int("DB_TCP_KEEPALIVES_INTERVAL", 30)
+    tcp_keepalives_count: int = _env_int("DB_TCP_KEEPALIVES_COUNT", 5)
     # Lock-safety GUCs — applied as server_settings on EVERY connection (see
     # db_service). They make it impossible for one statement, or a leaked /
     # interrupted transaction, to freeze the whole application:
