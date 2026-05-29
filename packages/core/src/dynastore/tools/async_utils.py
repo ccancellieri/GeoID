@@ -2,16 +2,9 @@ import logging
 import asyncio
 from contextlib import AbstractAsyncContextManager
 from typing import Optional, Any, Iterator, Callable, List, Awaitable, Dict, Tuple
-from dynastore.modules.db_config.query_executor import run_in_event_loop as _real_run
 
 logger = logging.getLogger(__name__)
 
-def run_in_event_loop(awaitable: Awaitable[Any]) -> Any:
-    """
-    Deprecated bridge: Runs an awaitable from a synchronous context.
-    Use `dynastore.modules.db_config.query_executor.run_in_event_loop` directly.
-    """
-    return _real_run(awaitable)
 
 class SyncQueueIterator:
     """
