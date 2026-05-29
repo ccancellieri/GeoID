@@ -312,10 +312,10 @@ def _process_feature_for_db(
         return feature.model_dump(by_alias=True, exclude_unset=True)
     except ValueError as e:
         logger.error(f"Failed to process feature: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     except KeyError as e:
         logger.error(f"Failed to process feature due to KeyError: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal config error: Missing key {e}",
-        )
+        ) from e

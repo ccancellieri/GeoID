@@ -203,7 +203,7 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
             except ValueError as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
-                )
+                ) from e
             return {
                 "type": "FeatureCollection",
                 "features": [f.model_dump(by_alias=True, exclude_none=True) for f in joined],
@@ -265,7 +265,7 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
             except ValueError as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
-                )
+                ) from e
             return {
                 "type": "FeatureCollection",
                 "features": [f.model_dump(by_alias=True, exclude_none=True) for f in joined],

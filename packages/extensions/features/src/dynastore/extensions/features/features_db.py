@@ -158,12 +158,12 @@ async def get_items_filtered(
                 request.raw_params.update(cql_params)
 
         except ValueError as ve:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
-        except ImportError:
-            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="CQL filtering is not available on this server.")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve)) from ve
+        except ImportError as e:
+            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=f"CQL filtering is not available on this server. ({e})") from e
         except Exception as e:
             logger.error(f"Failed to parse CQL2 filter: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid CQL2-TEXT filter: {e}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid CQL2-TEXT filter: {e}") from e
 
     if raw_where_parts:
         request.raw_where = " AND ".join(raw_where_parts)

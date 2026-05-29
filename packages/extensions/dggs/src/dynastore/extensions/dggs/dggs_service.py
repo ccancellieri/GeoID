@@ -255,7 +255,7 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to list catalogs: {exc}",
-            )
+            ) from exc
 
         root_url = get_root_url(request)
         result = []
@@ -355,7 +355,7 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
             except ValueError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-                )
+                ) from exc
 
         if bbox_tuple:
             query = build_query_for_bbox(
