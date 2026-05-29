@@ -542,6 +542,36 @@ class ConfigService(ConfigsProtocol):
             restrict_to_fields=set_fields,
         )
 
+    async def _resolve_or_create_phys_schema(
+        self, catalog_id: str, conn: Any, *, reensure_on_missing: bool
+    ) -> str:
+        """Ensure the catalog exists and return its physical schema.
+
+        Resolves the catalog's physical schema (creating the catalog on the
+        first pass). If still unresolved, retries once — the set-config path
+        re-runs ``ensure_catalog_exists`` first (``reensure_on_missing=True``);
+        the ref-keyed path does not. Raises ValueError if it cannot be resolved.
+        """
+        await self._get_catalog_manager().ensure_catalog_exists(
+            catalog_id, ctx=DriverContext(db_resource=conn)
+        )
+        phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+            catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+        )
+        if not phys_schema:
+            if reensure_on_missing:
+                await self._get_catalog_manager().ensure_catalog_exists(
+                    catalog_id, ctx=DriverContext(db_resource=conn)
+                )
+            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                catalog_id, ctx=DriverContext(db_resource=conn)
+            )
+        if not phys_schema:
+            raise ValueError(
+                f"Could not resolve physical schema for catalog '{catalog_id}'."
+            )
+        return phys_schema
+
     async def _set_catalog_config(
         self,
         catalog_id: str,
@@ -554,25 +584,9 @@ class ConfigService(ConfigsProtocol):
         class_key = cls.class_key()
 
         async with managed_transaction(db_resource or self.engine) as conn:
-            await self._get_catalog_manager().ensure_catalog_exists(
-                catalog_id, ctx=DriverContext(db_resource=conn)
+            phys_schema = await self._resolve_or_create_phys_schema(
+                catalog_id, conn, reensure_on_missing=True
             )
-
-            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
-                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
-            )
-            if not phys_schema:
-                await self._get_catalog_manager().ensure_catalog_exists(
-                    catalog_id, ctx=DriverContext(db_resource=conn)
-                )
-                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
-                    catalog_id, ctx=DriverContext(db_resource=conn)
-                )
-
-            if not phys_schema:
-                raise ValueError(
-                    f"Could not resolve physical schema for catalog '{catalog_id}'."
-                )
 
             if check_immutability:
                 current_data = await _cq.select_catalog_config_for_update(phys_schema).execute(
@@ -645,25 +659,9 @@ class ConfigService(ConfigsProtocol):
         class_key = cls.class_key()
 
         async with managed_transaction(db_resource or self.engine) as conn:
-            await self._get_catalog_manager().ensure_catalog_exists(
-                catalog_id, ctx=DriverContext(db_resource=conn)
+            phys_schema = await self._resolve_or_create_phys_schema(
+                catalog_id, conn, reensure_on_missing=True
             )
-
-            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
-                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
-            )
-            if not phys_schema:
-                await self._get_catalog_manager().ensure_catalog_exists(
-                    catalog_id, ctx=DriverContext(db_resource=conn)
-                )
-                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
-                    catalog_id, ctx=DriverContext(db_resource=conn)
-                )
-
-            if not phys_schema:
-                raise ValueError(
-                    f"Could not resolve physical schema for catalog '{catalog_id}'."
-                )
 
             # JIT-create the thin collection registry row if it doesn't yet
             # exist. Upfront config workflow: `PUT .../collections/{col}/configs/{key}`
@@ -1031,20 +1029,9 @@ class ConfigService(ConfigsProtocol):
         class_key = cls.class_key()
 
         async with managed_transaction(db_resource or self.engine) as conn:
-            await self._get_catalog_manager().ensure_catalog_exists(
-                catalog_id, ctx=DriverContext(db_resource=conn)
+            phys_schema = await self._resolve_or_create_phys_schema(
+                catalog_id, conn, reensure_on_missing=False
             )
-            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
-                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
-            )
-            if not phys_schema:
-                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
-                    catalog_id, ctx=DriverContext(db_resource=conn)
-                )
-            if not phys_schema:
-                raise ValueError(
-                    f"Could not resolve physical schema for catalog '{catalog_id}'."
-                )
 
             existing = await _cq.select_catalog_config_by_ref(phys_schema).execute(
                 conn, ref_key=ref_key
@@ -1110,20 +1097,9 @@ class ConfigService(ConfigsProtocol):
         class_key = cls.class_key()
 
         async with managed_transaction(db_resource or self.engine) as conn:
-            await self._get_catalog_manager().ensure_catalog_exists(
-                catalog_id, ctx=DriverContext(db_resource=conn)
+            phys_schema = await self._resolve_or_create_phys_schema(
+                catalog_id, conn, reensure_on_missing=False
             )
-            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
-                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
-            )
-            if not phys_schema:
-                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
-                    catalog_id, ctx=DriverContext(db_resource=conn)
-                )
-            if not phys_schema:
-                raise ValueError(
-                    f"Could not resolve physical schema for catalog '{catalog_id}'."
-                )
             await self._get_catalog_manager().ensure_collection_exists(
                 catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
             )
