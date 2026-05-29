@@ -99,17 +99,20 @@ class EngineInstanceProtocol(Protocol):
 
 
 class _Entry:
-    """Internal cache entry — tracks instance + last-access time."""
+    """Internal cache entry — tracks instance + last-access time.
 
-    __slots__ = ("instance", "last_accessed", "lock")
+    Concurrency for a ref is serialised by ``EngineInstanceCache._ref_locks``
+    (per-ref, in ``get()``); there is no per-entry lock. A concurrent
+    ``evict`` releasing the old instance while ``get`` warms a fresh one is
+    benign — they act on different instances, ``engine_release`` is idempotent,
+    and ``_ref_locks`` already prevents double-init.
+    """
+
+    __slots__ = ("instance", "last_accessed")
 
     def __init__(self, instance: Any, *, now: float) -> None:
         self.instance = instance
         self.last_accessed = now
-        # Per-entry lock so concurrent ``engine_release`` calls during
-        # eviction don't race against new ``get()`` calls re-warming the
-        # entry.
-        self.lock = asyncio.Lock()
 
 
 class EngineInstanceCache:
