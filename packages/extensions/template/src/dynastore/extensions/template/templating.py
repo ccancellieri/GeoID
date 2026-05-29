@@ -180,7 +180,7 @@ async def _resolve(client: httpx.AsyncClient, template_str: str, resolve_urls: l
         interpolated_template = json.loads(template_str)
     except Exception as e:
         raise Exception(
-            f"Unable to resolve {resolve_urls} the template is not a regular json. Exception: {str(e)}. Template: {template_str}")
+            f"Unable to resolve {resolve_urls} the template is not a regular json. Exception: {str(e)}. Template: {template_str}") from e
 
     urls=[]
     as_json = []
@@ -189,8 +189,8 @@ async def _resolve(client: httpx.AsyncClient, template_str: str, resolve_urls: l
             url = interpolated_template[key]
             try:
                 HttpUrl(url)
-            except Exception:
-                raise Exception(f"Url to be resolved for key: {key} is not valid, invalid url: {url}")
+            except Exception as e:
+                raise Exception(f"Url to be resolved for key: {key} is not valid, invalid url: {url} ({e})") from e
             urls.append(url)
             as_json.append(True)
         else:
@@ -352,7 +352,7 @@ class StreamParser:
         try:
             self.parser.feed(chunk)
         except Exception as e:
-            raise HTTPException(400, f"XML parsing error: {str(e)}")
+            raise HTTPException(400, f"XML parsing error: {str(e)}") from e
 
     def close(self):
         self.parser.close()
@@ -389,7 +389,7 @@ async def stream_xml_url(client: httpx.AsyncClient, url: httpx.URL) -> AsyncGene
             async for chunk in response.aiter_bytes(CHUNK_SIZE):
                 yield chunk
     except httpx.HTTPError as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Error fetching XML: {str(e)}")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Error fetching XML: {str(e)}") from e
 
 
 
@@ -476,7 +476,7 @@ async def fetch_xml(client: httpx.AsyncClient, url: httpx.URL) -> str:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Error fetching XML from URL: {str(e)}"
-        )
+        ) from e
 
 async def convert_xml(xml_data: str, config: dict, parser: str) -> Dict[str, Any]:
     """Core XML conversion logic with security hardening"""
@@ -515,7 +515,7 @@ async def convert_xml(xml_data: str, config: dict, parser: str) -> Dict[str, Any
             raise HTTPException(400, "Invalid parser specified")
             
     except Exception as e:
-        raise HTTPException(400, f"XML parsing error: {str(e)}")
+        raise HTTPException(400, f"XML parsing error: {str(e)}") from e
 
 def _check_headers(which_headers, requests_object, headers, param_name):
     if which_headers:
@@ -539,7 +539,7 @@ def _check_headers(which_headers, requests_object, headers, param_name):
                     raise HTTPException(status_code=500, detail=f"{param_name} keys must match its corresponding object keys (key not found: {which_headers_key})")
         except Exception as e:
             raise HTTPException(
-                status_code=500, detail=f"Parameter '{param_name}' should be a valid object: {str(which_headers)}\nException: {str(e)}")
+                status_code=500, detail=f"Parameter '{param_name}' should be a valid object: {str(which_headers)}\nException: {str(e)}") from e
 class TemplatingExtension(ExtensionProtocol):
     always_on = True
     priority: int = 100
@@ -619,18 +619,18 @@ class TemplatingExtension(ExtensionProtocol):
         if t_url:
             try:
                 HttpUrl(t_url)
-            except Exception:
+            except Exception as e:
                 raise HTTPException(
-                    status_code=500, detail=f"value of parameter 't_url' should be a valid url: {str(t_url)}")
+                    status_code=500, detail=f"value of parameter 't_url' should be a valid url: {str(t_url)} ({e})") from e
             
             _check_headers(t_url_h, t_url, headers, "t_url_h")
 
         if m and isinstance(m,str):
             try:
                 m = json.loads(m)
-            except Exception:
+            except Exception as e:
                 raise HTTPException(
-                    status_code=500, detail=f"parameter 'm' should be a valid object: {str(m)}")
+                    status_code=500, detail=f"parameter 'm' should be a valid object: {str(m)} ({e})") from e
             
         if ru and isinstance(ru,str):
             try:
@@ -638,9 +638,9 @@ class TemplatingExtension(ExtensionProtocol):
             except Exception:
                 try:
                     ru = ast.literal_eval(ru)
-                except Exception:
+                except Exception as e:
                     raise HTTPException(
-                        status_code=500, detail="parameter 'ru' should be a valid list")
+                        status_code=500, detail=f"parameter 'ru' should be a valid list ({e})") from e
             
             _check_headers(ru_h, ru, headers, "ru_h")
             
@@ -648,22 +648,22 @@ class TemplatingExtension(ExtensionProtocol):
             if isinstance(m_urls, str):
                 try:
                     m_urls = json.loads(m_urls)
-                except Exception:
+                except Exception as e:
                     raise HTTPException(
-                        status_code=500, detail="Parameter 'm_urls' should be a valid object")
+                        status_code=500, detail=f"Parameter 'm_urls' should be a valid object ({e})") from e
             
             for url in (m_urls or {}).values():
                 try:
                     HttpUrl(url)
-                except Exception:
-                    raise HTTPException(status_code=500, detail="values of parameter 'm_urls' should be valid urls")
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"values of parameter 'm_urls' should be valid urls ({e})") from e
                 
             _check_headers(m_urls_h, m_urls, headers, "m_urls_h")
 
         try:
             template, model = await _prepare_template_and_model(client, m_urls=m_urls, m_urls_h=m_urls_h, model=m, template=t, t_url=t_url, t_url_h=t_url_h, mergeModel=mm)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Exception: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Exception: {str(e)}") from e
         
         assert template is not None, "Template must be set at this point"
         _et: bool = et or False
@@ -687,7 +687,7 @@ class TemplatingExtension(ExtensionProtocol):
                         r_mt = "application/json"
                     return Response(_interpolate(template=template, model=model, escapeTemplate=_et, autoEscape=_ae), media_type=r_mt)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Exception: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Exception: {str(e)}") from e
     class InterpolationRequest(BaseModel):
         t : Optional[str]
         t_url: Optional[str]
@@ -765,7 +765,7 @@ class TemplatingExtension(ExtensionProtocol):
         except HTTPException as e:
             raise e
         except Exception as e:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
     
     @router.post("/xml-to-json/",
@@ -803,7 +803,7 @@ class TemplatingExtension(ExtensionProtocol):
         except HTTPException as e:
             raise e
         except Exception as e:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
     @router.get("/xml-to-json/",
             summary="Convert XML from URL to JSON",
@@ -854,7 +854,7 @@ class TemplatingExtension(ExtensionProtocol):
         except HTTPException as e:
             raise e
         except Exception as e:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 # async def main():
     
 #     test={
