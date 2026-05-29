@@ -281,7 +281,7 @@ class LocalizedExtraMetadata(LocalizedDTO[Dict[str, Any]]):
         """Wraps a dictionary in a language-keyed dict if it's not already one."""
         if isinstance(value, dict):
             # Check if keys are languages
-            if any(k in _LANGUAGE_METADATA for k in value.keys()):
+            if any(k in _LANGUAGE_METADATA for k in value):
                 return value
             
             # If lang is *, and input is NOT a lang-keyed dict (checked above), 
@@ -307,7 +307,7 @@ def localize_dict(data: Dict[str, Any], lang: str) -> Tuple[Dict[str, Any], Set[
     available_languages: Set[str] = set()
 
     for key, value in list(result.items()):
-        if isinstance(value, dict) and any(k in _LANGUAGE_METADATA for k in value.keys()):
+        if isinstance(value, dict) and any(k in _LANGUAGE_METADATA for k in value):
             available_languages.update(value.keys())
             
             if lang == '*':
@@ -403,7 +403,7 @@ def is_multilanguage_input(value: Any) -> bool:
         return False
     
     # If ANY key is a known language code, treat as multilanguage
-    return any(k in _LANGUAGE_METADATA for k in value.keys())
+    return any(k in _LANGUAGE_METADATA for k in value)
 
 
 def validate_language_consistency(data: Dict[str, Any], lang: str) -> None:
@@ -452,7 +452,7 @@ def validate_language_consistency(data: Dict[str, Any], lang: str) -> None:
         
         # Check if this field contains multilanguage input
         if is_multilanguage_input(value) and lang != '*':
-            lang_keys = [k for k in value.keys() if k in _LANGUAGE_METADATA]
+            lang_keys = [k for k in value if k in _LANGUAGE_METADATA]
             raise ValueError(
                 f"Conflicting language parameters: field '{field}' contains "
                 f"multilanguage dictionary with keys {lang_keys}, but lang='{lang}' "
@@ -531,13 +531,13 @@ class LocalizableModelMixin:
                 elif serialization_alias in data:
                     del data[serialization_alias]
 
-            elif hasattr(original_value, "localize") and callable(getattr(original_value, "localize")):
+            elif hasattr(original_value, "localize") and callable(original_value.localize):
                 localized_data, sub_langs = original_value.localize(lang, include_language_keys=include_language_keys)
                 data[serialization_alias] = localized_data
                 available_languages.update(sub_langs)
 
             elif isinstance(original_value, list) and original_value:
-                if hasattr(original_value[0], "localize") and callable(getattr(original_value[0], "localize")):
+                if hasattr(original_value[0], "localize") and callable(original_value[0].localize):
                     localized_list = []
                     for item in original_value:
                         item_data, item_langs = item.localize(lang, include_language_keys=include_language_keys)
@@ -637,7 +637,7 @@ class LocalizableModelMixin:
             if (
                 field_type
                 and hasattr(field_type, "delocalize_input")
-                and callable(getattr(field_type, "delocalize_input"))
+                and callable(field_type.delocalize_input)
             ):
                 processed_data[field_name] = field_type.delocalize_input(value, lang)
 

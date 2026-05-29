@@ -351,7 +351,7 @@ class LocalizedFieldsBase(BaseModel, LocalizableModelMixin):
             from dynastore.models.localization import _LANGUAGE_METADATA
 
             # If keys match known languages, assume it's already localized
-            if any(k in _LANGUAGE_METADATA for k in v.keys()):
+            if any(k in _LANGUAGE_METADATA for k in v):
                 return v
             # Otherwise treat as default language content
             return {Language.EN.value: v}
