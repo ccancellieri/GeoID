@@ -46,11 +46,11 @@ from __future__ import annotations
 from dynastore.modules.iam.audience_configs import CatalogLookupAudience
 from typing import ClassVar
 
-from dynastore.modules.storage.presets import get_preset, register_preset
-from dynastore.modules.storage.presets.protocol import PresetBundle, PresetTier
+from dynastore.modules.storage.presets import BundlePreset, get_preset, register_preset
+from dynastore.modules.storage.presets.protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
-class GeoidPreset:
+class GeoidPreset(BundlePreset):
     """Flagship FAO GeoID profile: private storage + anonymous lookup-only."""
 
     name = "geoid"
@@ -70,16 +70,18 @@ class GeoidPreset:
     def build(self, catalog_id: str, **_scope: str) -> PresetBundle:
         base = get_preset("private_catalog").build(catalog_id=catalog_id)
         return PresetBundle(
-            catalog_routing=base.catalog_routing,
-            collection_template=base.collection_template,
-            items_template=base.items_template,
-            asset_template=base.asset_template,
-            audience_configs={
-                "catalog_lookup_audience": CatalogLookupAudience(is_public=True),
-            },
+            entries=(
+                *base.entries,
+                PresetBundleEntry(
+                    slot="audience:catalog_lookup_audience",
+                    config_cls=CatalogLookupAudience,
+                    instance=CatalogLookupAudience(is_public=True),
+                    rollback_priority=100,
+                ),
+            )
         )
 
-    async def on_applied(self, catalog_id: str) -> None:
+    async def on_applied(self, catalog_id: str, **_scope: str) -> None:
         """Called after the preset bundle is applied to a catalog.
         
         Registers per-catalog geoid IAM policies for the lookup-only access model.

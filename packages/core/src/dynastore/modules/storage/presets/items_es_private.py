@@ -45,10 +45,11 @@ from typing import ClassVar
 from dynastore.modules.catalog.catalog_config import _build_private_items_routing
 from dynastore.modules.storage.routing_config import ItemsRoutingConfig
 
+from .bundle_preset import BundlePreset
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
-class ItemsEsPrivatePreset:
+class ItemsEsPrivatePreset(BundlePreset):
     """Items-tier private ES indexing, applicable at catalog or collection scope."""
 
     name = "items_es_private"

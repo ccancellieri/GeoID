@@ -12,30 +12,31 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-"""Preset registry — unified store for routing presets and generalised presets.
+"""Preset registry — unified store for all presets.
 
 Plain dict-backed registry. Built-in presets register themselves on
 package import (see ``__init__``). Extensions register additional
 presets during module bootstrap by importing ``register_preset``.
 
-The registry accepts both the legacy ``RoutingPreset`` protocol and the
-new generalised ``Preset`` protocol; they share the same flat namespace.
-``CompositePreset.compose`` references are validated at registration time.
+Every registered preset exposes the unified ``Preset`` interface
+(``apply`` / ``revoke`` / ``dry_run``) — build-based routing presets get
+it by subclassing ``BundlePreset``. ``CompositePreset.compose`` references
+are validated at registration time.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
-from .protocol import PresetTier, RoutingPreset
+from .protocol import PresetTier
 
-# Union type for the registry values; both routing presets and new-style
-# Preset / CompositePreset instances live here.
-_AnyPreset = Any  # RoutingPreset | Preset | CompositePreset
+# Union type for the registry values; Preset / CompositePreset instances
+# (BundlePreset subclasses included) live here.
+_AnyPreset = Any  # Preset | CompositePreset
 
 _REGISTRY: Dict[str, _AnyPreset] = {}
 
 
-def register_preset(preset: Union[RoutingPreset, Any]) -> None:
+def register_preset(preset: Any) -> None:
     """Register a preset under ``preset.name``.
 
     Raises ``ValueError`` if a preset with that name is already
@@ -48,20 +49,12 @@ def register_preset(preset: Union[RoutingPreset, Any]) -> None:
     Unknown child names raise ``ValueError`` with a clear message so
     authors catch missing dependencies at import time rather than at
     apply time.
-
-    Shape-A routing presets (those with ``build`` but no ``apply``) are
-    automatically wrapped in a ``RoutingPresetAdapter`` so every registered
-    preset exposes the unified ``apply`` / ``revoke`` / ``dry_run`` interface.
     """
     if preset.name in _REGISTRY:
         raise ValueError(
             f"Preset {preset.name!r} already registered "
             f"(by {type(_REGISTRY[preset.name]).__name__})"
         )
-    # Auto-wrap Shape-A routing presets that have build() but no apply().
-    if hasattr(preset, "build") and not hasattr(preset, "apply"):
-        from .routing_adapter import RoutingPresetAdapter
-        preset = RoutingPresetAdapter(preset)
     # Validate CompositePreset.compose references.
     compose = getattr(preset, "compose", None)
     if compose:

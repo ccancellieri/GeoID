@@ -14,10 +14,13 @@
 
 """Service wrapping ``iam.applied_presets`` queries.
 
-Provides typed methods for every state-machine transition. All writes
-use ``managed_transaction``; callers may pass a ``conn`` to participate
-in an outer transaction (used by the lifecycle layer for row-lock
-semantics: SELECT … FOR UPDATE then transition in the same transaction).
+Provides typed methods for every state-machine transition. Writes commit:
+when no ``conn`` is passed they run inside their own ``managed_transaction``;
+when a ``conn`` is passed they join the caller's transaction (used by the
+lifecycle layer for row-lock semantics: SELECT … FOR UPDATE then transition
+in the same transaction). A bare write straight on the engine would be
+rolled back by the executor's connection-hygiene path — see :meth:`_write`.
+Reads run on the engine directly.
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
-from dynastore.modules.db_config.query_executor import DbResource
+from dynastore.modules.db_config.query_executor import DbResource, managed_transaction
 
 from . import applied_presets_queries as _q
 
@@ -84,10 +87,35 @@ class AppliedPresetsService:
         self._engine = engine
 
     def _resource(self, conn: Optional[Any]) -> DbResource:
-        """Return ``conn`` if provided, else the service engine; assert non-None."""
+        """Return ``conn`` if provided, else the service engine; assert non-None.
+
+        For reads only. Writes must go through :meth:`_write` — a write
+        executed straight on the engine is rolled back (see below).
+        """
         resource = conn if conn is not None else self._engine
         assert resource is not None, "AppliedPresetsService: no DB resource available"
         return resource  # type: ignore[return-value]
+
+    async def _write(self, query: Any, conn: Optional[Any], **params: Any) -> Any:
+        """Execute a write query so that it commits.
+
+        With an explicit ``conn`` the write joins the caller's transaction
+        (the lifecycle layer holds a ``SELECT … FOR UPDATE`` row-lock across
+        the pending insert). With ``conn is None`` the write runs inside its
+        own :func:`managed_transaction`, which commits on exit.
+
+        This indirection is load-bearing: a bare ``DQLQuery.execute(engine)``
+        acquires a throwaway pooled connection and the executor's
+        connection-hygiene path rolls back any open transaction before
+        returning it to the pool — so the write is discarded even though the
+        ``RETURNING`` row is still handed back. State transitions therefore
+        MUST NOT run straight on the engine.
+        """
+        if conn is not None:
+            return await query.execute(conn, **params)
+        assert self._engine is not None, "AppliedPresetsService: no DB resource available"
+        async with managed_transaction(self._engine) as own:
+            return await query.execute(own, **params)
 
     # ------------------------------------------------------------------
     # DDL bootstrap — called from the IAM module lifespan
@@ -225,9 +253,9 @@ class AppliedPresetsService:
         conn: Optional[Any] = None,
     ) -> AppliedRow:
         """Insert or reset a row to ``pending`` state."""
-        resource = self._resource(conn)
-        row = await _q.UPSERT_PENDING.execute(
-            resource,
+        row = await self._write(
+            _q.UPSERT_PENDING,
+            conn,
             preset_name=name,
             scope_key=scope_key,
             applied_by=str(applied_by) if applied_by else None,
@@ -242,9 +270,9 @@ class AppliedPresetsService:
         task_id: Optional[UUID] = None,
         conn: Optional[Any] = None,
     ) -> Optional[AppliedRow]:
-        resource = self._resource(conn)
-        row = await _q.MARK_IN_PROGRESS.execute(
-            resource,
+        row = await self._write(
+            _q.MARK_IN_PROGRESS,
+            conn,
             preset_name=name,
             scope_key=scope_key,
             task_id=str(task_id) if task_id else None,
@@ -258,9 +286,9 @@ class AppliedPresetsService:
         revoke_descriptor: Dict[str, Any],
         conn: Optional[Any] = None,
     ) -> Optional[AppliedRow]:
-        resource = self._resource(conn)
-        row = await _q.MARK_APPLIED.execute(
-            resource,
+        row = await self._write(
+            _q.MARK_APPLIED,
+            conn,
             preset_name=name,
             scope_key=scope_key,
             revoke_descriptor=json.dumps(revoke_descriptor),
@@ -274,9 +302,9 @@ class AppliedPresetsService:
         last_error: str,
         conn: Optional[Any] = None,
     ) -> Optional[AppliedRow]:
-        resource = self._resource(conn)
-        row = await _q.MARK_FAILED.execute(
-            resource,
+        row = await self._write(
+            _q.MARK_FAILED,
+            conn,
             preset_name=name,
             scope_key=scope_key,
             last_error=last_error,
@@ -290,9 +318,9 @@ class AppliedPresetsService:
         task_id: Optional[UUID] = None,
         conn: Optional[Any] = None,
     ) -> Optional[AppliedRow]:
-        resource = self._resource(conn)
-        row = await _q.MARK_REVOKE_PENDING.execute(
-            resource,
+        row = await self._write(
+            _q.MARK_REVOKE_PENDING,
+            conn,
             preset_name=name,
             scope_key=scope_key,
             task_id=str(task_id) if task_id else None,
@@ -305,9 +333,8 @@ class AppliedPresetsService:
         scope_key: str,
         conn: Optional[Any] = None,
     ) -> Optional[AppliedRow]:
-        resource = self._resource(conn)
-        row = await _q.MARK_REVOKED.execute(
-            resource, preset_name=name, scope_key=scope_key
+        row = await self._write(
+            _q.MARK_REVOKED, conn, preset_name=name, scope_key=scope_key
         )
         return dict(row._mapping) if row is not None else None
 
@@ -318,9 +345,9 @@ class AppliedPresetsService:
         last_error: str,
         conn: Optional[Any] = None,
     ) -> Optional[AppliedRow]:
-        resource = self._resource(conn)
-        row = await _q.MARK_REVOKE_FAILED.execute(
-            resource,
+        row = await self._write(
+            _q.MARK_REVOKE_FAILED,
+            conn,
             preset_name=name,
             scope_key=scope_key,
             last_error=last_error,
@@ -335,9 +362,9 @@ class AppliedPresetsService:
         child_error: str,
         conn: Optional[Any] = None,
     ) -> Optional[AppliedRow]:
-        resource = self._resource(conn)
-        row = await _q.MARK_PARTIAL.execute(
-            resource,
+        row = await self._write(
+            _q.MARK_PARTIAL,
+            conn,
             preset_name=name,
             scope_key=scope_key,
             last_error=f"child {child_name!r} failed: {child_error}",

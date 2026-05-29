@@ -34,7 +34,8 @@ from dynastore.modules.storage.routing_config import (
 
 from typing import ClassVar
 
-from .protocol import PresetBundle, PresetTier
+from .bundle_preset import BundlePreset
+from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
 def _public_catalog_routing() -> CatalogRoutingConfig:
@@ -130,7 +131,7 @@ def _public_items_template() -> ItemsRoutingConfig:
     )
 
 
-class PublicCatalogPreset:
+class PublicCatalogPreset(BundlePreset):
     """PG-first storage + public ES indexers on every tier."""
 
     name = "public_catalog"
@@ -145,8 +146,24 @@ class PublicCatalogPreset:
 
     def build(self, catalog_id: str, **_scope: str) -> PresetBundle:  # noqa: ARG002
         return PresetBundle(
-            catalog_routing=_public_catalog_routing(),
-            collection_template=_public_collection_template(),
-            items_template=_public_items_template(),
-            audience_configs={},
+            entries=(
+                PresetBundleEntry(
+                    slot="catalog_routing",
+                    config_cls=CatalogRoutingConfig,
+                    instance=_public_catalog_routing(),
+                    rollback_priority=30,
+                ),
+                PresetBundleEntry(
+                    slot="collection_template",
+                    config_cls=CollectionRoutingConfig,
+                    instance=_public_collection_template(),
+                    rollback_priority=20,
+                ),
+                PresetBundleEntry(
+                    slot="items_template",
+                    config_cls=ItemsRoutingConfig,
+                    instance=_public_items_template(),
+                    rollback_priority=10,
+                ),
+            )
         )

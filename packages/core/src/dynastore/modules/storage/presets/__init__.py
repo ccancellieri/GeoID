@@ -36,7 +36,6 @@ from .protocol import (  # noqa: F401
     PresetBundle,
     PresetBundleEntry,
     PresetTier,
-    RoutingPreset,
 )
 from .preset import (  # noqa: F401
     AppliedDescriptor,
@@ -48,7 +47,7 @@ from .preset import (  # noqa: F401
     PresetPlanEntry,
 )
 from .registry import find_preset, get_preset, list_presets, register_preset, search_presets  # noqa: F401
-from .routing_adapter import RoutingPresetAdapter  # noqa: F401
+from .bundle_preset import BundlePreset  # noqa: F401
 
 # Built-in presets — auto-register on import.
 from .defaults_postgres import DefaultsPostgresPreset  # noqa: E402
@@ -80,6 +79,7 @@ except Exception:  # noqa: BLE001
 
 __all__ = [
     "AppliedDescriptor",
+    "BundlePreset",
     "CompositePreset",
     "DefaultsPostgresPreset",
     "ItemsEsPrivatePreset",
@@ -94,8 +94,6 @@ __all__ = [
     "PrivateCatalogPreset",
     "PrivateCollectionPreset",
     "PublicCatalogPreset",
-    "RoutingPreset",
-    "RoutingPresetAdapter",
     "find_preset",
     "get_preset",
     "list_presets",

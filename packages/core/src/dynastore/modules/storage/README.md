@@ -153,10 +153,12 @@ row diverges from the preset bundle. Applying a preset at a URL family that
 does not match its tier returns **409** (the preset exists but is invalid at
 that scope).
 
-Adding a preset: implement the `RoutingPreset` protocol (`name`,
-`description`, `tier`, `catalog_scopable`, `build(**scope) -> PresetBundle`)
-and call `register_preset(MyPreset())` from your extension or module
-bootstrap. `build` receives the scope its tier needs (`()` platform,
+Adding a preset: subclass `BundlePreset` (set `name`, `description`, `tier`,
+`catalog_scopable` and implement `build(**scope) -> PresetBundle`) and call
+`register_preset(MyPreset())` from your extension or module bootstrap. The
+base class supplies the `apply` / `revoke` / `dry_run` lifecycle on top of
+`build`; override the optional `on_applied` / `on_revoked` hooks for any
+side effects. `build` receives the scope its tier needs (`()` platform,
 `catalog_id` catalog, `catalog_id` + `collection_id` collection). Core
 presets live under `presets/` and auto-register on import; extension presets
 register from their package `__init__.py` (see `extensions/geoid/presets.py`).

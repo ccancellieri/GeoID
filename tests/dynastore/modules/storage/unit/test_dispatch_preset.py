@@ -1,9 +1,8 @@
 """Unit tests for ``lifecycle.dispatch_preset``.
 
-After the #1502 auto-wrap refactor all registered presets have ``apply``
-(routing presets are wrapped at registration time by ``register_preset``).
-The dispatcher no longer has a separate routing-bundle branch — it always
-goes through the audited lifecycle.
+All registered presets expose ``apply`` — build-based routing presets get
+it by subclassing ``BundlePreset``. The dispatcher has no separate
+routing-bundle branch; it always goes through the audited lifecycle.
 """
 from __future__ import annotations
 
@@ -19,8 +18,8 @@ from dynastore.modules.storage.presets.preset import (
     AppliedDescriptor,
     NoParams,
 )
-from dynastore.modules.storage.presets.protocol import PresetTier
-from dynastore.modules.storage.presets.routing_adapter import RoutingPresetAdapter
+from dynastore.modules.storage.presets.bundle_preset import BundlePreset
+from dynastore.modules.storage.presets.protocol import PresetBundle, PresetTier
 
 
 class _FakeGeneralisedPreset:
@@ -50,20 +49,16 @@ class _FakeGeneralisedPreset:
         return None
 
 
-class _FakeRoutingPreset:
-    """Has ``build`` but no ``apply`` — auto-wrapped by register_preset."""
+class _FakeRoutingPreset(BundlePreset):
+    """A build-based routing preset (BundlePreset subclass)."""
 
     name = "routing_test"
-
-    def __init__(self):
-        self.build_called_with: Any = None
+    description = "routing preset for dispatch test"
+    tier = PresetTier.PLATFORM
+    catalog_scopable = False
 
     def build(self, **base_scope):
-        self.build_called_with = base_scope
-        bundle = MagicMock()
-        bundle.iter_apply.return_value = []
-        bundle.iter_rollback.return_value = []
-        return bundle
+        return PresetBundle(entries=())
 
 
 def test_scope_from_base_normalises_tiers():
@@ -76,9 +71,9 @@ def test_scope_from_base_normalises_tiers():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_routing_preset_uses_adapter():
-    """A routing preset is auto-wrapped on registration; dispatch_preset calls
-    apply() on the RoutingPresetAdapter (not the old _apply_routing_bundle path).
+async def test_dispatch_bundle_preset_routes_through_lifecycle():
+    """A build-based routing preset (BundlePreset subclass) is stored as-is and
+    dispatch_preset routes its apply through the audited lifecycle.
     """
     from dynastore.modules.storage.presets.registry import _REGISTRY, register_preset
 
@@ -88,8 +83,8 @@ async def test_dispatch_routing_preset_uses_adapter():
     register_preset(raw_preset)
 
     registered = _REGISTRY["routing_test"]
-    assert isinstance(registered, RoutingPresetAdapter), (
-        "routing preset must be wrapped in RoutingPresetAdapter after register_preset"
+    assert isinstance(registered, BundlePreset), (
+        "routing preset must be stored as-is (BundlePreset) after register_preset"
     )
 
     fake_db = MagicMock()

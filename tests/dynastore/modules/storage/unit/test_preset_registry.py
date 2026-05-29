@@ -1,4 +1,4 @@
-"""RoutingPreset protocol + registry (#847)."""
+"""Preset registry (#847)."""
 from __future__ import annotations
 
 import pytest
@@ -8,7 +8,6 @@ from typing import ClassVar
 from dynastore.modules.storage.presets import (
     PresetBundle,
     PresetTier,
-    RoutingPreset,
     get_preset,
     list_presets,
     register_preset,
@@ -25,12 +24,6 @@ class _DummyPreset:
 
     def build(self, catalog_id: str) -> PresetBundle:  # noqa: ARG002
         return PresetBundle()
-
-
-def test_protocol_runtime_checkable_accepts_dummy():
-    """A class with ``name``, ``description``, ``tier``, ``catalog_scopable``,
-    ``build()`` satisfies the structural ``RoutingPreset`` protocol."""
-    assert isinstance(_DummyPreset(), RoutingPreset)
 
 
 def test_register_and_get_round_trip():

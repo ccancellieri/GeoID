@@ -27,8 +27,15 @@ from __future__ import annotations
 from typing import ClassVar, Any
 
 from dynastore.modules.catalog.catalog_config import _build_private_items_routing
+from dynastore.modules.storage.routing_config import (
+    AssetRoutingConfig,
+    CatalogRoutingConfig,
+    CollectionRoutingConfig,
+    ItemsRoutingConfig,
+)
 
-from .protocol import PresetBundle, PresetTier
+from .bundle_preset import BundlePreset
+from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
 def _build_pg_only_catalog_routing() -> Any:
@@ -138,7 +145,7 @@ def _build_pg_only_asset_routing() -> Any:
     )
 
 
-class PrivateCatalogPreset:
+class PrivateCatalogPreset(BundlePreset):
     """PG-only envelopes + per-tenant private ES on the items tier.
 
     Catalog and collection envelopes are stored in PostgreSQL only — no
@@ -163,9 +170,30 @@ class PrivateCatalogPreset:
 
     def build(self, catalog_id: str, **_scope: str) -> PresetBundle:  # noqa: ARG002
         return PresetBundle(
-            catalog_routing=_build_pg_only_catalog_routing(),
-            collection_template=_build_pg_only_collection_routing(),
-            items_template=_build_private_items_routing(),
-            asset_template=_build_pg_only_asset_routing(),
-            audience_configs={},
+            entries=(
+                PresetBundleEntry(
+                    slot="catalog_routing",
+                    config_cls=CatalogRoutingConfig,
+                    instance=_build_pg_only_catalog_routing(),
+                    rollback_priority=30,
+                ),
+                PresetBundleEntry(
+                    slot="collection_template",
+                    config_cls=CollectionRoutingConfig,
+                    instance=_build_pg_only_collection_routing(),
+                    rollback_priority=20,
+                ),
+                PresetBundleEntry(
+                    slot="items_template",
+                    config_cls=ItemsRoutingConfig,
+                    instance=_build_private_items_routing(),
+                    rollback_priority=10,
+                ),
+                PresetBundleEntry(
+                    slot="asset_template",
+                    config_cls=AssetRoutingConfig,
+                    instance=_build_pg_only_asset_routing(),
+                    rollback_priority=10,
+                ),
+            )
         )

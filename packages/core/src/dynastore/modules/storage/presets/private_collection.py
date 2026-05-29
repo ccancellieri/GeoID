@@ -32,10 +32,11 @@ from typing import ClassVar
 from dynastore.modules.catalog.catalog_config import _build_private_items_routing
 from dynastore.modules.storage.routing_config import ItemsRoutingConfig
 
+from .bundle_preset import BundlePreset
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
-class PrivateCollectionPreset:
+class PrivateCollectionPreset(BundlePreset):
     """Per-collection private items routing override."""
 
     name = "private_collection"

@@ -1,19 +1,17 @@
-"""Generic ``PresetBundle`` entries surface (#972 PR-1).
+"""Generic ``PresetBundle`` entries surface (#972 PR-1, #1657).
 
-Pins the post-#972 contract:
+Pins the post-#1657 contract:
 
-* ``PresetBundle`` exposes a flat tuple of ``PresetBundleEntry`` via
-  ``iter_apply``/``iter_rollback``.
-* The legacy tier-field constructor (``catalog_routing=...``,
-  ``items_template=...``, ``audience_configs={...}``) lifts the inputs
-  into ``entries`` with the documented apply + rollback orderings, so
-  the pre-#972 surface keeps working unchanged.
-* ``rollback_priority`` controls leaf-first ordering: items templates
-  unapply first, audiences trail, ties keep insertion order.
+* ``PresetBundle`` is constructed with ``entries=(PresetBundleEntry(...),
+  ...)`` — the single canonical form — and exposes a flat tuple via
+  ``iter_apply`` / ``iter_rollback``.
+* The tier-field accessors (``catalog_routing`` / ``collection_template``
+  / ``items_template`` / ``asset_template`` / ``audience_configs``) are
+  read-only computed views over ``entries``.
+* ``rollback_priority`` controls leaf-first ordering: items/asset
+  templates unapply first, audiences trail, ties keep insertion order.
 """
 from __future__ import annotations
-
-import pytest
 
 from dynastore.modules.storage.presets import (
     PresetBundle,
@@ -36,18 +34,48 @@ class _AudCfg:
         return {"k": "v"}
 
 
-def test_legacy_constructor_lifts_to_entries():
-    cat = CatalogRoutingConfig(operations={})
-    coll = CollectionRoutingConfig(operations={})
-    items = ItemsRoutingConfig(operations={})
-    aud = _AudCfg()
+def _routing_entries(*, asset: bool = False, audiences: tuple = ()) -> tuple:
+    """Build the standard routing entries (the shape the migrated presets
+    emit), optionally with an asset leaf and trailing audience entries."""
+    entries = [
+        PresetBundleEntry(
+            slot="catalog_routing",
+            config_cls=CatalogRoutingConfig,
+            instance=CatalogRoutingConfig(operations={}),
+            rollback_priority=30,
+        ),
+        PresetBundleEntry(
+            slot="collection_template",
+            config_cls=CollectionRoutingConfig,
+            instance=CollectionRoutingConfig(operations={}),
+            rollback_priority=20,
+        ),
+        PresetBundleEntry(
+            slot="items_template",
+            config_cls=ItemsRoutingConfig,
+            instance=ItemsRoutingConfig(operations={}),
+            rollback_priority=10,
+        ),
+    ]
+    if asset:
+        entries.append(PresetBundleEntry(
+            slot="asset_template",
+            config_cls=AssetRoutingConfig,
+            instance=AssetRoutingConfig(operations={}),
+            rollback_priority=10,
+        ))
+    for name in audiences:
+        entries.append(PresetBundleEntry(
+            slot=f"audience:{name}",
+            config_cls=_AudCfg,
+            instance=_AudCfg(),
+            rollback_priority=100,
+        ))
+    return tuple(entries)
 
-    bundle = PresetBundle(
-        catalog_routing=cat,
-        collection_template=coll,
-        items_template=items,
-        audience_configs={"my_aud": aud},
-    )
+
+def test_apply_order_follows_entry_order():
+    bundle = PresetBundle(entries=_routing_entries(audiences=("my_aud",)))
     slots = [e.slot for e in bundle.iter_apply()]
     assert slots == [
         "catalog_routing",
@@ -57,25 +85,18 @@ def test_legacy_constructor_lifts_to_entries():
     ]
 
 
-def test_legacy_constructor_lifts_asset_template():
-    """The ``asset_template`` legacy field lifts into ``entries`` after the
-    items template (independent leaf tier) and is exposed via the
-    read-only accessor (Part B)."""
-    cat = CatalogRoutingConfig(operations={})
-    coll = CollectionRoutingConfig(operations={})
-    items = ItemsRoutingConfig(operations={})
+def test_asset_template_accessor_views_into_entries():
+    """The ``asset_template`` accessor surfaces the asset entry instance."""
     asset = AssetRoutingConfig(operations={})
-
-    bundle = PresetBundle(
-        catalog_routing=cat,
-        collection_template=coll,
-        items_template=items,
-        asset_template=asset,
-    )
-    slots = [e.slot for e in bundle.iter_apply()]
-    assert slots == [
+    bundle = PresetBundle(entries=(
+        PresetBundleEntry("catalog_routing", CatalogRoutingConfig,
+                          CatalogRoutingConfig(operations={}), rollback_priority=30),
+        PresetBundleEntry("items_template", ItemsRoutingConfig,
+                          ItemsRoutingConfig(operations={}), rollback_priority=10),
+        PresetBundleEntry("asset_template", AssetRoutingConfig, asset, rollback_priority=10),
+    ))
+    assert [e.slot for e in bundle.iter_apply()] == [
         "catalog_routing",
-        "collection_template",
         "items_template",
         "asset_template",
     ]
@@ -85,12 +106,7 @@ def test_legacy_constructor_lifts_asset_template():
 def test_asset_template_rollback_is_leaf_first():
     """``asset_template`` unapplies at the leaf priority (alongside
     ``items_template``), before the collection/catalog envelopes."""
-    bundle = PresetBundle(
-        catalog_routing=CatalogRoutingConfig(operations={}),
-        collection_template=CollectionRoutingConfig(operations={}),
-        items_template=ItemsRoutingConfig(operations={}),
-        asset_template=AssetRoutingConfig(operations={}),
-    )
+    bundle = PresetBundle(entries=_routing_entries(asset=True))
     slots = [e.slot for e in bundle.iter_rollback()]
     assert slots == [
         "items_template",
@@ -100,15 +116,15 @@ def test_asset_template_rollback_is_leaf_first():
     ]
 
 
-def test_legacy_accessors_view_into_entries():
+def test_accessors_view_into_entries():
     cat = CatalogRoutingConfig(operations={})
     items = ItemsRoutingConfig(operations={})
     aud = _AudCfg()
-    bundle = PresetBundle(
-        catalog_routing=cat,
-        items_template=items,
-        audience_configs={"x": aud},
-    )
+    bundle = PresetBundle(entries=(
+        PresetBundleEntry("catalog_routing", CatalogRoutingConfig, cat, rollback_priority=30),
+        PresetBundleEntry("items_template", ItemsRoutingConfig, items, rollback_priority=10),
+        PresetBundleEntry("audience:x", _AudCfg, aud, rollback_priority=100),
+    ))
     assert bundle.catalog_routing is cat
     assert bundle.items_template is items
     assert bundle.collection_template is None
@@ -116,12 +132,7 @@ def test_legacy_accessors_view_into_entries():
 
 
 def test_iter_rollback_orders_leaves_first_audiences_last():
-    bundle = PresetBundle(
-        catalog_routing=CatalogRoutingConfig(operations={}),
-        collection_template=CollectionRoutingConfig(operations={}),
-        items_template=ItemsRoutingConfig(operations={}),
-        audience_configs={"a1": _AudCfg(), "a2": _AudCfg()},
-    )
+    bundle = PresetBundle(entries=_routing_entries(audiences=("a1", "a2")))
     slots = [e.slot for e in bundle.iter_rollback()]
     assert slots == [
         "items_template",
@@ -145,14 +156,6 @@ def test_rollback_tie_break_preserves_insertion_order():
     assert [e.slot for e in bundle.iter_rollback()] == ["first", "second", "third"]
 
 
-def test_mixing_entries_and_legacy_fields_raises():
-    with pytest.raises(TypeError, match="entries"):
-        PresetBundle(
-            entries=(PresetBundleEntry("x", ItemsRoutingConfig, ItemsRoutingConfig(operations={})),),
-            catalog_routing=CatalogRoutingConfig(operations={}),
-        )
-
-
 def test_empty_bundle_iterates_empty():
     bundle = PresetBundle()
     assert list(bundle.iter_apply()) == []
@@ -160,6 +163,7 @@ def test_empty_bundle_iterates_empty():
     assert bundle.catalog_routing is None
     assert bundle.collection_template is None
     assert bundle.items_template is None
+    assert bundle.asset_template is None
     assert bundle.audience_configs == {}
 
 

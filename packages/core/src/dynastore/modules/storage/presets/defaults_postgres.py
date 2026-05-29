@@ -37,6 +37,7 @@ from dynastore.modules.storage.routing_config import (
     OperationDriverEntry,
 )
 
+from .bundle_preset import BundlePreset
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
@@ -94,7 +95,7 @@ def _pg_items_routing() -> ItemsRoutingConfig:
     )
 
 
-class DefaultsPostgresPreset:
+class DefaultsPostgresPreset(BundlePreset):
     """Platform-tier PG-first routing defaults for catalog/collection/items."""
 
     name = "defaults_postgres"
