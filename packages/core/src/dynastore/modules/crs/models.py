@@ -69,7 +69,7 @@ class CRSDefinition(BaseModel):
             
             return v
         except CRSError as e:
-            raise ValueError(f"Invalid CRS definition: {str(e)}")
+            raise ValueError(f"Invalid CRS definition: {str(e)}") from e
 
     @model_validator(mode='after')
     def extract_metadata_from_crs(self) -> 'CRSDefinition':

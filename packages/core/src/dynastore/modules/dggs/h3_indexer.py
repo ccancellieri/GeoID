@@ -24,11 +24,11 @@ def _require_h3():
     try:
         import h3
         return h3
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
             "The 'h3' package is required for DGGS support. "
             "Install it with: pip install 'dynastore[extension_dggs]'"
-        )
+        ) from e
 
 
 def latlng_to_cell(lat: float, lng: float, resolution: int) -> str:

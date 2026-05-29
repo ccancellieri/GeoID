@@ -24,11 +24,11 @@ def _require_s2():
     try:
         import s2sphere
         return s2sphere
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
             "The 's2sphere' package is required for S2 DGGS support. "
             "Install it with: pip install 'dynastore[extension_dggs]'"
-        )
+        ) from e
 
 
 def latlng_to_cell(lat: float, lng: float, level: int) -> str:
