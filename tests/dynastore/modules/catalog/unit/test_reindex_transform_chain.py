@@ -21,7 +21,7 @@ class MarkerTransformer:
     """EntityTransformProtocol double — stamps the envelope on index."""
 
     async def transform_for_index(
-        self, entity, *, catalog_id, collection_id, entity_kind,
+        self, entity, *, catalog_id, collection_id, entity_kind, ctx,
     ):
         out = dict(entity)
         out["_transformed"] = True
@@ -29,7 +29,7 @@ class MarkerTransformer:
         return out
 
     async def restore_from_index(
-        self, doc, *, catalog_id, collection_id, entity_kind,
+        self, doc, *, catalog_id, collection_id, entity_kind, ctx,
     ):
         out = dict(doc)
         out.pop("_transformed", None)
@@ -40,12 +40,12 @@ class BoomTransformer:
     """EntityTransformProtocol double — always fails on index."""
 
     async def transform_for_index(
-        self, entity, *, catalog_id, collection_id, entity_kind,
+        self, entity, *, catalog_id, collection_id, entity_kind, ctx,
     ):
         raise RuntimeError("boom")
 
     async def restore_from_index(
-        self, doc, *, catalog_id, collection_id, entity_kind,
+        self, doc, *, catalog_id, collection_id, entity_kind, ctx,
     ):
         return doc
 

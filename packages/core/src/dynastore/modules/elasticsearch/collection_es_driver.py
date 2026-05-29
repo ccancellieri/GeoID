@@ -312,12 +312,16 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             driver_ref=_to_snake(type(self).__name__),
         )
         if restore_chain:
+            from dynastore.models.protocols.entity_transform import (
+                TransformChainContext,
+            )
             doc = await restore_transform_chain(
                 doc,
                 restore_chain,
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 entity_kind="collection",
+                ctx=TransformChainContext(),
             )
         return doc
 
@@ -570,6 +574,9 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             "sort": [{"_score": "desc"}, {"id": "asc"}],
         }
 
+        from dynastore.models.protocols.entity_transform import (
+            TransformChainContext,
+        )
         from dynastore.modules.storage.routing_config import (
             get_output_transformers_for_search,
         )
@@ -598,6 +605,8 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 collection_id=None,
                 driver_ref=driver_ref,
             )
+            # One restore context per query — shared cache across the page (#1568).
+            restore_ctx = TransformChainContext()
             results: List[Dict[str, Any]] = []
             for hit in hits.get("hits", []):
                 doc = self._unenrich_doc(hit["_source"])
@@ -608,6 +617,7 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                         catalog_id=catalog_id,
                         collection_id=None,
                         entity_kind="collection",
+                        ctx=restore_ctx,
                     )
                 results.append(doc)
             return results, total_count

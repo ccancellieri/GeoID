@@ -381,6 +381,7 @@ class ReindexWorker:
             return envelope
         from dynastore.models.protocols.entity_transform import (
             EntityTransformProtocol,
+            TransformChainContext,
         )
         from dynastore.modules.storage.transform_runtime import (
             apply_transform_chain,
@@ -403,12 +404,15 @@ class ReindexWorker:
             chain.append(transformer)
         if not chain:
             return envelope
+        # Operator-triggered reindex transforms one envelope per call (no open
+        # PG transaction); a fresh context gives the chain a cache for the run.
         return await apply_transform_chain(
             envelope,
             chain,
             catalog_id=catalog_id,
             collection_id=None,
             entity_kind="catalog",
+            ctx=TransformChainContext(),
         )
 
     async def _dispatch_one(

@@ -360,6 +360,9 @@ class ItemsElasticsearchEnvelopeDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        from dynastore.models.protocols.entity_transform import (
+            TransformChainContext,
+        )
         from dynastore.modules.storage.routing_config import (
             get_output_transformers_for_search,
         )
@@ -381,6 +384,8 @@ class ItemsElasticsearchEnvelopeDriver(
             collection_id=collection_id,
             driver_ref=_to_snake(type(self).__name__),
         )
+        # One restore context per query — shared cache across the page (#1568).
+        restore_ctx = TransformChainContext()
 
         # --- by-id lookup (geoid token retrieval) -------------------------
         if entity_ids:
@@ -397,6 +402,7 @@ class ItemsElasticsearchEnvelopeDriver(
                             catalog_id=catalog_id,
                             collection_id=collection_id,
                             entity_kind="item",
+                            ctx=restore_ctx,
                         )
                     yield feature
                 except Exception:
@@ -436,6 +442,7 @@ class ItemsElasticsearchEnvelopeDriver(
                         catalog_id=catalog_id,
                         collection_id=collection_id,
                         entity_kind="item",
+                        ctx=restore_ctx,
                     )
                 yield feature
             except Exception:

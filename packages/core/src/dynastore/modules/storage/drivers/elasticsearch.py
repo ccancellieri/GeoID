@@ -1215,6 +1215,9 @@ class ItemsElasticsearchDriver(
         from dynastore.modules.storage.routing_config import (
             get_output_transformers_for_search,
         )
+        from dynastore.models.protocols.entity_transform import (
+            TransformChainContext,
+        )
         from dynastore.modules.storage.transform_runtime import (
             restore_transform_chain,
         )
@@ -1232,6 +1235,9 @@ class ItemsElasticsearchDriver(
             collection_id=collection_id,
             driver_ref=_to_snake(type(self).__name__),
         )
+        # One restore context per query (read path → no pg_conn); the shared
+        # cache lets the restore chain batch any lookups across the page (#1568).
+        restore_ctx = TransformChainContext()
 
         if entity_ids:
             for eid in entity_ids:
@@ -1250,6 +1256,7 @@ class ItemsElasticsearchDriver(
                                 catalog_id=catalog_id,
                                 collection_id=collection_id,
                                 entity_kind="item",
+                                ctx=restore_ctx,
                             )
                         yield feature
                 except Exception:
@@ -1278,6 +1285,7 @@ class ItemsElasticsearchDriver(
                                 catalog_id=catalog_id,
                                 collection_id=collection_id,
                                 entity_kind="item",
+                                ctx=restore_ctx,
                             )
                         yield feature
                     except Exception:
@@ -2185,6 +2193,9 @@ class AssetElasticsearchDriver(
                 from_=offset,
             )
             hits = [hit["_source"] for hit in resp["hits"]["hits"]]
+            from dynastore.models.protocols.entity_transform import (
+                TransformChainContext,
+            )
             from dynastore.modules.storage.routing_config import (
                 get_output_transformers_for_search,
             )
@@ -2201,6 +2212,8 @@ class AssetElasticsearchDriver(
             )
             if not chain:
                 return hits
+            # One restore context per query — shared cache across the page (#1568).
+            restore_ctx = TransformChainContext()
             restored: List[Dict[str, Any]] = []
             for hit in hits:
                 restored.append(
@@ -2210,6 +2223,7 @@ class AssetElasticsearchDriver(
                         catalog_id=catalog_id,
                         collection_id=collection_id,
                         entity_kind="asset",
+                        ctx=restore_ctx,
                     )
                 )
             return restored

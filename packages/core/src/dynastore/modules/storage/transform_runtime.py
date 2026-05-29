@@ -39,6 +39,7 @@ from typing import Any, Iterable, Optional
 from dynastore.models.protocols.entity_transform import (
     EntityKind,
     EntityTransformProtocol,
+    TransformChainContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,11 +52,17 @@ async def apply_transform_chain(
     catalog_id: str,
     collection_id: Optional[str],
     entity_kind: EntityKind,
+    ctx: TransformChainContext,
 ) -> Any:
     """Apply each transformer's ``transform_for_index`` in order.
 
     Returns the doc to be written to the indexer's store. Empty
     ``transformers`` ⇒ returns ``entity`` unchanged.
+
+    ``ctx`` is the per-invocation :class:`TransformChainContext`. Callers
+    build it **once per batch** and pass the same instance for every entity
+    so the chain's transformers share ``ctx.cache`` across the batch —
+    forwarded verbatim to each transformer.
     """
     current = entity
     for transformer in transformers:
@@ -65,6 +72,7 @@ async def apply_transform_chain(
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 entity_kind=entity_kind,
+                ctx=ctx,
             )
         except Exception as exc:
             logger.warning(
@@ -84,12 +92,17 @@ async def restore_transform_chain(
     catalog_id: str,
     collection_id: Optional[str],
     entity_kind: EntityKind,
+    ctx: TransformChainContext,
 ) -> Any:
     """Apply each transformer's ``restore_from_index`` in reverse order.
 
     Inverses run right-to-left so the output shape matches what callers
     of ``apply_transform_chain`` originally passed in. Empty
     ``transformers`` ⇒ returns ``doc`` unchanged.
+
+    ``ctx`` is the per-query :class:`TransformChainContext`. Read-path
+    callers build it **once per query** and pass the same instance for
+    every hit so the restore chain shares ``ctx.cache`` across the page.
     """
     transformers_list = list(transformers)
     current = doc
@@ -100,6 +113,7 @@ async def restore_transform_chain(
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 entity_kind=entity_kind,
+                ctx=ctx,
             )
         except Exception as exc:
             logger.warning(

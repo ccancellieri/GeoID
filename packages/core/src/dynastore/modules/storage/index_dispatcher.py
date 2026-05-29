@@ -888,8 +888,18 @@ class IndexDispatcher:
         )
         if not transformers:
             return list(ops), []
+        from dynastore.models.protocols.entity_transform import (
+            TransformChainContext,
+        )
         from dynastore.modules.storage.transform_runtime import apply_transform_chain
 
+        # One context per batch — the same instance is threaded through every
+        # op so I/O-bearing transformers reuse the dispatcher's live ``pg_conn``
+        # and share ``cache`` across the bulk (N items ⇒ one lookup per key, #1568).
+        chain_ctx = TransformChainContext(
+            pg_conn=ctx.pg_conn,
+            correlation_id=ctx.correlation_id or None,
+        )
         kept: List[DispatchableOp] = []
         rejected: List[Dict[str, Any]] = []
         for op in ops:
@@ -904,6 +914,7 @@ class IndexDispatcher:
                     catalog_id=ctx.catalog,
                     collection_id=ctx.collection,
                     entity_kind=_op_entity_kind(op),
+                    ctx=chain_ctx,
                 )
             except Exception as exc:
                 rejected.append({

@@ -34,7 +34,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from dynastore.models.protocols.entity_transform import EntityKind
+from dynastore.models.protocols.entity_transform import (
+    EntityKind,
+    TransformChainContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,7 @@ class PrivateEntityTransformer:
         catalog_id: str,
         collection_id: Optional[str],
         entity_kind: EntityKind,
+        ctx: TransformChainContext,
     ) -> Any:
         """Build the tenant-feature doc + simplify to fit the ES doc-size limit.
 
@@ -73,6 +77,10 @@ class PrivateEntityTransformer:
         an items driver; the routing config should not apply this
         transformer outside that scope, but the no-op keeps things safe
         if it is mis-configured).
+
+        The ``simplify_geometry`` config lookup is memoized on ``ctx.cache``
+        keyed by ``(catalog_id, collection_id)`` — a bulk index of N items in
+        one collection resolves the flag once, not N times (#1568).
         """
         if entity_kind != "item":
             return entity
@@ -93,7 +101,7 @@ class PrivateEntityTransformer:
         # #1248: exact geometry by default — simplification is opt-in via the
         # private driver's ``simplify_geometry`` config flag.
         simplify_geometry = await self._resolve_simplify_geometry(
-            catalog_id, collection_id,
+            catalog_id, collection_id, ctx,
         )
         doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
         doc["simplification_factor"] = factor
@@ -103,12 +111,25 @@ class PrivateEntityTransformer:
     @staticmethod
     async def _resolve_simplify_geometry(
         catalog_id: str, collection_id: Optional[str],
+        ctx: TransformChainContext,
     ) -> bool:
         """Resolve the private driver's ``simplify_geometry`` flag (#1248).
 
         Exact geometry is indexed by default; simplification is opt-in via
         ``ItemsElasticsearchPrivateDriverConfig.simplify_geometry``.
+
+        Memoized on ``ctx.cache`` so a batch of items in the same
+        collection triggers a single ``ConfigsProtocol`` lookup (#1568).
         """
+        cache_key = (
+            "PrivateEntityTransformer.simplify_geometry",
+            catalog_id,
+            collection_id,
+        )
+        cached = ctx.cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.modules.storage.driver_config import (
             ItemsElasticsearchPrivateDriverConfig,
@@ -117,13 +138,16 @@ class PrivateEntityTransformer:
 
         configs = get_protocol(ConfigsProtocol)
         if configs is None:
-            return False
-        config = await configs.get_config(
-            ItemsElasticsearchPrivateDriverConfig,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-        )
-        return bool(getattr(config, "simplify_geometry", False))
+            resolved = False
+        else:
+            config = await configs.get_config(
+                ItemsElasticsearchPrivateDriverConfig,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+            resolved = bool(getattr(config, "simplify_geometry", False))
+        ctx.cache[cache_key] = resolved
+        return resolved
 
     async def restore_from_index(
         self,
@@ -132,6 +156,7 @@ class PrivateEntityTransformer:
         catalog_id: str,
         collection_id: Optional[str],
         entity_kind: EntityKind,
+        ctx: TransformChainContext,
     ) -> Any:
         """Reverse the tenant-feature projection back to a STAC-shaped Feature.
 

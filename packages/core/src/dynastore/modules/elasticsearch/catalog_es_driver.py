@@ -265,12 +265,16 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
             driver_ref=_to_snake(type(self).__name__),
         )
         if restore_chain:
+            from dynastore.models.protocols.entity_transform import (
+                TransformChainContext,
+            )
             doc = await restore_transform_chain(
                 doc,
                 restore_chain,
                 catalog_id=catalog_id,
                 collection_id=None,
                 entity_kind="catalog",
+                ctx=TransformChainContext(),
             )
         return doc
 

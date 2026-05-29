@@ -50,30 +50,69 @@ composes transformers and relies on that.
 
 I/O is permitted, and **enrichment transformers** (which compute fields from
 an external lookup — another store, a graph DB, an embeddings service) are a
-first-class, shipped use case: the in-tree ``PrivateEntityTransformer`` already
-resolves ``ConfigsProtocol`` via global ``get_protocol(...)``. When a transformer
-does I/O it MUST:
+first-class, shipped use case: the in-tree ``PrivateEntityTransformer`` resolves
+``ConfigsProtocol`` and memoizes the result on the chain context. When a
+transformer does I/O it MUST:
 
-- resolve its dependencies via global ``get_protocol(...)`` (there is no
-  execution context passed to the chain today — see the runtime caveat below);
+- prefer the :class:`TransformChainContext` passed on every call — reuse
+  ``ctx.pg_conn`` (the dispatcher's live connection on the write path) and
+  cache lookups on the shared ``ctx.cache`` rather than reaching for globals;
+  fall back to ``get_protocol(...)`` only for protocols not reachable via the
+  context;
 - be **fail-safe** — degrade to a sensible default rather than raising, since a
   raise rejects the item on the write path / drops it from the read shape;
-- **cache** in-process where possible — the chain runs per entity on the hot
-  secondary-index fan-out, so an uncached lookup is one external round-trip per
-  item;
+- **cache on ``ctx.cache``** — the context is built once per chain invocation
+  (per batch on the write fan-out, per query on the read path) and shared
+  across every entity in that invocation, so a cached lookup collapses
+  N items ⇒ N lookups down to one round-trip per distinct key;
 - honor ``TransformerEntry.sla`` to bound that I/O.
 
-Runtime caveat (tracked in geoid#1568): the chain currently runs **per item**
-with **no execution context** — transformers cannot piggyback on the
-dispatcher's ``pg_conn`` and there is no batch hook, so N items ⇒ N lookups.
-First-class context / batch support is a proposed enhancement, not yet wired.
+Execution context (geoid#1568): the chain runtime threads a
+:class:`TransformChainContext` to every ``transform_for_index`` /
+``restore_from_index`` call. It carries the caller's ``pg_conn`` (``None`` on
+the read path), a ``correlation_id``, and a ``cache`` dict shared across the
+whole invocation. This is what lets enrichment transformers piggyback on the
+dispatcher's connection and batch their external I/O.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Dict, Literal, Optional, Protocol, runtime_checkable
 
 EntityKind = Literal["item", "collection", "catalog", "asset"]
+
+
+@dataclass
+class TransformChainContext:
+    """Execution context threaded through one entity-transform chain run.
+
+    Built **once per chain invocation** — per batch on the write fan-out
+    (``IndexDispatcher``), per query on the read path (the ES restore
+    drivers) — and passed to every transformer in the chain. The same
+    instance is reused for every entity in that invocation, so transformers
+    can share state (most importantly the ``cache``) across the batch.
+
+    Fields
+    ------
+    pg_conn:
+        The caller's live PG connection / transaction handle on the write
+        path (from :class:`IndexContext.pg_conn`). ``None`` on the read path
+        and on operator-triggered reindex, where no PG transaction is open.
+    correlation_id:
+        The caller's correlation id for log/trace stitching. ``None`` when
+        the caller did not supply one.
+    cache:
+        A plain dict shared across the whole invocation. Enrichment
+        transformers memoize external lookups here (keyed however they
+        like, e.g. ``(catalog_id, collection_id)``) so N items collapse to
+        one round-trip per distinct key. Reset per invocation — never reused
+        across batches/queries, so it cannot leak stale state.
+    """
+
+    pg_conn: Optional[Any] = None
+    correlation_id: Optional[str] = None
+    cache: Dict[Any, Any] = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -91,10 +130,11 @@ class EntityTransformProtocol(Protocol):
     The transform must not mutate its input in place and must be
     deterministic for a given external state — the chain runtime composes
     transformers and relies on that. I/O **is** permitted: enrichment
-    transformers (e.g. the shipped ``PrivateEntityTransformer``) resolve
-    dependencies via global ``get_protocol(...)``. See the module docstring's
-    "Purity and I/O" section for the supported pattern (fail-safe, cache,
-    honor ``TransformerEntry.sla``) and the per-item runtime caveat (#1568).
+    transformers (e.g. the shipped ``PrivateEntityTransformer``) memoize
+    their dependency lookups on the :class:`TransformChainContext` passed to
+    every call. See the module docstring's "Purity and I/O" section for the
+    supported pattern (use ``ctx``, fail-safe, cache on ``ctx.cache``, honor
+    ``TransformerEntry.sla``).
     """
 
     async def transform_for_index(
@@ -104,6 +144,7 @@ class EntityTransformProtocol(Protocol):
         catalog_id: str,
         collection_id: Optional[str],
         entity_kind: EntityKind,
+        ctx: TransformChainContext,
     ) -> Any:
         """Mutate the entity for indexing.
 
@@ -112,6 +153,10 @@ class EntityTransformProtocol(Protocol):
         :attr:`OperationDriverEntry.input_transformers` tuple — typically
         the target driver's secondary-index ``WRITE`` entry. Composes
         left-to-right with other transformers in the same tuple.
+
+        ``ctx`` is the per-invocation :class:`TransformChainContext` (shared
+        across every entity in the batch) — reuse ``ctx.pg_conn`` and
+        memoize external lookups on ``ctx.cache`` instead of going global.
         """
         ...
 
@@ -122,6 +167,7 @@ class EntityTransformProtocol(Protocol):
         catalog_id: str,
         collection_id: Optional[str],
         entity_kind: EntityKind,
+        ctx: TransformChainContext,
     ) -> Any:
         """Inverse of :meth:`transform_for_index`.
 
@@ -131,6 +177,10 @@ class EntityTransformProtocol(Protocol):
         the SEARCH entry of the target driver. The chain runtime applies
         inverses right-to-left so the output shape matches the original
         entity.
+
+        ``ctx`` is the per-query :class:`TransformChainContext` (shared
+        across every hit). ``ctx.pg_conn`` is ``None`` on the read path;
+        ``ctx.cache`` is still available to batch any external lookups.
 
         May be a no-op when the indexed shape is already what clients
         want (rare — most transformers either fully invert or accept some

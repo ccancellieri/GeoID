@@ -13,6 +13,7 @@ from typing import Any, Optional, get_args
 from dynastore.models.protocols.entity_transform import (
     EntityKind,
     EntityTransformProtocol,
+    TransformChainContext,
 )
 
 
@@ -29,6 +30,7 @@ class _MinimalTransformer:
         catalog_id: str,
         collection_id: Optional[str],
         entity_kind: EntityKind,
+        ctx: TransformChainContext,
     ) -> Any:
         return entity
 
@@ -39,6 +41,7 @@ class _MinimalTransformer:
         catalog_id: str,
         collection_id: Optional[str],
         entity_kind: EntityKind,
+        ctx: TransformChainContext,
     ) -> Any:
         return doc
 
@@ -63,6 +66,7 @@ def test_methods_are_awaitable():
     t = _MinimalTransformer()
     coro = t.transform_for_index(
         {"x": 1}, catalog_id="c", collection_id="col", entity_kind="item",
+        ctx=TransformChainContext(),
     )
     result = asyncio.run(coro)
     assert result == {"x": 1}

@@ -18,10 +18,16 @@ from unittest.mock import patch
 
 import pytest
 
+from dynastore.models.protocols.entity_transform import TransformChainContext
 from dynastore.modules.storage.transform_runtime import (
     apply_transform_chain,
     restore_transform_chain,
 )
+
+# A single-use context for the direct chain-runtime calls below. The chain
+# requires a ``TransformChainContext`` on every call (#1568); these fixtures
+# don't exercise the cache, so a shared empty context is fine.
+_CTX = TransformChainContext()
 
 
 class _AppendTransformer:
@@ -31,10 +37,10 @@ class _AppendTransformer:
         self.transform_id = transform_id
         self.tag = tag
 
-    async def transform_for_index(self, entity, *, catalog_id, collection_id, entity_kind):
+    async def transform_for_index(self, entity, *, catalog_id, collection_id, entity_kind, ctx):
         return f"{entity}|{self.tag}"
 
-    async def restore_from_index(self, doc, *, catalog_id, collection_id, entity_kind):
+    async def restore_from_index(self, doc, *, catalog_id, collection_id, entity_kind, ctx):
         suffix = f"|{self.tag}"
         assert doc.endswith(suffix), f"restore expected suffix {suffix}, got {doc!r}"
         return doc[: -len(suffix)]
@@ -55,6 +61,7 @@ async def test_apply_chain_runs_left_to_right():
     chain = [_AppendTransformer("a", "A"), _AppendTransformer("b", "B")]
     result = await apply_transform_chain(
         "raw", chain, catalog_id="c", collection_id=None, entity_kind="item",
+        ctx=_CTX,
     )
     assert result == "raw|A|B"
 
@@ -65,6 +72,7 @@ async def test_restore_chain_runs_right_to_left():
     # Restore B first (matches its tag suffix), then A
     result = await restore_transform_chain(
         "raw|A|B", chain, catalog_id="c", collection_id=None, entity_kind="item",
+        ctx=_CTX,
     )
     assert result == "raw"
 
@@ -73,6 +81,7 @@ async def test_restore_chain_runs_right_to_left():
 async def test_apply_empty_chain_is_identity():
     result = await apply_transform_chain(
         {"x": 1}, [], catalog_id="c", collection_id=None, entity_kind="item",
+        ctx=_CTX,
     )
     assert result == {"x": 1}
 
@@ -81,6 +90,7 @@ async def test_apply_empty_chain_is_identity():
 async def test_restore_empty_chain_is_identity():
     result = await restore_transform_chain(
         {"x": 1}, [], catalog_id="c", collection_id=None, entity_kind="item",
+        ctx=_CTX,
     )
     assert result == {"x": 1}
 
@@ -91,6 +101,7 @@ async def test_apply_propagates_exceptions():
     with pytest.raises(RuntimeError, match="apply boom"):
         await apply_transform_chain(
             "raw", chain, catalog_id="c", collection_id=None, entity_kind="item",
+            ctx=_CTX,
         )
 
 
@@ -100,6 +111,7 @@ async def test_restore_propagates_exceptions():
     with pytest.raises(RuntimeError, match="restore boom"):
         await restore_transform_chain(
             "doc", chain, catalog_id="c", collection_id=None, entity_kind="item",
+            ctx=_CTX,
         )
 
 
@@ -109,11 +121,99 @@ async def test_apply_then_restore_round_trips():
     chain = [_AppendTransformer("a", "A"), _AppendTransformer("b", "B")]
     transformed = await apply_transform_chain(
         "raw", chain, catalog_id="c", collection_id=None, entity_kind="item",
+        ctx=_CTX,
     )
     restored = await restore_transform_chain(
         transformed, chain, catalog_id="c", collection_id=None, entity_kind="item",
+        ctx=_CTX,
     )
     assert restored == "raw"
+
+
+# ---------------------------------------------------------------------------
+# #1568 — TransformChainContext: per-invocation shared cache for enrichment I/O
+# ---------------------------------------------------------------------------
+
+
+class _CountingEnrichTransformer:
+    """Enrichment transformer that does one 'lookup' per distinct key and
+    memoizes it on ``ctx.cache`` — the supported #1568 pattern. Records how
+    many real lookups it performed so a test can assert they were batched.
+    """
+
+    def __init__(self) -> None:
+        self.lookups = 0
+
+    async def _enrich_value(self, catalog_id, collection_id, ctx):
+        key = ("enrich", catalog_id, collection_id)
+        if key in ctx.cache:
+            return ctx.cache[key]
+        self.lookups += 1
+        value = f"{catalog_id}:{collection_id}"
+        ctx.cache[key] = value
+        return value
+
+    async def transform_for_index(
+        self, entity, *, catalog_id, collection_id, entity_kind, ctx,
+    ):
+        out = dict(entity)
+        out["enriched"] = await self._enrich_value(catalog_id, collection_id, ctx)
+        return out
+
+    async def restore_from_index(
+        self, doc, *, catalog_id, collection_id, entity_kind, ctx,
+    ):
+        out = dict(doc)
+        out.pop("enriched", None)
+        return out
+
+
+@pytest.mark.asyncio
+async def test_shared_context_caches_enrichment_lookup_across_batch():
+    """One context shared across N items in the same collection ⇒ exactly
+    one enrichment lookup, not N (the core #1568 win)."""
+    transformer = _CountingEnrichTransformer()
+    batch_ctx = TransformChainContext()
+    out = []
+    for i in range(5):
+        out.append(
+            await apply_transform_chain(
+                {"id": i}, [transformer],
+                catalog_id="cat", collection_id="col", entity_kind="item",
+                ctx=batch_ctx,
+            )
+        )
+    assert transformer.lookups == 1, "shared ctx.cache must collapse N lookups to 1"
+    assert all(item["enriched"] == "cat:col" for item in out)
+
+
+@pytest.mark.asyncio
+async def test_distinct_keys_each_trigger_one_lookup_under_shared_context():
+    """The cache keys on (catalog, collection): two distinct collections in
+    one batch ⇒ two lookups, each reused for its own items."""
+    transformer = _CountingEnrichTransformer()
+    batch_ctx = TransformChainContext()
+    for col in ("a", "a", "b", "b", "a"):
+        await apply_transform_chain(
+            {"id": col}, [transformer],
+            catalog_id="cat", collection_id=col, entity_kind="item",
+            ctx=batch_ctx,
+        )
+    assert transformer.lookups == 2
+
+
+@pytest.mark.asyncio
+async def test_fresh_context_per_call_does_not_share_cache():
+    """A new context per call (the read-by-id / reindex shape) gives each
+    call its own cache — no cross-call batching, by design."""
+    transformer = _CountingEnrichTransformer()
+    for i in range(3):
+        await apply_transform_chain(
+            {"id": i}, [transformer],
+            catalog_id="cat", collection_id="col", entity_kind="item",
+            ctx=TransformChainContext(),
+        )
+    assert transformer.lookups == 3
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +327,7 @@ async def test_output_on_search_only_resolves_inverse_chain():
     # Inverse strips the tag back out — what the SEARCH wrap would yield.
     restored = await restore_transform_chain(
         {"tag": "X"}, chain, catalog_id="c", collection_id="col", entity_kind="item",
+        ctx=_CTX,
     )
     assert restored == {}
 
@@ -239,10 +340,12 @@ async def test_input_and_output_symmetric_round_trip():
     raw = {"id": "1"}
     indexed = await apply_transform_chain(
         raw, [appender], catalog_id="c", collection_id="col", entity_kind="item",
+        ctx=_CTX,
     )
     assert indexed == {"id": "1", "tag": "priv"}
     restored = await restore_transform_chain(
         indexed, [appender], catalog_id="c", collection_id="col", entity_kind="item",
+        ctx=_CTX,
     )
     assert restored == raw
 
@@ -253,10 +356,12 @@ async def test_chain_composition_two_transformers_left_to_right_then_right_to_le
     b = PayloadAppendTransformer("B")
     indexed = await apply_transform_chain(
         {}, [a, b], catalog_id="c", collection_id=None, entity_kind="item",
+        ctx=_CTX,
     )
     assert indexed == {"tag": "A|B"}
     restored = await restore_transform_chain(
         indexed, [a, b], catalog_id="c", collection_id=None, entity_kind="item",
+        ctx=_CTX,
     )
     assert restored == {}
 
@@ -538,14 +643,14 @@ class _PrefixTransformer:
         self.tag = tag
 
     async def transform_for_index(
-        self, entity, *, catalog_id, collection_id, entity_kind,
+        self, entity, *, catalog_id, collection_id, entity_kind, ctx,
     ):
         out = dict(entity)
         out["_t"] = self.tag
         return out
 
     async def restore_from_index(
-        self, doc, *, catalog_id, collection_id, entity_kind,
+        self, doc, *, catalog_id, collection_id, entity_kind, ctx,
     ):
         out = dict(doc)
         out.pop("_t", None)
