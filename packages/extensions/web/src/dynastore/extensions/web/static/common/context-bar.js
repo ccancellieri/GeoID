@@ -126,7 +126,7 @@ export function mountContextBar(container, { onChange } = {}) {
     if (!catalogId) return [];
     if (collectionsByCatalog[catalogId]) return collectionsByCatalog[catalogId];
     try {
-      const res = await getJSON(`/catalogs/${encodeURIComponent(catalogId)}/collections`);
+      const res = await getJSON(`/stac/catalogs/${encodeURIComponent(catalogId)}/collections`);
       const items = Array.isArray(res) ? res : (res.items || res.collections || []);
       const norm = items.map((c) => ({ id: c.id || c.collection_id || c }));
       collectionsByCatalog[catalogId] = norm;

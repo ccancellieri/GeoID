@@ -81,11 +81,12 @@ class OidcIdentityProvider(IdentityProviderProtocol):
                        Defaults to ``issuer_url``.
         roles_claim_path: Dotted JSON path used to locate roles inside the
                        decoded JWT claims. ``${audience}`` is substituted with
-                       the resolved audience. Defaults to
-                       ``resource_access.${audience}.roles``. Common operator
-                       overrides: ``resource_access.account.roles`` (when
-                       sysadmin sits on Keycloak's built-in account client) or
-                       ``realm_access.roles`` (realm roles).
+                       the resolved audience. Defaults to ``realm_access.roles``
+                       (Keycloak realm roles), matching
+                       ``IdpConfig.roles_claim_path``. Common operator overrides:
+                       ``resource_access.${audience}.roles`` (API client roles)
+                       or ``resource_access.account.roles`` (when sysadmin sits
+                       on Keycloak's built-in account client).
     """
 
     def __init__(
@@ -104,11 +105,14 @@ class OidcIdentityProvider(IdentityProviderProtocol):
         self.audience = audience or client_id
 
         # Resolve the roles claim path with ${audience} template substitution.
-        # Default points at the API audience client roles (standard OIDC
-        # pattern); operators can override via IDP_ROLES_CLAIM_PATH to e.g.
-        # ``resource_access.account.roles`` (FAO Keycloak setup) or
-        # ``realm_access.roles``.
-        raw_path = roles_claim_path or "resource_access.${audience}.roles"
+        # Default is ``realm_access.roles`` (Keycloak's standard realm-role
+        # location) to stay consistent with ``IdpConfig.roles_claim_path``'s
+        # default — the two IdP construction paths in IamModule must agree, or
+        # a deployment using the ENV fallback (which passes None here) resolves
+        # roles from a different claim than one using IdpConfig. Operators can
+        # override via IDP_ROLES_CLAIM_PATH / IdpConfig to e.g. client roles at
+        # ``resource_access.${audience}.roles`` or ``resource_access.account.roles``.
+        raw_path = roles_claim_path or "realm_access.roles"
         self.roles_claim_path = raw_path.replace("${audience}", self.audience)
 
         self._meta: Optional[Dict[str, Any]] = None

@@ -13,7 +13,7 @@
   "roles": {
     "realm": [
       {
-        "name": "sysadmin",
+        "name": "geoid.sysadmin",
         "description": "System administrator (full platform access)",
         "composite": false,
         "clientRole": false,
@@ -258,7 +258,7 @@
         }
       ],
       "realmRoles": [
-        "sysadmin",
+        "geoid.sysadmin",
         "default-roles-geoid"
       ],
       "clientRoles": {}

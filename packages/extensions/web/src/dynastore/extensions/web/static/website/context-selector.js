@@ -205,7 +205,7 @@ class ContextSelector {
             let allCatalogs = [];
 
             while (true) {
-                let url = this._apiPath(`/catalogs?limit=${limit}&offset=${offset}`);
+                let url = this._apiPath(`/stac/catalogs?limit=${limit}&offset=${offset}`);
                 if (this.state.q) url += `&q=${encodeURIComponent(this.state.q)}`;
 
                 const res = await fetch(url, { credentials: "same-origin" });
@@ -262,7 +262,7 @@ class ContextSelector {
             let allCollections = [];
 
             while (true) {
-                let url = this._apiPath(`/catalogs/${catalogId}/collections?limit=${limit}&offset=${offset}`);
+                let url = this._apiPath(`/stac/catalogs/${catalogId}/collections?limit=${limit}&offset=${offset}`);
                 if (this.enableVirtualCollections) {
                     url += '&include_virtual=true';
                 }

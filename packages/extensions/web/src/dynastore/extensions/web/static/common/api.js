@@ -153,7 +153,7 @@ export async function fetchMe() {
 }
 
 export function fetchCatalogs() {
-  return getJSON("/catalogs");
+  return getJSON("/stac/catalogs");
 }
 
 // ----- HTTP verbs used by admin pages -----
@@ -353,16 +353,16 @@ export const fetchGrantUsage = ({
 
 // ----- STAC write endpoints (create catalog / collection / features) -----
 
-export const createStacCatalog = (definition) => postJSON(`/catalogs`, definition);
+export const createStacCatalog = (definition) => postJSON(`/stac/catalogs`, definition);
 export const createStacCollection = (catalogId, definition) =>
-  postJSON(`/catalogs/${encodeURIComponent(catalogId)}/collections`, definition);
+  postJSON(`/stac/catalogs/${encodeURIComponent(catalogId)}/collections`, definition);
 
 // POST features to a collection. Returns the 201 BulkCreationResponse on
 // full success, or a 207 IngestionReport on partial failure (thrown as error
 // with .body payload — caller can inspect). Always returns whatever the
 // server sent as a parsed JSON object for a 2xx.
 export async function postFeatures(catalogId, collectionId, payload) {
-  const url = `/catalogs/${encodeURIComponent(catalogId)}`
+  const url = `/stac/catalogs/${encodeURIComponent(catalogId)}`
     + `/collections/${encodeURIComponent(collectionId)}/items`;
   const target = apiUrl(url);
   const r = await fetch(target, {
