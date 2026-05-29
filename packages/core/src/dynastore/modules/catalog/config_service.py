@@ -90,12 +90,26 @@ from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
 
 logger = logging.getLogger(__name__)
 
-# ==============================================================================
-#  LEGACY ALIASES
-# ==============================================================================
 
-CatalogConfig = PluginConfig
-CollectionConfig = PluginConfig
+def _serialize_config_for_db(config: "PluginConfig") -> str:
+    """Serialize a config to the JSON string persisted in the configs table.
+
+    ``secret_mode="db"`` → every Secret field serializes to its encrypted
+    envelope before jsonb persistence (see tools/secrets.py). ``exclude_unset``
+    → store only the fields the caller explicitly sent; class defaults and
+    parent-tier values are resolved at read time by the ``get_config`` waterfall,
+    not baked in here. A non-model ``config`` (already a plain mapping) is passed
+    through to ``json.dumps`` unchanged.
+
+    Single SSOT for the write-side serialization contract shared by every
+    ``set_config`` / ``set_config_by_ref`` path (catalog and collection tiers).
+    """
+    config_data = (
+        config.model_dump(mode="json", context={"secret_mode": "db"}, exclude_unset=True)
+        if hasattr(config, "model_dump")
+        else config
+    )
+    return json.dumps(config_data, cls=CustomJSONEncoder)
 
 # ==============================================================================
 #  STORAGE & SCHEMAS
@@ -572,6 +586,42 @@ class ConfigService(ConfigsProtocol):
             )
         return phys_schema
 
+    async def _enforce_write_immutability(
+        self,
+        cls: Type[PluginConfig],
+        config: PluginConfig,
+        current_data: Optional[Dict[str, Any]],
+        catalog_id: str,
+        collection_id: Optional[str],
+        conn: DbResource,
+    ) -> None:
+        """Enforce the config-immutability freeze for a ``set_config`` write.
+
+        ``current_data`` is the stored row from the scope-specific
+        select-for-update, or ``None`` on first write at this tier. Strips
+        caller values for machine-assigned (Computed) fields before
+        enforce/persist (#1135 — works on first-write too), then either:
+
+        * enforces immutability against the stored value, or
+        * on first write at this tier, enforces against the inherited
+          (parent-tier) baseline so a divergent override cannot slip past the
+          freeze on an already-materialized resource (#1198).
+
+        Shared by the catalog and collection ``_set_*_config`` paths; the
+        scope-specific select stays at the call site (explicit per tier).
+        """
+        current_config = cls.model_validate(current_data) if current_data else None
+        restore_system_assigned_fields(cls, config, current_config)
+        if current_config is not None:
+            await enforce_config_immutability(
+                current_config, config,
+                catalog_id=catalog_id, collection_id=collection_id, conn=conn,
+            )
+        else:
+            await self._enforce_first_write_against_inherited(
+                cls, config, catalog_id, collection_id, conn,
+            )
+
     async def _set_catalog_config(
         self,
         catalog_id: str,
@@ -592,49 +642,21 @@ class ConfigService(ConfigsProtocol):
                 current_data = await _cq.select_catalog_config_for_update(phys_schema).execute(
                     conn, ref_key=class_key
                 )
-                current_config = cls.model_validate(current_data) if current_data else None
-                # Strip caller values for machine-assigned (Computed) fields
-                # before enforce/persist (#1135) — works on first-write too.
-                restore_system_assigned_fields(cls, config, current_config)
-                if current_config is not None:
-                    await enforce_config_immutability(
-                        current_config, config,
-                        catalog_id=catalog_id, collection_id=None, conn=conn,
-                    )
-                else:
-                    # #1198: first write at this tier — compare against the
-                    # inherited (parent-tier) baseline so a divergent override
-                    # cannot slip past the freeze on an already-materialized
-                    # resource.
-                    await self._enforce_first_write_against_inherited(
-                        cls, config, catalog_id, None, conn,
-                    )
+                await self._enforce_write_immutability(
+                    cls, config, current_data, catalog_id, None, conn
+                )
 
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, None, conn)
 
             await _register_schema(conn, config)
 
-            # secret_mode="db" → every Secret field serializes to its
-            # encrypted envelope before jsonb persistence. See tools/secrets.py.
-            # exclude_unset=True → store only fields the caller explicitly sent.
-            # Class defaults and parent-tier values are resolved at read time
-            # by the ``get_config`` waterfall, not baked in here.
-            config_data = (
-                config.model_dump(
-                    mode="json",
-                    context={"secret_mode": "db"},
-                    exclude_unset=True,
-                )
-                if hasattr(config, "model_dump")
-                else config
-            )
             await _cq.upsert_catalog_config(phys_schema).execute(
                 conn,
                 ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=json.dumps(config_data, cls=CustomJSONEncoder),
+                config_data=_serialize_config_for_db(config),
             )
 
             # Phase 3 — apply (post-persist, best-effort).
@@ -678,50 +700,22 @@ class ConfigService(ConfigsProtocol):
                     collection_id=collection_id,
                     ref_key=class_key,
                 )
-                current_config = cls.model_validate(current_data) if current_data else None
-                # Strip caller values for machine-assigned (Computed) fields
-                # before enforce/persist (#1135) — works on first-write too.
-                restore_system_assigned_fields(cls, config, current_config)
-                if current_config is not None:
-                    await enforce_config_immutability(
-                        current_config, config,
-                        catalog_id=catalog_id, collection_id=collection_id, conn=conn,
-                    )
-                else:
-                    # #1198: first write at this tier — compare against the
-                    # inherited (catalog/platform) baseline so a divergent
-                    # override cannot slip past the freeze on an already-
-                    # materialized collection.
-                    await self._enforce_first_write_against_inherited(
-                        cls, config, catalog_id, collection_id, conn,
-                    )
+                await self._enforce_write_immutability(
+                    cls, config, current_data, catalog_id, collection_id, conn
+                )
 
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
 
             await _register_schema(conn, config)
 
-            # secret_mode="db" → every Secret field serializes to its
-            # encrypted envelope before jsonb persistence. See tools/secrets.py.
-            # exclude_unset=True → store only fields the caller explicitly sent.
-            # Class defaults and parent-tier values are resolved at read time
-            # by the ``get_config`` waterfall, not baked in here.
-            config_data = (
-                config.model_dump(
-                    mode="json",
-                    context={"secret_mode": "db"},
-                    exclude_unset=True,
-                )
-                if hasattr(config, "model_dump")
-                else config
-            )
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
                 collection_id=collection_id,
                 ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=json.dumps(config_data, cls=CustomJSONEncoder),
+                config_data=_serialize_config_for_db(config),
             )
 
             # Phase 3 — apply (post-persist, best-effort).
@@ -1057,21 +1051,12 @@ class ConfigService(ConfigsProtocol):
 
             await _register_schema(conn, config)
 
-            config_data = (
-                config.model_dump(
-                    mode="json",
-                    context={"secret_mode": "db"},
-                    exclude_unset=True,
-                )
-                if hasattr(config, "model_dump")
-                else config
-            )
             await _cq.upsert_catalog_config(phys_schema).execute(
                 conn,
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=json.dumps(config_data, cls=CustomJSONEncoder),
+                config_data=_serialize_config_for_db(config),
             )
 
             # Phase 3 — apply (post-persist, best-effort).
@@ -1127,22 +1112,13 @@ class ConfigService(ConfigsProtocol):
 
             await _register_schema(conn, config)
 
-            config_data = (
-                config.model_dump(
-                    mode="json",
-                    context={"secret_mode": "db"},
-                    exclude_unset=True,
-                )
-                if hasattr(config, "model_dump")
-                else config
-            )
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
                 collection_id=collection_id,
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=json.dumps(config_data, cls=CustomJSONEncoder),
+                config_data=_serialize_config_for_db(config),
             )
 
             # Phase 3 — apply (post-persist, best-effort).

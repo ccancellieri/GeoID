@@ -3,8 +3,6 @@ from tests.dynastore.test_utils import generate_test_id
 from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.catalog.config_service import (
     ConfigService,
-    CatalogConfig,
-    CollectionConfig,
 )
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.modules.db_config.platform_config_service import PlatformConfigService

@@ -3,8 +3,6 @@ from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.catalog.config_service import (
     ConfigService,
-    CatalogConfig,
-    CollectionConfig,
 )
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,

@@ -2,7 +2,6 @@ import pytest
 import logging
 from unittest.mock import MagicMock, AsyncMock, patch
 from dynastore.modules.tiles import tiles_db
-from dynastore.modules.catalog.config_service import CollectionConfig
 from dynastore.modules.tiles.tiles_models import TileMatrixSet
 
 # Configure logging to capture output
