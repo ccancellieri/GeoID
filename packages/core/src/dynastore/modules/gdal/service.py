@@ -128,7 +128,7 @@ def _href_to_vsi_path(href: str) -> str:
         return "/vsigs/" + href[len("gs://"):]
     if href.startswith("s3://"):
         return "/vsis3/" + href[len("s3://"):]
-    if href.startswith("http://") or href.startswith("https://"):
+    if href.startswith(("http://", "https://")):
         return "/vsicurl/" + href
     if href.startswith("file://"):
         # Local / on-prem asset: GDAL cannot open a ``file://`` URI; it needs a
