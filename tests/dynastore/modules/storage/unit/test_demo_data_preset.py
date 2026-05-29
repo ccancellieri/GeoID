@@ -3,7 +3,7 @@
 Pure-Python tests — no DB, no FastAPI, no network.  The suite covers:
 
 - ``_DemoDataContributor.get_data()`` yields exactly one ``DataSeed`` with the
-  expected catalog/collection IDs, exactly two items (Rome and Amsterdam), and
+  expected catalog/collection IDs, the 6-tile Italy grid items, and
   ``manage_catalog=True``.
 - ``DEMO_DATA_PRESET`` has the expected name, description, keywords, and PLATFORM
   tier.
@@ -41,24 +41,40 @@ def test_contributor_seed_catalog_and_collection_ids() -> None:
     assert seed.collection_id == "demo_collection"
 
 
-def test_contributor_seed_has_two_items() -> None:
-    """The seed carries exactly two items."""
+def test_contributor_seed_has_six_tiles() -> None:
+    """The seed carries the full 2×3 Italy tile grid."""
     seed = list(_DemoDataContributor().get_data())[0]
-    assert len(seed.items) == 2
+    assert len(seed.items) == 6
 
 
 def test_contributor_seed_item_ids() -> None:
-    """Item IDs are item_1 and item_2 in declaration order."""
+    """Item IDs are the 6 tile ids in (row, col) declaration order."""
     seed = list(_DemoDataContributor().get_data())[0]
     ids = [item["id"] for item in seed.items]
-    assert ids == ["item_1", "item_2"]
+    assert ids == [
+        "tile_west_south", "tile_east_south",
+        "tile_west_centre", "tile_east_centre",
+        "tile_west_north", "tile_east_north",
+    ]
+
+
+def test_contributor_seed_items_are_polygons() -> None:
+    """Every tile is a closed Polygon Feature over Italy."""
+    seed = list(_DemoDataContributor().get_data())[0]
+    for item in seed.items:
+        assert item["type"] == "Feature"
+        assert item["geometry"]["type"] == "Polygon"
+        ring = item["geometry"]["coordinates"][0]
+        assert ring[0] == ring[-1]  # closed ring
 
 
 def test_contributor_seed_item_names() -> None:
-    """Item names are Rome (item_1) and Amsterdam (item_2)."""
+    """Item names follow the 'Italy – <Row> <Col>' pattern."""
     seed = list(_DemoDataContributor().get_data())[0]
     names = [item["properties"]["name"] for item in seed.items]
-    assert names == ["Rome", "Amsterdam"]
+    assert names[0] == "Italy – South West"
+    assert names[-1] == "Italy – North East"
+    assert all(n.startswith("Italy – ") for n in names)
 
 
 def test_contributor_seed_manage_catalog_true() -> None:
