@@ -33,7 +33,7 @@ CEILINGS: dict[str, int] = {
     "F401": 233,    # unused-import
     "F811": 11,     # redefined-while-unused (duplicate imports)
     "F841": 35,     # unused-variable
-    "B904": 167,    # raise-without-from (broken exception chain)
+    "B904": 150,    # raise-without-from (broken exception chain)
     "RUF012": 15,   # mutable-class-default (unannotated shared class state)
     "SIM118": 17,   # `key in d.keys()` -> `key in d`
 }
