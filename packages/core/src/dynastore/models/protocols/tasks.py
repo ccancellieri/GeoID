@@ -12,9 +12,13 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-from typing import Protocol, runtime_checkable, Optional, List, Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Protocol, runtime_checkable, Optional, List, Any
 import uuid
-from dynastore.modules.db_config.query_executor import DbResource
+
+if TYPE_CHECKING:
+    from dynastore.modules.db_config.query_executor import DbResource
 
 @runtime_checkable
 class TasksProtocol(Protocol):

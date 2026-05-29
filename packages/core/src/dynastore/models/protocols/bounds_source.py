@@ -15,9 +15,10 @@ the HTTP surface keeps working when no real producer is registered.
 
 from __future__ import annotations
 
-from typing import Optional, Protocol, Sequence, runtime_checkable
+from typing import TYPE_CHECKING, Optional, Protocol, Sequence, runtime_checkable
 
-from dynastore.modules.volumes.bounds import FeatureBounds
+if TYPE_CHECKING:
+    from dynastore.modules.volumes.bounds import FeatureBounds
 
 
 @runtime_checkable

@@ -16,8 +16,12 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import Protocol, Optional, List, Any, runtime_checkable
-from dynastore.modules.db_config.query_executor import DbResource
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Protocol, Optional, List, Any, runtime_checkable
+
+if TYPE_CHECKING:
+    from dynastore.modules.db_config.query_executor import DbResource
 
 @runtime_checkable
 class CRSProtocol(Protocol):
