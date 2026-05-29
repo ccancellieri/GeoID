@@ -32,7 +32,6 @@ _ = _lxml_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filt
 
 import json as _json
 import logging
-import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional
 

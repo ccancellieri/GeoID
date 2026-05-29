@@ -18,8 +18,6 @@
 
 import logging
 
-from dynastore.modules.db_config.query_executor import AsyncEngine
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from typing import Optional
 

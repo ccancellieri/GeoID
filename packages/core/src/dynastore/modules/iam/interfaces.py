@@ -20,7 +20,6 @@
 
 from typing import Optional, List, Dict, Any, Protocol, runtime_checkable
 from dynastore.models.auth import Principal
-from dynastore.models.auth_models import IdentityLink
 
 @runtime_checkable
 class IdentityProviderProtocol(Protocol):

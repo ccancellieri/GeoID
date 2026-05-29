@@ -20,7 +20,7 @@ Records Part 1 (OGC 20-004).
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, Optional, Union
 
 from geojson_pydantic import Feature as _GeoJSONFeature
 

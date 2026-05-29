@@ -1212,11 +1212,26 @@ class ItemsElasticsearchDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        from dynastore.modules.storage.routing_config import (
+            get_output_transformers_for_search,
+        )
+        from dynastore.modules.storage.transform_runtime import (
+            restore_transform_chain,
+        )
+        from dynastore.tools.typed_store.base import _to_snake
+
         es = _es_client_required()
         index_name = self._items_index_name(catalog_id)
         # Resolve the wire-shape policy once per query so every hit is
         # reconstructed against the same read contract (id source, exposure).
         read_policy = await self._resolve_read_policy(catalog_id, collection_id)
+        # Resolve the output-transformer chain once per query (empty → no-op).
+        restore_chain = await get_output_transformers_for_search(
+            catalog_id,
+            entity="item",
+            collection_id=collection_id,
+            driver_ref=_to_snake(type(self).__name__),
+        )
 
         if entity_ids:
             for eid in entity_ids:
@@ -1227,7 +1242,16 @@ class ItemsElasticsearchDriver(
                     )
                     src = resp.get("_source")
                     if src is not None:
-                        yield self._es_source_to_feature(src, read_policy)
+                        feature = self._es_source_to_feature(src, read_policy)
+                        if restore_chain:
+                            feature = await restore_transform_chain(
+                                feature,
+                                restore_chain,
+                                catalog_id=catalog_id,
+                                collection_id=collection_id,
+                                entity_kind="item",
+                            )
+                        yield feature
                 except Exception:
                     pass
         else:
@@ -1244,9 +1268,18 @@ class ItemsElasticsearchDriver(
                 )
                 for hit in resp.get("hits", {}).get("hits", []):
                     try:
-                        yield self._es_source_to_feature(
+                        feature = self._es_source_to_feature(
                             hit["_source"], read_policy,
                         )
+                        if restore_chain:
+                            feature = await restore_transform_chain(
+                                feature,
+                                restore_chain,
+                                catalog_id=catalog_id,
+                                collection_id=collection_id,
+                                entity_kind="item",
+                            )
+                        yield feature
                     except Exception:
                         pass
             except Exception as e:

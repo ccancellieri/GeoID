@@ -25,7 +25,7 @@ no new storage layer is introduced.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, List, Optional, cast
 
 import pygeofilter as _pygeofilter_scope_gate  # noqa: F401  # SCOPE gate: extension_records requires pygeofilter
 _ = _pygeofilter_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
@@ -40,7 +40,7 @@ from dynastore.extensions.tools.db import get_async_connection
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.extensions.tools.query import resolve_items_read_policy  # noqa: E402
-from dynastore.models.protocols import CatalogsProtocol, ItemsProtocol
+from dynastore.models.protocols import ItemsProtocol
 from dynastore.models.shared_models import Link
 from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
 

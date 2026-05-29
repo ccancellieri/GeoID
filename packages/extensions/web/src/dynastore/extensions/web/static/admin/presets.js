@@ -119,7 +119,7 @@ async function loadCollections(catalogId) {
     return;
   }
   try {
-    const data = await getJSON(`/catalogs/${encodeURIComponent(catalogId)}/collections`);
+    const data = await getJSON(`/stac/catalogs/${encodeURIComponent(catalogId)}/collections`);
     const cols = (data && (data.collections || data)) || [];
     fillSelect(sel, cols, "— all collections —");
     sel.disabled = false;

@@ -20,7 +20,6 @@ from typing import Type, Dict, Any, List, Optional
 from pydantic import BaseModel
 from dynastore.modules.processes.models import (
     Process,
-    ProcessInput,
     ProcessScope,
     JobControlOptions,
     TransmissionMode,
@@ -55,7 +54,6 @@ def create_process_definition(
     """
     schema = input_model.model_json_schema()
     properties = schema.get("properties", {})
-    required = schema.get("required", [])
 
     inputs = {}
     # Map Pydantic properties to OGC ProcessInput

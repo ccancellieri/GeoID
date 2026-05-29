@@ -35,7 +35,7 @@ allocation.  Routing resolution is cached (300 s TTL) keyed on
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, FrozenSet, Generic, List, Optional, Protocol, Type, TypeVar, Union, cast, runtime_checkable
+from typing import TYPE_CHECKING, Dict, FrozenSet, Generic, List, Optional, Type, TypeVar, Union, cast
 
 if TYPE_CHECKING:
     from dynastore.models.protocols.storage_driver import CollectionItemsStore

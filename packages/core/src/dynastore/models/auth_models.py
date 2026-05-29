@@ -31,14 +31,12 @@ Models:
 - TokenResponse, TokenExchangeRequest: Token exchange models
 """
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, Dict, Any, List, Literal, Union, Annotated
-from uuid import UUID, uuid4
-from enum import Enum
+from pydantic import BaseModel, Field, model_validator
+from typing import Optional, Dict, Any, List
+from uuid import UUID
 from datetime import datetime, timezone
-import re
 
-from dynastore.models.auth import Principal, Policy, Condition
+from dynastore.models.auth import Policy
 
 # --- Constants ---
 SYSTEM_USER_ID = "system:platform"

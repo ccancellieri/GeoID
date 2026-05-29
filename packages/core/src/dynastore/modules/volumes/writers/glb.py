@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from dynastore.modules.volumes.mesh_builder import MeshBuffers
 

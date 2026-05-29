@@ -42,7 +42,6 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.ogc_common_models import Conformance
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
-from dynastore.extensions.tools.exception_handlers import http_errors
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.tools.discovery import get_protocol
 

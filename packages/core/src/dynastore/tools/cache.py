@@ -53,12 +53,9 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
-    Generic,
     List,
     Optional,
     Set,
-    Tuple,
-    Type,
     TypeVar,
     Union,
     get_args,
@@ -75,7 +72,6 @@ from dynastore.models.protocols.cache import (
     CacheEventData,
     CacheEventListener,
     CacheItemPriority,
-    CacheManagerProtocol,
     CacheSerializer,
     CacheStats,
     SyncCacheBackend,
@@ -1016,10 +1012,6 @@ def cached(
                     ignored_params.add(param_name)
         except Exception:
             pass
-
-        # Detect instance method (first param is 'self')
-        params = list(sig.parameters.keys())
-        is_method = len(params) > 0 and params[0] == "self"
 
         # Lazy backend resolution — deferred to first cache access so that
         # CacheModule has time to register Valkey during its lifespan.

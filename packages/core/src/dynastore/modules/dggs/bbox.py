@@ -32,8 +32,8 @@ def parse_bbox(bbox_str: Optional[str]) -> Optional[Tuple[float, float, float, f
         )
     try:
         xmin, ymin, xmax, ymax = (float(p) for p in parts)
-    except ValueError:
-        raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}")
+    except ValueError as e:
+        raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}") from e
     if xmin >= xmax or ymin >= ymax:
         raise ValueError(
             f"bbox is degenerate: xmin={xmin} >= xmax={xmax} or ymin={ymin} >= ymax={ymax}"

@@ -53,7 +53,7 @@ Usage example::
 import abc
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Generic, TypeVar, Protocol
+from typing import AsyncGenerator, Generic, TypeVar
 
 logger = logging.getLogger(__name__)
 

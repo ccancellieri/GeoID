@@ -33,7 +33,7 @@ carry no STAC pollution.
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Set, Tuple, Union
+from typing import Dict, Any, List, Optional, Set, Tuple
 
 from geojson_pydantic import Feature
 
@@ -45,7 +45,6 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarProtocol,
-    SidecarConfig,
     FeaturePipelineContext,
     ValidationResult,
     FieldDefinition,

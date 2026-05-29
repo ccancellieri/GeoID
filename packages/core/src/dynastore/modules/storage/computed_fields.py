@@ -643,6 +643,22 @@ class IdentityRule(BaseModel):
     on_match: Optional["WriteConflictPolicy"] = None
 
 
+# Identity + lifecycle field names that make up the ``system`` section of the
+# report envelope (see ``tasks/ingestion/main_ingestion._build_report_envelope``)
+# and of the ``expose_all`` read response. Single source of truth shared by the
+# write-side reporter and the read-side feature assembly so the two never drift.
+SYSTEM_FIELD_KEYS: tuple[str, ...] = (
+    "geoid",
+    "external_id",
+    "asset_id",
+    "geometry_hash",
+    "attributes_hash",
+    "validity",
+    "transaction_time",
+    "deleted_at",
+)
+
+
 class FeatureType(BaseModel):
     """Declarative wire-shape contract for the data-oriented read path.
 
@@ -703,6 +719,24 @@ class FeatureType(BaseModel):
     external_id_as_feature_id: bool = False
     expose_created: bool = False
     expose_geoid: bool = False
+    expose_all: bool = Field(
+        default=False,
+        description=(
+            "When True, the read response additionally carries the two "
+            "platform sections of the ingestion report envelope as top-level "
+            "Feature members beside ``properties``: ``stats`` (computed "
+            "statistics — geometry/attribute stats, content hashes, spatial "
+            "cells) and ``system`` (identity + lifecycle: geoid, external_id, "
+            "asset_id, geometry_hash, attributes_hash, validity, "
+            "transaction_time, deleted_at). ``properties`` still holds only "
+            "user attributes and is still governed by ``expose`` — so "
+            "``expose=[]`` + ``expose_all=true`` yields a report-style feature "
+            "with an empty ``properties`` plus the ``stats``/``system`` "
+            "sections. The sections are attached as GeoJSON foreign members "
+            "(RFC 7946 §6.1), so the response stays a valid GeoJSON Feature. "
+            "**Off by default** — the default read shape is unchanged."
+        ),
+    )
 
 
 __all__ = [
@@ -716,6 +750,7 @@ __all__ = [
     "ContentHash",
     "IdentityRule",
     "FeatureType",
+    "SYSTEM_FIELD_KEYS",
     "StatisticStorageMode",
     "SidecarTarget",
     "target_sidecar",

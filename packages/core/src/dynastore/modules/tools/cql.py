@@ -20,9 +20,6 @@
 import logging
 import re
 from typing import Dict, Any, Tuple, Optional, Set, Union, TYPE_CHECKING
-from sqlalchemy import text
-from sqlalchemy.dialects import postgresql
-from sqlalchemy.sql import column as sql_column
 
 logger = logging.getLogger(__name__)
 

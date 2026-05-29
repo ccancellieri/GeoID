@@ -12,11 +12,10 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.models.protocols.web import WebOverrideProtocol, WebPageProtocol, StaticFilesProtocol
 
 # Use the module-level decorators so Web discovers pages and static files automatically
-from dynastore.modules.web.decorators import expose_static, expose_web_page
+from dynastore.modules.web.decorators import expose_web_page
 
 from .lookup_router import router as lookup_router
 
-import user_agents  # Enforces installation-driven discovery
 
 logger = logging.getLogger(__name__)
 

@@ -386,19 +386,38 @@ class TransformerEntry(BaseModel):
 # Operations whose transformer hop is wired in this release. Declaring
 # input_transformers / output_transformers on any other (operation, side)
 # pair logs a one-time WARN so operators see the silent-no-op early.
+#
+# INPUT (write-side ``apply_transform_chain``) is wired on ``WRITE`` for every
+# tier (secondary-index fan-out). OUTPUT (read-side ``restore_from_index``) is
+# wired on ``SEARCH`` only for tiers whose search driver invokes
+# ``restore_transform_chain`` — today the asset tier alone. The per-tier flag
+# ``_RoutingConfigBase._wired_output_search_hop`` carries that distinction so a
+# SEARCH ``output_transformers`` declared on a collection/catalog/items tier
+# warns (instead of silently never running). See geoid#1567.
 _WIRED_INPUT_HOPS: FrozenSet[str] = frozenset({Operation.WRITE})
 _WIRED_OUTPUT_HOPS: FrozenSet[str] = frozenset({Operation.SEARCH})
-_DEFERRED_HOP_WARNED: Set[Tuple[str, str, str]] = set()
+_DEFERRED_HOP_WARNED: Set[Tuple[str, str, str, str]] = set()
 
 
 def _warn_deferred_transformer_hops(
     operations: Dict[str, List["OperationDriverEntry"]],
     config_label: str,
+    *,
+    output_search_wired: bool,
 ) -> None:
+    """Emit a one-time WARN per ``(tier, operation, driver, side)`` for a
+    transformer hop the runtime does not invoke, so the silent no-op surfaces
+    at config-load instead of as a mysteriously inert transformer.
+
+    ``output_search_wired`` reflects whether *this tier*'s SEARCH path runs the
+    read-side restore chain. Only the asset tier does today (geoid#1567); for
+    every other tier a SEARCH ``output_transformers`` declaration validates but
+    never fires, so it is warned as a deferred hop.
+    """
     for op_name, entries in operations.items():
         for entry in entries:
             if entry.input_transformers and op_name not in _WIRED_INPUT_HOPS:
-                key = (op_name, entry.driver_ref, "input")
+                key = (config_label, op_name, entry.driver_ref, "input")
                 if key not in _DEFERRED_HOP_WARNED:
                     _DEFERRED_HOP_WARNED.add(key)
                     logger.warning(
@@ -409,17 +428,27 @@ def _warn_deferred_transformer_hops(
                         config_label, op_name, entry.driver_ref, op_name,
                         sorted(_WIRED_INPUT_HOPS),
                     )
-            if entry.output_transformers and op_name not in _WIRED_OUTPUT_HOPS:
-                key = (op_name, entry.driver_ref, "output")
+            output_hop_wired = op_name in _WIRED_OUTPUT_HOPS and (
+                op_name != Operation.SEARCH or output_search_wired
+            )
+            if entry.output_transformers and not output_hop_wired:
+                key = (config_label, op_name, entry.driver_ref, "output")
                 if key not in _DEFERRED_HOP_WARNED:
                     _DEFERRED_HOP_WARNED.add(key)
+                    if op_name == Operation.SEARCH and not output_search_wired:
+                        reason = (
+                            "read-side restore_from_index is wired only for the "
+                            "asset tier in this release (geoid#1567)"
+                        )
+                    else:
+                        reason = (
+                            f"the {op_name} output-transformer hop is not yet "
+                            "wired in this release"
+                        )
                     logger.warning(
                         "%s: output_transformers declared on operation '%s' "
-                        "for driver '%s' but the %s output-transformer hop "
-                        "is not yet wired in this release — declaration is "
-                        "a no-op. Wired output hops: %s.",
-                        config_label, op_name, entry.driver_ref, op_name,
-                        sorted(_WIRED_OUTPUT_HOPS),
+                        "for driver '%s' but %s — declaration is a no-op.",
+                        config_label, op_name, entry.driver_ref, reason,
                     )
 
 
@@ -481,6 +510,13 @@ class _RoutingConfigBase(PluginConfig):
 
     is_abstract_base: ClassVar[bool] = True
 
+    # Whether THIS tier's SEARCH path invokes the read-side restore chain
+    # (``restore_from_index`` via ``restore_transform_chain``). Only the asset
+    # tier does today; other tiers leave it False so the validator warns on an
+    # inert SEARCH ``output_transformers`` declaration instead of silently
+    # dropping it. See geoid#1567.
+    _wired_output_search_hop: ClassVar[bool] = False
+
     model_config = ConfigDict(json_schema_extra=ui(category="routing"))
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
@@ -530,7 +566,10 @@ class _RoutingConfigBase(PluginConfig):
                 "will populate on next write.", label, exc,
             )
         _validate_transformer_attachment(self.operations, self.transformers, label)
-        _warn_deferred_transformer_hops(self.operations, label)
+        _warn_deferred_transformer_hops(
+            self.operations, label,
+            output_search_wired=type(self)._wired_output_search_hop,
+        )
         return self
 
 
@@ -555,6 +594,10 @@ class ItemsRoutingConfig(_RoutingConfigBase):
     # default (e.g. a routing preset) must surface in the catalog view even
     # though the immutability gate stays collection-scoped (``_freeze_at``).
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
+    # ItemsElasticsearchDriver.read_entities and the envelope/private siblings
+    # invoke get_output_transformers_for_search + restore_transform_chain, so
+    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -739,6 +782,10 @@ class CollectionRoutingConfig(_RoutingConfigBase):
     # catalog-tier default must surface in the catalog view while the
     # immutability gate stays collection-scoped (``_freeze_at``).
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
+    # CollectionElasticsearchDriver.get_metadata and search_metadata invoke
+    # get_output_transformers_for_search + restore_transform_chain, so
+    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -830,6 +877,10 @@ class AssetRoutingConfig(_RoutingConfigBase):
     # default must surface in the catalog view while the immutability gate
     # stays collection-scoped (``_freeze_at``).
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
+    # The asset SEARCH driver (AssetElasticsearchDriver.search_assets) is the
+    # only path that invokes the read-side restore chain today, so SEARCH
+    # output_transformers actually fire on this tier. See geoid#1567.
+    _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
@@ -923,7 +974,10 @@ class CatalogRoutingConfig(_RoutingConfigBase):
     # no longer depends on the unimplemented ``_freeze_at="catalog"`` hide-
     # at-collection rule.
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog")
-
+    # CatalogElasticsearchDriver.get_catalog_metadata invokes
+    # get_output_transformers_for_search + restore_transform_chain, so
+    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Immutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {

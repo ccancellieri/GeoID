@@ -23,9 +23,8 @@ from typing import Any, Optional, Tuple, List
 from pydantic import BaseModel
 
 from .query_executor import (
-    DDLQuery, DQLQuery, DbConnection, DbResource, ResultHandler, managed_transaction
+    DDLQuery, DbConnection, DbResource
 )
-from .locking_tools import acquire_startup_lock
 
 logger = logging.getLogger(__name__)
 class PartitionDefinition(BaseModel):

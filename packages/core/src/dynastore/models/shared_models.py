@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from enum import Enum, auto
+from enum import Enum
 from datetime import datetime
 from typing import (
     Any,
@@ -26,33 +26,23 @@ from typing import (
     Literal,
     Optional,
     Set,
-    Tuple,
     TypeVar,
     Union,
-    Generic,
-    get_args,
 )
-from typing_extensions import Self
 from pydantic import (
     BaseModel,
     Field,
     HttpUrl,
     ConfigDict,
-    model_validator,
     field_validator,
-    AliasChoices,
 )
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.models.localization import (
-    LocalizedDTO,
     LocalizedText,
     LocalizedLicense,
     LocalizedKeywords,
     LocalizedExtraMetadata,
-    is_multilanguage_input,
     Language,
-    T,
-    get_language_object,
     LocalizableModelMixin,
 )
 

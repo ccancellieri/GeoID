@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 

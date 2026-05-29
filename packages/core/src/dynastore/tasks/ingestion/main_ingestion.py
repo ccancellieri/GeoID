@@ -31,6 +31,7 @@ from dynastore.modules.catalog.models import CoreAssetReferenceType
 
 from dynastore.modules.catalog.tools import recalculate_and_update_extents
 from dynastore.modules.db_config.query_executor import DbEngine
+from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
 from dynastore.models.driver_context import DriverContext
 
 # Import Ingestion Configuration
@@ -121,16 +122,9 @@ def apply_temporal_coercion(properties: dict, temporal_fields: dict) -> dict:
 # Identity + lifecycle fields lifted from ``generated`` into ``record["system"]``.
 # Each is omitted from the envelope when its value is None — absent values
 # simply don't appear, so a reporter never sees a half-populated system bag.
-_SYSTEM_KEYS = (
-    "geoid",
-    "external_id",
-    "asset_id",
-    "geometry_hash",
-    "attributes_hash",
-    "validity",
-    "transaction_time",
-    "deleted_at",
-)
+# SSOT lives in ``modules/storage/computed_fields`` (imported at module top) so
+# the read-side ``expose_all`` assembly groups the same keys into ``system``.
+_SYSTEM_KEYS = SYSTEM_FIELD_KEYS
 
 
 def _build_report_envelope(record, generated: dict | None) -> dict:

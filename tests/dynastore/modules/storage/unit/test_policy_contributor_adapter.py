@@ -574,5 +574,8 @@ def test_contributor_class_property():
 # ---------------------------------------------------------------------------
 
 def test_shared_role_names_includes_standard_roles():
-    for rname in ("sysadmin", "admin", "user", "anonymous"):
-        assert rname in _SHARED_ROLE_NAMES
+    # `user` was dropped from the platform seed (default catalog roles trimmed
+    # to admin + unauthenticated); `_SHARED_ROLE_NAMES` is the SSOT for the
+    # roles a per-extension preset revoke must never delete. Assert equality
+    # against the constant so the test can't drift from the source tuple.
+    assert _SHARED_ROLE_NAMES == ("sysadmin", "admin", "anonymous", "unauthenticated")

@@ -69,7 +69,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from dynastore.models.protocols.driver_roles import DriverSla
 from dynastore.models.protocols.entity_store import CatalogStore
 from dynastore.modules.storage.routing_config import (
-    CatalogRoutingConfig, FailurePolicy, Operation, OperationDriverEntry,
+    CatalogRoutingConfig, FailurePolicy, OperationDriverEntry,
     secondary_index_entries,
 )
 from dynastore.tools.typed_store.base import _to_snake

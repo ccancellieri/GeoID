@@ -12,12 +12,11 @@ The driver uses the shared async client from
 ``dynastore.modules.elasticsearch.client``.
 """
 
-import json
 import logging
 import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from dynastore.modules.stats.storage import (

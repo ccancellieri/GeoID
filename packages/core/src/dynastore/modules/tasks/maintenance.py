@@ -38,11 +38,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
-    DDLQuery,
     ResultHandler,
     managed_transaction,
 )
-from dynastore.modules.tasks.models import Task, TaskStatusEnum
 from dynastore.modules.tasks.tasks_module import get_task_schema
 
 logger = logging.getLogger(__name__)

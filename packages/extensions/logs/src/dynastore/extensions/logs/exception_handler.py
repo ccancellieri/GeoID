@@ -17,11 +17,10 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import asyncio
 import traceback
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any
 from fastapi import HTTPException
-from dynastore.extensions.tools.exception_handlers import ExceptionHandler, ExceptionHandlerRegistry
+from dynastore.extensions.tools.exception_handlers import ExceptionHandler
 from dynastore.models.protocols.logs import LogsProtocol
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.concurrency import run_in_background

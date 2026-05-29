@@ -20,23 +20,18 @@
 
 import logging
 import re
-from enum import Enum
-from typing import Iterable, Dict, Any, Optional, cast
+from typing import Iterable, Any, Optional, cast
 
 # File: src/dynastore/extensions/formatters.py
 
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional, Literal
+from typing import List
 
-from dynastore.modules.catalog.models import (
-    Collection as CoreCollection,
-    Catalog as CoreCatalog,
-)
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 import orjson
 from datetime import datetime, timezone
-from typing import AsyncIterator, Union, Generator, Iterator
+from typing import AsyncIterator, Union
 from dynastore.tools.json import orjson_default
 # Use the real file writers instead of placeholders
 from dynastore.tools.file_io import write_csv, write_geopackage, write_geoparquet, write_parquet, write_shapefile, write_geojson

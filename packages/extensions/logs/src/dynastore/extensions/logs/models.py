@@ -1,7 +1,6 @@
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict
-from dynastore.tools.json import CustomJSONEncoder
 
 # --- SQL Schema ---
 

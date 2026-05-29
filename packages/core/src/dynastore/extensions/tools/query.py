@@ -16,11 +16,10 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import Optional, List, Dict, Any, Tuple, Union, AsyncIterator
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime, timezone
 import logging
-import orjson
-from fastapi import HTTPException, status, Request
+from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from dynastore.models.query_builder import (
     QueryRequest,
@@ -33,7 +32,6 @@ from dynastore.extensions.tools.formatters import (
     format_response,
     OGCResponseMetadata,
 )
-from dynastore.tools.json import orjson_default
 
 logger = logging.getLogger(__name__)
 

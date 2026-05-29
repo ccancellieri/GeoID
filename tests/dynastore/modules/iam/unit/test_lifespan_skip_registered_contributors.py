@@ -1,11 +1,18 @@
 """Verify that IamExtension.lifespan skips contributors covered by a preset.
 
-After PR-3, contributors whose class matches a registered
-``PolicyContributorPreset.contributor_class`` must be skipped in the
-boot-time discovery loop.  Contributors without a matching preset still
-run through the loop as a safety net until PR-5 removes it.
+After the per-extension preset refactor, each extension registers its policy
+contributor through a preset module (``dynastore.extensions.<ext>.presets``).
+The contributor lives *inside* the preset (a small wrapper class such as
+``_STACPolicyContributor``), not on the service class. The lifespan guard
+builds its ``covered`` set from each registered
+``PolicyContributorPreset.contributor_class`` and skips any discovered
+contributor whose class is in that set. These tests assert the registered
+preset is a ``PolicyContributorPreset`` and that its ``contributor_class``
+lands in the covered set after the extension's preset module is imported.
 """
 from __future__ import annotations
+
+import importlib
 
 import pytest
 
@@ -48,8 +55,23 @@ class _FakeContributorB:
         return []
 
 
+def _covered_contributor_classes() -> set:
+    """Build the covered-classes set exactly as the lifespan guard does."""
+    from dynastore.modules.storage.presets.policy_contributor_adapter import (
+        PolicyContributorPreset,
+    )
+    from dynastore.modules.storage.presets.registry import find_preset, list_presets
+
+    covered: set = set()
+    for name in list_presets():
+        preset = find_preset(name)
+        if isinstance(preset, PolicyContributorPreset):
+            covered.add(preset.contributor_class)
+    return covered
+
+
 # ---------------------------------------------------------------------------
-# Test: contributor with registered preset is skipped
+# Test: contributor with a registered preset is covered
 # ---------------------------------------------------------------------------
 
 def test_preset_covered_contributor_is_skipped():
@@ -75,18 +97,7 @@ def test_preset_covered_contributor_is_skipped():
     register_preset(preset)
 
     try:
-        # Build the covered-classes set as the lifespan does.
-        from dynastore.modules.storage.presets.registry import list_presets, get_preset
-
-        covered: set[type] = set()
-        for name in list_presets():
-            try:
-                p = get_preset(name)
-                if isinstance(p, PolicyContributorPreset):
-                    covered.add(p.contributor_class)
-            except Exception:
-                pass
-
+        covered = _covered_contributor_classes()
         assert _FakeContributorA in covered, "_FakeContributorA should be covered"
         assert _FakeContributorB not in covered, "_FakeContributorB should not be covered"
     finally:
@@ -95,20 +106,7 @@ def test_preset_covered_contributor_is_skipped():
 
 def test_uncovered_contributor_not_skipped():
     """Contributors without a matching preset are not in the covered set."""
-    from dynastore.modules.storage.presets.policy_contributor_adapter import (
-        PolicyContributorPreset,
-    )
-    from dynastore.modules.storage.presets.registry import list_presets, get_preset
-
-    covered: set[type] = set()
-    for name in list_presets():
-        try:
-            p = get_preset(name)
-            if isinstance(p, PolicyContributorPreset):
-                covered.add(p.contributor_class)
-        except Exception:
-            pass
-
+    covered = _covered_contributor_classes()
     # _FakeContributorB has no preset registered in any test — must not be covered.
     assert _FakeContributorB not in covered
 
@@ -118,54 +116,54 @@ def test_uncovered_contributor_not_skipped():
 # ---------------------------------------------------------------------------
 
 def test_stac_contributor_covered_after_extension_import():
-    """Importing the STAC extension registers stac_enable; STACService is covered."""
+    """Importing the STAC preset module registers ``stac_enable``; the wrapper
+    contributor class it carries lands in the lifespan covered set."""
     try:
-        import dynastore.extensions.stac  # noqa: F401 — triggers preset registration
+        presets_module = importlib.import_module(
+            "dynastore.extensions.stac.presets"
+        )
     except ImportError:
         pytest.skip("STAC extension not installed in this environment")
 
     from dynastore.modules.storage.presets.policy_contributor_adapter import (
         PolicyContributorPreset,
     )
-    from dynastore.modules.storage.presets.registry import list_presets, get_preset
+    from dynastore.modules.storage.presets.registry import find_preset
 
-    covered: set[type] = set()
-    for name in list_presets():
-        try:
-            p = get_preset(name)
-            if isinstance(p, PolicyContributorPreset):
-                covered.add(p.contributor_class)
-        except Exception:
-            pass
+    preset = find_preset("stac_enable")
+    assert isinstance(preset, PolicyContributorPreset), (
+        "stac_enable must be registered as a PolicyContributorPreset"
+    )
+    assert preset.contributor_class is presets_module._STACPolicyContributor
 
-    from dynastore.extensions.stac.stac_service import STACService
-
-    assert STACService in covered, (
-        "STACService should be in the covered set after stac extension import"
+    covered = _covered_contributor_classes()
+    assert preset.contributor_class in covered, (
+        "stac_enable contributor class should be in the covered set after import"
     )
 
 
 def test_admin_contributor_covered_after_extension_import():
-    """Importing the admin extension registers admin_enable; AdminService is covered."""
+    """Importing the admin preset module registers ``admin_enable``; the wrapper
+    contributor class it carries lands in the lifespan covered set."""
     try:
-        import dynastore.extensions.admin  # noqa: F401
+        presets_module = importlib.import_module(
+            "dynastore.extensions.admin.presets"
+        )
     except ImportError:
         pytest.skip("Admin extension not installed")
 
     from dynastore.modules.storage.presets.policy_contributor_adapter import (
         PolicyContributorPreset,
     )
-    from dynastore.modules.storage.presets.registry import list_presets, get_preset
+    from dynastore.modules.storage.presets.registry import find_preset
 
-    covered: set[type] = set()
-    for name in list_presets():
-        try:
-            p = get_preset(name)
-            if isinstance(p, PolicyContributorPreset):
-                covered.add(p.contributor_class)
-        except Exception:
-            pass
+    preset = find_preset("admin_enable")
+    assert isinstance(preset, PolicyContributorPreset), (
+        "admin_enable must be registered as a PolicyContributorPreset"
+    )
+    assert preset.contributor_class is presets_module._AdminPolicyContributor
 
-    from dynastore.extensions.admin.admin_service import AdminService
-
-    assert AdminService in covered
+    covered = _covered_contributor_classes()
+    assert preset.contributor_class in covered, (
+        "admin_enable contributor class should be in the covered set after import"
+    )

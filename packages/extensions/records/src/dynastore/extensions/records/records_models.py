@@ -157,5 +157,11 @@ class RecordsCatalogCollections(BaseModel):
     numberReturned: Optional[int] = None
 
 
-# Canonical Conformance & LandingPage — single source in ogc_common_models
-from dynastore.extensions.tools.ogc_common_models import Conformance, LandingPage
+# Canonical Conformance & LandingPage — single source in ogc_common_models.
+# Re-exported here (PEP 484 ``as`` form) so importers can use records_models as
+# the records-facing entry point; the alias marks the intentional re-export so
+# F401 does not flag it.
+from dynastore.extensions.tools.ogc_common_models import (
+    Conformance as Conformance,
+    LandingPage as LandingPage,
+)

@@ -8,12 +8,11 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection
 
-from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler, DbResource
+from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler, DbResource
 from dynastore.modules.db_config.exceptions import ResourceNotFoundError
 from dynastore.tools.cache import cached
-from .models import PlatformNotebookCreate, OwnerType
+from .models import PlatformNotebookCreate
 
 logger = logging.getLogger(__name__)
 

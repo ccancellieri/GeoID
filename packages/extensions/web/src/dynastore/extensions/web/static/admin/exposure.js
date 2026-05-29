@@ -39,7 +39,7 @@ import { apiUrl } from "../common/url.js";
   // Load list of catalogs
   async function loadCatalogs() {
     try {
-      const res = await getJSON("/catalogs");
+      const res = await getJSON("/stac/catalogs");
       const sel = $("#catalog-select");
       while (sel.firstChild) sel.removeChild(sel.firstChild);
 

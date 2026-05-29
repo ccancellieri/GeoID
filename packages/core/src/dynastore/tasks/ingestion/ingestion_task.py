@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 # Hard runtime dep — see modules/elasticsearch/module.py for rationale.
 # Forces entry-point load to fail on services without ``geopandas``
@@ -29,7 +29,6 @@ from typing import Any, Optional
 # entry-point layer.
 import geopandas  # noqa: F401
 
-from dynastore.tasks.protocols import TaskProtocol
 from dynastore.modules.processes.protocols import ProcessTaskProtocol
 from dynastore.modules.tasks.models import TaskPayload
 from dynastore.tasks.ingestion.main_ingestion import run_ingestion_task

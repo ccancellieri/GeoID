@@ -84,7 +84,7 @@ async function loadCollections(catalogId) {
     return;
   }
   try {
-    const data = await getJSON(`/catalogs/${encodeURIComponent(catalogId)}/collections`);
+    const data = await getJSON(`/stac/catalogs/${encodeURIComponent(catalogId)}/collections`);
     const cols = data.collections || data || [];
     fillSelect(sel, cols, "— pick a collection —");
     sel.disabled = false;

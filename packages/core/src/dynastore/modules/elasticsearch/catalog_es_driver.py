@@ -237,6 +237,14 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
         context: Optional[Dict[str, Any]] = None,
         db_resource: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
+        from dynastore.modules.storage.routing_config import (
+            get_output_transformers_for_search,
+        )
+        from dynastore.modules.storage.transform_runtime import (
+            restore_transform_chain,
+        )
+        from dynastore.tools.typed_store.base import _to_snake
+
         client = self._get_client()
         if not client:
             return None
@@ -246,9 +254,25 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
             return None
         try:
             resp = await client.get(index=index_name, id=catalog_id)
-            return resp["_source"]
+            doc = resp["_source"]
         except Exception:
             return None
+
+        restore_chain = await get_output_transformers_for_search(
+            catalog_id,
+            entity="catalog",
+            collection_id=None,
+            driver_ref=_to_snake(type(self).__name__),
+        )
+        if restore_chain:
+            doc = await restore_transform_chain(
+                doc,
+                restore_chain,
+                catalog_id=catalog_id,
+                collection_id=None,
+                entity_kind="catalog",
+            )
+        return doc
 
     async def upsert_catalog_metadata(
         self,

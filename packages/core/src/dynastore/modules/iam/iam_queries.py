@@ -19,7 +19,7 @@
 from typing import Any, Dict, Optional
 from uuid import UUID
 
-from dynastore.modules.db_config.query_executor import DDLQuery, DDLBatch, DQLQuery, ResultHandler
+from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler
 from .models import Principal, Role, RefreshToken, IdentityLink
 
 # --- Queries (IAM Tables) ---

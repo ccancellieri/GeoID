@@ -323,6 +323,7 @@ class TestProtocolCompliance:
         mock = MagicMock()
         for method in [
             "get_asset", "list_assets", "create_asset", "update_asset",
+            "patch_asset",
             "finalize_pending_upload",
             "delete_asset", "delete_assets", "search_assets",
             "ensure_asset_cleanup_trigger",

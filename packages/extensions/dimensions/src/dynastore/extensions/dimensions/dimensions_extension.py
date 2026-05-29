@@ -587,7 +587,6 @@ async def materialize_all_dimensions(
     (the task, a notebook, a test) can report per-dimension results.
     """
     from dynastore.models.protocols.catalogs import CatalogsProtocol
-    from dynastore.models.protocols import PropertiesProtocol
     from dynastore.tools.discovery import get_protocol
     from dynastore.tools.protocol_helpers import get_engine
 

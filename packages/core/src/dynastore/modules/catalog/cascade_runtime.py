@@ -46,7 +46,7 @@ from dynastore.modules.catalog.cascade_registry import (
     CascadeCleanupRegistry,
     cascade_cleanup_registry,
 )
-from dynastore.modules.catalog.resource_owner import CleanupMode, ResourceScope, ScopeRef
+from dynastore.modules.catalog.resource_owner import CleanupMode, ScopeRef
 
 if TYPE_CHECKING:
     from dynastore.modules.db_config.query_executor import DbResource

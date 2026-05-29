@@ -32,7 +32,6 @@ import asyncio
 import logging
 from typing import Optional, Tuple
 
-from sqlalchemy.ext.asyncio import AsyncEngine
 
 from dynastore.tools.async_utils import signal_bus, PgListenBridge
 from dynastore.modules.db_config.query_executor import DbResource

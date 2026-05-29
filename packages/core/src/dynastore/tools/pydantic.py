@@ -2,7 +2,7 @@
 import json
 import ast
 import logging
-from typing import Any, Optional, Dict, Callable, Annotated, Union
+from typing import Any, Annotated, Union
 from pydantic.functional_validators import BeforeValidator
 
 def parse_dict(value: str) -> Any:
@@ -27,7 +27,7 @@ def parse_template(value: str) -> Union[str, dict]:
                 raise ValueError("Input must be a dictionary")
             return parsed
         except Exception as e:
-            logging.warning(f"Unable to load template as a json, using plain/text")
+            logging.warning("Unable to load template as JSON (%s), using plain text", e)
         return value
 
 

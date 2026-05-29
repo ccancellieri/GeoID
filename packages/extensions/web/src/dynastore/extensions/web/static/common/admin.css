@@ -1,33 +1,44 @@
 /*
- * Cartographic Atlas — shared admin theme.
+ * Shared admin theme — aligned with the platform dashboard shell.
  *
- * Aesthetic direction: a drafting-table atlas. Ink on warm paper with a
- * single terracotta accent. Fraunces serif for display, IBM Plex Sans for
- * UI, JetBrains Mono for data. Hairline rules, sharp corners, small-caps
- * labels. Subtle contour-line texture. Nothing rounded, nothing neon.
+ * Dark slate surfaces matching the website's dyna-darker/slate palette,
+ * a single blue accent, Inter for UI + display and Fira Code for data.
+ * Hairline rules, sharp corners, small-caps labels, a subtle dark grid.
+ * Kept visually consistent with the dark dashboard that frames these pages.
+ *
+ * The CSS custom-property NAMES below are retained from the previous theme
+ * (--paper, --ink, --terracotta, …) so the ~1k lines of rules that follow
+ * keep working unchanged; only the VALUES are remapped to the dark palette.
  */
 
-@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700&family=IBM+Plex+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
+@import url("../vendor/inter.css");
+@import url("../vendor/fira-code.css");
 
 :root {
-  --paper: #f2ece0;
-  --paper-deep: #e8e0d0;
-  --paper-shadow: #dcd2bf;
-  --ink: #1a1612;
-  --ink-soft: #4a3f36;
-  --ink-dim: #7a6f63;
-  --rule: #b5a992;
-  --rule-hair: #cfc4ad;
+  /* Surfaces: page background → panels → raised, darkest to lightest. */
+  --paper: #020617;        /* page background (dyna-darker) */
+  --paper-deep: #0f172a;   /* plate / panel surface (slate-900) */
+  --paper-shadow: #1e293b; /* raised / hover surface (slate-800) */
+  /* Text: primary → soft → dim. */
+  --ink: #e2e8f0;          /* slate-200 */
+  --ink-soft: #cbd5e1;     /* slate-300 */
+  --ink-dim: #94a3b8;      /* slate-400 */
+  /* Hairlines and rules. */
+  --rule: #334155;         /* slate-700 */
+  --rule-hair: #1e293b;    /* slate-800 */
 
-  --terracotta: #b4472b;
-  --terracotta-deep: #8b341e;
-  --prussian: #1e3a5f;
-  --olive: #5e6b3f;
-  --amber: #c08a2e;
+  /* Accent (formerly terracotta) → the dashboard's blue/cyan. */
+  --terracotta: #3b82f6;       /* blue-500 — primary accent */
+  --terracotta-deep: #2563eb;  /* blue-600 */
+  --prussian: #0ea5e9;         /* cyan-500 — secondary accent */
+  --olive: #10b981;            /* emerald-500 — success */
+  --amber: #f59e0b;            /* amber-500 — warning */
+  --danger: #ef4444;           /* red-500 — danger / deny / error */
+  --danger-deep: #dc2626;      /* red-600 */
 
-  --font-display: "Fraunces", "Georgia", serif;
-  --font-ui: "IBM Plex Sans", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", "SF Mono", monospace;
+  --font-display: "Inter", system-ui, sans-serif;
+  --font-ui: "Inter", system-ui, sans-serif;
+  --font-mono: "Fira Code", "SF Mono", monospace;
 
   --gutter: 24px;
 }
@@ -45,12 +56,13 @@ html, body {
 }
 
 body {
-  /* Subtle contour-line texture, SVG data URI so no extra HTTP hop. */
+  /* Faint blue glow + a subtle dark grid, echoing the dashboard shell. */
   background-image:
-    radial-gradient(1200px 600px at 100% 0%, rgba(180, 71, 43, 0.04), transparent 60%),
-    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><g fill='none' stroke='%23b5a992' stroke-width='0.4' opacity='0.35'><path d='M-10 40 Q 20 20, 50 40 T 130 40'/><path d='M-10 60 Q 20 40, 50 60 T 130 60'/><path d='M-10 80 Q 20 60, 50 80 T 130 80'/></g></svg>");
-  background-repeat: no-repeat, repeat;
-  background-size: auto, 120px 120px;
+    radial-gradient(1200px 600px at 100% 0%, rgba(59, 130, 246, 0.07), transparent 60%),
+    linear-gradient(to right, rgba(30, 41, 59, 0.5) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(30, 41, 59, 0.5) 1px, transparent 1px);
+  background-repeat: no-repeat, repeat, repeat;
+  background-size: auto, 48px 48px, 48px 48px;
 }
 
 main {
@@ -202,7 +214,7 @@ select:focus,
 textarea:focus {
   outline: none;
   border-color: var(--terracotta);
-  box-shadow: 0 0 0 2px rgba(180, 71, 43, 0.12);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
 }
 
 textarea {
@@ -267,13 +279,13 @@ select { cursor: pointer; }
 
 .btn-danger {
   background: transparent;
-  color: var(--terracotta-deep);
+  color: var(--danger);
   border: 1px solid var(--rule);
 }
 .btn-danger:hover:not(:disabled) {
-  background: var(--terracotta);
+  background: var(--danger);
   color: var(--paper);
-  border-color: var(--terracotta);
+  border-color: var(--danger);
 }
 
 .btn-xs {
@@ -323,7 +335,7 @@ th {
 }
 
 tbody tr { transition: background 0.1s; }
-tbody tr:hover td { background: rgba(180, 71, 43, 0.04); }
+tbody tr:hover td { background: rgba(59, 130, 246, 0.04); }
 
 .empty-row td {
   text-align: center;
@@ -375,9 +387,9 @@ td.cell-truncate {
 }
 
 .chip.effect-ALLOW { color: var(--olive); border-color: var(--olive); }
-.chip.effect-DENY { color: var(--terracotta-deep); border-color: var(--terracotta-deep); }
+.chip.effect-DENY { color: var(--danger); border-color: var(--danger); }
 .chip.limit-rate { color: #b8860b; border-color: #d4a017; background: rgba(212, 160, 23, 0.08); }
-.chip.limit-quota { color: var(--terracotta-deep); border-color: var(--terracotta-deep); background: rgba(176, 71, 48, 0.08); }
+.chip.limit-quota { color: var(--danger); border-color: var(--danger); background: rgba(239, 68, 68, 0.10); }
 
 .status {
   font-size: 0.8rem;
@@ -386,7 +398,7 @@ td.cell-truncate {
   font-family: var(--font-mono);
 }
 .status.ok { color: var(--olive); }
-.status.err { color: var(--terracotta-deep); }
+.status.err { color: var(--danger); }
 .status.warn { color: var(--amber); }
 
 .muted { color: var(--ink-dim); }
@@ -523,7 +535,7 @@ td.cell-truncate {
 .dropzone.drag-over {
   border-color: var(--terracotta);
   color: var(--terracotta);
-  background: rgba(180, 71, 43, 0.04);
+  background: rgba(59, 130, 246, 0.04);
 }
 
 /* --- Report (insertion log) ------------------------------------------ */
@@ -541,7 +553,7 @@ td.cell-truncate {
   overflow: auto;
 }
 .report .ok { color: var(--olive); }
-.report .err { color: var(--terracotta-deep); }
+.report .err { color: var(--danger); }
 
 /* --- Schema list / form (Configuration Hub) -------------------------- */
 
@@ -567,12 +579,12 @@ td.cell-truncate {
   transition: all 0.1s;
 }
 .schema-list .schema-item:hover {
-  background: rgba(180, 71, 43, 0.06);
+  background: rgba(59, 130, 246, 0.06);
   color: var(--ink);
 }
 .schema-list .schema-item.selected {
   border-left-color: var(--terracotta);
-  background: rgba(180, 71, 43, 0.08);
+  background: rgba(59, 130, 246, 0.08);
   color: var(--terracotta-deep);
   font-weight: 500;
 }
@@ -607,7 +619,7 @@ td.cell-truncate {
   cursor: pointer;
 }
 .field-pill.override { color: var(--terracotta); border-color: var(--terracotta); }
-.field-pill.delete { color: var(--terracotta-deep); border-color: var(--terracotta-deep); }
+.field-pill.delete { color: var(--danger); border-color: var(--danger); }
 
 /* --- Configuration Hub: provenance + tier stack + tabs (#948) --------- */
 
@@ -681,12 +693,12 @@ td.cell-truncate {
 .ci-stack .ci-unset { color: var(--rule); text-align: center; }
 .ci-stack .ci-set { color: var(--ink-soft); }
 .ci-stack .ci-effective {
-  background: rgba(180, 71, 43, 0.10);
+  background: rgba(59, 130, 246, 0.10);
   color: var(--terracotta-deep);
   font-weight: 500;
 }
-.ci-stack tbody tr:hover td { background: rgba(30, 58, 95, 0.05); }
-.ci-stack tbody tr:hover .ci-effective { background: rgba(180, 71, 43, 0.14); }
+.ci-stack tbody tr:hover td { background: rgba(14, 165, 233, 0.07); }
+.ci-stack tbody tr:hover .ci-effective { background: rgba(59, 130, 246, 0.14); }
 
 /* Wire-tab read knobs. */
 .ci-knobs { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 10px; }
@@ -901,11 +913,11 @@ hr.rule { border: 0; border-top: 1px solid var(--rule-hair); margin: 16px 0; }
   transition: background 0.1s, color 0.1s, border-color 0.1s;
 }
 .schema-list .schema-list-item:hover {
-  background: rgba(180, 71, 43, 0.06);
+  background: rgba(59, 130, 246, 0.06);
   color: var(--ink);
 }
 .schema-list .schema-list-item.selected {
-  background: rgba(180, 71, 43, 0.08);
+  background: rgba(59, 130, 246, 0.08);
   color: var(--terracotta-deep);
   border-left-color: var(--terracotta);
 }
@@ -945,7 +957,7 @@ hr.rule { border: 0; border-top: 1px solid var(--rule-hair); margin: 16px 0; }
   margin-top: 6px;
   font-family: var(--font-ui);
 }
-.hint[data-level="error"] { color: var(--terracotta-deep); }
+.hint[data-level="error"] { color: var(--danger); }
 .hint[data-level="warn"]  { color: var(--amber); }
 .hint[data-level="ok"]    { color: var(--olive); }
 
@@ -1019,7 +1031,7 @@ hr.rule { border: 0; border-top: 1px solid var(--rule-hair); margin: 16px 0; }
  * deny pops visually against allow rows in long lists. */
 tbody tr.row-deny td { background: rgba(196, 78, 50, 0.06); }
 tbody tr.row-deny > td:first-child {
-  border-left: 3px solid var(--terracotta-deep);
+  border-left: 3px solid var(--danger-deep);
   padding-left: 8px;
 }
 
@@ -1054,7 +1066,7 @@ tbody tr.row-winner.row-deny td {
   color: var(--ink-dim);
 }
 .file-list li { padding: 2px 0; }
-.file-list li.file-err { color: var(--terracotta-deep); }
+.file-list li.file-err { color: var(--danger); }
 
 /* --- Provisioning panel (governance) ---------------------------------- */
 
@@ -1067,7 +1079,7 @@ tbody tr.row-winner.row-deny td {
 }
 .kv-table td.kv-value { color: var(--ink-soft); font-family: var(--font-mono); }
 .kv-table td.kv-value code { color: var(--ink-soft); }
-.kv-table .kv-error code { color: var(--terracotta-deep); word-break: break-all; }
+.kv-table .kv-error code { color: var(--danger); word-break: break-all; }
 
 /* Three-way (inherit / on / off) select used by Service Exposure. */
 .threeway-select {

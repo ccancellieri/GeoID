@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Type
+from typing import ClassVar, List, Type
 
 from .base import SourceReaderProtocol
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class ReaderRegistry:
     """Keeps the ordered list of registered :class:`SourceReaderProtocol`s."""
 
-    _registered: List[Type[SourceReaderProtocol]] = []
+    _registered: ClassVar[List[Type[SourceReaderProtocol]]] = []
 
     @classmethod
     def register(cls, reader_cls: Type[SourceReaderProtocol]) -> None:

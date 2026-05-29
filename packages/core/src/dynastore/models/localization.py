@@ -17,7 +17,6 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from enum import Enum
-from datetime import datetime, timezone
 from typing import (
     Any,
     Dict,

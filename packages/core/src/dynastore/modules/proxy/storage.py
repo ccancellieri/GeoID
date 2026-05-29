@@ -18,11 +18,10 @@
 
 import abc
 import datetime
-import os
 from contextlib import asynccontextmanager
 from typing import Optional, List, AsyncGenerator
 
-from dynastore.modules.db_config.query_executor import DbConnection, DbResource
+from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.tools.plugin import ProtocolPlugin
 
 from .models import ShortURL, AnalyticsPage

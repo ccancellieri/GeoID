@@ -149,19 +149,34 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             # iam.applied_presets sentinel prevents re-application on restarts.
             # Sysadmin DELETE of a preset removes the sentinel, re-arming
             # the bootstrap on the next restart.
-            try:
-                db = get_protocol(DatabaseProtocol)
-                engine = db.engine if db else None
-                from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
-                await bootstrap_preset_if_absent(engine, preset_name="default_roles_baseline")
-                await bootstrap_preset_if_absent(engine, preset_name="iam_baseline")
-                await bootstrap_preset_if_absent(engine, preset_name="public_access_baseline")
-            except Exception as exc:
-                logger.error(
-                    "IamModule: cold-boot preset bootstrap failed; /health may 403 "
-                    "until operator applies presets manually: %s",
-                    exc,
-                )
+            # Each preset is bootstrapped in its OWN try/except: they are
+            # independent (default_roles_baseline seeds the role rows;
+            # iam_baseline seeds the platform policy DEFINITIONS + the admin /
+            # unauthenticated role->policy bindings that gate /iam/me,
+            # /auth/userinfo and /web/static/*; public_access_baseline unions
+            # public_access). A failure seeding one MUST NOT abort the others —
+            # otherwise a single flaky cold-boot query leaves the whole platform
+            # deny-by-default (an empty `unauthenticated` role => 403 on every
+            # static asset, so the login UI itself cannot load).
+            db = get_protocol(DatabaseProtocol)
+            engine = db.engine if db else None
+            from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
+            for _preset_name in (
+                "default_roles_baseline",
+                "iam_baseline",
+                "public_access_baseline",
+            ):
+                try:
+                    await bootstrap_preset_if_absent(engine, preset_name=_preset_name)
+                except Exception as exc:
+                    logger.error(
+                        "IamModule: cold-boot bootstrap of preset %r failed; "
+                        "authorization for surfaces gated by this preset may 403 "
+                        "until it is applied manually: %s",
+                        _preset_name,
+                        exc,
+                        exc_info=True,
+                    )
 
             # Register plugins
             register_plugin(self._iam_manager)

@@ -458,6 +458,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                         if sid not in model_fields:
                             if feature.__pydantic_extra__ is not None:
                                 feature.__pydantic_extra__[sid] = data
+
+            # expose_all (#1402): attach the report-style ``stats`` + ``system``
+            # sections as top-level GeoJSON foreign members beside ``properties``.
+            self._apply_expose_all_sections(
+                feature, row_dict, resolved_sidecars, context
+            )
         else:
             logger.warning(
                 "No sidecars configured for col_config; returning minimal "
@@ -465,6 +471,72 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             )
 
         return feature
+
+    @staticmethod
+    def _apply_expose_all_sections(
+        feature: Feature,
+        row: Dict[str, Any],
+        resolved_sidecars: List[Any],
+        context: Optional[FeaturePipelineContext],
+    ) -> None:
+        """Attach the ``stats`` + ``system`` report sections (#1402).
+
+        No-op unless ``ItemsReadPolicy.feature_type.expose_all`` is True. When
+        on, builds two top-level Feature members (GeoJSON foreign members, RFC
+        7946 §6.1) from the read row, mirroring the ingestion report envelope:
+
+        - ``system`` — identity + lifecycle fields (``SYSTEM_FIELD_KEYS``),
+          each present only when the row carries a value.
+        - ``stats``  — every other producible computed value the resolved
+          sidecars can surface from the row (geometry/attribute stats, content
+          hashes, spatial cells).
+
+        ``properties`` is left untouched — it stays user-only and governed by
+        ``expose``. Any recognised stats/system key already attached flat (via
+        the sidecar foreign-member bridge) is folded into its section so it is
+        not emitted twice.
+
+        Note: a section is only as complete as the read SELECT. Columns the
+        query did not fetch (e.g. the STORED GENERATED ``*_hash`` columns absent
+        a hub read-back) simply do not appear — full column inclusion is tracked
+        separately and gated on live verification.
+        """
+        from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
+
+        policy = (
+            context.get("_items_read_policy") if context is not None else None
+        )
+        feature_type = getattr(policy, "feature_type", None)
+        if feature_type is None or not getattr(feature_type, "expose_all", False):
+            return
+
+        system: Dict[str, Any] = {}
+        for key in SYSTEM_FIELD_KEYS:
+            value = row.get(key)
+            if value is not None:
+                system[key] = value
+
+        system_keys = set(SYSTEM_FIELD_KEYS)
+        stats: Dict[str, Any] = {}
+        for sidecar in resolved_sidecars:
+            for name in sidecar.producible_computed_names():
+                if name in system_keys or name in stats:
+                    continue
+                found, value = sidecar.resolve_computed_value(row, name)
+                if found and value is not None:
+                    stats[name] = value
+
+        # Fold any flat foreign members the bridge already attached into their
+        # section so a recognised key is not emitted both flat and grouped.
+        extra = feature.__pydantic_extra__
+        if extra is not None:
+            for key in list(extra.keys()):
+                if key in system_keys:
+                    system.setdefault(key, extra.pop(key))
+                elif key in stats:
+                    extra.pop(key, None)
+            extra["stats"] = stats
+            extra["system"] = system
 
     @staticmethod
     def _resolved_driver_is_es_items(driver: Any) -> bool:

@@ -366,7 +366,9 @@ async def bootstrap_preset_if_absent(
              :params_snapshot, :revoke_descriptor, NOW())
         ON CONFLICT (preset_name, scope_key) DO NOTHING
         """,
-        result_handler=ResultHandler.ONE_OR_NONE,
+        # INSERT … DO NOTHING returns no rows; ONE_OR_NONE's fetchone() would
+        # raise ResourceClosedError. ROWCOUNT is the write-query convention.
+        result_handler=ResultHandler.ROWCOUNT,
     )
 
     _lock_key = lock_key or f"iam_seed:{preset_name}:{scope_key}"

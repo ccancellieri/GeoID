@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional, List, Union, Literal, Annotated
 import html
 from lxml import etree  # type: ignore[import]
 
-from pydantic import BaseModel, Field, model_validator, ConfigDict, AliasChoices
+from pydantic import BaseModel, Field, model_validator, ConfigDict
 from dynastore.models.shared_models import Link
 
 class StyleFormatEnum(str, Enum):
@@ -54,7 +54,7 @@ class SLDContent(BaseModel):
                 etree.fromstring(decoded_sld.encode('utf-8'))
                 data['sld_body'] = decoded_sld # Mutate the dict with the cleaned version
             except etree.XMLSyntaxError as e:
-                raise ValueError(f"Invalid SLD XML: The content is not well-formed. Error: {e}")
+                raise ValueError(f"Invalid SLD XML: The content is not well-formed. Error: {e}") from e
         return data
 
 class MapboxContent(BaseModel):

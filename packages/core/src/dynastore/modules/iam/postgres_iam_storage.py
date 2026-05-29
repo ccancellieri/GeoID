@@ -27,6 +27,7 @@ import time
 
 from dynastore.modules.db_config.exceptions import TableNotFoundError
 from dynastore.modules.db_config.query_executor import (
+    DDLBatch,
     DDLQuery,
     DQLQuery,
     ResultHandler,

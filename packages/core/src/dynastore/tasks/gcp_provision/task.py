@@ -30,7 +30,6 @@ import google.cloud.storage  # noqa: F401
 from pydantic import BaseModel
 from dynastore.tasks.protocols import TaskProtocol
 from dynastore.modules.tasks.models import (
-    RunnerContext,
     TaskPayload,
     PermanentTaskFailure,
 )

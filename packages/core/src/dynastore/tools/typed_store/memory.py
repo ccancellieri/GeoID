@@ -32,7 +32,7 @@ identical across implementations.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 from dynastore.tools.typed_store.base import PersistentModel
 from dynastore.tools.typed_store.migrations import migrate

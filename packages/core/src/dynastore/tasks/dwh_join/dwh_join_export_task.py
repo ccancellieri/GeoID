@@ -1,6 +1,6 @@
 import logging
 import asyncio
-from typing import Any, Optional, List
+from typing import Optional
 
 # Hard runtime dep — see modules/elasticsearch/module.py for rationale.
 # Forces entry-point load to fail on services without ``google-cloud-bigquery``
@@ -21,7 +21,6 @@ from dynastore.tools.async_utils import SyncQueueIterator
 from dynastore.tools.file_io import get_features_as_byte_stream
 from dynastore.modules.gcp.tools.bucket import upload_stream_to_gcs
 from dynastore.modules.tools.features import FeatureStreamConfig, stream_features
-from dynastore.models.shared_models import OutputFormatEnum
 from dynastore.extensions.dwh.dwh import execute_bigquery_async
 from dynastore.modules.concurrency import get_concurrency_backend
 from dynastore.extensions.tools.formatters import format_map

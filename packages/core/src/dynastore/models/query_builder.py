@@ -112,12 +112,12 @@ class FilterOperator(str, Enum):
         """
         try:
             return cls(value.lower())
-        except ValueError:
+        except ValueError as e:
             sql_upper = value.upper()
             for member in cls:
                 if member.to_sql().upper() == sql_upper:
                     return member
-            raise ValueError(f"Unknown FilterOperator: {value!r}")
+            raise ValueError(f"Unknown FilterOperator: {value!r}") from e
 
 
 # Module-level mapping — kept outside the enum body to avoid Python treating

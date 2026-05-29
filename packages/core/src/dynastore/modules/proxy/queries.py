@@ -17,7 +17,6 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler, DDLQuery
-import os
 
 from .models import ShortURL
 

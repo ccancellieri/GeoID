@@ -27,13 +27,11 @@ This module provides the FeatureAttributeSidecar which manages:
 import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union, cast
-from enum import Enum
-from pydantic import Field, BaseModel
 from geojson_pydantic import Feature
 from dynastore.models.query_builder import QueryRequest
 from sqlalchemy import text
-from dynastore.modules.db_config.query_executor import DbResource, DDLQuery, DQLQuery, ResultHandler
-from dynastore.models.protocols import ConfigsProtocol, AssetsProtocol
+from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.models.protocols import AssetsProtocol
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config.tools import map_pg_to_json_type
 from dynastore.models.field_types import CANONICAL_TO_PG_DDL
@@ -41,7 +39,6 @@ from dynastore.modules.storage.field_constraints import pg_native_to_canonical
 from dynastore.tools.json import CustomJSONEncoder
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarProtocol,
-    SidecarConfig,
     FeaturePipelineContext,
     FieldDefinition,
     FieldCapability,
@@ -52,15 +49,10 @@ from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
     AttributeStorageMode,
     PostgresType,
     AttributeIndexType,
-    AttributeSchemaEntry,
 )
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
     StatisticStorageMode,
-)
-from dynastore.modules.db_config.locking_tools import (
-    acquire_lock_if_needed,
-    check_trigger_exists,
 )
 
 logger = logging.getLogger(__name__)

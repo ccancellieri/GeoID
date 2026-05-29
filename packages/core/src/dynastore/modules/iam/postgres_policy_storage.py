@@ -19,11 +19,10 @@
 # File: dynastore/modules/iam/postgres_policy_storage.py
 
 from typing import Any, Dict, Optional, List
-from uuid import UUID
 import json
 
 from dynastore.modules.db_config import maintenance_tools
-from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler, DbResource, managed_transaction, DbConnection
+from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler, DbResource, managed_transaction
 from dynastore.modules import get_protocol
 from dynastore.models.protocols import DatabaseProtocol
 

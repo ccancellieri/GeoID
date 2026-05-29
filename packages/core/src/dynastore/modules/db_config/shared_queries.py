@@ -26,9 +26,7 @@ from dynastore.modules.db_config.query_executor import (
     GeoDQLQuery,
     ResultHandler,
     DbResource,
-    managed_transaction,
 )
-from sqlalchemy import Table, MetaData, text
 from dateutil.parser import isoparse
 
 logger = logging.getLogger(__name__)

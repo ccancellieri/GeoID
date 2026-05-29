@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from pydantic import BaseModel, Field, model_validator, field_validator, AliasChoices, ConfigDict
+from pydantic import BaseModel, Field, model_validator, field_validator
 from typing import Optional, Annotated
 from datetime import datetime
 from enum import Enum
@@ -69,7 +69,7 @@ class CRSDefinition(BaseModel):
             
             return v
         except CRSError as e:
-            raise ValueError(f"Invalid CRS definition: {str(e)}")
+            raise ValueError(f"Invalid CRS definition: {str(e)}") from e
 
     @model_validator(mode='after')
     def extract_metadata_from_crs(self) -> 'CRSDefinition':

@@ -19,7 +19,7 @@
 # dynastore/modules/ingestion/reporters.py
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
+from typing import Any, Dict, Generic, List, Optional, TypeVar
 from pydantic import BaseModel
 from sqlalchemy.engine import Engine
 

@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import TYPE_CHECKING, Protocol, TypeVar, Generic, runtime_checkable, Optional, List
+from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable, Optional, List
 from dynastore.tasks.protocols import TaskProtocol
 
 if TYPE_CHECKING:

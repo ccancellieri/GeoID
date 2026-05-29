@@ -16,7 +16,6 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 import json
-import orjson
 import uuid
 from datetime import date, datetime
 from decimal import Decimal

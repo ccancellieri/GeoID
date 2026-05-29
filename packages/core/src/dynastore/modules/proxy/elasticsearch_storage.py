@@ -15,7 +15,7 @@ The driver uses the shared async client from
 import asyncio
 import logging
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .models import AnalyticsPage, URLAnalytics

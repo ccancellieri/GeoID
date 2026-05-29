@@ -255,7 +255,7 @@ async function populateCollections(catalogId) {
   sel.disabled = false;
 
   try {
-    const payload = await getJSON(`/catalogs/${encodeURIComponent(catalogId)}/collections`);
+    const payload = await getJSON(`/stac/catalogs/${encodeURIComponent(catalogId)}/collections`);
     const items = Array.isArray(payload)
       ? payload
       : (payload.collections || payload.items || []);

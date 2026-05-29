@@ -1,12 +1,7 @@
 import logging
-import asyncio
 from dynastore.modules.db_config.query_executor import (
     DbResource,
     DDLQuery,
-)
-from dynastore.modules.db_config.locking_tools import (
-    acquire_lock_if_needed,
-    check_function_exists,
 )
 
 logger = logging.getLogger(__name__)

@@ -16,8 +16,8 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import Optional, Dict, Any, Union, List
-from dynastore.models.localization import LocalizedDTO, LocalizedText, LocalizedKeywords, Language, LocalizedLicense
+from typing import Optional, Dict, Union, List
+from dynastore.models.localization import LocalizedText, LocalizedKeywords
 
 
 def resolve_localized_field(

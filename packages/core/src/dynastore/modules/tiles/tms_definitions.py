@@ -74,7 +74,9 @@ def _generate_quad_matrices(
 def _get_crs_urn(srid: int) -> str:
     """Helper to format OGC CRS URNs using pyproj."""
     try:
-        crs = CRS.from_epsg(srid)
+        # Validates that the SRID is a known EPSG code; falls back to the
+        # urn: form below if pyproj cannot resolve it.
+        CRS.from_epsg(srid)
         return f"http://www.opengis.net/def/crs/EPSG/0/{srid}"
     except Exception:
         return f"urn:ogc:def:crs:EPSG::{srid}"

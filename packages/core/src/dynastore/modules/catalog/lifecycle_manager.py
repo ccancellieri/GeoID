@@ -505,7 +505,6 @@ class LifecycleRegistry:
         (non-fatal). Raises if the outer transaction itself is already
         aborted (fatal).
         """
-        from dynastore.modules.db_config.query_executor import is_async_resource
         from sqlalchemy.ext.asyncio import AsyncConnection
 
         # Only use begin_nested on async connections that support it

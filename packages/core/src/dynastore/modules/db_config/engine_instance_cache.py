@@ -52,11 +52,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 
 from dynastore.modules.db_config.engine_config import (
     EngineConfig,
-    EngineLifecycleConfig,
 )
 
 logger = logging.getLogger(__name__)

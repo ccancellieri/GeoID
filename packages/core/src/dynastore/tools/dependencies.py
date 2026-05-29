@@ -19,9 +19,8 @@
 import importlib.metadata
 import logging
 import os
-from typing import List, Optional, Set
+from typing import Optional, Set
 from packaging.requirements import Requirement
-from packaging.version import parse as parse_version
 
 logger = logging.getLogger(__name__)
 

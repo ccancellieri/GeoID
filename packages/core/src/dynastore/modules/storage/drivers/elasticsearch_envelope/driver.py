@@ -360,6 +360,13 @@ class ItemsElasticsearchEnvelopeDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        from dynastore.modules.storage.routing_config import (
+            get_output_transformers_for_search,
+        )
+        from dynastore.modules.storage.transform_runtime import (
+            restore_transform_chain,
+        )
+        from dynastore.tools.typed_store.base import _to_snake
 
         index_name = self._items_index_name(catalog_id)
         es = self._get_client()
@@ -367,14 +374,31 @@ class ItemsElasticsearchEnvelopeDriver(
         if not await es.indices.exists(index=index_name):
             return
 
+        # Resolve the output-transformer chain once per query (empty → no-op).
+        restore_chain = await get_output_transformers_for_search(
+            catalog_id,
+            entity="item",
+            collection_id=collection_id,
+            driver_ref=_to_snake(type(self).__name__),
+        )
+
         # --- by-id lookup (geoid token retrieval) -------------------------
         if entity_ids:
             for geoid in entity_ids:
                 try:
                     resp = await es.get(index=index_name, id=geoid)
-                    yield self._envelope_source_to_feature(
+                    feature = self._envelope_source_to_feature(
                         resp["_source"], catalog_id, collection_id, geoid,
                     )
+                    if restore_chain:
+                        feature = await restore_transform_chain(
+                            feature,
+                            restore_chain,
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                            entity_kind="item",
+                        )
+                    yield feature
                 except Exception:
                     pass
             return
@@ -402,9 +426,18 @@ class ItemsElasticsearchEnvelopeDriver(
         for hit in resp.get("hits", {}).get("hits", []):
             try:
                 src = hit["_source"]
-                yield self._envelope_source_to_feature(
+                feature = self._envelope_source_to_feature(
                     src, catalog_id, collection_id, src.get("geoid"),
                 )
+                if restore_chain:
+                    feature = await restore_transform_chain(
+                        feature,
+                        restore_chain,
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        entity_kind="item",
+                    )
+                yield feature
             except Exception:
                 pass
 

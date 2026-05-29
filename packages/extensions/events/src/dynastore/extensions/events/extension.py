@@ -5,7 +5,7 @@ from typing import Optional, Any
 import logging
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.models.protocols import DatabaseProtocol, EventDriverProtocol
-from fastapi import APIRouter, Query, HTTPException, Depends
+from fastapi import APIRouter, Query, HTTPException
 
 
 logger = logging.getLogger(__name__)
@@ -160,7 +160,6 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
 
     async def create_subscription(self, body: Any):
         """Create or update a platform-scoped webhook subscription."""
-        from dynastore.modules.events.models import EventSubscriptionCreate
         driver = self._get_driver()
         return await driver.subscribe(body)
 

@@ -18,7 +18,7 @@ def test_private_catalog_preset_registered():
 
 
 def test_private_catalog_bundle_shape():
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     assert isinstance(bundle.catalog_routing, CatalogRoutingConfig)
     assert isinstance(bundle.collection_template, CollectionRoutingConfig)
     assert isinstance(bundle.items_template, ItemsRoutingConfig)
@@ -28,7 +28,7 @@ def test_private_catalog_bundle_shape():
 
 def test_private_catalog_catalog_routing_is_pg_only():
     """Catalog envelopes are PG-only for private catalogs — no ES private index."""
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     cat_refs = [
         e.driver_ref
         for entries in bundle.catalog_routing.operations.values()
@@ -41,7 +41,7 @@ def test_private_catalog_catalog_routing_is_pg_only():
 
 def test_private_catalog_collection_routing_is_pg_only():
     """Collection envelopes are PG-only for private catalogs — no ES private index."""
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     coll_refs = [
         e.driver_ref
         for entries in bundle.collection_template.operations.values()
@@ -54,7 +54,7 @@ def test_private_catalog_collection_routing_is_pg_only():
 
 def test_private_catalog_items_pins_private_driver():
     """Items tier pins the private ES driver."""
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     assert _items_routing_has_private_driver(bundle.items_template)
     items_refs = [
         e.driver_ref
@@ -68,7 +68,7 @@ def test_private_catalog_items_pins_private_driver():
 def test_private_catalog_asset_routing_is_pg_only():
     """Assets are PG-only for private catalogs — they must NOT inherit the
     public asset ES driver and leak into public search (Part B)."""
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     asset_refs = [
         e.driver_ref
         for entries in bundle.asset_template.operations.values()
@@ -84,7 +84,7 @@ def test_private_catalog_asset_routing_has_write_and_read():
     left to validation-time auto-augmentation (not forced to an ES driver)."""
     from dynastore.modules.storage.routing_config import Operation
 
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     ops = bundle.asset_template.operations
     assert Operation.WRITE in ops
     assert Operation.READ in ops
@@ -130,7 +130,7 @@ def _patch_es_drivers_discoverable(monkeypatch):
 
 def test_private_catalog_catalog_routing_pg_only_under_es_pollution(monkeypatch):
     _patch_es_drivers_discoverable(monkeypatch)
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     cat_refs = [
         e.driver_ref
         for entries in bundle.catalog_routing.operations.values()
@@ -143,7 +143,7 @@ def test_private_catalog_catalog_routing_pg_only_under_es_pollution(monkeypatch)
 
 def test_private_catalog_collection_routing_pg_only_under_es_pollution(monkeypatch):
     _patch_es_drivers_discoverable(monkeypatch)
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     coll_refs = [
         e.driver_ref
         for entries in bundle.collection_template.operations.values()
@@ -189,7 +189,7 @@ def test_private_catalog_items_search_pg_and_private_only_under_es_pollution(mon
     _patch_items_es_driver_discoverable(monkeypatch)
     from dynastore.modules.storage.routing_config import Operation
 
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     search_refs = [
         e.driver_ref
         for e in bundle.items_template.operations.get(Operation.SEARCH, [])
@@ -205,7 +205,7 @@ def test_private_catalog_items_search_pg_and_private_only_under_es_pollution(mon
 
 def test_private_catalog_items_no_public_es_in_any_operation_under_pollution(monkeypatch):
     _patch_items_es_driver_discoverable(monkeypatch)
-    bundle = get_preset("private_catalog").build("cat-priv")
+    bundle = get_preset("private_catalog").build(catalog_id="cat-priv")
     all_refs = [
         e.driver_ref
         for entries in bundle.items_template.operations.values()

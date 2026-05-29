@@ -35,7 +35,7 @@
       <div class="plate">
         <div class="plate-header">
           <h3>Charter a catalog</h3>
-          <div class="plate-meta">POST /catalogs</div>
+          <div class="plate-meta">POST /stac/catalogs</div>
         </div>
         <p class="muted plate-note">
           <em>Sysadmin only.</em> Creates a new tenant schema with its own
@@ -79,7 +79,7 @@
       <div class="plate">
         <div class="plate-header">
           <h3>Extant catalogs</h3>
-          <div class="plate-meta">GET /catalogs</div>
+          <div class="plate-meta">GET /stac/catalogs</div>
         </div>
         <table id="catalogs-table">
           <thead><tr><th>ID</th><th>Title</th><th>License</th></tr></thead>
@@ -93,7 +93,7 @@
       <div class="plate">
         <div class="plate-header">
           <h3>Commission a collection</h3>
-          <div class="plate-meta">POST /catalogs/{id}/collections</div>
+          <div class="plate-meta">POST /stac/catalogs/{id}/collections</div>
         </div>
         <form id="collection-create">
           <div class="form-row">

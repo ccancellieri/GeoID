@@ -37,7 +37,6 @@ Usage::
 """
 
 from functools import wraps
-from typing import Optional
 
 from .query_executor import managed_transaction
 

@@ -28,7 +28,7 @@ from dynastore.tools.discovery import get_protocol
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response, JSONResponse
-from dynastore.modules.iam.conditions import condition_manager, EvaluationContext
+from dynastore.modules.iam.conditions import EvaluationContext
 from dynastore.models.protocols.stats import StatsProtocol
 from dynastore.models.protocols.policies import PermissionProtocol
 from dynastore.models.protocols.authentication import AuthenticatorProtocol
