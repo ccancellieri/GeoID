@@ -10,9 +10,7 @@
 Typed per-call context for driver / protocol operations.
 
 Replaces the weakly-typed `db_resource: Optional[Any]` and `processing_context:
-Optional[Dict[str, Any]]` pair that currently thread through ~467 call sites.
-
-See Part F of plan `lovely-twirling-pebble.md` for migration strategy.
+Optional[Dict[str, Any]]` pair that currently threads through call sites.
 """
 
 from typing import Any, Dict, Literal, Optional
