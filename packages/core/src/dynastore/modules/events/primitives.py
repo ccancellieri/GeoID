@@ -13,7 +13,7 @@
 #    limitations under the License.
 
 import logging
-from typing import Dict
+from typing import ClassVar, Dict
 
 from dynastore.models.shared_models import EventType
 
@@ -30,7 +30,7 @@ class EventScope:
 class EventRegistry:
     """Central registry for dynamic event definitions."""
 
-    _events: Dict[str, str] = {}
+    _events: ClassVar[Dict[str, str]] = {}
 
     @classmethod
     def register(cls, name: str, scope: str):

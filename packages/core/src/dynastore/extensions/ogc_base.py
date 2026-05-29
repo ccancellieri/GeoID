@@ -34,7 +34,7 @@ Usage::
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, Type, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, List, Optional, Type, TypeVar, cast
 
 from fastapi import HTTPException, Request, Response, status
 
@@ -99,7 +99,7 @@ class OGCServiceMixin:
     """
 
     # --- Class attributes to be set by subclasses ---
-    conformance_uris: List[str] = []
+    conformance_uris: ClassVar[List[str]] = []
     prefix: str = ""
     protocol_title: str = ""
     protocol_description: str = ""

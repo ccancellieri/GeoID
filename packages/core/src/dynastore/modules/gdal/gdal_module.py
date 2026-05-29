@@ -18,7 +18,7 @@
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Set
+from typing import AsyncGenerator, ClassVar, Set
 from dynastore.modules import ModuleProtocol
 from .service import GDAL_AVAILABLE, STATIC_RASTER_MIME_TYPES, STATIC_VECTOR_MIME_TYPES, FileType
 
@@ -38,10 +38,10 @@ class GdalModule(ModuleProtocol):
     explicit and consistent with the ProtocolPlugin model.
     """
 
-    RASTER_EXTENSIONS: Set[str] = set()
-    VECTOR_EXTENSIONS: Set[str] = set()
-    RASTER_MIME_TYPES: Set[str] = set()
-    VECTOR_MIME_TYPES: Set[str] = set()
+    RASTER_EXTENSIONS: ClassVar[Set[str]] = set()
+    VECTOR_EXTENSIONS: ClassVar[Set[str]] = set()
+    RASTER_MIME_TYPES: ClassVar[Set[str]] = set()
+    VECTOR_MIME_TYPES: ClassVar[Set[str]] = set()
 
     @classmethod
     def _build_format_maps(cls):

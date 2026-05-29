@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Type, TypeVar
 
 if TYPE_CHECKING:
     from dynastore.tools.typed_store.base import PersistentModel
@@ -58,7 +58,7 @@ class TypedModelRegistry:
     time — the failure is loud and deterministic.
     """
 
-    _by_key: Dict[str, Type["PersistentModel"]] = {}
+    _by_key: ClassVar[Dict[str, Type["PersistentModel"]]] = {}
 
     @classmethod
     def register(cls, model: Type["PersistentModel"]) -> None:
