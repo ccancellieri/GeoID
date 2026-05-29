@@ -327,10 +327,18 @@ def task_to_status_info(task: "Task", links: Optional[List[Link]] = None) -> Sta
     }
     api_status = mapping.get(task.status, "accepted")
 
+    # ``message`` carries the failure reason for failed jobs; for successful
+    # jobs a task may return a human-facing message (e.g. a signed result URL)
+    # in its ``outputs`` StatusInfo, which the runner persists. Surface that
+    # when there is no error_message, so successful jobs aren't left blank.
+    status_message = task.error_message
+    if status_message is None and isinstance(task.outputs, dict):
+        status_message = task.outputs.get("message")
+
     info = StatusInfo(
         jobID=task.jobID,
         status=api_status,
-        message=task.error_message,
+        message=status_message,
         type=task.type,
         progress=task.progress,
         created=task.timestamp,

@@ -28,15 +28,25 @@ DWH_JOIN_EXPORT_PROCESS_DEFINITION = Process(
     version="1.0.0",
     title="DWH Join Export",
     description=(
-        "Joins catalog features with DWH query results and exports to Cloud Storage."
+        "Joins catalog features with DWH query results and exports the result to "
+        "the catalog's Cloud Storage bucket. The output is returned by reference "
+        "as a time-limited signed URL (the job's message / results document); the "
+        "server owns the storage location."
     ),
     scopes=[ProcessScope.COLLECTION],
     inputs=pydantic_to_process_inputs(DwhJoinExportRequest),
     outputs={
         "result": ProcessOutput.model_validate(
-            {"title": "Result", "schema": {"type": "object"}}
+            {
+                "title": "Result",
+                "description": (
+                    "Time-limited (7-day) signed GET URL to the exported file in "
+                    "Cloud Storage."
+                ),
+                "schema": {"type": "string", "format": "uri"},
+            }
         )
     },
     jobControlOptions=[JobControlOptions.ASYNC_EXECUTE],
-    outputTransmission=[TransmissionMode.VALUE],
+    outputTransmission=[TransmissionMode.REFERENCE],
 )
