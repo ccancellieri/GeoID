@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 from typing import (
+    ClassVar,
     List,
     Optional,
     Any,
@@ -233,8 +234,8 @@ class EventService(EventBusProtocol):
     """
 
     # Shared state for listeners across all instances (Singleton behavior for registration)
-    _sync_listeners: Dict[str, List[Listener]] = defaultdict(list)
-    _async_listeners: Dict[str, List[Listener]] = defaultdict(list)
+    _sync_listeners: ClassVar[Dict[str, List[Listener]]] = defaultdict(list)
+    _async_listeners: ClassVar[Dict[str, List[Listener]]] = defaultdict(list)
 
     def __init__(self):
         self._consumer_running = False

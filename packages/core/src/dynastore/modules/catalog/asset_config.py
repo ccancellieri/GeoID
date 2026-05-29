@@ -25,6 +25,8 @@ operations) is handled by ``AssetRoutingConfig`` in
 ``dynastore.modules.storage.routing_config``.
 """
 
+from pydantic import ConfigDict
+
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from typing import ClassVar, Optional, Tuple
 
@@ -38,7 +40,7 @@ class AssetPluginConfig(PluginConfig):
     _freeze_at: ClassVar[Optional[str]] = "collection"
 
 
-    model_config = {"extra": "allow"}
+    model_config = ConfigDict(extra="allow")
 
 
 AssetPluginConfig.model_rebuild()

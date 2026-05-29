@@ -30,7 +30,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple, Union
+from typing import ClassVar, Dict, Any, List, Optional, Tuple, Union
 from geojson_pydantic import Feature
 from geojson_pydantic.geometries import Geometry
 from dynastore.models.query_builder import QueryRequest
@@ -95,7 +95,7 @@ class GeometriesSidecar(SidecarProtocol):
     # Map of ``ComputedKind`` → SQL column type for COLUMNAR storage. ``CENTROID``
     # is special-cased because it needs the active SRID + 2D/3D selection.
     # ``CENTROID_3D`` always emits GEOMETRY(POINTZ, 4326) regardless of srid.
-    _COLUMNAR_SQL_TYPE: Dict[ComputedKind, str] = {
+    _COLUMNAR_SQL_TYPE: ClassVar[Dict[ComputedKind, str]] = {
         ComputedKind.AREA: "DOUBLE PRECISION",
         ComputedKind.VOLUME: "DOUBLE PRECISION",
         ComputedKind.PERIMETER: "DOUBLE PRECISION",

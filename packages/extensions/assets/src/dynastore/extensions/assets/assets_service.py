@@ -18,7 +18,7 @@
 
 import json
 import logging
-from typing import Dict, Any, Optional, List, Union, cast
+from typing import ClassVar, Dict, Any, Optional, List, Union, cast
 from dynastore.modules import get_protocol
 from dynastore.tools.discovery import get_protocols
 from fastapi import (
@@ -151,7 +151,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     """
 
     # OGCServiceMixin class attributes
-    conformance_uris = list(ASSETS_CONFORMANCE_URIS)
+    conformance_uris: ClassVar[List[str]] = list(ASSETS_CONFORMANCE_URIS)
     prefix = "/assets"
     protocol_title = "DynaStore OGC API - Assets (draft)"
     protocol_description = (

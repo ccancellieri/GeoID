@@ -27,7 +27,7 @@ import json
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, ClassVar, Dict, List, Optional, Protocol, runtime_checkable
 
 from dynastore.modules.iam.conditions import ConditionHandler, EvaluationContext
 
@@ -236,7 +236,7 @@ class GeospatialFilterInspector:
 
     inspector_id = "geospatial"
 
-    _DEFAULT_FILTER_PARAMS = ["filter", "cql_filter"]
+    _DEFAULT_FILTER_PARAMS: ClassVar[List[str]] = ["filter", "cql_filter"]
     _DEFAULT_BBOX_PARAM = "bbox"
 
     def can_inspect(self, ctx: EvaluationContext, config: Dict[str, Any]) -> bool:

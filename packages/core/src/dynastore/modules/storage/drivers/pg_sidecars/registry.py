@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Any, Dict, List, Mapping, Optional, Type, Union
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Type, Union
 
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarConfig,
@@ -57,11 +57,11 @@ class SidecarRegistry:
     'attributes', 'geometries') rather than config class type.
     """
 
-    _registry: Dict[str, Type[SidecarProtocol]] = {}
+    _registry: ClassVar[Dict[str, Type[SidecarProtocol]]] = {}
 
     # Catalog-tier domain slices (folded in from the former separate
     # catalog-tier registry). ``sidecar_type`` -> ``CatalogStore`` class.
-    _catalog_registry: Dict[str, Type[Any]] = {}
+    _catalog_registry: ClassVar[Dict[str, Type[Any]]] = {}
     _catalog_defaults_loaded: bool = False
 
     @classmethod

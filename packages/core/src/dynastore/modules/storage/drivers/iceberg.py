@@ -303,7 +303,7 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
     })
 
     # Thread-safe catalog cache: loc_key → catalog instance, protected by a per-loop lock.
-    _catalog_cache: Dict[str, Any] = {}
+    _catalog_cache: ClassVar[Dict[str, Any]] = {}
     _catalog_lock: ClassVar[LoopLocalLock] = LoopLocalLock()
 
     def is_available(self) -> bool:

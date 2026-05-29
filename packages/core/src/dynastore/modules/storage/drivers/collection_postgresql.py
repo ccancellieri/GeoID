@@ -157,7 +157,7 @@ class CollectionPgSidecarRegistry:
     without the stac extra installed.
     """
 
-    _registry: Dict[str, Type[CollectionStore]] = {}
+    _registry: ClassVar[Dict[str, Type[CollectionStore]]] = {}
     _defaults_loaded: bool = False
 
     @classmethod

@@ -25,7 +25,7 @@ Provides enhanced configuration for attribute storage, including storage modes
 
 from typing import List, Optional, Dict, Any, Union, Literal
 from enum import Enum
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, SidecarConfigRegistry
 from dynastore.modules.storage.computed_fields import ComputedField
 from dynastore.models.field_types import CANONICAL_TO_PG_DDL, canonical_data_type
@@ -481,7 +481,7 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
         """
         return self.external_id_field
 
-    model_config = {"extra": "allow"}
+    model_config = ConfigDict(extra="allow")
 
 # Register for polymorphic resolution
 SidecarConfigRegistry.register("attributes", FeatureAttributeSidecarConfig)

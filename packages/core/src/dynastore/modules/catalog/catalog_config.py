@@ -19,6 +19,7 @@
 from enum import Enum
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     model_validator,
 )
@@ -109,7 +110,7 @@ class CollectionPluginConfig(PluginConfig):
     _freeze_at: ClassVar[Optional[str]] = "collection"
 
 
-    model_config = {"extra": "allow"}
+    model_config = ConfigDict(extra="allow")
 
     max_bulk_features: Mutable[int] = Field(
         default=10000,

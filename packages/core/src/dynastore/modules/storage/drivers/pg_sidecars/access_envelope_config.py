@@ -37,6 +37,8 @@ This sidecar is **opt-in only** — ``is_mandatory()`` returns ``False``.
 
 from typing import List, Literal
 
+from pydantic import Field
+
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarConfig,
     SidecarConfigRegistry,
@@ -100,7 +102,7 @@ class AccessEnvelopeSidecarConfig(SidecarConfig):
     read filter's equality/range predicates without promoting attrs to real
     columns. No-op unless ``known_attrs_keys`` is also non-empty."""
 
-    known_attrs_keys: List[str] = []
+    known_attrs_keys: List[str] = Field(default_factory=list)
     """Attribute keys to index when ``btree_attrs_index`` is True. Each becomes a
     btree expression index matching the read filter's ``->'attrs'->>'<key>'``
     access pattern. Keys must be ``[A-Za-z0-9_]`` identifiers; others are skipped

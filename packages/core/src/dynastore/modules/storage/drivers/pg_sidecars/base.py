@@ -28,6 +28,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import (
     Annotated,
+    ClassVar,
     Dict,
     Any,
     Optional,
@@ -312,7 +313,7 @@ class SidecarConfigRegistry:
     Registry for SidecarConfig subclasses to support polymorphic deserialization.
     """
 
-    _registry: Dict[str, Type["SidecarConfig"]] = {}
+    _registry: ClassVar[Dict[str, Type["SidecarConfig"]]] = {}
     _defaults_loaded: bool = False
 
     @classmethod

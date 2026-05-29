@@ -20,7 +20,7 @@ import logging
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Optional, AsyncIterator, Dict, Any, List, Tuple, Union
+from typing import TYPE_CHECKING, ClassVar, Optional, AsyncIterator, Dict, Any, List, Tuple, Union
 
 if TYPE_CHECKING:
     from google.api_core import exceptions as google_exceptions
@@ -155,7 +155,7 @@ class GCPModule(
     _config_service: Optional[ConfigsProtocol] = None
     _module_config: Optional[GcpModuleConfig] = None
     # In-memory upload ticket store: ticket_id → {asset_id, catalog_id, collection_id, expires_at}
-    _upload_tickets: Dict[str, Dict[str, Any]] = {}
+    _upload_tickets: ClassVar[Dict[str, Dict[str, Any]]] = {}
 
     priority: int = 30  # Priority for protocol implementation (lower means higher priority)
 
