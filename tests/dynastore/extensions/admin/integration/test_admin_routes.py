@@ -377,6 +377,18 @@ async def test_grant_and_revoke_catalog_role_round_trip(
     catalog_id = setup_catalogs[0]
     pid = created_principal.principal_id
 
+    # `editor` is no longer a default seed role (default catalog roles were
+    # trimmed to admin + unauthenticated). Catalog owners create custom roles
+    # via the roles API before granting them, so the grant can validate the
+    # role is registered for the catalog. Accept 201 (created) or 409 (left
+    # over from a prior run) so the test stays re-runnable.
+    r = await sysadmin_in_process_client.post(
+        "/admin/roles",
+        params={"catalog_id": catalog_id},
+        json={"name": "editor", "description": "Editor", "permissions": []},
+    )
+    assert r.status_code in (201, 409), f"Role create failed: {r.status_code} {r.text}"
+
     # Grant
     r = await sysadmin_in_process_client.post(
         f"/admin/catalogs/{catalog_id}/principals/{pid}/roles",
