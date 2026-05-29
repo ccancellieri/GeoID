@@ -18,9 +18,22 @@
 
 import logging
 import os
+from typing import Any, Mapping, Optional
+
 import dynastore.tools.class_tools as class_tools
+from dynastore.modules.db_config.instance import load_db_config
 
 logger = logging.getLogger(__name__)
+
+# DB connection / pool tunables resolve in the order:
+#   valid env var → db_config.json → code default
+# The file (loaded once at import) is the leak-proof deployment surface: a JSON
+# *value* is never shell-substituted, so a missing key can never arrive as a
+# literal ``${...}`` placeholder the way a templated env var can (#1581). An
+# explicitly-set, valid env var still wins (dev / compose / deliberate
+# override); the file fills the gap a deploy would otherwise template; the code
+# default is the last resort. See ``instance.load_db_config``.
+_FILE_VALUES: Mapping[str, Any] = load_db_config()
 
 # Smallest pool floor we consider safe under concurrent load. The review-env
 # outage (dynastore #320) ran with ``DB_POOL_MIN_SIZE=2``: with only two base
@@ -37,8 +50,16 @@ SAFE_POOL_MIN_FLOOR: int = 5
 SAFE_POOL_TOTAL_FLOOR: int = 5
 
 
-def _env_int(name: str, default: int) -> int:
-    """Read an int from env var ``name``, tolerating mis-templated values.
+def _looks_unsubstituted(value: str) -> bool:
+    """A value still carrying a ``${...}`` fragment is an unsubstituted deploy
+    placeholder (#1581), not a real config value — never usable."""
+    return "${" in value
+
+
+def _cfg_int(
+    name: str, default: int, *, file_values: Optional[Mapping[str, Any]] = None
+) -> int:
+    """Resolve an int tunable: valid env var → ``db_config.json`` → default.
 
     The failure mode behind #1581: a deploy templates the var through (e.g.
     ``iac.yml``) but leaves it undefined, so the container receives the literal
@@ -46,36 +67,85 @@ def _env_int(name: str, default: int) -> int:
     ``int(os.getenv(name, "1800"))`` only uses the default when the var is
     *unset* — a non-numeric literal makes ``int()`` raise ``ValueError`` at
     import, the gunicorn worker dies, and the Cloud Run startup probe fails the
-    whole revision rollout. Treating any empty / non-numeric value as the
-    default (with a WARN) makes a mis-templated env impossible to crash on.
+    whole revision rollout.
+
+    Each source is tried in order; an empty value is skipped silently (the
+    default is intended), a non-numeric value is skipped with a WARN (so a
+    mis-templated ``${...}`` can never crash startup and the operator sees it),
+    and the next source is consulted. ``file_values`` defaults to the
+    file loaded at import; tests pass an explicit mapping.
     """
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw.strip())
-    except (ValueError, TypeError):
+    fv = _FILE_VALUES if file_values is None else file_values
+    rejected = False
+    for source, raw in (("env", os.getenv(name)), ("db_config.json", fv.get(name))):
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text == "":
+            continue
+        try:
+            return int(text)
+        except (ValueError, TypeError):
+            rejected = True
+            logger.warning(
+                "%s=%r from %s is not a valid integer (commonly an "
+                "unsubstituted ${...} placeholder); ignoring this source.",
+                name, raw, source,
+            )
+    if rejected:
         logger.warning(
-            "%s=%r is not a valid integer (commonly an unsubstituted ${...} "
-            "placeholder or an empty value from the deploy env); falling back "
-            "to the default %d. Set %s to a numeric value to silence this.",
-            name,
-            raw,
-            default,
-            name,
+            "%s: no usable value found; falling back to the default %d.",
+            name, default,
         )
-        return default
+    return default
+
+
+def _cfg_str(
+    name: str, default: str, *, file_values: Optional[Mapping[str, Any]] = None
+) -> str:
+    """Resolve a string tunable: valid env var → ``db_config.json`` → default.
+
+    The string analogue of :func:`_cfg_int`. ``int()`` already rejects a
+    ``${...}`` placeholder; for free-form strings (``DATABASE_URL``,
+    ``DB_LOCK_TIMEOUT``, …) an unsubstituted placeholder is a *valid* string
+    that would silently mis-configure the connection (a broken DSN, a bad PG
+    ``server_settings`` value), so it is detected and skipped explicitly. An
+    empty value is skipped silently; the next source is consulted.
+    """
+    fv = _FILE_VALUES if file_values is None else file_values
+    rejected = False
+    for source, raw in (("env", os.getenv(name)), ("db_config.json", fv.get(name))):
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text == "":
+            continue
+        if _looks_unsubstituted(text):
+            rejected = True
+            logger.warning(
+                "%s=%r from %s looks like an unsubstituted ${...} placeholder; "
+                "ignoring this source.",
+                name, raw, source,
+            )
+            continue
+        return text
+    if rejected:
+        logger.warning(
+            "%s: no usable value found; falling back to the default %r.",
+            name, default,
+        )
+    return default
 
 
 class DBConfig:
-    database_url: str = os.getenv(
+    database_url: str = _cfg_str(
         "DATABASE_URL", "postgresql://testuser:testpassword@db:5432/gis_dev"
     )
-    pool_min_size: int = _env_int("DB_POOL_MIN_SIZE", 5)
-    pool_max_size: int = _env_int("DB_POOL_MAX_SIZE", 100)
-    pool_max_queries: int = _env_int("DB_POOL_MAX_QUERIES", 50000)
-    pool_command_timeout: int = _env_int("DB_POOL_COMMAND_TIMEOUT", 60)
-    connect_timeout: int = _env_int("DB_CONNECT_TIMEOUT", 30)
+    pool_min_size: int = _cfg_int("DB_POOL_MIN_SIZE", 5)
+    pool_max_size: int = _cfg_int("DB_POOL_MAX_SIZE", 100)
+    pool_max_queries: int = _cfg_int("DB_POOL_MAX_QUERIES", 50000)
+    pool_command_timeout: int = _cfg_int("DB_POOL_COMMAND_TIMEOUT", 60)
+    connect_timeout: int = _cfg_int("DB_CONNECT_TIMEOUT", 30)
     # SQLAlchemy retires a pooled connection once it reaches this age (#729).
     # On serverless deployments the VPC-egress path silently drops a TCP
     # connection that has been idle past its window; once dropped, the next
@@ -83,7 +153,7 @@ class DBConfig:
     # Recycling proactively — while the path is still warm — keeps reconnects
     # sub-second. Keep this BELOW the deployment's idle-drop window (set a
     # lower DB_POOL_RECYCLE per-environment where idle periods are common).
-    pool_recycle: int = _env_int("DB_POOL_RECYCLE", 1800)
+    pool_recycle: int = _cfg_int("DB_POOL_RECYCLE", 1800)
     # TCP keepalive tunables (#655). The egress path silently drops the
     # established-connection mapping after an idle window; without keepalive
     # probes the pool hands out a dead-at-the-wire socket whose replacement
@@ -94,9 +164,9 @@ class DBConfig:
     # client socket had to be armed directly. pool_recycle remains a backstop.
     # Keep idle BELOW the deployment's idle-drop window (lower it per-env where
     # idle periods are common) so a probe refreshes the mapping in time.
-    tcp_keepalives_idle: int = _env_int("DB_TCP_KEEPALIVES_IDLE", 300)
-    tcp_keepalives_interval: int = _env_int("DB_TCP_KEEPALIVES_INTERVAL", 30)
-    tcp_keepalives_count: int = _env_int("DB_TCP_KEEPALIVES_COUNT", 5)
+    tcp_keepalives_idle: int = _cfg_int("DB_TCP_KEEPALIVES_IDLE", 300)
+    tcp_keepalives_interval: int = _cfg_int("DB_TCP_KEEPALIVES_INTERVAL", 30)
+    tcp_keepalives_count: int = _cfg_int("DB_TCP_KEEPALIVES_COUNT", 5)
     # TCP_USER_TIMEOUT (ms) — caps how long transmitted data may stay
     # unacknowledged before the kernel tears the connection down (#710).
     # Armed on the client socket alongside SO_KEEPALIVE in db_service. This is
@@ -105,7 +175,7 @@ class DBConfig:
     # dead connection is detected and replaced within this window. Healthy
     # queries are unaffected — every ACK resets the timer. Linux-only; ignored
     # where the socket option is unavailable (e.g. macOS dev).
-    tcp_user_timeout_ms: int = _env_int("DB_TCP_USER_TIMEOUT_MS", 20000)
+    tcp_user_timeout_ms: int = _cfg_int("DB_TCP_USER_TIMEOUT_MS", 20000)
     # Lock-safety GUCs — applied as server_settings on EVERY connection (see
     # db_service). They make it impossible for one statement, or a leaked /
     # interrupted transaction, to freeze the whole application:
@@ -121,8 +191,8 @@ class DBConfig:
     #     never runs ROLLBACK — the exact failure mode that pinned
     #     catalog.catalogs behind an idle-in-transaction reader while an
     #     ALTER waited on it. A DDL therefore can never leave a lock open.
-    lock_timeout: str = os.getenv("DB_LOCK_TIMEOUT", "5s")
-    idle_in_transaction_session_timeout: str = os.getenv(
+    lock_timeout: str = _cfg_str("DB_LOCK_TIMEOUT", "5s")
+    idle_in_transaction_session_timeout: str = _cfg_str(
         "DB_IDLE_IN_TRANSACTION_TIMEOUT", "30s"
     )
 
