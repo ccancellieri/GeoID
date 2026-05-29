@@ -156,7 +156,7 @@ def _db_row_to_ogc_feature(
     # -- 2. Extract id (never serialise None as the string 'None') ------------
     feature_id = item.id if item.id is not None else None
 
-    # -- 3. Convert geometry to ogc_models.GeoJSONGeometry --------------------
+    # -- 3. Convert geometry to a GeoJSONGeometry -----------------------------
     geometry_model = None
     if item.geometry is not None:
         geom_dict = (
@@ -165,7 +165,11 @@ def _db_row_to_ogc_feature(
             else dict(item.geometry)
         )
         from pydantic import TypeAdapter
-        geometry_model = TypeAdapter(ogc_models.GeoJSONGeometry).validate_python(geom_dict)
+        # Imported here (not via ``ogc_models.GeoJSONGeometry``) so an F401 sweep
+        # of ogc_models.py cannot strip a re-export reached only by attribute
+        # access — the exact way #1648 regressed.
+        from dynastore.models.ogc import GeoJSONGeometry
+        geometry_model = TypeAdapter(GeoJSONGeometry).validate_python(geom_dict)
 
     # -- 4. Properties + OGC-specific validity mapping ------------------------
     # Strip GeoJSON/STAC structural members (id, geometry, …) that can ride into

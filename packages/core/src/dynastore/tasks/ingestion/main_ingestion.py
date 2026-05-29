@@ -802,18 +802,18 @@ async def run_ingestion_task(
                 f"({asset.asset_id} → {collection_id}): {ref_err}"
             )
 
-        # Only pass ``summary`` when there's something to carry, so the common
-        # path stays signature-identical to the pre-#1216 call (a custom reporter
-        # that doesn't accept ``summary`` is unaffected unless a schema is
-        # actually proposed).
-        _summary_kw = (
-            {"summary": {"proposed_items_schema": proposed_items_schema}}
+        # ``summary`` carries an optional proposed_items_schema (#1216). Every
+        # reporter's ``task_finished`` accepts ``summary`` (it is on the abstract
+        # base), so pass it explicitly — ``None`` when there's nothing to carry —
+        # rather than a ``**dict`` splat that pyright cannot type-check.
+        summary = (
+            {"proposed_items_schema": proposed_items_schema}
             if proposed_items_schema
-            else {}
+            else None
         )
         await asyncio.gather(
             *(
-                reporter.task_finished("COMPLETED", **_summary_kw)
+                reporter.task_finished("COMPLETED", summary=summary)
                 for reporter in reporters
             )
         )
