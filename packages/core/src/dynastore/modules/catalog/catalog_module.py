@@ -870,7 +870,6 @@ class CatalogModule(ModuleProtocol):
         partition_value: Any,
         ctx: Optional[DriverContext] = None,
     ) -> None:
-        db_resource = ctx.db_resource if ctx else None
         return await self._item_svc.ensure_partition_exists(
             catalog_id, collection_id, config, partition_value, ctx=ctx  # type: ignore[arg-type]
         )
@@ -911,10 +910,11 @@ class CatalogModule(ModuleProtocol):
         """Final physical destruction for catalog (Assets, Schema, Record)."""
         logger.info(f"Finalizing deletion for catalog '{catalog_id}'")
 
-        # Resolve dependencies via protocols
-        assets = get_protocol(AssetsProtocol)
+        # Resolve dependencies via protocols. Asset rows and per-catalog
+        # configs are torn down by ``DROP SCHEMA ... CASCADE`` below (or by the
+        # emitting CatalogService when it passes ``physical_schema``), so only
+        # the catalog resolver and the DB handle are needed here.
         catalogs = get_protocol(CatalogsProtocol)
-        configs = get_protocol(ConfigsProtocol)
         db = get_protocol(DatabaseProtocol)
 
         db_resource = kwargs.get("db_resource")

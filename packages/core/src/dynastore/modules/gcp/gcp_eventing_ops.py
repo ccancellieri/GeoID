@@ -154,7 +154,7 @@ class GcpEventingOpsMixin:
                     f"Setting up or updating managed eventing for catalog '{catalog_id}'."
                 )
                 # This call is already idempotent and manages Topic, Notification, and Subscription
-                updated_managed_config = await self.setup_managed_eventing_channel(
+                await self.setup_managed_eventing_channel(
                     catalog_id, config.managed_eventing, conn=conn
                 )
                 # We don't save back here to avoid infinite loops, the caller (ConfigManager) just saved the config.

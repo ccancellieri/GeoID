@@ -37,7 +37,6 @@ from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.tools.discovery import get_protocol
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.async_utils import signal_bus
-from dynastore.tools.json import CustomJSONEncoder
 from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry, LifecycleContext
 from dynastore.modules.catalog.event_service import CatalogEventType, emit_event
 from dynastore.modules.db_config import shared_queries
@@ -811,16 +810,6 @@ class CollectionService:
                 return None
 
             merged_model = existing_model.merge_localized_updates(updates, lang)
-
-            # Store only user-provided extra_metadata content (no envelope)
-            user_extra_metadata = (
-                json.dumps(
-                    merged_model.extra_metadata.model_dump(exclude_none=True),
-                    cls=CustomJSONEncoder,
-                )
-                if merged_model.extra_metadata
-                else None
-            )
 
             # First verify the collection exists in thin registry
             exists = await _make_collection_exists_query(phys_schema).execute(

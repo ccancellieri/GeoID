@@ -721,7 +721,6 @@ class CatalogService(CatalogsProtocol):
         partition_value: Any,
         ctx: Optional["DriverContext"] = None,
     ) -> None:
-        db_resource = ctx.db_resource if ctx else None
         return await self._item_svc.ensure_partition_exists(
             catalog_id, collection_id, config, partition_value, ctx=ctx
         )
@@ -1254,12 +1253,6 @@ class CatalogService(CatalogsProtocol):
             from dynastore.models.localization import validate_language_consistency
 
             validate_language_consistency(updates, lang)
-
-        update_model = (
-            CatalogUpdate.create_from_localized_input(updates, lang)
-            if isinstance(updates, dict)
-            else updates
-        )
 
         async with managed_transaction(get_catalog_engine(db_resource)) as conn:
             existing_model = await self.get_catalog_model(catalog_id, ctx=DriverContext(db_resource=conn))

@@ -906,7 +906,7 @@ async def run_dispatcher(
             # a defensive fallback — the pg_cron reaper issues ``pg_notify
             # 'new_task_queued'`` when it resets stuck rows, so we will be
             # woken promptly in steady state.
-            got_signal = await signal_bus.wait_for(NEW_TASK_QUEUED, timeout=signal_timeout)
+            await signal_bus.wait_for(NEW_TASK_QUEUED, timeout=signal_timeout)
 
             # Claim and dispatch in batches until queue is empty
             while not shutdown_event.is_set():

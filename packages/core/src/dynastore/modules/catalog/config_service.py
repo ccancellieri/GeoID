@@ -975,7 +975,6 @@ class ConfigService(ConfigsProtocol):
 
         db_resource = ctx.db_resource if ctx else None
         cls = type(config)
-        class_key = cls.class_key()
 
         if collection_id is not None:
             if catalog_id is None:
