@@ -41,6 +41,32 @@ The protocol itself is the structural marker — discovery uses
 flag; implementing the protocol is the contract.
 
 Empty attachment ⇒ identity (no-op).
+
+Purity and I/O
+--------------
+A transformer must not mutate its input in place and must be deterministic
+with respect to its inputs *for a given external state* — the chain runtime
+composes transformers and relies on that.
+
+I/O is permitted, and **enrichment transformers** (which compute fields from
+an external lookup — another store, a graph DB, an embeddings service) are a
+first-class, shipped use case: the in-tree ``PrivateEntityTransformer`` already
+resolves ``ConfigsProtocol`` via global ``get_protocol(...)``. When a transformer
+does I/O it MUST:
+
+- resolve its dependencies via global ``get_protocol(...)`` (there is no
+  execution context passed to the chain today — see the runtime caveat below);
+- be **fail-safe** — degrade to a sensible default rather than raising, since a
+  raise rejects the item on the write path / drops it from the read shape;
+- **cache** in-process where possible — the chain runs per entity on the hot
+  secondary-index fan-out, so an uncached lookup is one external round-trip per
+  item;
+- honor ``TransformerEntry.sla`` to bound that I/O.
+
+Runtime caveat (tracked in geoid#1568): the chain currently runs **per item**
+with **no execution context** — transformers cannot piggyback on the
+dispatcher's ``pg_conn`` and there is no batch hook, so N items ⇒ N lookups.
+First-class context / batch support is a proposed enhancement, not yet wired.
 """
 
 from __future__ import annotations
@@ -62,9 +88,13 @@ class EntityTransformProtocol(Protocol):
     routing entries reference these names from ``input_transformers`` /
     ``output_transformers`` to choose which chain runs where.
 
-    The transform should be a pure function — no I/O side effects, no
-    mutation of inputs in place. The chain runtime composes transformers,
-    so non-pure behavior breaks composition guarantees.
+    The transform must not mutate its input in place and must be
+    deterministic for a given external state — the chain runtime composes
+    transformers and relies on that. I/O **is** permitted: enrichment
+    transformers (e.g. the shipped ``PrivateEntityTransformer``) resolve
+    dependencies via global ``get_protocol(...)``. See the module docstring's
+    "Purity and I/O" section for the supported pattern (fail-safe, cache,
+    honor ``TransformerEntry.sla``) and the per-item runtime caveat (#1568).
     """
 
     async def transform_for_index(
