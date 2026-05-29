@@ -21,22 +21,9 @@ from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler, 
 from .models import ShortURL
 
 
-# --- Schema Creation ---
-
-
-CREATE_SHORT_URLS_TABLE = DDLQuery(
-    sql_template="""
-    CREATE TABLE IF NOT EXISTS {schema}.short_urls (
-        id BIGINT NOT NULL DEFAULT nextval('{schema}.short_url_id_seq'),
-        short_key VARCHAR(20) NOT NULL,
-        long_url TEXT NOT NULL,
-        collection_id VARCHAR(255) NOT NULL DEFAULT '_catalog_',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        comment TEXT,
-        PRIMARY KEY (collection_id, short_key)
-    ) PARTITION BY LIST (collection_id);
-    """
-)
+# --- Schema Setup (global proxy schema) ---
+# The sequence and key-generation functions live in the shared ``proxy`` schema;
+# they are created once at startup by PostgresProxyStorage.lifespan.
 
 CREATE_BASE62_FUNCTION = DDLQuery(
     sql_template="""
@@ -77,49 +64,65 @@ CREATE_SHORT_URL_SEQUENCE = DDLQuery(
     sql_template="""CREATE SEQUENCE IF NOT EXISTS {schema}.short_url_id_seq;"""
 )
 
+
+# --- Per-tenant collection_proxy_urls queries ---
+# All per-tenant URL rows live in ``{tenant_schema}.collection_proxy_urls``.
+# Key generation still calls the shared proxy-schema functions/sequence.
+
 INSERT_SHORT_URL_WITH_GENERATED_KEY = DQLQuery(
     sql_template="""
     WITH new_vals AS (
         SELECT
-            nextval('proxy.short_url_id_seq') as id,
-            proxy.base62(proxy.obfuscate_id(currval('proxy.short_url_id_seq'))) as s_key
+            nextval('proxy.short_url_id_seq') AS id,
+            proxy.base62(proxy.obfuscate_id(currval('proxy.short_url_id_seq'))) AS s_key
     )
-    INSERT INTO {schema}.short_urls (id, short_key, long_url, collection_id, comment)
+    INSERT INTO {schema}.collection_proxy_urls
+        (id, short_key, long_url, collection_id, comment)
     SELECT id, s_key, :long_url, :collection_id, :comment FROM new_vals
-    RETURNING id, short_key, long_url, created_at, comment;
+    RETURNING id, short_key, long_url, collection_id, created_at, comment;
     """,
     result_handler=ResultHandler.ONE_DICT,
-    post_processor=lambda d: ShortURL(**d) if d else None
+    post_processor=lambda d: ShortURL(**d) if d else None,
 )
 
 INSERT_SHORT_URL_WITH_CUSTOM_KEY = DQLQuery(
     sql_template="""
-    INSERT INTO {schema}.short_urls (short_key, long_url, collection_id, comment)
-    VALUES (:custom_key, :long_url, :collection_id, :comment)
-    RETURNING id, short_key, long_url, created_at, comment;
+    INSERT INTO {schema}.collection_proxy_urls
+        (id, short_key, long_url, collection_id, comment)
+    VALUES (
+        nextval('proxy.short_url_id_seq'),
+        :custom_key, :long_url, :collection_id, :comment
+    )
+    RETURNING id, short_key, long_url, collection_id, created_at, comment;
     """,
     result_handler=ResultHandler.ONE_DICT,
-    post_processor=lambda d: ShortURL(**d) if d else None
+    post_processor=lambda d: ShortURL(**d) if d else None,
 )
 
 GET_LONG_URL = DQLQuery(
-    sql_template="SELECT long_url FROM {schema}.short_urls WHERE short_key = :short_key;",
-    result_handler=ResultHandler.SCALAR_ONE_OR_NONE
+    sql_template=(
+        "SELECT long_url FROM {schema}.collection_proxy_urls"
+        " WHERE short_key = :short_key;"
+    ),
+    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
 )
 
 DELETE_SHORT_URL = DQLQuery(
-    sql_template="DELETE FROM {schema}.short_urls WHERE short_key = :short_key RETURNING short_key;",
-    result_handler=ResultHandler.SCALAR_ONE_OR_NONE
+    sql_template=(
+        "DELETE FROM {schema}.collection_proxy_urls"
+        " WHERE short_key = :short_key RETURNING short_key;"
+    ),
+    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
 )
 
 GET_URLS_BY_COLLECTION = DQLQuery(
     sql_template="""
     SELECT id, short_key, long_url, collection_id, created_at, comment
-    FROM {schema}.short_urls
+    FROM {schema}.collection_proxy_urls
     WHERE collection_id = :collection_id
     ORDER BY created_at DESC
     LIMIT :limit OFFSET :offset;
     """,
     result_handler=ResultHandler.ALL_DICTS,
-    post_processor=lambda rows: [ShortURL(**r) for r in rows]
+    post_processor=lambda rows: [ShortURL(**r) for r in rows],
 )

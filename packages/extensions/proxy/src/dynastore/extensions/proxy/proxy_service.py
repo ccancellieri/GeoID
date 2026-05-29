@@ -89,7 +89,6 @@ async def _log_proxy_analytics(
     referrer: str,
 ):
     """Background task to log specific proxy analytics (buffered)."""
-    # This calls the module's log_redirect, which now buffers the write
     try:
         await log_redirect(
             engine,
@@ -102,6 +101,8 @@ async def _log_proxy_analytics(
         )
     except Exception as e:
         logger.error(f"Failed to log proxy analytics: {e}")
+
+
 class ProxyService(ExtensionProtocol):
     priority: int = 100
     router: APIRouter = APIRouter(prefix="/proxy", tags=["URL Proxy"])
@@ -192,9 +193,6 @@ class ProxyService(ExtensionProtocol):
         short_key: str,
         engine: DbResource = Depends(get_async_engine),
     ):
-        # Optionally verify ownership before deletion?
-        # Partition-based deletion is implicitly handled by the catalog scope
-        # since the parent table is partitioned.
         deleted_key = await delete_short_url(
             engine, catalog_id=catalog_id, short_key=short_key
         )
@@ -261,7 +259,6 @@ class ProxyService(ExtensionProtocol):
             )
 
         # 2. Log Proxy Analytics (Specific - Buffered)
-        # We pass the engine to the background task to perform the buffered write
         ip_address = request.client.host if request.client else "unknown"
         user_agent = request.headers.get("user-agent", "")
         referrer = request.headers.get("referer", "")
@@ -305,7 +302,6 @@ class ProxyService(ExtensionProtocol):
         Redirects using the same logic as the catalog-level endpoint.
         The collection_id in the path serves as semantic context.
         """
-        # We reuse the same logic
         return await ProxyService.redirect_endpoint(  # type: ignore[attr-defined]
             catalog_id=catalog_id,
             short_key=short_key,
@@ -337,9 +333,6 @@ class ProxyService(ExtensionProtocol):
             engine: DbResource,
             proxy_client: httpx.AsyncClient,
         ):
-            """
-            Shared core logic for proxying requests.
-            """
             long_url = await _get_cached_long_url(engine, catalog_id, short_key)
             if not long_url:
                 raise HTTPException(status_code=404, detail="Short URL not found")
@@ -423,13 +416,8 @@ class ProxyService(ExtensionProtocol):
             proxy_client: httpx.AsyncClient = Depends(get_proxy_httpx_client),
         ):
             return await _perform_proxy_logic(
-                catalog_id,
-                short_key,
-                "",
-                request,
-                background_tasks,
-                engine,
-                proxy_client,
+                catalog_id, short_key, "", request,
+                background_tasks, engine, proxy_client,
             )
 
         @self.router.api_route(
@@ -448,13 +436,8 @@ class ProxyService(ExtensionProtocol):
             proxy_client: httpx.AsyncClient = Depends(get_proxy_httpx_client),
         ):
             return await _perform_proxy_logic(
-                catalog_id,
-                short_key,
-                path,
-                request,
-                background_tasks,
-                engine,
-                proxy_client,
+                catalog_id, short_key, path, request,
+                background_tasks, engine, proxy_client,
             )
 
     # --- MANAGEMENT ENDPOINTS ---
@@ -500,18 +483,6 @@ class ProxyService(ExtensionProtocol):
             end_date=end_date,
         )
 
-    # @router.get("/catalogs/{catalog_id}/owners/{owner_id}/urls", response_model=List[ShortURL])
-    # async def get_owner_urls_endpoint(
-    #     catalog_id: str,
-    #     owner_id: str,
-    #     engine: DbResource = Depends(get_async_engine),
-    #     limit: int = Query(100, ge=1, le=1000),
-    #     offset: int = Query(0, ge=0)
-    # ):
-    #     """Retrieves a paginated list of short URLs created by a specific owner."""
-    #     urls = await get_urls_by_owner(engine, catalog_id=catalog_id, owner_id=owner_id, limit=limit, offset=offset)
-    #     return urls
-
     @router.delete("/catalogs/{catalog_id}/urls/{short_key}", status_code=204)
     async def delete_url_endpoint(
         catalog_id: str, short_key: str, engine: DbResource = Depends(get_async_engine)  # type: ignore[reportGeneralTypeIssues]
@@ -521,25 +492,6 @@ class ProxyService(ExtensionProtocol):
         )
         if not deleted_key:
             raise HTTPException(status_code=404, detail="Short URL not found")
-
-        # --- REMOVE FROM TENANT TRACKING TABLE (Generic) ---
-        try:
-            from dynastore.models.protocols import CatalogsProtocol
-
-            catalogs = get_protocol(CatalogsProtocol)
-            from dynastore.modules.db_config.query_executor import DDLQuery
-
-            phys_schema = await catalogs.resolve_physical_schema(catalog_id)  # type: ignore[union-attr]
-            if phys_schema:
-                # We don't have collection_id here, but we can delete by short_key
-                del_query = DDLQuery(
-                    "DELETE FROM {schema}.collection_proxy_urls WHERE short_key = :key"
-                )
-                await del_query.execute(engine, schema=phys_schema, key=short_key)
-        except Exception as e:
-            logger.error(
-                f"ProxyService: Failed to remove tracking for catalog URL: {e}"
-            )
 
         # Invalidate the cache for the deleted short key
         _get_cached_long_url.cache_invalidate(engine, catalog_id, deleted_key)

@@ -39,28 +39,24 @@ This implementation MUST use the query_executor pattern (DQLQuery, DDLExecutor) 
 
 Key Generation: Use a reliable method for generating short, unique keys (e.g., base62 encoding of a PostgreSQL BIGSERIAL sequence).
 
-3. Database Schemas & Hyperscale Partitioning Strategy (Constraint 3, Scalability):
-The PostgresProxyStorage.initialize method must set up the parent tables. The partitioning strategy must be configurable via environment variables.
+3. Database Schemas:
+Global, once-per-startup objects live in the shared "proxy" schema and are created by PostgresProxyStorage.lifespan: the short_url_id_seq sequence plus the base62 / obfuscate_id key-generation functions. The per-tenant URL rows live in a per-catalog-schema table created by the proxy extension's sync_catalog_initializer.
 
-short_urls Table (Scalability Mandate):
+collection_proxy_urls Table (one per tenant schema):
 
-This table must be partitioned BY HASH (short_key) to evenly distribute writes and primary key lookups across many smaller tables.
+A single, non-partitioned table per catalog schema. (An earlier design partitioned a "short_urls" table BY LIST/HASH; that was retired — short URLs are not high-write enough to justify per-collection partitions, and lookups are by short_key alone.)
 
-The number of hash partitions must be configurable (e.g., env var PROXY_URL_HASH_PARTITIONS, default 64).
+id: BIGINT NOT NULL (assigned from the shared proxy.short_url_id_seq sequence)
 
-id: BIGSERIAL
-
-short_key: VARCHAR(20) NOT NULL (The partitioning key)
+short_key: VARCHAR(20) NOT NULL PRIMARY KEY (globally unique within the schema; resolution is by short_key alone)
 
 long_url: TEXT NOT NULL
 
+collection_id: VARCHAR(255) NOT NULL DEFAULT '_catalog_' (indexed, for listing/cleanup by collection)
+
 created_at: TIMESTAMPTZ NOT NULL DEFAULT NOW()
 
-owner_id: VARCHAR(255)
-
-PRIMARY KEY (short_key, id) (The partition key must be part of the primary key).
-
-UNIQUE (short_key) (This will be enforced by the PRIMARY KEY).
+comment: TEXT
 
 url_analytics Table (Scalability Mandate):
 
@@ -122,7 +118,7 @@ The proxy module will expose simple, async pass-through functions (e.g., async d
 
 6. Models:
 
-ShortURL: Maps to the short_urls table.
+ShortURL: Maps to the per-tenant collection_proxy_urls table.
 
 URLAnalytics: Maps to the url_analytics table.
 
