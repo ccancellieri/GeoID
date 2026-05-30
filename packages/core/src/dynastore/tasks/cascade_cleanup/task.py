@@ -97,6 +97,11 @@ class CascadeCleanupTask(TaskProtocol):
 
     task_type = "cascade_cleanup"
     priority = 60
+    # The cascade orchestrator enqueues this on the catalog tier; its cleanup-owner
+    # registry only exists there. It MUST have a live catalog-tier owner or the
+    # platform leaks resources — the mandatory-ownership guarantee enforces this.
+    mandatory = True
+    affinity_tier = "catalog"
 
     def is_available(self) -> bool:  # pragma: no cover
         return True

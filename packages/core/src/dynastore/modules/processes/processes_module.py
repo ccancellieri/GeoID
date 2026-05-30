@@ -33,6 +33,15 @@ from dynastore.modules.tasks.execution import execution_engine
 logger = logging.getLogger(__name__)
 
 
+def _is_invocable_process(process_id: str) -> bool:
+    """True iff ``process_id`` maps to a registered task that ships a Process
+    definition (kind=process). System tasks (kind=task) are NEVER invocable via
+    the OGC Processes API — they are enqueued only by events/orchestration."""
+    from dynastore.tasks import _DYNASTORE_TASKS, task_kind
+    cfg = _DYNASTORE_TASKS.get(process_id)
+    return cfg is not None and task_kind(cfg) == "process"
+
+
 def _resolve_execution_mode(
     process: models.Process,
     preferred_mode: Optional[models.JobControlOptions],
@@ -125,17 +134,26 @@ async def execute_process(
     Core logic for executing a process.
 
     Responsibilities (OGC-specific):
-      1. Lookup process definition
-      2. Validate inputs against JSON Schema
-      3. Resolve execution mode from preference + process constraints
-      4. Delegate to ExecutionEngine.execute()
+      1. Reject non-invocable ids (unknown / kind=task system tasks)
+      2. Lookup process definition
+      3. Validate inputs against JSON Schema
+      4. Resolve execution mode from preference + process constraints
+      5. Delegate to ExecutionEngine.execute()
 
     ``dedup_key``: optional idempotency token. When set, the runner passes it
     to ``TaskCreate`` so the DB partial unique index on
     ``(schema_name, dedup_key)`` for non-terminal tasks collapses redelivered
     events into a single task. Returns ``None`` on a dedup hit.
     """
-    # 1. Find the requested process definition.
+    # 1. Reject anything that is not an invocable process BEFORE any lookup or
+    # enqueue. This returns False both for unknown ids and for kind=task system
+    # tasks (cascade_cleanup, etc.) — the latter are enqueued only by
+    # events/orchestration. Raise the identical not-found error in both cases so
+    # the public API never leaks the existence of a system task (404, not 403).
+    if not _is_invocable_process(process_id):
+        raise ValueError(f"Process '{process_id}' not found.")
+
+    # 2. Find the requested process definition.
     process: Optional[models.Process] = None
     for registry in get_protocols(ProcessRegistryProtocol):
         process = await registry.get_process(process_id)
@@ -144,17 +162,17 @@ async def execute_process(
     if not process:
         raise ValueError(f"Process '{process_id}' not found.")
 
-    # 2. Validate inputs.
+    # 3. Validate inputs.
     _validate_process_inputs(process, execution_request)
 
-    # 3. Determine execution mode. ``background_tasks`` is the request-context
+    # 4. Determine execution mode. ``background_tasks`` is the request-context
     # signal runners use to gate in-process execution, so thread it into the
     # capability check that picks the mode.
     execution_mode = _resolve_execution_mode(
         process, preferred_mode, has_request_context=background_tasks is not None
     )
 
-    # 4. Resolve DB schema and delegate to ExecutionEngine.
+    # 5. Resolve DB schema and delegate to ExecutionEngine.
     db_schema = "public"
     catalog_protocol = get_protocol(CatalogsProtocol)
     if catalog_protocol and catalog_id:

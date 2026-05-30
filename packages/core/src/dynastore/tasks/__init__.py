@@ -20,6 +20,18 @@ class TaskConfig:
     definition: Any = None
     instance: TaskProtocol | None = None
 
+
+def task_kind(cfg: TaskConfig) -> str:
+    """Derive a task's invocation kind from its registry entry.
+
+    ``process`` iff the task ships a Process ``definition`` (and is therefore
+    reachable via the OGC Processes API under policy); ``task`` otherwise
+    (system task — enqueueable only by events/listeners/system orchestration).
+    This is the SSOT consulted by the autodiscovery publisher and the
+    Processes invocation guard; no separate field is stored.
+    """
+    return "process" if cfg.definition is not None else "task"
+
 _DYNASTORE_TASKS: Dict[str, TaskConfig] = {}
 
 # Module-level handle to the runtime app_state so ``get_task_instance`` can
@@ -52,6 +64,38 @@ def get_task_config(task_type: str) -> Optional[TaskConfig]:
 
 def get_all_task_configs() -> Dict[str, TaskConfig]:
     return _DYNASTORE_TASKS
+
+def describe_all() -> List[Dict[str, Any]]:
+    """Return every registered task's static descriptor merged with its kind.
+
+    JSON-ready: each item is ``TaskDescriptor.model_dump()`` plus ``"kind"``
+    ("task" | "process"). This is the in-process discovery surface — no DB, no
+    I/O — that a runner, the admin read view, or an external client consults to
+    enumerate available tasks/processes and their schemas.
+
+    Fail-soft per entry: a definition-only placeholder or a class without a
+    working ``describe()`` is skipped (DEBUG-logged), never breaking the list.
+    """
+    out: List[Dict[str, Any]] = []
+    for task_key, cfg in _DYNASTORE_TASKS.items():
+        describe = getattr(cfg.cls, "describe", None)
+        if describe is None:
+            logger.debug("describe_all: %r has no describe(); skipping", task_key)
+            continue
+        try:
+            descriptor = describe()
+            row = descriptor.model_dump()
+            # ``task_key`` is the inventory key (entry-point / DB ``task_type``)
+            # — the same identity the capability registry stores and that the
+            # claim/dispatch/placement paths key on. Callers join discovery
+            # output to the registry on this field. ``name`` stays the
+            # class-declared name from the descriptor.
+            row["task_key"] = task_key
+            row["kind"] = task_kind(cfg)
+            out.append(row)
+        except Exception as exc:  # noqa: BLE001 - one bad entry must not break the listing
+            logger.debug("describe_all: describe() failed for %r (%s); skipping", task_key, exc)
+    return out
 
 def get_loaded_task_types() -> List[str]:
     """Returns a list of all task_type values from discovered task classes.

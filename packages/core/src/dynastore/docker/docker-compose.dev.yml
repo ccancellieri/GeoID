@@ -32,9 +32,9 @@ services:
       # which no finder references. Source path is relative to THIS compose
       # file's directory (not your CWD), matching `build.context` above.
       - ../../../..:/dynastore/packages
-      # Service identity (instance.json) + shared task-routing defaults.
-      # Activates the TaskRoutingConfig service-affinity gate so this
-      # service only claims task types its routing entry whitelists it for.
+      # Service identity (instance.json) + shared config defaults.
+      # Drives the task-placement gate so this service only claims task
+      # types whose placement consumers list it.
       - ./config/catalog:/dynastore/config:ro
     env_file:
       - .env

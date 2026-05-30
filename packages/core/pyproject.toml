@@ -105,6 +105,7 @@ dimensions_materialize = "dynastore.tasks.dimensions_materialize.task:Dimensions
 outbox_drain = "dynastore.tasks.outbox_drain.drain_task:OutboxDrainTask"
 index_propagation = "dynastore.tasks.index_propagation.task:IndexPropagationTask"
 gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
+cascade_cleanup = "dynastore.tasks.cascade_cleanup.task:CascadeCleanupTask"
 requeue_dead_letter_tasks = "dynastore.tasks.requeue_dead_letter.task:RequeueDeadLetterTasksTask"
 
 [build-system]

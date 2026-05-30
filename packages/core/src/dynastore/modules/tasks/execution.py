@@ -67,6 +67,52 @@ _TERMINAL_STATUSES = frozenset({
 })
 
 
+# ----------------------------------------------------------------------
+# Placement-mode-aware runner preference (module-level seams)
+#
+# A task's resolved placement *mode* steers runner choice:
+#   - "sync"     → SYNCHRONOUS runners
+#   - "async"    → top-priority ASYNCHRONOUS runner
+#   - "off_load" → the preset's off_load runner_type (gcp_cloud_run for
+#                  cloud, worker_queue for onprem) when available, else
+#                  fail-open to the existing priority chain.
+#
+# These are module-level so they can be exercised in isolation.
+# ----------------------------------------------------------------------
+
+
+async def _resolved_mode(task_key: str) -> str:
+    from dynastore.modules.tasks.placement.resolver import resolved_entry
+    entry = await resolved_entry(task_key)
+    return entry.mode if entry is not None else "async"  # fail-open to today's async path
+
+
+async def _off_load_runner_type() -> str:
+    from dynastore.modules.tasks.placement.resolver import off_load_runner_type
+    return await off_load_runner_type()
+
+
+def _candidate_runners(mode: str):
+    from dynastore.modules.tasks.runners import TaskExecutionMode, get_runners
+    exec_mode = TaskExecutionMode.SYNCHRONOUS if mode == "sync" else TaskExecutionMode.ASYNCHRONOUS
+    return sorted(get_runners(exec_mode), key=lambda r: r.priority, reverse=True)
+
+
+async def select_runner_for(task_key: str):
+    """Pick a runner honoring the resolved placement mode; fail-open to priority."""
+    mode = await _resolved_mode(task_key)
+    candidates = [r for r in _candidate_runners(mode) if r.can_handle(task_key)]
+    if not candidates:
+        return None
+    if mode == "off_load":
+        target = await _off_load_runner_type()
+        for r in candidates:
+            if getattr(r, "runner_type", None) == target:
+                return r
+        # fail-open: off_load runner unavailable -> highest-priority capable runner
+    return candidates[0]
+
+
 class ExecutionEngine:
     """
     OGC-aligned job lifecycle engine.
@@ -156,6 +202,17 @@ class ExecutionEngine:
                 f"No available runner for task '{task_type}' "
                 f"with mode '{mode.value}'."
             )
+
+        # Honor placement mode: when a task is placed off_load, prefer its
+        # external-executor runner over the higher-priority in-process runner.
+        # Fail-open — any miss (no opinion, runner not in the context-filtered
+        # set, or selection error) leaves the existing priority order intact.
+        try:
+            preferred = await select_runner_for(task_type)
+        except Exception:  # noqa: BLE001 — selection is best-effort
+            preferred = None
+        if preferred is not None and any(preferred is r for r in runners):
+            runners = [preferred] + [r for r in runners if r is not preferred]
 
         context = RunnerContext(
             engine=engine,

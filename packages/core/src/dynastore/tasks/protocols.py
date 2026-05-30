@@ -17,9 +17,10 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import abc
-from typing import Protocol, AsyncGenerator, Optional, TypeVar, Generic, runtime_checkable, Any
+from typing import ClassVar, Protocol, AsyncGenerator, Optional, TypeVar, Generic, runtime_checkable, Any
 from contextlib import asynccontextmanager
 from dynastore.modules.protocols import HasConfigService
+from dynastore.tasks.descriptor import TaskDescriptor
 
 DefinitionType = TypeVar('DefinitionType', covariant=True)
 PayloadType = TypeVar('PayloadType', contravariant=True)
@@ -32,12 +33,22 @@ class TaskProtocol(HasConfigService, Protocol, Generic[DefinitionType, PayloadTy
     Defines the contract for a DynaStore Background Task.
 
     Service-affinity placement (which service may claim a given task_type)
-    is controlled by ``TaskRoutingConfig`` — see
-    ``modules/tasks/tasks_config.py``. There is intentionally no
+    is controlled by ``TaskPlacementConfig`` — see
+    ``modules/tasks/placement/model.py``. There is intentionally no
     source-level routing decoration: routing is deployment, not code.
     """
 
     priority: int = 0
+    # Declared-once class attributes consumed by the durable task-capability
+    # registry and the mandatory-ownership guarantee. Defaults make every existing
+    # task a non-mandatory, tier-agnostic participant with zero edits.
+    mandatory: ClassVar[bool] = False
+    affinity_tier: ClassVar[Optional[str]] = None
+    # Optional opt-in: a pydantic model describing this task's payload. When
+    # set, describe() exports its JSON Schema. Processes derive their schema
+    # from the Process definition at publish time instead; plain tasks opt in
+    # here. Left None for tasks that do not declare a payload contract.
+    payload_model: ClassVar[Optional[type]] = None
 
     def is_available(self) -> bool:
         """
@@ -102,6 +113,40 @@ class TaskProtocol(HasConfigService, Protocol, Generic[DefinitionType, PayloadTy
         Returns the registered name of the task.
         """
         return getattr(cls, "_registered_name", cls.__name__.lower())
+
+    @classmethod
+    def payload_schema(cls) -> Optional[dict]:
+        """JSON Schema for this task's payload, or None if undeclared.
+
+        Reads the opt-in ``payload_model`` ClassVar. Guarded: a model without a
+        ``model_json_schema`` method, or one that raises, yields None rather
+        than breaking self-description.
+        """
+        model = getattr(cls, "payload_model", None)
+        if model is None or not hasattr(model, "model_json_schema"):
+            return None
+        try:
+            return model.model_json_schema()
+        except Exception:  # noqa: BLE001 - self-description must never raise
+            return None
+
+    @classmethod
+    def describe(cls) -> "TaskDescriptor":
+        """Return this task's static self-description (see TaskDescriptor).
+
+        description is the first non-empty line of the class docstring (so it
+        is zero-edit for existing tasks); mandatory/affinity_tier mirror the
+        ClassVars; payload_schema comes from payload_schema().
+        """
+        doc = (cls.__doc__ or "").strip()
+        description = doc.splitlines()[0].strip() if doc else ""
+        return TaskDescriptor(
+            name=cls.get_name(),
+            mandatory=bool(getattr(cls, "mandatory", False)),
+            affinity_tier=getattr(cls, "affinity_tier", None),
+            description=description,
+            payload_schema=cls.payload_schema(),
+        )
 
     @abc.abstractmethod
     async def run(self, payload: PayloadType) -> ReturnType:

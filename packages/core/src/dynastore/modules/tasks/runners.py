@@ -17,18 +17,18 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import os
-from typing import Any, List, Union, Dict, Tuple, Protocol, runtime_checkable, AsyncGenerator
+from typing import Any, List, Optional, Union, Tuple, Protocol, runtime_checkable, AsyncGenerator
 from contextlib import asynccontextmanager
 
 from dynastore.modules.tasks.models import (PermanentTaskFailure, Task, TaskCreate,
                                             TaskExecutionMode, TaskStatusEnum, TaskUpdate, RunnerContext)
-from dynastore.tasks import get_task_instance
+from dynastore.tasks import get_task_instance, get_loaded_task_types
 import asyncio
 from dynastore.tools.plugin import ProtocolPlugin
 from dynastore.tools.discovery import register_plugin
 from dynastore.tools.async_utils import LoopLocalLock, LoopLocalSemaphore
 from dynastore.modules.concurrency import get_background_executor
+from dynastore.modules.tasks.dispatcher import _SERVICE_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +255,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
     """
     def __init__(self):
         self._running_tasks = set()
-        self._max_concurrency = int(os.getenv("BACKGROUND_RUNNER_CONCURRENCY", "100"))
+        self._max_concurrency = 100
         # BackgroundRunner is registered as a module-level singleton at import
         # (register_default_runners()), so a raw asyncio.Semaphore() here would
         # bind to the first loop that blocks on it and break when reused from
@@ -268,6 +268,18 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
     @asynccontextmanager
     async def lifespan(self, app_state: object) -> AsyncGenerator[None, None]:
+        try:
+            from dynastore.tools.discovery import get_protocol
+            from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+            config_mgr = get_protocol(PlatformConfigsProtocol)
+            if config_mgr is not None:
+                cfg = await config_mgr.get_config(TasksPluginConfig)
+                if isinstance(cfg, TasksPluginConfig):
+                    self._max_concurrency = cfg.background_runner_concurrency
+                    self._semaphore = LoopLocalSemaphore(self._max_concurrency)
+        except Exception as exc:  # noqa: BLE001 — keep default concurrency on any read failure
+            logger.debug("BackgroundRunner: concurrency config unavailable (%s) — default %d", exc, self._max_concurrency)
         try:
             yield
         finally:
@@ -608,54 +620,37 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
 # Worker-routed task-type snapshot (sync read for can_handle)
 # ---------------------------------------------------------------------------
 #
-# ``WorkerQueueRunner.can_handle`` is a *sync* method but the operator intent
-# it consults (``TaskRoutingConfig.routing``) lives behind an async config
-# accessor. We mirror the pattern ``GcpJobRunner`` uses for its Cloud Run job
-# map (``get_job_map_sync`` / ``_JOB_MAP_SYNC``): keep a module-level snapshot
-# that an async warm refreshes, and read it synchronously from ``can_handle``.
+# ``WorkerQueueRunner.can_handle`` is a *sync* method but the placement intent
+# it consults lives behind an async resolver. We mirror the pattern
+# ``GcpJobRunner`` uses for its Cloud Run job map (``get_job_map_sync`` /
+# ``_JOB_MAP_SYNC``): keep a module-level snapshot that an async warm refreshes,
+# and read it synchronously from ``can_handle``.
 #
 # The snapshot holds the set of task types that *some* service is configured to
-# claim (any non-empty ``routing`` entry). Combined with the "no in-process
-# task instance here" gate, this bounds the runner to types the deployment
-# actually expects a remote worker to run — it never enqueues an unknown type.
+# claim (placement returns a concrete, non-empty consumer list). Combined with
+# the "no in-process task instance here" gate, this bounds the runner to types
+# the deployment actually expects a remote worker to run — it never enqueues an
+# unknown type.
 _WORKER_ROUTED_TYPES: set = set()
 
 
 async def refresh_worker_routed_types() -> None:
-    """Refresh :data:`_WORKER_ROUTED_TYPES` from ``TaskRoutingConfig``.
+    """Refresh the worker-routed task-type snapshot from placement.
 
-    Best-effort: when the config registry is unavailable (early startup, tests)
-    the snapshot is left untouched and ``WorkerQueueRunner.can_handle`` falls
-    back to gating on the in-process task instance only. Never raises.
+    Best-effort: a task is "worker-routed" when placement returns a concrete,
+    non-empty consumer list for it. Never raises.
     """
     global _WORKER_ROUTED_TYPES
-    try:
-        from dynastore.tools.discovery import get_protocol
-        from dynastore.models.protocols.platform_configs import (
-            PlatformConfigsProtocol,
-        )
-        from dynastore.modules.tasks.tasks_config import TaskRoutingConfig
-
-        config_mgr = get_protocol(PlatformConfigsProtocol)
-        if config_mgr is None:
-            return
-        cfg = await config_mgr.get_config(TaskRoutingConfig)
-        if isinstance(cfg, TaskRoutingConfig):
-            routing = cfg.routing or {}
-            _WORKER_ROUTED_TYPES = {
-                task_type
-                for task_type, targets in routing.items()
-                if targets
-            }
-            logger.debug(
-                "WorkerQueueRunner: routed-types snapshot refreshed: %s",
-                sorted(_WORKER_ROUTED_TYPES),
-            )
-    except Exception as exc:  # noqa: BLE001 — config is best-effort
-        logger.debug(
-            "WorkerQueueRunner: TaskRoutingConfig unavailable (%s) — "
-            "routed-types snapshot left unchanged.", exc,
-        )
+    routed: set = set()
+    for task_type in get_loaded_task_types():
+        try:
+            from dynastore.modules.tasks.placement.resolver import resolved_consumers
+            consumers = await resolved_consumers(task_type)
+        except Exception:  # noqa: BLE001 — best-effort
+            consumers = None
+        if consumers:
+            routed.add(task_type)
+    _WORKER_ROUTED_TYPES = routed
 
 
 def get_worker_routed_types_sync() -> set:
@@ -673,7 +668,8 @@ class WorkerQueueRunner(RunnerProtocol, ProtocolPlugin[Any]):
     INSERT fires the ``on_task_insert`` trigger
     (``WHEN NEW.status = 'PENDING'``) → ``pg_notify('new_task_queued', ...)`` →
     the worker service's dispatcher claims the row (filtered by
-    ``TaskRoutingConfig`` service-affinity, e.g. ``{"gdal": ["worker"]}``) and
+    task placement (``TaskPlacementConfig``) service-affinity, e.g.
+    ``{"gdal": ["worker"]}``) and
     runs the registered task instance (``worker_task_gdal``) via the standard
     claim path. This is the canonical enqueue route already used by every
     worker-routed task type (ingestion, indexers, …) — no second dispatch
@@ -703,7 +699,7 @@ class WorkerQueueRunner(RunnerProtocol, ProtocolPlugin[Any]):
        where the instance *is* loaded, this runner returns False and the
        in-process ``BackgroundRunner`` claims the row).
     2. ``task_type`` appears in :data:`_WORKER_ROUTED_TYPES` — some service is
-       configured to claim it (non-empty ``TaskRoutingConfig`` entry), so a
+       configured to claim it (a non-empty placement consumer list), so a
        remote worker is actually expected to pick it up. This stops the runner
        enqueueing rows that would sit forever unclaimed.
     """
@@ -789,6 +785,20 @@ class WorkerQueueRunner(RunnerProtocol, ProtocolPlugin[Any]):
         return job
 
 
+async def _placement_consumers(task_key: str) -> Optional[List[str]]:
+    """None == no placement opinion -> do not filter (fail-open)."""
+    from dynastore.modules.tasks.placement.resolver import resolved_consumers
+    return await resolved_consumers(task_key)
+
+
+def _service_can_run_async(task_type: str) -> bool:
+    return any(r.can_handle(task_type) for r in get_runners(TaskExecutionMode.ASYNCHRONOUS))
+
+
+def _service_can_run_sync(task_type: str) -> bool:
+    return any(r.can_handle(task_type) for r in get_runners(TaskExecutionMode.SYNCHRONOUS))
+
+
 class CapabilityMap:
     """
     In-memory map of task_type to capable runners, grouped by execution mode.
@@ -808,7 +818,7 @@ class CapabilityMap:
 
     async def refresh(self) -> None:
         """Rebuild capability map from current runners, loaded task types,
-        and the cached ``TaskRoutingConfig`` (service-affinity narrowing).
+        and the placement resolver (service-affinity narrowing).
 
         Filtering precedence:
 
@@ -817,77 +827,44 @@ class CapabilityMap:
            a service without the dep won't even register the task.
         2. ``runner.can_handle(task_type)`` — at least one runner of the
            required execution mode admits the type.
-        3. ``TaskRoutingConfig.routing[task_type]`` — if non-empty, this
-           process's ``service_name`` must appear in the list.
+        3. Placement consumers for the type — when the resolver returns a
+           concrete, non-empty consumer list, this process's
+           ``service_name`` must appear in it; otherwise the type is not
+           claimable here.
 
-        Step 3 is the operator-controlled intent gate. Missing/empty
-        routing entry preserves legacy "any capable service may claim"
-        behaviour.
+        Step 3 is fail-open: a resolver that returns ``None`` (no opinion)
+        or raises leaves the type claimable, preserving "any capable
+        service may claim" behaviour. Only a concrete consumer list that
+        excludes this service filters a type out.
         """
-        from dynastore.tasks import get_loaded_task_types
-        from dynastore.modules.tasks.dispatcher import _SERVICE_NAME
-
-        # Resolve cached TaskRoutingConfig — best-effort. When the config
-        # registry isn't ready (early startup, tests) we fall back to "no
-        # routing", which preserves legacy behaviour.
-        routing: Dict[str, List[str]] = {}
-        routing_disabled: bool = False
-        try:
-            from dynastore.tools.discovery import get_protocol
-            from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-            from dynastore.modules.tasks.tasks_config import TaskRoutingConfig
-
-            config_mgr = get_protocol(PlatformConfigsProtocol)
-            if config_mgr is not None:
-                cfg = await config_mgr.get_config(TaskRoutingConfig)
-                # ``routing_disabled`` is the operator kill-switch.  No
-                # separate ``enabled`` toggle on this class — the cargo
-                # ``enabled`` field that used to be inherited from
-                # ``PluginConfig`` was removed in the Phase 0 cleanup.
-                if isinstance(cfg, TaskRoutingConfig):
-                    routing = cfg.routing or {}
-                    routing_disabled = cfg.routing_disabled
-                    # Keep WorkerQueueRunner's sync snapshot aligned with the
-                    # same config read — live PUT /configs routing changes
-                    # already trigger this refresh, so the fallback runner
-                    # picks them up without a separate config round-trip.
-                    global _WORKER_ROUTED_TYPES
-                    _WORKER_ROUTED_TYPES = {
-                        task_type
-                        for task_type, targets in routing.items()
-                        if targets
-                    }
-        except Exception as exc:  # noqa: BLE001 — non-fatal, log and continue
-            logger.debug(
-                "CapabilityMap: TaskRoutingConfig not yet available (%s) — "
-                "service-affinity routing skipped this refresh.", exc,
-            )
-
-        def _routed_to_me(task_type: str) -> bool:
-            if routing_disabled or _SERVICE_NAME is None:
-                return True
-            targets = routing.get(task_type)
-            return not targets or _SERVICE_NAME in targets
-
         async with self._lock:
             self._async_types.clear()
             self._sync_types.clear()
+            global _WORKER_ROUTED_TYPES
+            routed_types: set = set()
             for task_type in get_loaded_task_types():
-                if not _routed_to_me(task_type):
+                consumers = None
+                try:
+                    consumers = await _placement_consumers(task_type)
+                except Exception:  # noqa: BLE001 — placement read is best-effort
+                    logger.warning(
+                        "CapabilityMap: placement read failed for %r — failing open", task_type
+                    )
+                    consumers = None
+                # Filter ONLY when placement gives a concrete, non-empty consumer list
+                # that excludes this service. None/empty == no opinion -> stay claimable.
+                if consumers and _SERVICE_NAME is not None and _SERVICE_NAME not in consumers:
                     continue
-                for runner in get_runners(TaskExecutionMode.ASYNCHRONOUS):
-                    if runner.can_handle(task_type):
-                        self._async_types.add(task_type)
-                        break
-                for runner in get_runners(TaskExecutionMode.SYNCHRONOUS):
-                    if runner.can_handle(task_type):
-                        self._sync_types.add(task_type)
-                        break
+                if consumers:
+                    routed_types.add(task_type)
+                if _service_can_run_async(task_type):
+                    self._async_types.add(task_type)
+                if _service_can_run_sync(task_type):
+                    self._sync_types.add(task_type)
+            _WORKER_ROUTED_TYPES = routed_types
             logger.info(
-                "CapabilityMap refreshed (service=%r, routing_disabled=%s, "
-                "routing_keys=%d): async=%s, sync=%s",
-                _SERVICE_NAME, routing_disabled, len(routing),
-                sorted(self._async_types), sorted(self._sync_types),
+                "CapabilityMap refreshed (service=%r): async=%s, sync=%s",
+                _SERVICE_NAME, sorted(self._async_types), sorted(self._sync_types),
             )
 
     @property

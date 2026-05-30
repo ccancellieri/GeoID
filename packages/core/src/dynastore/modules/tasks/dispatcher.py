@@ -74,6 +74,15 @@ from dynastore.modules.db_config.exceptions import (
     DatabaseConnectionError,
     TableNotFoundError,
 )
+from dynastore.modules.tasks.mandatory import (
+    find_unclaimable_task_types as _find_unclaimable_task_types,
+    _live_owners_for,
+    _mandatory_specs,
+    _has_correct_tier_owner,
+)
+from dynastore.modules.tasks.maintenance import (
+    requeue_dead_letter_tasks_by_type as _requeue_dead_letter_tasks_by_type,
+)
 from dynastore.tools.async_utils import signal_bus
 
 logger = logging.getLogger(__name__)
@@ -139,13 +148,6 @@ from dynastore.modules.db_config.instance import get_service_name as _get_servic
 
 _SERVICE_NAME: Optional[str] = _get_service_name()
 
-# Back-off applied to a row when a worker's payload-aware ``can_claim``
-# refuses it.  Keeps the same worker from immediately re-claiming on the
-# next poll while leaving the row visible to any other worker (whose
-# ``claim_batch`` filter is ``locked_until IS NULL OR locked_until <= NOW()``).
-_CLAIM_REJECT_BACKOFF = timedelta(
-    seconds=int(os.environ.get("DISPATCHER_CLAIM_REJECT_BACKOFF_SECONDS", "30")),
-)
 if _SERVICE_NAME:
     logger.info("Dispatcher: service_name=%r (from instance.json)", _SERVICE_NAME)
 else:
@@ -616,71 +618,83 @@ async def sweep_dead_capability_rows(
 
 
 # ---------------------------------------------------------------------------
-# Janitor — recovery of stale ACTIVE tasks + orphan cleanup
+# Capability-less backstop — DLQ PENDING rows whose task_type has no live
+# correct-tier owner, regardless of required_capability. This is the escape
+# the capability-keyed reaper skips for required_capability=None rows (the
+# class of bug behind a registered task with no live consumer sitting PENDING
+# forever).
 # ---------------------------------------------------------------------------
 
-async def _run_janitor(
-    engine: DbResource,
-    visibility_timeout: timedelta,
-    orphan_grace_period: timedelta = timedelta(hours=1),
-) -> None:
-    """
-    Global janitor:
-    1. Finds ACTIVE tasks with expired locks and requeues or dead-letters them.
-    2. Cleans up orphaned tasks for deleted catalogs.
+_BACKSTOP_DLQ_SQL = """
+UPDATE "{schema}".tasks
+SET status        = 'DEAD_LETTER',
+    error_message = :err,
+    finished_at   = NOW(),
+    owner_id      = NULL,
+    locked_until  = NULL
+WHERE status = 'PENDING'
+  AND retry_count = 0
+  AND task_type = ANY(:task_types)
+  AND timestamp < NOW() - make_interval(secs => :min_age_s)
+RETURNING task_id
+"""
 
-    Uses pg_try_advisory_xact_lock to elect a single Janitor leader across
-    all Cloud Run instances.
-    """
-    from dynastore.modules.tasks.tasks_module import find_stale_tasks, fail_task, cleanup_orphan_tasks
-    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler, managed_transaction
 
-    _JANITOR_LOCK_KEY = _stable_advisory_lock_key("dynastore.janitor.global")
+def _unclaimable_error(task_types: str) -> str:
+    return (
+        f"reaped: task_type(s) {task_types} have no live correct-tier consumer "
+        f"(capability-less backstop) — restore a correct-tier owner and requeue "
+        f"via the catalog-admin dead-letter view or the requeue_dead_letter process"
+    )
 
+
+async def sweep_unclaimable_rows(
+    engine, schema: str, *, ttl_grace_seconds: float, min_age_s: float
+) -> int:
+    """DLQ PENDING rows whose task_type has no live correct-tier owner.
+
+    Uniform DEAD_LETTER for ordinary AND mandatory tasks (recall beats
+    hold-forever). Unlike the capability reaper, this requires no
+    required_capability — it closes the #1647 escape for capability-less rows.
+    Only rows PENDING (retry_count=0) longer than ``min_age_s`` are swept, so a
+    transient owner gap during a deploy does not dead-letter freshly-enqueued
+    work (mirrors the capability sweep's age floor)."""
+    unclaimable = await _find_unclaimable_task_types(engine, ttl_grace_seconds=ttl_grace_seconds)
+    if not unclaimable:
+        return 0
+    sql = _BACKSTOP_DLQ_SQL.format(schema=schema)
+    err = _unclaimable_error(",".join(sorted(unclaimable)))
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, ResultHandler, managed_transaction,
+    )
     async with managed_transaction(engine) as conn:
-        try:
-            lock_acquired = await DQLQuery(
-                "SELECT pg_try_advisory_xact_lock(:lock_key);",
-                result_handler=ResultHandler.SCALAR,
-            ).execute(conn, lock_key=_JANITOR_LOCK_KEY)
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, err=err, task_types=unclaimable, min_age_s=min_age_s,
+        )
+    n = len(rows or [])
+    if n:
+        logger.error("backstop: dead-lettered %d unclaimable row(s) types=%s", n, unclaimable)
+    return n
 
-            if not lock_acquired:
-                return
-        except Exception:
-            return
 
-    # Find stale tasks (expired locks) — global scan
-    try:
-        stale = await find_stale_tasks(engine, visibility_timeout)
-        if stale:
-            logger.info(f"Janitor: Found {len(stale)} stale ACTIVE task(s).")
-            for row in stale:
-                task_id = row["task_id"]
-                retry_count = int(row.get("retry_count", 0))
-                max_retries = int(row.get("max_retries", 3))
-                should_retry = retry_count < max_retries
-                await fail_task(
-                    engine,
-                    task_id=task_id,
-                    timestamp=datetime.now(timezone.utc),
-                    error_message=f"Janitor: visibility window expired (owner={row.get('owner_id')!r})",
-                    retry=should_retry,
+async def auto_requeue_recovered_mandatory(engine, *, ttl_grace_seconds: float) -> int:
+    """Requeue DEAD_LETTER rows of mandatory tasks that now have a live
+    correct-tier owner. The mandatory self-heal: a cleanup dead-lettered during a
+    deploy is recalled automatically when its tier comes back."""
+    total = 0
+    for task_key, tier in _mandatory_specs():
+        owners = await _live_owners_for(engine, task_key, ttl_grace_seconds)
+        if _has_correct_tier_owner(owners, tier):
+            n = await _requeue_dead_letter_tasks_by_type(
+                engine, task_key, reset_retries=True,
+            )
+            if n:
+                logger.info(
+                    "auto-requeue: %d DEAD_LETTER %r row(s) recalled — owner back",
+                    n, task_key,
                 )
-                if not should_retry:
-                    logger.error(
-                        f"Janitor: Task {task_id} moved to DEAD_LETTER after "
-                        f"{retry_count}/{max_retries} retries."
-                    )
-    except Exception as e:
-        logger.warning(f"Janitor: Error scanning stale tasks: {e}")
-
-    # Orphan cleanup
-    try:
-        orphaned = await cleanup_orphan_tasks(engine, orphan_grace_period)
-        if orphaned:
-            logger.info(f"Janitor: Dead-lettered {orphaned} orphaned task(s).")
-    except Exception as e:
-        logger.warning(f"Janitor: Error cleaning orphans: {e}")
+            total += n
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +707,7 @@ async def run_dispatcher(
     shutdown_event: asyncio.Event,
     visibility_timeout: timedelta = timedelta(minutes=5),
     signal_timeout: float = 35.0,
-    batch_size: int = int(os.getenv("DISPATCHER_BATCH_SIZE", "10")),
+    batch_size: Optional[int] = None,
 ) -> None:
     """
     Main dispatcher loop.
@@ -714,7 +728,9 @@ async def run_dispatcher(
                             Janitor can reclaim it (heartbeat extends this).
         signal_timeout:     Max seconds to wait for a signal before running
                             the Janitor anyway (defensive polling).
-        batch_size:         Max tasks to claim per batch (env: DISPATCHER_BATCH_SIZE).
+        batch_size:         Max tasks to claim per batch. When ``None`` (the
+                            default), resolved from
+                            ``TasksPluginConfig.dispatcher_batch_size``.
     """
     from dynastore.modules.tasks.runners import capability_map
     from dynastore.modules.tasks.models import PermanentTaskFailure
@@ -726,6 +742,26 @@ async def run_dispatcher(
 
     # Refresh capability map at startup
     await capability_map.refresh()
+
+    # Resolve runtime tunables from TasksPluginConfig once per run (not per
+    # tick): the batch size and the back-off applied when a worker's
+    # payload-aware ``can_claim`` refuses a row (keeps the same worker from
+    # immediately re-claiming while the row stays visible to other workers).
+    from dynastore.tools.discovery import get_protocol
+    from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+    from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+    _tcfg = None
+    _cm = get_protocol(PlatformConfigsProtocol)
+    if _cm is not None:
+        try:
+            _tcfg = await _cm.get_config(TasksPluginConfig)
+        except Exception:  # noqa: BLE001
+            _tcfg = None
+    if batch_size is None:
+        batch_size = _tcfg.dispatcher_batch_size if isinstance(_tcfg, TasksPluginConfig) else 10
+    claim_reject_backoff = timedelta(
+        seconds=(_tcfg.dispatcher_claim_reject_backoff_seconds if isinstance(_tcfg, TasksPluginConfig) else 30)
+    )
 
     logger.info(
         f"Dispatcher: Started (runner={_RUNNER_ID!r}, batch_size={batch_size}, "
@@ -817,7 +853,7 @@ async def run_dispatcher(
 
                         await bump_claim_rejected(cap_id, row["task_type"])
                     await reset_task_to_pending(
-                        engine, task_id, backoff=_CLAIM_REJECT_BACKOFF,
+                        engine, task_id, backoff=claim_reject_backoff,
                     )
                     return
 

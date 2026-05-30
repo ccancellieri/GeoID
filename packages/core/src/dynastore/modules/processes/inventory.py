@@ -180,10 +180,15 @@ async def build_process_inventory_entries(
     - Sets ``typologies`` / ``url_templates`` when ``include_typology=True``;
       leaves them empty otherwise (strict-OGC payload).
     """
+    from dynastore.tasks import _DYNASTORE_TASKS, task_kind
+
     seen_ids: Set[str] = set()
     processes: List[models.Process] = []
     for registry in get_protocols(ProcessRegistryProtocol):
         for p in await registry.list_processes():
+            cfg = _DYNASTORE_TASKS.get(p.id)
+            if cfg is not None and task_kind(cfg) == "task":
+                continue  # never advertise a system task in the OGC inventory
             if p.id not in seen_ids:
                 processes.append(p)
                 seen_ids.add(p.id)

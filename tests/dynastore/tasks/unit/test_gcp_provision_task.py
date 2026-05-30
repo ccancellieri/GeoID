@@ -263,10 +263,10 @@ async def test_bucket_conflict_marks_conflict_and_is_permanent():
 
 # ---------------------------------------------------------------------------
 # Note: the legacy ``@requires(StorageProtocol)`` / ``are_protocols_satisfied``
-# gate was removed in favour of operator-controlled service-affinity routing
-# (TaskRoutingConfig). The two tests that asserted that gate were dropped:
+# gate was removed in favour of operator-controlled task placement
+# (TaskPlacementConfig). The two tests that asserted that gate were dropped:
 # placement is now a deployment concern, not a source-level declaration.
-# Hard top-level imports of runtime deps in the task module + the routing
+# Hard top-level imports of runtime deps in the task module + the placement
 # config combine to deliver the same outcome (wrong-SCOPE services can't
 # load the task class, so it never enters get_loaded_task_types()).
 # ---------------------------------------------------------------------------

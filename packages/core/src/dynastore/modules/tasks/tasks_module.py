@@ -525,7 +525,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 # fail_task read the same module-level value at runtime.
                 from dynastore.tools.discovery import get_protocol
                 from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-                from dynastore.modules.tasks.tasks_config import TasksPluginConfig, TaskRoutingConfig
+                from dynastore.modules.tasks.tasks_config import TasksPluginConfig
 
                 # Apply per-deployment JSON defaults (idempotent, advisory-locked)
                 # before reading any config — so the seed values are visible to
@@ -558,43 +558,48 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                     except Exception as e:
                         logger.warning(f"TasksModule: Failed to load TasksPluginConfig, defaulting to {poll_interval}s / hard_cap={hard_cap}: {e}")
 
-                # TaskRoutingConfig is consumed lazily by CapabilityMap.refresh()
+                # TaskPlacementConfig is consumed lazily by CapabilityMap.refresh()
                 # via PlatformConfigsProtocol; nothing to load eagerly here.
                 # Register an apply-handler so live PUT /configs updates trigger
                 # a re-narrowing of the dispatcher's capability set without
                 # process restart. The handler also validates the new config
-                # against this process's loaded task types (warns on typos /
-                # types only loaded by other services) and emits an INFO
-                # summary of what this service will claim post-refresh.
+                # against this process's loaded task types (warns on placement
+                # keys only loaded by other services) and emits an INFO summary
+                # of what this service will claim post-refresh.
                 from dynastore.modules.tasks.runners import capability_map as _capability_map
                 from dynastore.modules.tasks.dispatcher import _SERVICE_NAME
+                from dynastore.modules.tasks.placement.model import TaskPlacementConfig
 
-                async def _on_routing_change(cfg, _catalog_id, _collection_id, _conn):
-                    logger.info("TaskRoutingConfig changed — refreshing CapabilityMap.")
+                async def _on_placement_change(cfg, _catalog_id, _collection_id, _conn):
+                    logger.info("TaskPlacementConfig changed — refreshing CapabilityMap.")
                     # Typo / cross-service-only diagnostic — informational only,
                     # since each service loads only the task types its SCOPE
                     # pulls in. A WARN here is the cheapest way to surface
-                    # routing keys that nothing in this deployment can claim.
+                    # placement keys that nothing in this deployment can claim.
                     try:
                         from dynastore.tasks import get_loaded_task_types
                         known = set(get_loaded_task_types())
-                        unknown = sorted(t for t in (getattr(cfg, "routing", {}) or {}) if t not in known)
+                        keys = (
+                            set(getattr(cfg, "placements", {}) or {})
+                            | set(getattr(cfg, "overrides", {}) or {})
+                        )
+                        unknown = sorted(t for t in keys if t not in known)
                         if unknown:
                             logger.warning(
-                                "TaskRoutingConfig: %d routing key(s) not loaded "
+                                "TaskPlacementConfig: %d placement key(s) not loaded "
                                 "on this service ('%s') — likely typos OR types "
                                 "only loaded elsewhere: %s",
                                 len(unknown), _SERVICE_NAME, unknown,
                             )
                     except Exception as exc:  # noqa: BLE001 — never fail apply
-                        logger.debug("Routing-key validation skipped: %s", exc)
+                        logger.debug("Placement-key validation skipped: %s", exc)
                     await _capability_map.refresh()
                     logger.info(
                         "Service '%s' will claim async types: %s",
                         _SERVICE_NAME, _capability_map.async_types,
                     )
 
-                TaskRoutingConfig.register_apply_handler(_on_routing_change)
+                TaskPlacementConfig.register_apply_handler(_on_placement_change)
 
                 async def _on_tasks_config_change(cfg, _catalog_id, _collection_id, _conn):
                     if not isinstance(cfg, TasksPluginConfig):
@@ -705,6 +710,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                         engine, schema, shutdown_event,
                         interval_s=sweep_interval,
                         min_age_s=sweep_min_age,
+                        capability_ttl_s=cap_ttl,
                     ),
                     task_name="service:proactive_capability_sweep",
                 )
@@ -719,6 +725,21 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                         refresh_seconds=cap_refresh,
                     ),
                     task_name="service:capability_publisher",
+                )
+                # Durable task-capability registry: self-publish this pod's task
+                # inventory (version-gated via the shared cache, so the structural
+                # write happens ~once per deploy) and heartbeat last_seen on the
+                # same cadence as the capability publisher.
+                from dynastore.modules.tasks.registry.publisher import (
+                    run_registry_heartbeat,
+                )
+                executor.submit(
+                    run_registry_heartbeat(
+                        engine,
+                        shutdown_event,
+                        refresh_seconds=cap_refresh,
+                    ),
+                    task_name="service:task_registry_heartbeat",
                 )
                 logger.info(f"TasksModule: QueueListener (poll_interval={poll_interval}s) and Multi-Tenant Dispatcher launched.")
             else:
@@ -752,7 +773,7 @@ async def _warn_stuck_pending_tasks(
     PENDING with ``retry_count = 0`` for more than ``min_age_s`` seconds.
 
     The most common cause is operator misconfiguration of
-    :class:`TaskRoutingConfig` — a typo in a service name or a target that
+    :class:`TaskPlacementConfig` — a typo in a service name or a target that
     no deployed service maps to — which leaves tasks sitting unclaimable
     forever. Today the dispatcher's CapabilityMap silently excludes them;
     this coroutine surfaces the silence.
@@ -793,6 +814,44 @@ async def _warn_stuck_pending_tasks(
             logger.warning("stuck-pending warner: scan failed: %s", exc)
 
 
+async def _run_mandatory_backstop_pass(
+    engine: DbResource, schema: str, *, ttl_grace_seconds: float, min_age_s: float
+) -> None:
+    """Leader-coordinated (advisory-locked) backstop pass: log mandatory-ownership
+    violations and DLQ capability-less unclaimable PENDING rows. Runs on whichever
+    pod wins ``pg_try_advisory_xact_lock`` for this pass; others return immediately.
+    Fail-open: any error is logged and swallowed."""
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, ResultHandler, managed_transaction,
+    )
+    from dynastore.modules.tasks.dispatcher import (
+        _stable_advisory_lock_key, sweep_unclaimable_rows,
+        auto_requeue_recovered_mandatory,
+    )
+    from dynastore.modules.tasks.mandatory import check_mandatory_ownership
+
+    lock_key = _stable_advisory_lock_key("dynastore.mandatory.backstop")
+    try:
+        async with managed_transaction(engine) as conn:
+            got = await DQLQuery(
+                "SELECT pg_try_advisory_xact_lock(:k) AS got",
+                result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, k=lock_key)
+            if not got or not got.get("got"):
+                return  # another pod owns this pass; advisory xact lock held until txn end
+            # Lock held for the whole block below (sub-calls open their own pooled
+            # connections; the global advisory lock still serializes the pass).
+            await check_mandatory_ownership(engine, ttl_grace_seconds=ttl_grace_seconds)
+            await sweep_unclaimable_rows(
+                engine, schema, ttl_grace_seconds=ttl_grace_seconds, min_age_s=min_age_s,
+            )
+            await auto_requeue_recovered_mandatory(
+                engine, ttl_grace_seconds=ttl_grace_seconds,
+            )
+    except Exception as exc:  # noqa: BLE001 — never crash the sweep loop
+        logger.warning("proactive_sweep: mandatory backstop pass failed: %s", exc)
+
+
 async def _run_proactive_capability_sweep(
     engine: DbResource,
     schema: str,
@@ -801,6 +860,7 @@ async def _run_proactive_capability_sweep(
     interval_s: float = 60.0,
     min_age_s: float = 300.0,
     max_caps_per_pass: int = 50,
+    capability_ttl_s: float = 90.0,
 ) -> None:
     """Periodically DLQ PENDING/retry=0 rows whose required capability
     has no live worker (issue #524).
@@ -869,6 +929,13 @@ async def _run_proactive_capability_sweep(
                             "(capability=%s task_type=%s): %s",
                             cap_id, task_type, exc,
                         )
+            # Capability-less backstop + mandatory-ownership invariant. Runs on
+            # one pod per pass (advisory-locked inside the helper) so it covers
+            # task types the capability reaper skips for required_capability=None
+            # rows.
+            await _run_mandatory_backstop_pass(
+                engine, schema, ttl_grace_seconds=capability_ttl_s, min_age_s=min_age_s,
+            )
         except Exception as exc:  # noqa: BLE001 — never crash the loop
             logger.warning("proactive_sweep: pass failed: %s", exc)
 
@@ -1009,7 +1076,7 @@ def _stuck_pending_hint(
             f"but none has claimed yet."
         )
     return (
-        f"check TaskRoutingConfig.routing[{task_type!r}] for typos or for "
+        f"check TaskPlacementConfig.placements[{task_type!r}] for typos or for "
         f"a service that should claim it but isn't deployed."
     )
 

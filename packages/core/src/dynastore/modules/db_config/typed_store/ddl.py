@@ -76,6 +76,35 @@ CREATE INDEX IF NOT EXISTS ix_platform_configs_class_key
 """
 
 
+# Durable task-capability registry. Platform-wide observed facts: one row per
+# (service, task_key). Created idempotently alongside the platform config
+# schemas; never ALTERed in place (hard invariant — new columns ship via a fresh
+# CREATE on a clean pre-prod DB, not ADD COLUMN).
+TASK_CAPABILITY_REGISTRY_DDL = """
+CREATE TABLE IF NOT EXISTS configs.task_capability_registry (
+    service             text        NOT NULL,
+    task_key            text        NOT NULL,
+    kind                text        NOT NULL,
+    modes               text[]      NOT NULL DEFAULT '{}',
+    required_capability text        NULL,
+    mandatory           boolean     NOT NULL DEFAULT false,
+    affinity_tier       text        NULL,
+    service_version     text        NOT NULL DEFAULT 'unknown',
+    service_commit      text        NOT NULL DEFAULT 'unknown',
+    version             text        NOT NULL DEFAULT 'unknown',
+    description         text        NOT NULL DEFAULT '',
+    payload_schema      jsonb       NULL,
+    last_seen           timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (service, task_key)
+);
+CREATE INDEX IF NOT EXISTS task_capability_registry_task_key_idx
+    ON configs.task_capability_registry (task_key);
+CREATE INDEX IF NOT EXISTS task_capability_registry_mandatory_idx
+    ON configs.task_capability_registry (task_key) WHERE mandatory;
+"""
+
+
 def tenant_configs_ddl(tenant_schema: str) -> str:
     """Return idempotent DDL for the two per-tenant typed-config tables.
 

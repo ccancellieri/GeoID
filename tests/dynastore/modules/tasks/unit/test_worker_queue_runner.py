@@ -10,13 +10,14 @@ launching a Cloud Run Job. It is the fallback that makes asset-scoped OGC
 This suite asserts the contract:
 
 - ``can_handle`` gating: True only when (a) no in-process task instance exists
-  here AND (b) the task type is routed to a worker via ``TaskRoutingConfig``.
+  here AND (b) the task type is placed on a worker via task placement
+  (``TaskPlacementConfig``).
 - REST-path invocation (no ``task_id`` in extra_context) enqueues exactly one
   ``PENDING`` row via ``create_task`` and returns the ``Task``.
 - Dispatcher-path invocation (``task_id`` present) refuses to re-enqueue.
 - Dedup hit (``create_task`` -> None) returns None.
 - Priority ranks below every in-process runner and below ``GcpJobRunner``.
-- The worker-routed snapshot refreshes from ``TaskRoutingConfig``.
+- The worker-routed snapshot refreshes from task placement.
 """
 
 from __future__ import annotations
@@ -255,27 +256,27 @@ def test_runner_does_not_require_request_context():
 
 
 @pytest.mark.asyncio
-async def test_refresh_worker_routed_types_from_config():
-    """``refresh_worker_routed_types`` collects task types with a non-empty
-    routing target into the sync snapshot."""
+async def test_refresh_worker_routed_types_from_placement(monkeypatch):
+    """``refresh_worker_routed_types`` collects task types whose placement
+    returns a concrete, non-empty consumer list into the sync snapshot."""
     import dynastore.modules.tasks.runners as runners_mod
-    from dynastore.modules.tasks.tasks_config import TaskRoutingConfig
+    from dynastore.modules.tasks.placement import resolver as placement_resolver
 
-    cfg = TaskRoutingConfig(
-        routing={"gdal": ["worker"], "ingestion": ["worker"], "noop": []}
+    monkeypatch.setattr(
+        runners_mod, "get_loaded_task_types", lambda: ["gdal", "ingestion", "noop"]
     )
-    fake_config_mgr = MagicMock()
-    fake_config_mgr.get_config = AsyncMock(return_value=cfg)
 
-    with patch(
-        "dynastore.tools.discovery.get_protocol", return_value=fake_config_mgr
-    ):
-        await runners_mod.refresh_worker_routed_types()
+    async def _consumers(task_key):
+        return {"gdal": ["worker"], "ingestion": ["worker"], "noop": []}.get(task_key)
+
+    monkeypatch.setattr(placement_resolver, "resolved_consumers", _consumers)
+
+    await runners_mod.refresh_worker_routed_types()
 
     snap = runners_mod.get_worker_routed_types_sync()
     assert "gdal" in snap
     assert "ingestion" in snap
-    assert "noop" not in snap, "Empty target list must NOT be treated as routed."
+    assert "noop" not in snap, "Empty consumer list must NOT be treated as routed."
 
 
 @pytest.mark.asyncio

@@ -122,7 +122,8 @@ async def list_dead_letter_tasks(
 
 
 async def requeue_dead_letter_task(
-    engine: AsyncEngine, task_id: str, reset_retries: bool = True
+    engine: AsyncEngine, task_id: str, reset_retries: bool = True,
+    schema_name: Optional[str] = None,
 ) -> bool:
     """
     Resets a DEAD_LETTER task back to PENDING for another attempt.
@@ -131,11 +132,17 @@ async def requeue_dead_letter_task(
     Args:
         reset_retries: If True, resets retry_count to 0 (full fresh start).
                        If False, keeps the count (will fail again on next exhaustion).
+        schema_name: If provided, the UPDATE only matches a task whose tenant tag
+                     (the ``schema_name`` column) equals this value — an atomic
+                     tenant guard so a caller scoped to one tenant cannot requeue
+                     another tenant's task by id. None = no tenant filter
+                     (platform/sysadmin-wide requeue).
     Returns:
         True if the task was found and requeued, False otherwise.
     """
     task_schema = get_task_schema()
     retry_clause = "retry_count = 0," if reset_retries else ""
+    tenant_clause = "AND schema_name = :schema_name" if schema_name is not None else ""
     sql = f"""
         UPDATE {task_schema}.tasks
         SET status       = 'PENDING',
@@ -145,11 +152,15 @@ async def requeue_dead_letter_task(
             error_message = NULL
         WHERE task_id = :task_id
           AND status  = 'DEAD_LETTER'
+          {tenant_clause}
         RETURNING task_id;
     """
+    params = {"task_id": task_id}
+    if schema_name is not None:
+        params["schema_name"] = schema_name
     async with managed_transaction(engine) as conn:
         row = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
-            conn, task_id=task_id
+            conn, **params
         )
     if row:
         logger.info(f"Maintenance: Task {task_id} re-queued from DEAD_LETTER.")

@@ -370,6 +370,74 @@ async def _unapply_preset_bundle(preset, base_scope: dict) -> dict:
     return await dispatch_preset(preset, "unapply", base_scope=base_scope)
 
 
+from dynastore.modules.tasks.registry import repository as _registry_repo  # noqa: E402
+
+# Small indirections so the read view is unit-testable without a DB/app and so
+# the platform-engine accessor matches the rest of this module.
+_registry_list_all = _registry_repo.list_all
+
+
+def _platform_engine():
+    from dynastore.models.protocols import DatabaseProtocol
+
+    db = get_protocol(DatabaseProtocol)
+    return db.engine if db is not None else None
+
+
+async def list_task_registry() -> list[dict]:
+    """Return all observed task-capability registry rows.
+
+    Sysadmin-gated by the broad ``admin_access`` policy on ``/admin/.*``; this
+    view exposes only observed platform facts (no mutation).
+    """
+    engine = _platform_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return await _registry_list_all(engine)
+
+
+from dynastore.modules.tasks.maintenance import (  # noqa: E402
+    list_dead_letter_tasks as _dlq_list,
+    requeue_dead_letter_task as _dlq_requeue,
+)
+
+# Same indirection style as ``_registry_list_all``: aliases the maintenance
+# primitives so the catalog DLQ views are unit-testable without a DB/app.
+
+
+async def _catalog_task_schema(catalog_id: str, engine) -> str:
+    """Resolve the catalog's task-row ``schema_name`` (the tenant tag DLQ queries
+    filter on). Reuses the tasks module's catalog->schema resolver."""
+    from dynastore.modules.tasks.tasks_module import _resolve_catalog_schema
+    return await _resolve_catalog_schema(catalog_id, engine)
+
+
+async def list_catalog_dead_letter(catalog_id: str) -> list[dict]:
+    """Dead-lettered tasks for one catalog (catalog-admin recovery view)."""
+    engine = _platform_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    schema = await _catalog_task_schema(catalog_id, engine)
+    return await _dlq_list(engine, schema_name=schema)
+
+
+async def requeue_catalog_dead_letter(catalog_id: str, task_id: str) -> dict:
+    """One-shot recall of a dead-lettered task (catalog-admin).
+
+    Tenant-scoped: resolves the catalog's task ``schema_name`` and passes it to
+    ``requeue_dead_letter_task``, whose UPDATE then only matches a task carrying
+    that tag. A catalog admin therefore cannot requeue another catalog's task
+    even by guessing its id — the UPDATE matches nothing and returns
+    ``requeued: false``.
+    """
+    engine = _platform_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    schema = await _catalog_task_schema(catalog_id, engine)
+    ok = await _dlq_requeue(engine, task_id, reset_retries=True, schema_name=schema)
+    return {"task_id": task_id, "requeued": bool(ok)}
+
+
 class AdminService(ExtensionProtocol):
     always_on = True
     priority: int = 200
@@ -388,6 +456,17 @@ class AdminService(ExtensionProtocol):
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
         yield
+
+    # -------------------------------------------------------------------------
+    # Task-Capability Registry (/admin/task-registry)
+    # -------------------------------------------------------------------------
+
+    @router.get(
+        "/task-registry",
+        summary="Sysadmin view of the durable task-capability registry (observed facts).",
+    )
+    async def list_task_registry_view():  # type: ignore[reportGeneralTypeIssues]
+        return await list_task_registry()
 
     # -------------------------------------------------------------------------
     # Principal Management (/admin/principals)
@@ -720,6 +799,22 @@ class AdminService(ExtensionProtocol):
             provisioning_status=provisioning_status,
             task=task_view,
         )
+
+    @router.get(
+        "/catalogs/{catalog_id}/dead-letter",
+        summary="List dead-lettered tasks for this catalog (catalog-admin).",
+    )
+    async def list_catalog_dead_letter_view(catalog_id: str):  # type: ignore[reportGeneralTypeIssues]
+        await _assert_catalog_exists(catalog_id)
+        return await list_catalog_dead_letter(catalog_id)
+
+    @router.post(
+        "/catalogs/{catalog_id}/dead-letter/{task_id}/requeue",
+        summary="One-shot recall of a dead-lettered task (catalog-admin).",
+    )
+    async def requeue_catalog_dead_letter_view(catalog_id: str, task_id: str):  # type: ignore[reportGeneralTypeIssues]
+        await _assert_catalog_exists(catalog_id)
+        return await requeue_catalog_dead_letter(catalog_id, task_id)
 
     @router.post(
         "/catalogs/{catalog_id}/principals/{principal_id}/roles",

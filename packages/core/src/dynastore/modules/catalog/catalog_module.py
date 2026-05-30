@@ -87,6 +87,34 @@ from dynastore.modules.catalog.log_manager import LogService, initialize_system_
 logger = logging.getLogger(__name__)
 
 
+EVENT_TASK_KEY = "outbox_drain"
+
+
+async def _placement_consumers(task_key: str) -> Optional[List[str]]:
+    from dynastore.modules.tasks.placement.resolver import resolved_consumers
+    return await resolved_consumers(task_key)
+
+
+def _service_name() -> Optional[str]:
+    from dynastore.modules.db_config.instance import get_service_name
+    return get_service_name()
+
+
+async def is_event_consumer() -> bool:
+    """True iff this service is a placement consumer of the event/outbox task.
+
+    Fail-closed: a missing/empty consumer list or unknown service name means
+    "not a consumer" — an unconfigured or degraded deployment never starts a
+    durable consumer (avoids a connection storm; outbox depth stays visible in
+    monitoring instead).
+    """
+    consumers = await _placement_consumers(EVENT_TASK_KEY)
+    svc = _service_name()
+    if not consumers or svc is None:
+        return False
+    return svc in consumers
+
+
 def _register_cascade_owners(
     registry: Any,
     owner_modules: List[tuple[str, str]],
@@ -442,51 +470,32 @@ class CatalogModule(ModuleProtocol):
             # Both reindex and task.failed listeners are registered
             # unconditionally above, so has_listeners() is True on every
             # service that loads CatalogModule. Gate consumer startup on
-            # the deployment's TaskRoutingConfig.event_consumer_services
-            # — the same admin-managed config that already governs which
-            # tasks each service may claim. Default-empty means an
-            # unconfigured deployment fails noisy (event-outbox depth
-            # visible in monitoring) rather than silent (connection
-            # storm everywhere — see the marker-plugin failure in
+            # task placement: event consumers are exactly the placement
+            # consumers of the event/outbox task, resolved through the same
+            # admin-managed placement config that governs which tasks each
+            # service may claim. Fail-closed (no resolved consumers / unknown
+            # service name) means an unconfigured deployment fails noisy
+            # (event-outbox depth visible in monitoring) rather than silent
+            # (connection storm everywhere — see the marker-plugin failure in
             # commit 3a3ceda which leaked through Python entry-point
             # loading).
-            from dynastore.modules.tasks.tasks_config import TaskRoutingConfig
-            from dynastore.modules.db_config.instance import get_service_name
-
             _consumer_shutdown = asyncio.Event()
-            service_name = get_service_name()
-            routing_cfg: Optional[TaskRoutingConfig] = None
-            config_mgr = get_protocol(ConfigsProtocol)
-            if config_mgr is not None:
-                try:
-                    cfg = await config_mgr.get_config(TaskRoutingConfig)
-                    if isinstance(cfg, TaskRoutingConfig):
-                        routing_cfg = cfg
-                except Exception as exc:  # noqa: BLE001 — never block startup
-                    logger.warning(
-                        "TaskRoutingConfig lookup failed during consumer-gate "
-                        "evaluation: %s. Defaulting to consumer-disabled.", exc,
-                    )
-
-            is_consumer = bool(
-                routing_cfg
-                and service_name
-                and service_name in routing_cfg.event_consumer_services
-            )
+            service_name = _service_name()
+            is_consumer = await is_event_consumer()
 
             if self.event_service.has_listeners() and is_consumer:
                 logger.info(
-                    "CatalogModule: service=%r is in "
-                    "TaskRoutingConfig.event_consumer_services — "
-                    "starting durable event consumer.", service_name,
+                    "CatalogModule: service=%r is a placement consumer of %r "
+                    "— starting durable event consumer.",
+                    service_name, EVENT_TASK_KEY,
                 )
                 await self.event_service.start_consumer(_consumer_shutdown)
             else:
                 logger.info(
                     "CatalogModule: event consumer not started "
-                    "(has_listeners=%s, service=%r, configured=%r).",
+                    "(has_listeners=%s, service=%r, is_consumer=%s).",
                     self.event_service.has_listeners(), service_name,
-                    list(routing_cfg.event_consumer_services) if routing_cfg else None,
+                    is_consumer,
                 )
 
             # 7. Start soft-delete TTL reaper background loop.

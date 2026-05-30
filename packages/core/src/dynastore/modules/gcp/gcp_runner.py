@@ -41,11 +41,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Default lease for a freshly-launched Cloud Run Job. Picked to outlast typical
-# job startup + run; the in-job heartbeat (main_task.py) extends it while the
-# job runs, and the pg_cron reaper resets the row if the lease lapses.
-_DEFAULT_TASK_TIMEOUT_SECONDS = int(os.getenv("TASK_TIMEOUT", "3600"))
-
 # Lease used for the REST-path INSERT-as-claimed flow.  No longer a cold-start
 # *guess* (#726's 60→300s bump was a fragile fixed timer) — it is now just a
 # modest floor covering the window before the GcpLivenessReconciler's first
@@ -210,7 +205,22 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
         execution_id = generate_id_hex()
         owner_id = f"gcp_cloud_run_{execution_id}"
-        task_lease = timedelta(seconds=_DEFAULT_TASK_TIMEOUT_SECONDS)
+        # Lease for a freshly-launched Cloud Run Job. Picked to outlast typical
+        # job startup + run; the in-job heartbeat (main_task.py) extends it while
+        # the job runs, and the pg_cron reaper resets the row if the lease lapses.
+        _timeout_seconds = 3600
+        try:
+            from dynastore.tools.discovery import get_protocol
+            from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+            _cm = get_protocol(PlatformConfigsProtocol)
+            if _cm is not None:
+                _cfg = await _cm.get_config(TasksPluginConfig)
+                if isinstance(_cfg, TasksPluginConfig):
+                    _timeout_seconds = _cfg.task_timeout_seconds
+        except Exception:  # noqa: BLE001 — default lease on any read failure
+            pass
+        task_lease = timedelta(seconds=_timeout_seconds)
         new_locked_until = datetime.now(timezone.utc) + task_lease
 
         existing_task: Optional[Task] = None
