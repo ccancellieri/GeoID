@@ -186,7 +186,7 @@ async def stream_features(
                 req.raw_params = bind_params
         except Exception as e:
             logger.error(f"CQL parse error: {e}")
-            raise ValueError(f"Invalid CQL filter: {e}")
+            raise ValueError(f"Invalid CQL filter: {e}") from e
 
     # Privileged system read (exporter): this path is driven by server-side
     # export config with no end-user principal; allow all rows from the envelope JOIN.
