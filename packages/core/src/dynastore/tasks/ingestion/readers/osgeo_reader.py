@@ -220,11 +220,11 @@ class GdalOsgeoReader(SourceReaderProtocol):
                 if geom is not None:
                     try:
                         geom_geojson = json.loads(geom.ExportToJson())
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001 — geometry_wkb is the fallback path
                         pass
                     try:
                         geom_wkb = bytes(geom.ExportToWkb())
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001 — feature still yields; caller decides
                         pass
                 # Emit the GeoJSON Feature record shape (`{"properties": …,
                 # "geometry": …}`) so call sites that deconstruct reader

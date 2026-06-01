@@ -121,8 +121,12 @@ class GcpCatalogCleanupTask(TaskProtocol):
                 # Force teardown as fallback
                 try:
                     await eventing.teardown_catalog_eventing(catalog_id, config=None)
-                except Exception:
-                    pass
+                except Exception as force_exc:  # noqa: BLE001 — best-effort; cleanup continues
+                    logger.warning(
+                        "GcpCatalogCleanupTask[CATALOG]: force eventing teardown for '%s' "
+                        "also failed (resource may already be gone): %s",
+                        catalog_id, force_exc,
+                    )
 
         # 2. Delete bucket
         if storage:

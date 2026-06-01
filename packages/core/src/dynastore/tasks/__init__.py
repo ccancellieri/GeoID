@@ -1,6 +1,5 @@
 import logging
 import inspect
-import os
 from dataclasses import dataclass
 from contextlib import asynccontextmanager, AsyncExitStack
 from typing import Dict, Type, Any, Optional, List, cast, AsyncGenerator
@@ -432,7 +431,8 @@ async def manage_tasks(app_state: object, include_only: Optional[List[str]] = No
                     logger.debug(f"Task '{name}' does not implement lifespan. Skipping.")
             except Exception as e:
                 logger.error(f"Failed to initialize task '{name}': {e}", exc_info=True)
-                # If a task fails to initialize, we continue with others unless it's critical?
-                # For now, we just log the error.
+                # Startup resilience: a failing optional task must not prevent others
+                # from initializing. Mandatory-task invariants are enforced separately
+                # by the backstop pass (which dead-letters rows when no live owner exists).
 
         yield
