@@ -170,12 +170,6 @@ async def lifespan(app: FastAPI):
                     _scope,
                     os.environ.get("IDP_ISSUER_URL") or "<none>",
                 )
-            # Freeze the cascade-cleanup registry now that ALL module AND
-            # extension lifespans have run and registered their resource owners.
-            # Done here (not inside CatalogModule) so registration order cannot
-            # silently lock out a late-registering module/extension. See geoid#1468.
-            from dynastore.modules.catalog.cascade_registry import finalize_cascade_registry
-            finalize_cascade_registry()
             logger.info("--- [main.py] Web Extensions are active. Application is running. ---")
             yield
 
@@ -276,10 +270,6 @@ async def run_worker(concurrency: int = 1):
 
     # 3. Run module lifespans — TasksModule will start the dispatcher and queue listener.
     async with modules_lifespan(app_state):
-        # Worker runs modules only (no extensions); freeze the cascade registry
-        # once all module lifespans have registered their owners. See geoid#1468.
-        from dynastore.modules.catalog.cascade_registry import finalize_cascade_registry
-        finalize_cascade_registry()
         logger.info("--- [main.py] Worker running. Dispatcher managed by TasksModule. ---")
         # Block until manually terminated (SIGTERM will set the shutdown event
         # inside TasksModule and clean up gracefully).

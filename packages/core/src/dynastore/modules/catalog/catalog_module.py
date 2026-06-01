@@ -382,11 +382,14 @@ class CatalogModule(ModuleProtocol):
                 ),
             ]
             _register_cascade_owners(cascade_cleanup_registry, _owner_modules)
-            # The registry is NOT frozen here. It is frozen by the
-            # application-level finalize_cascade_registry() fence in main.py,
-            # AFTER all module and extension lifespans have run, so a
-            # module/extension that registers its own cascade owner in its own
-            # lifespan is not locked out by registration order. See geoid#1468.
+            # Freeze the registry immediately after all owners have been
+            # registered via _register_cascade_owners above.  All cascade
+            # owners are contributed through that call (modules and
+            # extensions alike), so the fence can live here rather than in
+            # main.py. Removes the last named-module coupling from main.py.
+            # See geoid#1683.
+            from dynastore.modules.catalog.cascade_registry import finalize_cascade_registry
+            finalize_cascade_registry()
 
             # Wire AssetEntitySyncSubscriber to drive AssetIndexer fan-out
             # from the events bus. Replaces the legacy per-driver listener
