@@ -308,6 +308,36 @@ class GcpLivenessReconciler:
                     "GcpLivenessReconciler: task %s %s (execution=%s) — failed (retry).",
                     task_id, verdict.value, runner_ref,
                 )
+                # Exactly-once: fire the terminal Action only when the owner-guarded
+                # write landed.  DEAD maps to on_timeout (Cloud Run taskTimeout
+                # cancellation) while TERMINAL_FAILED maps to on_failure (logic
+                # error / non-zero exit).
+                _outcome = "timeout" if verdict == LivenessVerdict.DEAD else "failure"
+                try:
+                    from dynastore.modules.tasks.execution import (
+                        apply_terminal_action as _apply_terminal_action,
+                        resolve_routing_terminal as _resolve_routing_terminal,
+                    )
+                    _terminal = await _resolve_routing_terminal(task.task_type)
+                    _action = _terminal.on_timeout if verdict == LivenessVerdict.DEAD else _terminal.on_failure
+                    await _apply_terminal_action(
+                        self._engine,
+                        outcome=_outcome,
+                        action=_action,
+                        task_id=task_id,
+                        task_type=task.task_type,
+                        inputs=row.get("inputs"),
+                        caller_id=row.get("caller_id"),
+                        collection_id=row.get("collection_id"),
+                        schema=row.get("schema_name", "tasks"),
+                        scope=row.get("scope"),
+                    )
+                except Exception as _ta_exc:
+                    logger.warning(
+                        "GcpLivenessReconciler: apply_terminal_action(%s) failed "
+                        "for task %s: %s — continuing.",
+                        _outcome, task_id, _ta_exc,
+                    )
             else:
                 logger.warning(
                     "GcpLivenessReconciler: task %s %s (execution=%s) but fail_task "
@@ -337,6 +367,32 @@ class GcpLivenessReconciler:
                     task_id, runner_ref,
                     "" if outputs is not None else " (no outputs on row)",
                 )
+                # Exactly-once: fire on_success only when the owner-guarded write
+                # landed.  A lost race (else branch) must not double-enqueue.
+                try:
+                    from dynastore.modules.tasks.execution import (
+                        apply_terminal_action as _apply_terminal_action,
+                        resolve_routing_terminal as _resolve_routing_terminal,
+                    )
+                    _terminal = await _resolve_routing_terminal(task.task_type)
+                    await _apply_terminal_action(
+                        self._engine,
+                        outcome="success",
+                        action=_terminal.on_success,
+                        task_id=task_id,
+                        task_type=task.task_type,
+                        inputs=row.get("inputs"),
+                        caller_id=row.get("caller_id"),
+                        collection_id=row.get("collection_id"),
+                        schema=row.get("schema_name", "tasks"),
+                        scope=row.get("scope"),
+                    )
+                except Exception as _ta_exc:
+                    logger.warning(
+                        "GcpLivenessReconciler: apply_terminal_action(success) failed "
+                        "for task %s: %s — continuing.",
+                        task_id, _ta_exc,
+                    )
             else:
                 logger.warning(
                     "GcpLivenessReconciler: task %s TERMINAL_SUCCEEDED (execution=%s) but "

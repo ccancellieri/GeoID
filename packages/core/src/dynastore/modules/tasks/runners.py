@@ -497,6 +497,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
         from dynastore.modules.tasks.tasks_module import (
             complete_task as _complete_task,
             fail_task as _fail_task,
+            dead_letter_task as _dead_letter_task,
         )
         from dynastore.modules.tasks.execution import (
             apply_terminal_action as _apply_terminal_action,
@@ -549,7 +550,13 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         f"({context.task_type}) in background."
                     )
                     hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-                    result = await task_instance.run(hydrated_payload)
+                    if _terminal.timeout_seconds:
+                        result = await asyncio.wait_for(
+                            task_instance.run(hydrated_payload),
+                            timeout=_terminal.timeout_seconds,
+                        )
+                    else:
+                        result = await task_instance.run(hydrated_payload)
 
                     await _complete_task(
                         context.engine, claimed_task_id,
@@ -605,6 +612,26 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     await _emit_task_failure(context, None, error_message, e)
                     # Permanent failure is terminal (FAILED) — fire on_failure.
                     await _apply_terminal("failure", _terminal.on_failure)
+
+                except asyncio.TimeoutError:
+                    timeout_s = _terminal.timeout_seconds
+                    logger.error(
+                        "BackgroundRunner: claimed task '%s' (%s) timed out after %ss — dead-lettering.",
+                        claimed_task_id, context.task_type, timeout_s,
+                    )
+                    try:
+                        await _dead_letter_task(
+                            context.engine, claimed_task_id, _dt.now(_tz.utc),
+                            f"Runner timed out after {timeout_s}s",
+                        )
+                    except Exception as dle:
+                        logger.critical(
+                            "BackgroundRunner: failed to dead-letter timed-out task '%s': %s — "
+                            "pg_cron reaper will catch it via expired locked_until.",
+                            claimed_task_id, dle, exc_info=True,
+                        )
+                    # Distinct terminal outcome — fire on_timeout (NOT on_failure).
+                    await _apply_terminal("timeout", _terminal.on_timeout)
 
                 except Exception as e:
                     logger.error(
