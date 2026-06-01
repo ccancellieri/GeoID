@@ -30,6 +30,16 @@ async def cleanup_iam(engine):
             ("iam", "role_hierarchy"),
             ("iam", "roles"),
             ("iam", "policies"),
+            # applied_presets MUST be cleared whenever roles/policies are wiped.
+            # The cold-boot preset bootstrap treats an applied_presets row as a
+            # "already seeded" sentinel and SKIPS re-application (only the
+            # force=True presets re-assert). Deleting the role/policy rows while
+            # leaving the sentinel behind produces a split-brain: the DB looks
+            # provisioned but the unauthenticated role has no policies, so every
+            # request — including /health and the static web UI — fails
+            # deny-by-default with 403 until the sentinel is cleared. Wiping the
+            # data must re-arm the bootstrap, exactly as a preset DELETE does.
+            ("iam", "applied_presets"),
             ("users", "oauth_tokens"),
             ("users", "oauth_codes"),
             ("users", "users")
