@@ -19,6 +19,8 @@ When it is not loaded, the `DefaultAuthorizer` sentinel takes over and
 fails closed on privileged checks.
 """
 
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any, ClassVar, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -27,6 +29,79 @@ from pydantic import BaseModel, Field, model_validator
 from dynastore.models.protocols.authorization_context import SecurityContext
 from dynastore.models.mutability import Immutable, Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
+
+
+# --- Effective-permissions trace types (public protocol surface) ---
+#
+# These dataclasses are the public interface consumed by the admin
+# explainer route.  The IAM engine (modules/iam/policies.py) constructs
+# and populates them during a traced ``evaluate_access`` call; non-IAM
+# code (admin_service.py) only needs to instantiate ``TraceCollector``
+# and read its fields back — it must not import from
+# ``dynastore.modules.iam.*``.
+
+
+@dataclass
+class GrantTraceRecord:
+    """Mutable per-policy walk record populated by the IAM engine during
+    a traced ``evaluate_access`` call.
+
+    Fields mirror :class:`GrantTraceEntry` (the wire DTO) so the
+    explainer route can translate with a one-for-one mapping.
+    """
+
+    policy_id: str
+    grant_id: str
+    subject_kind: str = "role"
+    subject_ref: str = ""
+    object_kind: str = "policy"
+    object_ref: str = ""
+    effect: str = "allow"
+    resource_kind: Optional[str] = None
+    resource_ref: Optional[str] = None
+    matched: bool = False
+    why_not: Optional[str] = None
+    conditions_evaluated: List[Dict[str, Any]] = field(default_factory=list)
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    in_validity_window: bool = True
+
+
+@dataclass
+class TraceCollector:
+    """Carries trace state through ``_resolve_effective_policies`` and
+    ``evaluate_access``.
+
+    Callers that want a trace instantiate ``TraceCollector()`` and pass
+    it as ``trace_collector=`` to the policy engine; the hot path passes
+    ``None`` and pays nothing.
+
+    ``records`` accumulates one ``GrantTraceRecord`` per policy walk
+    step; ``decision_reason`` and ``deny_precedence_applied`` are set by
+    the engine's winner-selection step.
+    """
+
+    records: List[GrantTraceRecord] = field(default_factory=list)
+    deny_precedence_applied: bool = False
+    decision_reason: str = ""
+
+    def add(self, rec: GrantTraceRecord) -> None:
+        self.records.append(rec)
+
+    def find_or_create(self, policy_id: str, grant_id: str) -> GrantTraceRecord:
+        """Return an existing record matching ``(policy_id, grant_id)``,
+        or create and append a fresh one.
+        """
+        for r in self.records:
+            if r.policy_id == policy_id and r.grant_id == grant_id:
+                return r
+        rec = GrantTraceRecord(
+            policy_id=policy_id,
+            grant_id=grant_id or policy_id,
+            object_ref=policy_id,
+        )
+        self.records.append(rec)
+        return rec
 
 
 class Permission(str, Enum):

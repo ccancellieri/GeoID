@@ -16,28 +16,48 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-import re
 import enum
+import json
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import List, Optional, Tuple, Any, Dict, Union, cast
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from uuid import UUID
-from dynastore.modules.iam.compiled_rule_cache import (
-    get_compiled_rule_cache,
-    get_ttl_seconds,
-    iam_rule_version_async,
-)
-from dynastore.modules.db_config.exceptions import TableNotFoundError
+
+from dynastore.models.driver_context import DriverContext
+from dynastore.models.protocols import DatabaseProtocol
 from dynastore.models.protocols.access_filter import (
     AccessClause,
     AccessFilter,
     FieldPredicate,
     RangePredicate,
 )
-import json
+from dynastore.models.protocols.authorization import (
+    GrantTraceRecord,
+    IamRolesConfig,
+    TraceCollector,
+)
+from dynastore.modules import get_protocol
+from dynastore.modules.db_config.exceptions import TableNotFoundError
+from dynastore.modules.db_config.query_executor import managed_transaction
+from dynastore.modules.iam.compiled_rule_cache import (
+    get_compiled_rule_cache,
+    get_ttl_seconds,
+    iam_rule_version_async,
+)
+from dynastore.modules.iam.iam_storage import AbstractIamStorage
+from dynastore.modules.iam.policy_storage import AbstractPolicyStorage
+from dynastore.modules.iam.postgres_policy_storage import PostgresPolicyStorage
+
+from .models import PolicyBundle, Policy, Condition, Role, Principal  # noqa: F401
+
+# Private aliases kept for IAM-internal references throughout this module.
+_GrantTraceRecord = GrantTraceRecord
+_TraceCollector = TraceCollector
 
 _SAFE_SCHEMA_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_schema_name(schema: str) -> str:
@@ -45,92 +65,6 @@ def _validate_schema_name(schema: str) -> str:
     if not _SAFE_SCHEMA_RE.match(schema):
         raise ValueError(f"Invalid schema name: {schema!r}")
     return schema
-
-from dynastore.models.protocols.authorization import IamRolesConfig
-
-from .models import PolicyBundle, Policy, Condition, Role, Principal  # noqa: F401
-
-
-# --- Effective-permissions explainer support (#1346 backend half) ---
-#
-# A trace is a *byproduct* of the existing evaluate_access walk: every
-# step the engine already takes (resolve effective policies → walk each
-# policy for method/resource/conditions → rank) drops a record into a
-# collector when one is passed in. The hot path passes nothing and pays
-# nothing (default ``None``); the explainer route passes a collector and
-# reads back the full annotated walk. The decision the engine returns is
-# identical with or without a collector — that invariant is enforced by
-# the drift property test.
-
-
-@dataclass
-class _GrantTraceRecord:
-    """Mutable per-policy walk record the collector fills in as the walk
-    proceeds. Mirrors :class:`GrantTraceEntry` field-for-field; the
-    explainer route translates the dataclass to the Pydantic DTO.
-
-    ``policy_id`` is keyed by the engine's policy iteration; the
-    collector cross-references ``grant_by_policy_id`` (populated during
-    resolution) to backfill grant-row identity. Defaults pre-fill the
-    "policy not reached via a binding" shape so a record that never sees
-    a grant row still has sensible values."""
-
-    policy_id: str
-    grant_id: str
-    subject_kind: str = "role"
-    subject_ref: str = ""
-    object_kind: str = "policy"
-    object_ref: str = ""
-    effect: str = "allow"
-    resource_kind: Optional[str] = None
-    resource_ref: Optional[str] = None
-    matched: bool = False
-    why_not: Optional[str] = None
-    conditions_evaluated: List[Dict[str, Any]] = field(default_factory=list)
-    valid_from: Optional[datetime] = None
-    valid_until: Optional[datetime] = None
-    in_validity_window: bool = True
-
-
-@dataclass
-class _TraceCollector:
-    """Carries trace state through ``_resolve_effective_policies`` and
-    ``evaluate_access``. Default-constructed when the caller asks for a
-    trace; the hot path passes ``None`` and never allocates one.
-
-    ``records`` is keyed by ``Policy.id`` *plus* a discriminator (grant
-    id or ``"policy:<id>"``) so a policy reached via multiple grants
-    (e.g. same role bound twice with different validity windows) shows
-    as multiple records — that's what the operator needs to see.
-
-    ``decision_reason`` is set by the walk's winner-selection step so
-    the API response mirrors the engine's audit log line by
-    construction."""
-
-    records: List[_GrantTraceRecord] = field(default_factory=list)
-    deny_precedence_applied: bool = False
-    decision_reason: str = ""
-
-    def add(self, rec: _GrantTraceRecord) -> None:
-        self.records.append(rec)
-
-    def find_or_create(self, policy_id: str, grant_id: str) -> _GrantTraceRecord:
-        """Look up a previously-recorded entry (resolution time) so the
-        walk can mark it matched / record per-condition outcomes. Falls
-        back to creating a fresh record when the policy is reached
-        through a path the resolver did not annotate (custom_policies,
-        statement-only bundles).
-        """
-        for r in self.records:
-            if r.policy_id == policy_id and r.grant_id == grant_id:
-                return r
-        rec = _GrantTraceRecord(
-            policy_id=policy_id,
-            grant_id=grant_id or policy_id,
-            object_ref=policy_id,
-        )
-        self.records.append(rec)
-        return rec
 
 
 def _find_trace_record_for_policy(
@@ -163,15 +97,6 @@ def _find_trace_record_for_policy(
     )
     collector.records.append(rec)
     return rec
-from .policy_storage import AbstractPolicyStorage
-from .iam_storage import AbstractIamStorage
-from .postgres_policy_storage import PostgresPolicyStorage
-from dynastore.modules.db_config.query_executor import managed_transaction
-from dynastore.modules import get_protocol
-from dynastore.models.protocols import DatabaseProtocol
-from dynastore.models.driver_context import DriverContext
-
-logger = logging.getLogger(__name__)
 
 
 

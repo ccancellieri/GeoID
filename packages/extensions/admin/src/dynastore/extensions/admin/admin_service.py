@@ -1427,8 +1427,8 @@ class AdminService(ExtensionProtocol):
         # Run the SAME evaluator the hot path uses, with a trace
         # collector attached. The hot-path call site stays untouched —
         # ``trace_collector`` defaults to ``None``.
-        from dynastore.modules.iam.policies import _TraceCollector
-        collector = _TraceCollector()
+        from dynastore.models.protocols.authorization import TraceCollector
+        collector = TraceCollector()
         perm = mgr.get_policy_service()
         allowed, _reason = await perm.evaluate_access(  # type: ignore[attr-defined]
             principals=principals_list,
