@@ -1,6 +1,6 @@
 """Unit tests for the canonical field-type vocabulary (``dynastore.models.field_types``).
 
-Pins: the strict canonical set, the temporary legacy-alias normalization layer
+Pins: the strict canonical set, the legacy-alias normalization layer
 and rejection of truly-unknown tokens, parametrized-geometry passthrough, OGR
 (type, subtype) mapping incl. subtype promotion, the raster band vocabulary, and
 the ``FieldDefinition`` validator wiring.
@@ -16,6 +16,7 @@ from dynastore.models.field_types import (
     CANONICAL_TO_JSON_SCHEMA,
     CANONICAL_TO_PG_DDL,
     GDAL_BAND_TYPES,
+    LEGACY_DATA_TYPE_ALIASES,
     DataSubtype,
     DataType,
     canonical_band_type,
@@ -23,7 +24,6 @@ from dynastore.models.field_types import (
     normalize_subtype,
     ogr_to_canonical,
 )
-from dynastore.models.legacy_type_aliases import LEGACY_DATA_TYPE_ALIASES
 from dynastore.models.protocols.field_definition import FieldDefinition
 
 
@@ -62,8 +62,8 @@ def test_parametrized_geometry_preserved_lowercased() -> None:
     ("json", "jsonb"), ("guid", "uuid"), ("bytea", "binary"), ("blob", "binary"),
 ])
 def test_legacy_aliases_normalize(alias: str, expected: str) -> None:
-    # TEMPORARY compatibility window: legacy/SQL spellings normalize to canonical
-    # (case-insensitively) so pre-canonical configs keep validating.
+    # Legacy/SQL spellings normalize to canonical (case-insensitively) so
+    # pre-canonical configs keep validating.
     assert canonical_data_type(alias) == expected
     assert canonical_data_type(alias.upper()) == expected
     assert expected in CANONICAL_DATA_TYPES

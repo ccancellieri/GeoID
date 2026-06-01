@@ -33,19 +33,80 @@ preserved on the optional ``subtype`` axis so they are no longer flattened away;
 ``Int16``/``Float32`` keep their base today and are recorded for the planned
 narrowing to ``SMALLINT``/``REAL`` (see ``CANONICAL_TO_PG_DDL`` below).
 
-The user-facing reference — the canonical vocabulary, the temporary deprecated
-aliases (see :mod:`dynastore.models.legacy_type_aliases`), and the planned
-changes — is ``docs/components/field-types.md``; keep it in sync with the tables
-in this module.
+The user-facing reference — the canonical vocabulary, the deprecated aliases in
+:data:`LEGACY_DATA_TYPE_ALIASES`, and the planned changes — is
+``docs/components/field-types.md``; keep it in sync with the tables in this module.
 """
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-# TEMPORARY legacy-alias compatibility — delete this import with the module.
-from dynastore.models.legacy_type_aliases import normalize_legacy_data_type
+
+# ---------------------------------------------------------------------------
+# Legacy / SQL spelling → canonical data_type aliases
+# ---------------------------------------------------------------------------
+# These map pre-canonical configs that used SQL or informal spellings onto the
+# strict canonical tokens so existing configs keep validating. Keys are
+# lowercase; callers normalize case before lookup. Date/time/timestamp stay
+# distinct — only the zoned/`datetime` spellings fold into ``timestamp``.
+# The "Deprecated" column in ``docs/components/field-types.md`` is derived
+# from this table; keep both in sync when entries change.
+LEGACY_DATA_TYPE_ALIASES: Dict[str, str] = {
+    # string family
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "character": "string",
+    "character varying": "string",
+    "str": "string",
+    "keyword": "string",
+    # 32-bit integer family
+    "int": "integer",
+    "int4": "integer",
+    "smallint": "integer",
+    "int2": "integer",
+    "int32": "integer",
+    # 64-bit integer family
+    "int8": "bigint",
+    "long": "bigint",
+    "int64": "bigint",
+    # binary floating point
+    "float": "double",
+    "float8": "double",
+    "real": "double",
+    "double precision": "double",
+    # exact decimal
+    "decimal": "numeric",
+    "number": "numeric",
+    # boolean
+    "bool": "boolean",
+    # instant (zoned/legacy spellings only — `date` and `time` stay distinct)
+    "datetime": "timestamp",
+    "timestamptz": "timestamp",
+    "timestamp with time zone": "timestamp",
+    "timestamp without time zone": "timestamp",
+    # json
+    "json": "jsonb",
+    # uuid
+    "guid": "uuid",
+    # binary
+    "bytea": "binary",
+    "blob": "binary",
+}
+
+
+def normalize_legacy_data_type(low: Optional[str]) -> Optional[str]:
+    """Map a lowercased legacy/SQL spelling to its canonical token, or ``None``.
+
+    ``low`` must already be stripped + lowercased. Returns a canonical
+    ``data_type`` string when ``low`` is a known legacy alias, otherwise
+    ``None`` so the caller can fall through to its strict-reject path.
+    """
+    if not low:
+        return None
+    return LEGACY_DATA_TYPE_ALIASES.get(low)
 
 
 class DataType(str, Enum):
@@ -99,9 +160,7 @@ def canonical_data_type(value: Optional[str]) -> str:
       embedded SRID, so it must survive unchanged apart from case.
     - A canonical token (case-insensitive) is returned lowercased.
     - A legacy/SQL spelling (``text``, ``int``, ``datetime`` …) is normalized to
-      its canonical token via the temporary, separately-kept alias table
-      (:mod:`dynastore.models.legacy_type_aliases`) — a compatibility window that
-      is deleted once configs migrate.
+      its canonical token via :data:`LEGACY_DATA_TYPE_ALIASES`.
     - Anything else raises ``ValueError``.
     """
     if value is None:
@@ -114,7 +173,6 @@ def canonical_data_type(value: Optional[str]) -> str:
         return low
     if low in CANONICAL_DATA_TYPES:
         return low
-    # TEMPORARY legacy-alias fallback — delete with the module once migrated.
     aliased = normalize_legacy_data_type(low)
     if aliased is not None:
         return aliased
