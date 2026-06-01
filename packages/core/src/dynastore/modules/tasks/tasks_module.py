@@ -1555,9 +1555,20 @@ async def update_task(
 
     query_params = {**update_fields, "task_id": task_id, "schema_name": schema}
 
-    updated_task_dict = await DQLQuery(
-        sql, result_handler=ResultHandler.ONE_DICT
-    ).execute(conn, **query_params)
+    # Commit the write explicitly. ``conn`` is frequently a bare engine — every
+    # BackgroundRunner / GcpJobRunner terminal flip passes ``context.engine`` —
+    # and ``DQLQuery.execute`` on an engine routes through the executor's
+    # pool-return path, which ROLLS BACK any open transaction before handing the
+    # connection back to the pool. The UPDATE's ``RETURNING`` row is therefore
+    # read (so a Task is returned) while the status change is silently discarded.
+    # Running the write inside ``managed_transaction`` commits via ``conn.begin()``
+    # for an engine input, or a savepoint for a live-connection input (the caller
+    # still owns the outer commit), so the flip lands for every caller. Mirrors
+    # ``create_task`` / ``complete_task``.
+    async with managed_transaction(conn) as tx_conn:
+        updated_task_dict = await DQLQuery(
+            sql, result_handler=ResultHandler.ONE_DICT
+        ).execute(tx_conn, **query_params)
 
     get_task.cache_invalidate(conn, task_id, schema)
     return Task.model_validate(updated_task_dict) if updated_task_dict else None
