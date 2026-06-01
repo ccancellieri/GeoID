@@ -338,7 +338,7 @@ async def shared_catalog(app_lifespan_module, worker_id):
         )
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(loop_scope="module")
 async def shared_collection_factory(shared_catalog, sysadmin_in_process_client_module):
     """Function-scoped factory that creates random collections inside the
     module-shared catalog and cleans them up on test teardown.
@@ -353,7 +353,9 @@ async def shared_collection_factory(shared_catalog, sysadmin_in_process_client_m
     collections this specific test created are removed.
 
     Depends on ``sysadmin_in_process_client_module`` (module-scoped client)
-    so we don't pay client-bootstrap overhead per test.
+    so we don't pay client-bootstrap overhead per test. ``loop_scope="module"``
+    ensures setup and teardown share the same event loop as the module-scoped
+    dependencies, preventing asyncio loop conflicts on fixture finalization.
     """
     created: list[tuple[str, str]] = []
 
