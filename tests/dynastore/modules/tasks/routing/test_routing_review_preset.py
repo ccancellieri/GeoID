@@ -3,14 +3,16 @@
 Covers four concerns:
 (a) review preset routes gdal to background runner on catalog with BACKGROUND hint.
 (b) cloud preset remains unchanged — gdal still gcp_cloud_run with {OFFLOAD, HEAVY}.
-(c) ReviewTaskRoutingPreset is registered in the platform-tier preset registry.
+(c) ReviewTaskRoutingPreset is registered only when osgeo is present.
 (d) Prod-bleed guard: scope_catalog and scope_geoid do NOT pull in scope_catalog_review
-    or the gdal sub-extras (module_gdal / worker_task_gdal).
+    or the gdal sub-extras (module_gdal / worker_task_gdal), directly or transitively.
 """
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from dynastore.modules.tasks.routing.exec_hints import ExecHint
 from dynastore.modules.tasks.routing.matrix import (
@@ -112,21 +114,30 @@ def test_cloud_gdal_no_background_hint():
 
 
 # ---------------------------------------------------------------------------
-# (c) ReviewTaskRoutingPreset registered
+# (c) ReviewTaskRoutingPreset registered only when osgeo present
 # ---------------------------------------------------------------------------
 
 
-def test_review_preset_registered():
-    from dynastore.modules.storage.presets.registry import list_presets
-    # Importing presets triggers _register() as a side-effect.
-    from dynastore.modules.tasks.routing import presets as _  # noqa: F401
-    assert "review" in list_presets()
+def test_osgeo_present_registers_review(monkeypatch):
+    from dynastore.modules.tasks.routing import presets as routing_presets
+    fake = MagicMock()
+    monkeypatch.setattr("dynastore.modules.storage.presets.register_preset", fake)
+    monkeypatch.setattr(routing_presets, "_osgeo_available", lambda: True)
+    routing_presets._register()
+    registered = [c.args[0].name for c in fake.call_args_list]
+    assert "review" in registered
+    assert "cloud" in registered and "onprem" in registered
 
 
-def test_review_preset_get_returns_review_object():
-    from dynastore.modules.storage.presets.registry import get_preset
-    from dynastore.modules.tasks.routing.presets import ReviewTaskRoutingPreset
-    assert get_preset("review") is ReviewTaskRoutingPreset
+def test_osgeo_absent_skips_review(monkeypatch):
+    from dynastore.modules.tasks.routing import presets as routing_presets
+    fake = MagicMock()
+    monkeypatch.setattr("dynastore.modules.storage.presets.register_preset", fake)
+    monkeypatch.setattr(routing_presets, "_osgeo_available", lambda: False)
+    routing_presets._register()
+    registered = [c.args[0].name for c in fake.call_args_list]
+    assert "review" not in registered
+    assert "cloud" in registered and "onprem" in registered
 
 
 def test_review_preset_platform_tier():
@@ -159,6 +170,50 @@ def _load_extras() -> dict:
     with pyproject.open("rb") as f:
         data = tomllib.load(f)
     return data["project"]["optional-dependencies"]
+
+
+_DYNASTORE_REF = re.compile(r"dynastore\[([^\]]+)\]")
+
+
+def _transitive_extras(name: str, extras: dict, seen: set | None = None) -> set:
+    """Recursively expand ``dynastore[a,b,...]`` references reachable from
+    ``extras[name]`` and return the full set of extra names pulled in
+    (including ``name`` itself)."""
+    seen = seen if seen is not None else set()
+    if name in seen or name not in extras:
+        return seen
+    seen.add(name)
+    for dep in extras[name]:
+        for m in _DYNASTORE_REF.finditer(dep):
+            for part in (p.strip() for p in m.group(1).split(",")):
+                if part:
+                    _transitive_extras(part, extras, seen)
+    return seen
+
+
+_GDAL_FAMILY = {"module_gdal", "worker_task_gdal", "extension_gdal", "task_gdal_deps", "gdal", "scope_catalog_review"}
+
+
+def test_scope_catalog_transitively_excludes_gdal():
+    extras = _load_extras()
+    closure = _transitive_extras("scope_catalog", extras)
+    assert not (closure & _GDAL_FAMILY), (
+        f"scope_catalog transitively pulls gdal-family extras: {sorted(closure & _GDAL_FAMILY)} (prod-bleed)"
+    )
+
+
+def test_scope_geoid_transitively_excludes_gdal():
+    extras = _load_extras()
+    closure = _transitive_extras("scope_geoid", extras)
+    assert not (closure & _GDAL_FAMILY), (
+        f"scope_geoid transitively pulls gdal-family extras: {sorted(closure & _GDAL_FAMILY)} (prod-bleed)"
+    )
+
+
+def test_scope_catalog_review_transitively_includes_gdal():
+    extras = _load_extras()
+    closure = _transitive_extras("scope_catalog_review", extras)
+    assert {"module_gdal", "worker_task_gdal"} <= closure
 
 
 def test_scope_catalog_does_not_include_gdal_extras():

@@ -11,18 +11,29 @@ admin presets UI and ``/admin/presets`` with dry-run/apply/rollback.
 """
 from __future__ import annotations
 
+import importlib.util
 import logging
 
 logger = logging.getLogger(__name__)
 
 
+def _osgeo_available() -> bool:
+    """True when GDAL's ``osgeo`` bindings are importable.
+
+    The review preset routes the gdal process to an in-process background
+    runner on the catalog service; that only works on an image that ships
+    GDAL.  On a GDAL-less image the preset would mis-route gdal work, so it
+    is only registered where osgeo is present.
+    """
+    return importlib.util.find_spec("osgeo") is not None
+
+
 class _TaskRoutingPreset:
     """Minimal RoutingPreset: materializes a TaskRoutingConfig at platform tier.
 
-    Mirrors the shape of ``_PlacementRoutingPreset`` in
-    ``placement/presets.py``: a thin factory that emits a validated
-    ``PresetBundle`` whose single entry carries the ``TaskRoutingConfig``
-    for the active deployment profile.
+    A thin factory that emits a validated ``PresetBundle`` whose single
+    entry carries the ``TaskRoutingConfig`` for the active deployment
+    profile.
     """
 
     catalog_scopable = False
@@ -78,7 +89,8 @@ def _register() -> None:
         from dynastore.modules.storage.presets import register_preset
         register_preset(CloudTaskRoutingPreset)
         register_preset(OnpremTaskRoutingPreset)
-        register_preset(ReviewTaskRoutingPreset)
+        if _osgeo_available():
+            register_preset(ReviewTaskRoutingPreset)
     except Exception:
         logger.warning(
             "task routing presets not registered in storage registry",

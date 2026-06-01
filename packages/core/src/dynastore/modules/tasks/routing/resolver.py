@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 async def _load_config() -> TaskRoutingConfig:
     """Load the platform-tier TaskRoutingConfig, fail-open to an empty default.
 
-    Mirrors placement/resolver._load_config: uses PlatformConfigsProtocol when
-    available; falls back to TaskRoutingConfig() (which fills the registry-
-    derived defaults via _materialize_if_empty) when the protocol is absent or
-    returns an unexpected type.
+    Uses PlatformConfigsProtocol when available; falls back to
+    TaskRoutingConfig() (which fills the registry-derived defaults via
+    _materialize_if_empty) when the protocol is absent or returns an
+    unexpected type.
     """
     from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
     from dynastore.tools.discovery import get_protocol
@@ -44,7 +44,7 @@ async def resolved_targets(task_key: str) -> List[RunnerTarget]:
 
     A failure to load the config (network error, DB unavailable, corrupt config)
     returns [] and logs a WARNING so the caller can degrade gracefully --
-    identical to the placement resolver's fail-open contract.
+    a fail-open contract: a degraded registry never makes a pod refuse to claim.
     """
     try:
         cfg = await _load_config()
