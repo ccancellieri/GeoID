@@ -34,7 +34,7 @@ Usage::
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, List, Optional, Type, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, List, Optional, Tuple, Type, TypeVar, cast
 
 from fastapi import HTTPException, Request, Response, status
 
@@ -115,6 +115,62 @@ class OGCServiceMixin:
 
     def register_policies(self) -> None:
         """Override in subclass to register IAM policies.  Default: no-op."""
+
+    @staticmethod
+    def register_ogc_preset(
+        *,
+        name: str,
+        description: str,
+        keywords: Tuple[str, ...],
+        policies_factory: Callable[[], List[Any]],
+        role_bindings_factory: Callable[[], List[Any]],
+    ) -> None:
+        """Register a ``PolicyContributorPreset`` from two pure-data factories.
+
+        Shared registration plumbing for all OGC-extension presets.  Each
+        extension calls this from its ``presets/__init__.py`` with its own
+        ``name``, ``description``, ``keywords``, and the two callables that
+        return its ``Policy`` / ``Role`` declarations.
+
+        The factories are invoked at ``apply`` / ``revoke`` / ``dry_run``
+        time (not at registration time), matching the existing
+        ``contributor_factory`` semantics of ``PolicyContributorPreset``.
+
+        Both callable shapes are supported:
+
+        * **Module-function style** — pass the imported function directly,
+          e.g. ``policies_factory=stac_policies``.
+        * **Inline style** — pass a lambda or nested function that returns
+          the list, e.g.
+          ``policies_factory=lambda: [Policy(id="foo_public_access", ...)]``.
+
+        Behavioral equivalence guarantee: the registered preset is
+        structurally identical to one constructed by hand — same ``name``,
+        ``description``, ``keywords``, and a ``contributor_factory`` that
+        returns an object whose ``get_policies()`` / ``get_role_bindings()``
+        results come directly from the supplied factories unchanged.
+        """
+        from dynastore.modules.storage.presets.policy_contributor_adapter import (
+            PolicyContributorPreset,
+        )
+        from dynastore.modules.storage.presets.registry import register_preset
+
+        _p_factory = policies_factory
+        _rb_factory = role_bindings_factory
+
+        class _Contributor:
+            def get_policies(self) -> List[Any]:
+                return _p_factory()
+
+            def get_role_bindings(self) -> List[Any]:
+                return _rb_factory()
+
+        register_preset(PolicyContributorPreset(
+            name=name,
+            description=description,
+            keywords=keywords,
+            contributor_factory=_Contributor,
+        ))
 
     # ------------------------------------------------------------------
     # Protocol getters (cached, with standard error handling)

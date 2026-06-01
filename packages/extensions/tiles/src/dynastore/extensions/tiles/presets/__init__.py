@@ -14,47 +14,41 @@
 
 """Tiles extension preset — auto-register on import."""
 
-from dynastore.modules.storage.presets.policy_contributor_adapter import (
-    PolicyContributorPreset,
-)
-from dynastore.modules.storage.presets.registry import register_preset
+from dynastore.extensions.ogc_base import OGCServiceMixin
 
 
-class _TilesPolicyContributor:
-    def get_policies(self):
-        from dynastore.models.protocols.policies import Policy
-        return [
-            Policy(
-                id="tiles_public_access",
-                description="Allows anonymous access to tiles endpoints.",
-                actions=["GET", "OPTIONS"],
-                resources=[
-                    "/tiles.*",
-                    "/tiles/.*",
-                ],
-                effect="ALLOW",
-            ),
-        ]
-
-    def get_role_bindings(self):
-        from dynastore.models.protocols.policies import Role
-        from dynastore.models.protocols.authorization import IamRolesConfig
-        return [
-            Role(
-                name=IamRolesConfig().anonymous_role_name,
-                description="Anonymous user with limited access.",
-                policies=["tiles_public_access"],
-            ),
-        ]
+def _tiles_policies():
+    from dynastore.models.protocols.policies import Policy
+    return [
+        Policy(
+            id="tiles_public_access",
+            description="Allows anonymous access to tiles endpoints.",
+            actions=["GET", "OPTIONS"],
+            resources=[
+                "/tiles.*",
+                "/tiles/.*",
+            ],
+            effect="ALLOW",
+        ),
+    ]
 
 
-def _make_contributor() -> _TilesPolicyContributor:
-    return _TilesPolicyContributor()
+def _tiles_role_bindings():
+    from dynastore.models.protocols.policies import Role
+    from dynastore.models.protocols.authorization import IamRolesConfig
+    return [
+        Role(
+            name=IamRolesConfig().anonymous_role_name,
+            description="Anonymous user with limited access.",
+            policies=["tiles_public_access"],
+        ),
+    ]
 
 
-register_preset(PolicyContributorPreset(
+OGCServiceMixin.register_ogc_preset(
     name="tiles_enable",
     description="Tiles extension public-access policy",
     keywords=("iam", "tiles", "platform"),
-    contributor_factory=_make_contributor,
-))
+    policies_factory=_tiles_policies,
+    role_bindings_factory=_tiles_role_bindings,
+)

@@ -14,47 +14,41 @@
 
 """Features extension preset — auto-register on import."""
 
-from dynastore.modules.storage.presets.policy_contributor_adapter import (
-    PolicyContributorPreset,
-)
-from dynastore.modules.storage.presets.registry import register_preset
+from dynastore.extensions.ogc_base import OGCServiceMixin
 
 
-class _FeaturesPolicyContributor:
-    def get_policies(self):
-        from dynastore.models.protocols.policies import Policy
-        return [
-            Policy(
-                id="features_public_access",
-                description="Allows anonymous access to OGC API Features endpoints.",
-                actions=["GET", "OPTIONS"],
-                resources=[
-                    "/features.*",
-                    "/features/.*",
-                ],
-                effect="ALLOW",
-            ),
-        ]
-
-    def get_role_bindings(self):
-        from dynastore.models.protocols.policies import Role
-        from dynastore.models.protocols.authorization import IamRolesConfig
-        return [
-            Role(
-                name=IamRolesConfig().anonymous_role_name,
-                description="Anonymous user with limited access.",
-                policies=["features_public_access"],
-            ),
-        ]
+def _features_policies():
+    from dynastore.models.protocols.policies import Policy
+    return [
+        Policy(
+            id="features_public_access",
+            description="Allows anonymous access to OGC API Features endpoints.",
+            actions=["GET", "OPTIONS"],
+            resources=[
+                "/features.*",
+                "/features/.*",
+            ],
+            effect="ALLOW",
+        ),
+    ]
 
 
-def _make_contributor() -> _FeaturesPolicyContributor:
-    return _FeaturesPolicyContributor()
+def _features_role_bindings():
+    from dynastore.models.protocols.policies import Role
+    from dynastore.models.protocols.authorization import IamRolesConfig
+    return [
+        Role(
+            name=IamRolesConfig().anonymous_role_name,
+            description="Anonymous user with limited access.",
+            policies=["features_public_access"],
+        ),
+    ]
 
 
-register_preset(PolicyContributorPreset(
+OGCServiceMixin.register_ogc_preset(
     name="features_enable",
     description="OGC API Features public-access policy",
     keywords=("iam", "features", "platform"),
-    contributor_factory=_make_contributor,
-))
+    policies_factory=_features_policies,
+    role_bindings_factory=_features_role_bindings,
+)

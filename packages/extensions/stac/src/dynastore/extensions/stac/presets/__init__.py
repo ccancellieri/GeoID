@@ -18,24 +18,13 @@ The contributor lives inside the preset, not on the service. Services
 don't mutate platform IAM state; presets do.
 """
 
+from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.stac.policies import stac_policies, stac_role_bindings
-from dynastore.modules.storage.presets.policy_contributor_adapter import (
-    PolicyContributorPreset,
-)
-from dynastore.modules.storage.presets.registry import register_preset
 
-
-class _STACPolicyContributor:
-    def get_policies(self):
-        return stac_policies()
-
-    def get_role_bindings(self):
-        return stac_role_bindings()
-
-
-register_preset(PolicyContributorPreset(
+OGCServiceMixin.register_ogc_preset(
     name="stac_enable",
     description="STAC extension IAM policies + anonymous read access",
     keywords=("iam", "stac", "platform"),
-    contributor_factory=_STACPolicyContributor,
-))
+    policies_factory=stac_policies,
+    role_bindings_factory=stac_role_bindings,
+)
