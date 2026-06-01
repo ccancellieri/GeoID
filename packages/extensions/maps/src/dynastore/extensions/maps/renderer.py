@@ -17,7 +17,6 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import random
-import uuid
 import logging
 from osgeo import gdal, ogr, osr, __version__ as gdal_version
 import xml.etree.ElementTree as ET

@@ -18,5 +18,7 @@
 
 from .decorators import expose_static, expose_web_page
 
+__all__ = ["expose_static", "expose_web_page"]
+
 # Register the web_enable preset into the global preset registry on import.
 from . import presets as _web_presets  # noqa: F401  -- preset registration side-effect

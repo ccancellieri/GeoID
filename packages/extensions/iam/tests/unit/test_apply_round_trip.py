@@ -4,7 +4,7 @@ Uses an in-memory state dict to simulate a minimal policy + role store.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from unittest.mock import MagicMock
 import pytest
 
@@ -12,7 +12,6 @@ from dynastore.extensions.iam.presets.iam_baseline import (
     IamBaseline,
     IamBaselineParams,
     _iam_service_policies,
-    _iam_service_role_bindings,
 )
 from dynastore.modules.storage.presets.preset import AppliedDescriptor, PresetContext
 

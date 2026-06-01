@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional
 from dynastore.models.shared_models import Link
 from dynastore.extensions.tools.ogc_common_models import LandingPage

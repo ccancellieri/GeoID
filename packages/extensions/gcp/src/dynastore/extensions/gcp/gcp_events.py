@@ -21,7 +21,6 @@ from dynastore.modules.concurrency import run_in_thread
 import logging
 from typing import (
     Optional,
-    cast,
     Dict,
     Any,
     List,
@@ -40,8 +39,6 @@ from dynastore.modules import get_protocol
 from dynastore.modules.gcp.tools import bucket as bucket_tool
 from dynastore.modules.db_config.query_executor import (
     managed_transaction,
-    DQLQuery,
-    ResultHandler,
     DbResource,
 )
 from dynastore.modules.gcp.gcp_config import (
@@ -49,7 +46,6 @@ from dynastore.modules.gcp.gcp_config import (
     GcpCatalogBucketConfig,
     GcpCollectionBucketConfig,
     GcsNotificationEventType,
-    TriggeredAction,
 )
 from dynastore.modules.catalog.event_service import CatalogEventType
 from dynastore.modules.events.models import (
@@ -59,7 +55,6 @@ from dynastore.modules.events.models import (
     EventSubscriptionCreate,
 )
 from fastapi.security import APIKeyHeader
-from dynastore.tasks.ingestion.ingestion_models import TaskIngestionRequest
 from dynastore.modules.processes.models import ExecuteRequest
 import dynastore.modules.processes.processes_module as processes_module
 try:
