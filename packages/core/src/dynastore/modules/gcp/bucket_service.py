@@ -19,7 +19,7 @@
 import logging
 import asyncio
 import re
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from google.cloud import storage

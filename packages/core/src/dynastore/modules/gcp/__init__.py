@@ -29,18 +29,18 @@ try:
     # By importing the bucket_reporter here, we ensure that whenever the GCPModule
     # is active, the GcsDetailedReporter is automatically registered with the
     # ingestion task system. This makes it discoverable.
-    from dynastore.modules.gcp import bucket_reporter
+    from dynastore.modules.gcp import bucket_reporter  # noqa: F401  -- side-effect: registers GcsDetailedReporter
 except ImportError as e:
     logger.debug(f"GCP Module: bucket_reporter skipped due to missing dependencies: {e}")
 
 try:
     # By importing the gcp_config here, we ensure that the PluginConfig models
     # auto-register via PluginConfig.__init_subclass__ when the GCP module loads.
-    from dynastore.modules.gcp import gcp_config
+    from dynastore.modules.gcp import gcp_config  # noqa: F401  -- side-effect: auto-registers PluginConfig models
 except ImportError as e:
     logger.debug(f"GCP Module: gcp_config skipped due to missing dependencies: {e}")
 
 try:
-    from dynastore.modules.gcp import gcp_ingestion_operations
+    from dynastore.modules.gcp import gcp_ingestion_operations  # noqa: F401  -- side-effect: registers ingestion operations
 except ImportError as e:
     logger.debug(f"GCP Module: gcp_ingestion_operations skipped due to missing dependencies: {e}")

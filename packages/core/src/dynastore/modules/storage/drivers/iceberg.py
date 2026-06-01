@@ -75,7 +75,6 @@ from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.modules.protocols import ModuleProtocol
 from dynastore.tools.async_utils import LoopLocalLock
-from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.driver_config import (
     ItemsIcebergDriverConfig,
@@ -593,7 +592,6 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
             dicts_to_features,
         )
         from dynastore.modules.storage.driver_config import (
-            ItemsWritePolicy,
             WriteConflictPolicy,
         )
 

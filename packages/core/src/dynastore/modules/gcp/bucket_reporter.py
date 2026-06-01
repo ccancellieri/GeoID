@@ -25,9 +25,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING
 
 from dynastore.tools.json import CustomJSONEncoder
-from dynastore.modules import get_protocol
 from dynastore.modules.concurrency import run_in_thread
-from dynastore.tasks.ingestion.ingestion_models import TaskIngestionRequest
 from dynastore.tasks.reporters import ReportingInterface
 from dynastore.tasks.ingestion.reporters import ingestion_reporter
 from dynastore.tools.path import insert_before_extension
@@ -74,7 +72,7 @@ _FEATURE_STRUCTURAL_KEYS = frozenset(
 _REPORT_ENVELOPE_KEYS = frozenset({"stats", "system"})
 
 if TYPE_CHECKING:
-    from dynastore.modules.gcp.gcp_module import GCPModule
+    pass
 
 
 class GcsDetailedReporterConfig(BaseModel):

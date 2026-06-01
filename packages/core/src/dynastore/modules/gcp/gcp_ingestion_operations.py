@@ -20,7 +20,7 @@ import io
 import zipfile
 import logging
 import httpx
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 from pydantic import BaseModel
 try:
     from google.cloud import storage

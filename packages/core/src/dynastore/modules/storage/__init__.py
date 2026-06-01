@@ -49,7 +49,6 @@ from dynastore.modules.storage.driver_config import (
     ItemsSchema,
     DriverCapability,
     DriverPluginConfig,
-    ItemsPostgresqlDriverConfig,
     WriteConflictPolicy,
 )
 from dynastore.modules.storage.computed_fields import (

@@ -17,14 +17,12 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Annotated, Any, Callable, ClassVar, Dict, List, Literal, Optional, TYPE_CHECKING, Tuple, Union
-from datetime import date
+from typing import Any, ClassVar, Dict, List, Optional, TYPE_CHECKING, Tuple, Union
 from dynastore.models.mutability import Immutable, Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 import os
 if TYPE_CHECKING:
-    from dynastore.modules.gcp.gcp_module import GCPModule
     from dynastore.modules.db_config.query_executor import DbResource
 
 from dynastore.modules.gcp.models import (
@@ -32,7 +30,7 @@ from dynastore.modules.gcp.models import (
     ExternalTopicSubscription,
     LifecycleRule
 )
-from enum import Enum, StrEnum
+from enum import StrEnum
 
 # --- Application Hooks ---
 

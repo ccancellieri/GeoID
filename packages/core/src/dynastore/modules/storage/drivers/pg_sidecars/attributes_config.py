@@ -23,7 +23,7 @@ Provides enhanced configuration for attribute storage, including storage modes
 (Relational vs JSONB), per-attribute indexing, and partitioning control.
 """
 
-from typing import List, Optional, Dict, Any, Union, Literal
+from typing import List, Optional, Dict, Any, Literal
 from enum import Enum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, SidecarConfigRegistry

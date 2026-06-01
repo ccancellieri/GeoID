@@ -17,7 +17,6 @@ from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.drivers.bigquery_models import (
     BigQueryCredentials,
-    BigQueryTarget,
     ItemsBigQueryDriverConfig,
 )
 from dynastore.modules.storage.drivers.bigquery_stream import (

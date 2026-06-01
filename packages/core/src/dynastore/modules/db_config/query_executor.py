@@ -26,9 +26,7 @@ import weakref
 import contextvars
 import hashlib
 import os
-import secrets
 import time
-from uuid import UUID, uuid4
 from abc import abstractmethod, ABC
 from contextlib import asynccontextmanager, contextmanager
 from sqlalchemy import text, DDL
@@ -46,15 +44,13 @@ from sqlalchemy.ext.asyncio import (
     AsyncTransaction,
 )
 from sqlalchemy.exc import (
-    ProgrammingError,
-    IntegrityError,
     InterfaceError,
     OperationalError,
     PendingRollbackError,
     InvalidRequestError,
 )
 from geoalchemy2.shape import to_shape
-from geoalchemy2.elements import WKBElement, WKTElement, _SpatialElement
+from geoalchemy2.elements import WKBElement, WKTElement
 from sqlalchemy import Table, MetaData
 from typing import (
     Iterator,
@@ -71,7 +67,6 @@ from typing import (
     cast,
     Type,
     Dict,
-    Set,
     TypeGuard,
 )
 from pydantic import BaseModel
@@ -1703,7 +1698,7 @@ class DQLQuery(BaseQuery):
         return inst
 
 
-from .ddl_inference import _infer_existence_check, _ddl_existence_cache
+from .ddl_inference import _infer_existence_check
 
 
 

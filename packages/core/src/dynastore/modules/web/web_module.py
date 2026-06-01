@@ -21,7 +21,7 @@ import inspect
 import os
 import re
 from pathlib import Path
-from typing import Dict, Any, Callable, List, Optional, Union
+from typing import Dict, Any, Callable, List, Optional
 from contextlib import asynccontextmanager
 
 from dynastore.tools.language_utils import resolve_localized_field

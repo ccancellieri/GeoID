@@ -62,8 +62,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List, Optional
 
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.entity_store import (
-    CatalogStore,
-    CollectionStore,
     EntityStoreCapability,
 )
 from dynastore.models.protocols.typed_driver import TypedDriver

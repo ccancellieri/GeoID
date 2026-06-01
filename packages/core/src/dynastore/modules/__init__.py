@@ -19,17 +19,16 @@
 # dynastore/modules/__init__.py
 
 import logging
-import pkgutil
-import importlib
-import os
 import inspect
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass, field
-from typing import Any, Dict, Tuple, Type, TypeVar, List, Optional
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, Tuple, Type, TypeVar, List, Optional
 
 from .protocols import ModuleProtocol
-from dynastore.tools.discovery import get_protocol, get_protocols
+from dynastore.tools.discovery import (  # noqa: F401  -- re-exported as dynastore.modules.get_protocol/get_protocols
+    get_protocol,
+    get_protocols,
+)
 from dynastore.tools.env import load_component_dotenv
 
 logger = logging.getLogger(__name__)

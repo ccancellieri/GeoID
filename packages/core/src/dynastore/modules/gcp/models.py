@@ -18,12 +18,12 @@
 
 #    dynastore/modules/gcp/models.py
 
-from typing import Optional, Literal, List, Any, Dict, Annotated
-from pydantic import BaseModel, Field, model_validator, AliasChoices, ConfigDict
+from typing import Optional, Literal, Annotated
+from pydantic import BaseModel, Field, model_validator
 from datetime import date
 
 
-from enum import Enum, StrEnum
+from enum import StrEnum
 
 # --- GCP Specific Event Types ---
 class GcpEventType(StrEnum):

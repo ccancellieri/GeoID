@@ -172,8 +172,6 @@ class GcpStorageOpsMixin:
         """
         from datetime import datetime, timezone, timedelta
         from fastapi import HTTPException, status as http_status
-        from enum import Enum
-        from google.api_core.retry import Retry
         import google.api_core.exceptions
         from dynastore.modules.gcp.tools import bucket as bucket_tool
         from dynastore.modules.gcp.gcp_config import (

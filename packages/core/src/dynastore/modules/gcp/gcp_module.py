@@ -20,7 +20,7 @@ import logging
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, ClassVar, Optional, AsyncIterator, Dict, Any, List, Tuple, Union
+from typing import TYPE_CHECKING, ClassVar, Optional, AsyncIterator, Dict, Any, List
 
 if TYPE_CHECKING:
     from google.api_core import exceptions as google_exceptions
@@ -34,14 +34,12 @@ else:
         google_exceptions = None
         Aborted = None
 from dynastore.tools.cache import cached
-import dynastore.modules as dm
 from dynastore.modules import ModuleProtocol
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config.query_executor import (
     DbResource,
     managed_transaction,
-    DDLQuery,
     DQLQuery,
     ResultHandler,
 )
@@ -52,31 +50,13 @@ from dynastore.models.protocols import (
     CloudStorageClientProtocol,
     CloudIdentityProtocol,
     EventingProtocol,
-    DatabaseProtocol,
-    CatalogsProtocol,
     AssetUploadProtocol,
-    UploadTicket,
-    UploadStatus,
-    UploadStatusResponse,
 )
 from dynastore.modules.gcp.tools.service_account import get_credentials
 from dynastore.modules.gcp import gcp_db
-from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry, LifecycleContext
-from dynastore.modules.catalog.log_manager import log_info, log_error, log_warning
 from dynastore.modules.db_config import maintenance_tools
 from dynastore.modules.gcp.gcp_config import (
-    GcpCatalogBucketConfig,
-    GcpEventingConfig,
-    ManagedBucketEventing,
-    GcpCollectionBucketConfig,
-    GcsNotificationEventType,
     GcpModuleConfig,
-    TriggeredAction,
-)
-from dynastore.modules.gcp.models import (
-    GcpEventType,
-    PushSubscriptionConfig,
-    PUBSUB_JWT_AUDIENCE,
 )
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
 

@@ -36,7 +36,6 @@ def write_zarr(
 
     import numpy as np
     import xarray as xr
-    import zarr
 
     # One float32 accumulation buffer per band
     data: dict[str, np.ndarray] = {

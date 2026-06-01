@@ -18,7 +18,6 @@
 
 import asyncio
 import logging
-import os
 import datetime
 from dateutil.relativedelta import relativedelta
 from typing import Literal
@@ -31,16 +30,10 @@ from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     DbResource,
     ResultHandler,
-    DbEngine,
-    DbConnection,
 )
 from dynastore.modules.db_config.partition_tools import ensure_partition_exists
 from dynastore.modules.db_config.locking_tools import (
-    acquire_startup_lock,
-    check_schema_exists,
-    acquire_lock_if_needed,
     check_cron_job_exists,
-    check_extension_exists,
 )
 
 logger = logging.getLogger(__name__)

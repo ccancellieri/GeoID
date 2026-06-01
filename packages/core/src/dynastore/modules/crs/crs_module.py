@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 
 from dynastore.modules import ModuleProtocol, get_protocol
 from dynastore.models.protocols import DatabaseProtocol, CRSProtocol
-from dynastore.modules.db_config.query_executor import managed_transaction, DDLQuery
+from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.modules.db_config import maintenance_tools
 from dynastore.modules.db_config.partition_tools import ensure_partition_exists

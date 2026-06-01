@@ -20,7 +20,6 @@
 
 import logging
 import httpx
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 

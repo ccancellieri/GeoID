@@ -76,7 +76,6 @@ from dynastore.modules.db_config.exceptions import (
 )
 from dynastore.modules.tasks.mandatory import (
     find_unclaimable_task_types as _find_unclaimable_task_types,
-    _live_owners_for,
     _mandatory_specs,
     _has_correct_tier_owner,
 )

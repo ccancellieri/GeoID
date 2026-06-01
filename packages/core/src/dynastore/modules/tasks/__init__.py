@@ -16,4 +16,4 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from . import tasks_config  # Ensure plugin configuration is registered
+from . import tasks_config  # noqa: F401  -- side-effect import: registers plugin configuration
