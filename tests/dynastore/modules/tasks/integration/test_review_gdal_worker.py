@@ -40,8 +40,12 @@ import asyncio
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import text
 
+from dynastore.modules.db_config.query_executor import (
+    DQLQuery,
+    ResultHandler,
+    managed_transaction,
+)
 from dynastore.modules.tasks import tasks_module
 from dynastore.modules.tasks.models import RunnerContext
 from dynastore.modules.tasks.routing.exec_hints import ExecHint
@@ -166,18 +170,14 @@ async def test_review_routed_gdal_executes_on_background_runner_in_process(
     task_schema = tasks_module.get_task_schema()
     try:
         # 4. The runner created the audit task row (dispatch happened).
-        async with engine.connect() as conn:
-            row = (
-                await conn.execute(
-                    text(
-                        f'SELECT task_type, schema_name FROM "{task_schema}".tasks '
-                        "WHERE task_id = :tid"
-                    ),
-                    {"tid": task_id},
-                )
-            ).fetchone()
+        async with managed_transaction(engine) as conn:
+            row = await DQLQuery(
+                f'SELECT task_type, schema_name FROM "{task_schema}".tasks '
+                "WHERE task_id = :tid",
+                result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, tid=task_id)
         assert row is not None, "runner must create an audit task row"
-        assert row[0] == "gdal"
+        assert row["task_type"] == "gdal"
 
         # 5. Await the scheduled coroutine — the gdal task ran IN-PROCESS here
         #    (the catalog pod), with the request inputs threaded through, and
@@ -187,9 +187,8 @@ async def test_review_routed_gdal_executes_on_background_runner_in_process(
         assert _RUN_RECORD.get("asset_id") == "demo-asset"
         assert _RUN_RECORD.get("result", {}).get("driverShortName") == "GTiff"
     finally:
-        async with engine.connect() as conn:
-            await conn.execute(
-                text(f'DELETE FROM "{task_schema}".tasks WHERE task_id = :tid'),
-                {"tid": task_id},
-            )
-            await conn.commit()
+        async with managed_transaction(engine) as conn:
+            await DQLQuery(
+                f'DELETE FROM "{task_schema}".tasks WHERE task_id = :tid',
+                result_handler=ResultHandler.NONE,
+            ).execute(conn, tid=task_id)
