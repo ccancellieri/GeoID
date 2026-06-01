@@ -19,7 +19,6 @@
 import logging
 import asyncio
 import json
-import os
 from typing import (
     ClassVar,
     List,
@@ -29,41 +28,23 @@ from typing import (
     Coroutine,
     Dict,
     Tuple,
-    Protocol,
-    runtime_checkable,
-    Awaitable,
-    cast,
-    Set,
     Union,
 )
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from enum import Enum
 
 from dynastore.modules.events.primitives import (
     EventScope,
     EventRegistry,
     define_event,
 )
-from dynastore.models.shared_models import EventType, SYSTEM_SCHEMA
-from dynastore.models.protocols import EventsProtocol, EventDriverProtocol
+from dynastore.models.shared_models import EventType
+from dynastore.models.protocols import EventDriverProtocol
 from dynastore.models.protocols.event_bus import EventBusProtocol
 from dynastore.modules.db_config.query_executor import (
-    DQLQuery,
-    DDLQuery,
-    ResultHandler,
-    managed_transaction,
     DbResource,
-    QueryExecutionError,
-)
-from dynastore.modules.db_config.locking_tools import (
-    check_trigger_exists,
-    check_function_exists,
-    check_table_exists,
 )
 from dynastore.modules.db_config.exceptions import TableNotFoundError
-from dynastore.tools.json import CustomJSONEncoder
-from dynastore.modules.db_config.maintenance_tools import register_cron_job
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.concurrency import get_background_executor, run_in_background
 from dynastore.models.driver_context import DriverContext

@@ -22,7 +22,7 @@ _ = _pyproj_scope_gate  # silence pyright "unused" — load-bearing for SCOPE fi
 from dynastore.tools.discovery import get_protocol
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 from dynastore.tools.cache import cached
 from dynastore.tools.enrichment import enrich_features
 
@@ -35,7 +35,6 @@ from fastapi import (
     Request,
     APIRouter,
 )
-from dynastore.models.shared_models import OutputFormatEnum
 
 from dynastore.extensions.dwh.models import (
     DWHJoinRequest,
@@ -112,7 +111,7 @@ async def execute_bigquery_async(
         raise HTTPException(status_code=500, detail=f"BigQuery query error: {str(e)}")
 
 
-from dynastore.models.query_builder import QueryRequest, FieldSelection, FilterCondition
+from dynastore.models.query_builder import QueryRequest, FieldSelection
 from dynastore.modules.tools.field_categories import resolve_category_field_names  # noqa: E402
 
 

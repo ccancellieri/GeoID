@@ -19,29 +19,25 @@
 # dynastore/extensions/stac/stac_service.py
 
 import logging
-import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional, cast, Dict, Any, Tuple, List, Union
+from typing import Optional, Dict, Any, Tuple, List
 
 import pystac
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import Response, HTMLResponse
+from fastapi.responses import Response
 from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
 from dynastore.models.driver_context import DriverContext
-from sqlalchemy import text
 from dynastore.models.protocols import ConfigsProtocol
 from dynastore.models.protocols.authentication import AuthenticatorProtocol
 from dynastore.models.protocols.authorization import IamRolesConfig
 
 
-import dynastore.modules.db_config.shared_queries as shared_queries
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.web.decorators import expose_static
 from dynastore.extensions.tools.db import get_async_engine
 from dynastore.extensions.tools.exception_handlers import handle_or_raise
 from dynastore.modules.db_config.query_executor import (
     managed_transaction,
-    ResultHandler,
 )
 from dynastore.extensions.stac.search import (
     CollectionSearchRequest,
@@ -56,7 +52,7 @@ from dynastore.tools.db import validate_sql_identifier
 from .stac_models import STACCatalogRequest, stac_localize
 from .stac_validator import validate_stac_item, validate_stac_collection
 from dynastore.models.shared_models import Feature
-from . import stac_generator, stac_db, asset_factory
+from . import stac_generator
 from .stac_models import (
     STACCollectionUpdate,
     STACItem,
@@ -64,19 +60,14 @@ from .stac_models import (
     STACItemOrItemCollection,
     STACCollectionRequest,
     STACCatalogUpdate,
-    STACItemResponse,
-    STACItemCollectionResponse,
 )
 from .stac_aggregation_models import AggregationRequest
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
-from datetime import datetime, timezone
-from dynastore.extensions.tools.url import get_url, get_parent_url, get_root_url
+from dynastore.extensions.tools.url import get_url
 from dynastore.tools.discovery import get_protocol, get_protocols
-from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
 from dynastore.models.localization import normalize_i18n_for_replace
 
 logger = logging.getLogger(__name__)
-from dynastore.modules.db_config.exceptions import TableNotFoundError
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.localization_utils import detect_use_lang
 from dynastore.extensions.web.decorators import expose_web_page

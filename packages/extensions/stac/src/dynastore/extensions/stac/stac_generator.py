@@ -17,35 +17,21 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 # dynastore/extensions/stac/stac_generator.py
-from dynastore.tools.utils import safe_get
 import asyncio
-import json
 import logging
-import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Type, Union, cast
-from uuid import UUID
+from typing import Any, Dict, List, Optional, Union, cast
 from dynastore.models.shared_models import Feature
 from dynastore.models.ogc import Feature as OGCFeature
 
 import pystac
 from fastapi import HTTPException, Request, status
-from shapely import wkb
-from shapely.geometry import mapping, shape
-from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.elasticsearch.items_projection import strip_reserved_members
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
-import dynastore.modules.db_config.shared_queries as shared_queries
 from dynastore.extensions.tools.url import (
-    get_base_url,
     get_parent_url,
     get_root_url,
     get_url,
-)
-from dynastore.tools.geospatial import (
-    GeometryProcessingError,
-    calculate_spatial_indices,
-    process_geometry,
 )
 from dynastore.modules.storage.driver_config import (
     ItemsPostgresqlDriverConfig,
@@ -53,15 +39,13 @@ from dynastore.modules.storage.driver_config import (
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import GeometriesSidecarConfig
 from dynastore.modules.stac.stac_config import (
     StacPluginConfig,
-    StacAssetDefinition,
     HierarchyStrategy,
 )
 from dynastore.tools.language_utils import resolve_localized_field
-from dynastore.extensions.tools.conformance import Conformance, get_active_conformance
+from dynastore.extensions.tools.conformance import get_active_conformance
 from dynastore.models.localization import (
     STAC_LANGUAGE_EXTENSION_URI,
     get_language_object,
-    localize_dict,
 )
 from .stac_models import stac_localize
 from dynastore.tools.discovery import get_protocol, get_protocols
@@ -837,7 +821,6 @@ async def create_item_from_feature(
 ) -> Optional[pystac.Item]:
     """Generates a STAC Item from a mapped Feature."""
     from dynastore.models.protocols.configs import ConfigsProtocol
-    from typing import cast # Added for cast
 
     # 1. Resolve Configs
     if not stac_config:

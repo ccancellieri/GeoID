@@ -23,7 +23,7 @@ import json
 import asyncio
 import hashlib
 import time
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List
 from contextlib import asynccontextmanager
 from fastapi import (
     FastAPI,
@@ -36,10 +36,8 @@ from fastapi import (
     Path,
     BackgroundTasks,
 )
-from fastapi.responses import HTMLResponse, RedirectResponse
-from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
+from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncConnection
-from pyproj import CRS
 
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
@@ -49,9 +47,7 @@ from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.web import WebModuleProtocol, StaticFilesProtocol
 from dynastore.extensions.web.decorators import expose_static
 from dynastore.extensions.tools.db import get_async_connection
-from dynastore.modules.db_config import shared_queries
 import dynastore.modules.tiles.tiles_module as tms_manager
-from dynastore.tools.ogc_common import parse_subset_parameter
 from dynastore.tools.geospatial import SimplificationAlgorithm
 from dynastore.extensions.web.decorators import expose_web_page
 import os

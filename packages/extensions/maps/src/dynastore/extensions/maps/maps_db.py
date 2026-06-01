@@ -18,15 +18,12 @@
 
 # dynastore/extensions/maps/maps_db.py
 
-import re
 from typing import Dict, Any, Optional, List
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 import asyncio
 
 from dynastore.modules.db_config import shared_queries
 from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
-import dynastore.modules.catalog.catalog_module as catalog_manager
 
 async def get_features_for_rendering(
     conn: AsyncConnection, 

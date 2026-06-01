@@ -28,8 +28,7 @@ This service implements CatalogsProtocol and provides:
 
 import logging
 import json
-import uuid
-from typing import List, Optional, Any, Dict, FrozenSet, Union, Set, Callable, Tuple, TYPE_CHECKING
+from typing import List, Optional, Any, Dict, FrozenSet, Union, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
@@ -37,7 +36,6 @@ if TYPE_CHECKING:
     from dynastore.modules.storage.hints import Hint
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
-from sqlalchemy import text
 
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
@@ -50,7 +48,6 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.catalog.models import (
     Catalog,
     CatalogUpdate,
-    EventType,
     LocalizedText,
     Collection,
 )
@@ -474,7 +471,6 @@ def _invalidate_catalog_model_cache(catalog_id: str) -> None:
 
 from dynastore.modules.catalog.collection_service import CollectionService
 from dynastore.modules.catalog.item_service import ItemService
-from dynastore.tools.protocol_helpers import get_engine
 
 # ... (Previous imports and helpers remain same, just adding these)
 
@@ -744,8 +740,6 @@ class CatalogService(CatalogsProtocol):
     ) -> Catalog:
         """Create a new catalog."""
         db_resource = ctx.db_resource if ctx else None
-        from dynastore.modules.tasks.tasks_module import create_task
-        from dynastore.modules.tasks.models import TaskCreate
 
         if isinstance(catalog_data, dict):
             from dynastore.models.localization import validate_language_consistency
@@ -1348,7 +1342,6 @@ class CatalogService(CatalogsProtocol):
                 raise ValueError(f"Catalog '{catalog_id}' not found.")
 
             # Check if language exists and if it's not the last one
-            from dynastore.models.localization import Language
 
             can_delete = False
             fields_to_update: Dict[str, str] = {}
@@ -1985,7 +1978,6 @@ class CatalogService(CatalogsProtocol):
         from dynastore.models.query_builder import (
             QueryRequest,
             FieldSelection,
-            FilterCondition,
         )
 
         # 1. Build QueryRequest

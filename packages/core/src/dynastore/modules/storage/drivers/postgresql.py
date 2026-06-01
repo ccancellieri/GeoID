@@ -296,7 +296,6 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         db_resource: Optional[Any] = None,
     ) -> None:
         """Rename PG physical table and update driver config."""
-        from dynastore.modules.db_config.query_executor import DDLQuery, managed_transaction
 
         schema = await self._resolve_schema(catalog_id, db_resource=db_resource)
         old_table = await self.resolve_physical_table(
@@ -410,7 +409,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             raise ValueError("ensure_storage requires db_resource")
 
         from dynastore.modules.db_config.query_executor import (
-            DDLQuery, DQLQuery, ResultHandler, managed_transaction,
+            DDLQuery, managed_transaction,
         )
         from dynastore.tools.discovery import get_protocol
         from dynastore.models.protocols.configs import ConfigsProtocol

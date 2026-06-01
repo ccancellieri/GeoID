@@ -35,15 +35,11 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
 )
 from dynastore.modules.db_config.locking_tools import (
-    acquire_startup_lock,
     _get_stable_lock_id,
     check_trigger_exists,
 )
 from dynastore.models.protocols import (
-    CatalogsProtocol,
-    ConfigsProtocol,
     PropertiesProtocol,
-    DatabaseProtocol,
     EventDriverProtocol,
 )
 from dynastore.models.protocols.event_driver import (
@@ -56,13 +52,6 @@ from .models import (
     EventSubscriptionCreate,
     API_KEY_NAME,
 )
-from .primitives import (
-    EventScope,
-    EventRegistry,
-    define_event,
-    SystemEventType,
-)
-from sqlalchemy import text as _sql_text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 logger = logging.getLogger(__name__)

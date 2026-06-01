@@ -51,7 +51,6 @@ from typing import Any, Dict, FrozenSet, List, Optional
 
 from sqlalchemy import text
 
-from dynastore.models.protocols.asset_driver import AssetStore
 from dynastore.models.protocols.storage_driver import Capability
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.models.query_builder import AssetFilter

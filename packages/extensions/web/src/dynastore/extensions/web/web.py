@@ -18,9 +18,7 @@
 
 import asyncio
 import os
-import glob
 import hashlib
-import inspect
 import itertools
 import logging
 import re
@@ -34,19 +32,14 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from fastapi.middleware.gzip import GZipMiddleware
 from dynastore.extensions.web.cors_middleware import DynamicCORSMiddleware
-from fastapi.routing import APIRoute
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
-from dynastore.extensions.tools.conformance import (
-    get_active_conformance,
-    Conformance,
-)
 from dynastore.extensions.web.decorators import expose_static, expose_web_page
 from dynastore.models.auth import Condition
 from dynastore.models.protocols.authorization import IamRolesConfig
-from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role, Principal
+from dynastore.models.protocols.policies import Policy, Role, Principal
 from dynastore.tools.discovery import get_protocol, get_protocols, register_plugin
 
 # Register public access policy for web extension
@@ -284,7 +277,7 @@ WEB_CONFORMANCE_URIS = [
 ]
 
 from pydantic import Field
-from dynastore.models.protocols.web import WebModuleProtocol, WebPageProtocol, StaticFilesProtocol
+from dynastore.models.protocols.web import WebModuleProtocol, StaticFilesProtocol
 from dynastore.models.mutability import Mutable
 from dynastore.modules.db_config.plugin_config import PluginConfig
 
@@ -1627,7 +1620,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             offset: int = Query(0, ge=0),
         ):
             from dynastore.models.protocols import CollectionsProtocol
-            from dynastore.tools.discovery import get_protocol, register_plugin
+            from dynastore.tools.discovery import get_protocol
 
             collections_provider: Optional[CollectionsProtocol] = get_protocol(
                 CollectionsProtocol

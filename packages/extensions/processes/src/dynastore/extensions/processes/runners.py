@@ -17,18 +17,16 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import asyncio
 import traceback
 from typing import Any
 from fastapi import BackgroundTasks
 
 from dynastore.modules.tasks import tasks_module
-from dynastore.modules.tasks.models import (Task, TaskCreate, TaskExecutionMode,
+from dynastore.modules.tasks.models import (TaskCreate, TaskExecutionMode,
                                             TaskPayload, TaskStatusEnum,
                                             TaskUpdate, RunnerContext)
 from dynastore.tools.plugin import ProtocolPlugin
 from dynastore.modules.tasks.runners import RunnerProtocol
-from dynastore.tools.discovery import register_plugin
 from dynastore.tasks import get_task_instance
 from dynastore.modules.processes.models import ExecuteRequest, as_process_task_payload
 

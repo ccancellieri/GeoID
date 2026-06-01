@@ -29,7 +29,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import sys
 import os
 from contextlib import asynccontextmanager
-from dynastore import modules, tasks
 from dynastore.modules import (
     lifespan as modules_lifespan,
     discover_modules,

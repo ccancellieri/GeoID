@@ -37,12 +37,10 @@ from typing import (
     Union,
     Tuple,
     Type,
-    Protocol,
-    runtime_checkable,
 )
-from pydantic import BaseModel, BeforeValidator, Field, SerializeAsAny, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, SerializeAsAny, model_validator
 from enum import Enum
-from dynastore.models.ogc import Feature, FeatureCollection
+from dynastore.models.ogc import Feature
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.db_config.query_executor import DbResource
 
