@@ -513,15 +513,25 @@ class TimeWindowHandler(ConditionHandler):
         if start_str:
             try:
                 start_dt = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-                if now < start_dt:
-                    raise IamError(f"Key is outside of its valid time window (valid from {start_dt.isoformat()}).")
-            except ValueError: pass
+            except ValueError as e:
+                logger.warning(
+                    "Ignoring malformed time-window 'start' value %r in validity condition: %s",
+                    start_str, e,
+                )
+                start_dt = None
+            if start_dt is not None and now < start_dt:
+                raise IamError(f"Key is outside of its valid time window (valid from {start_dt.isoformat()}).")
         if end_str:
             try:
                 end_dt = datetime.fromisoformat(end_str.replace('Z', '+00:00'))
-                if now > end_dt:
-                    raise IamError(f"Key is outside of its valid time window (expired at {end_dt.isoformat()}).")
-            except ValueError: pass
+            except ValueError as e:
+                logger.warning(
+                    "Ignoring malformed time-window 'end' value %r in validity condition: %s",
+                    end_str, e,
+                )
+                end_dt = None
+            if end_dt is not None and now > end_dt:
+                raise IamError(f"Key is outside of its valid time window (expired at {end_dt.isoformat()}).")
 
         # Hour-based recurring windows
         start_h = config.get("start_hour", 0)
