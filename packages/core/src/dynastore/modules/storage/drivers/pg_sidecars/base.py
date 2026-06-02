@@ -1158,14 +1158,14 @@ class SidecarProtocol(ABC):
         """
         return True
 
-    def get_field_definitions(
-        self, sidecar_alias: Optional[str] = None
-    ) -> Dict[str, FieldDefinition]:
+    def get_field_definitions(self) -> Dict[str, FieldDefinition]:
         """
         Returns all queryable fields exposed by this sidecar.
-        
-        DEPRECATED: Use get_queryable_fields() directly instead.
-        This method delegates to get_queryable_fields() for backward compatibility.
+
+        DEPRECATED: Use ``get_queryable_fields()`` directly.  This shim
+        delegates to ``get_queryable_fields()`` and does not accept a
+        ``sidecar_alias`` argument — the alias is determined internally by
+        ``get_queryable_fields`` from the sidecar configuration.
 
         Returns:
             Dict mapping field name to FieldDefinition

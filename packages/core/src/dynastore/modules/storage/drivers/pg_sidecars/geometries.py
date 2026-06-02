@@ -242,14 +242,16 @@ class GeometriesSidecar(SidecarProtocol):
         """
         Returns all queryable geometry fields.
 
-        Includes geom, bbox, and optionally centroid based on config.
+        Single source of truth for geometry field definitions.
+        ``get_field_definitions()`` delegates here via the base shim.
         """
         # Alias must match builder convention
         alias = f"sc_{self.sidecar_id}"
 
-        fields = {}
+        fields: Dict[str, FieldDefinition] = {}
 
-        # Main geometry - always queryable
+        # Main geometry keyed by config column name (e.g. "geom") — simple entry
+        # used by the optimizer for quick capability checks.
         fields[self.config.geom_column] = FieldDefinition(
             name=self.config.geom_column,
             sql_expression=f"{alias}.{self.config.geom_column}",
@@ -260,24 +262,174 @@ class GeometriesSidecar(SidecarProtocol):
             description="Primary geometry",
         )
 
-        # Bounding box - always stored, queryable
+        # Canonical "geom" key with full localisation — callers that key on
+        # "geom" (e.g. validation) use this entry.
+        if self.config.geom_column != "geom":
+            fields["geom"] = FieldDefinition(
+                name="geom",
+                alias="geometry",
+                title=LocalizedText(en="Geometry", fr="Géométrie", es="Geometría"),
+                description=LocalizedText(
+                    en="The primary spatial geometry of the feature.",
+                    fr="La géométrie spatiale primaire de l'entité.",
+                    es="La geometría espacial primaria de la entidad.",
+                ),
+                sql_expression=f"{alias}.{self.config.geom_column}",
+                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
+                data_type="geometry",
+                aggregations=None,
+                transformations=None,
+                expose=True,
+            )
+        else:
+            # geom_column IS "geom" — enrich the entry already added above.
+            fields["geom"] = FieldDefinition(
+                name="geom",
+                alias="geometry",
+                title=LocalizedText(en="Geometry", fr="Géométrie", es="Geometría"),
+                description=LocalizedText(
+                    en="The primary spatial geometry of the feature.",
+                    fr="La géométrie spatiale primaire de l'entité.",
+                    es="La geometría espacial primaria de la entidad.",
+                ),
+                sql_expression=f"{alias}.{self.config.geom_column}",
+                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
+                data_type="geometry",
+                aggregations=None,
+                transformations=None,
+                expose=True,
+            )
+
+        # Bounding box
         if self.config.bbox_column:
             fields["bbox"] = FieldDefinition(
                 name="bbox",
+                alias="bbox",
+                title=LocalizedText(
+                    en="Bounding Box", fr="Boîte Englobante", es="Caja de Delimitación"
+                ),
+                description=LocalizedText(
+                    en="The spatial extent (bounding box) of the feature.",
+                    fr="L'étendue spatiale (boîte englobante) de l'entité.",
+                    es="La extensión espacial (caja de delimitación) de la entidad.",
+                ),
                 sql_expression=f"{alias}.{self.config.bbox_column}",
                 capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
                 data_type="geometry",
-                expose=False,  # Query-only by default
-                title="Bounding Box",
-                description="Geometry bounding box",
+                aggregations=None,
+                transformations=None,
+                expose=True,
             )
 
-        # Add index fields from get_field_definitions if needed
-        # Just use defaults from get_field_definitions to ensure consistency
-        other_fields = self.get_field_definitions(sidecar_alias=alias)
-        for k, v in other_fields.items():
-            if k not in fields:
-                fields[k] = v
+        # H3 indexes
+        for res in self.config.h3_resolutions:
+            fields[f"h3_res{res}"] = FieldDefinition(
+                name=f"h3_res{res}",
+                sql_expression=f"{alias}.h3_res{res}",
+                capabilities=[
+                    FieldCapability.FILTERABLE,
+                    FieldCapability.SORTABLE,
+                    FieldCapability.GROUPABLE,
+                    FieldCapability.INDEXED,
+                ],
+                data_type="bigint",
+                aggregations=["count", "array_agg"],
+                transformations=[],
+                expose=True,
+            )
+
+        # S2 indexes
+        for res in self.config.s2_resolutions:
+            fields[f"s2_res{res}"] = FieldDefinition(
+                name=f"s2_res{res}",
+                sql_expression=f"{alias}.s2_res{res}",
+                capabilities=[
+                    FieldCapability.FILTERABLE,
+                    FieldCapability.SORTABLE,
+                    FieldCapability.GROUPABLE,
+                    FieldCapability.INDEXED,
+                ],
+                data_type="bigint",
+                aggregations=["count", "array_agg"],
+                transformations=[],
+                expose=True,
+            )
+
+        # COLUMNAR stat fields — overlay-driven
+        for f in self._columnar_fields():
+            key = f.resolved_name
+            if f.kind == ComputedKind.CENTROID:
+                fields[key] = FieldDefinition(
+                    name=key,
+                    sql_expression=f"{alias}.{key}",
+                    capabilities=[
+                        FieldCapability.FILTERABLE,
+                        FieldCapability.SPATIAL,
+                    ],
+                    data_type="geometry",
+                    aggregations=None,
+                    transformations=None,
+                )
+            else:
+                fields[key] = FieldDefinition(
+                    name=key,
+                    sql_expression=f"{alias}.{key}",
+                    capabilities=[
+                        FieldCapability.FILTERABLE,
+                        FieldCapability.SORTABLE,
+                        FieldCapability.AGGREGATABLE,
+                    ],
+                    data_type=self._field_data_type(f),
+                    aggregations=["sum", "avg", "min", "max", "count"],
+                )
+
+        # Virtual bbox components for STAC — use stored bbox when available
+        bbox_source = (
+            f"{alias}.{self.config.bbox_column}" if self.config.write_bbox else f"{alias}.geom"
+        )
+
+        fields["bbox_xmin"] = FieldDefinition(
+            name="bbox_xmin",
+            sql_expression=f"ST_XMin({bbox_source})",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+            data_type="numeric",
+        )
+        fields["bbox_ymin"] = FieldDefinition(
+            name="bbox_ymin",
+            sql_expression=f"ST_YMin({bbox_source})",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+            data_type="numeric",
+        )
+        fields["bbox_xmax"] = FieldDefinition(
+            name="bbox_xmax",
+            sql_expression=f"ST_XMax({bbox_source})",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+            data_type="numeric",
+        )
+        fields["bbox_ymax"] = FieldDefinition(
+            name="bbox_ymax",
+            sql_expression=f"ST_YMax({bbox_source})",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+            data_type="numeric",
+        )
+
+        # Hub temporal field — always present; expression references hub alias "h"
+        fields["transaction_time"] = FieldDefinition(
+            name="transaction_time",
+            title=LocalizedText(
+                en="Transaction Time",
+                fr="Temps de Transaction",
+                es="Tiempo de Transacción",
+            ),
+            description=LocalizedText(
+                en="The time when this record was recorded in the database.",
+                fr="Le moment où cet enregistrement a été consigné dans la base de données.",
+                es="El momento en que este registro fue grabado en la base de datos.",
+            ),
+            sql_expression="h.transaction_time",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+            data_type="timestamp",
+        )
 
         return fields
 
@@ -598,12 +750,6 @@ class GeometriesSidecar(SidecarProtocol):
             if attr_name == f"s2_res{res}":
                 return (f"{alias}.s2_res{res}", alias)
 
-        # Computed attributes
-        if attr_name == "area":
-            return (f"ST_Area({alias}.{self.config.geom_column})", alias)
-        if attr_name == "centroid":
-            return (f"ST_Centroid({alias}.{self.config.geom_column})", alias)
-
         return None
 
     def get_select_fields(
@@ -832,167 +978,6 @@ class GeometriesSidecar(SidecarProtocol):
         if self.config.s2_resolutions:
             for res in self.config.s2_resolutions:
                 fields.append(f"{alias}.s2_res{res}")
-
-        return fields
-
-    def get_field_definitions(
-        self, sidecar_alias: Optional[str] = None
-    ) -> Dict[str, FieldDefinition]:
-        """Returns capabilities of geometry sidecar fields."""
-        alias = sidecar_alias or f"sc_{self.sidecar_id}"
-        fields = {}
-
-        # Geometry field - allow all spatial aggregations and transformations by default
-        fields["geom"] = FieldDefinition(
-            name="geom",
-            alias="geometry",  # Standard external name
-            title=LocalizedText(en="Geometry", fr="Géométrie", es="Geometría"),
-            description=LocalizedText(
-                en="The primary spatial geometry of the feature.",
-                fr="La géométrie spatiale primaire de l'entité.",
-                es="La geometría espacial primaria de la entidad.",
-            ),
-            sql_expression=f"{alias}.{self.config.geom_column}",
-            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
-            data_type="geometry",
-            aggregations=None,  # All spatial aggregations allowed (ST_Union, ST_Collect, etc.)
-            transformations=None,  # All spatial transformations allowed (ST_AsGeoJSON, ST_Buffer, etc.)
-            expose=True,
-        )
-
-        if self.config.bbox_column:
-            fields["bbox"] = FieldDefinition(
-                name="bbox",
-                alias="bbox",
-                title=LocalizedText(
-                    en="Bounding Box", fr="Boîte Englobante", es="Caja de Delimitación"
-                ),
-                description=LocalizedText(
-                    en="The spatial extent (bounding box) of the feature.",
-                    fr="L'étendue spatiale (boîte englobante) de l'entité.",
-                    es="La extensión espacial (caja de delimitación) de la entidad.",
-                ),
-                sql_expression=f"{alias}.{self.config.bbox_column}",
-                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
-                data_type="geometry",
-                aggregations=None,
-                transformations=None,
-                expose=True,
-            )
-
-        # H3 indexes
-        for res in self.config.h3_resolutions:
-            fields[f"h3_res{res}"] = FieldDefinition(
-                name=f"h3_res{res}",
-                sql_expression=f"{alias}.h3_res{res}",
-                capabilities=[
-                    FieldCapability.FILTERABLE,
-                    FieldCapability.SORTABLE,
-                    FieldCapability.GROUPABLE,
-                    FieldCapability.INDEXED,
-                ],
-                data_type="bigint",
-                aggregations=["count", "array_agg"],
-                transformations=[],
-                expose=True,
-            )
-
-        # S2 indexes
-        for res in self.config.s2_resolutions:
-            fields[f"s2_res{res}"] = FieldDefinition(
-                name=f"s2_res{res}",
-                sql_expression=f"{alias}.s2_res{res}",
-                capabilities=[
-                    FieldCapability.FILTERABLE,
-                    FieldCapability.SORTABLE,
-                    FieldCapability.GROUPABLE,
-                    FieldCapability.INDEXED,
-                ],
-                data_type="bigint",
-                aggregations=["count", "array_agg"],
-                transformations=[],
-                expose=True,
-            )
-
-        # Statistics — overlay-driven. COLUMNAR fields expose as queryable
-        # FieldDefinitions; JSONB fields land inside ``geom_stats`` and
-        # are not directly queryable through this surface (operators can
-        # still filter via JSONB path expressions outside the
-        # FieldDefinition surface).
-        for f in self._columnar_fields():
-            key = f.resolved_name
-            if f.kind == ComputedKind.CENTROID:
-                fields[key] = FieldDefinition(
-                    name=key,
-                    sql_expression=f"{alias}.{key}",
-                    capabilities=[
-                        FieldCapability.FILTERABLE,
-                        FieldCapability.SPATIAL,
-                    ],
-                    data_type="geometry",
-                    aggregations=None,
-                    transformations=None,
-                )
-            else:
-                fields[key] = FieldDefinition(
-                    name=key,
-                    sql_expression=f"{alias}.{key}",
-                    capabilities=[
-                        FieldCapability.FILTERABLE,
-                        FieldCapability.SORTABLE,
-                        FieldCapability.AGGREGATABLE,
-                    ],
-                    data_type=self._field_data_type(f),
-                    aggregations=["sum", "avg", "min", "max", "count"],
-                )
-
-        # Virtual Bbox components for STAC - use stored bbox column when available
-        bbox_source = (
-            f"{alias}.{self.config.bbox_column}" if self.config.write_bbox else f"{alias}.geom"
-        )
-
-        fields["bbox_xmin"] = FieldDefinition(
-            name="bbox_xmin",
-            sql_expression=f"ST_XMin({bbox_source})",
-            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-            data_type="numeric",
-        )
-        fields["bbox_ymin"] = FieldDefinition(
-            name="bbox_ymin",
-            sql_expression=f"ST_YMin({bbox_source})",
-            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-            data_type="numeric",
-        )
-        fields["bbox_xmax"] = FieldDefinition(
-            name="bbox_xmax",
-            sql_expression=f"ST_XMax({bbox_source})",
-            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-            data_type="numeric",
-        )
-        fields["bbox_ymax"] = FieldDefinition(
-            name="bbox_ymax",
-            sql_expression=f"ST_YMax({bbox_source})",
-            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-            data_type="numeric",
-        )
-
-        # Hub fields
-        fields["transaction_time"] = FieldDefinition(
-            name="transaction_time",
-            title=LocalizedText(
-                en="Transaction Time",
-                fr="Temps de Transaction",
-                es="Tiempo de Transacción",
-            ),
-            description=LocalizedText(
-                en="The time when this record was recorded in the database.",
-                fr="Le moment où cet enregistrement a été consigné dans la base de données.",
-                es="El momento en que este registro fue grabado en la base de datos.",
-            ),
-            sql_expression="h.transaction_time",
-            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-            data_type="timestamp",
-        )
 
         return fields
 

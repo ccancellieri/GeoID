@@ -222,16 +222,19 @@ class FeatureAttributeSidecar(SidecarProtocol):
 
     def get_queryable_fields(self) -> Dict[str, FieldDefinition]:
         """
-        Returns all queryable fields including auto-included asset_id.
+        Returns all queryable attribute fields.
 
-        Fields with expose=False are queryable but not in Feature output.
+        Single source of truth for attribute field definitions.
+        ``get_field_definitions()`` delegates here via the base shim.
+
+        Fields with expose=False are queryable but not included in Feature output.
         """
         # Alias must match builder convention
         alias = f"sc_{self.sidecar_id}"
 
-        fields = {}
+        fields: Dict[str, FieldDefinition] = {}
 
-        # ALWAYS include asset_id if enabled (even if not in attribute_schema)
+        # Identity columns
         if self.config.asset_id_field is not None:
             asset_col = self.config.asset_id_field
             fields[asset_col] = FieldDefinition(
@@ -248,7 +251,6 @@ class FeatureAttributeSidecar(SidecarProtocol):
                 description="Reference to parent asset",
             )
 
-        # external_id - always query-only, mapped to Feature.id
         if self.config.external_id_field is not None:
             ext_col = self.config.external_id_field
             fields[ext_col] = FieldDefinition(
@@ -269,12 +271,10 @@ class FeatureAttributeSidecar(SidecarProtocol):
         # Attributes from schema
         if self.config.attribute_schema:
             for attr in self.config.attribute_schema:
-                # Check if this is a storage-only field
                 is_storage_only = attr.name in (
                     getattr(self.config, "storage_only_fields", None) or []
                 )
 
-                # Determine capabilities based on type
                 caps = [
                     FieldCapability.FILTERABLE,
                     FieldCapability.SORTABLE,
@@ -297,22 +297,101 @@ class FeatureAttributeSidecar(SidecarProtocol):
                     sql_expression=f'{alias}."{attr.name}"',
                     capabilities=caps,
                     data_type=pg_native_to_canonical(attr.type.value),
-                    expose=not is_storage_only,  # Storage-only fields not in Feature output
+                    expose=not is_storage_only,
                     title=getattr(attr, "title", attr.name),
                     description=getattr(attr, "description", None),
                 )
 
-        # Merge with other definitions (validity, transaction_time) from get_field_definitions
-        # Pass the correct alias!
-        other_fields = self.get_field_definitions(sidecar_alias=alias)
-        # We only add fields that aren't already covered or if we prefer the detailed definition
-        # get_field_definitions includes external_id/asset_id/attributes too.
-        # It seems there's duplication between get_queryable_fields and get_field_definitions?
-        # Yes. We should probably rely on get_field_definitions more.
+        # Temporal validity fields (bi-temporal exposure)
+        if self.config.enable_validity:
+            fields["start_datetime"] = FieldDefinition(
+                name="validity_start",
+                alias="start_datetime",
+                title=LocalizedText(
+                    en="Valid From", fr="Valide à partir de", es="Válido desde"
+                ),
+                description=LocalizedText(
+                    en="Start of the temporal validity period.",
+                    fr="Début de la période de validité temporelle.",
+                    es="Inicio del periodo de validez temporal.",
+                ),
+                sql_expression=f"lower({alias}.validity)",
+                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+                data_type="timestamp",
+                expose=True,
+            )
+            fields["end_datetime"] = FieldDefinition(
+                name="validity_end",
+                alias="end_datetime",
+                title=LocalizedText(
+                    en="Valid To", fr="Valide jusqu'à", es="Válido hasta"
+                ),
+                description=LocalizedText(
+                    en="End of the temporal validity period.",
+                    fr="Fin de la période de validité temporelle.",
+                    es="Fin del periodo de validez temporal.",
+                ),
+                sql_expression=f"upper({alias}.validity)",
+                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+                data_type="timestamp",
+                expose=True,
+            )
+            fields["validity"] = FieldDefinition(
+                name="validity",
+                title=LocalizedText(
+                    en="Temporal Validity",
+                    fr="Validité Temporelle",
+                    es="Validez Temporal",
+                ),
+                description=LocalizedText(
+                    en="The temporal validity range of the record.",
+                    fr="La période de validité temporelle de l'enregistrement.",
+                    es="El rango de validez temporal del registro.",
+                ),
+                sql_expression=f"{alias}.validity",
+                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+                data_type="timestamp",
+                expose=True,
+            )
 
-        for k, v in other_fields.items():
-            if k not in fields:
-                fields[k] = v
+        # Hub temporal field — expression references hub alias "h"
+        fields["transaction_time"] = FieldDefinition(
+            name="transaction_time",
+            title=LocalizedText(
+                en="Transaction Time",
+                fr="Temps de Transaction",
+                es="Tiempo de Transacción",
+            ),
+            description=LocalizedText(
+                en="The time when this record was recorded in the database.",
+                fr="Le moment où cet enregistrement a été consigné dans la base de données.",
+                es="El momento en que este registro fue grabado en la base de données.",
+            ),
+            sql_expression="h.transaction_time",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
+            data_type="timestamp",
+            expose=True,
+        )
+
+        # Attribute stat fields (COLUMNAR only) — queryable but not in Feature output by default
+        for stat in self._columnar_stat_fields():
+            stat_key = stat.resolved_name
+            stat_caps = [
+                FieldCapability.FILTERABLE,
+                FieldCapability.SORTABLE,
+                FieldCapability.GROUPABLE,
+                FieldCapability.AGGREGATABLE,
+            ]
+            if stat.indexed:
+                stat_caps.append(FieldCapability.INDEXED)
+            fields[stat_key] = FieldDefinition(
+                name=stat_key,
+                sql_expression=f'{alias}."{stat_key}"',
+                capabilities=stat_caps,
+                data_type="numeric",
+                aggregations=["count", "sum", "avg", "min", "max"],
+                expose=False,
+            )
 
         return fields
 
@@ -872,209 +951,6 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         ):
             for attr in self.config.attribute_schema:
                 fields.append(f"{alias}.{attr.name}")
-
-        return fields
-
-    def get_field_definitions(
-        self, sidecar_alias: Optional[str] = None
-    ) -> Dict[str, FieldDefinition]:
-        """Returns capabilities of attribute fields and identity mapping."""
-        alias = sidecar_alias or f"sc_{self.sidecar_id}"
-        fields = {}
-
-        # 1. Identity Columns (null-object: field name present → column enabled)
-        if self.config.external_id_field is not None:
-            ext_col = self.config.external_id_field
-            fields[ext_col] = FieldDefinition(
-                name=ext_col,
-                alias="id",  # Standard external name for STAC/OGC
-                title=LocalizedText(
-                    en="External ID",
-                    fr="Identifiant Externe",
-                    es="Identificador Externo",
-                ),
-                description=LocalizedText(
-                    en="The unique identifier of the feature in the source system.",
-                    fr="L'identifiant unique de l'entité dans le système source.",
-                    es="El identificador único de la entidad en el sistema de origen.",
-                ),
-                sql_expression=f"{alias}.{ext_col}",
-                capabilities=[
-                    FieldCapability.FILTERABLE,
-                    FieldCapability.SORTABLE,
-                    FieldCapability.GROUPABLE,
-                    FieldCapability.INDEXED,
-                ],
-                data_type="string",
-                aggregations=["count", "array_agg"],
-                expose=True,
-            )
-
-        if self.config.asset_id_field is not None:
-            asset_col = self.config.asset_id_field
-            fields[asset_col] = FieldDefinition(
-                name=asset_col,
-                alias=asset_col,
-                title=LocalizedText(
-                    en="Asset ID",
-                    fr="Identifiant de l'Actif",
-                    es="Identificador del Activo",
-                ),
-                description=LocalizedText(
-                    en="The identifier of the associated physical asset.",
-                    fr="L'identifiant de l'actif physique associé.",
-                    es="El identificador del activo físico asociado.",
-                ),
-                sql_expression=f"{alias}.{asset_col}",
-                capabilities=[
-                    FieldCapability.FILTERABLE,
-                    FieldCapability.SORTABLE,
-                    FieldCapability.GROUPABLE,
-                    FieldCapability.INDEXED,
-                ],
-                data_type="string",
-                aggregations=["count", "array_agg"],
-                expose=True,
-            )
-
-        # 3. Validity Mapping (Bi-temporal exposure)
-        if self.config.enable_validity:
-            # start_datetime mapping
-            fields["start_datetime"] = FieldDefinition(
-                name="validity_start",
-                alias="start_datetime",
-                title=LocalizedText(
-                    en="Valid From", fr="Valide à partir de", es="Válido desde"
-                ),
-                description=LocalizedText(
-                    en="Start of the temporal validity period.",
-                    fr="Début de la période de validité temporelle.",
-                    es="Inicio del periodo de validez temporal.",
-                ),
-                sql_expression=f"lower({alias}.validity)",
-                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-                data_type="timestamp",
-                expose=True,
-            )
-            # end_datetime mapping
-            fields["end_datetime"] = FieldDefinition(
-                name="validity_end",
-                alias="end_datetime",
-                title=LocalizedText(
-                    en="Valid To", fr="Valide jusqu'à", es="Válido hasta"
-                ),
-                description=LocalizedText(
-                    en="End of the temporal validity period.",
-                    fr="Fin de la période de validité temporelle.",
-                    es="Fin del periodo de validez temporal.",
-                ),
-                sql_expression=f"upper({alias}.validity)",
-                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-                data_type="timestamp",
-                expose=True,
-            )
-            # validity range mapping
-            fields["validity"] = FieldDefinition(
-                name="validity",
-                title=LocalizedText(
-                    en="Temporal Validity",
-                    fr="Validité Temporelle",
-                    es="Validez Temporal",
-                ),
-                description=LocalizedText(
-                    en="The temporal validity range of the record.",
-                    fr="La période de validité temporelle de l'enregistrement.",
-                    es="El rango de validez temporal del registro.",
-                ),
-                sql_expression=f"{alias}.validity",
-                capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-                # No canonical range type; the validity range is exposed as a
-                # timestamp field (precise bounds carried by start/end_datetime).
-                data_type="timestamp",
-                expose=True,
-            )
-
-        # 4. Standard Hub Temporal Info
-        fields["transaction_time"] = FieldDefinition(
-            name="transaction_time",
-            title=LocalizedText(
-                en="Transaction Time",
-                fr="Temps de Transaction",
-                es="Tiempo de Transacción",
-            ),
-            description=LocalizedText(
-                en="The time when this record was recorded in the database.",
-                fr="Le moment où cet enregistrement a été consigné dans la base de données.",
-                es="El momento en que este registro fue grabado en la base de datos.",
-            ),
-            sql_expression="h.transaction_time",
-            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SORTABLE],
-            data_type="timestamp",
-            expose=True,
-        )
-
-        # 5. Columnar Mode Attributes
-        if (
-            self.resolved_storage_mode == AttributeStorageMode.COLUMNAR
-            and self.config.attribute_schema
-        ):
-            for attr in self.config.attribute_schema:
-                caps = [
-                    FieldCapability.FILTERABLE,
-                    FieldCapability.SORTABLE,
-                    FieldCapability.GROUPABLE,
-                ]
-                if attr.index != AttributeIndexType.NONE:
-                    caps.append(FieldCapability.INDEXED)
-
-                aggs = ["count", "array_agg"]
-                transforms = []
-
-                if attr.type in [
-                    PostgresType.INTEGER,
-                    PostgresType.BIGINT,
-                    PostgresType.NUMERIC,
-                    PostgresType.FLOAT,
-                ]:
-                    caps.append(FieldCapability.AGGREGATABLE)
-                    aggs.extend(["sum", "avg", "min", "max"])
-                elif attr.type in [PostgresType.TEXT, PostgresType.VARCHAR_255]:
-                    transforms = None
-
-                fields[attr.name] = FieldDefinition(
-                    name=attr.name,
-                    # Quote the identifier — see note in get_queryable_fields.
-                    sql_expression=f'{alias}."{attr.name}"',
-                    capabilities=caps,
-                    data_type=pg_native_to_canonical(attr.type.value),
-                    aggregations=aggs,
-                    transformations=transforms,
-                    expose=True,  # Standard attributes exposed by default
-                )
-
-        # 6. Attribute Statistics (ATTRIBUTE_STAT overlay) — COLUMNAR stats are
-        # queryable (filter/sort/aggregate); their values reach Feature output
-        # only via ``ItemsReadPolicy.feature_type.expose`` (expose=False here),
-        # never as default properties. JSONB stats live inside the shared
-        # ``attribute_stats`` blob and are not individually defined. #1074
-        for stat in self._columnar_stat_fields():
-            stat_key = stat.resolved_name
-            stat_caps = [
-                FieldCapability.FILTERABLE,
-                FieldCapability.SORTABLE,
-                FieldCapability.GROUPABLE,
-                FieldCapability.AGGREGATABLE,
-            ]
-            if stat.indexed:
-                stat_caps.append(FieldCapability.INDEXED)
-            fields[stat_key] = FieldDefinition(
-                name=stat_key,
-                sql_expression=f'{alias}."{stat_key}"',
-                capabilities=stat_caps,
-                data_type="numeric",
-                aggregations=["count", "sum", "avg", "min", "max"],
-                expose=False,
-            )
 
         return fields
 

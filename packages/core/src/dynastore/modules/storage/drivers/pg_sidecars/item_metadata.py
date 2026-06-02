@@ -304,9 +304,7 @@ class ItemMetadataSidecar(SidecarProtocol):
         if is_select_all or has_metadata_request:
             sc_alias = f"sc_{self.sidecar_id}"
             context["select_fields"].extend(
-                self.get_select_fields(
-                    request, sidecar_alias=sc_alias
-                )
+                self.get_select_fields(request, sidecar_alias=sc_alias)
             )
 
     def get_queryable_fields(self) -> Dict[str, FieldDefinition]:

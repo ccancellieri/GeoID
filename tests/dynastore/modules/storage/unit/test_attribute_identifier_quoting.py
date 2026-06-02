@@ -51,7 +51,9 @@ def test_queryable_fields_quote_uppercase_attribute_column() -> None:
 
 
 def test_field_definitions_quote_uppercase_attribute_column() -> None:
-    fields = _columnar_sidecar("CODE").get_field_definitions(sidecar_alias="sc_attributes")
+    # get_field_definitions() is a deprecated alias for get_queryable_fields();
+    # it no longer accepts a sidecar_alias argument.
+    fields = _columnar_sidecar("CODE").get_queryable_fields()
     assert fields["CODE"].sql_expression == 'sc_attributes."CODE"'
 
 

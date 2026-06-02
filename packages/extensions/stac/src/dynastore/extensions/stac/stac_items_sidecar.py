@@ -215,7 +215,6 @@ class StacItemsSidecar(SidecarProtocol):
     def get_select_fields(
         self,
         request: Optional[Any] = None,
-        hub_alias: str = "h",
         sidecar_alias: Optional[str] = None,
         include_all: bool = False,
     ) -> List[str]:
