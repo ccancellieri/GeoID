@@ -32,11 +32,10 @@ def test_collect_local_inventory_populates_description_and_schema(monkeypatch):
         tasks_pkg, "_DYNASTORE_TASKS",
         {"reindex": TaskConfig(cls=_DescribedTask, module_name="m", name="reindex")},
     )
-    # Identity + observed modes are orthogonal — stub them so the test is hermetic.
+    # Identity is stubbed so the test is hermetic.
     monkeypatch.setattr(publisher, "get_service_name", lambda: "catalog")
     monkeypatch.setattr(publisher, "get_git_commit", lambda: "abc123")
     monkeypatch.setattr(publisher, "get_version", lambda: "0.1.0")
-    monkeypatch.setattr(publisher, "_observed_modes", lambda task_key: ["async"])
 
     service, commit, version, rows = publisher.collect_local_inventory()
     assert len(rows) == 1
@@ -49,7 +48,7 @@ def test_collect_local_inventory_populates_description_and_schema(monkeypatch):
 
 def test_capability_row_defaults_keep_new_fields_optional():
     r = CapabilityRow(
-        service="s", task_key="t", kind="task", modes=["async"],
+        service="s", task_key="t", kind="task",
         service_version="v", service_commit="c", version="c",
     )
     assert r.description == ""

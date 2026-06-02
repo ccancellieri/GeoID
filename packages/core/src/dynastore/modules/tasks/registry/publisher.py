@@ -30,55 +30,6 @@ logger = logging.getLogger(__name__)
 _PUBLISH_DIGEST_TTL_SECONDS = 3600.0
 
 
-def _observed_modes(task_key: str) -> List[str]:
-    """In-process fallback modes this pod can serve the task in.
-
-    Records the conservative in-process capability (async/sync) so the table is
-    populated even before routing config is readable. The authoritative runner
-    names come from the routing resolver, which overrides this at publish time
-    (see :func:`_overlay_routing_modes`).
-    """
-    from dynastore.modules.tasks.runners import capability_map  # local import: avoid cycle
-    modes: List[str] = []
-    if task_key in capability_map.async_types:
-        modes.append("async")
-    if task_key in capability_map.sync_types:
-        modes.append("sync")
-    return modes or ["async"]
-
-
-async def _overlay_routing_modes(rows: List[CapabilityRow]) -> None:
-    """Override each row's observed modes with the routing-resolved runner name.
-
-    The routing config is the deployment SSOT for how a task runs (which runner
-    handles it); the in-process observed modes are only the fallback when routing
-    has no opinion. Mutates ``rows`` in place.
-
-    Fail-open: any resolver error (or empty targets) leaves the observed modes
-    untouched — a degraded routing read must never distort or block publication.
-    The resolved runner name is informational in the registry (no consumer keys
-    on ``modes``), and the publish digest is keyed on task_keys only, so a
-    routing change that does not roll the build is reflected on the next
-    build-digest re-assert rather than immediately — acceptable for an
-    inspect-only field.
-    """
-    try:
-        from dynastore.modules.tasks.routing import resolver as routing_resolver
-    except Exception as exc:  # noqa: BLE001 — routing module optional/absent
-        logger.debug("task-registry: routing resolver unavailable (%s)", exc)
-        return
-    for row in rows:
-        try:
-            targets = await routing_resolver.resolved_targets(row.task_key)
-        except Exception as exc:  # noqa: BLE001 — fail-open per row
-            logger.debug("task-registry: routing resolve failed for %r (%s)", row.task_key, exc)
-            continue
-        if targets:
-            # Use the first target's runner as the canonical mode label for the
-            # registry row — informational only, not used for routing decisions.
-            row.modes = [targets[0].runner]
-
-
 def _safe_describe(cls):
     """Return cls.describe() or None — self-description must never break publish."""
     fn = getattr(cls, "describe", None)
@@ -141,7 +92,6 @@ def collect_local_inventory() -> Tuple[str, str, str, List[CapabilityRow]]:
                 service=service,
                 task_key=task_key,
                 kind=kind,
-                modes=_observed_modes(task_key),
                 required_capability=None,  # payload-dependent; not summarizable per row
                 mandatory=mandatory,
                 affinity_tier=affinity_tier,
@@ -196,7 +146,6 @@ async def publish_inventory(engine) -> None:
         return
     if not service or not rows:
         return
-    await _overlay_routing_modes(rows)
     digest = compute_publish_digest(commit, version, rows)
     try:
         await _publish_if_new(service, digest, engine=engine, rows=rows)

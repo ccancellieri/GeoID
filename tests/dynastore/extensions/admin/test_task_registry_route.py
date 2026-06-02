@@ -12,7 +12,7 @@ from dynastore.extensions.admin import admin_service
 async def test_list_task_registry_serializes_rows(monkeypatch):
     fake_rows = [
         {"service": "worker", "task_key": "gdal", "kind": "process",
-         "modes": ["async"], "mandatory": False, "affinity_tier": None,
+         "mandatory": False, "affinity_tier": None,
          "service_commit": "c1"},
     ]
 

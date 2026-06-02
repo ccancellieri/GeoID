@@ -92,7 +92,6 @@ CREATE TABLE IF NOT EXISTS configs.task_capability_registry (
     service             text        NOT NULL,
     task_key            text        NOT NULL,
     kind                text        NOT NULL,
-    modes               text[]      NOT NULL DEFAULT '{}',
     required_capability text        NULL,
     mandatory           boolean     NOT NULL DEFAULT false,
     affinity_tier       text        NULL,

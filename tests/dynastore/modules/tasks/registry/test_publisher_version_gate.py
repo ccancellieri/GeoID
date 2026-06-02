@@ -12,7 +12,7 @@ from dynastore.modules.tasks.registry.model import CapabilityRow
 def _rows():
     return [
         CapabilityRow(
-            service="worker", task_key="gdal", kind="process", modes=["async"],
+            service="worker", task_key="gdal", kind="process",
             required_capability=None, mandatory=False, affinity_tier=None,
             service_version="1.0.0", service_commit="c1", version="c1",
         )

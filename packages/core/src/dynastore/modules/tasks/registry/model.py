@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # The registry is a platform-wide observed-fact table; it lives in the same
 # platform schema as the typed-store configs (created alongside the platform
@@ -18,7 +18,6 @@ class CapabilityRow(BaseModel):
     service: str
     task_key: str
     kind: str  # "process" | "task"
-    modes: List[str] = Field(default_factory=list)  # runner-name label(s), informational only
     required_capability: Optional[str] = None
     mandatory: bool = False
     affinity_tier: Optional[str] = None

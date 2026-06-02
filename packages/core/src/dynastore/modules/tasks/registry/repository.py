@@ -19,16 +19,15 @@ from dynastore.modules.tasks.registry.model import (
 
 _UPSERT_SQL = f"""
 INSERT INTO {TASK_CAPABILITY_REGISTRY_TABLE}
-    (service, task_key, kind, modes, required_capability, mandatory,
+    (service, task_key, kind, required_capability, mandatory,
      affinity_tier, service_version, service_commit, version,
      description, payload_schema, last_seen, updated_at)
 VALUES
-    (:service, :task_key, :kind, :modes, :required_capability, :mandatory,
+    (:service, :task_key, :kind, :required_capability, :mandatory,
      :affinity_tier, :service_version, :service_commit, :version,
      :description, CAST(:payload_schema AS jsonb), now(), now())
 ON CONFLICT (service, task_key) DO UPDATE SET
     kind = EXCLUDED.kind,
-    modes = EXCLUDED.modes,
     required_capability = EXCLUDED.required_capability,
     mandatory = EXCLUDED.mandatory,
     affinity_tier = EXCLUDED.affinity_tier,
@@ -48,7 +47,7 @@ WHERE service = :service
 """
 
 _LIST_SQL = f"""
-SELECT service, task_key, kind, modes, required_capability, mandatory,
+SELECT service, task_key, kind, required_capability, mandatory,
        affinity_tier, service_version, service_commit, version,
        description, payload_schema, last_seen, updated_at
 FROM {TASK_CAPABILITY_REGISTRY_TABLE}
