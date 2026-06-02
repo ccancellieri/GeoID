@@ -43,6 +43,49 @@ logger = logging.getLogger(__name__)
 # Sized for ~4k distinct (policy, principal) pairs in flight per pod.
 _DENIAL_LOG_GATE: TTLGate = TTLGate(maxsize=4096, ttl_seconds=60.0)
 
+# Per-pattern invalid-regex warning throttle.  Emits at most once per unique
+# bad pattern per 5 minutes so a mis-typed policy condition doesn't flood logs.
+# Uses a plain set + timestamp dict so the warning path stays synchronous and
+# captures correctly in both async and sync test contexts.
+_INVALID_REGEX_WARNED: dict = {}  # pattern -> last_warned_epoch_seconds
+_INVALID_REGEX_WARN_TTL: float = 300.0
+
+
+def _safe_regex_matches(
+    pattern: str, value: str, *, kind: str, fullmatch: bool = False
+) -> Optional[bool]:
+    """Compile and apply a user-supplied regex; return None on invalid pattern.
+
+    Returns True/False on success.  Returns None when the pattern is
+    syntactically invalid, and logs a throttled WARNING naming the condition
+    kind and the offending pattern so operators can locate the mis-config.
+
+    Callers treat None as non-match and follow their existing no-match path
+    (fail-open for rate_limit/max_count path gates; no-match for query_match
+    and attribute-match comparisons).  None is a distinct sentinel: callers
+    must check ``result is None`` rather than ``not result``.
+
+    ``fullmatch=True`` uses ``re.fullmatch`` semantics (anchors both ends),
+    matching the behaviour of the original ``QueryParamHandler`` call site.
+    """
+    try:
+        fn = re.fullmatch if fullmatch else re.search
+        return bool(fn(pattern, value))
+    except re.error as exc:
+        import time
+        now = time.monotonic()
+        last = _INVALID_REGEX_WARNED.get(pattern, 0.0)
+        if now - last >= _INVALID_REGEX_WARN_TTL:
+            _INVALID_REGEX_WARNED[pattern] = now
+            logger.warning(
+                "invalid_regex condition_kind=%s pattern=%r error=%s — "
+                "treating as non-match (fail-open); fix the policy condition",
+                kind,
+                pattern,
+                exc,
+            )
+        return None
+
 
 async def _log_usage_counter_denied(
     *,
@@ -193,10 +236,19 @@ def _principal_key_for(scope: str, ctx: EvaluationContext) -> Optional[str]:
 
 
 def _path_method_matches(config: Dict[str, Any], ctx: EvaluationContext) -> bool:
-    """Apply ``path_pattern`` / ``methods`` gate; conditions skip non-matching requests."""
+    """Apply ``path_pattern`` / ``methods`` gate; conditions skip non-matching requests.
+
+    An invalid ``path_pattern`` regex is treated as non-matching: the condition
+    is skipped and the request is allowed (fail-open — availability beats
+    enforcing a mis-typed limit).  A throttled WARNING is emitted via
+    :func:`_safe_regex_matches` so operators can find the mis-config.
+    """
     pattern = config.get("path_pattern")
-    if pattern and not re.search(pattern, ctx.path or ""):
-        return False
+    if pattern:
+        matched = _safe_regex_matches(pattern, ctx.path or "", kind="path_pattern")
+        # None → invalid pattern → treat as non-match → skip condition (return False)
+        if not matched:
+            return False
     methods = config.get("methods")
     if methods and ctx.method.upper() not in {m.upper() for m in methods}:
         return False
@@ -494,10 +546,15 @@ class QueryParamHandler(ConditionHandler):
         param_key = config.get("param")
         pattern = config.get("pattern")
         if not param_key or not pattern: return True
-        
+
         val = ctx.query_params.get(param_key)
         if val is None: return False
-        if not re.fullmatch(pattern, val): return False
+        # _safe_regex_matches(fullmatch=True) replicates the original re.fullmatch
+        # semantics and returns None on invalid pattern (non-match direction).
+        matched = _safe_regex_matches(pattern, val, kind="query_match", fullmatch=True)
+        # None → invalid pattern → treat as non-match → False.
+        if not matched:
+            return False
         return True
 
 class TimeWindowHandler(ConditionHandler):
@@ -614,7 +671,12 @@ class AttributeMatchHandler(ConditionHandler):
         if operator == "eq": return str(actual) == str(expected)
         if operator == "neq": return str(actual) != str(expected)
         if operator == "contains": return str(expected) in str(actual)
-        if operator == "regex": return bool(re.match(str(expected), str(actual)))
+        if operator == "regex":
+            matched = _safe_regex_matches(
+                str(expected), str(actual), kind="match/regex"
+            )
+            # None → invalid pattern → non-match direction → False.
+            return bool(matched)
         if operator == "gt": 
             try: return float(actual) > float(expected)
             except Exception: return False

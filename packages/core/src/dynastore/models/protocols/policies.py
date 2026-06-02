@@ -150,6 +150,30 @@ class CreateBindingRequest(BaseModel):
         ),
     )
 
+    @field_validator("quota", mode="before")
+    @classmethod
+    def _validate_quota_patterns(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Compile-check any regex patterns inside a grant's quota spec.
+
+        ``quota.rate_limit.path_pattern`` and ``quota.max_count.path_pattern``
+        are compiled at request time so operators get a 422 instead of
+        allowing a bad pattern to be stored and later cause eval-time 500s.
+        """
+        if not isinstance(v, dict):
+            return v
+        for key in ("rate_limit", "max_count"):
+            spec = v.get(key)
+            if isinstance(spec, dict):
+                pat = spec.get("path_pattern")
+                if pat:
+                    try:
+                        re.compile(pat)
+                    except re.error as exc:
+                        raise ValueError(
+                            f"quota.{key}.path_pattern: invalid regex {pat!r}: {exc}"
+                        ) from exc
+        return v
+
     @field_validator("attribute_predicates", mode="before")
     @classmethod
     def _validate_attribute_predicates(
@@ -434,6 +458,53 @@ class EffectivePermissionResponse(BaseModel):
 
 # --- Policy wire DTOs ---
 
+def _validate_condition_regex_patterns(conditions: List[Condition]) -> None:
+    """Compile-check every regex pattern carried in a list of conditions.
+
+    Raises ``ValueError`` (→ HTTP 422 via Pydantic / FastAPI) when any
+    pattern is syntactically invalid.  The message names the condition type
+    and the offending field so the operator can fix the mis-config.
+
+    Checked fields per condition type:
+    * ``rate_limit`` / ``max_count``: ``config.path_pattern``
+    * ``query_match``: ``config.pattern``
+    * ``match`` (attribute-match) with ``operator="regex"``: ``config.value``
+    """
+    for cond in conditions:
+        cfg = cond.config or {}
+        if cond.type in ("rate_limit", "max_count"):
+            pat = cfg.get("path_pattern")
+            if pat:
+                try:
+                    re.compile(pat)
+                except re.error as exc:
+                    raise ValueError(
+                        f"condition '{cond.type}': invalid path_pattern regex "
+                        f"{pat!r}: {exc}"
+                    ) from exc
+        elif cond.type == "query_match":
+            pat = cfg.get("pattern")
+            if pat:
+                try:
+                    re.compile(pat)
+                except re.error as exc:
+                    raise ValueError(
+                        f"condition 'query_match': invalid pattern regex "
+                        f"{pat!r}: {exc}"
+                    ) from exc
+        elif cond.type == "match":
+            if cfg.get("operator") == "regex":
+                pat = cfg.get("value")
+                if pat is not None:
+                    try:
+                        re.compile(str(pat))
+                    except re.error as exc:
+                        raise ValueError(
+                            f"condition 'match' (regex operator): invalid value "
+                            f"pattern {str(pat)!r}: {exc}"
+                        ) from exc
+
+
 class PolicyCreate(BaseModel):
     id: str
     description: Optional[str] = None
@@ -445,6 +516,12 @@ class PolicyCreate(BaseModel):
     priority: int = Field(default=0, ge=-1000, le=1000)
     conditions: List[Condition] = Field(default_factory=list)
 
+    @field_validator("conditions", mode="after")
+    @classmethod
+    def _validate_condition_patterns(cls, v: List[Condition]) -> List[Condition]:
+        _validate_condition_regex_patterns(v)
+        return v
+
 
 class PolicyUpdate(BaseModel):
     description: Optional[str] = None
@@ -453,6 +530,15 @@ class PolicyUpdate(BaseModel):
     effect: Optional[Literal["ALLOW", "DENY"]] = None
     priority: Optional[int] = Field(default=None, ge=-1000, le=1000)
     conditions: Optional[List[Condition]] = None
+
+    @field_validator("conditions", mode="after")
+    @classmethod
+    def _validate_condition_patterns(
+        cls, v: Optional[List[Condition]]
+    ) -> Optional[List[Condition]]:
+        if v is not None:
+            _validate_condition_regex_patterns(v)
+        return v
 
 
 class PolicyResponse(BaseModel):

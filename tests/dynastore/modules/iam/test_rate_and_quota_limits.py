@@ -32,7 +32,10 @@ from dynastore.models.protocols.usage_counter import UsageCounterProtocol
 from dynastore.modules.iam.conditions import (
     EvaluationContext,
     MaxCountHandler,
+    QueryParamHandler,
+    AttributeMatchHandler,
     RateLimitHandler,
+    _safe_regex_matches,
 )
 from dynastore.modules.iam.exceptions import (
     QuotaExceededError,
@@ -286,6 +289,200 @@ class TestMaxCount:
         assert summary["remaining"] == 6
         # No reset_at for lifetime quotas.
         assert "reset_at" not in summary
+
+
+# ---------------------------------------------------------------------------
+# _safe_regex_matches helper — invalid-pattern guard
+# ---------------------------------------------------------------------------
+
+
+class TestSafeRegexMatches:
+    """Unit tests for the _safe_regex_matches helper."""
+
+    def setup_method(self):
+        from dynastore.modules.iam.conditions import _INVALID_REGEX_WARNED
+        _INVALID_REGEX_WARNED.clear()
+
+    def test_valid_pattern_matches(self):
+        result = _safe_regex_matches("^/tiles/", "/tiles/foo", kind="path_pattern")
+        assert result is True
+
+    def test_valid_pattern_no_match(self):
+        result = _safe_regex_matches("^/tiles/", "/assets/foo", kind="path_pattern")
+        assert result is False
+
+    def test_invalid_pattern_returns_none(self):
+        result = _safe_regex_matches("*bad(", "/any/path", kind="path_pattern")
+        assert result is None
+
+    def test_invalid_bracket_returns_none(self):
+        result = _safe_regex_matches("[", "/any/path", kind="query_match")
+        assert result is None
+
+    def test_invalid_unclosed_group_returns_none(self):
+        result = _safe_regex_matches("(?P<unclosed", "/any/path", kind="path_pattern")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# RateLimitHandler — invalid path_pattern does not crash (Layer A)
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimitInvalidRegex:
+    @pytest.mark.asyncio
+    async def test_invalid_path_pattern_does_not_raise(self, counter, caplog):
+        import logging
+        from dynastore.modules.iam.conditions import _INVALID_REGEX_WARNED
+        _INVALID_REGEX_WARNED.clear()  # ensure throttle doesn't suppress warning
+        h = RateLimitHandler()
+        cfg = _config(limit=1, window_seconds=60, path_pattern="*bad(")
+        ctx = _ctx(path="/anything")
+        # Must not raise — fail-open: condition treated as non-matching → allow
+        with caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.conditions"):
+            result = await h.evaluate(cfg, ctx)
+        assert result is True  # non-match direction = allow
+        # WARNING was emitted
+        assert any("*bad(" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_invalid_path_pattern_bracket_does_not_raise(self, counter, caplog):
+        import logging
+        from dynastore.modules.iam.conditions import _INVALID_REGEX_WARNED
+        _INVALID_REGEX_WARNED.clear()
+        h = RateLimitHandler()
+        cfg = _config(limit=1, window_seconds=60, path_pattern="[")
+        ctx = _ctx(path="/tiles/x")
+        with caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.conditions"):
+            result = await h.evaluate(cfg, ctx)
+        assert result is True
+        assert any("path_pattern" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_valid_path_pattern_still_gates(self, counter):
+        # Regression: a valid pattern must still work correctly.
+        h = RateLimitHandler()
+        cfg = _config(limit=1, window_seconds=60, path_pattern="^/tiles/")
+        await h.evaluate(cfg, _ctx(path="/assets/x"))  # non-match, no budget consumed
+        assert await h.evaluate(cfg, _ctx(path="/tiles/x")) is True
+        with pytest.raises(RateLimitExceededError):
+            await h.evaluate(cfg, _ctx(path="/tiles/x"))
+
+
+# ---------------------------------------------------------------------------
+# MaxCountHandler — invalid path_pattern does not crash (Layer A)
+# ---------------------------------------------------------------------------
+
+
+class TestMaxCountInvalidRegex:
+    @pytest.mark.asyncio
+    async def test_invalid_path_pattern_does_not_raise(self, counter, caplog):
+        import logging
+        from dynastore.modules.iam.conditions import _INVALID_REGEX_WARNED
+        _INVALID_REGEX_WARNED.clear()
+        h = MaxCountHandler()
+        cfg = _config(limit=1, path_pattern="(?P<unclosed")
+        ctx = _ctx(path="/items")
+        with caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.conditions"):
+            result = await h.evaluate(cfg, ctx)
+        assert result is True
+        assert any("(?P<unclosed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# QueryParamHandler — invalid pattern does not crash (Layer A)
+# ---------------------------------------------------------------------------
+
+
+class TestQueryParamHandlerInvalidRegex:
+    def _qctx(self, params: dict) -> EvaluationContext:
+        class _Req:
+            headers: dict = {}
+            client = None
+        return EvaluationContext(
+            request=_Req(),
+            storage=None,
+            query_params=params,
+            path="/search",
+            method="GET",
+            extras={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalid_pattern_does_not_raise(self, caplog):
+        import logging
+        from dynastore.modules.iam.conditions import _INVALID_REGEX_WARNED
+        _INVALID_REGEX_WARNED.clear()
+        h = QueryParamHandler()
+        cfg = {"param": "format", "pattern": "*bad_query("}
+        ctx = self._qctx({"format": "json"})
+        with caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.conditions"):
+            result = await h.evaluate(cfg, ctx)
+        # No-match direction for query_match: val present but pattern bad → False
+        assert result is False
+        assert any("*bad_query(" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_valid_pattern_still_works(self):
+        h = QueryParamHandler()
+        cfg = {"param": "format", "pattern": "^(json|geojson)$"}
+        ctx = self._qctx({"format": "json"})
+        assert await h.evaluate(cfg, ctx) is True
+
+    @pytest.mark.asyncio
+    async def test_valid_pattern_no_match_returns_false(self):
+        h = QueryParamHandler()
+        cfg = {"param": "format", "pattern": "^json$"}
+        ctx = self._qctx({"format": "xml"})
+        assert await h.evaluate(cfg, ctx) is False
+
+
+# ---------------------------------------------------------------------------
+# AttributeMatchHandler — invalid regex operator does not crash (Layer A)
+# ---------------------------------------------------------------------------
+
+
+class TestAttributeMatchHandlerInvalidRegex:
+    def _actx(self, path: str = "/foo") -> EvaluationContext:
+        class _Req:
+            headers: dict = {}
+            client = None
+        return EvaluationContext(
+            request=_Req(),
+            storage=None,
+            query_params={},
+            path=path,
+            method="GET",
+            extras={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalid_regex_in_match_operator_does_not_raise(self, caplog):
+        import logging
+        from dynastore.modules.iam.conditions import _INVALID_REGEX_WARNED
+        _INVALID_REGEX_WARNED.clear()
+        h = AttributeMatchHandler()
+        cfg = {"attribute": "path", "operator": "regex", "value": "*bad_attr("}
+        ctx = self._actx(path="/some/path")
+        with caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.conditions"):
+            result = await h.evaluate(cfg, ctx)
+        # No-match direction for attribute match: regex fails → False
+        assert result is False
+        assert any("*bad_attr(" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_valid_regex_still_matches(self):
+        h = AttributeMatchHandler()
+        cfg = {"attribute": "path", "operator": "regex", "value": "^/tiles/"}
+        ctx = self._actx(path="/tiles/foo")
+        assert await h.evaluate(cfg, ctx) is True
+
+    @pytest.mark.asyncio
+    async def test_valid_regex_no_match_returns_false(self):
+        h = AttributeMatchHandler()
+        cfg = {"attribute": "path", "operator": "regex", "value": "^/tiles/"}
+        ctx = self._actx(path="/assets/foo")
+        assert await h.evaluate(cfg, ctx) is False
 
 
 # ---------------------------------------------------------------------------
