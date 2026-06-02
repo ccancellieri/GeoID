@@ -105,6 +105,7 @@ def _iam_service_policies() -> List[Policy]:
             resources=[".*"],
             effect="ALLOW",
             partition_key="global",
+            priority=900
         ),
         Policy(
             id="admin_authorization_api",

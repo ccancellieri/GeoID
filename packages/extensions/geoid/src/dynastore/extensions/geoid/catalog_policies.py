@@ -156,12 +156,12 @@ async def register_geoid_policies_for_catalog(catalog_id: str) -> None:
                 # The STAC/Features enumeration DENYs default to priority 0 and
                 # cover the item-POST path. Evaluation is highest-priority-wins
                 # with DENY-on-tie (PermissionService.evaluate_access, #915), so
-                # an equal-priority ALLOW would lose to the DENY. Priority 10
+                # an equal-priority ALLOW would lose to the DENY. Priority 500
                 # lets the create win — but ONLY for a request that also passes
                 # the per-collection ``collection_write_anonymous_allowed`` gate.
                 # Browse/list/search verbs never match this POST-only ALLOW, so
                 # they remain denied: the "blind dropbox" stays blind.
-                priority=10,
+                priority=500,
             ),
         ]
 

@@ -395,6 +395,8 @@ class PolicyCreate(BaseModel):
     actions: List[str]
     resources: List[str]
     effect: Literal["ALLOW", "DENY"] = "ALLOW"
+    # Priorities [-500, 500] reserved for system policies.
+    # Use (-1000, -500) or (500, 1000) for user-defined policies.
     priority: int = Field(default=0, ge=-1000, le=1000)
     conditions: List[Condition] = Field(default_factory=list)
 
