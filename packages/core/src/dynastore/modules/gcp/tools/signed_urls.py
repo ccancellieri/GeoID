@@ -88,7 +88,7 @@ async def generate_gcs_signed_url(
         "expiration": expiration,
         "method": method,
     }
-    if content_type is not None:
+    if content_type is not None and method != "GET":
         kwargs["content_type"] = content_type
     if identity_provider is not None:
         kwargs["service_account_email"] = identity_provider.get_account_email()
