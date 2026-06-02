@@ -178,7 +178,7 @@ class NotebooksExtension(ExtensionProtocol):
         try:
             return await notebook_service.get_platform_notebook(notebook_id)
         except ResourceNotFoundError as e:
-            raise HTTPException(status_code=404, detail=str(e))
+            raise HTTPException(status_code=404, detail=str(e)) from e
 
     async def save_platform_notebook(
         self,

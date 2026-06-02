@@ -110,13 +110,13 @@ class GdalService(ExtensionProtocol):
         except RuntimeError as e:
             error_str = str(e).lower()
             if "http response code: 403" in error_str:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Access denied: {e}")
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Access denied: {e}") from e
             if "http response code: 404" in error_str or "does not exist" in error_str:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Not found: {e}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Not found: {e}") from e
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
         except Exception as e:
             logger.error(f"Error processing '{file_path}': {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
 
     @router.get("/raster/info", response_model=RasterInfo, summary="Get metadata for a raster file.")
     async def raster_info(

@@ -629,7 +629,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 raise HTTPException(
                     status_code=500,
                     detail=f"Could not process CRS for TMS '{tileMatrixSetId}'.",
-                )
+                ) from e
 
             # Resolve metadata for each collection (Cached in TilesModule)
             from dynastore.modules.tiles import tiles_module
@@ -751,7 +751,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             logger.error(f"CRITICAL ERROR in get_vector_tile: {e}", exc_info=True)
             raise HTTPException(
                 status_code=500, detail=f"Internal Server Error: {str(e)}"
-            )
+            ) from e
 
     # --- Helper Private Methods ---
 
@@ -913,10 +913,10 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             return None
         try:
             return {int(k): float(v) for k, v in json.loads(rules_str).items()}
-        except Exception:
+        except Exception as e:
             raise HTTPException(
-                status_code=400, detail="Invalid simplification_by_zoom format."
-            )
+                status_code=400, detail=f"Invalid simplification_by_zoom format: {e}"
+            ) from e
 
     @staticmethod
     def _finalize_response(request: Request, content: bytes) -> Response:
@@ -993,4 +993,4 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             raise HTTPException(
                 status_code=500,
                 detail=f"An error occurred during cache invalidation: {e}",
-            )
+            ) from e

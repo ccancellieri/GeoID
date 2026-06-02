@@ -52,7 +52,7 @@ class TasksService(ExtensionProtocol):
             return HTMLResponse(content=html_content)
         except Exception as e:
             logger.error(f"Failed to load or read task monitor HTML page: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load task monitor page.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load task monitor page.") from e
 
     @router.get("/catalogs/{catalog_id}", response_model=List[Task], summary="List all asynchronous tasks")
     async def list_tasks_catalog(

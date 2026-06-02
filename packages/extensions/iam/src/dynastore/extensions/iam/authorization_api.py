@@ -120,8 +120,8 @@ async def resolve_catalog_schema(catalog_id: str) -> str:
                 detail=f"Catalog not found or schema not resolved: {catalog_id}",
             )
         return schema
-    except (ValueError, AttributeError):
-        raise HTTPException(status_code=404, detail=f"Catalog not found: {catalog_id}")
+    except (ValueError, AttributeError) as e:
+        raise HTTPException(status_code=404, detail=f"Catalog not found: {catalog_id}") from e
 
 
 # --- Self-Service Endpoints ---

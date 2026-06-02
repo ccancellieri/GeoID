@@ -265,7 +265,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
             raise HTTPException(
                 status_code=500,
                 detail=f"Could not prepare database for catalog '{catalog_id}'.",
-            )
+            ) from exc
 
         try:
             return await styles_db.create_style(conn, catalog_id, collection_id, style)
@@ -274,7 +274,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
                 raise HTTPException(
                     status_code=409,
                     detail=f"Style '{style.style_id}' already exists for this collection.",
-                )
+                ) from exc
             raise
 
     async def list_styles(

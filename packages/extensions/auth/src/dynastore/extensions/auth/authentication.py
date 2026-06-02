@@ -246,7 +246,7 @@ class Authentication(ExtensionProtocol):
                     return token_data
                 except Exception as e:
                     logger.error("Token exchange failed: %s", e)
-                    raise HTTPException(400, f"Token exchange failed: {e}")
+                    raise HTTPException(400, f"Token exchange failed: {e}") from e
 
             raise HTTPException(501, "No identity provider configured.")
 
@@ -270,7 +270,7 @@ class Authentication(ExtensionProtocol):
                     return token_data
                 except Exception as e:
                     logger.error("Token refresh failed: %s", e)
-                    raise HTTPException(400, f"Token refresh failed: {e}")
+                    raise HTTPException(400, f"Token refresh failed: {e}") from e
 
             raise HTTPException(501, "No identity provider configured.")
 

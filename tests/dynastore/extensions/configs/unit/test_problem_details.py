@@ -147,7 +147,7 @@ def app_with_handler():
         try:
             _Model.model_validate({"srid": -1})
         except ValidationError as ve:
-            raise problem_details.validation_failed(ve)
+            raise problem_details.validation_failed(ve) from ve
 
     @app.get("/raises-with-explicit-instance")
     def _raises_with_explicit_instance():

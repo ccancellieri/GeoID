@@ -155,7 +155,7 @@ class ProxyService(ExtensionProtocol):
         except Exception as e:
             raise HTTPException(
                 status_code=409, detail=f"Could not create short URL. Error: {e}"
-            )
+            ) from e
 
     @router.post(
         "/catalogs/{catalog_id}/collections/{collection_id}/urls",
@@ -181,7 +181,7 @@ class ProxyService(ExtensionProtocol):
         except Exception as e:
             raise HTTPException(
                 status_code=409, detail=f"Could not create short URL. Error: {e}"
-            )
+            ) from e
 
     @router.delete(
         "/catalogs/{catalog_id}/collections/{collection_id}/urls/{short_key}",
@@ -399,7 +399,7 @@ class ProxyService(ExtensionProtocol):
                 logger.error(f"Proxy request to {long_url} failed: {e}", exc_info=True)
                 raise HTTPException(
                     status_code=502, detail=f"Failed to connect to the target URL: {e}"
-                )
+                ) from e
 
         @self.router.api_route(
             "/catalogs/{catalog_id}/p/{short_key}",

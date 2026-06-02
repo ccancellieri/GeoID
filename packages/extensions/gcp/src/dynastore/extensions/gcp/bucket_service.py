@@ -81,7 +81,7 @@ async def verify_pubsub_jwt(
         # ValueError is raised for invalid tokens by the google-auth library.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {e}"
-        )
+        ) from e
 
 
 class FileListResponse(BaseModel):

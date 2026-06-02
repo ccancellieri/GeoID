@@ -274,7 +274,7 @@ class ConnectedSystemsService(
             raise HTTPException(
                 status_code=500,
                 detail=f"Could not prepare database for catalog '{catalog_id}'.",
-            )
+            ) from exc
 
         try:
             result = await consys_db.create_system(conn, catalog_id, system)
@@ -283,7 +283,7 @@ class ConnectedSystemsService(
                 raise HTTPException(
                     status_code=409,
                     detail=f"System '{system.system_id}' already exists in catalog '{catalog_id}'.",
-                )
+                ) from exc
             raise
         if not result:
             raise HTTPException(status_code=500, detail="Failed to create system.")
@@ -402,7 +402,7 @@ class ConnectedSystemsService(
                 raise HTTPException(
                     status_code=409,
                     detail=f"DataStream '{datastream.datastream_id}' already exists.",
-                )
+                ) from exc
             raise
         if not result:
             raise HTTPException(status_code=500, detail="Failed to create datastream.")

@@ -238,11 +238,11 @@ class SearchService(ExtensionProtocol):
             )
             return cql_ast_to_es_query(ast_node, field_mapping, fulltext_mapping)
         except UntranslatableFilterError as exc:
-            raise HTTPException(status_code=400, detail=f"Unsupported filter: {exc}")
+            raise HTTPException(status_code=400, detail=f"Unsupported filter: {exc}") from exc
         except HTTPException:
             raise
         except Exception as exc:  # malformed CQL2, parse failure
-            raise HTTPException(status_code=400, detail=f"Invalid CQL2 filter: {exc}")
+            raise HTTPException(status_code=400, detail=f"Invalid CQL2 filter: {exc}") from exc
 
     async def search_items(
         self,

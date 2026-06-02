@@ -129,7 +129,7 @@ class CRSExtension(ExtensionProtocol):
             return new_crs
         except Exception as e:
             logger.error(f"Failed to create CRS '{crs_data.crs_uri}' for catalog '{catalog_id}': {e}")
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
 
     async def update_crs_endpoint(
