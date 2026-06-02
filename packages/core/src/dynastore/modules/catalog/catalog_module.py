@@ -361,16 +361,8 @@ class CatalogModule(ModuleProtocol):
 
             _owner_modules = [
                 (
-                    "dynastore.modules.storage.drivers.elasticsearch_private.cascade_owners",
-                    "ES private items",
-                ),
-                (
-                    "dynastore.modules.storage.drivers.elasticsearch_cascade_owners",
-                    "ES public items + assets",
-                ),
-                (
-                    "dynastore.modules.storage.drivers.elasticsearch_envelope.cascade_owners",
-                    "ES envelope items",
+                    "dynastore.modules.storage.drivers.routing_driven_cascade_owner",
+                    "routing-driven storage driver cleanup",
                 ),
                 (
                     "dynastore.modules.iam.cascade_owner",

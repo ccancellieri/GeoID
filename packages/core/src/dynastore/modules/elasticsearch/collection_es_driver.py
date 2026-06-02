@@ -185,6 +185,72 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         """
         return None
 
+    async def drop_storage(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
+        soft: bool = False,
+    ) -> None:
+        """Remove collection docs from the singleton ``{prefix}-collections`` index.
+
+        Tenant-safe: every operation is scoped to ``catalog_id`` via the
+        ``routing`` param (shard locality) plus an explicit ``catalog_id``
+        term filter, so documents belonging to other catalogs are never
+        touched.
+
+        - ``collection_id`` set → delete the single composite doc
+          ``{catalog_id}:{collection_id}`` (routing=catalog_id, ignore 404).
+        - ``collection_id`` None (catalog scope) → delete_by_query with
+          ``term: {catalog_id: <catalog_id>}`` on the catalog's shard only.
+
+        ``soft=True`` is honoured by :meth:`delete_metadata`; for the
+        catalog-scope path (collection_id=None) there is no meaningful
+        soft-delete for a batch removal, so it is treated as a no-op.
+        """
+        if soft and collection_id is None:
+            return
+
+        client = self._get_client()
+        if not client:
+            return
+
+        index_name = self._index_name()
+
+        if collection_id is not None:
+            # Single-doc removal — reuse delete_metadata which already handles
+            # soft vs hard and 404 suppression.
+            await self.delete_metadata(
+                catalog_id, collection_id, soft=soft
+            )
+            return
+
+        # Catalog-scope: remove all collection docs owned by catalog_id.
+        # routing=catalog_id keeps the operation on the correct shard;
+        # the term filter is the correctness guard — it prevents the
+        # delete from touching documents of other catalogs on the same shard.
+        try:
+            await client.delete_by_query(
+                index=index_name,
+                body={"query": {"term": {"catalog_id": catalog_id}}},
+                params={
+                    "routing": catalog_id,
+                    "conflicts": "proceed",
+                    "ignore_unavailable": "true",
+                },
+            )
+            logger.info(
+                "CollectionElasticsearchDriver.drop_storage: removed all "
+                "collection docs for catalog_id=%r from %r.",
+                catalog_id, index_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "CollectionElasticsearchDriver.drop_storage: delete_by_query "
+                "failed for catalog_id=%r index=%r: %s",
+                catalog_id, index_name, exc,
+            )
+
     @staticmethod
     def _enrich_doc(metadata: Dict[str, Any]) -> Dict[str, Any]:
         """Prepare doc for ES: add bbox_shape and convert temporal interval to date_range format.

@@ -25,10 +25,10 @@ Covers the full hard-delete cascade against a live Elasticsearch instance:
      asserted to SURVIVE — deleting one catalog must never touch platform
      state shared across tenants.
 
-The per-catalog ES teardown wiring under test already exists in production
-(``EsItemsPublicIndexOwner`` / ``EsAssetIndexOwner`` /
-``EsItemsIndexOwner`` / ``EsItemsEnvelopeIndexOwner`` registered in
-``CatalogModule.lifespan``); this test only asserts the end-to-end behaviour.
+The per-catalog ES teardown wiring under test is provided by
+``RoutingDrivenCascadeOwner`` registered in ``CatalogModule.lifespan``.
+This test also verifies that catalog-owned collection docs are removed from
+the singleton ``{prefix}-collections`` index (fixes #1750).
 
 Requires a live Elasticsearch instance (``@pytest.mark.elasticsearch``) and
 is skipped otherwise.

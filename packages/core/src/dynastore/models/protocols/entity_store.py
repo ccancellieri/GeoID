@@ -260,6 +260,30 @@ class CollectionStore(Protocol):
         """
         ...
 
+    async def drop_storage(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
+        soft: bool = False,
+    ) -> None:
+        """Remove backing storage for a catalog or collection (idempotent).
+
+        Semantics (mirrors ``CollectionItemsStore.drop_storage``):
+
+        - ``collection_id`` is set — remove the single collection document
+          (or docs) owned by that collection.  Must NOT touch other catalogs
+          or collections sharing the same index/table.
+        - ``collection_id`` is None (catalog scope) — remove ALL collection
+          documents belonging to ``catalog_id``.
+
+        Implementations must be fail-soft: a missing resource (already-deleted
+        index, absent document) must be treated as success (idempotent).
+        ``soft=True`` marks as deleted without full removal where supported;
+        drivers that don't support soft-delete return immediately (no-op).
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Helper mixin: default-raising stubs for TRANSFORM-only drivers
@@ -363,6 +387,16 @@ class TransformOnlyCollectionStoreMixin:
         **kwargs: Any,
     ) -> None:
         """No-op: TRANSFORM-only drivers have no backing storage to provision."""
+        return None
+
+    async def drop_storage(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
+        soft: bool = False,
+    ) -> None:
+        """No-op: TRANSFORM-only drivers have no backing storage to drop."""
         return None
 
 
