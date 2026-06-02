@@ -1678,6 +1678,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         )
 
         dispatcher = get_index_dispatcher()
+        id_less = [r for r in results if r.id is None]
+        if id_less:
+            logger.error(
+                "item_service._dispatch_index_upsert: %d result(s) have no id "
+                "in catalog=%s collection=%s — these items WILL NOT be dispatched "
+                "to any index driver and their index entries will not be created "
+                "or updated.",
+                len(id_less), catalog_id, collection_id,
+            )
         ops = [
             IndexOp(
                 op_type="upsert",

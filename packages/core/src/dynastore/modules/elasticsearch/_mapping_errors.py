@@ -1,11 +1,17 @@
 """Shared translation: opensearch ``illegal_argument_exception`` →
-:class:`IndexMappingMismatchError`.
+:class:`IndexMappingMismatchError`, and full bulk-error surfacing via
+:func:`raise_on_bulk_errors`.
 
-Single home for the wrapper used by every ES write path so a code-side
+Single home for the wrappers used by every ES write path so a code-side
 field added without re-rolling the index surfaces as 503 (typed,
-actionable) instead of a generic 500.
+actionable) instead of a generic 500, and so any other per-doc rejection
+surfaces as :class:`~dynastore.modules.storage.errors.EsBulkWriteError`
+instead of being silently discarded.
 """
-from typing import Any, Dict, Iterable, Optional
+import logging
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def maybe_raise_mapping_mismatch(
@@ -68,3 +74,61 @@ def maybe_raise_bulk_mapping_mismatch(
                     index=index_name,
                     field=None,
                 )
+
+
+def raise_on_bulk_errors(
+    bulk_resp: Any,
+    index_name: str,
+    ids: "List[str]",
+) -> None:
+    """Check a ``_bulk`` response for per-doc errors and enforce the invariant.
+
+    Must be called AFTER :func:`maybe_raise_bulk_mapping_mismatch` so
+    ``illegal_argument_exception`` is already promoted to
+    :class:`~dynastore.modules.storage.errors.IndexMappingMismatchError` (503)
+    before we reach this point.
+
+    For every remaining failure (any ``status >= 300`` or ``"error"`` key):
+
+    1. Emit an ERROR-level log line with the item id, error type, and reason
+       (guarantees a durable trace even when the caller has ``on_failure=WARN``
+       or ``on_failure=IGNORE``).
+    2. Collect all failures and raise a single
+       :class:`~dynastore.modules.storage.errors.EsBulkWriteError` carrying the
+       full ``(id, reason)`` list so the dispatcher's ``on_failure`` policy can
+       route the batch to OUTBOX or propagate as FATAL.
+
+    Parameters
+    ----------
+    bulk_resp:
+        Raw dict returned by ``es.bulk()``.
+    index_name:
+        The ES index that was written — used in log messages.
+    ids:
+        The submitted document ids in the same order as ``bulk_resp["items"]``.
+        Used to correlate failures back to the original documents when ES
+        omits ``_id`` from an error entry.
+    """
+    if not isinstance(bulk_resp, dict) or not bulk_resp.get("errors"):
+        return
+
+    from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+    from dynastore.modules.storage.errors import EsBulkWriteError
+
+    _passed, transient, poison = classify_bulk_response(bulk_resp, ids)
+    all_failures: List[Tuple[str, str]] = list(transient) + list(poison)
+
+    if not all_failures:
+        return
+
+    for doc_id, reason in all_failures:
+        logger.error(
+            "ES bulk write rejected: index=%s id=%s reason=%s",
+            index_name, doc_id, reason,
+        )
+
+    raise EsBulkWriteError(
+        f"ES bulk write to '{index_name}' rejected {len(all_failures)} "
+        f"document(s) — see ERROR logs above for per-doc details.",
+        failures=all_failures,
+    )

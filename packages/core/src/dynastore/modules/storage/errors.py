@@ -133,6 +133,38 @@ class IndexMappingMismatchError(Exception):
         self.field = field
 
 
+class EsBulkWriteError(Exception):
+    """One or more documents in an ES ``_bulk`` call were rejected by the
+    cluster (HTTP 200 response with ``"errors": true`` and per-doc
+    ``status >= 300`` or ``"error"`` key).
+
+    Raised by every inline ES write path so the dispatcher's
+    ``on_failure`` policy can apply: ``OUTBOX`` enqueues for the drain
+    worker; ``FATAL`` rolls back the wrapping transaction.
+
+    Carries the list of per-item failures so callers can log structured
+    diagnostics without re-parsing the raw ES response.
+
+    Attributes
+    ----------
+    failures:
+        List of ``(id, reason)`` tuples for every rejected document.
+        ``id`` is the document's ``_id`` as echoed by ES (or the
+        submitted id when ES omits ``_id`` from the error entry).
+        ``reason`` is a compact ``"{status} {err_type}: {err_reason}"``
+        string built by the classifier.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failures: list[tuple[str, str]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failures: list[tuple[str, str]] = failures or []
+
+
 class UniqueConstraintViolationError(Exception):
     """A ``FieldDefinition.unique=True`` field collided with an existing value.
 

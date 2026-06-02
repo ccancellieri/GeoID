@@ -961,8 +961,9 @@ class ItemsElasticsearchDriver(
 
             doc_id = stac_doc.get("id") or base_id
             if doc_id is None:
-                logger.warning(
-                    "ES write_entities: skipping item with no id in %s/%s",
+                logger.error(
+                    "ES write_entities: skipping item with no id in %s/%s "
+                    "— this item will NOT be indexed in Elasticsearch.",
                     catalog_id, collection_id,
                 )
                 continue
@@ -979,10 +980,18 @@ class ItemsElasticsearchDriver(
 
         if prepped_bulk:
             body: list = []
+            submitted_ids: list = []
             for entry in prepped_bulk:
                 body.append(entry["action"])
                 body.append(entry["doc"])
-            await es.bulk(body=body, params={"refresh": "false"})
+                submitted_ids.append(entry["action"]["index"]["_id"])
+            from dynastore.modules.elasticsearch._mapping_errors import (
+                maybe_raise_bulk_mapping_mismatch,
+                raise_on_bulk_errors,
+            )
+            resp = await es.bulk(body=body, params={"refresh": "false"})
+            maybe_raise_bulk_mapping_mismatch(resp, index_name)
+            raise_on_bulk_errors(resp, index_name, submitted_ids)
 
         return written
 
@@ -1972,6 +1981,7 @@ class AssetElasticsearchDriver(
                     raise
 
         bulk_body: list = []
+        asset_ids: list = []
         for item in items:
             doc = item if isinstance(item, dict) else (
                 item.model_dump(by_alias=True, exclude_none=True)
@@ -1982,9 +1992,16 @@ class AssetElasticsearchDriver(
             asset_id = doc.get("asset_id", doc.get("id", ""))
             bulk_body.append({"index": {"_index": index_name, "_id": asset_id}})
             bulk_body.append(doc)
+            asset_ids.append(str(asset_id))
 
         if bulk_body:
-            await es.bulk(body=bulk_body)
+            from dynastore.modules.elasticsearch._mapping_errors import (
+                maybe_raise_bulk_mapping_mismatch,
+                raise_on_bulk_errors,
+            )
+            resp = await es.bulk(body=bulk_body)
+            maybe_raise_bulk_mapping_mismatch(resp, index_name)
+            raise_on_bulk_errors(resp, index_name, asset_ids)
 
         return items if isinstance(items, list) else list(items)
 

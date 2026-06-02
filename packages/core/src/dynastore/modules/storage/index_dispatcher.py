@@ -1132,6 +1132,17 @@ class IndexDispatcher:
         ops: Sequence[DispatchableOp],
     ) -> BulkResult:
         if self._breaker is not None and self._breaker.is_open(entry.driver_ref):
+            # Breaker is open — the indexer is not healthy enough to attempt a
+            # sync call.  We still MUST honour the entry's on_failure policy so
+            # that OUTBOX entries are enqueued (and drained later when the
+            # breaker half-closes) rather than being silently discarded.  This
+            # matches the design intent stated in the module docstring:
+            # "OUTBOX policy still enqueues so the worker drains when the
+            # breaker half-closes."
+            exc = RuntimeError(
+                f"circuit_breaker_open for indexer '{entry.driver_ref}'"
+            )
+            await self._handle_failure_bulk(entry, ctx, ops, exc)
             return BulkResult(total=len(ops), failed=len(ops), failures=[
                 {"reason": "circuit_breaker_open", "indexer": entry.driver_ref},
             ])

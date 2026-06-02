@@ -19,8 +19,8 @@ Classification rules
 * ``error.type`` in :data:`_POISON_ERROR_TYPES`
   (``mapper_parsing_exception``, ``illegal_argument_exception``,
   ``version_conflict_engine_exception``,
-  ``document_missing_exception``, ``type_missing_exception``) or
-  any other ``4xx`` (non-429) → ``poison``.
+  ``document_missing_exception``, ``type_missing_exception``,
+  ``invalid_shape_exception``) or any other ``4xx`` (non-429) → ``poison``.
 * Connection-level exception raised by the client → every op in the
   batch lands in ``transient`` with a single shared reason; nothing
   reached the cluster, so retry is the right policy.
@@ -37,24 +37,7 @@ from dynastore.models.protocols.indexing import (
     BulkIndexResult,
     IndexableOp,
 )
-
-
-_TRANSIENT_ERROR_TYPES = frozenset({
-    "es_rejected_execution_exception",
-    "cluster_block_exception",
-    "circuit_breaking_exception",
-    "node_not_connected_exception",
-    "process_cluster_event_timeout_exception",
-})
-
-
-_POISON_ERROR_TYPES = frozenset({
-    "mapper_parsing_exception",
-    "illegal_argument_exception",
-    "version_conflict_engine_exception",  # idempotency violation — drop, don't retry
-    "document_missing_exception",
-    "type_missing_exception",
-})
+from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
 
 
 class ESBulkIndexer:
@@ -186,37 +169,34 @@ class ESBulkIndexer:
         op_index_map: Sequence[IndexableOp],
         response: dict,
     ) -> BulkIndexResult:
-        passed: List[UUID] = []
-        transient: List[Tuple[UUID, str]] = []
-        poison: List[Tuple[UUID, str]] = []
+        """Translate an ES bulk response into a :class:`BulkIndexResult`.
 
-        items = response.get("items", []) if isinstance(response, dict) else []
-        for op, item in zip(op_index_map, items, strict=True):
-            # Each `items` entry is a single-key dict keyed by op-name
-            # ("index" or "delete"); take the inner record.
-            entry = next(iter(item.values())) if isinstance(item, dict) and item else {}
-            status = entry.get("status", 200) if isinstance(entry, dict) else 200
-            error = entry.get("error") if isinstance(entry, dict) else None
+        Delegates the per-row classification to the shared
+        :func:`~dynastore.modules.elasticsearch.bulk_classify.classify_bulk_response`
+        helper, then maps string ids back to the ``op_id`` UUIDs that the
+        drain protocol requires.  The shared helper works with string ids so
+        both the drain adapter and the inline write drivers can reuse it
+        without importing ``IndexableOp``.
+        """
+        # Build a parallel list of string ids so classify_bulk_response can
+        # correlate response items back to documents even when ES omits ``_id``
+        # from an error entry (e.g. 429 with no body).
+        str_ids = [op.idempotency_key for op in op_index_map]
+        op_by_key = {op.idempotency_key: op for op in op_index_map}
 
-            if not error and 200 <= int(status) < 300:
-                passed.append(op.op_id)
-                continue
+        passed_ids, transient_pairs, poison_pairs = classify_bulk_response(
+            response, str_ids,
+        )
 
-            err_type = (error or {}).get("type", "unknown") if isinstance(error, dict) else "unknown"
-            err_reason = (error or {}).get("reason", "no reason") if isinstance(error, dict) else str(error)
-
-            # 429 always retried regardless of "type" (sometimes type
-            # is es_rejected_execution_exception, sometimes empty).
-            if int(status) == 429:
-                transient.append((op.op_id, f"429 rate-limited: {err_reason}"))
-                continue
-            if err_type in _TRANSIENT_ERROR_TYPES or int(status) >= 500:
-                transient.append((op.op_id, f"{status} {err_type}: {err_reason}"))
-                continue
-            if err_type in _POISON_ERROR_TYPES or 400 <= int(status) < 500:
-                poison.append((op.op_id, f"{status} {err_type}: {err_reason}"))
-                continue
-            # Unknown shape — be conservative, send to retry.
-            transient.append((op.op_id, f"{status} {err_type}: {err_reason}"))
-
+        passed: List[UUID] = [op_by_key[sid].op_id for sid in passed_ids if sid in op_by_key]
+        transient: List[Tuple[UUID, str]] = [
+            (op_by_key[sid].op_id, reason)
+            for sid, reason in transient_pairs
+            if sid in op_by_key
+        ]
+        poison: List[Tuple[UUID, str]] = [
+            (op_by_key[sid].op_id, reason)
+            for sid, reason in poison_pairs
+            if sid in op_by_key
+        ]
         return BulkIndexResult(passed=passed, transient=transient, poison=poison)

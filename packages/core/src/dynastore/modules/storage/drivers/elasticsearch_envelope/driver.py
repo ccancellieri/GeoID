@@ -305,9 +305,12 @@ class ItemsElasticsearchEnvelopeDriver(
                                  get_private_items_index_settings)
 
         bulk_body: list = []
+        submitted_ids: list = []
+        skipped_no_id = 0
         for item in items:
             geoid = self._extract_item_id(item)
             if not geoid:
+                skipped_no_id += 1
                 continue
             doc = self._build_doc(
                 item, catalog_id=catalog_id, collection_id=collection_id,
@@ -320,9 +323,23 @@ class ItemsElasticsearchEnvelopeDriver(
             doc["simplification_mode"] = mode
             bulk_body.append({"index": {"_index": index_name, "_id": geoid}})
             bulk_body.append(doc)
+            submitted_ids.append(geoid)
+
+        if skipped_no_id:
+            logger.error(
+                "ItemsElasticsearchEnvelopeDriver.write_entities: skipped %d item(s) "
+                "with no id in catalog=%s collection=%s — these will NOT be indexed.",
+                skipped_no_id, catalog_id, collection_id,
+            )
 
         if bulk_body:
-            await es.bulk(body=bulk_body)
+            from dynastore.modules.elasticsearch._mapping_errors import (
+                maybe_raise_bulk_mapping_mismatch,
+                raise_on_bulk_errors,
+            )
+            resp = await es.bulk(body=bulk_body)
+            maybe_raise_bulk_mapping_mismatch(resp, index_name)
+            raise_on_bulk_errors(resp, index_name, submitted_ids)
 
         return items if isinstance(items, list) else list(items)
 
