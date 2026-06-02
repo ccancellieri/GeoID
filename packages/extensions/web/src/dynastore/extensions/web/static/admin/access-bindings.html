@@ -28,6 +28,10 @@
 
     <div id="context-bar" class="context-bar"></div>
 
+    <!-- Stale-data inline banner — shown when Valkey is unavailable and the
+         bindings table is displaying PG-fallback counter figures. -->
+    <p id="usage-stale-banner-inline" class="status err" style="display:none"></p>
+
     <!-- Scope picker -------------------------------------------------- -->
     <section class="plate">
       <div class="plate-header">
@@ -82,6 +86,15 @@
           <h3 id="bindings-title">Bindings on the selected collection</h3>
           <div class="plate-meta">GET /admin/catalogs/{cat}/collections/{coll}/grants?principal_id=&hellip;</div>
         </div>
+        <!-- Live counter hint — displayed inline when bindings are rendered.
+             Counters merge from GET /admin/iam/usage/grants (#1342). -->
+        <p class="hint" style="margin-bottom:6px">
+          The <strong>Counters</strong> column merges live quota figures
+          (rate_limit / max_count) from
+          <code>GET /admin/iam/usage/grants</code> by grant&nbsp;id. Use
+          <strong>Why?</strong> to trace effective permissions and
+          <strong>Usage</strong> for a full counter breakdown.
+        </p>
         <div id="bindings-table"></div>
       </div>
 
@@ -125,6 +138,23 @@
               <input id="binding-quota" type="text" placeholder='{"rate_limit":{"limit":100,"window_seconds":60}}'>
             </div>
           </div>
+          <!-- Attribute predicates editor (#1443) — wire ABAC predicates into
+               the CreateBindingRequest. op ∈ in/eq/lte/gte/between/lte:timestamp/gte:timestamp.
+               Key must match [A-Za-z_][A-Za-z0-9_]*. Leave blank for no predicates. -->
+          <div class="form-row">
+            <div style="flex:1">
+              <label for="binding-attr-predicates">
+                Attribute predicates (JSON array, optional — refs #1443)
+              </label>
+              <textarea id="binding-attr-predicates" rows="3"
+                placeholder='[{"key":"dept","op":"in","values":["finance","global"]}]'
+                style="font-family:var(--font-mono);width:100%;box-sizing:border-box"></textarea>
+              <p class="hint" style="margin-top:2px">
+                Each entry: <code>{"key":"&hellip;","op":"in|eq|lte|gte|between|lte:timestamp|gte:timestamp","values":[&hellip;]}</code>.
+                Key must match <code>[A-Za-z_][A-Za-z0-9_]*</code>.
+              </p>
+            </div>
+          </div>
           <div class="form-actions">
             <button class="btn" type="submit">Grant binding</button>
             <span id="binding-create-status" class="hint"></span>
@@ -148,6 +178,142 @@
         <div id="reverse-table"></div>
       </div>
     </section>
+
+    <!-- ABAC stamping config editor (#1443) --------------------------------
+         GET + PUT /configs/catalogs/{cat}/collections/{col}/plugins/attribute_stamping_policy
+         Body: {"attribute_paths": {"dept": "$.properties.department", ...}}
+         Disabled until both catalog and collection are selected. -->
+    <section class="plate">
+      <div class="plate-header">
+        <h3>Attribute stamping (ABAC)</h3>
+        <div class="plate-meta">
+          GET / PUT /configs/catalogs/{cat}/collections/{col}/plugins/attribute_stamping_policy
+        </div>
+      </div>
+      <p class="hint">
+        Declare which Feature <code>properties</code> are lifted onto the
+        document's <code>_attrs</code> envelope at write time, enabling
+        per-document ABAC enforcement via <code>attribute_predicates</code>
+        on grants. Only <code>$.properties.&lt;field&gt;</code> paths are
+        supported in this slice.
+      </p>
+      <form id="stamping-form">
+        <div class="form-row">
+          <div style="flex:1">
+            <label for="stamping-attr-paths">
+              attribute_paths — JSON object: envelope key → JSONPath
+            </label>
+            <textarea id="stamping-attr-paths" rows="6" disabled
+              placeholder='{"dept":"$.properties.department","sensitivity":"$.properties.classification"}'
+              style="font-family:var(--font-mono);width:100%;box-sizing:border-box"></textarea>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn" type="submit">Save</button>
+          <button class="btn btn-secondary" type="button" id="stamping-reload-btn">Reload</button>
+          <span id="stamping-status" class="hint"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- Effective-permissions explainer (#1390) — per-row "Why?" affordance
+         opens this dialog, picks an action, then calls
+         GET /admin/iam/effective and renders the full trace.
+         Markup ported from governance.html; same plate idiom and CSS classes. -->
+    <dialog id="explainer-modal" class="explainer-modal"
+            aria-labelledby="explainer-title">
+      <div class="plate explainer-plate">
+        <div class="plate-header">
+          <h3 id="explainer-title">Explain effective permission</h3>
+          <div class="plate-meta">GET /admin/iam/effective</div>
+        </div>
+        <p class="muted" id="explainer-subject"></p>
+        <form id="explainer-form" method="dialog">
+          <div class="form-row">
+            <div>
+              <label for="explainer-action">Action to evaluate</label>
+              <select id="explainer-action">
+                <option value="GET">GET</option>
+                <option value="POST">POST</option>
+                <option value="PUT">PUT</option>
+                <option value="PATCH">PATCH</option>
+                <option value="DELETE">DELETE</option>
+                <option value="__custom__">Custom…</option>
+              </select>
+            </div>
+            <div>
+              <label for="explainer-action-custom">
+                Custom action (HTTP verb or Action enum)
+              </label>
+              <input id="explainer-action-custom" type="text"
+                     placeholder="SEARCH" disabled>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn" type="submit" id="explainer-run-btn">
+              Explain
+            </button>
+            <button class="btn btn-secondary" type="button"
+                    id="explainer-close-btn">Close</button>
+            <span id="explainer-status" class="hint"></span>
+          </div>
+        </form>
+
+        <div id="explainer-result" style="display:none">
+          <hr class="rule">
+          <div class="explainer-verdict">
+            <span id="explainer-verdict-chip" class="chip"></span>
+            <span id="explainer-deny-note" class="muted" style="display:none">
+              deny-precedence applied
+            </span>
+            <span id="explainer-rule-version" class="muted" style="margin-left:12px;font-size:0.8em"></span>
+          </div>
+          <p id="explainer-reason" class="explainer-reason"></p>
+
+          <h4 class="ci-subhead">Grants considered (walk order)</h4>
+          <table id="explainer-grants">
+            <thead>
+              <tr>
+                <th>Object</th>
+                <th>Ref</th>
+                <th>Effect</th>
+                <th>Scope</th>
+                <th>Matched</th>
+                <th>Why not</th>
+                <th>Validity</th>
+                <th>Conditions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- Per-binding live counter view (#1342) — per-row "Usage" affordance
+         opens this dialog and calls GET /admin/iam/usage/grants.
+         Markup ported from governance.html; same plate idiom. -->
+    <dialog id="usage-modal" class="explainer-modal"
+            aria-labelledby="usage-title">
+      <div class="plate explainer-plate">
+        <div class="plate-header">
+          <h3 id="usage-title">Live usage counters</h3>
+          <div class="plate-meta">GET /admin/iam/usage/grants</div>
+        </div>
+        <p class="muted" id="usage-modal-subject"></p>
+        <p id="usage-stale-banner-modal" class="status err" style="display:none"></p>
+        <div class="form-actions">
+          <button class="btn" type="button" id="usage-refresh-btn">
+            Refresh
+          </button>
+          <button class="btn btn-secondary" type="button"
+                  id="usage-close-btn">Close</button>
+          <span id="usage-modal-status" class="hint"></span>
+        </div>
+        <hr class="rule">
+        <div id="usage-modal-body"></div>
+      </div>
+    </dialog>
   </main>
 
   <script>
