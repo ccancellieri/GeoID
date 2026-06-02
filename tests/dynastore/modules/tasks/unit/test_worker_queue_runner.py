@@ -17,7 +17,7 @@ This suite asserts the contract:
 - Dispatcher-path invocation (``task_id`` present) refuses to re-enqueue.
 - Dedup hit (``create_task`` -> None) returns None.
 - Priority ranks below every in-process runner and below ``GcpJobRunner``.
-- The worker-routed snapshot refreshes from task placement.
+- The worker-routed snapshot refreshes from task routing.
 """
 
 from __future__ import annotations

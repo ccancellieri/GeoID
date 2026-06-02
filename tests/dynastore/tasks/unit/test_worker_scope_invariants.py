@@ -539,7 +539,7 @@ def test_every_scope_discovering_index_propagation_pins_an_indexer_module() -> N
     is the canonical extras key that pulls in ``module_tasks`` +
     ``extension_tasks`` — the actual task-dispatch surface. A service
     with ``core`` but no ``tasks`` (e.g. ``scope_tools``, which forwards
-    ``index_propagation`` to the catalog service per its task placement)
+    ``index_propagation`` to the catalog service per its task routing)
     is a router, not a dispatcher, and is out of scope for this invariant.
     Likewise
     ``worker_task_*`` images intentionally drop ``core`` and use

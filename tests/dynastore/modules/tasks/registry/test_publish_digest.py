@@ -6,7 +6,7 @@ from dynastore.modules.tasks.registry.model import CapabilityRow, compute_publis
 
 def _row(task_key: str) -> CapabilityRow:
     return CapabilityRow(
-        service="worker", task_key=task_key, kind="process", modes=["off_load"],
+        service="worker", task_key=task_key, kind="process", modes=["gcp_cloud_run"],
         required_capability=None, mandatory=False, affinity_tier=None,
         service_version="1.2.3", service_commit="abc123", version="abc123",
     )

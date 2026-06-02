@@ -96,7 +96,7 @@ class TasksPluginConfig(PluginConfig):
         description="Back-off before re-claiming a rejected row.")
     task_timeout_seconds: Mutable[int] = Field(
         default=3600, ge=1,
-        description="Cloud Run Job lease duration for an off_loaded task.")
+        description="Cloud Run Job lease duration for a task executing on a Cloud Run Job.")
 
     @model_validator(mode="after")
     def _enforce_refresh_le_half_ttl(self) -> "TasksPluginConfig":

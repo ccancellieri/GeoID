@@ -31,7 +31,7 @@ async def test_upsert_then_list_roundtrip(db_engine):  # db_engine fixture from 
     await _ensure_table(db_engine)
 
     row = CapabilityRow(
-        service="worker", task_key="gdal", kind="process", modes=["off_load", "async"],
+        service="worker", task_key="gdal", kind="process", modes=["gcp_cloud_run", "background"],
         required_capability=None, mandatory=False, affinity_tier=None,
         service_version="1.0.0", service_commit="c1", version="c1",
     )
@@ -40,7 +40,7 @@ async def test_upsert_then_list_roundtrip(db_engine):  # db_engine fixture from 
     rows = await repository.list_all(db_engine)
     gdal = [r for r in rows if r["service"] == "worker" and r["task_key"] == "gdal"]
     assert len(gdal) == 1
-    assert gdal[0]["modes"] == ["off_load", "async"]  # text[] round-trips intact
+    assert gdal[0]["modes"] == ["gcp_cloud_run", "background"]  # text[] round-trips intact
 
     # Idempotent re-upsert: same PK must not duplicate the row.
     await repository.upsert_rows(db_engine, [row])

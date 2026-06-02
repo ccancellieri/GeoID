@@ -33,8 +33,8 @@ services:
       # file's directory (not your CWD), matching `build.context` above.
       - ../../../..:/dynastore/packages
       # Service identity (instance.json) + shared config defaults.
-      # Drives the task-placement gate so this service only claims task
-      # types whose placement consumers list it.
+      # Drives the task-routing gate so this service only claims task
+      # types whose routing consumers list it.
       - ./config/catalog:/dynastore/config:ro
     env_file:
       - .env

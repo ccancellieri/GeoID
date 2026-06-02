@@ -481,9 +481,9 @@ class CatalogModule(ModuleProtocol):
             # Both reindex and task.failed listeners are registered
             # unconditionally above, so has_listeners() is True on every
             # service that loads CatalogModule. Gate consumer startup on
-            # task placement: event consumers are exactly the placement
+            # task routing: event consumers are exactly the routing
             # consumers of the event/outbox task, resolved through the same
-            # admin-managed placement config that governs which tasks each
+            # admin-managed routing config that governs which tasks each
             # service may claim. Fail-closed (no resolved consumers / unknown
             # service name) means an unconfigured deployment fails noisy
             # (event-outbox depth visible in monitoring) rather than silent
