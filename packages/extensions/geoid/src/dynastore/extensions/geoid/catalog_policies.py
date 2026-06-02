@@ -8,8 +8,12 @@ This enables the lookup-only access model with optional enumeration denial.
 """
 import logging
 
+from dynastore.models.driver_context import DriverContext
+from dynastore.models.protocols import DatabaseProtocol, CatalogsProtocol
 from dynastore.models.protocols.policies import Policy, Role, PermissionProtocol
 from dynastore.models.protocols.authorization import IamRolesConfig
+from dynastore.modules.db_config.query_executor import managed_transaction
+from dynastore.modules.iam.postgres_policy_storage import PostgresPolicyStorage
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
@@ -175,6 +179,44 @@ async def register_geoid_policies_for_catalog(catalog_id: str) -> None:
         for _policy in policies_to_create:
             _policy.partition_key = catalog_id
 
+        # Provision the dedicated partition policies_{catalog_id} before any
+        # INSERT so this catalog's rows land in a per-catalog slice. The
+        # per-catalog partition is what lets catalog-delete cascade cleanly
+        # DROP TABLE policies_{catalog_id} (see iam/cascade_owner.py).
+        # CREATE TABLE IF NOT EXISTS makes this idempotent. A failure here is
+        # non-fatal: without the dedicated partition the rows fall through to
+        # the policies_default DEFAULT partition and stay addressable — reads
+        # query the parent policies table by partition_key regardless of which
+        # partition physically holds the row — so registration still proceeds.
+        try:
+            _db_proto = get_protocol(DatabaseProtocol)
+            _catalogs = get_protocol(CatalogsProtocol)
+            _engine = _db_proto.engine if _db_proto else None
+            if _engine and _catalogs:
+                _tenant_schema = await _catalogs.resolve_physical_schema(
+                    catalog_id,
+                    ctx=DriverContext(db_resource=_engine),
+                    allow_missing=True,
+                )
+                if _tenant_schema:
+                    _ps = PostgresPolicyStorage()
+                    async with managed_transaction(_engine) as _conn:
+                        await _ps.ensure_policy_partition(
+                            _conn, catalog_id, schema=_tenant_schema
+                        )
+                    logger.debug(
+                        "Ensured partition policies_%s in schema '%s'.",
+                        catalog_id,
+                        _tenant_schema,
+                    )
+        except Exception as _exc:
+            logger.warning(
+                "Could not pre-provision policy partition for catalog '%s' "
+                "(non-fatal — rows fall back to the policies_default "
+                "partition and remain addressable): %s",
+                catalog_id,
+                _exc,
+            )
 
         # Create policies, skipping if they already exist (idempotent)
         created_count = 0
@@ -209,10 +251,7 @@ async def register_geoid_policies_for_catalog(catalog_id: str) -> None:
         # Enrich the catalog's unauthenticated role with geoid policies in the tenant schema
         try:
             from dynastore.modules.iam.module import IamModule
-            from dynastore.models.protocols import DatabaseProtocol, CatalogsProtocol
-            from dynastore.modules.db_config.query_executor import managed_transaction
             from dynastore.modules.db_config.exceptions import TableNotFoundError
-            from dynastore.models.driver_context import DriverContext
             
             anon_role_name = IamRolesConfig().anonymous_role_name
             enriched_role = Role(
