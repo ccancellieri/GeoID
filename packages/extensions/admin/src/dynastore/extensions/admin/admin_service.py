@@ -1025,6 +1025,7 @@ class AdminService(ExtensionProtocol):
                 valid_until=body.valid_until,
                 quota=body.quota,
                 granted_by=granted_by,
+                attribute_predicates=body.attribute_predicates,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -1036,6 +1037,7 @@ class AdminService(ExtensionProtocol):
             "effect": body.effect,
             "resource_kind": None,
             "resource_ref": None,
+            "attribute_predicates": body.attribute_predicates,
         }
 
     @router.get(
@@ -1145,6 +1147,7 @@ class AdminService(ExtensionProtocol):
                 valid_until=body.valid_until,
                 quota=body.quota,
                 granted_by=granted_by,
+                attribute_predicates=body.attribute_predicates,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -1156,6 +1159,7 @@ class AdminService(ExtensionProtocol):
             "effect": body.effect,
             "resource_kind": None,
             "resource_ref": None,
+            "attribute_predicates": body.attribute_predicates,
         }
 
     @router.get(
@@ -1573,6 +1577,7 @@ class AdminService(ExtensionProtocol):
                 granted_by=granted_by,
                 resource_kind="collection",
                 resource_ref=collection_id,
+                attribute_predicates=body.attribute_predicates,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -1584,6 +1589,7 @@ class AdminService(ExtensionProtocol):
             "effect": body.effect,
             "resource_kind": "collection",
             "resource_ref": collection_id,
+            "attribute_predicates": body.attribute_predicates,
         }
 
     @router.get(

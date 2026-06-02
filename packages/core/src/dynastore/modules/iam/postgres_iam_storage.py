@@ -848,6 +848,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         granted_by: Optional[UUID] = None,
         resource_kind: Optional[str] = None,
         resource_ref: Optional[str] = None,
+        attribute_predicates: Optional[List[Dict[str, Any]]] = None,
         conn: Optional[DbResource] = None,
     ) -> Optional[UUID]:
         """Insert (or refresh) a grant row in `{scope_schema}.grants`.
@@ -855,12 +856,19 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         Returns the grant id. Idempotent on
         (subject_kind, subject_ref, object_kind, object_ref, effect,
         resource_kind, resource_ref): a second call with the same tuple
-        updates the time/condition/quota columns and bumps `granted_at`.
+        updates the time/condition/quota/attribute_predicates columns and
+        bumps `granted_at`.
 
         `resource_kind`/`resource_ref` scope the grant to a specific
         resource within the scope schema (e.g. ``"collection"`` + a
         collection id). ``None``/``None`` (the default) is a whole-catalog
         grant — the historical behaviour.
+
+        `attribute_predicates` is a list of ABAC predicate dicts applied at
+        query time (document-level row filter); ``None`` leaves the column
+        at its ``'[]'::jsonb`` default (no additional restriction — the grant
+        behaves as a plain RBAC binding). See ``attribute_predicates.py``
+        for the supported ops; refs #1443.
         """
         async with managed_transaction(conn or self.engine) as db:
             result = await INSERT_GRANT.execute(
@@ -878,6 +886,11 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 granted_by=granted_by,
                 resource_kind=resource_kind,
                 resource_ref=resource_ref,
+                attribute_predicates=(
+                    json.dumps(attribute_predicates)
+                    if attribute_predicates is not None
+                    else None
+                ),
             )
         await self._bump_binding_version(scope_schema)
         return result

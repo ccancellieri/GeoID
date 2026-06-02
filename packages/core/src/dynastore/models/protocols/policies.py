@@ -12,11 +12,14 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from __future__ import annotations
+
+import re
 from datetime import datetime
-from typing import Dict, Protocol, List, Literal, Optional, Tuple, Any, runtime_checkable
+from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple, runtime_checkable
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Re-export permission-related models so extensions only need ONE import:
 #   from dynastore.models.protocols.policies import PermissionProtocol, Policy, Role, Principal
@@ -132,6 +135,48 @@ class CreateBindingRequest(BaseModel):
             "{'max_count': {'limit': 100000}}."
         ),
     )
+    attribute_predicates: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Per-binding ABAC attribute predicates applied at query time "
+            "(document-level row filter, compiled into the AccessFilter by "
+            "``compile_read_filter``). Each element must be a valid "
+            "``AttributePredicate`` dict: ``{key, op, values}``. Key must "
+            "match ``[A-Za-z_][A-Za-z0-9_]*``. Supported ops: 'in', 'eq', "
+            "'lte', 'gte', 'between' (and their ':timestamp' variants). "
+            "``None`` (the default) means no additional attribute restriction — "
+            "the grant behaves as a plain RBAC binding. Stored as "
+            "``iam.grants.attribute_predicates JSONB``; refs #1443."
+        ),
+    )
+
+    @field_validator("attribute_predicates", mode="before")
+    @classmethod
+    def _validate_attribute_predicates(
+        cls, v: Optional[List[Any]]
+    ) -> Optional[List[Any]]:
+        """Validate each element against AttributePredicate's key pattern.
+
+        Uses a lazy import to avoid a module-level dependency from
+        ``models.protocols`` into ``modules.iam``. The key regex is reproduced
+        here so the validator is self-contained and does not require the full
+        AttributePredicate pydantic model at load time — only the pattern check.
+        """
+        if v is None:
+            return v
+        _key_re = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+        for elem in v:
+            if not isinstance(elem, dict):
+                raise ValueError(
+                    f"Each attribute_predicates element must be a dict, got {type(elem)!r}."
+                )
+            key = elem.get("key", "")
+            if not isinstance(key, str) or not _key_re.fullmatch(key):
+                raise ValueError(
+                    f"attribute_predicates key {key!r} must match "
+                    "[A-Za-z_][A-Za-z0-9_]* (no quotes, dots, or whitespace)."
+                )
+        return v
 
 
 class PrincipalResponse(BaseModel):

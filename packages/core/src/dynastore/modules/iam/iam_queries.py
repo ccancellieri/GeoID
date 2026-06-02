@@ -684,23 +684,25 @@ INSERT_GRANT = DQLQuery(
     INSERT INTO {schema}.grants (
         subject_kind, subject_ref, object_kind, object_ref, effect,
         valid_from, valid_until, conditions, quota, granted_by,
-        resource_kind, resource_ref
+        resource_kind, resource_ref, attribute_predicates
     )
     VALUES (
         :subject_kind, :subject_ref, :object_kind, :object_ref, :effect,
         COALESCE(:valid_from, NOW()), :valid_until,
         CAST(:conditions AS jsonb), CAST(:quota AS jsonb), :granted_by,
-        :resource_kind, :resource_ref
+        :resource_kind, :resource_ref,
+        COALESCE(CAST(:attribute_predicates AS jsonb), '[]'::jsonb)
     )
     ON CONFLICT (subject_kind, subject_ref, object_kind, object_ref, effect,
                  COALESCE(resource_kind, ''), COALESCE(resource_ref, ''))
     DO UPDATE SET
-        valid_from  = EXCLUDED.valid_from,
-        valid_until = EXCLUDED.valid_until,
-        conditions  = EXCLUDED.conditions,
-        quota       = EXCLUDED.quota,
-        granted_by  = EXCLUDED.granted_by,
-        granted_at  = NOW()
+        valid_from           = EXCLUDED.valid_from,
+        valid_until          = EXCLUDED.valid_until,
+        conditions           = EXCLUDED.conditions,
+        quota                = EXCLUDED.quota,
+        granted_by           = EXCLUDED.granted_by,
+        granted_at           = NOW(),
+        attribute_predicates = EXCLUDED.attribute_predicates
     RETURNING id;
     """,
     result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
