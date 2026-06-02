@@ -389,11 +389,14 @@ class TransformerEntry(BaseModel):
 #
 # INPUT (write-side ``apply_transform_chain``) is wired on ``WRITE`` for every
 # tier (secondary-index fan-out). OUTPUT (read-side ``restore_from_index``) is
-# wired on ``SEARCH`` only for tiers whose search driver invokes
-# ``restore_transform_chain`` — today the asset tier alone. The per-tier flag
+# wired on ``SEARCH`` for every tier whose search driver invokes
+# ``restore_transform_chain`` — the four ES-backed tiers (items, collection,
+# asset, catalog) since geoid#1574. The per-tier flag
 # ``_RoutingConfigBase._wired_output_search_hop`` carries that distinction so a
-# SEARCH ``output_transformers`` declared on a collection/catalog/items tier
-# warns (instead of silently never running). See geoid#1567.
+# SEARCH ``output_transformers`` declared on a tier that does NOT run the
+# restore chain (e.g. a non-ES read path) warns instead of silently never
+# running. See geoid#1567, geoid#1574; non-ES read-side wiring tracked in
+# geoid#1643.
 _WIRED_INPUT_HOPS: FrozenSet[str] = frozenset({Operation.WRITE})
 _WIRED_OUTPUT_HOPS: FrozenSet[str] = frozenset({Operation.SEARCH})
 _DEFERRED_HOP_WARNED: Set[Tuple[str, str, str, str]] = set()
@@ -410,9 +413,10 @@ def _warn_deferred_transformer_hops(
     at config-load instead of as a mysteriously inert transformer.
 
     ``output_search_wired`` reflects whether *this tier*'s SEARCH path runs the
-    read-side restore chain. Only the asset tier does today (geoid#1567); for
-    every other tier a SEARCH ``output_transformers`` declaration validates but
-    never fires, so it is warned as a deferred hop.
+    read-side restore chain. The four ES-backed tiers (items, collection, asset,
+    catalog) do since geoid#1574; for a tier that does not, a SEARCH
+    ``output_transformers`` declaration validates but never fires, so it is
+    warned as a deferred hop.
     """
     for op_name, entries in operations.items():
         for entry in entries:
