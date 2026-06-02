@@ -1308,7 +1308,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             )
         except Exception as e:
             logger.error(f"Error serving file {file_path}: {e}")
-            raise HTTPException(status_code=500, detail="Internal Server Error")
+            raise HTTPException(status_code=500, detail="Internal Server Error") from e
 
     @staticmethod
     def _cache_headers_for(prefix: str, rel_path: str) -> Dict[str, str]:
@@ -1527,7 +1527,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
                 return HTMLResponse(content=html_content)
             except Exception as e:
                 logger.error(f"Error reading doc {doc_id}: {e}")
-                raise HTTPException(status_code=500, detail="Error reading document")
+                raise HTTPException(status_code=500, detail="Error reading document") from e
 
         @self.router.get("/dashboard/catalogs", response_class=JSONResponse)
         async def get_dashboard_catalogs(
@@ -1889,8 +1889,8 @@ class Web(ExtensionProtocol, OGCServiceMixin):
                         "writable": False, "created": ts, "last_modified": ts,
                         "content": nb_content, "mimetype": None, "size": None,
                     }, headers={"Cache-Control": "no-cache"})
-                except (ResourceNotFoundError, Exception):
-                    raise HTTPException(status_code=404, detail="Notebook not found")
+                except (ResourceNotFoundError, Exception) as exc:
+                    raise HTTPException(status_code=404, detail="Notebook not found") from exc
 
             raise HTTPException(status_code=404, detail="Not found")
 
@@ -1930,7 +1930,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
                     allowed_files = provider_callable()
             except Exception as e:
                 logger.error(f"Static provider for '{prefix}' raised an error: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Provider error: {e}")
+                raise HTTPException(status_code=500, detail=f"Provider error: {e}") from e
 
             if not allowed_files:
                 # If the provider returned an empty list, the file doesn't exist under this prefix
@@ -1942,7 +1942,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
                 common_root = os.path.commonpath(dirs) if len(dirs) > 1 else dirs[0]
             except ValueError as e:
                 logger.error(f"commonpath failed for prefix '{prefix}': {e}")
-                raise HTTPException(status_code=500, detail="Static file layout error")
+                raise HTTPException(status_code=500, detail="Static file layout error") from e
 
             allowed_map = {
                 os.path.relpath(f, common_root).replace(os.sep, "/"): f 

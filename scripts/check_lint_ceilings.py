@@ -33,7 +33,7 @@ CEILINGS: dict[str, int] = {
     "F401": 233,    # unused-import
     "F811": 11,     # redefined-while-unused (duplicate imports)
     "F841": 35,     # unused-variable
-    "B904": 70,     # raise-without-from (broken exception chain)
+    "B904": 23,     # raise-without-from (broken exception chain)
     "RUF012": 0,    # mutable-class-default (unannotated shared class state) — cleared #1598; ClassVar / ConfigDict / default_factory
     "SIM118": 17,   # `key in d.keys()` -> `key in d`
 }

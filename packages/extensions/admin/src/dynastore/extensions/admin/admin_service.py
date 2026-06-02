@@ -136,11 +136,11 @@ async def _ensure_sysadmin(request: Request) -> None:
     ctx = security_context_from_request(request)
     try:
         await require_permission(ctx, Permission.SYSADMIN)
-    except PermissionError:
+    except PermissionError as exc:
         raise HTTPException(
             status_code=403,
             detail="Only System Administrators can manage this resource.",
-        )
+        ) from exc
 
 
 async def _is_catalog_only_admin(request: Request) -> bool:
@@ -672,7 +672,7 @@ class AdminService(ExtensionProtocol):
                 role_name=body.role,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.delete(
         "/platform/principals/{principal_id}/roles/{role_name}",
@@ -692,7 +692,7 @@ class AdminService(ExtensionProtocol):
                 role_name=role_name,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.get(
         "/platform/principals/{principal_id}/roles",
@@ -859,7 +859,7 @@ class AdminService(ExtensionProtocol):
                 catalog_schema=await mgr.resolve_schema(catalog_id, strict=True),
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.delete(
         "/catalogs/{catalog_id}/principals/{principal_id}/roles/{role_name}",
@@ -892,7 +892,7 @@ class AdminService(ExtensionProtocol):
                 catalog_schema=await mgr.resolve_schema(catalog_id, strict=True),
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.get(
         "/catalogs/{catalog_id}/principals/{principal_id}/roles",
@@ -1028,7 +1028,7 @@ class AdminService(ExtensionProtocol):
                 attribute_predicates=body.attribute_predicates,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
         return {
             "id": str(grant_id) if grant_id else None,
             "principal_id": str(body.principal_id),
@@ -1084,7 +1084,7 @@ class AdminService(ExtensionProtocol):
                 effect=effect,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     @router.post(
         "/catalogs/{catalog_id}/grants",
@@ -1150,7 +1150,7 @@ class AdminService(ExtensionProtocol):
                 attribute_predicates=body.attribute_predicates,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
         return {
             "id": str(grant_id) if grant_id else None,
             "principal_id": str(body.principal_id),
@@ -1213,7 +1213,7 @@ class AdminService(ExtensionProtocol):
                 effect=effect,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     # ---- IAM phantom-token denylist (#1343 — operator-facing immediate
     #      revocation surface). Sysadmin-only: every route below adds an
@@ -1245,14 +1245,14 @@ class AdminService(ExtensionProtocol):
             effective_ttl = await mgr.deny_subject(
                 storage_subject, ttl_seconds=body.ttl_seconds, reason=body.reason,
             )
-        except DenylistBackendUnavailable:
+        except DenylistBackendUnavailable as exc:
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "Denylist backend (Valkey) is unavailable; "
                     "cannot confirm the revocation landed."
                 ),
-            )
+            ) from exc
         from time import time as _t
         return DenylistEntryResponse(
             subject=body.subject,
@@ -1292,11 +1292,11 @@ class AdminService(ExtensionProtocol):
         from dynastore.modules.iam.phantom_token import DenylistBackendUnavailable
         try:
             rows = await mgr.list_denylist(prefix=storage_prefix, limit=limit)
-        except DenylistBackendUnavailable:
+        except DenylistBackendUnavailable as exc:
             raise HTTPException(
                 status_code=503,
                 detail="Denylist backend (Valkey) is unavailable.",
-            )
+            ) from exc
         return [
             DenylistEntryResponse(
                 subject=_denylist_storage_to_subject(r["token_id"]),
@@ -1321,14 +1321,14 @@ class AdminService(ExtensionProtocol):
         from dynastore.modules.iam.phantom_token import DenylistBackendUnavailable
         try:
             await mgr.undeny_subject(storage_subject)
-        except DenylistBackendUnavailable:
+        except DenylistBackendUnavailable as exc:
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "Denylist backend (Valkey) is unavailable; "
                     "cannot confirm the removal landed."
                 ),
-            )
+            ) from exc
         # DELETE is idempotent: whether or not an entry actually existed,
         # the post-condition ("entry is absent") holds → 204.
 
@@ -1400,8 +1400,8 @@ class AdminService(ExtensionProtocol):
         # confusing deny-by-default).
         try:
             principal_uuid = UUID(principal_id)
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=422, detail="Invalid principal_id (must be UUID).")
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid principal_id (must be UUID).") from exc
         principal = await mgr.get_principal(principal_uuid)
         if principal is None:
             raise HTTPException(status_code=404, detail="Principal not found.")
@@ -1580,7 +1580,7 @@ class AdminService(ExtensionProtocol):
                 attribute_predicates=body.attribute_predicates,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
         return {
             "id": str(grant_id) if grant_id else None,
             "principal_id": str(body.principal_id),
@@ -1663,7 +1663,7 @@ class AdminService(ExtensionProtocol):
                 resource_ref=collection_id,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     # -------------------------------------------------------------------------
     # Role Management (/admin/roles)
@@ -1713,7 +1713,7 @@ class AdminService(ExtensionProtocol):
         try:
             created = await mgr.create_role(role, catalog_id=catalog_id)
         except ValueError as e:
-            raise HTTPException(status_code=409, detail=str(e))
+            raise HTTPException(status_code=409, detail=str(e)) from e
         return RoleResponse(
             name=created.name, description=created.description,
             policies=created.policies or [],
@@ -1812,7 +1812,7 @@ class AdminService(ExtensionProtocol):
         try:
             created = await pm.create_policy(policy, catalog_id=catalog_id)
         except ValueError as e:
-            raise HTTPException(status_code=409, detail=str(e))
+            raise HTTPException(status_code=409, detail=str(e)) from e
         return _policy_to_response(created)
 
     @router.put("/policies/{policy_id}", summary="Update a policy")
@@ -2041,11 +2041,11 @@ class AdminService(ExtensionProtocol):
         # consistent error vocabulary across the IAM diagnostic surfaces.
         try:
             principal_uuid = UUID(principal_id)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
             raise HTTPException(
                 status_code=422,
                 detail="Invalid principal_id (must be UUID).",
-            )
+            ) from exc
 
         mgr = _iam()
         principal = await mgr.get_principal(principal_uuid)
