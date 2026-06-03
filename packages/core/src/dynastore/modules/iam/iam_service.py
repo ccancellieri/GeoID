@@ -874,7 +874,18 @@ class IamService:
 
     async def add_role_hierarchy(
         self, parent_role: str, child_role: str, catalog_id: Optional[str] = None
-    ):
+    ) -> None:
+        if parent_role == child_role:
+            raise ValueError(
+                f"Adding edge {parent_role!r}->{child_role!r} would create a self-loop "
+                "in the role hierarchy."
+            )
+        descendants = await self.get_role_hierarchy(child_role, catalog_id=catalog_id)
+        if parent_role in descendants:
+            raise ValueError(
+                f"Adding edge {parent_role!r}->{child_role!r} would create a cycle: "
+                f"{parent_role!r} is already reachable from {child_role!r}."
+            )
         schema = await self._resolve_schema(catalog_id)
         await self.storage.add_role_hierarchy(parent_role, child_role, schema=schema)
 
@@ -891,6 +902,13 @@ class IamService:
     ) -> List[str]:
         schema = await self._resolve_schema(catalog_id)
         return await self.storage.get_role_hierarchy([role_name], schema=schema)
+
+    async def list_role_hierarchy(
+        self, catalog_id: Optional[str] = None
+    ) -> List[tuple[str, str]]:
+        """Return all (parent_role, child_role) edges at this scope."""
+        schema = await self._resolve_schema(catalog_id)
+        return await self.storage.list_role_hierarchy_edges(schema=schema)
 
     # --- IamQueryProtocol surface (read-side, for non-IAM consumers) ---
     #

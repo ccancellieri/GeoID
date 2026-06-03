@@ -12,6 +12,7 @@ import {
   fetchGrantUsage,
   resetGrantUsage,
   getCatalogProvisioning,
+  listRoleHierarchyEdges, addRoleHierarchyEdge, removeRoleHierarchyEdge, getRoleDescendants,
 } from "../common/api.js";
 import { mountContextBar } from "../common/context-bar.js";
 
@@ -28,6 +29,7 @@ const state = {
   // Principals → binding editor (#1346) — picked subject for the binding form.
   bindingSubject: null,    // { id, label }
   bindings: [],            // list of grant rows for the picked subject at scope
+  hierarchyEdges: [],      // list of {parent, child} from GET /admin/hierarchies
 };
 
 function csv(s) {
@@ -1287,6 +1289,180 @@ async function checkProvisioning() {
   }
 }
 
+// --- Hierarchy ----------------------------------------------------------
+
+function _populateRolePicker(sel) {
+  clearNode(sel);
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = "— pick a role —";
+  sel.appendChild(empty);
+  for (const r of state.roles) {
+    const opt = document.createElement("option");
+    opt.value = r.name;
+    opt.textContent = r.name;
+    sel.appendChild(opt);
+  }
+}
+
+async function refreshHierarchy() {
+  if (!state.roles.length) {
+    try {
+      state.roles = await listRoles(scopeCatalogId());
+    } catch (_e) { /* ignore, roles were already attempted */ }
+  }
+  _populateRolePicker($("#hierarchy-parent"));
+  _populateRolePicker($("#hierarchy-child"));
+  _populateRolePicker($("#hierarchy-query-role"));
+
+  const tbody = $("#hierarchy-table tbody");
+  clearNode(tbody);
+  const loading = document.createElement("tr");
+  loading.className = "empty-row";
+  const td = document.createElement("td");
+  td.colSpan = 3;
+  td.textContent = "Loading…";
+  loading.appendChild(td);
+  tbody.appendChild(loading);
+
+  try {
+    state.hierarchyEdges = await listRoleHierarchyEdges(scopeCatalogId());
+  } catch (e) {
+    setStatus("#hierarchy-status", `Load failed: ${e.message}`, "err");
+    clearNode(tbody);
+    return;
+  }
+  renderHierarchyEdges();
+}
+
+function renderHierarchyEdges() {
+  const tbody = $("#hierarchy-table tbody");
+  clearNode(tbody);
+  if (!state.hierarchyEdges.length) {
+    const tr = document.createElement("tr");
+    tr.className = "empty-row";
+    const td = document.createElement("td");
+    td.colSpan = 3;
+    td.textContent = "No hierarchy edges at this scope.";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  const canWrite = canWriteAtScope();
+  for (const edge of state.hierarchyEdges) {
+    const tr = document.createElement("tr");
+    const parent = document.createElement("td");
+    parent.textContent = edge.parent;
+    const child = document.createElement("td");
+    child.textContent = edge.child;
+    const actions = document.createElement("td");
+    actions.className = "table-actions";
+    const del = document.createElement("button");
+    del.className = "btn btn-danger btn-xs";
+    del.textContent = "Delete";
+    del.disabled = !canWrite;
+    del.addEventListener("click", async () => {
+      if (!confirm(`Delete edge "${edge.parent}" → "${edge.child}"?`)) return;
+      try {
+        await removeRoleHierarchyEdge({
+          parent: edge.parent,
+          child: edge.child,
+          catalogId: scopeCatalogId(),
+        });
+        setStatus("#hierarchy-status", `Removed ${edge.parent} → ${edge.child}.`, "ok");
+        refreshHierarchy();
+      } catch (e) {
+        setStatus("#hierarchy-status", `Delete failed: ${e.message}`, "err");
+      }
+    });
+    actions.appendChild(del);
+    tr.append(parent, child, actions);
+    tbody.appendChild(tr);
+  }
+}
+
+async function onSubmitHierarchyEdge(e) {
+  e.preventDefault();
+  if (!canWriteAtScope()) {
+    setStatus("#hierarchy-status", "You cannot modify the hierarchy at this scope.", "err");
+    return;
+  }
+  const parent = $("#hierarchy-parent").value;
+  const child = $("#hierarchy-child").value;
+  if (!parent || !child) {
+    setStatus("#hierarchy-status", "Select both parent and child roles.", "err");
+    return;
+  }
+  if (parent === child) {
+    setStatus("#hierarchy-status", "Parent and child must be different roles.", "err");
+    return;
+  }
+  // Client-side cycle pre-check using known edges (server is authoritative).
+  const childDescendants = new Set();
+  const visited = new Set();
+  const queue = [child];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    for (const edge of state.hierarchyEdges) {
+      if (edge.parent === cur && !visited.has(edge.child)) {
+        childDescendants.add(edge.child);
+        queue.push(edge.child);
+      }
+    }
+  }
+  if (childDescendants.has(parent)) {
+    setStatus(
+      "#hierarchy-status",
+      `Adding ${parent} → ${child} would create a cycle (${parent} is already a descendant of ${child}).`,
+      "err",
+    );
+    return;
+  }
+  try {
+    await addRoleHierarchyEdge({ parent, child, catalogId: scopeCatalogId() });
+    setStatus("#hierarchy-status", `Added ${parent} → ${child}.`, "ok");
+    refreshHierarchy();
+  } catch (e) {
+    // 409 = cycle detected server-side; surface detail directly.
+    const detail = e.body ? (() => {
+      try { return JSON.parse(e.body).detail || e.message; } catch (_p) { return e.message; }
+    })() : e.message;
+    setStatus("#hierarchy-status", `Failed: ${detail}`, "err");
+  }
+}
+
+async function expandDescendants() {
+  const role = $("#hierarchy-query-role").value;
+  if (!role) {
+    setStatus("#hierarchy-query-status", "Pick a role first.", "err");
+    return;
+  }
+  setStatus("#hierarchy-query-status", "Loading…", "");
+  try {
+    const descendants = await getRoleDescendants(role, scopeCatalogId());
+    setStatus("#hierarchy-query-status", "", "");
+    const container = $("#hierarchy-descendants");
+    clearNode(container);
+    if (!descendants.length) {
+      container.textContent = `No descendants for "${role}".`;
+      container.className = "muted";
+      return;
+    }
+    container.className = "";
+    for (const d of descendants) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.textContent = d;
+      chip.style.marginRight = "6px";
+      container.appendChild(chip);
+    }
+  } catch (e) {
+    setStatus("#hierarchy-query-status", `Failed: ${e.message}`, "err");
+  }
+}
+
 // --- Tabs ---------------------------------------------------------------
 
 function switchTab(name) {
@@ -1339,6 +1515,7 @@ async function boot() {
       if (state.bindingSubject) closeBindingEditor();
       await Promise.all([refreshRoles(), refreshPolicies()]);
       if ($("#tab-principals").classList.contains("active")) refreshPrincipals();
+      if ($("#tab-hierarchy").classList.contains("active")) refreshHierarchy();
       refreshObjectRefSuggestions();
     },
   });
@@ -1349,6 +1526,7 @@ async function boot() {
       if (name !== "provisioning") _stopProvPoll();
       switchTab(name);
       if (name === "principals" && !state.principals.length) refreshPrincipals();
+      if (name === "hierarchy") refreshHierarchy();
     });
   });
 
@@ -1382,6 +1560,11 @@ async function boot() {
     // sitting in the box would just cause a 422 on submit.
     $("#binding-object-ref").value = "";
   });
+
+  // Hierarchy tab
+  $("#hierarchy-create").addEventListener("submit", onSubmitHierarchyEdge);
+  $("#hierarchy-refresh").addEventListener("click", refreshHierarchy);
+  $("#hierarchy-query-btn").addEventListener("click", expandDescendants);
 
   $("#prov-check-btn").addEventListener("click", checkProvisioning);
   $("#prov-catalog-id").addEventListener("keydown", (e) => {

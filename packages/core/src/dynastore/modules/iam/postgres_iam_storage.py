@@ -494,6 +494,15 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             self._role_hierarchy_cache[cache_key] = (merged, time.monotonic())
             return merged
 
+    async def list_role_hierarchy_edges(
+        self,
+        conn: Optional[DbResource] = None,
+        schema: str = "iam",
+    ) -> List[tuple[str, str]]:
+        """Return all (parent_role, child_role) edges stored in the hierarchy table."""
+        async with managed_transaction(conn or self.engine) as db:
+            return await LIST_ROLE_HIERARCHY_EDGES.execute(db, schema=schema)
+
     async def create_refresh_token(
         self,
         token: RefreshToken,

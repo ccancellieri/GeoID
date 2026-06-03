@@ -92,6 +92,15 @@ class Role(BaseModel):
             self.id = self.name
         return self
 
+# --- 2b. Role Hierarchy Edge DTO ---
+
+class RoleHierarchyEdge(BaseModel):
+    """A single parent→child edge from the role_hierarchy table."""
+
+    parent: str
+    child: str
+
+
 # --- 3. Identity Authorization (Simplified IAG) ---
 
 class IdentityAuthorization(BaseModel):

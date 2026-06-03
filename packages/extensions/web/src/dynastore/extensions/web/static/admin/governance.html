@@ -31,6 +31,7 @@
       <button class="tab-btn active" data-tab="roles">Roles</button>
       <button class="tab-btn" data-tab="policies">Policies</button>
       <button class="tab-btn" data-tab="principals">Principals</button>
+      <button class="tab-btn" data-tab="hierarchy">Hierarchy</button>
       <button class="tab-btn" data-tab="provisioning">Provisioning</button>
     </div>
 
@@ -246,6 +247,61 @@
           </thead>
           <tbody><tr class="empty-row"><td colspan="7">Pick a principal above.</td></tr></tbody>
         </table>
+      </div>
+    </section>
+
+    <!-- Hierarchy --------------------------------------------------------- -->
+    <section id="tab-hierarchy" class="tab-panel">
+      <div class="plate">
+        <div class="plate-header">
+          <h3>Add hierarchy edge</h3>
+          <div class="plate-meta">POST /admin/hierarchies</div>
+        </div>
+        <form id="hierarchy-create">
+          <div class="form-row">
+            <div>
+              <label for="hierarchy-parent">Parent role</label>
+              <select id="hierarchy-parent"></select>
+            </div>
+            <div>
+              <label for="hierarchy-child">Child role</label>
+              <select id="hierarchy-child"></select>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn" type="submit" id="hierarchy-submit-btn">Add edge</button>
+            <span id="hierarchy-status" class="status"></span>
+          </div>
+        </form>
+      </div>
+
+      <div class="plate">
+        <div class="plate-header">
+          <h3>Existing edges</h3>
+          <div class="plate-meta">
+            <button class="btn btn-secondary btn-xs" id="hierarchy-refresh" type="button">Refresh</button>
+          </div>
+        </div>
+        <table id="hierarchy-table">
+          <thead>
+            <tr><th>Parent</th><th>Child</th><th></th></tr>
+          </thead>
+          <tbody><tr class="empty-row"><td colspan="3">Loading…</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="plate">
+        <div class="plate-header">
+          <h3>Effective descendants</h3>
+          <div class="plate-meta">GET /admin/hierarchies/{role}</div>
+        </div>
+        <div class="row">
+          <select id="hierarchy-query-role"></select>
+          <button class="btn btn-secondary btn-xs" id="hierarchy-query-btn" type="button">Expand</button>
+          <span id="hierarchy-query-status" class="status"></span>
+        </div>
+        <hr class="rule">
+        <div id="hierarchy-descendants" class="muted">Pick a role and press Expand.</div>
       </div>
     </section>
 

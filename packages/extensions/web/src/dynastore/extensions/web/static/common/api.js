@@ -411,3 +411,23 @@ export const fetchMyCatalogs = () => getJSON("/iam/me/catalogs");
 
 export const getCatalogProvisioning = (catalogId) =>
   getJSON(`/admin/catalogs/${encodeURIComponent(catalogId)}`);
+
+// ----- Role hierarchy edges (/admin/hierarchies) -----
+//
+// GET /admin/hierarchies returns [{parent, child}, ...].
+// POST and DELETE take query params (not a JSON body) matching the backend
+// route signature: parent=, child=, catalog_id=.
+
+export const listRoleHierarchyEdges = (catalogId) =>
+  getJSON(`/admin/hierarchies${qs({ catalog_id: catalogId })}`);
+
+export const addRoleHierarchyEdge = ({ parent, child, catalogId }) =>
+  postJSON(`/admin/hierarchies${qs({ parent, child, catalog_id: catalogId })}`, null);
+
+export const removeRoleHierarchyEdge = ({ parent, child, catalogId }) =>
+  deleteJSON(`/admin/hierarchies${qs({ parent, child, catalog_id: catalogId })}`);
+
+export const getRoleDescendants = (role, catalogId) =>
+  getJSON(
+    `/admin/hierarchies/${encodeURIComponent(role)}${qs({ catalog_id: catalogId })}`,
+  );

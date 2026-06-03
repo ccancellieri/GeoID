@@ -126,6 +126,9 @@ class AbstractIamStorage(abc.ABC):
     @abc.abstractmethod
     async def remove_role_hierarchy(self, parent_role: str, child_role: str, conn: Optional[Any] = None, schema: str = "iam") -> bool: ...
 
+    @abc.abstractmethod
+    async def list_role_hierarchy_edges(self, conn: Optional[Any] = None, schema: str = "iam") -> List[tuple[str, str]]: ...
+
     # --- Refresh Token Management ---
 
     @abc.abstractmethod

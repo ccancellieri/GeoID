@@ -66,3 +66,9 @@ class RoleAdminProtocol(Protocol):
     ) -> List[str]:
         """Return the effective hierarchy for a role."""
         ...
+
+    async def list_role_hierarchy(
+        self, catalog_id: Optional[str] = None
+    ) -> List[tuple[str, str]]:
+        """Return all (parent_role, child_role) edges at this scope."""
+        ...

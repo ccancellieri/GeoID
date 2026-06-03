@@ -51,6 +51,7 @@ from dynastore.modules.iam.authorization import require_permission
 from dynastore.models.protocols.policies import (
     PolicyCreate, PolicyUpdate, PolicyResponse,
 )
+from dynastore.models.auth_models import RoleHierarchyEdge
 
 from .models import (
     PrincipalCreate, PrincipalUpdate,
@@ -1822,6 +1823,14 @@ class AdminService(ExtensionProtocol):
     # Role Hierarchies (/admin/hierarchies)
     # -------------------------------------------------------------------------
 
+    @router.get("/hierarchies", summary="List all role hierarchy edges")
+    async def list_role_hierarchy(  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: Optional[str] = Query(None),
+    ) -> list[RoleHierarchyEdge]:
+        mgr = _iam()
+        edges = await mgr.list_role_hierarchy(catalog_id=catalog_id)
+        return [RoleHierarchyEdge(parent=p, child=c) for p, c in edges]
+
     @router.post("/hierarchies", status_code=204, summary="Add a parent→child role hierarchy edge")
     async def add_role_hierarchy(  # type: ignore[reportGeneralTypeIssues]
         parent: str = Query(..., description="Parent role name"),
@@ -1829,7 +1838,10 @@ class AdminService(ExtensionProtocol):
         catalog_id: Optional[str] = Query(None),
     ):
         mgr = _iam()
-        await mgr.add_role_hierarchy(parent, child, catalog_id=catalog_id)
+        try:
+            await mgr.add_role_hierarchy(parent, child, catalog_id=catalog_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
 
     @router.delete("/hierarchies", status_code=204, summary="Remove a parent→child role hierarchy edge")
     async def remove_role_hierarchy(  # type: ignore[reportGeneralTypeIssues]

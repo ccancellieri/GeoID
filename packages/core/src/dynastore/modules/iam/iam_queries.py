@@ -598,6 +598,12 @@ DELETE_ROLE_HIERARCHY = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
+LIST_ROLE_HIERARCHY_EDGES = DQLQuery(
+    "SELECT parent_role, child_role FROM {schema}.role_hierarchy ORDER BY parent_role, child_role;",
+    result_handler=ResultHandler.ALL_DICTS,
+    post_processor=lambda rows: [(row["parent_role"], row["child_role"]) for row in rows],
+)
+
 UPDATE_ROLE = DQLQuery(
     """
     UPDATE {schema}.roles
