@@ -600,6 +600,14 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             self._setup_cache()
         if self.engine is not None:
             await self.initialize_storage(self.engine)
+        else:
+            logger.error(
+                "PlatformConfigService: no DB engine available at lifespan — "
+                "configs schema and configs.task_capability_registry NOT initialized; "
+                "task backstop / proactive-sweep loops will fail with "
+                "'relation does not exist' if a DB-backed tier starts without a preceding "
+                "DBService lifespan. Check module priority ordering or engine configuration."
+            )
         logger.info("PlatformConfigService: Started.")
         yield
         logger.info("PlatformConfigService: Stopped.")

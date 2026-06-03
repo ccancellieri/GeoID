@@ -639,6 +639,26 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                         )
                     await ensure_task_storage_exists(locked_conn, schema)
 
+                # Ensure configs.task_capability_registry exists before the
+                # backstop/sweep loops start querying it. PlatformConfigService
+                # owns this DDL but may have skipped it if DBService (priority 10)
+                # was not yet up when DBConfigModule (priority 0) ran its lifespan.
+                # TasksModule (priority 15) always runs after DBService, so by this
+                # point the engine is present and the idempotent CREATE TABLE IF NOT
+                # EXISTS is safe.  Advisory lock mirrors the tasks_storage_init
+                # namespace pattern: one pod wins per cold-start, others skip.
+                from dynastore.modules.db_config.typed_store.ddl import (
+                    TASK_CAPABILITY_REGISTRY_DDL,
+                )
+                async with acquire_startup_lock(
+                    engine, f"tasks_storage_init.{schema}.registry"
+                ) as reg_conn:
+                    if reg_conn is not None:
+                        await DDLQuery(TASK_CAPABILITY_REGISTRY_DDL).execute(reg_conn)
+                        logger.info(
+                            "TasksModule: configs.task_capability_registry ensured."
+                        )
+
                 # Optional one-shot cleanup of pre-existing per-tenant
                 # ``{schema}.tasks`` tables left over from the
                 # cellular-safety pattern that this PR removes. Opt-in via
