@@ -581,7 +581,7 @@ class EventService(EventBusProtocol):
         self,
         shutdown_event: Any,
         *,
-        scope: str = "PLATFORM",
+        scope: str = "ALL",
         channels: Optional[List[str]] = None,
     ) -> None:
         """Spawn 16 shard consumer tasks and wait for all to complete."""
@@ -600,7 +600,7 @@ class EventService(EventBusProtocol):
         self,
         shutdown_event: Any,
         *,
-        scope: str = "PLATFORM",
+        scope: str = "ALL",
         leader_key: str = "dynastore.events.consumer.v1",
         channels: Optional[List[str]] = None,
     ) -> None:
