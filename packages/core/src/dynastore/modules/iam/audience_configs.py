@@ -26,8 +26,9 @@ class CatalogLookupAudience(PluginConfig):
 
     When ``is_public=True``, the operator has declared that this catalog
     accepts unauthenticated traffic on whichever routes their policies
-    open (typically the lookup-only ``/search`` and
-    ``/search/catalogs/{cat}`` surface gated by ``lookup_only_search``).
+    open (typically the lookup-only ``/search/catalogs/{cat}/items-search``
+    and STAC ``/stac/catalogs/{cat}/search`` surface gated by
+    ``lookup_only_search``).
 
     Default is ``is_public=False`` (auth-required); anonymous lookup is
     a deliberate, per-catalog opt-in. Activate via:

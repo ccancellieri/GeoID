@@ -27,7 +27,6 @@ import dynastore.extensions.records  # noqa: F401
 import dynastore.extensions.processes  # noqa: F401
 import dynastore.extensions.dimensions  # noqa: F401
 import dynastore.extensions.dwh  # noqa: F401
-import dynastore.extensions.search  # noqa: F401
 import dynastore.modules.stats  # noqa: F401
 import dynastore.extensions.logs  # noqa: F401
 import dynastore.extensions.notebooks  # noqa: F401
@@ -56,7 +55,7 @@ from dynastore.modules.db_config.plugin_config import list_registered_configs
 # extension has at least one ExposableConfigMixin config.
 _TOGGLABLE = frozenset({
     "stac", "features", "wfs", "coverages", "edr", "records", "processes", "dggs",
-    "tiles", "maps", "styles", "dimensions", "dwh", "joins", "search", "stats",
+    "tiles", "maps", "styles", "dimensions", "dwh", "joins", "stats",
     "gcp", "logs", "notebooks", "crs", "gdal", "assets", "moving_features",
     "connected_systems",
     # ``volumes`` lives in ``packages/core`` and registers no

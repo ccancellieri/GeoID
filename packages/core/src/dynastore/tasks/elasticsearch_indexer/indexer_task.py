@@ -15,10 +15,10 @@ made by ``ExecutionEngine.execute()`` based on the requested mode and which
 runner reports ``can_handle`` first.
 
 The legacy fan-out task types ``elasticsearch_bulk_reindex_catalog`` and
-``elasticsearch_bulk_reindex_collection`` remain registered (the existing
-admin reindex routes in ``extensions/search/search_service.py`` still
-dispatch them directly). This wrapper is the new canonical entry point for
-OGC Processes callers and any new integration sites.
+``elasticsearch_bulk_reindex_collection`` remain registered and are
+enqueued via ``POST /admin/catalogs/{cat}/tasks`` (action=reindex), which
+resolves to this entry point. This is the canonical dispatch path for
+reindex/backfill since the generic search extension was removed.
 """
 from typing import Any, Dict, Optional
 

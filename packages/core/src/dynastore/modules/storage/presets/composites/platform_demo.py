@@ -47,7 +47,6 @@ _COMPOSE: Tuple[str, ...] = (
     "iam_baseline",
     "defaults_postgres",
     "features_enable",
-    "search_enable",
     "tiles_enable",
     "auth_enable",
     "stac_enable",

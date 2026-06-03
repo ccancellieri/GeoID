@@ -1106,13 +1106,13 @@ def _read_scope_probe_paths(
 
     A policy is relevant to the read scope when its resource pattern matches
     at least one of these. We probe the canonical per-catalog read surfaces
-    (STAC + OGC Features item reads) plus the platform-tier item search, so
-    a policy scoped to any of them is recognised. When no catalog is given
-    we probe the platform-tier search root and the bare root, which a
-    ``.*`` super-admin resource still matches.
+    (STAC + OGC Features item reads) plus the geoid lookup surface, so a
+    policy scoped to any of them is recognised. When no catalog is given we
+    probe only the bare root, which a ``.*`` super-admin resource still
+    matches (the generic platform-tier ``/search`` endpoint is gone).
     """
     if catalog_id is None:
-        return ("/", "/search")
+        return ("/",)
     cat = catalog_id
     if collection_id:
         col = collection_id
@@ -1121,7 +1121,7 @@ def _read_scope_probe_paths(
             f"/stac/catalogs/{cat}/collections/{col}/items/_probe_",
             f"/features/catalogs/{cat}/collections/{col}/items",
             f"/search/catalogs/{cat}/items-search",
-            f"/search/catalogs/{cat}",
+            f"/stac/catalogs/{cat}/search",
         )
     # Catalog-wide read scope: also probe a representative collection-item
     # read path so a policy scoped to ``.../collections/{col}/items`` (the
@@ -1136,7 +1136,7 @@ def _read_scope_probe_paths(
         f"/features/catalogs/{cat}",
         f"/features/catalogs/{cat}/collections/_probe_/items",
         f"/search/catalogs/{cat}/items-search",
-        f"/search/catalogs/{cat}",
+        f"/stac/catalogs/{cat}/search",
     )
 
 

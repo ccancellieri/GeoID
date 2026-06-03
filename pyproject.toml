@@ -44,7 +44,6 @@ dynastore-ext-dimensions = { workspace = true }
 dynastore-ext-notebooks = { workspace = true }
 dynastore-ext-proxy = { workspace = true }
 dynastore-ext-processes = { workspace = true }
-dynastore-ext-search = { workspace = true }
 dynastore-ext-crs = { workspace = true }
 dynastore-ext-dggs = { workspace = true }
 dynastore-ext-features = { workspace = true }
@@ -139,7 +138,6 @@ extension_admin = ["dynastore[extension_base,extension_iam]", "dynastore-ext-adm
 extension_assets = ["dynastore[extension_base]", "dynastore-ext-assets"]
 extension_notebooks = ["dynastore[extension_base,module_notebooks]", "dynastore-ext-notebooks"]
 extension_records = ["dynastore[extension_base]", "pygeofilter[backend-sqlalchemy]", "dynastore-ext-records"]
-extension_search = ["dynastore[extension_base]", "dynastore-ext-search"]
 extension_gcp_bucket = ["dynastore[extension_base,module_gcp]", "dynastore-ext-gcp-bucket"]
 extension_geoid = ["dynastore[extension_base,extension_web]", "user-agents>=2.2.0", "dynastore-ext-geoid"]
 extension_maps = ["dynastore[extension_base,geospatial_core,mvt]", "GDAL==3.13.0", "dynastore-ext-maps"]
@@ -215,7 +213,6 @@ proxy = ["dynastore[module_proxy,extension_proxy]"]
 logs = ["dynastore[extension_logs]"]
 assets = ["dynastore[extension_assets]"]
 configs = ["dynastore[extension_configs]"]
-search = ["dynastore[extension_search]"]
 storage = ["dynastore[module_storage]"]
 auth = ["dynastore[extension_auth]"]
 template = ["dynastore[extension_template]"]
@@ -266,7 +263,7 @@ core = ["dynastore[db_async,web,configs,storage,cache]"]
 # included (api_open, scope_catalog, catalog_local, api_features, worker_service).
 # Maps + tools deliberately do not pull catalog_grp → no /events route.
 catalog_data_grp = ["dynastore[geospatial_core,catalog,features]"]
-catalog_routes_grp = ["dynastore[stac,assets,search,extension_records]"]
+catalog_routes_grp = ["dynastore[stac,assets,extension_records]"]
 catalog_grp = ["dynastore[catalog_data_grp,catalog_routes_grp,module_local,events]"]
 maps_grp = ["dynastore[styles,maps,extension_wfs,tiles,crs,gdal,extension_coverages]"]
 # google_grp split: dwh is rendering input (BQ joins also live here),
@@ -508,7 +505,7 @@ all = ["dynastore[api_full,geoid_service,worker_service]"]
 # `everything` = `all` + every `extension_*` extra, so all 35 ext wheels resolve.
 # Build the CI test image with SCOPE=everything. Keep service images on the
 # narrow `scope_*` extras to stay slim.
-everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,extension_configs,extension_connected_systems,extension_coverages,extension_crs,extension_dggs,extension_dimensions,extension_dwh,extension_edr,extension_events,extension_features,extension_gcp_bucket,extension_gdal,extension_geoid,extension_httpx,extension_iam,extension_logs,extension_maps,extension_moving_features,extension_notebooks,extension_processes,extension_proxy,extension_records,extension_search,extension_stac,extension_stats,extension_styles,extension_tasks,extension_template,extension_tiles,extension_web,extension_wfs]"]
+everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,extension_configs,extension_connected_systems,extension_coverages,extension_crs,extension_dggs,extension_dimensions,extension_dwh,extension_edr,extension_events,extension_features,extension_gcp_bucket,extension_gdal,extension_geoid,extension_httpx,extension_iam,extension_logs,extension_maps,extension_moving_features,extension_notebooks,extension_processes,extension_proxy,extension_records,extension_stac,extension_stats,extension_styles,extension_tasks,extension_template,extension_tiles,extension_web,extension_wfs]"]
 # Superset of `everything` that pulls in every optional driver / task-only
 # dependency referenced anywhere in src/. Pyright/mypy need these resolvable to
 # clear `reportMissingImports` on optional code paths (duckdb, pyiceberg,

@@ -444,7 +444,9 @@ class MaxCountHandler(ConditionHandler):
 class LookupOnlySearchHandler(ConditionHandler):
     """Pass only when the request looks like a needle-lookup search.
 
-    Used to expose ``/search`` and ``/search/catalogs/{cat}`` to
+    Used to gate the geoid lookup surface
+    ``/search/catalogs/{cat}/items-search`` (and, where operators open it,
+    the STAC search at ``/stac/catalogs/{cat}/search``) to
     anonymous (or otherwise narrowly-scoped) callers as a retrieve-by-id
     surface — the caller can find an item they already know the GeoID
     or external_id of, but cannot enumerate the catalog.

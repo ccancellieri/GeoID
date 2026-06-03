@@ -2,7 +2,7 @@
 
 Verifies the end-to-end flow:
   POST /stac/.../items  →  item lands in per-catalog ES index
-                        →  GET /search returns it (by id, bbox, fulltext)
+                        →  POST /stac/catalogs/{cat}/search returns it
   DELETE .../items/{id} →  item removed from ES index
 
 All tests require a live ES instance and are skipped otherwise.
@@ -19,7 +19,7 @@ from tests.dynastore.modules.elasticsearch.integration.conftest import (
 )
 
 pytestmark = [
-    pytest.mark.enable_extensions("stac", "features", "search"),
+    pytest.mark.enable_extensions("stac", "features"),
     # Full default stack + elasticsearch: the STAC POST/DELETE endpoints require
     # db_config + db + catalog + iam + collection_postgresql + catalog_postgresql.
     # enable_modules() replaces the default list entirely, so we must repeat it.
@@ -75,13 +75,15 @@ async def test_item_post_then_found_by_id(
     setup_catalog: str,
     setup_collection: str,
 ):
-    """POST a STAC item → it appears in /search?ids=."""
+    """POST a STAC item → it appears in STAC search by ids."""
     cat, col = setup_catalog, setup_collection
     item = make_item("es-rt-by-id")
     await _post_item(sysadmin_in_process_client, cat, col, item)
     await _yield_to_async_writer(cat)
 
-    r = await sysadmin_in_process_client.get("/search", params={"ids": "es-rt-by-id"})
+    r = await sysadmin_in_process_client.post(
+        f"/stac/catalogs/{cat}/search", json={"ids": ["es-rt-by-id"]}
+    )
     assert r.status_code == 200
     data = r.json()
     ids = [f["id"] for f in data.get("features", [])]
@@ -101,13 +103,17 @@ async def test_item_found_by_bbox(
     await _yield_to_async_writer(cat)
 
     # Enclosing bbox
-    r = await sysadmin_in_process_client.get("/search", params={"bbox": "5,35,15,45"})
+    r = await sysadmin_in_process_client.post(
+        f"/stac/catalogs/{cat}/search", json={"bbox": [5, 35, 15, 45]}
+    )
     assert r.status_code == 200
     ids = [f["id"] for f in r.json().get("features", [])]
     assert "es-rt-bbox" in ids
 
     # Disjoint bbox — item must NOT be returned
-    r2 = await sysadmin_in_process_client.get("/search", params={"bbox": "20,50,30,60"})
+    r2 = await sysadmin_in_process_client.post(
+        f"/stac/catalogs/{cat}/search", json={"bbox": [20, 50, 30, 60]}
+    )
     assert r2.status_code == 200
     ids2 = [f["id"] for f in r2.json().get("features", [])]
     assert "es-rt-bbox" not in ids2
@@ -119,7 +125,7 @@ async def test_item_found_by_fulltext(
     setup_catalog: str,
     setup_collection: str,
 ):
-    """POST item with unique title → GET /search?q=<title> returns it."""
+    """POST item with unique title → POST /stac/.../search?q=<title> returns it."""
     cat, col = setup_catalog, setup_collection
     unique_token = "ZZQrtPlanTest7331"
     item = make_item("es-rt-fulltext")
@@ -127,7 +133,9 @@ async def test_item_found_by_fulltext(
     await _post_item(sysadmin_in_process_client, cat, col, item)
     await _yield_to_async_writer(cat)
 
-    r = await sysadmin_in_process_client.get("/search", params={"q": unique_token})
+    r = await sysadmin_in_process_client.post(
+        f"/stac/catalogs/{cat}/search", json={"q": unique_token}
+    )
     assert r.status_code == 200
     ids = [f["id"] for f in r.json().get("features", [])]
     assert "es-rt-fulltext" in ids
@@ -139,14 +147,16 @@ async def test_item_not_found_after_delete(
     setup_catalog: str,
     setup_collection: str,
 ):
-    """POST item, DELETE it, verify it is no longer in /search results."""
+    """POST item, DELETE it, verify it is no longer in STAC search results."""
     cat, col = setup_catalog, setup_collection
     item = make_item("es-rt-delete")
     await _post_item(sysadmin_in_process_client, cat, col, item)
     await _yield_to_async_writer(cat)
 
     # Verify it's there first
-    r = await sysadmin_in_process_client.get("/search", params={"ids": "es-rt-delete"})
+    r = await sysadmin_in_process_client.post(
+        f"/stac/catalogs/{cat}/search", json={"ids": ["es-rt-delete"]}
+    )
     assert r.status_code == 200
     assert any(f["id"] == "es-rt-delete" for f in r.json().get("features", []))
 
@@ -155,6 +165,8 @@ async def test_item_not_found_after_delete(
     await _yield_to_async_writer(cat)
 
     # Should be gone
-    r2 = await sysadmin_in_process_client.get("/search", params={"ids": "es-rt-delete"})
+    r2 = await sysadmin_in_process_client.post(
+        f"/stac/catalogs/{cat}/search", json={"ids": ["es-rt-delete"]}
+    )
     assert r2.status_code == 200
     assert not any(f["id"] == "es-rt-delete" for f in r2.json().get("features", []))
