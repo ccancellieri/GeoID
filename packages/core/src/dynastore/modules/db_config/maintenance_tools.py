@@ -39,6 +39,39 @@ from dynastore.modules.db_config.locking_tools import (
 
 logger = logging.getLogger(__name__)
 
+# Public surface of this maintenance facade. Listing names here (in addition to
+# the per-line F401-suppression directive) makes the cross-package re-exports
+# below machine-checkable and survives a ``ruff --fix`` F401 sweep: ruff never
+# reports — and never strips — an import that appears in ``__all__`` (refs #1747,
+# #1547).
+# ``acquire_startup_lock`` in particular is referenced only as
+# ``maintenance_tools.acquire_startup_lock`` (never inside this module), so
+# without this protection a per-file F401 pass removes it and breaks startup for
+# every module lifespan that acquires the lock (the #1705 -> #1745 regression).
+# ``DDLQuery``/``DQLQuery``/``DbResource``/``ResultHandler`` are re-exported back
+# into ``locking_tools`` via this facade; ``check_cron_job_exists`` is consumed
+# by tenant cron callers.
+__all__ = [
+    # cross-package re-exports (load-bearing — see note above)
+    "acquire_startup_lock",
+    "check_cron_job_exists",
+    "DDLQuery",
+    "DQLQuery",
+    "DbResource",
+    "ResultHandler",
+    # functions defined in this module
+    "retry_on_invalidated_connection",
+    "ensure_db_extension",
+    "ensure_schema_exists",
+    "ensure_enum_type",
+    "ensure_future_partitions",
+    "register_retention_policy",
+    "register_partition_creation_policy",
+    "ensure_global_cron_cleanup",
+    "register_cron_job",
+    "unregister_cron_job",
+]
+
 
 async def retry_on_invalidated_connection(
     coro_factory,

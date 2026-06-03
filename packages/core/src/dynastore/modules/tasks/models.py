@@ -37,6 +37,31 @@ from dynastore.models.tasks import (  # noqa: F401 — re-export
 
 from dynastore.modules.db_config.query_executor import DbResource
 
+# Public surface. The canonical task models are defined in
+# ``dynastore.models.tasks`` and re-exported here for backward compatibility;
+# nothing in this module references them, so a per-file F401 sweep would strip
+# the re-export and break every ``dynastore.modules.tasks.models`` importer.
+# Listing them in ``__all__`` makes the re-export machine-checkable and immune
+# to ``ruff --fix`` (ruff never reports a name that appears in ``__all__``) —
+# the same guard applied across the cross-package re-export sites in #1747
+# (refs #1547).
+__all__ = [
+    # cross-package re-exports from dynastore.models.tasks (load-bearing)
+    "TaskStatusEnum",
+    "TaskExecutionMode",
+    "TaskExecutionScope",
+    "TaskPayload",
+    "TaskBase",
+    "TaskCreate",
+    "TaskUpdate",
+    "Task",
+    # runtime types defined in this module
+    "PermanentTaskFailure",
+    "DEFERRED_COMPLETION",
+    "RunnerContext",
+    "RunnerCapabilities",
+]
+
 
 class PermanentTaskFailure(Exception):
     """
