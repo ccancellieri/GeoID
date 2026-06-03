@@ -23,8 +23,15 @@ Outcome contract:
   Per-ref retry count is incremented in the task payload on each attempt.
   After ``max_ref_retries`` attempts (default 5, configurable in task inputs),
   the ref is marked DEAD and processing continues so other refs are not blocked.
-- Any DEAD  → logged as permanent failure; does not block other refs.
-  Task fails at the end if any DEAD refs remain.
+- Any DEAD  → permanent failure; does not block other refs.  When DEAD refs
+  remain after all refs are processed, the task raises
+  :class:`PermanentTaskFailure` so the dispatcher dead-letters it immediately
+  **without retrying**.  A DEAD ref can never succeed on re-run — its owner is
+  unregistered, its payload is malformed, the owner returned DEAD, or per-ref
+  retries are exhausted.  Raising the retryable ``RuntimeError`` here instead
+  would let the dispatcher reset the row to PENDING and re-claim the same doomed
+  task every backoff cycle forever, emitting a ``task.failed`` event each time —
+  an unbounded loop that never drains.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from typing import Any, Dict, List
 
 from dynastore.tasks.protocols import TaskProtocol
 from dynastore.tasks.cascade_cleanup.inputs import CascadeCleanupInputs
+from dynastore.modules.tasks.models import PermanentTaskFailure
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +210,15 @@ class CascadeCleanupTask(TaskProtocol):
             )
 
         if dead_refs:
-            raise RuntimeError(
+            # DEAD refs are terminal: re-running cannot make them succeed, so
+            # raise PermanentTaskFailure (NOT the retryable RuntimeError used for
+            # retry_refs above).  The dispatcher dead-letters the row instead of
+            # resetting it to PENDING — without this, a doomed cascade_cleanup
+            # task (e.g. one whose payload names a cleanup owner retired by a
+            # later refactor) is re-claimed every backoff cycle forever and
+            # emits a task.failed event each time, so the events outbox never
+            # drains.
+            raise PermanentTaskFailure(
                 f"cascade_cleanup: {len(dead_refs)} ref(s) permanently failed "
                 f"(DEAD): {dead_refs}"
             )

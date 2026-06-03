@@ -31,6 +31,7 @@ from dynastore.modules.catalog.resource_owner import (
     ResourceScope,
     ScopeRef,
 )
+from dynastore.modules.tasks.models import PermanentTaskFailure
 
 
 # ---------------------------------------------------------------------------
@@ -527,10 +528,10 @@ class TestCascadeCleanupTaskPerRefRetry:
         ):
             with patch("dynastore.tasks.cascade_cleanup.task._persist_updated_refs", new=AsyncMock()):
                 try:
-                    return asyncio.get_event_loop().run_until_complete(
-                        CascadeCleanupTask().run(payload)
-                    ), None
-                except RuntimeError as exc:
+                    # asyncio.run (not get_event_loop().run_until_complete):
+                    # Python 3.12 removed the implicit current-loop.
+                    return asyncio.run(CascadeCleanupTask().run(payload)), None
+                except (RuntimeError, PermanentTaskFailure) as exc:
                     return None, exc
 
     def test_ref_with_max_retries_exhausted_marked_dead(self) -> None:
