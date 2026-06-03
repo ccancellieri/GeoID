@@ -209,3 +209,33 @@ class AppliedPresetsPage(BaseModel):
             "to retrieve the following page. ``null`` when this is the last page."
         ),
     )
+
+
+# --- Admin task-dispatch request / response DTOs ---
+
+
+class AdminTaskRequest(BaseModel):
+    """Request body for POST /admin/catalogs/{cat}/tasks and
+    POST /admin/catalogs/{cat}/collections/{col}/tasks."""
+
+    action: str = Field(description="Action to enqueue (e.g. 'reindex', 'backfill_envelope_attrs').")
+    params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Action-specific parameters (optional).",
+    )
+
+
+class AdminTaskTarget(BaseModel):
+    """Identifies the scope the dispatched task targets."""
+
+    catalog_id: str
+    collection_id: Optional[str] = None
+
+
+class AdminTaskResponse(BaseModel):
+    """202 Accepted response for admin task-dispatch endpoints."""
+
+    task_id: str
+    action: str
+    target: AdminTaskTarget
+    status: str = "queued"
