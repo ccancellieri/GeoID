@@ -48,14 +48,16 @@ async def test_stac_search_filters(sysadmin_in_process_client, in_process_client
     assert r2.status_code in [200, 201]
     item2_id = r2.json()["id"]
 
+    # All searches use the canonical catalog-scoped path.
+    _search_url = f"/stac/catalogs/{catalog_id}/search"
+
     # 1. Test BBOX Filter (Spatial Only Optimization Candidate)
     # item1 is in [9,9,11,11], item2 is not
     search_bbox = {
-        "catalog_id": catalog_id,
         "bbox": [9.0, 9.0, 11.0, 11.0],
         "collections": [collection_id],
     }
-    r = await sysadmin_in_process_client.post("/stac/search", json=search_bbox)
+    r = await sysadmin_in_process_client.post(_search_url, json=search_bbox)
     if r.status_code != 200:
         print(f"\nResponse: {r.json()}")
     assert r.status_code == 200
@@ -69,11 +71,10 @@ async def test_stac_search_filters(sysadmin_in_process_client, in_process_client
     # resolves these features. ES driver matches against ``_id`` (the geoid)
     # — that path requires the geoid.
     search_ids = {
-        "catalog_id": catalog_id,
         "ids": ["item1", "item2", item1_id, item2_id],
         "collections": [collection_id],
     }
-    r = await sysadmin_in_process_client.post("/stac/search", json=search_ids)
+    r = await sysadmin_in_process_client.post(_search_url, json=search_ids)
     if r.status_code != 200:
         print(f"\nResponse: {r.json()}")
     assert r.status_code == 200
@@ -81,11 +82,10 @@ async def test_stac_search_filters(sysadmin_in_process_client, in_process_client
     assert len(features) == 2
 
     search_ids_single = {
-        "catalog_id": catalog_id,
         "ids": ["item2", item2_id],
         "collections": [collection_id],
     }
-    r = await sysadmin_in_process_client.post("/stac/search", json=search_ids_single)
+    r = await sysadmin_in_process_client.post(_search_url, json=search_ids_single)
     if r.status_code != 200:
         print(f"\nResponse: {r.json()}")
     assert r.status_code == 200
@@ -106,11 +106,10 @@ async def test_stac_search_filters(sysadmin_in_process_client, in_process_client
     # validity column exists, so both items are returned — the assertion here
     # guards the absence of the 500, not temporal narrowing.
     search_datetime = {
-        "catalog_id": catalog_id,
         "datetime": "2024-01-01T00:00:00Z/2024-01-03T00:00:00Z",
         "collections": [collection_id],
     }
-    r = await sysadmin_in_process_client.post("/stac/search", json=search_datetime)
+    r = await sysadmin_in_process_client.post(_search_url, json=search_datetime)
     if r.status_code != 200:
         print(f"\nResponse: {r.json()}")
     assert r.status_code == 200, r.text
@@ -123,13 +122,12 @@ async def test_stac_search_filters(sysadmin_in_process_client, in_process_client
     # JOIN (ids + datetime), and the datetime projection together — the exact
     # composition that previously 500'd. The bbox narrows the result to item1.
     search_combined = {
-        "catalog_id": catalog_id,
         "bbox": [9.0, 9.0, 11.0, 11.0],
         "ids": ["item1", "item2", item1_id, item2_id],
         "datetime": "2024-01-01T00:00:00Z/2024-01-03T00:00:00Z",
         "collections": [collection_id],
     }
-    r = await sysadmin_in_process_client.post("/stac/search", json=search_combined)
+    r = await sysadmin_in_process_client.post(_search_url, json=search_combined)
     if r.status_code != 200:
         print(f"\nResponse: {r.json()}")
     assert r.status_code == 200, r.text

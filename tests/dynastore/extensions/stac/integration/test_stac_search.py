@@ -6,7 +6,7 @@ Covers the most under-tested STAC routes:
 - GET /stac/catalogs/{id}/collections          (list collections)
 - GET /stac/catalogs/{id}/collections/{id}/items  (list items, bbox, pagination)
 - POST /stac/catalogs/{id}/search              (item search by catalog)
-- POST /stac/collections-search                (cross-catalog collection search)
+- GET /stac/catalogs/{id}/collections          (collection search via standard path)
 """
 
 import pytest
@@ -220,19 +220,19 @@ async def test_stac_search_post_with_limit(
 
 
 # ---------------------------------------------------------------------------
-# POST /collections-search (cross-catalog collection search)
+# GET /catalogs/{id}/collections (collection search — standard path)
 # ---------------------------------------------------------------------------
 
 
 @MARKER
 @pytest.mark.asyncio
-async def test_collections_search_post_basic(
+async def test_collections_list_returns_200(
     sysadmin_in_process_client: AsyncClient, setup_catalog, setup_collection
 ):
-    """POST /stac/collections-search — returns collections list."""
-    r = await sysadmin_in_process_client.post(
-        "/stac/collections-search",
-        json={},
+    """GET /stac/catalogs/{id}/collections (plain) — returns collections list."""
+    catalog_id = setup_catalog
+    r = await sysadmin_in_process_client.get(
+        f"/stac/catalogs/{catalog_id}/collections",
     )
     assert r.status_code == 200
     data = r.json()
@@ -242,15 +242,15 @@ async def test_collections_search_post_basic(
 
 @MARKER
 @pytest.mark.asyncio
-async def test_collections_search_post_with_catalog_filter(
+async def test_collections_search_get_with_limit(
     sysadmin_in_process_client: AsyncClient, setup_catalog, setup_collection
 ):
-    """POST /stac/collections-search — filter by catalog_id."""
+    """GET /stac/catalogs/{id}/collections?limit — standard collection search path."""
     catalog_id = setup_catalog
     collection_id = setup_collection
-    r = await sysadmin_in_process_client.post(
-        "/stac/collections-search",
-        json={"catalog_ids": [catalog_id]},
+    r = await sysadmin_in_process_client.get(
+        f"/stac/catalogs/{catalog_id}/collections",
+        params={"limit": 100},
     )
     assert r.status_code == 200
     data = r.json()

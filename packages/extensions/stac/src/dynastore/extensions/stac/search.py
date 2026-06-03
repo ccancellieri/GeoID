@@ -68,6 +68,16 @@ class ItemSearchRequest(BaseModel):
     limit: int = Field(10, ge=1, le=1000)
     offset: int = Field(0, ge=0)
     aggregations: Optional[List[AggregationRule]] = Field(None, alias="aggregate")
+    sortby: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Sort fields. Each entry is a field name optionally prefixed with "
+            "'+' for ascending (default) or '-' for descending. "
+            "GET form also accepts a single comma-separated string. "
+            "Example POST: [\"+datetime\", \"-id\"]. "
+            "Example GET: \"+datetime,-id\"."
+        ),
+    )
 
 
 class CollectionSearchRequest(BaseModel):
@@ -77,6 +87,15 @@ class CollectionSearchRequest(BaseModel):
     bbox: Optional[Tuple[float, float, float, float]] = None
     datetime: Optional[str] = None
     keywords: Optional[List[str]] = None
+    # STAC Collection Search extension: free-text query param `q`
+    q: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Free-text search terms. Terms are matched case-insensitively against "
+            "collection id, title, description, and keywords. "
+            "GET form accepts a comma-separated string; POST accepts a list."
+        ),
+    )
     limit: int = Field(10, ge=1, le=1000)
     offset: int = Field(0, ge=0)
     sortby: Optional[str] = Field(
@@ -297,6 +316,40 @@ def _parse_collection_sort_sql(sortby: Optional[str], lang: Optional[str] = None
     if _SAFE_ATTRIBUTE_FIELD_RE.match(field):
         return f"(extra_metadata->>'{field}') {direction}"
     raise ValueError(f"Invalid sort field: {field!r}")
+
+
+# Safe item sort fields available in the candidate_matches CTE columns:
+# valid_from (timestamptz), id (text), catalog_id (text), collection_id (text)
+_ITEM_DIRECT_SORT_COLUMNS = frozenset({"valid_from", "id", "catalog_id", "collection_id"})
+_ITEM_SORT_ALIASES: dict = {"datetime": "valid_from"}
+
+
+def _parse_item_sort_order_by(sortby: Optional[List[str]]) -> str:
+    """Convert the STAC sortby list to a safe SQL ORDER BY clause for item search.
+
+    Each entry in the list is a field name with an optional '+' (ascending, default)
+    or '-' (descending) prefix.  The fields are validated against the columns
+    projected by the candidate_matches CTE — valid_from, id, catalog_id, collection_id
+    — plus the alias 'datetime' which maps to valid_from.
+
+    Returns the default ``valid_from DESC, id`` order when sortby is empty/None.
+    """
+    if not sortby:
+        return "valid_from DESC, id"
+    parts = []
+    for entry in sortby:
+        if not entry:
+            continue
+        direction = "DESC" if entry.startswith("-") else "ASC"
+        raw_field = entry.lstrip("+-")
+        field = _ITEM_SORT_ALIASES.get(raw_field, raw_field)
+        if field not in _ITEM_DIRECT_SORT_COLUMNS:
+            raise ValueError(
+                f"Invalid item sort field {raw_field!r}. "
+                f"Supported fields: {sorted(_ITEM_DIRECT_SORT_COLUMNS | set(_ITEM_SORT_ALIASES))}."
+            )
+        parts.append(f"{field} {direction}")
+    return ", ".join(parts) if parts else "valid_from DESC, id"
 
 
 def _inject_search_hints(
@@ -903,13 +956,16 @@ async def search_items(
 
     full_union_query = " UNION ALL ".join(candidate_fragments)
 
+    # Build ORDER BY from optional sortby; default to valid_from DESC, id
+    order_by_clause = _parse_item_sort_order_by(search_request.sortby)
+
     # Merged paging + count using a window function (1 query instead of 2)
     paging_query = f"""
         WITH candidate_matches AS ({full_union_query})
         SELECT catalog_id, collection_id, geoid, valid_from, id,
                COUNT(*) OVER() AS _total_count
         FROM candidate_matches
-        ORDER BY valid_from DESC, id
+        ORDER BY {order_by_clause}
         LIMIT :limit OFFSET :offset
     """
 
@@ -1213,6 +1269,20 @@ async def search_collections(
     if search_request.keywords:
         where_clauses.append("mc.keywords @> CAST(:keywords AS jsonb)")
         params["keywords"] = str(search_request.keywords).replace("'", '"')
+
+    # STAC Collection Search `q` — free-text across id, title (all languages), description
+    if search_request.q:
+        q_conditions = []
+        for idx, term in enumerate(search_request.q):
+            p = f"_q_term_{idx}"
+            params[p] = f"%{term.lower()}%"
+            q_conditions.append(
+                f"(lower(c.id) LIKE :{p} "
+                f"OR lower(mc.description) LIKE :{p} "
+                f"OR lower(mc.title::text) LIKE :{p})"
+            )
+        if q_conditions:
+            where_clauses.append("(" + " AND ".join(q_conditions) + ")")
 
     if search_request.bbox:
         where_clauses.append(

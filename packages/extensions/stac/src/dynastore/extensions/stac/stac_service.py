@@ -163,6 +163,7 @@ def _assert_stac_capable_collection_stack() -> None:
 STAC_API_URIS = [
     "https://api.stacspec.org/v1.0.0/core",
     "https://api.stacspec.org/v1.0.0/item-search",
+    "https://api.stacspec.org/v1.1.0/item-search#sort",
     "https://api.stacspec.org/v1.0.0/collections",
     "https://api.stacspec.org/v1.0.0-rc.2/transactions",
     "https://api.stacspec.org/v1.0.0/item-search/definition",
@@ -174,7 +175,15 @@ STAC_API_URIS = [
     "https://api.stacspec.org/v1.0.0/item-search#query",
     "https://api.stacspec.org/v1.0.0/item-search#filter:cql-json",
     "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/filter",
+    "http://www.opengis.net/spec/cql2/1.0/conf/cql2-text",
+    "http://www.opengis.net/spec/cql2/1.0/conf/cql2-json",
+    "http://www.opengis.net/spec/cql2/1.0/conf/basic-cql2",
     "https://api.stacspec.org/v1.0.0/children",
+    # STAC Collection Search extension
+    "https://api.stacspec.org/v1.0.0/collection-search",
+    "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query",
+    "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query#free-text",
+    "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query#filter",
 ]
 class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCServiceMixin, OGCTransactionMixin):
     priority: int = 100
@@ -286,11 +295,13 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ("/catalogs/{catalog_id}/collections/{collection_id}/items", "add_stac_item", ["POST"], {"status_code": status.HTTP_201_CREATED}),
             ("/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}", "update_stac_item", ["PUT"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}", "delete_stac_item", ["DELETE"], {}),
-            # Search Endpoints
+            # Search Endpoints — STAC API standard
+            # Item Search: GET and POST /catalogs/{catalog_id}/search
+            ("/catalogs/{catalog_id}/search", "search_items_get", ["GET"], {"response_class": _J}),
             ("/catalogs/{catalog_id}/search", "search_items_post", ["POST"], {"response_class": _J}),
-            ("/collections-search", "search_stac_collections_post", ["POST"], {"response_class": _J}),
-            ("/search", "search_items_post", ["POST"], {"response_class": _J, "deprecated": True}),
-            ("/collections/search", "search_stac_collections_post", ["POST"], {"response_class": _J, "deprecated": True}),
+            # Non-standard paths removed: /collections-search, /collections/search (deprecated),
+            # /search bare (deprecated). Capability is preserved via the standard paths above
+            # (item search) and GET /catalogs/{catalog_id}/collections (collection search).
             # Virtual STAC Endpoints
             ("/virtual/assets/catalogs/{catalog_id}/collections/{collection_id}", "get_virtual_asset_list", ["GET"], {"response_class": _J}),
             ("/virtual/assets/{asset_code}/catalogs/{catalog_id}/collections/{collection_id}", "get_virtual_asset_collection", ["GET"], {"response_class": _J}),
@@ -402,8 +413,47 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         return JSONResponse(content=catalog_dict)
 
     async def list_stac_collections(
-        self, catalog_id: str, request: Request, language: str = Depends(get_language)
+        self,
+        catalog_id: str,
+        request: Request,
+        engine=Depends(get_async_engine),
+        language: str = Depends(get_language),
+        # STAC Collection Search extension query params (GET /collections)
+        bbox: Optional[str] = Query(
+            None,
+            description="Bounding box as comma-separated: minx,miny,maxx,maxy (EPSG:4326).",
+        ),
+        datetime: Optional[str] = Query(
+            None,
+            description="RFC 3339 date-time or interval.",
+        ),
+        q: Optional[str] = Query(
+            None,
+            description=(
+                "Free-text search: comma-separated terms matched against "
+                "collection id, title, and description."
+            ),
+        ),
+        limit: int = Query(10, ge=1, le=1000, description="Maximum number of collections to return."),
+        offset: int = Query(0, ge=0, description="Number of collections to skip."),
+        sortby: Optional[str] = Query(
+            None,
+            description=(
+                "Sort field with optional '+' (asc) or '-' (desc) prefix. "
+                "Aliases: 'code'=id, 'label'=title. E.g. '+code', '-label'."
+            ),
+        ),
     ):
+        """GET /catalogs/{catalog_id}/collections — list or search STAC collections.
+
+        When any STAC Collection Search extension parameters are present (bbox,
+        datetime, q, sortby) the request is routed through search_collections().
+        With no search parameters the plain listing path is used
+        (stac_generator.create_collections_catalog).
+
+        Conforms to: https://api.stacspec.org/v1.0.0/collection-search and
+        http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query.
+        """
         catalog_id = validate_sql_identifier(catalog_id)
         catalogs_svc = await self._get_catalogs_service()
         try:
@@ -414,25 +464,90 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             raise HTTPException(
                 status_code=404, detail=f"Catalog '{catalog_id}' not found."
             )
-        # From stac_generator.py: create_collection is the only one, maybe there is no list?
-        # Actually, OGC API - STAC requires /collections.
-        # I'll check stac_generator.py for a listing method if it exists.
-        # Assuming it is stac_generator.create_collections (guessed)
+
+        # Detect whether any Collection Search params were supplied
+        has_search_params = any([bbox, datetime, q, sortby])
+        if not has_search_params and limit == 10 and offset == 0:
+            # Plain listing — no search parameters
+            try:
+                collections = await stac_generator.create_collections_catalog(
+                    request, catalog_id=catalog_id, lang=language
+                )
+                return JSONResponse(content=collections)
+            except AttributeError:
+                raise HTTPException(
+                    status_code=501,
+                    detail="STAC Collection listing not yet implemented in generator.",
+                )
+
+        # Collection Search path — parse params into CollectionSearchRequest
+        parsed_bbox = None
+        if bbox:
+            parts = bbox.split(",")
+            if len(parts) != 4:
+                raise HTTPException(
+                    status_code=400,
+                    detail="bbox must be four comma-separated numbers: minx,miny,maxx,maxy",
+                )
+            try:
+                parsed_bbox = tuple(float(p) for p in parts)  # type: ignore[assignment]
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail="bbox values must be numbers"
+                ) from exc
+
+        parsed_q: Optional[List[str]] = (
+            [t.strip() for t in q.split(",") if t.strip()] if q else None
+        )
+
+        search_req = CollectionSearchRequest(
+            catalog_id=catalog_id,
+            bbox=parsed_bbox,
+            datetime=datetime,
+            q=parsed_q,
+            limit=limit,
+            offset=offset,
+            sortby=sortby,
+        )
+
         try:
-            # Let's check if stac_generator has a generic collections lister
-            # If not, we might need to implement it.
-            # Usually it's create_root_catalog -> provides links to collections.
-            # But the spec also has /collections route.
-            collections = await stac_generator.create_collections_catalog(
-                request, catalog_id=catalog_id, lang=language
+            async with managed_transaction(engine) as conn:
+                collections_list, total_count = await search_collections(conn, search_req)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        stac_collections = []
+        for coll in collections_list:
+            localized_coll, _ = stac_localize(coll, language)
+            if coll.extent is None:
+                continue
+            stac_coll = pystac.Collection(
+                id=str(localized_coll.get("id") or ""),
+                description=str(localized_coll.get("description") or ""),
+                title=localized_coll.get("title"),
+                license=str(localized_coll.get("license") or ""),
+                extent=pystac.Extent(
+                    spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
+                    temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
+                ),
             )
-            return JSONResponse(content=collections)
-        except AttributeError:
-            # Fallback if method doesn't exist yet
-            raise HTTPException(
-                status_code=501,
-                detail="STAC Collection listing not yet implemented in generator.",
-            )
+            if "language" in localized_coll:
+                stac_coll.extra_fields["language"] = localized_coll["language"]
+            if "languages" in localized_coll:
+                stac_coll.extra_fields["languages"] = localized_coll["languages"]
+            stac_collections.append(stac_coll.to_dict())
+
+        return JSONResponse(
+            content={
+                "collections": stac_collections,
+                "context": {
+                    "limit": search_req.limit,
+                    "offset": search_req.offset,
+                    "matched": total_count,
+                    "returned": len(stac_collections),
+                },
+            }
+        )
 
     async def get_stac_collection(
         self,
@@ -827,7 +942,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 )
             except ValueError as e:
                 # Unknown property / malformed CQL → 400
-                raise HTTPException(status_code=400, detail=str(e))
+                raise HTTPException(status_code=400, detail=str(e)) from e
         return JSONResponse(content=result)
 
     async def _get_item_with_row(
@@ -1165,7 +1280,9 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         except HTTPException:
             raise
         except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+            ) from e
         except Exception as e:
             return handle_or_raise(
                 e,
@@ -1193,6 +1310,193 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 catalog_id, collection_id, item_id, conn,
                 caller_id=self._principal_caller_id(request),
             )
+
+    async def search_items_get(
+        self,
+        request: Request,
+        catalog_id: str,
+        engine=Depends(get_async_engine),
+        language: str = Depends(get_language),
+        bbox: Optional[str] = Query(
+            None,
+            description="Bounding box as comma-separated: minx,miny,maxx,maxy (EPSG:4326).",
+        ),
+        datetime: Optional[str] = Query(
+            None,
+            description="RFC 3339 date-time or interval (e.g. 2021-01-01T00:00:00Z or 2021-01-01/2021-12-31).",
+        ),
+        ids: Optional[str] = Query(None, description="Comma-separated Item IDs."),
+        collections: Optional[str] = Query(None, description="Comma-separated Collection IDs."),
+        limit: int = Query(10, ge=1, le=1000, description="Maximum number of items to return."),
+        offset: int = Query(0, ge=0, description="Number of items to skip."),
+        filter: Optional[str] = Query(
+            None,
+            alias="filter",
+            description="CQL2 filter expression. Defaults to CQL2-Text encoding unless filter-lang overrides.",
+        ),
+        filter_lang: str = Query(
+            "cql2-text",
+            alias="filter-lang",
+            description="Filter encoding: 'cql2-text' (default for GET) or 'cql2-json'.",
+        ),
+        sortby: Optional[str] = Query(
+            None,
+            description=(
+                "Comma-separated sort fields with optional '+' (asc) or '-' (desc) prefix. "
+                "Example: '+datetime,-id'."
+            ),
+        ),
+        f: str = Query("geojson", description="Output format: 'geojson' or 'geoparquet'."),
+    ):
+        """STAC API Item Search — GET /catalogs/{catalog_id}/search.
+
+        Maps standard STAC GET query parameters into an ItemSearchRequest and
+        delegates to the same engine path as the POST variant.  Per the STAC
+        spec, GET filter defaults to cql2-text; callers may override via
+        filter-lang=cql2-json.
+        """
+        # Parse bbox: comma-separated floats → 4-tuple
+        parsed_bbox = None
+        if bbox:
+            parts = bbox.split(",")
+            if len(parts) != 4:
+                raise HTTPException(
+                    status_code=400,
+                    detail="bbox must be four comma-separated numbers: minx,miny,maxx,maxy",
+                )
+            try:
+                parsed_bbox = tuple(float(p) for p in parts)  # type: ignore[assignment]
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail="bbox values must be numbers"
+                ) from exc
+
+        # Parse ids: comma-separated → list
+        parsed_ids: Optional[List[str]] = (
+            [i.strip() for i in ids.split(",") if i.strip()] if ids else None
+        )
+
+        # Parse collections: comma-separated → list
+        parsed_collections: Optional[List[str]] = (
+            [c.strip() for c in collections.split(",") if c.strip()] if collections else None
+        )
+
+        # Parse sortby: comma-separated "+field,-field2" → list of individual entries
+        parsed_sortby: Optional[List[str]] = None
+        if sortby:
+            parsed_sortby = [s.strip() for s in sortby.split(",") if s.strip()]
+
+        # Parse filter: CQL2-Text/JSON string → AttributeFilter/QueryFilter
+        parsed_filter = None
+        if filter:
+            if filter_lang == "cql2-json":
+                import json as _json
+                try:
+                    filter_body = _json.loads(filter)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid cql2-json filter"
+                    ) from exc
+                from pydantic import ValidationError as _VE
+                try:
+                    from dynastore.extensions.stac.search import QueryFilter as _QF
+                    parsed_filter = _QF.model_validate(filter_body)
+                except _VE:
+                    try:
+                        from dynastore.extensions.stac.search import AttributeFilter as _AF
+                        parsed_filter = _AF.model_validate(filter_body)
+                    except _VE as exc:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Could not parse cql2-json filter: {exc}",
+                        ) from exc
+            else:
+                # cql2-text: parse via pygeofilter then encode to CQL2-JSON dict
+                try:
+                    import json as _json2
+                    from pygeofilter.parsers.cql2_text import parse as _parse_cql2_text
+                    from pygeofilter.backends.cql2_json import to_cql2 as _to_cql2_json_str
+                    _ast = _parse_cql2_text(filter)
+                    _cql2_json_dict = _json2.loads(_to_cql2_json_str(_ast))
+                    from pydantic import ValidationError as _VE2
+                    try:
+                        from dynastore.extensions.stac.search import QueryFilter as _QF2
+                        parsed_filter = _QF2.model_validate(_cql2_json_dict)
+                    except _VE2:
+                        try:
+                            from dynastore.extensions.stac.search import AttributeFilter as _AF2
+                            parsed_filter = _AF2.model_validate(_cql2_json_dict)
+                        except _VE2 as exc:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Could not parse cql2-text filter: {exc}",
+                            ) from exc
+                except ImportError as exc:
+                    raise HTTPException(
+                        status_code=501,
+                        detail="CQL2-Text filter requires pygeofilter (not installed)",
+                    ) from exc
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=400, detail=f"Invalid cql2-text filter: {exc}"
+                    ) from exc
+
+        search_request = ItemSearchRequest(
+            catalog_id=catalog_id,
+            collections=parsed_collections,
+            ids=parsed_ids,
+            bbox=parsed_bbox,
+            datetime=datetime,
+            filter=parsed_filter,
+            filter_lang="cql2-json" if filter else filter_lang,
+            limit=limit,
+            offset=offset,
+            sortby=parsed_sortby,
+        )
+
+        async with managed_transaction(engine) as conn:
+            stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
+            try:
+                from dynastore.modules.storage.access_scope import (
+                    principals_from_request_state,
+                )
+
+                _principals, _principal = principals_from_request_state(request)
+                rows, count, aggregations = await search_items(
+                    conn, search_request, stac_config,
+                    principals=_principals, principal=_principal,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        from dynastore.models.shared_models import OutputFormatEnum
+        if f in (OutputFormatEnum.GEOPARQUET, "geoparquet", "parquet"):
+            from dynastore.tools.file_io import write_geoparquet
+            from fastapi.responses import StreamingResponse
+
+            def _geoparquet_stream():
+                yield from write_geoparquet(iter(rows), srid=4326)
+
+            return StreamingResponse(
+                content=_geoparquet_stream(),
+                media_type="application/geoparquet",
+                headers={"Content-Disposition": 'attachment; filename="search.parquet"'},
+            )
+
+        results = await stac_generator.create_search_results_collection(
+            request,
+            rows,
+            count,
+            search_request.limit,
+            search_request.offset,
+            stac_config,
+            lang=language,
+        )
+        if aggregations:
+            results["aggregations"] = aggregations
+        return JSONResponse(content=results)
 
     async def search_items_post(
         self,
@@ -1225,7 +1529,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             except ValueError as exc:
                 # Invalid filter (e.g. unknown queryable property) — surface as a
                 # 400 instead of a 500, matching the ``/items`` filter path.
-                raise HTTPException(status_code=400, detail=str(exc))
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         from dynastore.models.shared_models import OutputFormatEnum
         if f in (OutputFormatEnum.GEOPARQUET, "geoparquet", "parquet"):
@@ -1266,7 +1570,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             async with managed_transaction(engine) as conn:
                 collections, total_count = await search_collections(conn, search_req)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         # Release connection before PySTAC processing
         stac_collections = []

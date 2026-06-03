@@ -75,7 +75,7 @@ async def test_stac_aggregations(sysadmin_in_process_client, in_process_client: 
         ]
     }
 
-    search_response = await sysadmin_in_process_client.post("/stac/search", json=search_request)
+    search_response = await sysadmin_in_process_client.post(f"/stac/catalogs/{catalog_id}/search", json=search_request)
     assert search_response.status_code == 200
     search_results = search_response.json()
 
