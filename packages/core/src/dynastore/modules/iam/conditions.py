@@ -987,21 +987,48 @@ class ConditionRegistry:
     def register(self, handler: ConditionHandler):
         self._handlers[handler.type] = handler
 
+    def known_types(self) -> set[str]:
+        """Return the set of condition type strings with a registered handler."""
+        return set(self._handlers)
+
     async def evaluate_all(self, conditions: List[Condition], ctx: EvaluationContext) -> bool:
-        if not conditions: return True
+        """Evaluate every condition in ``conditions``; return False on first denial.
+
+        An empty list is unconditionally True (no restrictions).
+
+        An unknown condition type (no registered handler) is treated as a
+        *hard deny* — the policy is not matched. This is the fail-closed
+        posture: a typo'd or unregistered type must never silently behave
+        as if the condition is absent (fail-open would allow privilege
+        escalation through configuration error).
+        """
+        if not conditions:
+            return True
         for condition in conditions:
             handler = self._handlers.get(condition.type)
             if not handler:
-                logger.warning(f"Unknown condition type: {condition.type}. Skipping.")
-                continue
+                logger.error(
+                    "Unknown condition type %r — denying match. "
+                    "Known types: %s. Fix the policy or register the handler.",
+                    condition.type,
+                    sorted(self._handlers),
+                )
+                return False
             allowed = await handler.evaluate(condition.config, ctx)
-            if not allowed: return False
+            if not allowed:
+                return False
         return True
-    
+
     async def inspect_all(self, conditions: List[Condition], ctx: EvaluationContext) -> List[Dict[str, Any]]:
+        """Return inspect() payloads for all conditions that have registered handlers.
+
+        Unknown condition types are silently skipped here — ``inspect_all`` is a
+        telemetry path and must never raise or deny. The authoritative unknown-type
+        check is in ``evaluate_all``.
+        """
         results = []
-        if not conditions: return results
-        
+        if not conditions:
+            return results
         for condition in conditions:
             handler = self._handlers.get(condition.type)
             if handler:
@@ -1062,3 +1089,23 @@ def register_condition_handler(handler: ConditionHandler):
         register_condition_handler(MyHandler())
     """
     _get_condition_registry().register(handler)
+
+
+def known_condition_types() -> set[str]:
+    """Return the set of condition type strings recognised by the active registry.
+
+    Use this at policy write time to validate that every ``condition.type``
+    in a new or updated policy has a registered handler. An unrecognised type
+    would be silently denied at evaluation time (fail-closed), which is a
+    hard-to-diagnose configuration error; rejecting it at write time surfaces
+    the mistake immediately.
+
+    Example::
+
+        from dynastore.modules.iam.conditions import known_condition_types
+        valid = known_condition_types()
+        for cond in policy.conditions:
+            if cond.type not in valid:
+                raise ValueError(f"Unknown condition type {cond.type!r}. Valid: {sorted(valid)}")
+    """
+    return _get_condition_registry().known_types()

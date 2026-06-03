@@ -1935,6 +1935,24 @@ class AdminService(ExtensionProtocol):
             raise HTTPException(status_code=404, detail=f"Policy '{policy_id}' not found.")
 
     # -------------------------------------------------------------------------
+    # Condition Type Registry (/admin/conditions/types)
+    # -------------------------------------------------------------------------
+
+    @router.get("/conditions/types", summary="List all registered condition types")
+    async def list_condition_types():  # type: ignore[reportGeneralTypeIssues]
+        """Return the sorted list of condition type strings recognised by the
+        active condition registry.
+
+        The UI uses this to populate the condition-type dropdown so it only
+        offers types that pass write-time validation. The list is sourced from
+        the same registry that enforces the fail-closed policy at evaluation
+        time, so the UI and the backend are always in sync.
+        """
+        from dynastore.modules.iam.conditions import known_condition_types
+
+        return {"types": sorted(known_condition_types())}
+
+    # -------------------------------------------------------------------------
     # Usage Inspection (/admin/policies/{policy_id}/usage)
     # -------------------------------------------------------------------------
 

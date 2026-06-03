@@ -860,7 +860,14 @@ function openPolicyModal(editId) {
 }
 function closePolicyModal() { hideModal('policy-modal'); }
 
-const CONDITION_TYPES = ['rate_limit', 'max_count', 'time_window', 'expiration', 'match', 'custom'];
+// Fallback list used when the /admin/conditions/types endpoint is unavailable.
+const _CONDITION_TYPES_FALLBACK = ['rate_limit', 'max_count', 'time_window', 'expiration', 'match', 'custom'];
+// Structured-form types: these have dedicated input widgets below.
+const _CONDITION_TYPES_STRUCTURED = new Set(['rate_limit', 'max_count', 'time_window', 'expiration', 'match']);
+
+// Populated on page load from the backend registry; falls back to the static
+// list above so the editor remains functional when the endpoint is unreachable.
+let CONDITION_TYPES = _CONDITION_TYPES_FALLBACK.slice();
 
 function _condBody(type, cfg) {
   const c = cfg || {};
@@ -910,7 +917,13 @@ function _condBody(type, cfg) {
   if (type === 'match') {
     return `<div><label>Match config (JSON)</label><textarea data-k="__json" rows="4" placeholder='{"field": "subject.tier", "equals": "premium"}'>${escapeHtml(JSON.stringify(c, null, 2) === '{}' ? '' : JSON.stringify(c, null, 2))}</textarea></div>`;
   }
-  return `<div><label>Config (JSON)</label><textarea data-k="__json" rows="5" placeholder='{}'>${escapeHtml(JSON.stringify(c, null, 2) === '{}' ? '' : JSON.stringify(c, null, 2))}</textarea></div>`;
+  // All other registered types (e.g. catalog_lookup_public_allowed,
+  // collection_write_anonymous_allowed, lookup_only_search, and, or, not,
+  // catalog_admin_required, catalog_membership_required, query_match,
+  // max_token_ttl, time_expiration) use a raw-JSON config textarea.
+  // Most of these types accept an empty config ({}) which is the default.
+  const jsonVal = escapeHtml(JSON.stringify(c, null, 2) === '{}' ? '' : JSON.stringify(c, null, 2));
+  return `<p class="cond-note">Type <strong>${escapeHtml(type)}</strong> — enter config as JSON (leave blank for default empty config).</p><div><label>Config (JSON)</label><textarea data-k="__json" rows="4" placeholder='{}'>${jsonVal}</textarea></div>`;
 }
 
 function addPolicyCondition(preset) {
@@ -1112,6 +1125,15 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
   });
+
+  // Populate condition-type dropdown from the backend registry so the UI only
+  // offers types that pass write-time validation. Falls back to the static
+  // fallback list if the endpoint is unreachable, so the editor still works.
+  apiFetch('/conditions/types').then(data => {
+    if (data && Array.isArray(data.types) && data.types.length > 0) {
+      CONDITION_TYPES = data.types;
+    }
+  }).catch(() => { /* fallback list already in place */ });
 
   // Initial tab
   loadPrincipals();
