@@ -109,16 +109,35 @@ def _service_name() -> Optional[str]:
 
 
 async def is_event_consumer() -> bool:
-    """True iff this service is a routing consumer of the event/outbox task.
+    """True iff this service is eligible to drain the event outbox.
 
-    Fail-closed: a missing/empty consumer list or unknown service name means
-    "not a consumer" — an unconfigured or degraded deployment never starts a
-    durable consumer (avoids a connection storm; outbox depth stays visible in
-    monitoring instead).
+    Eligibility contract (aligns with the resolver's fail-open semantics):
+
+    * ``consumers is None``  — routing config is silent / unconfigured.
+      Any process that has registered listeners (i.e. loaded CatalogModule)
+      is eligible.  The Postgres advisory lock inside
+      ``EventService.start_consumer`` guarantees that exactly one process
+      across the entire fleet drains at a time, so fail-open here is safe.
+
+    * ``consumers`` is a non-empty list — operator has explicitly pinned
+      draining to those service tiers.  Only services whose name appears in
+      the list are eligible; all others (including services with an unknown
+      name) are excluded.
+
+    The advisory-lock single-runner guarantee is the authoritative election
+    mechanism.  This gate is an optional eligibility pin for deployments that
+    want to restrict draining to a dedicated worker tier (e.g. on-prem
+    ``worker`` job).  It must never be the only line of defence against
+    connection storms — that role belongs to the lock.
     """
     consumers = await _routed_consumers(EVENT_TASK_KEY)
+    if consumers is None:
+        # No routing opinion: every CatalogModule-bearing process is eligible.
+        # The advisory lock ensures only one drains.
+        return True
+    # Explicit pin: only named services are eligible.
     svc = _service_name()
-    if not consumers or svc is None:
+    if svc is None:
         return False
     return svc in consumers
 
