@@ -1,4 +1,4 @@
-"""Unit tests for the geoid extension's items-search router (#1210).
+"""Unit tests for the geoid extension's geoid-search router (#1210).
 
 The route resolves one item by exactly one of geoid or external_id; the
 service layer is mocked here and exercised directly in test_lookup_service.py.
@@ -43,7 +43,7 @@ def app(monkeypatch):
 
 def test_items_search_by_geoid(app):
     with TestClient(app) as c:
-        r = c.post("/search/catalogs/cat/items-search", json={"geoid": "g1"})
+        r = c.post("/search/catalogs/cat/geoid-search", json={"geoid": "g1"})
     assert r.status_code == 200
     body = r.json()
     assert len(body["results"]) == 1
@@ -57,7 +57,7 @@ def test_items_search_external_id_without_collection_id_rejected(app):
     # would be a cross-collection scan, disallowed by the public lookup contract
     # (un-fao/GeoID#1204 R2). It must be a 400, and the resolver is never reached.
     with TestClient(app) as c:
-        r = c.post("/search/catalogs/cat/items-search", json={"external_id": "ext-1"})
+        r = c.post("/search/catalogs/cat/geoid-search", json={"external_id": "ext-1"})
     assert r.status_code == 400
     app.state._fake_external_id.assert_not_awaited()
 
@@ -65,7 +65,7 @@ def test_items_search_external_id_without_collection_id_rejected(app):
 def test_items_search_by_external_id_with_collection(app):
     with TestClient(app) as c:
         r = c.post(
-            "/search/catalogs/cat/items-search",
+            "/search/catalogs/cat/geoid-search",
             json={"external_id": "ext-1", "collection_id": "col"},
         )
     assert r.status_code == 200
@@ -79,7 +79,7 @@ def test_items_search_by_external_id_with_collection(app):
 def test_items_search_rejects_both_geoid_and_external_id(app):
     with TestClient(app) as c:
         r = c.post(
-            "/search/catalogs/cat/items-search",
+            "/search/catalogs/cat/geoid-search",
             json={"geoid": "g1", "external_id": "ext-1"},
         )
     assert r.status_code == 400
@@ -87,7 +87,7 @@ def test_items_search_rejects_both_geoid_and_external_id(app):
 
 def test_items_search_rejects_empty_body(app):
     with TestClient(app) as c:
-        r = c.post("/search/catalogs/cat/items-search", json={})
+        r = c.post("/search/catalogs/cat/geoid-search", json={})
     assert r.status_code == 400
 
 
@@ -104,7 +104,7 @@ def test_items_search_with_non_uuid_geoid_returns_200_empty():
     a = FastAPI()
     a.include_router(router)
     with TestClient(a) as c:
-        r = c.post("/search/catalogs/cat/items-search", json={"geoid": "not-a-uuid"})
+        r = c.post("/search/catalogs/cat/geoid-search", json={"geoid": "not-a-uuid"})
     assert r.status_code == 200
     body = r.json()
     assert body["results"] == []

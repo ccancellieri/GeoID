@@ -6,7 +6,7 @@ external_id resolution runs over PostgreSQL), so the route does not hard-depend
 on Elasticsearch availability.
 
 URL contract (#1210 — replaces the former GET/POST .../geoid routes):
-  POST /search/catalogs/{catalog_id}/items-search
+  POST /search/catalogs/{catalog_id}/geoid-search
     body: exactly one of
       {"geoid": ...}                              # one geoid, resolved catalog-wide
       {"geoid": [..., ...]}                       # many geoids, resolved catalog-wide
@@ -33,7 +33,7 @@ def _to_collection(rows) -> GeoidCollection:
 
 
 @router.post(
-    "/catalogs/{catalog_id}/items-search",
+    "/catalogs/{catalog_id}/geoid-search",
     response_model=GeoidCollection,
     summary="Resolve an item in a catalog by exactly one of geoid or external_id.",
     response_model_exclude_none=True,

@@ -26,7 +26,7 @@ class CatalogLookupAudience(PluginConfig):
 
     When ``is_public=True``, the operator has declared that this catalog
     accepts unauthenticated traffic on whichever routes their policies
-    open (typically the lookup-only ``/search/catalogs/{cat}/items-search``
+    open (typically the lookup-only ``/search/catalogs/{cat}/geoid-search``
     and STAC ``/stac/catalogs/{cat}/search`` surface gated by
     ``lookup_only_search``).
 

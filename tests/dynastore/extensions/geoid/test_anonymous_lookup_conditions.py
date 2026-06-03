@@ -1,7 +1,7 @@
 """Tests for the IAM-layer needle-only guard on the geoid anonymous lookup
 ALLOW policy (un-fao/GeoID#1204 P2-R7).
 
-The anonymous lookup surface (``POST /search/catalogs/{cat}/items-search``) must
+The anonymous lookup surface (``POST /search/catalogs/{cat}/geoid-search``) must
 be a *needle* lookup only: a caller may resolve a single item by ``geoid`` /
 ``external_id`` but must not be able to broaden the request into an enumeration
 (``bbox`` / ``intersects`` / ``datetime`` / ``filter`` / ``q``). The route

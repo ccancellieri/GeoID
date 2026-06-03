@@ -19,7 +19,7 @@ private ES indexers on the items tier, IAM DENY on the catalog's routes)
 and opts the catalog in to a single anonymous audience:
 
   * ``CatalogLookupAudience.is_public=True`` — opens the anonymous
-    lookup-only needle endpoint ``POST /search/catalogs/{cat}/items-search``
+    lookup-only needle endpoint ``POST /search/catalogs/{cat}/geoid-search``
     (resolve one item by exact ``geoid`` / ``external_id``, gated by the
     ``lookup_only_search`` handler so a broadening request never matches),
     and arms the geoid extension's anonymous STAC/Features enumeration DENY

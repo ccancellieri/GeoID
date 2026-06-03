@@ -78,7 +78,7 @@ async def test_emit_audit_does_not_forward_tenant_schema() -> None:
         "authz_denied",
         "principal-123",
         "203.0.113.7",
-        {"path": "/search/catalogs/abc/items-search", "method": "POST",
+        {"path": "/search/catalogs/abc/geoid-search", "method": "POST",
          "reason": "denied"},
     )
     # _emit_audit schedules a fire-and-forget task; let it run.

@@ -1,7 +1,7 @@
 """Pydantic models for the geoid-extension item-search route.
 
 These shapes are part of the customer-facing contract for
-``POST /search/catalogs/{catalog_id}/items-search`` (PG-backed). The route
+``POST /search/catalogs/{catalog_id}/geoid-search`` (PG-backed). The route
 resolves items within a catalog by exactly one of ``geoid`` or
 ``external_id`` and returns a :class:`GeoidCollection`.
 """
@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 
 class ItemsSearchBody(BaseModel):
-    """Body for ``POST /search/catalogs/{catalog_id}/items-search`` (#1210).
+    """Body for ``POST /search/catalogs/{catalog_id}/geoid-search`` (#1210).
 
     Resolve items within the path catalog by **exactly one** of:
 

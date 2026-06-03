@@ -169,7 +169,7 @@ _CATALOG_ID = "cat-regression"
 _ANON_ROLE = "ANONYMOUS"
 
 # Path exercised by the needle lookup
-_LOOKUP_PATH = "/search/catalogs/cat-regression/items-search"
+_LOOKUP_PATH = "/search/catalogs/cat-regression/geoid-search"
 
 
 class _FakeIamStorage:
@@ -235,7 +235,7 @@ async def test_lookup_allow_wins_over_catchall_deny_at_priority_zero() -> None:
         id="geoid_anonymous_lookup",
         effect="ALLOW",
         actions=["POST"],
-        resources=[r"/search/catalogs/[^/]+/items-search(/.*)?"],
+        resources=[r"/search/catalogs/[^/]+/geoid-search(/.*)?"],
         conditions=[
             {"type": "catalog_lookup_public_allowed"},
             {"type": "lookup_only_search"},
@@ -295,7 +295,7 @@ async def test_catchall_deny_blocks_lookup_when_at_same_priority() -> None:
         id="geoid_anonymous_lookup",
         effect="ALLOW",
         actions=["POST"],
-        resources=[r"/search/catalogs/[^/]+/items-search(/.*)?"],
+        resources=[r"/search/catalogs/[^/]+/geoid-search(/.*)?"],
         conditions=[
             {"type": "catalog_lookup_public_allowed"},
             {"type": "lookup_only_search"},

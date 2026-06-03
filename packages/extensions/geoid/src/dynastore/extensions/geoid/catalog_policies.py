@@ -34,12 +34,12 @@ logger = logging.getLogger(__name__)
 #       these DENYs take effect even when the catch-all is absent.
 #
 #   _PRIORITY_LOOKUP_ALLOW = 200 — needle-lookup ALLOW on
-#       POST /search/catalogs/{cat}/items-search. Must outrank a generic
+#       POST /search/catalogs/{cat}/geoid-search. Must outrank a generic
 #       deny-all at priority 0: if ALLOW and that catch-all DENY tied at 0,
 #       DENY would win by tie-breaking, silently blocking the public lookup
 #       surface. Priority 200 ensures the lookup ALLOW is always the decisive
 #       policy for its own path (the enumeration DENYs do NOT cover
-#       /search/…/items-search, so they do not compete here).
+#       /search/…/geoid-search, so they do not compete here).
 #
 #   _PRIORITY_ANON_CREATE = 500 — per-collection anonymous item POST on
 #       .../collections/{col}/items. The enumeration DENYs (_PRIORITY_ENUM_DENY)
@@ -195,12 +195,12 @@ async def register_geoid_policies_for_catalog(catalog_id: str) -> None:
             Policy(
                 id="geoid_anonymous_lookup",
                 description=(
-                    "Anonymous access to POST /search/catalogs/{cat}/items-search "
+                    "Anonymous access to POST /search/catalogs/{cat}/geoid-search "
                     "(resolve one item by geoid or external_id) when the catalog has "
                     "opted in via CatalogLookupAudience.is_public."
                 ),
                 actions=["POST"],
-                resources=[r"/search/catalogs/[^/]+/items-search(/.*)?"],
+                resources=[r"/search/catalogs/[^/]+/geoid-search(/.*)?"],
                 conditions=_ANON_LOOKUP_ALLOW_CONDITION,
                 effect="ALLOW",
                 # Must outrank a generic catch-all DENY at priority 0 so a

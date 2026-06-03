@@ -15,7 +15,7 @@
 #    Author: Carlo Cancellieri (ccancellieri@gmail.com)
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
-"""Single source of truth for the Elasticsearch items-search query DSL.
+"""Single source of truth for the Elasticsearch geoid-search query DSL.
 
 This module lives in ``core`` so that **both** the items storage drivers
 (``ItemsElasticsearchDriver`` and ``ItemsElasticsearchPrivateDriver``) and the
