@@ -395,6 +395,14 @@ class IamScaleConfig(PluginConfig):
     """
 
     _address: ClassVar[Tuple[Optional[str], ...]] = ("platform", "modules", "iam", "scale")
+    # ``usage_counter_hash_partitions`` is structural: it shapes the
+    # ``iam.usage_counters`` table at provisioning time. The Immutable gate
+    # locks it once the physical layer materializes; declare the tier
+    # explicitly so the structural intent is visible. ``"platform"`` ==
+    # "locked once any catalog is provisioned" — the same check ``_freeze_at
+    # =None`` already resolves to, spelled out because this config governs
+    # platform-level structure.
+    _freeze_at: ClassVar[Optional[str]] = "platform"
 
     valkey_required: Mutable[bool] = Field(
         default=False,
