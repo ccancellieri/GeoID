@@ -323,6 +323,99 @@ def _parse_collection_sort_sql(sortby: Optional[str], lang: Optional[str] = None
 _ITEM_DIRECT_SORT_COLUMNS = frozenset({"valid_from", "id", "catalog_id", "collection_id"})
 _ITEM_SORT_ALIASES: dict = {"datetime": "valid_from"}
 
+# Allowed STAC property key characters: letters, digits, underscore, hyphen, colon.
+# Colon is required for extension-namespaced keys such as ``eo:cloud_cover``.
+# This regex is intentionally more restrictive than the full JSON key spec to
+# block SQL-injection attempts while covering the realistic STAC namespace corpus.
+_SAFE_STAC_PROPERTY_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_:\-]*$')
+
+
+class _ItemSortEntry:
+    """One parsed sortby entry for item search, with PG and ES resolution."""
+
+    __slots__ = ("order_by_expr", "pg_alias", "pg_raw_select_template", "direction", "raw_field")
+
+    def __init__(
+        self,
+        order_by_expr: str,
+        direction: str,
+        raw_field: str,
+        pg_alias: Optional[str] = None,
+        pg_raw_select_template: Optional[str] = None,
+    ) -> None:
+        self.order_by_expr = order_by_expr
+        self.direction = direction
+        self.raw_field = raw_field
+        self.pg_alias = pg_alias
+        self.pg_raw_select_template = pg_raw_select_template
+
+
+def _parse_item_sort_entries(sortby: Optional[List[str]]) -> List["_ItemSortEntry"]:
+    """Parse the STAC sortby list into resolved sort entries.
+
+    Handles three kinds of sort fields:
+
+    * **Direct CTE columns** — ``valid_from`` (alias ``datetime``), ``id``,
+      ``catalog_id``, ``collection_id``: resolved to the bare column name so
+      the ``ORDER BY`` clause can reference the ``candidate_matches`` CTE
+      projection directly.
+    * **``properties.<field>``** — STAC item properties stored as JSONB in the
+      attributes sidecar.  ``<field>`` is validated against
+      ``_SAFE_STAC_PROPERTY_RE`` (alphanumeric + ``_``, ``-``, ``:``).  A
+      deterministic alias ``_sort{i}`` is assigned; the per-collection fragment
+      builder must project ``sc_attributes.attributes->>'<field>' AS _sort{i}``
+      into each candidate fragment so the outer CTE can reference it.
+    * Any other field — rejected with ``ValueError`` (→ HTTP 400).
+
+    Returns an empty list when *sortby* is ``None`` or all entries are empty.
+    The caller must fall back to the default order (``valid_from DESC, id``)
+    when the list is empty.
+    """
+    if not sortby:
+        return []
+    entries: List[_ItemSortEntry] = []
+    prop_counter = 0
+    for raw_entry in sortby:
+        if not raw_entry:
+            continue
+        direction = "DESC" if raw_entry.startswith("-") else "ASC"
+        raw_field = raw_entry.lstrip("+-")
+        mapped = _ITEM_SORT_ALIASES.get(raw_field, raw_field)
+
+        if mapped in _ITEM_DIRECT_SORT_COLUMNS:
+            entries.append(_ItemSortEntry(
+                order_by_expr=f"{mapped} {direction}",
+                direction=direction,
+                raw_field=raw_field,
+            ))
+        elif raw_field.startswith("properties."):
+            tail = raw_field[len("properties."):]
+            if not _SAFE_STAC_PROPERTY_RE.match(tail):
+                raise ValueError(
+                    f"Invalid item sort field {raw_field!r}: property key "
+                    f"{tail!r} contains unsafe characters."
+                )
+            alias = f"_sort{prop_counter}"
+            prop_counter += 1
+            # The pg_raw_select_template uses a {sidecar} placeholder replaced
+            # per-fragment so callers can substitute the correct table alias.
+            entries.append(_ItemSortEntry(
+                order_by_expr=f"{alias} {direction}",
+                direction=direction,
+                raw_field=raw_field,
+                pg_alias=alias,
+                pg_raw_select_template=(
+                    f"{{sidecar}}.attributes->>'{tail}' AS {alias}"
+                ),
+            ))
+        else:
+            raise ValueError(
+                f"Invalid item sort field {raw_field!r}. "
+                f"Supported: {sorted(_ITEM_DIRECT_SORT_COLUMNS | set(_ITEM_SORT_ALIASES))}"
+                f" or 'properties.<key>' for STAC item properties."
+            )
+    return entries
+
 
 def _parse_item_sort_order_by(sortby: Optional[List[str]]) -> str:
     """Convert the STAC sortby list to a safe SQL ORDER BY clause for item search.
@@ -330,26 +423,17 @@ def _parse_item_sort_order_by(sortby: Optional[List[str]]) -> str:
     Each entry in the list is a field name with an optional '+' (ascending, default)
     or '-' (descending) prefix.  The fields are validated against the columns
     projected by the candidate_matches CTE — valid_from, id, catalog_id, collection_id
-    — plus the alias 'datetime' which maps to valid_from.
+    — plus the alias 'datetime' which maps to valid_from.  A ``properties.<field>``
+    entry resolves to a ``_sort{i}`` alias that each per-collection fragment must
+    project (see :func:`_parse_item_sort_entries` and the fragment loop in
+    :func:`search_items`).
 
     Returns the default ``valid_from DESC, id`` order when sortby is empty/None.
     """
-    if not sortby:
+    entries = _parse_item_sort_entries(sortby)
+    if not entries:
         return "valid_from DESC, id"
-    parts = []
-    for entry in sortby:
-        if not entry:
-            continue
-        direction = "DESC" if entry.startswith("-") else "ASC"
-        raw_field = entry.lstrip("+-")
-        field = _ITEM_SORT_ALIASES.get(raw_field, raw_field)
-        if field not in _ITEM_DIRECT_SORT_COLUMNS:
-            raise ValueError(
-                f"Invalid item sort field {raw_field!r}. "
-                f"Supported fields: {sorted(_ITEM_DIRECT_SORT_COLUMNS | set(_ITEM_SORT_ALIASES))}."
-            )
-        parts.append(f"{field} {direction}")
-    return ", ".join(parts) if parts else "valid_from DESC, id"
+    return ", ".join(e.order_by_expr for e in entries)
 
 
 def _inject_search_hints(
@@ -488,6 +572,7 @@ async def _maybe_dispatch_to_es_search(
         limit=search_request.limit,
         offset=search_request.offset,
         es_filter=es_filter,
+        sortby=getattr(search_request, "sortby", None) or None,
     )
 
     # Row-level ABAC: when the resolved driver opts in (the standardized
@@ -659,7 +744,15 @@ async def search_items(
     # Sidecar requirements and sort strategy are resolved per-collection inside
     # the loop below (``req_attributes``/``req_stac`` recomputed from each
     # collection's WHERE), and the final ORDER BY is built by
-    # ``_parse_collection_sort_sql`` over the unioned ``all_matches`` CTE.
+    # ``_parse_item_sort_order_by`` over the unioned ``candidate_matches`` CTE.
+
+    # Pre-parse sortby once so every fragment loop iteration can inject the
+    # same property-sort alias expressions.  Raises ValueError (→ HTTP 400)
+    # here — before any fragment work — if a sort field is invalid.
+    _sort_entries = _parse_item_sort_entries(search_request.sortby)
+    # Property-sort entries need ``sc_attributes`` to be joined in each fragment
+    # and their value projected as a stable alias (``_sort{i}``) into the CTE.
+    _prop_sort_entries = [e for e in _sort_entries if e.pg_alias is not None]
 
     candidate_fragments = []
 
@@ -779,7 +872,9 @@ async def search_items(
 
         # --- Optimization Mode: Spatial Only ---
 
-        # Check if we need Attributes Sidecar based on filters
+        # Check if we need Attributes Sidecar based on filters or sort.
+        # ``properties.*`` sort entries also require the attributes sidecar join
+        # so their JSONB accessor expression is available in the fragment SELECT.
         req_attributes = bool(
             search_request.ids
             or search_request.datetime
@@ -787,6 +882,7 @@ async def search_items(
             or "attributes" in where_sql
             or "external_id" in where_sql
             or "validity" in where_sql
+            or _prop_sort_entries
         )
 
         req_stac = bool(
@@ -805,12 +901,48 @@ async def search_items(
         from dynastore.modules.storage.drivers.pg_sidecars import (
             driver_sidecars as _driver_sidecars,
         )
-        coll_has_validity = any(
-            getattr(sc, "enable_validity", False)
-            for sc in _driver_sidecars(config)
-            if sc.enabled
-            and getattr(sc, "sidecar_type", "") in ("attributes", "feature_attributes")
+        from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+            AttributeStorageMode,
         )
+        coll_has_validity = False
+        # None  → no attributes sidecar present for this collection
+        # True  → JSONB sidecar
+        # False → COLUMNAR sidecar (attributes blob column absent)
+        _coll_attr_is_jsonb: Optional[bool] = None
+        for _sc in _driver_sidecars(config):
+            if not _sc.enabled:
+                continue
+            if getattr(_sc, "sidecar_type", "") in ("attributes", "feature_attributes"):
+                coll_has_validity = bool(getattr(_sc, "enable_validity", False))
+                # Import here to avoid circular at module level; mirrors
+                # ``_attributes_hydration_projection`` which does the same import.
+                from dynastore.modules.storage.drivers.pg_sidecars.attributes import (
+                    FeatureAttributeSidecar,
+                )
+                _coll_attr_is_jsonb = (
+                    FeatureAttributeSidecar(_sc).resolved_storage_mode  # type: ignore[arg-type]
+                    == AttributeStorageMode.JSONB
+                )
+                break  # only the first enabled attributes sidecar is relevant
+
+        # ``properties.*`` sort injects ``sc_attributes.attributes->>'<key>'``
+        # into each fragment. That accessor is only valid when the attributes
+        # sidecar is in JSONB storage mode. COLUMNAR sidecars store each
+        # declared property as its own physical column and have no ``attributes``
+        # blob — the expression is invalid SQL and produces a 500.  Raise a
+        # clear 400 here instead, before any fragment work is attempted.
+        if _prop_sort_entries:
+            if _coll_attr_is_jsonb is None:
+                raise ValueError(
+                    f"Sorting by properties.{_prop_sort_entries[0].raw_field!r} "
+                    f"is not supported for collection {collection_id!r}: "
+                    "no attributes sidecar is configured for this collection."
+                )
+            if not _coll_attr_is_jsonb:
+                raise ValueError(
+                    f"Sorting by properties is not supported for collection "
+                    f"{collection_id!r} (COLUMNAR attribute storage)."
+                )
 
         # Select & Sort Strategy
         if req_attributes:
@@ -843,6 +975,17 @@ async def search_items(
                 FieldSelection(field="transaction_time", alias="valid_from")
             )
             raw_selects.append("h.geoid::text as id")
+
+        # Inject a raw SELECT expression for every ``properties.*`` sort alias
+        # so each fragment projects the value under the stable ``_sort{i}`` name
+        # and the outer CTE can reference it in ORDER BY.
+        # The sidecar table alias used by QueryOptimizer for attributes is
+        # ``sc_attributes``; we use that directly in the JSONB accessor.
+        for _se in _prop_sort_entries:
+            if _se.pg_raw_select_template is not None:
+                raw_selects.append(
+                    _se.pg_raw_select_template.format(sidecar="sc_attributes")
+                )
 
         # Construct QueryRequest
         query_req = QueryRequest(
@@ -956,13 +1099,27 @@ async def search_items(
 
     full_union_query = " UNION ALL ".join(candidate_fragments)
 
-    # Build ORDER BY from optional sortby; default to valid_from DESC, id
-    order_by_clause = _parse_item_sort_order_by(search_request.sortby)
+    # Build ORDER BY from optional sortby; default to valid_from DESC, id.
+    # Uses the pre-parsed _sort_entries (already validated above); calling
+    # _parse_item_sort_order_by a second time would re-parse but is safe.
+    order_by_clause = (
+        ", ".join(e.order_by_expr for e in _sort_entries)
+        if _sort_entries
+        else "valid_from DESC, id"
+    )
+
+    # When ``properties.*`` sort is requested, the CTE outer SELECT must also
+    # carry the ``_sort{i}`` aliases so ``ORDER BY`` can reference them.
+    _prop_sort_select_extras = (
+        ", " + ", ".join(e.pg_alias for e in _prop_sort_entries)  # type: ignore[misc]
+        if _prop_sort_entries
+        else ""
+    )
 
     # Merged paging + count using a window function (1 query instead of 2)
     paging_query = f"""
         WITH candidate_matches AS ({full_union_query})
-        SELECT catalog_id, collection_id, geoid, valid_from, id,
+        SELECT catalog_id, collection_id, geoid, valid_from, id{_prop_sort_select_extras},
                COUNT(*) OVER() AS _total_count
         FROM candidate_matches
         ORDER BY {order_by_clause}

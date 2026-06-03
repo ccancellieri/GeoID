@@ -718,11 +718,31 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
 
         source_filter = _ItemsElasticsearchBase._build_source_filter(request)
 
+        # Build ES sort clause from STAC sortby when the request carries it.
+        # ``parse_sort`` handles field-path resolution (properties.* → extras.*)
+        # and direction; its return value is ``[{<field>: {order}}, {"_score": …}]``.
+        # Naively extending from each entry appends a ``_score`` tiebreaker after
+        # every field, making ES treat ``_score`` as a higher-priority sort than
+        # every field after the first. Instead, collect only the leading
+        # non-``_score`` clause from each call, then append a single tiebreaker.
+        sort_clause: Optional[List[Dict[str, Any]]] = None
+        if request is not None and getattr(request, "sortby", None):
+            from dynastore.modules.elasticsearch.items_query import parse_sort
+            field_clauses: List[Dict[str, Any]] = []
+            for entry in request.sortby:  # type: ignore[union-attr]
+                for clause in parse_sort(entry):
+                    if "_score" not in clause:
+                        field_clauses.append(clause)
+            if field_clauses:
+                sort_clause = field_clauses + [{"_score": {"order": "desc"}}]
+
         if request is not None and request.collections:
             # Multi-collection: scoping is already in base_query's terms filter.
             body: Dict[str, Any] = {"query": base_query}
             if source_filter is not None:
                 body["_source"] = source_filter
+            if sort_clause is not None:
+                body["sort"] = sort_clause
             return body, params
 
         collection_filter = {"term": {fields.collection: collection_id}}
@@ -736,6 +756,8 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         }
         if source_filter is not None:
             body["_source"] = source_filter
+        if sort_clause is not None:
+            body["sort"] = sort_clause
         params["routing"] = collection_id
         return body, params
 

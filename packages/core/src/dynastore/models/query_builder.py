@@ -339,6 +339,18 @@ class QueryRequest(BaseModel):
             "controls Feature.geometry."
         ),
     )
+    sortby: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "[INTERNAL] STAC sortby list carried through to drivers that "
+            "can honor it natively (e.g. Elasticsearch). Each entry is a "
+            "field name with an optional '+' (ascending, default) or '-' "
+            "(descending) prefix. Example: [\"+datetime\", \"-properties.eo:cloud_cover\"]. "
+            "Ignored by drivers that do not consume it."
+        ),
+        json_schema_extra={"x-internal": True},
+        exclude=True,
+    )
 
     @field_validator("select")
     @classmethod
