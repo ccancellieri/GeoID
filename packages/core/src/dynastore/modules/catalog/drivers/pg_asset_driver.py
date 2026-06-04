@@ -115,7 +115,11 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
     # ------------------------------------------------------------------
 
     async def _resolve_schema(
-        self, catalog_id: str, db_resource: Optional[DbResource] = None
+        self,
+        catalog_id: str,
+        db_resource: Optional[DbResource] = None,
+        *,
+        allow_missing: bool = False,
     ) -> Optional[str]:
         from dynastore.tools.discovery import get_protocol
         from dynastore.models.protocols.catalogs import CatalogsProtocol
@@ -124,7 +128,9 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         if not catalogs:
             return None
         conn = db_resource or self.engine
-        return await catalogs.resolve_physical_schema(catalog_id, ctx=DriverContext(db_resource=conn))
+        return await catalogs.resolve_physical_schema(
+            catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=allow_missing
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -265,7 +271,15 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         if soft:
             return
 
-        schema = await self._resolve_schema(catalog_id, db_resource)
+        # Idempotent cleanup: the cascade hard-delete runs this AFTER the catalog
+        # row (and its per-tenant schema, which owns the ``assets`` table) is
+        # already gone, so an absent catalog means there is nothing left to drop.
+        # ``allow_missing=True`` makes schema resolution return None in that case
+        # instead of raising "Catalog not found" — which otherwise propagates as
+        # a RETRY and, after exhausting the per-ref retries, a permanent DEAD
+        # cascade failure. Every sibling routing-driven driver already tolerates
+        # the deleted catalog; this aligns the asset driver with them.
+        schema = await self._resolve_schema(catalog_id, db_resource, allow_missing=True)
         if not schema:
             return
 
