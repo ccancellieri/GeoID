@@ -554,6 +554,43 @@ def unproject_item_from_es(source: Dict[str, Any]) -> Dict[str, Any]:
     Read-policy exposure (id override, ``expose`` gating) is layered on by
     the caller after this structural normalisation.
     """
+    return unproject_envelope_from_es(
+        source,
+        reserved_member_keys=_RESERVED_MEMBER_KEYS,
+        default_type="Feature",
+        null_empty_geometry=True,
+    )
+
+
+def unproject_envelope_from_es(
+    source: Dict[str, Any],
+    *,
+    reserved_member_keys: "frozenset[str]",
+    default_type: Optional[str] = None,
+    null_empty_geometry: bool = False,
+) -> Dict[str, Any]:
+    """Level-agnostic read reconstruction from a canonical ``_source`` (#1285).
+
+    Generalises :func:`unproject_item_from_es` so every entity level
+    (catalog / collection / item / asset) restores its wire shape with the
+    same three moves, parameterised by which structural members that level
+    surfaces:
+
+    * ``properties.extras.*`` is hoisted back to flat ``properties.*`` (an
+      existing flat key wins on collision — it is the more specific value);
+    * only the level's ``reserved_member_keys`` survive at the top level —
+      flat identity (``catalog_id``/``collection_id``), internal ``_*`` fields
+      and the ``system``/``stats``/``access`` containers are dropped;
+    * when ``default_type`` is given it is stamped as the GeoJSON/STAC
+      ``type``; when ``null_empty_geometry`` is set an empty/falsy
+      ``geometry`` is normalised to ``None`` (valid GeoJSON ``null``).
+
+    The per-(entity_level, protocol) projector registry (#1285) layers any
+    attribute → wire-member remapping (e.g. a STAC Collection has no
+    ``properties`` member) on top of this structural normalisation.
+
+    Pure function — returns a new dict, the input is not mutated.
+    """
     if not isinstance(source, dict):
         return source
 
@@ -564,14 +601,16 @@ def unproject_item_from_es(source: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in extras.items():
             props.setdefault(k, v)
 
-    out: Dict[str, Any] = {"type": "Feature", "properties": props}
-    for key in _RESERVED_MEMBER_KEYS:
+    out: Dict[str, Any] = {"properties": props}
+    if default_type is not None:
+        out["type"] = default_type
+    for key in reserved_member_keys:
         if key == "type":
             continue
         if key in source:
             out[key] = source[key]
 
-    if not out.get("geometry"):
+    if null_empty_geometry and not out.get("geometry"):
         out["geometry"] = None
 
     return out

@@ -367,7 +367,12 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 id=_doc_id(catalog_id, collection_id),
                 params={"routing": catalog_id},
             )
-            doc = self._unenrich_doc(resp["_source"])
+            from dynastore.modules.elasticsearch.collection_canonical import (
+                unproject_collection_from_es,
+            )
+            # Canonical envelope → STAC Collection wire shape, then restore the
+            # STAC extent shape from the enriched ES representation.
+            doc = self._unenrich_doc(unproject_collection_from_es(resp["_source"]))
         except Exception as exc:  # noqa: BLE001
             # Document absent (404) or transient transport error.  The read
             # contract allows None for "not found"; PG is the SoR so a missing
@@ -412,9 +417,22 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             raise RuntimeError("Elasticsearch client not available")
 
         index_name = self._index_name()
-        doc = self._enrich_doc(metadata)
-        doc["id"] = collection_id
-        doc["catalog_id"] = catalog_id
+        # Canonical collection envelope (#1285/#1800): identity + system +
+        # access containers, attributes under properties (unknown→extras lane).
+        # ``extent`` is enriched first (bbox→geo_shape, temporal→date_range) and
+        # carried opaquely as a reserved structural member.
+        from dynastore.modules.elasticsearch.collection_canonical import (
+            build_canonical_collection_doc,
+        )
+        from dynastore.modules.elasticsearch.items_projection import build_known_fields
+
+        enriched = self._enrich_doc(metadata)
+        doc = build_canonical_collection_doc(
+            enriched,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            known_fields=build_known_fields(),
+        )
 
         try:
             await client.index(
@@ -605,9 +623,13 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 "multi_match": {
                     "query": q,
                     "fields": [
-                        "title.en^3", "title.en.keyword^2",
-                        "description.en^2",
-                        "keywords.*.text",
+                        # Attributes moved under properties in the canonical
+                        # envelope (#1285/#1800); id stays a top-level identity
+                        # axis. _search_text carries the unknown-attribute tail.
+                        "properties.title.en^3", "properties.title.en.keyword^2",
+                        "properties.description.en^2",
+                        "properties.keywords.text",
+                        "_search_text",
                         "id^2",
                     ],
                     "type": "best_fields",
@@ -681,9 +703,12 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             )
             # One restore context per query — shared cache across the page (#1568).
             restore_ctx = TransformChainContext()
+            from dynastore.modules.elasticsearch.collection_canonical import (
+                unproject_collection_from_es,
+            )
             results: List[Dict[str, Any]] = []
             for hit in hits.get("hits", []):
-                doc = self._unenrich_doc(hit["_source"])
+                doc = self._unenrich_doc(unproject_collection_from_es(hit["_source"]))
                 if restore_chain:
                     doc = await restore_transform_chain(
                         doc,

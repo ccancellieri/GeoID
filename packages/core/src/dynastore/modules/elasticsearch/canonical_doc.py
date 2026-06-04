@@ -12,10 +12,16 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-"""Canonical, policy-independent Elasticsearch _source builder for items.
+"""Canonical, policy-independent Elasticsearch _source builders.
 
-Phase 1 of the canonical-index-envelope initiative (#1800): additive write-side
-builder only. No wiring into write paths, no reindex, no behavior change.
+The canonical-index-envelope initiative (#1800) shipped the item builder; the
+generalization (#1285) factors its section assembly into a level-agnostic core
+(:func:`build_canonical_envelope`) reused by every entity level (catalog /
+collection / item / asset). The shape is the contract — ``system`` (core
+identity/lifecycle), ``properties`` (attributes), ``stats`` (derived),
+``access`` (IAM), plus reserved protocol-structural members the read-time
+projector surfaces verbatim. ES-only for now; other drivers keep their own
+internal storage concern.
 """
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +29,65 @@ from dynastore.modules.elasticsearch.items_projection import project_item_for_es
 from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
 
 _SYSTEM_KEYS: frozenset = frozenset(SYSTEM_FIELD_KEYS)
+
+
+def build_canonical_envelope(
+    *,
+    identity: Dict[str, Any],
+    properties: Dict[str, Any],
+    known_fields: Dict[str, Any],
+    reserved_members: Optional[Dict[str, Any]] = None,
+    system: Optional[Dict[str, Any]] = None,
+    stats: Optional[Dict[str, Any]] = None,
+    access: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Assemble the level-agnostic canonical ES ``_source`` (refs #1285/#1800).
+
+    One modular, pluggable shape for every entity level. The sections are the
+    contract; what fills them is the caller's (per-level) concern:
+
+    * **flat identity** — ``identity`` keys sit at the document top level
+      (``id``, ``catalog_id``, ``collection_id``, ``external_id``, ``asset_id``,
+      ``validity``, the ``_external_id`` read tracker …). ``id`` is whatever
+      stable identifier the level uses (``geoid`` for items, ``collection_id``
+      for collections, ``catalog_id`` for catalogs).
+    * **reserved members** — protocol-structural keys surfaced verbatim by the
+      read-time projector (``collection``/``geometry``/``bbox`` for items;
+      ``extent``/``summaries``/``providers``/``links``/``assets``/
+      ``stac_extensions`` for collections; …). ``None`` values are skipped.
+    * **properties** — the attribute bag. Reshaped through
+      :func:`project_item_for_es` so unknown keys move under
+      ``properties.extras`` (the ``flattened`` long-tail lane) and the analyzed
+      ``_search_text`` catch-all is populated — identical handling at every
+      level, so the strict ``dynamic: false`` mapping never grows per-key.
+    * **system** — the core identity/lifecycle container. Emitted when non-empty.
+    * **stats** — derived values. Emitted when non-empty.
+    * **access** — the IAM authorization sidecar, plugged in by the ABAC layer.
+      Emitted when non-empty.
+
+    Pure function — returns a new dict; inputs are not mutated. Reserved
+    GeoJSON/STAC members never leak into ``properties`` (enforced by
+    :func:`project_item_for_es`).
+    """
+    doc: Dict[str, Any] = dict(identity)
+    if reserved_members:
+        for key, value in reserved_members.items():
+            if value is not None:
+                doc[key] = value
+
+    # properties: attribute bag; unknown keys move to properties.extras by
+    # reusing the existing projection so behavior matches the rest of the ES
+    # projection path at every level.
+    doc["properties"] = dict(properties or {})
+    doc = project_item_for_es(doc, known_fields)
+
+    if system:
+        doc["system"] = dict(system)
+    if stats:
+        doc["stats"] = dict(stats)
+    if access:
+        doc["access"] = dict(access)
+    return doc
 
 
 def build_canonical_index_doc(
@@ -56,10 +121,14 @@ def build_canonical_index_doc(
 
     ``id`` is ALWAYS ``row["geoid"]``, regardless of any policy.
     Reserved STAC/GeoJSON members never leak into properties.
+
+    Implemented as a thin item-level adapter over
+    :func:`build_canonical_envelope`: it maps the PG row + sidecars onto the
+    generic sections (identity / reserved members / properties / system /
+    stats / access) and delegates the assembly.
     """
-    geoid = row.get("geoid")
-    doc: Dict[str, Any] = {
-        "id": geoid,
+    identity: Dict[str, Any] = {
+        "id": row.get("geoid"),
         "catalog_id": catalog_id,
         "collection_id": collection_id,
         # ``collection`` is the STAC/GeoJSON wire member (a reserved key the
@@ -74,32 +143,18 @@ def build_canonical_index_doc(
 
     external_id = row.get("external_id")
     if external_id is not None:
-        doc["external_id"] = str(external_id)
-        doc["_external_id"] = str(external_id)   # transition tracker (read path)
+        identity["external_id"] = str(external_id)
+        identity["_external_id"] = str(external_id)   # transition tracker (read path)
 
     if row.get("asset_id") is not None:
-        doc["asset_id"] = str(row["asset_id"])
+        identity["asset_id"] = str(row["asset_id"])
 
     if row.get("validity") is not None:
-        doc["validity"] = row["validity"]
-
-    if geometry is not None:
-        doc["geometry"] = geometry
-
-    if bbox is not None:
-        doc["bbox"] = bbox
-
-    # properties: user attrs only; unknown keys are moved to properties.extras
-    # by reusing the existing projection function so behavior matches the rest
-    # of the ES projection path.
-    doc["properties"] = dict(user_properties or {})
-    doc = project_item_for_es(doc, known_fields)
+        identity["validity"] = row["validity"]
 
     # system: SYSTEM_FIELD_KEYS values present on the row (content hashes live
     # here, not in stats).
     system = {k: row[k] for k in SYSTEM_FIELD_KEYS if row.get(k) is not None}
-    if system:
-        doc["system"] = system
 
     # stats: producible computed values from sidecars NOT claimed by system.
     # System wins all overlaps: if a sidecar also produces geometry_hash it
@@ -112,13 +167,16 @@ def build_canonical_index_doc(
             found, value = sidecar.resolve_computed_value(row, name)
             if found and value is not None:
                 stats[name] = value
-    if stats:
-        doc["stats"] = stats
 
-    if access:
-        doc["access"] = access
+    return build_canonical_envelope(
+        identity=identity,
+        properties=user_properties or {},
+        known_fields=known_fields,
+        reserved_members={"geometry": geometry, "bbox": bbox},
+        system=system or None,
+        stats=stats or None,
+        access=access or None,
+    )
 
-    return doc
 
-
-__all__ = ["build_canonical_index_doc"]
+__all__ = ["build_canonical_envelope", "build_canonical_index_doc"]

@@ -182,41 +182,15 @@ STAC_DATETIME_FIELDS: Dict[str, Any] = {
 # Index mappings per entity type
 # ---------------------------------------------------------------------------
 
-CATALOG_MAPPING: Dict[str, Any] = {
-    "dynamic": True,
-    "dynamic_templates": DYNAMIC_TEMPLATES,
-    "numeric_detection": False,
-    "properties": {
-        **COMMON_PROPERTIES,
-        "created": {"type": "date"},
-        "updated": {"type": "date"},
-    },
-}
+# ``CATALOG_MAPPING`` is assembled by :func:`build_catalog_mapping` (defined
+# below) once the shared container helpers exist — same canonical shape as
+# collections, minus the spatial/temporal extent.
 
-COLLECTION_MAPPING: Dict[str, Any] = {
-    "dynamic": True,
-    "dynamic_templates": DYNAMIC_TEMPLATES,
-    "numeric_detection": False,
-    "properties": {
-        **COMMON_PROPERTIES,
-        "created": {"type": "date"},
-        "updated": {"type": "date"},
-        "extent": {
-            "properties": {
-                "spatial": {
-                    "properties": {
-                        "bbox": {"type": "float"},
-                    }
-                },
-                "temporal": {
-                    "properties": {
-                        "interval": {"type": "object"},
-                    }
-                },
-            }
-        },
-    },
-}
+# ``COLLECTION_MAPPING`` is assembled by :func:`build_collection_mapping`
+# (defined below, after the shared container helpers) and assigned once those
+# helpers exist. The canonical collection envelope (#1285/#1800) replaced the
+# previous ``dynamic: true`` + dynamic-templates shape, whose per-key field
+# growth let leaked item attributes poison the singleton collections index.
 
 
 def _field_def_container(name: str, field_def: Any) -> str:
@@ -370,6 +344,136 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
 # ``build_item_mapping(build_known_fields(cfg))`` once Tier 2 lands so
 # it picks up the operator overlay.
 ITEM_MAPPING: Dict[str, Any] = build_item_mapping(build_known_fields())
+
+
+def build_collection_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the strict canonical collection mapping (refs #1285/#1800).
+
+    Mirrors :func:`build_item_mapping` at the collection level:
+
+    * ``dynamic: false`` at the root — undeclared members ride in ``_source``
+      unindexed (kept for round-trip) instead of minting a new mapping field,
+      closing the per-key growth that once poisoned the singleton collections
+      index when item attributes leaked in.
+    * attributes live under ``properties`` — ``known_fields`` typed flat,
+      everything else under the ``extras`` ``flattened`` lane, paired with the
+      analyzed ``_search_text`` catch-all.
+    * lifecycle (``created``/``updated``) in a typed ``system`` container.
+    * structural members (``links``/``assets``/``providers``/``summaries``/
+      ``stac_extensions``/``extent``) are declared so they round-trip and the
+      spatial envelope stays queryable; ``access`` is an opaque IAM sidecar.
+    """
+    props_fields: Dict[str, Any] = {}
+    for name, field_def in known_fields.items():
+        if _field_def_container(name, field_def) in ("stats", "system", "identity"):
+            continue
+        props_fields[name] = _field_def_es_type(field_def)
+
+    root_properties: Dict[str, Any] = {
+        "id":              {"type": "keyword"},
+        "catalog_id":      {"type": "keyword"},
+        "collection_id":   {"type": "keyword"},
+        "type":            {"type": "keyword"},
+        "stac_version":    {"type": "keyword"},
+        "stac_extensions": {"type": "keyword"},
+        # Structural members: returned, not searched — suppress indexing but
+        # keep in _source so the read projector reconstructs them verbatim.
+        "links":       {"type": "object", "enabled": False},
+        "assets":      {"type": "object", "enabled": False},
+        "item_assets": {"type": "object", "enabled": False},
+        "providers":   {"type": "object", "enabled": False},
+        "summaries":   {"type": "object", "enabled": False},
+        "extent": {
+            "properties": {
+                "spatial": {
+                    "properties": {
+                        "bbox": {"type": "float"},
+                        # Enriched envelope written by the driver's _enrich_doc.
+                        "bbox_shape": {"type": "geo_shape"},
+                    }
+                },
+                "temporal": {
+                    "properties": {
+                        "interval": {"type": "object"},
+                    }
+                },
+            }
+        },
+        "properties": {
+            "dynamic": False,
+            "properties": {
+                **props_fields,
+                "extras": {"type": "flattened"},
+            },
+        },
+        "system": {
+            "dynamic": False,
+            "properties": {
+                "created": {"type": "date"},
+                "updated": {"type": "date"},
+            },
+        },
+        # IAM authorization sidecar — opaque, never queried at the wire.
+        "access": {"type": "object", "enabled": False},
+        # Soft-delete tracker (driver delete_metadata(soft=True)); must stay
+        # indexed so search_metadata's must_not _deleted filter works under
+        # the strict dynamic:false mapping.
+        "_deleted": {"type": "boolean"},
+        "_search_text": {"type": "text", "analyzer": "standard"},
+    }
+    return {"dynamic": False, "properties": root_properties}
+
+
+# Canonical collections mapping (Tier 1 known attributes). Replaces the former
+# ``dynamic: true`` dynamic-template shape.
+COLLECTION_MAPPING: Dict[str, Any] = build_collection_mapping(build_known_fields())
+
+
+def build_catalog_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the strict canonical catalog mapping (refs #1285/#1800).
+
+    The thinnest metadata entity: identity + ``type``/``stac_version`` keyword,
+    attributes under ``properties`` (typed known + ``extras`` flattened lane +
+    ``_search_text``), lifecycle in a typed ``system`` container, ``links``
+    suppressed, ``access`` opaque. ``dynamic: false`` — undeclared members ride
+    in ``_source`` unindexed (kept for round-trip), no per-key growth.
+    """
+    props_fields: Dict[str, Any] = {}
+    for name, field_def in known_fields.items():
+        if _field_def_container(name, field_def) in ("stats", "system", "identity"):
+            continue
+        props_fields[name] = _field_def_es_type(field_def)
+
+    root_properties: Dict[str, Any] = {
+        "id":              {"type": "keyword"},
+        "catalog_id":      {"type": "keyword"},
+        "type":            {"type": "keyword"},
+        "stac_version":    {"type": "keyword"},
+        "stac_extensions": {"type": "keyword"},
+        "links":           {"type": "object", "enabled": False},
+        "properties": {
+            "dynamic": False,
+            "properties": {
+                **props_fields,
+                "extras": {"type": "flattened"},
+            },
+        },
+        "system": {
+            "dynamic": False,
+            "properties": {
+                "created": {"type": "date"},
+                "updated": {"type": "date"},
+            },
+        },
+        "access": {"type": "object", "enabled": False},
+        "_deleted": {"type": "boolean"},
+        "_search_text": {"type": "text", "analyzer": "standard"},
+    }
+    return {"dynamic": False, "properties": root_properties}
+
+
+# Canonical catalogs mapping. Replaces the former dynamic-template shape.
+CATALOG_MAPPING: Dict[str, Any] = build_catalog_mapping(build_known_fields())
 
 
 # Just the new top-level fields a cap-safe items index needs that an

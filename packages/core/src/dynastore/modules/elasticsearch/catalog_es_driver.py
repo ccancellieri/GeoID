@@ -273,7 +273,10 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
             return None
         try:
             resp = await client.get(index=index_name, id=catalog_id)
-            doc = resp["_source"]
+            from dynastore.modules.elasticsearch.catalog_canonical import (
+                unproject_catalog_from_es,
+            )
+            doc = unproject_catalog_from_es(resp["_source"])
         except Exception as exc:  # noqa: BLE001
             # Document absent (404) or transient transport error.  The read
             # contract allows None for "not found"; a missing catalog metadata
@@ -317,9 +320,18 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
         if not client:
             raise RuntimeError("Elasticsearch client not available")
 
-        doc = dict(metadata)
-        doc["id"] = catalog_id
-        doc["catalog_id"] = catalog_id
+        # Canonical catalog envelope (#1285/#1800): identity + system + access
+        # containers, attributes under properties (unknown→extras lane).
+        from dynastore.modules.elasticsearch.catalog_canonical import (
+            build_canonical_catalog_doc,
+        )
+        from dynastore.modules.elasticsearch.items_projection import build_known_fields
+
+        doc = build_canonical_catalog_doc(
+            metadata,
+            catalog_id=catalog_id,
+            known_fields=build_known_fields(),
+        )
 
         index_name = self._index_name()
         try:
