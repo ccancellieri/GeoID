@@ -22,8 +22,9 @@ Stores the full feature (geometry + properties + external_id) in a single
 index per tenant (catalog). Access is gated by the DENY policy applied
 when the private driver is active. Docs that would exceed the ES 10MB
 per-doc limit are shrunk by ``simplify_to_fit``
-(:mod:`dynastore.tools.geometry_simplify`), which records a
-``simplification_factor`` and ``simplification_mode`` on the stored doc.
+(:mod:`dynastore.tools.geometry_simplify`), which records
+``system.geometry_simplification.factor`` and ``.mode`` on the stored doc
+(#1828 Phase 2; previously stored flat at the doc root).
 
 Two index shapes are supported, selected per tenant by the operator via
 :attr:`~dynastore.modules.storage.driver_config.ItemsElasticsearchPrivateDriverConfig.mapping`:
@@ -67,10 +68,10 @@ _PRIVATE_RESERVED_ROOT_FIELDS = frozenset({
     "asset_id",
     "geometry",
     "bbox",
-    "simplification_factor",
-    "simplification_mode",
     "properties",
     "extras",
+    "system",
+    "stats",
 })
 
 
@@ -123,9 +124,6 @@ def _tenant_root_fields() -> Dict[str, Any]:
         "_simplification_factor":{"type": "float"},
         "_simplification_mode":  {"type": "keyword"},
         "_search_text":          {"type": "text", "analyzer": "standard"},
-        # Kept for backward compat; new docs carry these in ``system``.
-        "simplification_factor": {"type": "float"},
-        "simplification_mode":   {"type": "keyword"},
     }
 
 
@@ -147,6 +145,17 @@ _PRIVATE_SYSTEM_FIELDS: Dict[str, Any] = {
     "validity":         {"type": "keyword"},
     "transaction_time": {"type": "date"},
     "deleted_at":       {"type": "date"},
+    # Geometry simplification metadata (#1828 Phase 2).
+    # Nested under system so it travels with other lifecycle fields rather
+    # than polluting the doc root.
+    "geometry_simplification": {
+        "type": "object",
+        "dynamic": False,
+        "properties": {
+            "factor": {"type": "float"},
+            "mode":   {"type": "keyword"},
+        },
+    },
 }
 
 # Canonical nested containers for both mapping shapes.

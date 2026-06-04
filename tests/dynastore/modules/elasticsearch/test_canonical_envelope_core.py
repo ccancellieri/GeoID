@@ -77,8 +77,64 @@ def test_envelope_omits_empty_optional_sections():
     )
     assert doc["id"] == "K1"
     assert doc["properties"] == {}
-    for absent in ("system", "stats", "access"):
+    for absent in ("system", "stats", "access", "metadata"):
         assert absent not in doc
+
+
+# ---------------------------------------------------------------------------
+# metadata section in build_canonical_envelope (refs #1828)
+# ---------------------------------------------------------------------------
+
+
+def test_envelope_emits_metadata_when_provided():
+    """build_canonical_envelope must emit a ``metadata`` section when a non-empty
+    dict is passed, with the same copy-semantics as system/stats/access."""
+    meta = {"title": {"en": "Hello", "fr": "Bonjour"}, "keywords": ["a", "b"]}
+    doc = build_canonical_envelope(
+        identity={"id": "M1", "catalog_id": "cat"},
+        properties={},
+        known_fields={},
+        metadata=meta,
+    )
+    assert doc["metadata"] == meta
+    # metadata must not pollute other sections
+    assert "metadata" not in doc.get("properties", {})
+    assert "metadata" not in doc.get("system", {})
+
+
+def test_envelope_omits_metadata_when_not_provided():
+    """Omitting ``metadata`` (None, the default) must leave the key absent."""
+    doc = build_canonical_envelope(
+        identity={"id": "M2", "catalog_id": "cat"},
+        properties={},
+        known_fields={},
+    )
+    assert "metadata" not in doc
+
+
+def test_envelope_omits_metadata_when_empty_dict():
+    """An empty dict passed as ``metadata`` must be omitted (same as system/stats)."""
+    doc = build_canonical_envelope(
+        identity={"id": "M3", "catalog_id": "cat"},
+        properties={},
+        known_fields={},
+        metadata={},
+    )
+    assert "metadata" not in doc
+
+
+def test_envelope_metadata_is_copy_not_alias():
+    """build_canonical_envelope must copy the metadata dict, not alias it."""
+    meta = {"title": {"en": "Original"}}
+    doc = build_canonical_envelope(
+        identity={"id": "M4", "catalog_id": "cat"},
+        properties={},
+        known_fields={},
+        metadata=meta,
+    )
+    # Mutating the original must not affect the stored doc.
+    meta["title"] = {"en": "Changed"}
+    assert doc["metadata"]["title"] == {"en": "Original"}
 
 
 def test_envelope_pure_does_not_mutate_inputs():

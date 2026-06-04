@@ -86,6 +86,17 @@ from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.catalog.canonical_index_read import read_canonical_index_inputs
 from dynastore.modules.elasticsearch.items_projection import resolve_catalog_known_fields
 
+# Geometry simplification — shapely is an optional dependency; guard so the
+# module can be imported in environments without it (tests, lean deployments).
+# Tests can patch ``dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es``.
+try:
+    from dynastore.tools.geometry_simplify import maybe_simplify_for_es
+except ImportError:  # shapely not installed
+
+    def maybe_simplify_for_es(doc, *, simplify=False):  # type: ignore[misc]
+        """No-op fallback when shapely is not available."""
+        return doc, 1.0, "none"
+
 logger = logging.getLogger(__name__)
 
 
@@ -189,6 +200,25 @@ async def _ensure_in_public_alias_once(catalog_id: str, index_name: str) -> None
         )
         return
     _ALIAS_REGISTERED_CATALOGS.add(catalog_id)
+
+
+def _apply_geometry_simplification(
+    doc: Dict[str, Any], factor: float, mode: str,
+) -> None:
+    """Stamp geometry-simplification metadata into ``doc["system"]``.
+
+    Writes ``doc.system.geometry_simplification = {factor, mode}`` only
+    when *mode* is not ``"none"`` (i.e. simplification actually ran).
+    The flat ``_simplification_factor`` / ``_simplification_mode`` keys
+    are intentionally NOT written — the canonical nested object under
+    ``system`` is the authoritative location (#1828 Phase 2).
+    """
+    if mode == "none":
+        return
+    doc.setdefault("system", {})["geometry_simplification"] = {
+        "factor": factor,
+        "mode": mode,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +927,6 @@ class ItemsElasticsearchDriver(
 
         from dynastore.modules.elasticsearch.canonical_doc import build_canonical_index_doc
         from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
-        from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
         items = self._normalize_entities(entities)
         if not items:
@@ -910,10 +939,9 @@ class ItemsElasticsearchDriver(
         # the driver's ``simplify_geometry`` config flag; oversized geometries
         # are otherwise rejected up-front by ``item_service.upsert`` (HTTP 422)
         # rather than truncated here.
-        driver_config = await self.get_driver_config(
+        simplify_geometry = await self._resolve_simplify_geometry(
             catalog_id, collection_id, db_resource=db_resource,
         )
-        simplify_geometry = bool(getattr(driver_config, "simplify_geometry", False))
 
         # Service-layer enforcement of FieldDefinition.required / .unique for
         # drivers (like ES) that don't advertise native REQUIRED_ENFORCEMENT /
@@ -1088,15 +1116,13 @@ class ItemsElasticsearchDriver(
                 # the top-level identity field).
                 es_doc["_asset_id"] = str(asset_id)
 
-            # Geometry simplification (#1248) — operates on the assembled
-            # _source dict so the canonical envelope is intact; the simplification
-            # metadata is appended as top-level tracking fields.
+            # Geometry simplification (#1248/#1828) — operates on the assembled
+            # _source dict so the canonical envelope is intact; metadata is
+            # recorded in system.geometry_simplification (nested, typed).
             es_doc, factor, mode = maybe_simplify_for_es(
                 es_doc, simplify=simplify_geometry,
             )
-            if mode != "none":
-                es_doc["_simplification_factor"] = factor
-                es_doc["_simplification_mode"] = mode
+            _apply_geometry_simplification(es_doc, factor, mode)
 
             prepped_bulk.append({
                 "action": {"index": {
@@ -1203,6 +1229,23 @@ class ItemsElasticsearchDriver(
         except Exception:
             pass
         return ItemsWritePolicy()
+
+    async def _resolve_simplify_geometry(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> bool:
+        """Return the ``simplify_geometry`` flag from the driver config.
+
+        Centralises the flag lookup so ``write_entities``, ``index``, and
+        ``index_bulk`` all read from a single code path.
+        """
+        driver_config = await self.get_driver_config(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
+        return bool(getattr(driver_config, "simplify_geometry", False))
 
     @staticmethod
     async def _resolve_read_policy(
@@ -1682,6 +1725,9 @@ class ItemsElasticsearchDriver(
             user_properties=ci.user_properties,
             access=ci.access,
         )
+        simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
+        doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
+        _apply_geometry_simplification(doc, factor, mode)
         await es.index(
             index=index_name, id=op.entity_id, body=doc,
             params={"routing": ctx.collection},
@@ -1716,6 +1762,7 @@ class ItemsElasticsearchDriver(
         index_name = self._items_index_name(ctx.catalog)
         await _ensure_in_public_alias_once(ctx.catalog, index_name)
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
+        simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
 
         # Batch-fetch canonical inputs for all upsert ops in one PG round-trip.
         upsert_geoids = [
@@ -1758,6 +1805,8 @@ class ItemsElasticsearchDriver(
                 user_properties=ci.user_properties,
                 access=ci.access,
             )
+            doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
+            _apply_geometry_simplification(doc, factor, mode)
             body.append({"index": {
                 "_index": index_name, "_id": op.entity_id,
                 "routing": ctx.collection,

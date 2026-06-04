@@ -21,11 +21,19 @@ in the envelope subpackage so the platform never imports it.
 Like the private-driver doc builder, but additionally stamps the canonical
 *access envelope* — ``visibility`` / ``owner`` / ``attrs`` — as typed
 top-level fields so the row-level access filter can match on them reliably.
+
+The doc shape aligns with the canonical envelope (#1285/#1800/#1828):
+- flat identity + access ABAC fields at root (``visibility``/``owner``/``attrs``)
+- ``geometry`` / ``bbox`` as GeoJSON reserved members
+- ``properties`` sub-tree (dynamic)
+- ``system`` container for lifecycle/simplification metadata
+  (``geometry_simplification`` lives here, not at root)
+- ``metadata`` container for multilingual descriptive metadata (optional)
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 def build_envelope_feature_doc(
@@ -38,6 +46,8 @@ def build_envelope_feature_doc(
     visibility: Any = None,
     owner: Any = None,
     attrs: Any = None,
+    system: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build an ``ENVELOPE_FEATURE_MAPPING``-shaped doc from a Feature/dict.
 
@@ -56,6 +66,21 @@ def build_envelope_feature_doc(
     * ``owner``          ← arg, else ``src["_owner"]``
     * ``attrs``          ← arg, else ``src["_attrs"]`` (ABAC attribute dict
       from the per-collection stamping policy)
+
+    Canonical containers:
+
+    * ``system`` — carries ``geometry_simplification`` (factor/mode) when
+      simplification was applied (mode != "none"), plus any caller-supplied
+      system entries. Populated by the write path after ``maybe_simplify_for_es``
+      is called; pass as ``None`` at initial build time.
+    * ``metadata`` — multilingual descriptive metadata (title/description/
+      keywords as localized dicts). Emitted when non-empty.
+
+    The ABAC root fields (``visibility`` / ``owner`` / ``attrs``) deliberately
+    stay at the document root — NOT inside the canonical ``access`` container —
+    because the row-level filter predicates match on the root path
+    (``{"terms": {"visibility": [...]}}``). Moving them would silently break
+    every compiled AccessFilter clause.
     """
     if hasattr(item, "model_dump"):
         src = item.model_dump(by_alias=True, exclude_none=True)
@@ -105,5 +130,14 @@ def build_envelope_feature_doc(
 
     if props:
         doc["properties"] = props
+
+    # Canonical ``system`` container — populated by the caller after
+    # simplification (geometry_simplification lives here, not at root).
+    if system:
+        doc["system"] = dict(system)
+
+    # Canonical ``metadata`` container — multilingual descriptive metadata.
+    if metadata:
+        doc["metadata"] = dict(metadata)
 
     return doc

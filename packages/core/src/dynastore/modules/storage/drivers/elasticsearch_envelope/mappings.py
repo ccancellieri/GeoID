@@ -70,11 +70,36 @@ ENVELOPE_FEATURE_MAPPING: Dict[str, Any] = {
             "dynamic": True,
             "properties": {},  # sub-fields auto-mapped as keyword on first write
         },
-        # --- geometry + simplification bookkeeping ---
+        # --- geometry ---
         "geometry":              {"type": "geo_shape"},
         "bbox":                  {"type": "float"},
-        "simplification_factor": {"type": "float"},
-        "simplification_mode":   {"type": "keyword"},
+        # --- system container (canonical envelope, refs #1285/#1828) ---
+        # Carries lifecycle and simplification metadata. The
+        # ``geometry_simplification`` sub-object is declared static so the
+        # ``factor`` float and ``mode`` keyword are reliably typed regardless
+        # of whether any document has been simplified yet.
+        "system": {
+            "type": "object",
+            "dynamic": False,
+            "properties": {
+                "geometry_simplification": {
+                    "type": "object",
+                    "dynamic": False,
+                    "properties": {
+                        "factor": {"type": "float"},
+                        "mode":   {"type": "keyword"},
+                    },
+                },
+            },
+        },
+        # --- metadata container (multilingual descriptive metadata) ---
+        # Title / description / keywords stored as per-language sub-fields.
+        # Dynamic true inside ``metadata`` so new language codes index
+        # automatically without mapping updates.
+        "metadata": {
+            "type": "object",
+            "dynamic": True,
+        },
         # Tenant attributes live under a dynamic sub-tree so new fields
         # are indexed without mapping updates.
         "properties":            {"type": "object", "dynamic": True},

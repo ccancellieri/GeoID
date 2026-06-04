@@ -28,6 +28,7 @@ from typing import Any, Dict, List
 
 from dynastore.modules.elasticsearch.items_projection import (
     LANGUAGE_ANALYZERS,
+    _localized_text_field,
     build_known_fields,
 )
 
@@ -119,6 +120,53 @@ DYNAMIC_TEMPLATES: List[Dict[str, Any]] = [
     },
 ]
 
+
+# ---------------------------------------------------------------------------
+# Metadata container — typed, dynamic:false, shared across item/collection/
+# catalog builders (refs #1828). Multilingual title/description/keywords with
+# per-language analyzed text sub-fields via the existing _localized_text_field
+# helper from items_projection.  Keywords are an array of keyword-exact tokens
+# plus a .text analyzed sub-field for full-text on the same field.
+# ---------------------------------------------------------------------------
+
+def _build_metadata_container() -> Dict[str, Any]:
+    """Return the canonical ``metadata`` mapping block (dynamic:false).
+
+    Shared by item, collection, and catalog builders so they all emit the
+    same typed metadata container. Language set is pinned to
+    ``LANGUAGE_ANALYZERS`` (en/fr/es/ru/ar/it/de/zh) — unknown locales are
+    blocked by the per-field ``dynamic: false`` on the parent object, matching
+    the same guard in ``_localized_text_field`` (refs #1828).
+    """
+    return {
+        "dynamic": False,
+        "properties": {
+            "title":       _localized_text_field(ignore_above=512),
+            "description": _localized_text_field(ignore_above=1024),
+            # keywords: array of exact tokens; .text sub-field for full-text.
+            "keywords": {
+                "type": "keyword",
+                "fields": {"text": {"type": "text", "analyzer": "standard"}},
+            },
+        },
+    }
+
+
+_METADATA_CONTAINER: Dict[str, Any] = _build_metadata_container()
+
+# geometry_simplification typed nested object inside the ``system`` container
+# (refs #1828).  Drivers currently write the flat ``_simplification_factor`` /
+# ``_simplification_mode`` root-level trackers (see COMMON_PROPERTIES below).
+# Those flat fields are KEPT for backward compatibility until drivers migrate in
+# Phase 2.  The typed nested version is added here so new writes can begin
+# populating ``system.geometry_simplification`` without breaking old reads.
+_SYSTEM_GEOMETRY_SIMPLIFICATION: Dict[str, Any] = {
+    "dynamic": False,
+    "properties": {
+        "factor": {"type": "float"},
+        "mode":   {"type": "keyword"},
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Common top-level fields. Extended with the internal ``_*`` write-time
@@ -295,11 +343,20 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
         if container == "stats":
             stats_fields[name] = es_type
         elif container == "system":
+            # NOTE (#1828 Phase 2): the target is to type ``validity`` as a
+            # ``date_range`` and write it as an ES range object ({"gte","lte"}).
+            # That mapping and the driver-side conversion from the PG tstzrange
+            # value MUST land together — typing date_range here while the raw
+            # tstzrange value is still written into ``system.validity`` (validity
+            # is in SYSTEM_FIELD_KEYS) would fail ingest. So validity keeps its
+            # current es_type until the Phase 2 write conversion. TODO (#1828):
+            # validity -> date_range + driver writes {"gte": lower, "lte": upper}.
             system_fields[name] = es_type
-        elif container == "identity":
-            # Identity fields (external_id, asset_id, geoid) are already
-            # declared in COMMON_PROPERTIES at the document root.  They must
-            # NOT be duplicated inside ``properties``, ``stats``, or ``system``.
+        elif container in ("metadata", "identity"):
+            # metadata: lands in the _METADATA_CONTAINER block below (emitted
+            # statically with per-language analyzed sub-fields, not per-field).
+            # identity: declared in COMMON_PROPERTIES at the doc root; not
+            # duplicated inside properties/stats/system.
             pass
         else:
             # Default: properties lane.
@@ -310,6 +367,10 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
         **COMMON_PROPERTIES,
         "geometry": {"type": "geo_shape"},
         "bbox": {"type": "float"},
+        # metadata: typed dynamic:false container for multilingual
+        # title/description/keywords (refs #1828). Always emitted so the
+        # mapping is ready to accept ItemMetadataSidecar writes.
+        "metadata": _METADATA_CONTAINER,
         "properties": {
             "dynamic": False,
             "properties": {
@@ -327,10 +388,18 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # Emit the ``system`` container only when there are tagged system fields.
+    # Always inject geometry_simplification into the system container when
+    # system is emitted, so the nested structure is available for new writes
+    # without a mapping update (refs #1828). The flat ``_simplification_factor``
+    # / ``_simplification_mode`` root entries in COMMON_PROPERTIES are kept for
+    # backward compatibility until Phase 2 drivers migrate.
     if system_fields:
         root_properties["system"] = {
             "dynamic": False,
-            "properties": system_fields,
+            "properties": {
+                **system_fields,
+                "geometry_simplification": _SYSTEM_GEOMETRY_SIMPLIFICATION,
+            },
         }
 
     return {
@@ -399,6 +468,9 @@ def build_collection_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
                 },
             }
         },
+        # metadata: typed dynamic:false container for multilingual
+        # title/description/keywords (refs #1828).
+        "metadata": _METADATA_CONTAINER,
         "properties": {
             "dynamic": False,
             "properties": {
@@ -451,6 +523,9 @@ def build_catalog_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
         "stac_version":    {"type": "keyword"},
         "stac_extensions": {"type": "keyword"},
         "links":           {"type": "object", "enabled": False},
+        # metadata: typed dynamic:false container for multilingual
+        # title/description/keywords (refs #1828).
+        "metadata": _METADATA_CONTAINER,
         "properties": {
             "dynamic": False,
             "properties": {

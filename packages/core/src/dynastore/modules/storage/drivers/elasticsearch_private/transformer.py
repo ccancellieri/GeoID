@@ -49,8 +49,8 @@ class PrivateEntityTransformer:
     :func:`build_tenant_feature_doc`. Geometry is indexed EXACTLY by
     default (#1248); :func:`simplify_to_fit` only runs when the private
     driver's ``simplify_geometry`` config flag is enabled. The resulting
-    ``simplification_factor`` and ``simplification_mode`` are persisted on
-    the doc so clients can detect when geometry fidelity was reduced.
+    simplification metadata is persisted under ``system.geometry_simplification``
+    (#1828 Phase 2) so clients can detect when geometry fidelity was reduced.
 
     On READ (restore): lifts the per-tenant flat fields back into a
     standard Feature shape — geometry, bbox, properties (with
@@ -104,8 +104,11 @@ class PrivateEntityTransformer:
             catalog_id, collection_id, ctx,
         )
         doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
-        doc["simplification_factor"] = factor
-        doc["simplification_mode"] = mode
+        if mode != "none":
+            doc.setdefault("system", {})["geometry_simplification"] = {
+                "factor": factor,
+                "mode": mode,
+            }
         return doc
 
     @staticmethod
@@ -172,8 +175,8 @@ class PrivateEntityTransformer:
                 "properties": {
                     **<doc.properties>,
                     "external_id":           <doc.external_id>,
-                    "simplification_factor": <doc.simplification_factor>,
-                    "simplification_mode":   <doc.simplification_mode>,
+                    "simplification_factor": <doc.system.geometry_simplification.factor>,
+                    "simplification_mode":   <doc.system.geometry_simplification.mode>,
                     "catalog_id":            <doc.catalog_id>,
                     "collection_id":         <doc.collection_id>,
                 },
@@ -183,15 +186,20 @@ class PrivateEntityTransformer:
             return doc
 
         props = dict(doc.get("properties") or {})
-        for surfaced in (
-            "external_id",
-            "simplification_factor",
-            "simplification_mode",
-            "catalog_id",
-            "collection_id",
-        ):
+        for surfaced in ("external_id", "catalog_id", "collection_id"):
             if surfaced in doc and surfaced not in props:
                 props[surfaced] = doc[surfaced]
+        # Read geometry_simplification from canonical system container (#1828).
+        # Defensive fallback reads old flat keys for docs written before this change.
+        _gs = doc.get("system", {}).get("geometry_simplification")
+        if _gs:
+            props["simplification_factor"] = _gs.get("factor")
+            props["simplification_mode"] = _gs.get("mode")
+        else:
+            # Back-compat: flat keys on docs written before #1828 Phase 2.
+            for _flat in ("simplification_factor", "simplification_mode"):
+                if _flat in doc and _flat not in props:
+                    props[_flat] = doc[_flat]
 
         feature: dict = {
             "type": "Feature",

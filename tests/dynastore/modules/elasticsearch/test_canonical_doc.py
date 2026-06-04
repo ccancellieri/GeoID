@@ -292,6 +292,69 @@ def test_sidecar_none_value_not_written_to_stats():
     assert "stats" not in doc
 
 
+# ---------------------------------------------------------------------------
+# metadata section — item_title / item_description / item_keywords (refs #1828)
+# ---------------------------------------------------------------------------
+
+
+def test_metadata_section_populated_from_row_columns():
+    """When the row carries item_title / item_description / item_keywords,
+    build_canonical_index_doc must surface them in the ``metadata`` section."""
+    row = _row()
+    row["item_title"] = {"en": "Rome", "fr": "Rome"}
+    row["item_description"] = {"en": "The Eternal City"}
+    row["item_keywords"] = ["city", "europe"]
+    doc = build_canonical_index_doc(
+        row, resolved_sidecars=[], known_fields={},
+        catalog_id="c", collection_id="k",
+    )
+    assert "metadata" in doc
+    assert doc["metadata"]["title"] == {"en": "Rome", "fr": "Rome"}
+    assert doc["metadata"]["description"] == {"en": "The Eternal City"}
+    assert doc["metadata"]["keywords"] == ["city", "europe"]
+
+
+def test_metadata_section_absent_when_no_columns():
+    """When none of item_title / item_description / item_keywords are on the
+    row, the ``metadata`` section must be absent (not an empty dict)."""
+    doc = build_canonical_index_doc(
+        _row(), resolved_sidecars=[], known_fields={},
+        catalog_id="c", collection_id="k",
+    )
+    assert "metadata" not in doc
+
+
+def test_metadata_section_partial_columns():
+    """If only some metadata columns are present, only those keys are emitted."""
+    row = _row()
+    row["item_title"] = {"en": "Partial"}
+    doc = build_canonical_index_doc(
+        row, resolved_sidecars=[], known_fields={},
+        catalog_id="c", collection_id="k",
+    )
+    assert "metadata" in doc
+    assert doc["metadata"] == {"title": {"en": "Partial"}}
+    assert "description" not in doc["metadata"]
+    assert "keywords" not in doc["metadata"]
+
+
+def test_metadata_columns_do_not_leak_into_system_or_stats():
+    """item_title / item_description / item_keywords must not bleed into
+    ``system`` or ``stats`` sections."""
+    row = _row()
+    row["item_title"] = {"en": "Title"}
+    row["item_keywords"] = ["kw"]
+    doc = build_canonical_index_doc(
+        row, resolved_sidecars=[], known_fields={},
+        catalog_id="c", collection_id="k",
+    )
+    for section in ("system", "stats"):
+        if section in doc:
+            assert "title" not in doc[section]
+            assert "item_title" not in doc[section]
+            assert "keywords" not in doc[section]
+
+
 def test_reserved_stac_key_in_user_properties_is_dropped():
     # "id" is a reserved GeoJSON/STAC member — project_item_for_es drops it from
     # properties rather than routing it into extras.

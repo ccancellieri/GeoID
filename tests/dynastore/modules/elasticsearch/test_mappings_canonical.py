@@ -159,13 +159,17 @@ def test_system_object_is_dynamic_false() -> None:
     [
         ("geometry_hash", "keyword"),
         ("attributes_hash", "keyword"),
+        # validity keeps its current es_type until #1828 Phase 2 lands the
+        # date_range mapping together with the driver-side range-object write
+        # (typing date_range while the raw tstzrange value is still written into
+        # system.validity would fail ingest).
         ("validity", "keyword"),
         ("transaction_time", "date"),
         ("deleted_at", "date"),
     ],
 )
 def test_system_pinned_types(field_name: str, expected_type: str) -> None:
-    """System field ES types must match the canonical pins (refs #1800)."""
+    """System field ES types must match the canonical pins (refs #1800/#1828)."""
     m = _mapping()
     got = m["properties"]["system"]["properties"][field_name]["type"]
     assert got == expected_type, (
@@ -257,3 +261,151 @@ def test_item_mapping_default_has_no_stats_or_system_when_tier1_only() -> None:
     # stats / system are absent from the Tier-1 default mapping (no tagged fields).
     assert "stats" not in ITEM_MAPPING["properties"]
     assert "system" not in ITEM_MAPPING["properties"]
+
+
+# ---------------------------------------------------------------------------
+# metadata container — present in all three entity mappings (refs #1828)
+# ---------------------------------------------------------------------------
+
+def test_item_mapping_has_metadata_container() -> None:
+    """``metadata`` typed container must always be present in item mapping."""
+    m = _mapping()
+    assert "metadata" in m["properties"]
+    meta = m["properties"]["metadata"]
+    assert meta.get("dynamic") is False
+    assert "properties" in meta
+
+
+def test_item_mapping_metadata_title_is_localized() -> None:
+    """metadata.title must be a per-language localized object with dynamic:false."""
+    m = _mapping()
+    title = m["properties"]["metadata"]["properties"]["title"]
+    assert title.get("dynamic") is False
+    # Each supported locale must appear as a text subfield.
+    from dynastore.modules.elasticsearch.items_projection import LANGUAGE_ANALYZERS
+    for lang in LANGUAGE_ANALYZERS:
+        assert lang in title["properties"], f"metadata.title missing lang {lang!r}"
+        assert title["properties"][lang]["type"] == "text"
+
+
+def test_item_mapping_metadata_description_is_localized() -> None:
+    """metadata.description must be a per-language localized object."""
+    m = _mapping()
+    desc = m["properties"]["metadata"]["properties"]["description"]
+    assert desc.get("dynamic") is False
+    from dynastore.modules.elasticsearch.items_projection import LANGUAGE_ANALYZERS
+    for lang in LANGUAGE_ANALYZERS:
+        assert lang in desc["properties"], f"metadata.description missing lang {lang!r}"
+
+
+def test_item_mapping_metadata_keywords_is_keyword_with_text_subfield() -> None:
+    """metadata.keywords must be keyword-exact with a .text analyzed sub-field."""
+    m = _mapping()
+    kw = m["properties"]["metadata"]["properties"]["keywords"]
+    assert kw["type"] == "keyword"
+    assert kw["fields"]["text"]["type"] == "text"
+
+
+def test_item_mapping_default_tier1_still_has_metadata_container() -> None:
+    """Tier-1 ITEM_MAPPING must include the metadata container even when no
+    FieldDefinition-tagged metadata fields are present."""
+    from dynastore.modules.elasticsearch.mappings import ITEM_MAPPING
+    assert "metadata" in ITEM_MAPPING["properties"]
+    assert ITEM_MAPPING["properties"]["metadata"]["dynamic"] is False
+
+
+def test_collection_mapping_has_metadata_container() -> None:
+    """build_collection_mapping must emit the ``metadata`` container."""
+    from dynastore.modules.elasticsearch.mappings import build_collection_mapping
+    m = build_collection_mapping({})
+    assert "metadata" in m["properties"]
+    meta = m["properties"]["metadata"]
+    assert meta.get("dynamic") is False
+    assert "title" in meta["properties"]
+    assert "description" in meta["properties"]
+    assert "keywords" in meta["properties"]
+
+
+def test_catalog_mapping_has_metadata_container() -> None:
+    """build_catalog_mapping must emit the ``metadata`` container."""
+    from dynastore.modules.elasticsearch.mappings import build_catalog_mapping
+    m = build_catalog_mapping({})
+    assert "metadata" in m["properties"]
+    meta = m["properties"]["metadata"]
+    assert meta.get("dynamic") is False
+    assert "title" in meta["properties"]
+    assert "description" in meta["properties"]
+    assert "keywords" in meta["properties"]
+
+
+def test_metadata_container_shared_structure_is_identical() -> None:
+    """All three entity mappings must share the same metadata container structure
+    (same language set, same field types) — no drift between levels."""
+    from dynastore.modules.elasticsearch.mappings import (
+        build_catalog_mapping,
+        build_collection_mapping,
+    )
+    item_meta = _mapping()["properties"]["metadata"]
+    coll_meta = build_collection_mapping({})["properties"]["metadata"]
+    cat_meta = build_catalog_mapping({})["properties"]["metadata"]
+    assert item_meta == coll_meta == cat_meta
+
+
+# ---------------------------------------------------------------------------
+# system.geometry_simplification typed nested object (refs #1828)
+# ---------------------------------------------------------------------------
+
+def test_system_has_geometry_simplification_when_system_fields_present() -> None:
+    """system.geometry_simplification must be emitted when system is emitted."""
+    m = _mapping()
+    system_props = m["properties"]["system"]["properties"]
+    assert "geometry_simplification" in system_props
+
+
+def test_system_geometry_simplification_is_dynamic_false() -> None:
+    """system.geometry_simplification must be dynamic:false."""
+    m = _mapping()
+    gs = m["properties"]["system"]["properties"]["geometry_simplification"]
+    assert gs.get("dynamic") is False
+
+
+def test_system_geometry_simplification_has_factor_and_mode() -> None:
+    """system.geometry_simplification must carry factor (float) and mode (keyword)."""
+    m = _mapping()
+    gs_props = m["properties"]["system"]["properties"]["geometry_simplification"]["properties"]
+    assert gs_props["factor"]["type"] == "float"
+    assert gs_props["mode"]["type"] == "keyword"
+
+
+def test_flat_simplification_fields_still_in_common_properties() -> None:
+    """The backward-compat flat ``_simplification_factor`` / ``_simplification_mode``
+    root trackers must remain in COMMON_PROPERTIES until Phase 2 drivers migrate."""
+    from dynastore.modules.elasticsearch.mappings import COMMON_PROPERTIES
+    assert "_simplification_factor" in COMMON_PROPERTIES
+    assert COMMON_PROPERTIES["_simplification_factor"]["type"] == "float"
+    assert "_simplification_mode" in COMMON_PROPERTIES
+    assert COMMON_PROPERTIES["_simplification_mode"]["type"] == "keyword"
+
+
+# ---------------------------------------------------------------------------
+# validity — date_range deferred to #1828 Phase 2 (mapping + driver write move
+# together); for now it keeps its current es_type so ingest of the raw tstzrange
+# value into system.validity does not fail.
+# ---------------------------------------------------------------------------
+
+def test_system_validity_not_yet_date_range() -> None:
+    """Until Phase 2, system.validity must NOT be date_range (the raw tstzrange
+    value is still written there; date_range would reject it on ingest)."""
+    m = _mapping()
+    validity = m["properties"]["system"]["properties"]["validity"]
+    assert validity["type"] != "date_range"
+
+
+def test_flat_valid_from_to_still_in_common_properties() -> None:
+    """Backward-compat ``_valid_from`` / ``_valid_to`` flat trackers must stay
+    in COMMON_PROPERTIES until drivers migrate (#1828 Phase 2)."""
+    from dynastore.modules.elasticsearch.mappings import COMMON_PROPERTIES
+    assert "_valid_from" in COMMON_PROPERTIES
+    assert COMMON_PROPERTIES["_valid_from"]["type"] == "date"
+    assert "_valid_to" in COMMON_PROPERTIES
+    assert COMMON_PROPERTIES["_valid_to"]["type"] == "date"

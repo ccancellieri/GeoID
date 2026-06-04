@@ -63,6 +63,24 @@ from dynastore.modules.storage.hints import Hint
 logger = logging.getLogger(__name__)
 
 
+def _stamp_simplification(doc: Dict[str, Any], factor: float, mode: str) -> None:
+    """Write simplification metadata into ``doc["system"]["geometry_simplification"]``.
+
+    Only emits the container when ``mode != "none"`` (exact geometry indexed,
+    no simplification applied). When simplification ran, the canonical shape is:
+
+        doc["system"]["geometry_simplification"] = {"factor": factor, "mode": mode}
+
+    ``system`` is created if absent; pre-existing system keys are preserved.
+    The old flat ``simplification_factor`` / ``simplification_mode`` root keys
+    are NOT written — only the canonical nested path is used.
+    """
+    if mode == "none":
+        return
+    system = doc.setdefault("system", {})
+    system["geometry_simplification"] = {"factor": factor, "mode": mode}
+
+
 class ItemsElasticsearchEnvelopeDriver(
     TypedDriver[ItemsElasticsearchEnvelopeDriverConfig],
     _ItemsElasticsearchBase,
@@ -319,8 +337,7 @@ class ItemsElasticsearchEnvelopeDriver(
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry,
             )
-            doc["simplification_factor"] = factor
-            doc["simplification_mode"] = mode
+            _stamp_simplification(doc, factor, mode)
             bulk_body.append({"index": {"_index": index_name, "_id": geoid}})
             bulk_body.append(doc)
             submitted_ids.append(geoid)
@@ -471,23 +488,59 @@ class ItemsElasticsearchEnvelopeDriver(
         catalog_id: str,
         collection_id: str,
         fallback_id: Any,
+        lang: Optional[str] = None,
     ) -> Feature:
         """Reconstruct a :class:`Feature` from an envelope doc ``_source``.
 
-        Surfaces feature bookkeeping (``external_id`` and the simplification
+        Surfaces feature bookkeeping (``external_id`` and simplification
         markers) in ``properties`` so callers can detect simplification without
-        a separate API. The access-envelope fields (``visibility`` / ``owner``
-        ) are deliberately NOT surfaced into the read
-        contract — they are internal authorization metadata, not feature
-        attributes.
+        a separate API.
+
+        Simplification is read from the canonical path
+        ``source["system"]["geometry_simplification"]`` with a back-compat
+        fallback to the old flat root keys (``simplification_factor`` /
+        ``simplification_mode``) for docs written by an older driver version.
+
+        When ``source["metadata"]`` is present (multilingual title/description/
+        keywords), each field is resolved to the requested language (``lang``,
+        defaulting to ``"en"`` when absent) via
+        :func:`dynastore.tools.language_utils.resolve_localized_field` and
+        surfaced in ``properties``.
+
+        The access-envelope fields (``visibility`` / ``owner`` / ``attrs``)
+        are deliberately NOT surfaced into the read contract — they are
+        internal authorization metadata, not feature attributes.
         """
+        from dynastore.tools.language_utils import resolve_localized_field
+
+        effective_lang = lang or "en"
         props = dict(source.get("properties") or {})
         if "external_id" in source:
             props["external_id"] = source["external_id"]
-        if "simplification_factor" in source:
-            props["simplification_factor"] = source["simplification_factor"]
-        if "simplification_mode" in source:
-            props["simplification_mode"] = source["simplification_mode"]
+
+        # Simplification: canonical path first, flat fallback for old docs.
+        system = source.get("system") or {}
+        geo_simp = system.get("geometry_simplification")
+        if isinstance(geo_simp, dict):
+            props["simplification_factor"] = geo_simp.get("factor")
+            props["simplification_mode"] = geo_simp.get("mode")
+        else:
+            # Back-compat: docs written before the canonical system container.
+            if "simplification_factor" in source:
+                props["simplification_factor"] = source["simplification_factor"]
+            if "simplification_mode" in source:
+                props["simplification_mode"] = source["simplification_mode"]
+
+        # Multilingual metadata: resolve each field to the requested language.
+        metadata = source.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("title", "description", "keywords"):
+                raw = metadata.get(key)
+                if raw is not None:
+                    resolved = resolve_localized_field(raw, effective_lang)
+                    if resolved is not None:
+                        props.setdefault(key, resolved)
+
         props["catalog_id"] = source.get("catalog_id", catalog_id)
         props["collection_id"] = source.get("collection_id", collection_id)
         return Feature(
@@ -629,8 +682,7 @@ class ItemsElasticsearchEnvelopeDriver(
             ctx.catalog, ctx.collection,
         )
         doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
-        doc["simplification_factor"] = factor
-        doc["simplification_mode"] = mode
+        _stamp_simplification(doc, factor, mode)
         await es.index(index=index_name, id=op.entity_id, body=doc)
 
     async def index_bulk(self, ctx, ops):
@@ -676,8 +728,7 @@ class ItemsElasticsearchEnvelopeDriver(
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry,
             )
-            doc["simplification_factor"] = factor
-            doc["simplification_mode"] = mode
+            _stamp_simplification(doc, factor, mode)
             body.append({"index": {"_index": index_name, "_id": op.entity_id}})
             body.append(doc)
 

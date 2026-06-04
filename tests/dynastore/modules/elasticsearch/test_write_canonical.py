@@ -768,3 +768,314 @@ class TestConvergenceInvariant:
         assert index_bulk_doc == expected_doc, (
             f"index_bulk doc diverges from reference:\n{index_bulk_doc}\n{expected_doc}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (#1828) — system.geometry_simplification nested object
+# ---------------------------------------------------------------------------
+
+
+class TestGeometrySimplificationCanonicalNested:
+    """Simplification metadata must land in ``system.geometry_simplification``
+    (nested, typed) on ALL three write paths, and the flat
+    ``_simplification_factor`` / ``_simplification_mode`` keys must NOT be
+    written (#1828 Phase 2).
+
+    ``maybe_simplify_for_es`` is mocked so these tests run without shapely.
+    The simplify flag is enabled via ``_resolve_simplify_geometry`` mock.
+    """
+
+    # Fake return value simulating a simplification that actually ran.
+    _FACTOR = 0.01
+    _MODE = "douglas_peucker"
+
+    @staticmethod
+    def _make_driver():
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+        return ItemsElasticsearchDriver.__new__(ItemsElasticsearchDriver)
+
+    @pytest.mark.asyncio
+    async def test_write_entities_uses_nested_system_geometry_simplification(self):
+        """write_entities: simplified doc carries system.geometry_simplification,
+        NOT flat _simplification_factor / _simplification_mode."""
+        driver = self._make_driver()
+        geoid = _GEOID
+        ext_id = _EXTERNAL_ID
+        canonical_input = _make_canonical_input(geoid=geoid, external_id=ext_id)
+
+        feature = MagicMock()
+        feature.id = ext_id
+        feature.geometry = canonical_input.geometry
+        feature.properties = canonical_input.user_properties
+        feature.model_dump = MagicMock(return_value={
+            "id": ext_id,
+            "type": "Feature",
+            "geometry": canonical_input.geometry,
+            "properties": {**(canonical_input.user_properties or {}), "geoid": geoid},
+            "geoid": geoid,
+        })
+
+        mock_config = MagicMock()
+        mock_config.simplify_geometry = True
+        mock_config.external_id_path = MagicMock(return_value=None)
+        mock_config.on_batch_conflict = None
+        mock_config.on_conflict = None
+        mock_config.validity = None
+
+        captured_bulk: List[Dict] = []
+
+        async def _fake_bulk(body, params=None):
+            captured_bulk.extend(body)
+            return {
+                "errors": False,
+                "items": [{"index": {"_id": geoid, "_index": "test", "status": 200}}],
+            }
+
+        es_mock = AsyncMock()
+        es_mock.bulk = _fake_bulk
+
+        with (
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+                return_value=es_mock,
+            ),
+            patch.object(driver, "get_driver_config", new=AsyncMock(return_value=mock_config)),
+            patch.object(driver, "_enforce_field_constraints", new=AsyncMock()),
+            patch.object(driver, "_resolve_write_policy", new=AsyncMock(return_value=mock_config)),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={geoid: canonical_input}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, simplify: (doc, self._FACTOR, self._MODE),
+            ),
+        ):
+            await driver.write_entities("cat1", "col1", [feature])
+
+        doc_lines = [b for b in captured_bulk if isinstance(b, dict) and "index" not in b]
+        assert len(doc_lines) == 1, f"Expected one doc in bulk; got: {captured_bulk}"
+        doc = doc_lines[0]
+
+        # Nested object present under system.
+        assert "system" in doc, f"'system' key missing; doc keys: {list(doc.keys())}"
+        gs = doc["system"].get("geometry_simplification")
+        assert gs is not None, (
+            f"system.geometry_simplification missing; system={doc['system']}"
+        )
+        assert gs["factor"] == self._FACTOR, f"wrong factor: {gs}"
+        assert gs["mode"] == self._MODE, f"wrong mode: {gs}"
+
+        # Flat keys must NOT be present.
+        assert "_simplification_factor" not in doc, (
+            f"flat _simplification_factor still written: {list(doc.keys())}"
+        )
+        assert "_simplification_mode" not in doc, (
+            f"flat _simplification_mode still written: {list(doc.keys())}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_simplification_leaves_no_system_geometry_simplification(self):
+        """When simplification is off (mode=='none'), system.geometry_simplification
+        must NOT be added."""
+        driver = self._make_driver()
+        geoid = _GEOID
+        ext_id = _EXTERNAL_ID
+        canonical_input = _make_canonical_input(geoid=geoid, external_id=ext_id)
+
+        feature = MagicMock()
+        feature.id = ext_id
+        feature.geometry = canonical_input.geometry
+        feature.properties = canonical_input.user_properties
+        feature.model_dump = MagicMock(return_value={
+            "id": ext_id,
+            "type": "Feature",
+            "geometry": canonical_input.geometry,
+            "properties": {**(canonical_input.user_properties or {}), "geoid": geoid},
+            "geoid": geoid,
+        })
+
+        mock_config = MagicMock()
+        mock_config.simplify_geometry = False
+        mock_config.external_id_path = MagicMock(return_value=None)
+        mock_config.on_batch_conflict = None
+        mock_config.on_conflict = None
+        mock_config.validity = None
+
+        captured_bulk: List[Dict] = []
+
+        async def _fake_bulk(body, params=None):
+            captured_bulk.extend(body)
+            return {
+                "errors": False,
+                "items": [{"index": {"_id": geoid, "_index": "test", "status": 200}}],
+            }
+
+        es_mock = AsyncMock()
+        es_mock.bulk = _fake_bulk
+
+        with (
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+                return_value=es_mock,
+            ),
+            patch.object(driver, "get_driver_config", new=AsyncMock(return_value=mock_config)),
+            patch.object(driver, "_enforce_field_constraints", new=AsyncMock()),
+            patch.object(driver, "_resolve_write_policy", new=AsyncMock(return_value=mock_config)),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={geoid: canonical_input}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+            ),
+        ):
+            await driver.write_entities("cat1", "col1", [feature])
+
+        doc_lines = [b for b in captured_bulk if isinstance(b, dict) and "index" not in b]
+        assert len(doc_lines) == 1
+        doc = doc_lines[0]
+
+        # system may be present (from canonical builder) but must NOT have geometry_simplification.
+        sys_section = doc.get("system", {})
+        assert "geometry_simplification" not in sys_section, (
+            f"geometry_simplification must be absent when mode=='none'; system={sys_section}"
+        )
+        assert "_simplification_factor" not in doc
+        assert "_simplification_mode" not in doc
+
+    @pytest.mark.asyncio
+    async def test_index_bulk_uses_nested_system_geometry_simplification(self):
+        """index_bulk: simplified docs carry system.geometry_simplification,
+        NOT flat keys."""
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+        from dynastore.models.protocols.indexer import IndexOp
+
+        driver = ItemsElasticsearchDriver.__new__(ItemsElasticsearchDriver)
+        ctx = _make_ctx()
+        op = IndexOp(op_type="upsert", entity_type="item", entity_id=_GEOID)
+        canonical_input = _make_canonical_input()
+
+        bulk_captured: List[Dict] = []
+
+        async def _fake_bulk(body, params=None):
+            bulk_captured.extend(body)
+            return _bulk_ok_response(_GEOID)
+
+        es_mock = AsyncMock()
+        es_mock.bulk = _fake_bulk
+
+        with (
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+                return_value=es_mock,
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._ensure_in_public_alias_once",
+                new=AsyncMock(),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={_GEOID: canonical_input}),
+            ),
+            patch.object(
+                driver, "_resolve_simplify_geometry",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, simplify: (doc, self._FACTOR, self._MODE),
+            ),
+        ):
+            from dynastore.models.protocols.indexer import BulkResult
+            result = await driver.index_bulk(ctx, [op])
+
+        doc_lines = [b for b in bulk_captured if isinstance(b, dict) and "index" not in b]
+        assert len(doc_lines) == 1, f"Expected 1 doc; body: {bulk_captured}"
+        doc = doc_lines[0]
+
+        assert "system" in doc
+        gs = doc["system"].get("geometry_simplification")
+        assert gs is not None, f"system.geometry_simplification missing; system={doc['system']}"
+        assert gs["factor"] == self._FACTOR
+        assert gs["mode"] == self._MODE
+        assert "_simplification_factor" not in doc
+        assert "_simplification_mode" not in doc
+
+    @pytest.mark.asyncio
+    async def test_index_uses_nested_system_geometry_simplification(self):
+        """index (single op): simplified doc carries system.geometry_simplification,
+        NOT flat keys."""
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+        from dynastore.models.protocols.indexer import IndexOp
+
+        driver = ItemsElasticsearchDriver.__new__(ItemsElasticsearchDriver)
+        ctx = _make_ctx()
+        op = IndexOp(op_type="upsert", entity_type="item", entity_id=_GEOID)
+        canonical_input = _make_canonical_input()
+
+        indexed_docs: List[Dict] = []
+
+        async def _fake_index(index, id, body, params=None):
+            indexed_docs.append(body)
+
+        es_mock = AsyncMock()
+        es_mock.index = _fake_index
+
+        with (
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+                return_value=es_mock,
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._ensure_in_public_alias_once",
+                new=AsyncMock(),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={_GEOID: canonical_input}),
+            ),
+            patch.object(
+                driver, "_resolve_simplify_geometry",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, simplify: (doc, self._FACTOR, self._MODE),
+            ),
+        ):
+            await driver.index(ctx, op)
+
+        assert len(indexed_docs) == 1, f"Expected 1 indexed doc; got {indexed_docs}"
+        doc = indexed_docs[0]
+
+        assert "system" in doc
+        gs = doc["system"].get("geometry_simplification")
+        assert gs is not None, f"system.geometry_simplification missing; system={doc['system']}"
+        assert gs["factor"] == self._FACTOR
+        assert gs["mode"] == self._MODE
+        assert "_simplification_factor" not in doc
+        assert "_simplification_mode" not in doc

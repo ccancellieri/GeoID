@@ -271,8 +271,11 @@ class ItemsElasticsearchPrivateDriver(
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry,
             )
-            doc["simplification_factor"] = factor
-            doc["simplification_mode"] = mode
+            if mode != "none":
+                doc.setdefault("system", {})["geometry_simplification"] = {
+                    "factor": factor,
+                    "mode": mode,
+                }
             doc = project_private_doc(doc, known_fields)
             bulk_body.append({"index": {"_index": index_name, "_id": geoid}})
             bulk_body.append(doc)
@@ -374,10 +377,18 @@ class ItemsElasticsearchPrivateDriver(
         props = dict(source.get("properties") or {})
         if "external_id" in source:
             props["external_id"] = source["external_id"]
-        if "simplification_factor" in source:
-            props["simplification_factor"] = source["simplification_factor"]
-        if "simplification_mode" in source:
-            props["simplification_mode"] = source["simplification_mode"]
+        # Read geometry_simplification from canonical system container (#1828).
+        # Defensive fallback reads old flat keys for docs written before this change.
+        _gs = source.get("system", {}).get("geometry_simplification")
+        if _gs:
+            props["simplification_factor"] = _gs.get("factor")
+            props["simplification_mode"] = _gs.get("mode")
+        else:
+            # Back-compat: flat keys on docs written before #1828 Phase 2.
+            if "simplification_factor" in source:
+                props["simplification_factor"] = source["simplification_factor"]
+            if "simplification_mode" in source:
+                props["simplification_mode"] = source["simplification_mode"]
         props["catalog_id"] = source.get("catalog_id", catalog_id)
         props["collection_id"] = source.get("collection_id", collection_id)
         return Feature(
@@ -571,8 +582,11 @@ class ItemsElasticsearchPrivateDriver(
             ctx.catalog, ctx.collection,
         )
         doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
-        doc["simplification_factor"] = factor
-        doc["simplification_mode"] = mode
+        if mode != "none":
+            doc.setdefault("system", {})["geometry_simplification"] = {
+                "factor": factor,
+                "mode": mode,
+            }
         doc = project_private_doc(doc, known_fields)
         await es.index(index=index_name, id=op.entity_id, body=doc)
 
@@ -638,8 +652,11 @@ class ItemsElasticsearchPrivateDriver(
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry,
             )
-            doc["simplification_factor"] = factor
-            doc["simplification_mode"] = mode
+            if mode != "none":
+                doc.setdefault("system", {})["geometry_simplification"] = {
+                    "factor": factor,
+                    "mode": mode,
+                }
             doc = project_private_doc(doc, known_fields)
             body.append({"index": {"_index": index_name, "_id": op.entity_id}})
             body.append(doc)

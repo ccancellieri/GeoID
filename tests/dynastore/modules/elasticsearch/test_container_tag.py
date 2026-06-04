@@ -82,6 +82,27 @@ def test_computed_sidecar_names_classify_as_stats(name: str) -> None:
     assert classify_container(name, fd) == "stats"
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "s2_res12",
+        "s2_res_12",
+        "h3_res10",
+        "geohash_res6",
+    ],
+)
+def test_custom_named_spatial_cells_classify_as_stats(name: str) -> None:
+    """Spatial-cell fields named with a ``res`` token (e.g. the geoid preset's
+    ``s2_res12``) must still classify to 'stats' from the name pattern alone.
+
+    Regression: the original pattern ``^(s2|h3|geohash)_\\d+$`` did not match a
+    ``res`` infix, so ``s2_res12`` fell through to 'properties' and got swept
+    into ``properties.extras`` by the ES projection.
+    """
+    fd = FieldDefinition(name=name, data_type="string")
+    assert classify_container(name, fd) == "stats"
+
+
 # ---------------------------------------------------------------------------
 # Properties — user / STAC attributes
 # ---------------------------------------------------------------------------
@@ -99,6 +120,41 @@ def test_user_stac_attrs_classify_as_properties(name: str) -> None:
     """STAC common metadata and arbitrary user attributes resolve to 'properties'."""
     fd = FieldDefinition(name=name, data_type="string")
     assert classify_container(name, fd) == "properties"
+
+
+# ---------------------------------------------------------------------------
+# Metadata fields — multilingual title / description / keywords (refs #1828)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "title",
+        "description",
+        "keywords",
+        "item_title",
+        "item_description",
+        "item_keywords",
+    ],
+)
+def test_descriptive_metadata_classifies_as_metadata(name: str) -> None:
+    """Descriptive multilingual metadata routes to the 'metadata' container, not
+    'properties' — so the strict mapping types it as localized text and the read
+    projector resolves it per ?lang= instead of leaking into properties."""
+    fd = FieldDefinition(name=name, data_type="string")
+    assert classify_container(name, fd) == "metadata"
+
+
+@pytest.mark.parametrize(
+    "container",
+    ["metadata", "extras", "stac", "assets", "access"],
+)
+def test_field_definition_accepts_new_open_containers(container: str) -> None:
+    """FieldDefinition accepts the v2 namespace containers (refs #1828)."""
+    fd = FieldDefinition(name="x", data_type="string", container=container)  # type: ignore[arg-type]
+    assert fd.container == container
+    # An explicit tag is honoured by classify_container (rule 3) for a plain name.
+    assert classify_container("x", fd) == container
 
 
 # ---------------------------------------------------------------------------

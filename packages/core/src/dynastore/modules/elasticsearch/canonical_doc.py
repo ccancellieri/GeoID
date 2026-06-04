@@ -37,11 +37,12 @@ def build_canonical_envelope(
     properties: Dict[str, Any],
     known_fields: Dict[str, Any],
     reserved_members: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
     system: Optional[Dict[str, Any]] = None,
     stats: Optional[Dict[str, Any]] = None,
     access: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Assemble the level-agnostic canonical ES ``_source`` (refs #1285/#1800).
+    """Assemble the level-agnostic canonical ES ``_source`` (refs #1285/#1800/#1828).
 
     One modular, pluggable shape for every entity level. The sections are the
     contract; what fills them is the caller's (per-level) concern:
@@ -60,6 +61,10 @@ def build_canonical_envelope(
       ``properties.extras`` (the ``flattened`` long-tail lane) and the analyzed
       ``_search_text`` catch-all is populated — identical handling at every
       level, so the strict ``dynamic: false`` mapping never grows per-key.
+    * **metadata** — multilingual descriptive metadata (``title``,
+      ``description``, ``keywords``), sourced from the ``ItemMetadataSidecar``
+      (refs #1828). Typed ``dynamic: false`` mapping with per-language analyzed
+      sub-fields. Emitted when non-empty.
     * **system** — the core identity/lifecycle container. Emitted when non-empty.
     * **stats** — derived values. Emitted when non-empty.
     * **access** — the IAM authorization sidecar, plugged in by the ABAC layer.
@@ -81,6 +86,8 @@ def build_canonical_envelope(
     doc["properties"] = dict(properties or {})
     doc = project_item_for_es(doc, known_fields)
 
+    if metadata:
+        doc["metadata"] = dict(metadata)
     if system:
         doc["system"] = dict(system)
     if stats:
@@ -168,11 +175,31 @@ def build_canonical_index_doc(
             if found and value is not None:
                 stats[name] = value
 
+    # metadata: multilingual descriptive metadata from the ItemMetadataSidecar
+    # (item_title / item_description / item_keywords JSONB columns). The sidecar
+    # wiring into this assembly is deferred to #1828 Phase 2; for now we read
+    # the three columns directly from the row if present so callers that already
+    # populate them (e.g. future PG-level joins) get the typed metadata container
+    # without any driver change. The preferred canonical names are the un-prefixed
+    # forms (title/description/keywords); the item_* aliases are also accepted.
+    # TODO (#1828 Phase 2): wire ItemMetadataSidecar here so sidecars can produce
+    # metadata fields and this reads from resolved_sidecars instead of the row.
+    metadata: Dict[str, Any] = {}
+    for col, key in (
+        ("item_title", "title"),
+        ("item_description", "description"),
+        ("item_keywords", "keywords"),
+    ):
+        val = row.get(col)
+        if val is not None:
+            metadata[key] = val
+
     return build_canonical_envelope(
         identity=identity,
         properties=user_properties or {},
         known_fields=known_fields,
         reserved_members={"geometry": geometry, "bbox": bbox},
+        metadata=metadata or None,
         system=system or None,
         stats=stats or None,
         access=access or None,

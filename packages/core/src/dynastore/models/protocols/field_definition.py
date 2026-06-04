@@ -178,8 +178,21 @@ class FieldDefinition(BaseModel):
     # ``build_es_field_mapping``, ``parse_sort``). Single source of truth — no drift
     # between mapping and resolution. Sidecars that produce computed statistics set
     # this to ``"stats"``; the platform identity / lifecycle fields use ``"system"``
-    # or ``"identity"``; user / STAC attributes default to ``"properties"`` (refs #1800).
-    container: Literal["identity", "properties", "stats", "system"] = "properties"
+    # or ``"identity"``; multilingual descriptive metadata (title/description/keywords)
+    # uses ``"metadata"``; user / STAC attributes default to ``"properties"``. The
+    # open-ended lanes (``"extras"``, ``"stac"``, ``"assets"``, ``"access"``) are mapped
+    # ``flat_object``/``flattened`` so they never grow the strict mapping (refs #1800/#1828).
+    container: Literal[
+        "identity",
+        "properties",
+        "stats",
+        "system",
+        "metadata",
+        "extras",
+        "stac",
+        "assets",
+        "access",
+    ] = "properties"
 
     @field_validator("data_type")
     @classmethod

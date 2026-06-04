@@ -45,6 +45,8 @@ import json
 import logging
 from typing import Any, Dict, Iterable, List, Optional
 
+from dynastore.tools.language_utils import resolve_localized_field
+
 logger = logging.getLogger(__name__)
 
 
@@ -525,7 +527,10 @@ def _collect_search_tokens(values: Iterable[Any], out: List[str]) -> None:
             out.append(str(v))
 
 
-def unproject_item_from_es(source: Dict[str, Any]) -> Dict[str, Any]:
+def unproject_item_from_es(
+    source: Dict[str, Any],
+    lang: str = "en",
+) -> Dict[str, Any]:
     """Rebuild the GeoJSON/STAC read contract from an indexed ``_source``.
 
     Inverse of :func:`project_item_for_es`. The write path routes unknown
@@ -544,6 +549,11 @@ def unproject_item_from_es(source: Dict[str, Any]) -> Dict[str, Any]:
 
     * ``properties.extras.*`` is hoisted back to flat ``properties.*`` (an
       existing flat key wins on collision — it is the more specific value);
+    * when ``_source["metadata"]`` contains a typed multilingual container
+      (``title`` / ``description`` / ``keywords``), each field is resolved
+      to the requested ``lang`` (defaulting to ``"en"``) and placed onto
+      the flat ``properties`` dict — matching the PG read contract. The raw
+      ``metadata`` container is not surfaced on the wire;
     * only GeoJSON/STAC structural members (:data:`_RESERVED_MEMBER_KEYS`)
       survive at the top level — internal ``_*`` fields and leaked
       attribute/echo keys are dropped;
@@ -559,6 +569,7 @@ def unproject_item_from_es(source: Dict[str, Any]) -> Dict[str, Any]:
         reserved_member_keys=_RESERVED_MEMBER_KEYS,
         default_type="Feature",
         null_empty_geometry=True,
+        lang=lang,
     )
 
 
@@ -568,6 +579,7 @@ def unproject_envelope_from_es(
     reserved_member_keys: "frozenset[str]",
     default_type: Optional[str] = None,
     null_empty_geometry: bool = False,
+    lang: str = "en",
 ) -> Dict[str, Any]:
     """Level-agnostic read reconstruction from a canonical ``_source`` (#1285).
 
@@ -578,6 +590,13 @@ def unproject_envelope_from_es(
 
     * ``properties.extras.*`` is hoisted back to flat ``properties.*`` (an
       existing flat key wins on collision — it is the more specific value);
+    * when ``_source["metadata"]`` carries a typed multilingual container
+      (``title`` / ``description`` / ``keywords``), each present key is
+      resolved to the requested ``lang`` (``"*"`` returns the full dict;
+      otherwise falls back to ``"en"`` then the first available language)
+      and written to flat ``properties`` via ``setdefault`` — the raw
+      ``metadata`` container is kept out of the wire output, consistent with
+      how ``system``/``stats``/``access`` are treated;
     * only the level's ``reserved_member_keys`` survive at the top level —
       flat identity (``catalog_id``/``collection_id``), internal ``_*`` fields
       and the ``system``/``stats``/``access`` containers are dropped;
@@ -600,6 +619,20 @@ def unproject_envelope_from_es(
     if isinstance(extras, dict):
         for k, v in extras.items():
             props.setdefault(k, v)
+
+    # Resolve the typed multilingual metadata container (#1828 Phase 2).
+    # The raw ``metadata`` block is intentionally excluded from the wire output
+    # (same treatment as ``system``/``stats``/``access``). Only the resolved
+    # scalar/array values land on flat ``properties``.
+    metadata = source.get("metadata")
+    if isinstance(metadata, dict):
+        for _meta_key in ("title", "description", "keywords"):
+            _raw = metadata.get(_meta_key)
+            if _raw is None:
+                continue
+            _resolved = resolve_localized_field(_raw, lang)
+            if _resolved is not None:
+                props.setdefault(_meta_key, _resolved)
 
     out: Dict[str, Any] = {"properties": props}
     if default_type is not None:
