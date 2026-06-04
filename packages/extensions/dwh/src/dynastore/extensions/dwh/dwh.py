@@ -109,7 +109,7 @@ async def execute_bigquery_async(
         raise
     except Exception as e:
         logger.error("BigQuery query failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"BigQuery query error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"BigQuery query error: {str(e)}") from e
 
 
 from dynastore.models.query_builder import QueryRequest, FieldSelection
@@ -150,7 +150,7 @@ class DwhService(ExtensionProtocol):
         except (ValueError, TypeError) as e:
             raise HTTPException(
                 status_code=400, detail=f"Invalid identifier in request: {e}"
-            )
+            ) from e
 
         # 1. Resolve Catalog Provider
         catalogs_provider = get_protocol(CatalogsProtocol)
@@ -369,7 +369,7 @@ class DwhService(ExtensionProtocol):
         except (ValueError, TypeError) as e:
             raise HTTPException(
                 status_code=400, detail=f"Invalid identifier in request: {e}"
-            )
+            ) from e
 
         if format not in ["mvt", "pbf"]:
             raise HTTPException(
@@ -465,7 +465,7 @@ class DwhService(ExtensionProtocol):
             raise HTTPException(
                 status_code=500,
                 detail=f"Could not process CRS for TMS '{req.tiles.tileMatrixSetId}'.",
-            )
+            ) from e
 
         # 6. Get source SRID for collection
         from dynastore.modules.tiles import tiles_module

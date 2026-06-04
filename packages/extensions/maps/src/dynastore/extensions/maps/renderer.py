@@ -131,7 +131,7 @@ def _render_sld_style(
         root = ET.fromstring(sld_body)
     except ET.ParseError as e:
         logger.error(f"Failed to parse SLD XML: {e}")
-        raise ValueError("Invalid SLD XML content.")
+        raise ValueError("Invalid SLD XML content.") from e
 
     ns = {"sld": "http://www.opengis.net/sld", "ogc": "http://www.opengis.net/ogc"}
 

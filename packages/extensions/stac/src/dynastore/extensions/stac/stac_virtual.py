@@ -633,7 +633,7 @@ class StacVirtualMixin(_Host):
             raise HTTPException(
                 status_code=500,
                 detail=f"Invalid HierarchyProviderConfig for {hierarchy_id!r}: {exc}",
-            )
+            ) from exc
 
         ctx = SimpleNamespace(
             conn=conn,
@@ -644,7 +644,7 @@ class StacVirtualMixin(_Host):
         try:
             provider = get_hierarchy_provider(provider_cfg, ctx)
         except LookupError as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         if parent_value:
             page = await provider.children(ctx, parent_value, limit=limit, offset=0)

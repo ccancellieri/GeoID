@@ -523,11 +523,11 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                     request, catalog_id=catalog_id, lang=language
                 )
                 return JSONResponse(content=collections)
-            except AttributeError:
+            except AttributeError as e:
                 raise HTTPException(
                     status_code=501,
                     detail="STAC Collection listing not yet implemented in generator.",
-                )
+                ) from e
 
         # Collection Search path — parse params into CollectionSearchRequest
         parsed_bbox = None
@@ -1057,7 +1057,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             raise
         except ValueError as e:
             logger.error(f"Validation error in add_stac_item: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
         except Exception as e:
             return handle_or_raise(
                 e,

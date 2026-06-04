@@ -261,7 +261,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             raise HTTPException(
                 status_code=500,
                 detail=f"Could not prepare database for catalog '{catalog_id}'.",
-            )
+            ) from exc
 
         created = await mf_db.create_moving_feature(conn, catalog_id, collection_id, mf)
         if not created:
@@ -357,7 +357,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             raise HTTPException(
                 status_code=500,
                 detail=f"Could not prepare database for catalog '{catalog_id}'.",
-            )
+            ) from exc
 
         created = await mf_db.create_temporal_geometry(conn, catalog_id, mf_id, tg)
         if not created:

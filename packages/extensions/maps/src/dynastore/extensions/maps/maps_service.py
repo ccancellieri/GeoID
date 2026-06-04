@@ -348,7 +348,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 target_srid = await tms_manager.resolve_srid(conn=conn, crs_str=tms_def.crs, catalog_id=dataset)
             except Exception as e:
                 logger.error(f"CRS Error: {e}")
-                raise HTTPException(status_code=500, detail=f"Could not process CRS '{tms_def.crs}' in TMS '{tileMatrixSetId}'.")
+                raise HTTPException(status_code=500, detail=f"Could not process CRS '{tms_def.crs}' in TMS '{tileMatrixSetId}'.") from e
 
             # 5. Calculate Bounding Box for the Tile
             # OGC Tiles usually assume TopLeft origin for the matrix
@@ -395,7 +395,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 )
             except ValueError as e:
                 logger.error(f"Render Fetch Error: {e}")
-                raise HTTPException(status_code=400, detail=str(e))
+                raise HTTPException(status_code=400, detail=str(e)) from e
             if layer_config is None or layer_config.geometry_storage is None:
                 raise HTTPException(
                     status_code=404,
@@ -422,7 +422,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             return Response(content=image_bytes, media_type="image/png")
         except Exception as e:
             logger.error(f"Tile Render Failed: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Rendering failed.")
+            raise HTTPException(status_code=500, detail="Rendering failed.") from e
 
     # --- Existing Map Endpoint ---
 
@@ -470,8 +470,8 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
 
         try:
             bbox_list = [float(coord) for coord in bbox.split(',')]
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid BBOX format.")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail="Invalid BBOX format.") from e
 
         # The DB-dependent steps (collection validation, feature fetch, style
         # resolution) run under a single connection that is released before the
@@ -506,7 +506,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 )
             except ValueError as e:
                 logger.error(f"Data Error: {e}")
-                raise HTTPException(status_code=400, detail=str(e))
+                raise HTTPException(status_code=400, detail=str(e)) from e
             if layer_config is None or layer_config.geometry_storage is None:
                 raise HTTPException(
                     status_code=404,
@@ -531,7 +531,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             )
         except Exception as e:
             logger.error(f"Render Error: {e}")
-            raise HTTPException(status_code=500, detail="Failed to render map.")
+            raise HTTPException(status_code=500, detail="Failed to render map.") from e
 
         # Convert PNG to requested format (png passthrough; jpeg/geotiff post-process).
         try:
@@ -542,5 +542,5 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             raise
         except Exception as e:
             logger.error(f"Format conversion error: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Format conversion failed.")
+            raise HTTPException(status_code=500, detail="Format conversion failed.") from e
         return Response(content=out_bytes, media_type=_FORMAT_MEDIA_TYPES[fmt])
