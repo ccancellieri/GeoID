@@ -306,7 +306,7 @@ def test_build_optimized_query(mock_col_config, mock_registry):
     # This calls registry.get_sidecar again for required sidecars
     sql, params = optimizer.build_optimized_query(req, "schema", "table")
 
-    assert "sc_geom.geom as geometry" in sql
+    assert 'sc_geom.geom as "geometry"' in sql
     assert 'FROM "schema"."table" h' in sql
     assert "LEFT JOIN geom_table sc_geom" in sql  # Needed for select
     assert "LEFT JOIN attr_table sc_attr" in sql  # Needed for filter
@@ -692,11 +692,12 @@ def test_star_expansion_skips_sidecar_field_when_explicit_override_present(
     sql, _ = optimizer.build_optimized_query(req, "schema", "table")
 
     # The explicit ST_Transform expression must appear exactly once.
-    # The optimizer renders lowercase "as" aliases.
+    # The optimizer quotes aliases to preserve case (#719).
     sql_lower = sql.lower()
-    geom_occurrences = sql_lower.count(" as geom")
+    # Alias is quoted: as "geom" — search for the quoted form after lowercasing.
+    geom_occurrences = sql_lower.count(' as "geom"')
     assert geom_occurrences == 1, (
-        f"Expected exactly 1 'as geom' in SQL, found {geom_occurrences}.\nSQL:\n{sql}"
+        f'Expected exactly 1 \'as "geom"\' in SQL, found {geom_occurrences}.\nSQL:\n{sql}'
     )
     # Verify it is the ST_Transform variant, not the raw sidecar projection.
     assert "st_transform" in sql_lower, f"Expected ST_Transform in SQL:\n{sql}"
@@ -1222,3 +1223,175 @@ def test_validate_query_sort_defaults_and_optout(mock_col_config, mock_registry)
         QueryRequest(sort=[SortOrder(field="blob", direction="ASC")])
     )
     assert any("blob" in e and "not sortable" in e for e in bad), bad
+
+
+# ---------------------------------------------------------------------------
+# #719 — projection alias quoting (regression for MVT mixed/upper-case fields)
+# ---------------------------------------------------------------------------
+
+
+def test_quote_alias_helper():
+    """``_quote_alias`` must double-quote bare identifiers and be idempotent."""
+    from dynastore.modules.catalog.query_optimizer import _quote_alias
+
+    # Bare lowercase identifier gets quoted.
+    assert _quote_alias("code") == '"code"'
+    # Bare uppercase identifier gets quoted.
+    assert _quote_alias("CODE") == '"CODE"'
+    # Mixed-case identifier gets quoted.
+    assert _quote_alias("ADM0_Name") == '"ADM0_Name"'
+    # Already-quoted alias is returned unchanged (idempotent).
+    assert _quote_alias('"CODE"') == '"CODE"'
+    # Star is never quoted — wildcard must stay bare.
+    assert _quote_alias("*") == "*"
+    # Embedded double-quote is escaped.
+    assert _quote_alias('a"b') == '"a""b"'
+    # Surrounding whitespace is stripped before quoting.
+    assert _quote_alias("  CODE  ") == '"CODE"'
+
+
+def test_build_optimized_query_quotes_upper_case_alias(mock_col_config, mock_registry):
+    """Regression for #719: a FieldSelection with an UPPER-case field (e.g. ``CODE``)
+    must produce ``as "CODE"`` in the generated SQL so that the alias survives
+    Postgres identifier folding.  An unquoted ``as CODE`` is folded to lowercase
+    ``code`` by Postgres, breaking the MVT outer wrapper that selects ``"CODE"``
+    from the inner subquery.
+    """
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.SPATIAL],
+            data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        "LEFT JOIN geom_table sc_geometries ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+
+    mock_attr = MagicMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    # COLUMNAR mode: CODE is a native column; sql_expression already quoted.
+    mock_attr.get_queryable_fields.return_value = {
+        "CODE": FieldDefinition(
+            name="CODE",
+            sql_expression='sc_attributes."CODE"',
+            capabilities=[FieldCapability.FILTERABLE],
+            data_type="string",
+        )
+    }
+    mock_attr.get_join_clause.return_value = (
+        "LEFT JOIN attr_table sc_attributes ON h.geoid = sc_attributes.geoid"
+    )
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom
+        if getattr(sc, "sidecar_type", "") == "geometries"
+        else mock_attr
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    # Non-wildcard path: the optimizer must quote the alias.
+    req = QueryRequest(
+        select=[FieldSelection(field="CODE")],
+        raw_where=None,
+        include_total_count=False,
+    )
+    sql, _ = optimizer.build_optimized_query(req, "schema", "table")
+
+    assert 'as "CODE"' in sql, (
+        f'Expected quoted alias as "CODE" in SQL (got: {sql})'
+    )
+    # The old buggy unquoted form must not appear.
+    assert " as CODE" not in sql.replace('"CODE"', ""), (
+        f'Unquoted alias "as CODE" found in SQL (got: {sql})'
+    )
+
+
+def test_build_optimized_query_quotes_upper_case_alias_star_path(
+    mock_col_config, mock_registry
+):
+    """Regression for #719: the wildcard (``*``) expansion path must also quote
+    the alias for any explicit non-``*`` FieldSelection whose field name is
+    mixed/upper case.
+    """
+    class _SidecarMock(MagicMock):
+        @classmethod
+        def serves_consumers(cls):
+            return None
+
+    mock_geom = _SidecarMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.SPATIAL],
+            data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        "LEFT JOIN geom_table sc_geometries ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+    mock_geom.get_main_geometry_field.return_value = "geom"
+    mock_geom.get_select_fields.return_value = [
+        "ST_AsGeoJSON(sc_geometries.geom)::jsonb as geom"
+    ]
+
+    mock_attr = _SidecarMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {
+        "CODE": FieldDefinition(
+            name="CODE",
+            sql_expression='sc_attributes."CODE"',
+            capabilities=[FieldCapability.FILTERABLE],
+            data_type="string",
+        )
+    }
+    mock_attr.get_join_clause.return_value = (
+        "LEFT JOIN attr_table sc_attributes ON h.geoid = sc_attributes.geoid"
+    )
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.get_main_geometry_field.return_value = None
+    mock_attr.get_select_fields.return_value = []
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom
+        if getattr(sc, "sidecar_type", "") == "geometries"
+        else mock_attr
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    # Wildcard path with an explicit UPPER-case FieldSelection alongside it.
+    req = QueryRequest(
+        select=[
+            FieldSelection(field="CODE"),
+            FieldSelection(field="*"),
+        ],
+        raw_where=None,
+        include_total_count=False,
+    )
+    sql, _ = optimizer.build_optimized_query(req, "schema", "table")
+
+    assert 'as "CODE"' in sql, (
+        f'Expected quoted alias as "CODE" in SQL on the wildcard path (got: {sql})'
+    )

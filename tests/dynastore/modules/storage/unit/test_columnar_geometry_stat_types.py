@@ -201,8 +201,10 @@ def _columnar_centroid_sidecar(centroid_type=None, name=None):
 
 
 def _centroid_select_expr(fields, key="centroid"):
-    matches = [f for f in fields if f.endswith(f" as {key}")]
-    assert matches, f"no projection aliased ' as {key}' in {fields}"
+    # Aliases are quoted to preserve case (#719); accept both the quoted and
+    # bare forms so the helper is future-proof against formatting changes.
+    matches = [f for f in fields if f.endswith(f' as "{key}"') or f.endswith(f" as {key}")]
+    assert matches, f"no projection aliased ' as {key}' (or ' as \"{key}\"') in {fields}"
     return matches[0]
 
 

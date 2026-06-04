@@ -129,8 +129,8 @@ def test_columnar_area_expose_no_duplicate_in_select(real_registry):
     # column name after the dot).
     import re
 
-    # Match explicit aliases: `... as area`
-    explicit_area = re.findall(r"\bas\s+area\b", select_clause)
+    # Match explicit aliases: `... as area` or `... as "area"` (quoted form, see #719)
+    explicit_area = re.findall(r'\bas\s+"?area"?\b', select_clause)
     # Match bare unaliased: `sc_geometries.area` (no following `as`)
     bare_area = re.findall(r"sc_geometries\.area(?!\s+as\b)", select_clause)
 
@@ -168,7 +168,8 @@ def _count_output_columns(sql: str, name: str, table: str = "sc_geometries") -> 
     from_idx = sql_lower.find(" from ")
     assert from_idx != -1, f"No FROM found in SQL:\n{sql}"
     select_clause = sql_lower[:from_idx]
-    explicit = re.findall(rf"\bas\s+{re.escape(name)}\b", select_clause)
+    # Accept both quoted (as "name", see #719) and unquoted (as name) forms.
+    explicit = re.findall(rf'\bas\s+"?{re.escape(name)}"?\b', select_clause)
     bare = re.findall(
         rf"{re.escape(table)}\.{re.escape(name)}(?!\s+as\b)", select_clause
     )

@@ -58,6 +58,23 @@ def _extract_alias(sql_fragment: str) -> str:
     return sql_fragment.rsplit(".", 1)[-1].strip().strip('"')
 
 
+def _quote_alias(alias: str) -> str:
+    """Double-quote a projection alias so Postgres preserves its exact case.
+
+    Unquoted aliases are folded to lowercase by Postgres, which breaks any
+    consumer that references the alias with its declared (mixed/upper) case —
+    e.g. the MVT outer wrapper that selects ``"CODE"`` from the inner subquery.
+    Idempotent: an already-quoted alias is returned unchanged. ``*`` is never
+    quoted. See #719.
+    """
+    a = alias.strip()
+    if a == "*":
+        return a
+    if a.startswith('"') and a.endswith('"'):
+        return a
+    return '"' + a.replace('"', '""') + '"'
+
+
 class QueryOptimizer:
     """Optimizes queries based on sidecar capabilities and requested operations.
 
@@ -707,7 +724,7 @@ class QueryOptimizer:
                         )
                         expr = f"{sel.transformation}({expr}{', ' + args_str if args_str else ''})"
                 alias = sel.alias or sel.field
-                rendered = f"{expr} as {alias}"
+                rendered = f"{expr} as {_quote_alias(alias)}"
                 if rendered not in select_fields:
                     select_fields.append(rendered)
         elif not query.select:
@@ -761,7 +778,7 @@ class QueryOptimizer:
 
                 # Apply alias
                 alias = sel.alias or sel.field
-                select_fields.append(f"{expr} as {alias}")
+                select_fields.append(f"{expr} as {_quote_alias(alias)}")
 
         if query.raw_selects:
             select_fields.extend(query.raw_selects)

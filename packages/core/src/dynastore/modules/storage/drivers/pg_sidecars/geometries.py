@@ -77,6 +77,19 @@ _SIMPLIFY_SQL_FUNCTIONS: Dict[str, str] = {
 _DEFAULT_SIMPLIFY_SQL_FUNCTION = "ST_SimplifyPreserveTopology"
 
 
+def _quote_ident(name: str) -> str:
+    """Double-quote a SQL identifier so Postgres preserves its exact case.
+
+    Unquoted identifiers are folded to lowercase by Postgres, which breaks
+    consumers that reference the column by its original mixed/upper-case name.
+    Idempotent: an already-quoted name is returned unchanged. See #719.
+    """
+    n = name.strip()
+    if n.startswith('"') and n.endswith('"'):
+        return n
+    return '"' + n.replace('"', '""') + '"'
+
+
 # ============================================================================
 # IMPLEMENTATION
 # ============================================================================
@@ -212,7 +225,7 @@ class GeometriesSidecar(SidecarProtocol):
             coords = f"{coords}, ST_Z({col})"
         return (
             f"CASE WHEN {col} IS NULL THEN NULL "
-            f"ELSE ARRAY[{coords}] END as {field.resolved_name}"
+            f"ELSE ARRAY[{coords}] END as {_quote_ident(field.resolved_name)}"
         )
 
     @property
@@ -822,7 +835,7 @@ class GeometriesSidecar(SidecarProtocol):
                 if f.kind == ComputedKind.CENTROID:
                     fields.append(self._centroid_select_field(f, alias))
                 else:
-                    fields.append(f"{alias}.{key} as {key}")
+                    fields.append(f"{alias}.{key} as {_quote_ident(key)}")
             if self._has_jsonb_stats() and (
                 "geom_stats" in all_needed or "*" in requested
             ):
@@ -851,7 +864,7 @@ class GeometriesSidecar(SidecarProtocol):
                 if f.kind == ComputedKind.CENTROID:
                     fields.append(self._centroid_select_field(f, alias))
                 else:
-                    fields.append(f"{alias}.{key} as {key}")
+                    fields.append(f"{alias}.{key} as {_quote_ident(key)}")
             if self._has_jsonb_stats():
                 fields.append(f"{alias}.geom_stats as geom_stats")
 
