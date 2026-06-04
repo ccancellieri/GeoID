@@ -4,14 +4,31 @@ UPSERT keyed on the (service, task_key) PK. The only per-tick write in steady
 state is the cheap last_seen heartbeat. The build-keyed publish digest is NOT
 stored here — the publisher gates the structural UPSERT with the shared
 ``@cached`` decorator (tools/cache.py), so no bespoke digest store exists.
+
+Driver-agnostic IO
+------------------
+Every statement runs through ``managed_transaction`` + ``DQLQuery`` rather than
+raw ``engine.begin()`` / ``engine.connect()``. The registry heartbeat publishes
+from *every* pod — including background **job** processes that reach Postgres via
+the datastore module's **sync** driver. ``managed_transaction`` accepts both an
+async server engine (asyncpg) and a sync ``Engine``, and the ``DQLQuery``
+executor drives either connection kind. ``async with engine.begin()`` was
+async-only: under a job's sync engine ``engine.begin()`` returns a *sync*
+``contextlib._GeneratorContextManager``, so ``async with`` raised
+``'... does not support the asynchronous context manager protocol'`` and dropped
+every heartbeat (stale ``last_seen`` → live owners look dead to the routing /
+mandatory-ownership check).
 """
 from __future__ import annotations
 
 import json
 from typing import List
 
-from sqlalchemy import text
-
+from dynastore.modules.db_config.query_executor import (
+    DQLQuery,
+    ResultHandler,
+    managed_transaction,
+)
 from dynastore.modules.tasks.registry.model import (
     TASK_CAPABILITY_REGISTRY_TABLE,
     CapabilityRow,
@@ -71,8 +88,8 @@ WHERE last_seen > now() - make_interval(secs => :ttl_grace_seconds)
 
 
 def _coerce_payload_schema(d: dict) -> dict:
-    """asyncpg may hand back jsonb as a JSON string under a raw text() query;
-    decode it to a dict so callers get structured data. Pass dicts/None through."""
+    """asyncpg may hand back jsonb as a JSON string under a raw query; decode it
+    to a dict so callers get structured data. Pass dicts/None through."""
     ps = d.get("payload_schema")
     if isinstance(ps, str):
         try:
@@ -85,46 +102,43 @@ def _coerce_payload_schema(d: dict) -> dict:
 async def upsert_rows(engine, rows: List[CapabilityRow]) -> int:
     if not rows:
         return 0
-    # JSON-encode the dict for the jsonb bind: asyncpg won't auto-encode a Python
-    # dict for a CAST(... AS jsonb) text() bind, so serialize it ourselves.
-    params = []
-    for r in rows:
-        p = r.model_dump()
-        ps = p.get("payload_schema")
-        p["payload_schema"] = json.dumps(ps) if ps is not None else None
-        params.append(p)
-    async with engine.begin() as conn:
-        await conn.execute(text(_UPSERT_SQL), params)
+    async with managed_transaction(engine) as conn:
+        for r in rows:
+            # JSON-encode the dict for the jsonb bind: the CAST(:payload_schema
+            # AS jsonb) text bind won't auto-encode a Python dict, so serialize
+            # it ourselves. One UPSERT per row keeps the path driver-agnostic
+            # (no executemany); this runs ~once per deploy (digest-gated).
+            p = r.model_dump()
+            ps = p.get("payload_schema")
+            p["payload_schema"] = json.dumps(ps) if ps is not None else None
+            await DQLQuery(_UPSERT_SQL, result_handler=ResultHandler.NONE).execute(conn, **p)
     return len(rows)
 
 
 async def heartbeat(engine, service: str) -> None:
-    async with engine.begin() as conn:
-        await conn.execute(text(_HEARTBEAT_SQL), {"service": service})
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(_HEARTBEAT_SQL, result_handler=ResultHandler.NONE).execute(
+            conn, service=service,
+        )
 
 
 async def list_all(engine) -> List[dict]:
-    async with engine.connect() as conn:
-        result = await conn.execute(text(_LIST_SQL))
-        return [_coerce_payload_schema(dict(row._mapping)) for row in result]
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(_LIST_SQL, result_handler=ResultHandler.ALL_DICTS).execute(conn)
+    return [_coerce_payload_schema(dict(r)) for r in rows]
 
 
 async def live_owners_for(engine, task_key: str, ttl_grace_seconds: float) -> List[dict]:
-    async with engine.connect() as conn:
-        result = await conn.execute(
-            text(_LIVE_OWNERS_SQL),
-            {"task_key": task_key, "ttl_grace_seconds": ttl_grace_seconds},
-        )
-        return [dict(row._mapping) for row in result]
+    async with managed_transaction(engine) as conn:
+        return await live_owners_for_conn(conn, task_key, ttl_grace_seconds)
 
 
 async def live_owners_for_conn(conn, task_key: str, ttl_grace_seconds: float) -> List[dict]:
     """Same as ``live_owners_for`` but uses a caller-supplied connection."""
-    result = await conn.execute(
-        text(_LIVE_OWNERS_SQL),
-        {"task_key": task_key, "ttl_grace_seconds": ttl_grace_seconds},
+    rows = await DQLQuery(_LIVE_OWNERS_SQL, result_handler=ResultHandler.ALL_DICTS).execute(
+        conn, task_key=task_key, ttl_grace_seconds=ttl_grace_seconds,
     )
-    return [dict(row._mapping) for row in result]
+    return [dict(r) for r in rows]
 
 
 async def live_owners_all(engine, ttl_grace_seconds: float) -> dict:
@@ -133,19 +147,18 @@ async def live_owners_all(engine, ttl_grace_seconds: float) -> dict:
     Returns a ``{task_key: [row, ...]}`` dict; every row has the same
     shape as ``live_owners_for`` (service, affinity_tier, last_seen).
     """
-    async with engine.connect() as conn:
+    async with managed_transaction(engine) as conn:
         return await live_owners_all_conn(conn, ttl_grace_seconds)
 
 
 async def live_owners_all_conn(conn, ttl_grace_seconds: float) -> dict:
     """Same as ``live_owners_all`` but uses a caller-supplied connection."""
-    result = await conn.execute(
-        text(_LIVE_OWNERS_ALL_SQL),
-        {"ttl_grace_seconds": ttl_grace_seconds},
+    rows = await DQLQuery(_LIVE_OWNERS_ALL_SQL, result_handler=ResultHandler.ALL_DICTS).execute(
+        conn, ttl_grace_seconds=ttl_grace_seconds,
     )
     grouped: dict = {}
-    for row in result:
-        d = dict(row._mapping)
+    for row in rows:
+        d = dict(row)
         key = d.pop("task_key")
         grouped.setdefault(key, []).append(d)
     return grouped
