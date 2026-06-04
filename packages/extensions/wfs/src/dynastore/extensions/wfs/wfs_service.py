@@ -268,22 +268,16 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
         catalogs_with_collections = {}
 
         catalogs_svc = await self._get_catalogs_service()
-        configs_svc = await self._get_configs_service()
 
         # Phase 1.6: collection_type was hoisted out of ItemsPostgresqlDriverConfig
-        # into its own CollectionInfo PluginConfig. Fetch from configs_svc instead
-        # of reading driver config (which no longer exposes the attribute).
-        from dynastore.modules.catalog.catalog_config import (
-            CollectionInfo, CollectionKind,
-        )
+        # into its own CollectionInfo PluginConfig. Kind classification is the
+        # shared OGCServiceMixin helper, which reads that SSOT and fails open to
+        # VECTOR on a missing config — matching the pre-Phase-1.6 "no driver
+        # config → include" path.
+        from dynastore.modules.catalog.catalog_config import CollectionKind
 
         async def _is_vector(cat_id: str, coll_id: str) -> bool:
-            ct = await configs_svc.get_config(
-                CollectionInfo, catalog_id=cat_id, collection_id=coll_id,
-            ) if configs_svc else None
-            # Default per CollectionInfo.kind = VECTOR — missing config means
-            # vector, matching the pre-Phase-1.6 "no driver config → include" path.
-            return ct is None or ct.kind == CollectionKind.VECTOR
+            return await self._collection_kind(cat_id, coll_id) == CollectionKind.VECTOR
 
         if catalog_id:
             # Scoped request: only fetch collections for the specified catalog.

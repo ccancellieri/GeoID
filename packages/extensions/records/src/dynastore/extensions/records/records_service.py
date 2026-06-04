@@ -193,14 +193,18 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
 
         root_url = get_root_url(request)
 
-        # Filter to RECORDS-type collections
+        # Filter to RECORDS-kind collections via the CollectionInfo SSOT
+        # (shared OGCServiceMixin helper; sequential awaits — see its docstring).
+        from dynastore.modules.catalog.catalog_config import CollectionKind
+
         records_collections = []
-        for coll in all_collections:
-            if await self._is_records_collection(catalog_id, coll):
-                localized, _ = coll.localize(language) if hasattr(coll, "localize") else (coll, language)
-                records_collections.append(
-                    gen.collection_to_records_collection(localized, catalog_id, root_url)
-                )
+        for coll in await self._filter_collections_by_kind(
+            catalog_id, all_collections, CollectionKind.RECORDS
+        ):
+            localized, _ = coll.localize(language) if hasattr(coll, "localize") else (coll, language)
+            records_collections.append(
+                gen.collection_to_records_collection(localized, catalog_id, root_url)
+            )
 
         links = [
             Link(href=str(request.url), rel="self", type="application/json"),
@@ -608,16 +612,17 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     async def _is_records_collection(
         self, catalog_id: str, collection: Any
     ) -> bool:
-        """Check if a collection is of RECORDS type via its driver config."""
-        from dynastore.modules.storage.router import get_driver
-        from dynastore.modules.storage.routing_config import Operation
+        """Check if a collection is RECORDS-kind via its ``CollectionInfo``.
+
+        Delegates to :meth:`OGCServiceMixin._collection_kind`, the single
+        source of truth since Phase 1.6 moved ``collection_type`` off the PG
+        driver config onto the ``CollectionInfo`` plugin config.  Reading the
+        kind off the driver config (the previous approach) silently returned
+        the ``VECTOR`` default, hiding every RECORDS collection.
+        """
+        from dynastore.modules.catalog.catalog_config import CollectionKind
 
         coll_id = collection.id if hasattr(collection, "id") else collection.get("id")
         if not coll_id:
             return False
-        try:
-            driver = await get_driver(Operation.READ, catalog_id, coll_id)
-            config = await driver.get_driver_config(catalog_id, coll_id)
-            return getattr(config, "collection_type", "VECTOR") == "RECORDS"
-        except Exception:
-            return False
+        return await self._collection_kind(catalog_id, coll_id) == CollectionKind.RECORDS

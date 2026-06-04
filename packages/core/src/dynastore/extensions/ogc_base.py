@@ -34,7 +34,7 @@ Usage::
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional, Tuple, Type, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, cast
 
 from fastapi import HTTPException, Request, Response, status
 
@@ -56,6 +56,7 @@ from dynastore.models.shared_models import Link
 from dynastore.tools.discovery import get_protocol
 
 if TYPE_CHECKING:
+    from dynastore.modules.catalog.catalog_config import CollectionKind
     from dynastore.modules.db_config.plugin_config import PluginConfig
 
 logger = logging.getLogger(__name__)
@@ -254,6 +255,63 @@ class OGCServiceMixin:
         if hasattr(first, "model_dump"):
             return first.model_dump(by_alias=True, exclude_none=True)
         return dict(first)
+
+    # ------------------------------------------------------------------
+    # Collection-kind classification (Phase-1.6 ``CollectionInfo`` SSOT)
+    # ------------------------------------------------------------------
+
+    async def _collection_kind(
+        self, catalog_id: str, collection_id: str
+    ) -> "CollectionKind":
+        """Resolve a collection's semantic kind from its ``CollectionInfo``.
+
+        ``CollectionInfo.kind`` is the single source of truth for collection
+        kind since Phase 1.6 hoisted ``collection_type`` off the per-driver
+        config — it was removed from ``ItemsPostgresqlDriverConfig`` entirely.
+        Reading the kind off a driver config now silently yields the default
+        ``VECTOR`` (the latent misclassification this consolidation removes);
+        the kind is a property of the DATA, not of one storage backend.
+
+        A missing config, unavailable configs service, or read error all fall
+        back to the model default ``VECTOR`` (via :meth:`_get_plugin_config`),
+        matching the fail-open contract WFS relied on (no config → vector).
+        """
+        from dynastore.modules.catalog.catalog_config import (
+            CollectionInfo,
+            CollectionKind,
+        )
+
+        info = await self._get_plugin_config(
+            CollectionInfo, catalog_id, collection_id
+        )
+        return info.kind if info is not None else CollectionKind.VECTOR
+
+    async def _filter_collections_by_kind(
+        self,
+        catalog_id: str,
+        collections: Iterable[Any],
+        kind: "CollectionKind",
+    ) -> List[Any]:
+        """Return the subset of ``collections`` whose kind equals ``kind``.
+
+        Each collection's kind is resolved via :meth:`_collection_kind`.
+        Awaits are sequential (never ``gather``): the underlying config reads
+        may share the request's asyncpg connection, and concurrent statements
+        on a single connection deadlock asyncpg's one-stream protocol.
+        Collections without a resolvable ``id`` are skipped.
+        """
+        matched: List[Any] = []
+        for coll in collections:
+            coll_id = (
+                coll.id if hasattr(coll, "id")
+                else coll.get("id") if isinstance(coll, dict)
+                else None
+            )
+            if not coll_id:
+                continue
+            if await self._collection_kind(catalog_id, coll_id) == kind:
+                matched.append(coll)
+        return matched
 
     # ------------------------------------------------------------------
     # Fail-fast catalog-readiness guard
