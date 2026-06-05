@@ -41,11 +41,20 @@ logger = logging.getLogger(__name__)
 
 _client: Optional[AsyncOpenSearch] = None
 _index_prefix: str = "dynastore"
+# Tri-state: None = not yet probed, True/False = detected at init() from the
+# cluster's info() distribution. Drives the flattened→flat_object mapping shim.
+_is_opensearch: Optional[bool] = None
 
 
 def get_client() -> Optional[AsyncOpenSearch]:
     """Return the shared async client instance, or None if not initialized."""
     return _client
+
+
+def is_opensearch_backend() -> bool:
+    """True when the connected cluster reported the OpenSearch distribution at
+    init(). False before init() or against Elasticsearch."""
+    return bool(_is_opensearch)
 
 
 def get_index_prefix() -> str:
@@ -108,7 +117,7 @@ async def init(index_prefix: Optional[str] = None) -> None:
     cluster name and version are logged at INFO.  On failure a WARNING is emitted
     and startup continues — ES is optional; callers handle missing connectivity.
     """
-    global _client, _index_prefix
+    global _client, _index_prefix, _is_opensearch
     _index_prefix = index_prefix or os.environ.get("ES_INDEX_PREFIX", "dynastore")
     cfg = await load_client_config()
     _client = _build_client(cfg)
@@ -124,10 +133,21 @@ async def init(index_prefix: Optional[str] = None) -> None:
         info = await _client.info()
         cluster = info.get("cluster_name", "unknown")
         version = info.get("version", {}).get("number", "unknown")
+        # Detect the server dialect and, on OpenSearch, install the
+        # flattened→flat_object mapping shim so index-create paths that declare
+        # the ES-only ``flattened`` type don't 400 (see _backend_compat).
+        from dynastore.modules.elasticsearch._backend_compat import (
+            install_opensearch_mapping_shim,
+            is_opensearch_distribution,
+        )
+        _is_opensearch = is_opensearch_distribution(info)
+        if _is_opensearch:
+            install_opensearch_mapping_shim(_client)
         logger.info(
-            "Connected: cluster=%r version=%s host=%s:%s prefix=%r ssl=%s",
+            "Connected: cluster=%r version=%s opensearch=%s host=%s:%s prefix=%r ssl=%s",
             cluster,
             version,
+            _is_opensearch,
             host,
             port,
             _index_prefix,
