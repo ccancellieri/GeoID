@@ -395,6 +395,31 @@ def test_underscore_properties_are_stripped():
     assert doc["properties"] == {"name": "keep"}
 
 
+def test_system_field_keys_excluded_from_properties():
+    """SYSTEM_FIELD_KEYS (external_id, geoid, validity, geometry_hash, …)
+    must NOT appear inside ``properties`` even when they are not ``_``-prefixed.
+    They belong in the identity / system containers, not the user-attrs lane
+    (refs #1828)."""
+    from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
+    # Inject a selection of SYSTEM_FIELD_KEYS into properties.
+    polluted_props = {
+        "name": "keep",
+        "geoid": "should-be-excluded",
+        "external_id": "should-be-excluded",
+        "validity": "should-be-excluded",
+        "geometry_hash": "should-be-excluded",
+        "attributes_hash": "should-be-excluded",
+    }
+    item = {"id": "geo-sys", "properties": polluted_props}
+    doc = build_envelope_feature_doc(item, catalog_id="cat", collection_id="col")
+    props = doc.get("properties", {})
+    assert props.get("name") == "keep"
+    for key in SYSTEM_FIELD_KEYS:
+        assert key not in props, (
+            f"SYSTEM_FIELD_KEY '{key}' leaked into envelope properties: {props}"
+        )
+
+
 def test_identity_fields_stamped():
     item = {"id": "geo-9", "_external_id": "ext-1", "_asset_id": "as-1", "properties": {}}
     doc = build_envelope_feature_doc(item, catalog_id="cat", collection_id="col")
@@ -540,3 +565,96 @@ def test_query_access_clause_ands_with_es_filter():
     assert _es_clause_admits(
         query, {"owner": "bob", "properties.kind": "field"},
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# CanonicalIndexInput fast path (#1828)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStatsSidecar:
+    def producible_computed_names(self):
+        return {"area"}
+
+    def resolve_computed_value(self, row, name):
+        return (True, 99.5) if name == "area" else (False, None)
+
+
+def _make_canonical_input():
+    from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+    row = {
+        "geoid": "geo-ci-1",
+        "external_id": "ext-ci",
+        "geometry_hash": "ghash-ci",
+        "validity": "[2024-01-01,)",
+    }
+    return CanonicalIndexInput(
+        row=row,
+        resolved_sidecars=[_FakeStatsSidecar()],
+        geometry={"type": "Point", "coordinates": [10.0, 20.0]},
+        bbox=[10.0, 20.0, 10.0, 20.0],
+        user_properties={"kind": "station"},
+        access=None,
+    )
+
+
+def test_canonical_input_fast_path_identity():
+    """CanonicalIndexInput fast path sets geoid at root for read back-compat."""
+    ci = _make_canonical_input()
+    doc = build_envelope_feature_doc(
+        ci, catalog_id="cat", collection_id="col",
+        visibility="public", owner="alice",
+    )
+    # Envelope read uses ``geoid`` at root.
+    assert doc.get("geoid") == "geo-ci-1"
+    assert doc.get("catalog_id") == "cat"
+    assert doc.get("collection_id") == "col"
+
+
+def test_canonical_input_fast_path_access_fields():
+    """Access fields are overlaid at root from explicit args on CanonicalIndexInput."""
+    ci = _make_canonical_input()
+    doc = build_envelope_feature_doc(
+        ci, catalog_id="cat", collection_id="col",
+        visibility="restricted", owner="bob",
+    )
+    assert doc.get("visibility") == "restricted"
+    assert doc.get("owner") == "bob"
+
+
+def test_canonical_input_fast_path_user_props_in_properties():
+    """User properties must appear under ``properties`` on the fast path."""
+    ci = _make_canonical_input()
+    doc = build_envelope_feature_doc(ci, catalog_id="cat", collection_id="col")
+    assert doc.get("properties", {}).get("kind") == "station"
+
+
+def test_canonical_input_fast_path_stats_populated():
+    """Stats section is populated from sidecars on the CanonicalIndexInput path."""
+    ci = _make_canonical_input()
+    doc = build_envelope_feature_doc(ci, catalog_id="cat", collection_id="col")
+    assert doc.get("stats", {}).get("area") == 99.5
+
+
+def test_canonical_input_fast_path_system_field_keys_not_in_properties():
+    """SYSTEM_FIELD_KEYS must not appear in ``properties`` on the canonical path."""
+    from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
+    ci = _make_canonical_input()
+    doc = build_envelope_feature_doc(ci, catalog_id="cat", collection_id="col")
+    props = doc.get("properties", {})
+    for key in SYSTEM_FIELD_KEYS:
+        assert key not in props, (
+            f"SYSTEM_FIELD_KEY '{key}' leaked into envelope properties via canonical path"
+        )
+
+
+def test_canonical_input_access_fields_not_in_properties():
+    """ABAC fields (visibility/owner/attrs) must be at root, never in properties."""
+    ci = _make_canonical_input()
+    doc = build_envelope_feature_doc(
+        ci, catalog_id="cat", collection_id="col",
+        visibility="public", owner="alice",
+    )
+    props = doc.get("properties", {})
+    assert "visibility" not in props
+    assert "owner" not in props

@@ -25,15 +25,64 @@ top-level fields so the row-level access filter can match on them reliably.
 The doc shape aligns with the canonical envelope (#1285/#1800/#1828):
 - flat identity + access ABAC fields at root (``visibility``/``owner``/``attrs``)
 - ``geometry`` / ``bbox`` as GeoJSON reserved members
-- ``properties`` sub-tree (dynamic)
+- ``properties`` sub-tree (dynamic — only user attrs; SYSTEM_FIELD_KEYS and
+  ``_``-prefixed internal keys are excluded so they never leak into properties)
 - ``system`` container for lifecycle/simplification metadata
   (``geometry_simplification`` lives here, not at root)
 - ``metadata`` container for multilingual descriptive metadata (optional)
+
+``CanonicalIndexInput`` fast path: when the caller already has the PG-fetched
+canonical input (e.g. the IndexDispatcher passing a pre-built payload), the
+identity / properties / system / stats sections are assembled via
+:func:`~dynastore.modules.elasticsearch.canonical_doc.build_canonical_index_doc`
+and the access fields are overlaid on top.  Stats/system sections are populated
+with real sidecar values on this path; they are empty when the caller provides
+only a Feature/dict.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+
+# SYSTEM_FIELD_KEYS that live in the canonical ``system`` / identity containers
+# and must NEVER appear inside ``properties`` on any envelope doc.
+# Imported lazily to avoid a circular import risk at module level.
+_SYSTEM_KEYS_CACHE: "frozenset[str] | None" = None
+
+
+def _get_system_keys() -> "frozenset[str]":
+    global _SYSTEM_KEYS_CACHE
+    if _SYSTEM_KEYS_CACHE is None:
+        from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
+        _SYSTEM_KEYS_CACHE = frozenset(SYSTEM_FIELD_KEYS)
+    return _SYSTEM_KEYS_CACHE
+
+
+def _overlay_access_fields(
+    doc: Dict[str, Any],
+    *,
+    src: Dict[str, Any],
+    visibility: Any,
+    owner: Any,
+    attrs: Any,
+) -> None:
+    """Stamp ABAC root fields onto ``doc`` in-place.
+
+    Each field falls back to a dispatcher-stamped ``_``-prefixed source key.
+    The fields are typed root keywords so row-level filter predicates can
+    match them reliably — they must NOT be inside the ``access`` container.
+    """
+    vis = visibility if visibility is not None else src.get("_visibility")
+    if vis is not None:
+        doc["visibility"] = str(vis)
+
+    own = owner if owner is not None else src.get("_owner")
+    if own is not None:
+        doc["owner"] = str(own)
+
+    raw_attrs = attrs if attrs is not None else src.get("_attrs")
+    if isinstance(raw_attrs, dict) and raw_attrs:
+        doc["attrs"] = raw_attrs
 
 
 def build_envelope_feature_doc(
@@ -51,11 +100,25 @@ def build_envelope_feature_doc(
 ) -> Dict[str, Any]:
     """Build an ``ENVELOPE_FEATURE_MAPPING``-shaped doc from a Feature/dict.
 
-    Accepts a Feature pydantic model, a STAC item dict, or a GeoJSON Feature
-    dict. Pulls ``geoid`` from the item's ``id``, ``geometry`` and ``bbox``
-    from the GeoJSON shape, and copies any non-internal ``properties`` (keys
-    starting with ``_`` are skipped — those are internal tracking fields like
-    ``_external_id``).
+    Accepts:
+
+    * A :class:`~dynastore.modules.catalog.canonical_index_read.CanonicalIndexInput`
+      instance — the preferred path when the caller already has a batched PG
+      read result.  Delegates to
+      :func:`~dynastore.modules.elasticsearch.canonical_doc.build_canonical_index_doc`
+      for the base (identity / properties / system / stats) then overlays the
+      ABAC access fields at root.
+
+    * A Feature pydantic model, a STAC item dict, or a GeoJSON Feature dict —
+      extracts identity / geometry / properties and assembles the envelope doc
+      directly.
+
+    Pulls ``geoid`` from the item's ``id`` / ``geoid``, ``geometry`` and
+    ``bbox`` from the GeoJSON shape.  ``properties`` is cleaned: keys starting
+    with ``_`` (internal tracking fields like ``_external_id``) and keys in
+    :data:`SYSTEM_FIELD_KEYS` (lifecycle fields like ``external_id``,
+    ``validity``, ``geometry_hash``) are excluded so they never leak into the
+    ``properties`` container (refs #1828).
 
     Identity and access fields are projected as typed top-level fields.  Each
     falls back to a dispatcher-stamped ``_``-prefixed source key:
@@ -82,8 +145,68 @@ def build_envelope_feature_doc(
     (``{"terms": {"visibility": [...]}}``). Moving them would silently break
     every compiled AccessFilter clause.
     """
+    # --- CanonicalIndexInput fast path -----------------------------------
+    # When the caller already has the PG-fetched canonical input, build the
+    # canonical base (identity / user-properties / system / stats) via the
+    # shared SSOT then overlay the envelope-specific access fields at root.
+    #
+    # ``build_canonical_index_doc`` calls ``project_item_for_es(doc, {})``
+    # which routes all user properties to ``properties.extras`` when
+    # ``known_fields`` is empty (the no-known-fields = extras-everything
+    # contract).  The envelope mapping uses ``dynamic:True`` on
+    # ``properties``, so the read path (``_envelope_source_to_feature``)
+    # reads ``source["properties"]`` flat — it does not hoist from
+    # ``extras``.  We therefore hoist ``properties.extras`` back to flat
+    # ``properties`` after the canonical build, matching the envelope's
+    # dynamic-properties semantics while still using the shared SSOT for
+    # identity / system / stats assembly.
+    try:
+        from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+        if isinstance(item, CanonicalIndexInput):
+            from dynastore.modules.elasticsearch.canonical_doc import build_canonical_index_doc
+            doc = build_canonical_index_doc(
+                item.row,
+                resolved_sidecars=item.resolved_sidecars,
+                known_fields={},  # envelope uses dynamic properties; extras hoisted below
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                geometry=item.geometry,
+                bbox=item.bbox,
+                user_properties=item.user_properties,
+                access=item.access,
+            )
+            # Hoist ``properties.extras`` back to flat ``properties`` so the
+            # envelope read path finds user attrs at ``properties.<key>``
+            # (the read does not hoist from extras).  A flat key already
+            # present wins over the extras value (more specific wins).
+            inner_props = doc.get("properties")
+            if isinstance(inner_props, dict):
+                extras = inner_props.pop("extras", None)
+                if isinstance(extras, dict):
+                    for k, v in extras.items():
+                        inner_props.setdefault(k, v)
+                # Remove _search_text injected by project_item_for_es for the
+                # extras we just un-nested; the envelope mapping does not need
+                # it (properties is dynamic:True, full-text is not used there).
+                doc.pop("_search_text", None)
+            # Canonical sets ``id``=geoid; envelope read path uses ``geoid`` at root.
+            geoid = doc.get("id")
+            if geoid and "geoid" not in doc:
+                doc["geoid"] = geoid
+            # Overlay access fields from caller args or dispatcher-stamped row keys.
+            raw_src: Dict[str, Any] = item.row or {}
+            _overlay_access_fields(doc, src=raw_src, visibility=visibility, owner=owner, attrs=attrs)
+            if system:
+                doc.setdefault("system", {}).update(system)
+            if metadata:
+                doc["metadata"] = dict(metadata)
+            return doc
+    except ImportError:
+        pass
+
+    # --- Feature / dict path -------------------------------------------
     if hasattr(item, "model_dump"):
-        src = item.model_dump(by_alias=True, exclude_none=True)
+        src: Dict[str, Any] = item.model_dump(by_alias=True, exclude_none=True)
     elif isinstance(item, dict):
         src = item
     else:
@@ -91,9 +214,16 @@ def build_envelope_feature_doc(
 
     geoid = src.get("id") or src.get("geoid")
     raw_props = src.get("properties") or {}
-    props = {k: v for k, v in raw_props.items() if not str(k).startswith("_")}
+    _sys_keys = _get_system_keys()
+    # Exclude both ``_``-prefixed internal tracking keys and SYSTEM_FIELD_KEYS
+    # (e.g. ``external_id``, ``validity``, ``geometry_hash``) so they never
+    # pollute the ``properties`` container (refs #1828).
+    props = {
+        k: v for k, v in raw_props.items()
+        if not str(k).startswith("_") and k not in _sys_keys
+    }
 
-    doc: Dict[str, Any] = {
+    doc = {
         "geoid": geoid,
         "catalog_id": catalog_id,
         "collection_id": collection_id,
@@ -107,18 +237,7 @@ def build_envelope_feature_doc(
     if aid is not None:
         doc["asset_id"] = str(aid)
 
-    vis = visibility if visibility is not None else src.get("_visibility")
-    if vis is not None:
-        doc["visibility"] = str(vis)
-
-    own = owner if owner is not None else src.get("_owner")
-    if own is not None:
-        doc["owner"] = str(own)
-
-    # ABAC attribute dict — propagated verbatim from ``_attrs``.
-    raw_attrs = attrs if attrs is not None else src.get("_attrs")
-    if isinstance(raw_attrs, dict) and raw_attrs:
-        doc["attrs"] = raw_attrs
+    _overlay_access_fields(doc, src=src, visibility=visibility, owner=owner, attrs=attrs)
 
     geom = src.get("geometry")
     if geom is not None:
