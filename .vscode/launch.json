@@ -22,22 +22,6 @@
       "justMyCode": false
     },
     {
-      "name": "GeoID Worker: Remote Attach",
-      "type": "debugpy",
-      "request": "attach",
-      "connect": {
-        "host": "localhost",
-        "port": 5679
-      },
-      "pathMappings": [
-        {
-          "localRoot": "${workspaceFolder}",
-          "remoteRoot": "/dynastore"
-        }
-      ],
-      "justMyCode": false
-    },
-    {
       "name": "GeoID Tools: Remote Attach",
       "type": "debugpy",
       "request": "attach",
@@ -60,22 +44,6 @@
       "connect": {
         "host": "localhost",
         "port": 5681
-      },
-      "pathMappings": [
-        {
-          "localRoot": "${workspaceFolder}",
-          "remoteRoot": "/dynastore"
-        }
-      ],
-      "justMyCode": false
-    },
-    {
-      "name": "GeoID Auth: Remote Attach",
-      "type": "debugpy",
-      "request": "attach",
-      "connect": {
-        "host": "localhost",
-        "port": 5682
       },
       "pathMappings": [
         {

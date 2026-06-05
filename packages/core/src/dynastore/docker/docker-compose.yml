@@ -32,12 +32,18 @@ services:
     networks:
       - dynastore_net
 
+  # On-prem fat node: ONE process that is catalog + geoid (gateway, auth/IAM,
+  # UI) + worker (every task & process run in-process via the background
+  # runner). Built from scope_onprem (= scope_geoid ∪ scope_worker) and routed
+  # by DYNASTORE_TASK_ROUTING_PRESET=onprem. Cloud is unchanged — it keeps the
+  # split scope_catalog / scope_geoid / scope_worker services, deployed via
+  # Cloud Run (deploy.yml), not this compose file.
   catalog:
     build:
       context: ../../../../..
       dockerfile: packages/core/src/dynastore/docker/Dockerfile
       args:
-        SCOPE: ${CATALOG_SCOPE:-scope_catalog}
+        SCOPE: ${CATALOG_SCOPE:-scope_onprem}
         BUILD_JUPYTERLITE: "true"
     container_name: geoid_catalog
     restart: always
@@ -47,16 +53,27 @@ services:
       - path: .env.local
         required: false
     environment:
-      SCOPE: ${CATALOG_SCOPE:-scope_catalog}
+      SCOPE: ${CATALOG_SCOPE:-scope_onprem}
       TCP_PORT: 80
       UVICORN_WORKERS: 4
       # On-prem PG budget (default max_connections=100):
-      #   catalog 30 + geoid 10 + worker 15 + tools 10 + maps 10 = 75 < 100
+      #   catalog (fat: gateway+worker) 40 + tools 10 + maps 10 = 60 < 100
       DB_POOL_MIN_SIZE: "5"
-      DB_POOL_MAX_SIZE: "30"
+      DB_POOL_MAX_SIZE: "40"
       DB_CONNECT_TIMEOUT: "30"
       ERROR_LOG: /dynastore/logs/error.log
       VALKEY_URL: valkey://valkey:6379
+      # Run every task/process in-process on its affinity tier (no Cloud Run,
+      # no dedicated worker tier).
+      DYNASTORE_TASK_ROUTING_PRESET: onprem
+      # Gateway responsibilities inherited from the (now folded-in) geoid
+      # service: embedded logs dashboard proxied at /dashboards. For prod
+      # against Elastic Cloud, set KIBANA_UPSTREAM_URL to the managed Kibana
+      # endpoint (no /dashboards suffix) and provide KIBANA_UPSTREAM_API_KEY
+      # via Secret Manager.
+      KIBANA_UPSTREAM_URL: ${KIBANA_UPSTREAM_URL:-http://kibana:5601/dashboards}
+      KIBANA_UPSTREAM_API_KEY: ${KIBANA_UPSTREAM_API_KEY:-}
+      KIBANA_PUBLIC_PATH: ${KIBANA_PUBLIC_PATH:-/dashboards}
     ports:
       - "${HOST_PORT_CATALOG:-80}:80"
     volumes:
@@ -64,83 +81,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      valkey:
+      elasticsearch:
         condition: service_healthy
-    networks:
-      - dynastore_net
-
-  geoid:
-    build:
-      context: ../../../../..
-      dockerfile: packages/core/src/dynastore/docker/Dockerfile
-      args:
-        SCOPE: ${GEOID_SCOPE:-scope_geoid}
-        BUILD_JUPYTERLITE: "true"
-    container_name: geoid_web
-    restart: always
-    stop_grace_period: 30s
-    env_file:
-      - .env
-      - path: .env.local
-        required: false
-    environment:
-      SCOPE: ${GEOID_SCOPE:-scope_geoid}
-      TCP_PORT: 80
-      UVICORN_WORKERS: 1
-      DB_POOL_MIN_SIZE: "2"
-      DB_POOL_MAX_SIZE: "10"
-      # Embedded logs dashboard: upstream URL includes the Dashboards base
-      # path so both the provisioner and the reverse proxy can forward
-      # requests unchanged. Keep in sync with the kibana service
-      # SERVER_BASEPATH env above. For prod against Elastic Cloud, set this
-      # to the managed Kibana endpoint (no /dashboards suffix) and provide
-      # KIBANA_UPSTREAM_API_KEY via Secret Manager.
-      KIBANA_UPSTREAM_URL: ${KIBANA_UPSTREAM_URL:-http://kibana:5601/dashboards}
-      KIBANA_UPSTREAM_API_KEY: ${KIBANA_UPSTREAM_API_KEY:-}
-      KIBANA_PUBLIC_PATH: ${KIBANA_PUBLIC_PATH:-/dashboards}
-      VALKEY_URL: valkey://valkey:6379
-    ports:
-      - "8080:80"
-    volumes:
-      - ../../../logs/geoid:/dynastore/logs
-    depends_on:
-      db:
-        condition: service_healthy
-      valkey:
-        condition: service_healthy
-    networks:
-      - dynastore_net
-
-  worker:
-    build:
-      context: ../../../../..
-      dockerfile: packages/core/src/dynastore/docker/Dockerfile
-      args:
-        SCOPE: ${WORKER_SCOPE:-scope_worker}
-        BUILD_JUPYTERLITE: "false"
-    container_name: geoid_worker
-    restart: always
-    stop_grace_period: 30s
-    env_file:
-      - .env
-      - path: .env.local
-        required: false
-    # Run in worker mode (same image as catalog, different modules + CMD)
-    command: ["worker"]
-    environment:
-      SCOPE: ${WORKER_SCOPE:-scope_worker}
-      TCP_PORT: 81
-      UVICORN_WORKERS: 2
-      DB_POOL_MIN_SIZE: "2"
-      DB_POOL_MAX_SIZE: "15"
-      ERROR_LOG: /dynastore/logs/error.log
-      VALKEY_URL: valkey://valkey:6379
-    ports:
-      - "${HOST_PORT_WORKER:-81}:81"
-    volumes:
-      - ../../../logs/worker:/dynastore/logs
-    depends_on:
-      db:
+      keycloak:
         condition: service_healthy
       valkey:
         condition: service_healthy

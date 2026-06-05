@@ -29,9 +29,10 @@ services:
       dockerfile: packages/core/src/dynastore/docker/Dockerfile
       target: development
       args:
-        # Hardcoded (not ${CATALOG_SCOPE}): the shared .env pins
-        # CATALOG_SCOPE=scope_catalog for the cloud/base compose, which must
-        # stay split. The local fat node always builds the merged scope.
+        # Hardcoded (not ${CATALOG_SCOPE}) so dev is self-contained even if a
+        # local .env overrides CATALOG_SCOPE. Both dev and the base compose now
+        # run the on-prem fat node (scope_geoid ∪ scope_worker); cloud keeps the
+        # split via Cloud Run.
         SCOPE: scope_onprem
         BUILD_JUPYTERLITE: "true"
     volumes:
