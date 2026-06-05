@@ -31,10 +31,11 @@ build-backend = "setuptools.build_meta"
 # migration plan.
 # ===========================================================================
 [tool.uv.workspace]
-members = ["packages/core", "packages/extensions/*"]
+members = ["packages/core", "packages/extensions/*", "packages/modules/*"]
 
 [tool.uv.sources]
 dynastore-core = { workspace = true }
+dynastore-module-datastore = { workspace = true }
 dynastore-ext-tasks = { workspace = true }
 dynastore-ext-stats = { workspace = true }
 dynastore-ext-edr = { workspace = true }
@@ -88,7 +89,7 @@ module_catalog_elasticsearch = ["dynastore[module_elasticsearch]"]
 module_stac = []
 module_catalog = ["dynastore[geospatial_core]", "sqlalchemy>=2.0.0"]
 module_gcp = ["gcloud-aio-storage==9.6.0", "google-cloud-bigquery==3.24.0", "google-cloud-run", "google-cloud-storage>=3.1.0", "google-cloud-pubsub", "gcsfs>=2024.5.0", "charset-normalizer>=3", "urllib3>=2.7.0,<3", "requests>=2.32", "httpx", "pmtiles>=3.2.0"]
-module_datastore = ["dynastore[db_sync]", "psycopg2-binary>=2.9.7"]
+module_datastore = ["dynastore[db_sync]", "psycopg2-binary>=2.9.7", "dynastore-module-datastore"]
 module_db_config = ["sqlalchemy", "geoalchemy2", "h3>=4.4.2", "s2sphere>=0.2.5", "python-dateutil"]
 module_iam = ["pydantic[email]", "PyJWT>=2.0.0", "tenacity>=8.0"]
 module_local = ["python-multipart>=0.0.27"]

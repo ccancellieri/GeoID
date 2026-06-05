@@ -46,6 +46,14 @@ dependencies = [
 # Discovery loops over these entry-points at startup; modules whose third-party
 # deps aren't installed (because the SCOPE didn't pull them in) raise
 # ImportError and are skipped — same behavior as before the wheel split.
+#
+# NOTE: the `datastore` entry-point (DatastoreModule / sync psycopg2 engine) is
+# intentionally absent here.  It ships in the separate `dynastore-module-datastore`
+# wheel so it is only registered in environments whose SCOPE selects
+# `module_datastore` (i.e. sync-worker tasks).  API/catalog SCOPEs
+# (`scope_catalog`, `scope_geoid`) do not include `module_datastore`, so the
+# entry-point is absent from importlib.metadata on those services regardless of
+# whether pyiceberg transitively installs psycopg2-binary.  See #1748.
 # ============================================================================
 [project.entry-points."dynastore.modules"]
 cache = "dynastore.modules.cache.cache_module:CacheModule"
@@ -55,7 +63,6 @@ gdal = "dynastore.modules.gdal.gdal_module:GdalModule"
 catalog = "dynastore.modules.catalog.catalog_module:CatalogModule"
 gcp = "dynastore.modules.gcp.gcp_module:GCPModule"
 tiles = "dynastore.modules.tiles.tiles_module:TilesModule"
-datastore = "dynastore.modules.datastore.datastore_service:DatastoreModule"
 styles = "dynastore.modules.styles.styles_module:StylesModule"
 moving_features = "dynastore.modules.moving_features.mf_module:MovingFeaturesModule"
 local_upload = "dynastore.modules.local.local_upload:LocalUploadModule"
