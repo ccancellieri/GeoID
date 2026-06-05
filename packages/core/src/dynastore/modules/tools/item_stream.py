@@ -13,7 +13,7 @@
 #    limitations under the License.
 
 """
-Driver-agnostic item stream normalization utilities.
+Driver-agnostic item stream normalization and streaming-join utilities.
 
 Historically the PG read path could echo columns selected outside the declared
 attribute schema into the Feature's model_extra (extra='allow'), while the
@@ -32,11 +32,18 @@ This module provides:
   normalize_feature_attributes — lift any stray model_extra keys into
                                   feature.properties, making the Feature layout
                                   uniform across drivers.
+  resolve_join_value           — section-aware join key resolver (#1827).
   stream_normalized_items      — the shared stream boundary: call stream_items
                                   and normalize each Feature before yielding.
+  stream_join_features         — the shared streaming-join primitive (#1835):
+                                  key extraction via resolve_join_value, O(1)
+                                  dict lookup, merge-into-properties, yield.
+                                  Both enrich_features (dwh path) and run_join
+                                  (OGC joins path) delegate here so join
+                                  semantics live in exactly one place.
 """
 
-from typing import Any, AsyncIterator, FrozenSet, Optional, TYPE_CHECKING
+from typing import Any, AsyncIterator, Dict, FrozenSet, Optional, TYPE_CHECKING
 
 from dynastore.models.ogc import Feature
 
@@ -78,9 +85,6 @@ def normalize_feature_attributes(feature: Feature) -> Feature:
 # feature.properties. See #1827.
 _JOIN_SECTIONS = ("system", "stats")
 
-# Allowed values for the join_source parameter. See #1827.
-_VALID_JOIN_SOURCES = frozenset({"properties", "system", "stats"})
-
 
 def resolve_join_value(
     feature: Feature,
@@ -118,6 +122,59 @@ def resolve_join_value(
         if isinstance(sec, dict) and join_column in sec:
             return sec[join_column]
     return None
+
+
+async def stream_join_features(
+    primary_stream: AsyncIterator[Feature],
+    secondary_index: Dict[Any, Dict[str, Any]],
+    join_column: str,
+    *,
+    join_source: str = "properties",
+    inner_join: bool = True,
+) -> AsyncIterator[Feature]:
+    """Streaming O(1) per-feature dict-lookup join — the shared primitive.
+
+    Iterates ``primary_stream`` and merges matching secondary properties from
+    ``secondary_index`` (keyed by the join-column value) into each feature's
+    ``properties``.  Both ``enrich_features`` (dwh export path) and ``run_join``
+    (OGC joins path) delegate to this function so join semantics live in one
+    place (#1835).
+
+    Key resolution is handled by ``resolve_join_value`` so that
+    ``join_source="system"`` or ``"stats"`` routes the lookup to the appropriate
+    named section without colliding with a same-named user property (#1827).
+
+    Args:
+        primary_stream: Async iterator of primary ``Feature`` objects.
+        secondary_index: ``{join_value: properties_dict}`` prepared by the
+            caller (e.g. ``index_secondary`` or ``get_enrichment_data``).
+        join_column: The property/column name used as the join key.
+        join_source: Which section to read the join key from.  One of
+            ``"properties"`` (default), ``"system"``, or ``"stats"``.
+        inner_join: When ``True`` (default) only features with a matching
+            secondary row are yielded.  When ``False`` (LEFT JOIN) all
+            primary features are yielded; those without a match pass through
+            with their properties unmodified.
+
+    Yields:
+        ``Feature`` instances.  Matched features have secondary properties
+        merged into ``feature.properties`` (secondary wins on collision, so
+        the enrichment data overrides the primary).  Unmatched features are
+        yielded unchanged when ``inner_join=False``.
+    """
+    async for feature in primary_stream:
+        props = feature.properties or {}
+        key = resolve_join_value(feature, join_column, join_source)
+        match = secondary_index.get(key) if key is not None else None
+        if match is not None:
+            yield Feature(
+                type=feature.type,
+                id=feature.id,
+                geometry=feature.geometry,
+                properties={**props, **match},
+            )
+        elif not inner_join:
+            yield feature
 
 
 async def stream_normalized_items(

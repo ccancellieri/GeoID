@@ -4,6 +4,16 @@ Driver-agnostic: the executor takes a primary-stream callable and an
 already-materialized secondary lookup dict, so callers can wire in any
 data source (DynaStore items via ItemsProtocol, BigQuery via Phase 4a's
 ItemsBigQueryDriver, ad-hoc test fixtures, etc.).
+
+The core join loop (key extraction, O(1) dict lookup, merge-into-properties)
+is shared with the dwh enrichment path via ``resolve_join_value`` from
+``modules/tools/item_stream`` (#1835).  ``run_join`` adds OGC-joins-specific
+concerns on top: ``enrichment=False`` pass-through, ``projection.attributes``
+column filtering, geometry selection, and paging (offset + limit).  These
+concerns require access to the pre-merge primary properties, so ``run_join``
+keeps its own async-for loop rather than delegating wholesale to the async
+generator ``stream_join_features``; it does use ``resolve_join_value`` so the
+key-extraction logic is not duplicated.
 """
 
 from __future__ import annotations
@@ -12,7 +22,7 @@ from typing import Any, AsyncIterator, Callable, Dict
 
 from dynastore.models.ogc import Feature
 from dynastore.modules.joins.models import JoinRequest
-from dynastore.modules.tools.item_stream import normalize_feature_attributes
+from dynastore.modules.tools.item_stream import normalize_feature_attributes, resolve_join_value
 
 PrimaryStream = Callable[..., AsyncIterator[Feature]]
 
@@ -24,6 +34,13 @@ async def run_join(
     secondary_index: Dict[Any, Dict[str, Any]],
 ) -> AsyncIterator[Feature]:
     """Execute the join.
+
+    Uses ``resolve_join_value`` (from ``modules/tools/item_stream``) for key
+    extraction so the resolution logic is shared with the dwh ``enrich_features``
+    path (#1835).  OGC-joins-specific concerns (``enrichment=False`` props-only
+    pass-through, ``projection.attributes`` filtering, geometry selection, paging)
+    are applied in this loop because they require access to the pre-merge primary
+    properties or must interleave with the offset counter.
 
     Args:
         request: Validated JoinRequest.
@@ -46,18 +63,10 @@ async def run_join(
     async for feat in primary_stream:
         feat = normalize_feature_attributes(feat)
         props = feat.properties or {}
-        # Look up the join value: prefer the explicit property, but fall
-        # back to feat.id only when the column is ABSENT from properties.
-        # Drivers like ItemsBigQueryDriver promote the id_column out of
-        # `properties` into `feat.id` (see bigquery_stream.row_to_feature),
-        # so a join on the id column would otherwise drop every feature.
-        # An explicit None in properties means the caller actively wants
-        # to drop the row (NULL keys do not match) — distinguish absent
-        # vs. None-valued so we don't resurrect intentionally-null rows.
-        if join_col in props:
-            key = props[join_col]
-        else:
-            key = feat.id
+        # resolve_join_value handles the absent-vs-None distinction and the
+        # feature.id fallback in one place, replacing the inline if/else that
+        # was here before (#1835 unification).
+        key = resolve_join_value(feat, join_col, "properties")
         if key is None:
             continue
         match = secondary_index.get(key)

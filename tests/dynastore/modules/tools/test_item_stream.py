@@ -16,6 +16,7 @@ from dynastore.models.ogc import Feature
 from dynastore.modules.tools.item_stream import (
     normalize_feature_attributes,
     resolve_join_value,
+    stream_join_features,
     stream_normalized_items,
 )
 
@@ -292,3 +293,122 @@ def test_resolve_join_value_stats_returns_none_when_absent():
     """stats source: returns None (no feature.id fallback)."""
     f = _feat("s2", props={"area_ha": 10.0})
     assert resolve_join_value(f, "area_ha", "stats") is None
+
+
+# ---------------------------------------------------------------------------
+# stream_join_features — shared streaming-join primitive (#1835)
+# ---------------------------------------------------------------------------
+
+
+async def _astream(items):
+    for it in items:
+        yield it
+
+
+@pytest.mark.asyncio
+async def test_stream_join_features_inner_join_drops_unmatched():
+    """Default inner_join=True: features with no secondary match are dropped."""
+    primary = _astream([
+        _feat("f1", props={"code": "A", "name": "Alpha"}),
+        _feat("f2", props={"code": "B", "name": "Beta"}),
+        _feat("f3", props={"code": "MISSING"}),
+    ])
+    secondary = {
+        "A": {"code": "A", "score": 1},
+        "B": {"code": "B", "score": 2},
+    }
+    out = [f async for f in stream_join_features(primary, secondary, "code")]
+    assert [f.id for f in out] == ["f1", "f2"]
+    assert out[0].properties["score"] == 1
+    assert out[0].properties["name"] == "Alpha"
+
+
+@pytest.mark.asyncio
+async def test_stream_join_features_left_join_passes_unmatched():
+    """inner_join=False: features without a match are yielded unmodified."""
+    primary = _astream([
+        _feat("f1", props={"code": "A"}),
+        _feat("f2", props={"code": "NOMATCH"}),
+    ])
+    secondary = {"A": {"code": "A", "score": 10}}
+    out = [f async for f in stream_join_features(primary, secondary, "code", inner_join=False)]
+    assert [f.id for f in out] == ["f1", "f2"]
+    assert out[0].properties["score"] == 10
+    # Unmatched feature keeps only its original properties.
+    assert "score" not in out[1].properties
+    assert out[1].properties["code"] == "NOMATCH"
+
+
+@pytest.mark.asyncio
+async def test_stream_join_features_secondary_wins_on_collision():
+    """When both sides have the same key, secondary value wins (enrichment overrides)."""
+    primary = _astream([_feat("f1", props={"code": "X", "label": "primary-label"})])
+    secondary = {"X": {"code": "X", "label": "secondary-label", "extra": "bonus"}}
+    out = [f async for f in stream_join_features(primary, secondary, "code")]
+    assert len(out) == 1
+    assert out[0].properties["label"] == "secondary-label"
+    assert out[0].properties["extra"] == "bonus"
+
+
+@pytest.mark.asyncio
+async def test_stream_join_features_preserves_geometry():
+    """Geometry is carried through unchanged on matched features."""
+    geo = {"type": "Point", "coordinates": [12.0, 41.0]}
+    primary = _astream([
+        Feature(type="Feature", id="f1", geometry=geo, properties={"code": "IT"}),
+    ])
+    secondary = {"IT": {"score": 5}}
+    out = [f async for f in stream_join_features(primary, secondary, "code")]
+    assert len(out) == 1
+    # geometry round-trips via geojson_pydantic; compare via model_dump
+    assert out[0].geometry is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_join_features_none_key_not_matched():
+    """A feature whose join key resolves to None is never matched (dropped on inner join)."""
+    primary = _astream([
+        _feat("f1", props={"code": None}),    # explicit None → no match
+        _feat("f2", props={}),                 # absent key → falls back to feat.id
+    ])
+    secondary = {"f2": {"from_id": True}}
+    out = [f async for f in stream_join_features(primary, secondary, "code")]
+    # f1 has explicit None → dropped; f2's id "f2" matches the secondary.
+    assert [f.id for f in out] == ["f2"]
+    assert out[0].properties["from_id"] is True
+
+
+@pytest.mark.asyncio
+async def test_stream_join_features_join_source_system():
+    """join_source='system' resolves the key from the system foreign-member section."""
+    f = Feature(type="Feature", id="uuid-1", geometry=None, properties={"name": "Italy"})
+    if f.__pydantic_extra__ is not None:
+        f.__pydantic_extra__["system"] = {"external_id": "EXT-001"}
+    primary = _astream([f])
+    secondary = {"EXT-001": {"country_code": "IT"}}
+    out = [f async for f in stream_join_features(
+        primary, secondary, "external_id", join_source="system"
+    )]
+    assert len(out) == 1
+    assert out[0].properties["country_code"] == "IT"
+    assert out[0].properties["name"] == "Italy"
+
+
+@pytest.mark.asyncio
+async def test_stream_join_features_empty_secondary_drops_all_on_inner_join():
+    """No secondary rows → all features dropped (inner join with empty index)."""
+    primary = _astream([_feat("f1", props={"code": "A"})])
+    out = [f async for f in stream_join_features(primary, {}, "code")]
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_stream_join_features_empty_primary_yields_nothing():
+    """Empty primary stream → nothing yielded regardless of secondary."""
+    async def empty():
+        return
+        yield  # make it an async generator
+
+    secondary = {"A": {"score": 1}}
+    out = [f async for f in stream_join_features(empty(), secondary, "code")]
+    assert out == []

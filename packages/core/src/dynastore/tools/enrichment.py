@@ -51,7 +51,7 @@ Typical usage pattern (replaces hardwired BQ join logic):
 from typing import Any, AsyncIterator, Dict, Optional
 
 from dynastore.models.ogc import Feature
-from dynastore.modules.tools.item_stream import resolve_join_value
+from dynastore.modules.tools.item_stream import resolve_join_value, stream_join_features
 
 
 async def get_enrichment_data(
@@ -114,6 +114,9 @@ async def enrich_features(
 ) -> AsyncIterator[Feature]:
     """Streaming O(1) per-feature dict lookup enrichment.
 
+    Delegates to ``stream_join_features`` (the shared streaming-join primitive)
+    so join semantics live in one place (#1835).
+
     Iterates ``feature_stream`` and merges matching enrichment properties
     from ``enrichment_data`` (keyed by ``join_column`` value).
 
@@ -135,19 +138,11 @@ async def enrich_features(
         ``Feature`` instances with enrichment properties merged into
         ``feature.properties``.
     """
-    async for feature in feature_stream:
-        props = feature.properties or {}
-        # resolve_join_value respects join_source — for "system"/"stats" it reads
-        # the named section only (no feature.id fallback). See #1827.
-        key = resolve_join_value(feature, join_column, join_source)
-        extra = enrichment_data.get(key) if key is not None else None
-        if extra:
-            merged_props = {**props, **extra}
-            yield Feature(
-                type=feature.type,
-                id=feature.id,
-                geometry=feature.geometry,
-                properties=merged_props,
-            )
-        elif not inner_join:
-            yield feature
+    async for feature in stream_join_features(
+        feature_stream,
+        enrichment_data,
+        join_column,
+        join_source=join_source,
+        inner_join=inner_join,
+    ):
+        yield feature
