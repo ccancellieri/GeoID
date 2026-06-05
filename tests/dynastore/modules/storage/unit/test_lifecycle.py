@@ -207,8 +207,47 @@ async def test_apply_params_mismatch_raises_409():
 
 
 # ---------------------------------------------------------------------------
-# apply failure → state=failed
+# params_snapshot mismatch + force=True → re-applies (no 409)
 # ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_apply_params_mismatch_overridden_with_force():
+    """``force=True`` replaces an already-applied preset whose stored params
+    differ from the request — the ``?force=true`` REST contract. Without it
+    the same inputs raise 409 (see test_apply_params_mismatch_raises_409)."""
+    from dynastore.modules.storage.presets.lifecycle import apply_preset
+
+    existing = {
+        "state": "applied",
+        "params_snapshot": json.dumps({"mode": "old"}),
+        "revoke_descriptor": "{}",
+    }
+    preset = _SyncPreset()
+    engine = MagicMock()
+    audit = _audit(existing=existing)
+
+    class ParamsWithMode(BaseModel):
+        mode: str = "new"
+
+    with patch(
+        "dynastore.modules.storage.presets.lifecycle.find_preset",
+        return_value=preset,
+    ), patch(
+        "dynastore.modules.storage.presets.lifecycle.managed_transaction"
+    ) as mock_tx:
+        mock_tx.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+        mock_tx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await apply_preset(
+            "test-sync-preset", "platform", ParamsWithMode(mode="new"), _ctx(),
+            engine=engine, audit=audit,
+            force=True,
+        )
+
+    # Force bypasses the mismatch 409: the preset is re-applied.
+    audit.insert_pending.assert_awaited_once()
+    audit.mark_applied.assert_awaited_once()
+    assert isinstance(result, dict)
 
 @pytest.mark.asyncio
 async def test_apply_failure_marks_failed():

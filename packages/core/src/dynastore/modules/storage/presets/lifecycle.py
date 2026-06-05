@@ -250,6 +250,7 @@ async def dispatch_preset(
     base_scope: Mapping[str, str],
     params: Optional[BaseModel] = None,
     principal: Optional[Any] = None,
+    force: bool = False,
 ) -> dict:
     """Single entry point used by the admin layer.
 
@@ -257,6 +258,11 @@ async def dispatch_preset(
     (routing presets are auto-wrapped at registration time). Delegates to
     the audited :func:`apply_preset` / :func:`revoke_preset` /
     :func:`dry_run_preset` lifecycle.
+
+    ``force`` is threaded to :func:`apply_preset` so an operator can replace
+    an already-applied preset whose stored params snapshot differs from the
+    request (the ``?force=true`` REST contract). Ignored for ``revoke`` /
+    ``dry_run``.
 
     Returns the operator-visible response dict.
     """
@@ -274,6 +280,7 @@ async def dispatch_preset(
         params_model = params or preset.params_model()
         row = await apply_preset(
             preset.name, scope_key, params_model, ctx, engine, audit,
+            force=force,
             applied_by=principal,
         )
         return {

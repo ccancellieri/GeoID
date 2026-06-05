@@ -146,6 +146,33 @@ async def test_dispatch_generalised_preset_routes_through_lifecycle():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_forwards_force_to_apply_preset():
+    """``dispatch_preset(..., force=True)`` must thread ``force`` into
+    ``apply_preset`` — the plumbing the admin ``?force=true`` REST flag
+    depends on. Default (no force) must pass ``force=False``."""
+    preset = _FakeGeneralisedPreset()
+    fake_db = MagicMock()
+    fake_db.engine = MagicMock()
+
+    with patch(
+        "dynastore.modules.get_protocol",
+        return_value=fake_db,
+    ), patch(
+        "dynastore.modules.storage.presets.lifecycle.apply_preset",
+        new=AsyncMock(return_value={"state": "applied"}),
+    ) as mock_apply, patch(
+        "dynastore.modules.storage.presets.lifecycle._build_context",
+        return_value=MagicMock(),
+    ):
+        await dispatch_preset(preset, "apply", base_scope={}, force=True)
+        assert mock_apply.await_args.kwargs.get("force") is True
+
+        mock_apply.reset_mock()
+        await dispatch_preset(preset, "apply", base_scope={})
+        assert mock_apply.await_args.kwargs.get("force") is False
+
+
+@pytest.mark.asyncio
 async def test_dispatch_unknown_op_raises():
     preset = _FakeGeneralisedPreset()
     fake_db = MagicMock()
