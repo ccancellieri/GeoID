@@ -549,6 +549,27 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 # keep flowing; an explicitly requested SYSTEM field (#1827
                 # join key) is surfaced regardless.
                 _props_keys = set(feature.properties) if feature.properties else set()
+                # Derived/computed values (geometry ``stats`` — area/perimeter/
+                # length/centroid… — and ``system`` names) are governed solely
+                # by the read policy: exposed onto ``properties`` via
+                # ``feature_type.expose`` (handled above) or folded into the
+                # gated ``stats``/``system`` sections by
+                # ``_apply_expose_all_sections``. ``pushdown_read_select`` keeps
+                # unexposed computed columns out of the SELECT on the common
+                # path, but the attributes sidecar still republishes the *entire*
+                # fetched row into context for inter-sidecar use — so when the
+                # projection cannot be narrowed (schemaless collection, no read
+                # policy, wildcard caller) those columns are present here yet
+                # absent from ``properties`` and from any ``get_internal_columns()``
+                # set. Without this backstop they would leak onto the Feature
+                # root as foreign members regardless of the policy. A producible
+                # computed value surfaces here only when the policy selected it
+                # (it then rides ``_requested``, set from the narrowed/explicit
+                # select) — e.g. a #1827 join key — mirroring the producer
+                # contract #1826 applied to user attributes.
+                _gated_computed: set = set()
+                for _sc in resolved_sidecars:
+                    _gated_computed.update(_sc.producible_computed_names())
                 for sid, data in sidecar_data.items():
                     if isinstance(data, dict):
                         # Merge dicts if it's a standard sidecar publication,
@@ -558,6 +579,10 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                         for k, v in data.items():
                             surface_requested = k in _requested and k in _system_set
                             if k in _props_keys and not surface_requested:
+                                continue
+                            # Policy-governed computed value, not explicitly
+                            # requested -> never flat on the Feature root.
+                            if k in _gated_computed and k not in _requested:
                                 continue
                             if (k not in all_internal or surface_requested) and k not in model_fields:
                                 if feature.__pydantic_extra__ is not None:

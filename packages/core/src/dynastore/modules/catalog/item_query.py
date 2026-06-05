@@ -1247,11 +1247,82 @@ class ItemQueryMixin:
                 "col_config": col_config,
                 **(request.raw_params or {}),
             }
+
+            # Read-policy projection pushdown (config-driven). Resolve the
+            # collection's ItemsReadPolicy ONCE here — reused for row assembly
+            # below — and narrow a wildcard SELECT to exactly what
+            # ``feature_type`` exposes. Without this a wildcard /items read
+            # fetches every sidecar column (geometry stats area/perimeter/length,
+            # spatial-cell indexes, …) the policy does not surface, joining and
+            # computing columns no consumer asked for and leaking them onto the
+            # Feature root. The tile path already narrows via
+            # ``project_select_for_feature_type``; ``pushdown_read_select`` brings
+            # the row-projected path under the same SSOT (and returns None — no
+            # change — for STAC, explicit caller projections, expose_all, or
+            # schemaless collections; the row-map guard remains the backstop).
+            read_policy = await self._resolve_read_policy(catalog_id, collection_id)
+            try:
+                from dynastore.modules.storage.driver_config import ItemsSchema
+                from dynastore.modules.storage.drivers.pg_sidecars import (
+                    SidecarRegistry,
+                )
+                from dynastore.modules.storage.read_policy import (
+                    pushdown_read_select,
+                )
+
+                _feature_type = getattr(read_policy, "feature_type", None)
+                _declared_schema = None
+                if _feature_type is not None:
+                    _configs = get_protocol(ConfigsProtocol)
+                    if _configs is not None:
+                        _schema = await _configs.get_config(
+                            ItemsSchema,
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                        )
+                        _declared_schema = getattr(_schema, "fields", None) or {}
+                        # The optimizer needs the declared schema to resolve
+                        # JSONB-only field names (no columnar storage) in its
+                        # field index — same thread the tile path uses.
+                        context["schema_fields"] = _declared_schema
+                _geom_field = next(
+                    (
+                        name
+                        for name in (
+                            sc.get_main_geometry_field()
+                            for sc in (
+                                SidecarRegistry.get_sidecar(cfg, lenient=True)
+                                for cfg in driver_sidecars(col_config)
+                            )
+                            if sc is not None
+                        )
+                        if name
+                    ),
+                    None,
+                )
+                _narrowed = pushdown_read_select(
+                    request.select,
+                    _feature_type,
+                    _declared_schema,
+                    is_stac=(consumer == ConsumerType.STAC),
+                    geometry_field=_geom_field,
+                    skip_geometry=bool(getattr(request, "skip_geometry", False)),
+                )
+                if _narrowed is not None:
+                    request.select = _narrowed
+            except Exception as exc:  # noqa: BLE001 — pushdown is an optimisation; never break the read
+                logger.debug(
+                    "read-select pushdown skipped for %s/%s: %s",
+                    catalog_id, collection_id, exc,
+                )
+
             # Snapshot a pagination-free copy BEFORE the data transformation
             # runs: _apply_query_transformations mutates the request in place
             # (it folds the parsed CQL filter into raw_where/raw_params), so a
             # copy taken afterwards would re-parse the filter and double the
-            # predicate. deep=True isolates the shared raw_params dict.
+            # predicate. deep=True isolates the shared raw_params dict. Taken
+            # AFTER the projection pushdown so the count query shares the
+            # narrowed select.
             count_request = (
                 request.model_copy(deep=True, update={"limit": None, "offset": None})
                 if request.include_total_count
@@ -1280,7 +1351,8 @@ class ItemQueryMixin:
 
         # Stream Generator (O(1) Memory)
         lang = (request.raw_params or {}).get("lang", "en")
-        read_policy = await self._resolve_read_policy(catalog_id, collection_id)
+        # ``read_policy`` was resolved once above (projection pushdown) and is
+        # reused here for row assembly — no second config fetch.
         # Collect explicitly-requested field names (both alias and source column)
         # so the sidecar bridge can surface SYSTEM fields named here. Wildcard
         # selects ("*") are excluded — only opt-in by name exposes system columns.

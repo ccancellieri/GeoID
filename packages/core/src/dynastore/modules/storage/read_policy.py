@@ -296,8 +296,91 @@ def project_select_for_feature_type(
     return selects
 
 
+def pushdown_read_select(
+    current_select: Optional[List[Any]],
+    feature_type: Optional[FeatureType],
+    declared_schema: Optional[Mapping[str, FieldDefinition]],
+    *,
+    is_stac: bool,
+    geometry_field: Optional[str],
+    skip_geometry: bool,
+) -> Optional[List[Any]]:
+    """Narrow a wildcard read ``SELECT`` to exactly what ``feature_type`` exposes.
+
+    The data-oriented PG read (`/items`, EDR, Coverages) historically fetched
+    every sidecar column (``h.*`` + all sidecar projections — including geometry
+    statistics like ``area``/``perimeter``/``length`` and spatial-cell indexes)
+    and relied on the row mapper to drop what the policy did not surface. That
+    over-fetch both joined/computed columns no consumer asked for and let those
+    columns leak onto the Feature root as foreign members.
+
+    This pushes the SAME declarative contract the tile path already materialises
+    (:func:`project_select_for_feature_type`) down to the SQL projection so the
+    unexposed columns are never fetched or joined. **The config drives**: with
+    ``expose=None`` the declared schema fields are the projection; with an
+    explicit ``expose`` list it is schema + listed computed values; with ``[]``
+    it is geometry-only.
+
+    Returns the narrowed ``FieldSelection`` list, or ``None`` to leave the
+    request's wildcard select unchanged. ``None`` (no narrowing) is returned
+    whenever narrowing is inapplicable or unsafe:
+
+      * ``is_stac`` — STAC items are metadata documents, not properties-projected
+        features; they bypass ``feature_type`` (see :class:`FeatureType`).
+      * ``feature_type is None`` — no read policy to drive the projection.
+      * ``feature_type.expose_all`` — the report-style read reads stats/system
+        columns off the raw row at map time, so they must stay in the SELECT.
+      * the caller already pinned an explicit projection (any non-``*`` field) —
+        e.g. the DWH join, which names exactly the columns it needs; that choice
+        is authoritative and must not be clobbered.
+      * no ``declared_schema`` — a free-form collection has no notion of "all
+        declared properties" to narrow to; the wildcard read stays (the row-map
+        guard still prevents stat leaks).
+      * the narrowed list would be empty — :meth:`QueryRequest.validate_select`
+        re-expands ``[]`` back to ``[*]``, which would silently defeat the
+        pushdown; leave the wildcard untouched in that degenerate case.
+
+    Geometry is not a property: :func:`project_select_for_feature_type` omits it,
+    so it is re-prepended here for the row-projected read path (the tile path
+    injects geometry separately) unless the caller asked to skip it
+    (``returnGeometry=false`` / ``skipGeometry=true``).
+    """
+    from dynastore.models.query_builder import FieldSelection
+
+    if is_stac:
+        return None
+    if feature_type is None:
+        return None
+    if getattr(feature_type, "expose_all", False):
+        return None
+
+    # Only narrow a wildcard read. An explicit caller projection (any non-"*"
+    # field) is authoritative — never override it.
+    sel = current_select or []
+    if any(getattr(s, "field", None) and s.field != "*" for s in sel):
+        return None
+
+    if not declared_schema:
+        return None
+
+    projected = project_select_for_feature_type(feature_type, declared_schema)
+
+    result: List[Any] = []
+    if geometry_field and not skip_geometry:
+        result.append(FieldSelection(field=geometry_field))
+    result.extend(projected)
+
+    if not result:
+        # An empty list is re-expanded to the wildcard by validate_select,
+        # defeating the pushdown (e.g. expose=[] + skip_geometry). Leave the
+        # request untouched; the row-map guard still prevents stat leaks.
+        return None
+    return result
+
+
 __all__ = [
     "ItemsReadPolicy",
     "project_select_for_feature_type",
+    "pushdown_read_select",
     "is_user_readable_schema_field",
 ]
