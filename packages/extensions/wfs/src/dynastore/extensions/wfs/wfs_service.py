@@ -58,6 +58,62 @@ from dynastore.extensions.tools.query import parse_ogc_query_request, stream_ogc
 logger = logging.getLogger(__name__)
 
 
+def wfs_sortby_to_ogc(sort_by_str: Optional[str]) -> Optional[str]:
+    """Translate a WFS ``SORTBY`` value into the OGC API - Features ``sortby`` form.
+
+    WFS 2.0 expresses sort order as ``property [ASC|DESC]`` (or the ``A``/``D``
+    abbreviations), whitespace-separated, comma-delimited for multiple keys —
+    e.g. ``geoid ASC,date DESC``. The shared :func:`parse_ogc_query_request`
+    parser instead expects the OGC API - Features syntax where direction is a
+    ``+``/``-`` prefix on the property name (``geoid``/``-date``). Forwarding the
+    raw WFS value made the parser read ``"geoid ASC"`` as a single field name and
+    reject it as unknown. This normalises each clause so both spellings work.
+
+    Returns ``None`` when there is nothing to sort by, so the caller can pass it
+    straight through unchanged.
+    """
+    if not sort_by_str:
+        return None
+    clauses = []
+    for raw in sort_by_str.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        parts = token.split()
+        field = parts[0].lstrip("+-")
+        if not field:
+            continue
+        direction = parts[1].upper() if len(parts) > 1 else ""
+        # Honour an OGC-style ``-`` prefix too, so a value that is already in
+        # OGC form survives the round-trip untouched.
+        descending = direction in ("DESC", "D") or parts[0].startswith("-")
+        clauses.append(f"-{field}" if descending else field)
+    return ",".join(clauses) if clauses else None
+
+
+def wfs_property_names(property_name_str: Optional[str]) -> Optional[list]:
+    """Resolve a WFS ``PROPERTYNAME`` value into a concrete projection list.
+
+    WFS clients may request a namespace wildcard such as ``attributes.*`` (or a
+    bare ``*``) to mean "return every attribute". The shared projection layer
+    only understands concrete queryable names and rejects ``attributes.*`` as an
+    unknown field. When any wildcard token is present we therefore decline to
+    narrow the projection at all (return ``None`` -> all properties), preserving
+    the historical "return everything" behaviour. A purely concrete list is
+    passed through so explicit field selection still works.
+    """
+    if not property_name_str:
+        return None
+    names = [p.strip() for p in property_name_str.split(",") if p.strip()]
+    if not names:
+        return None
+    has_wildcard = any(n == "*" or n.endswith(".*") for n in names)
+    if has_wildcard:
+        # ``attributes.*`` / ``*`` -> no narrowing; return the full feature.
+        return None
+    return names
+
+
 class WFSGlobalExceptionHandler(ExceptionHandler):
     """
     Handles WFS-specific exceptions and returns a standard OGC ExceptionReport.
@@ -497,12 +553,18 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
         # WFS ``propertyName`` -> the shared driver-level projection
         # (``select_fields``), exactly as features/records/STAC narrow their
         # attribute output. Geometry is governed separately and is retained.
-        property_names = property_name_str.split(",") if property_name_str else None
+        # A namespace wildcard (``attributes.*`` / ``*``) means "all
+        # attributes" -> no narrowing (see ``wfs_property_names``).
+        property_names = wfs_property_names(property_name_str)
+
+        # WFS ``SORTBY`` uses ``field ASC|DESC``; translate to the OGC
+        # ``[+-]field`` form the shared parser expects.
+        ogc_sortby = wfs_sortby_to_ogc(sort_by_str)
 
         request_obj = parse_ogc_query_request(
             bbox=bbox_val,
             datetime_param=time_str,
-            sortby=sort_by_str,
+            sortby=ogc_sortby,
             filter=cql_filter,
             item_ids=feature_id_str,
             limit=count,

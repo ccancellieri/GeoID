@@ -72,6 +72,24 @@ def test_reserved_params_set_contains_core_ogc_params():
         assert reserved in OGC_RESERVED_QUERY_PARAMS
 
 
+def test_reserved_params_set_contains_projection_and_geometry_params():
+    # Regression: ``properties``, the geometry switches and the CRS overrides
+    # are real endpoint parameters. If they are not reserved, the items
+    # equality shorthand sweeps them into a bogus ``param = 'value'`` CQL
+    # filter and the request 400s with "Unknown properties: <param>".
+    for reserved in (
+        "properties",
+        "skipGeometry",
+        "skip_geometry",
+        "returnGeometry",
+        "return_geometry",
+        "filter-crs",
+        "filter_crs",
+        "bbox_crs",
+    ):
+        assert reserved in OGC_RESERVED_QUERY_PARAMS
+
+
 def test_shorthand_property_name_is_not_interpolated_as_value():
     # The property name appears verbatim (it is validated against queryable
     # fields downstream); only the value is quoted as a CQL literal.
