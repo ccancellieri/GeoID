@@ -16,10 +16,10 @@ services:
   # On-prem / local fat node: ONE process that is catalog + geoid (gateway,
   # auth/IAM, UI) + worker (every task & process run in-process via the
   # background runner). Built from scope_onprem (= scope_geoid ∪ scope_worker)
-  # and routed by DYNASTORE_TASK_ROUTING_PRESET=onprem. The dedicated `geoid`
-  # and `worker` services move to the `legacy` profile (opt in with
-  # `--profile legacy`). Cloud/prod is unchanged — it keeps the split
-  # scope_catalog / scope_geoid / scope_worker services from docker-compose.yml.
+  # and routed by DYNASTORE_TASK_ROUTING_PRESET=onprem. There are no dedicated
+  # `geoid` / `worker` services here — they are folded into this node. Cloud/prod
+  # is unchanged — it keeps the split scope_catalog / scope_geoid / scope_worker
+  # services from docker-compose.yml.
   catalog:
     extends:
       file: docker-compose.yml
@@ -91,95 +91,6 @@ services:
       - "8080:80"   # Public gateway ingress (taken over from the geoid service)
       - "5678:5678" # Debug port
     command: python -m debugpy --listen 0.0.0.0:5678 -m uvicorn dynastore.main:app --host 0.0.0.0 --port 80 --reload --reload-dir packages
-
-  # LEGACY (opt-in: `docker compose --profile legacy up`). On-prem/local folds
-  # geoid into the merged `catalog` node above. Kept here to reproduce the
-  # cloud split topology locally when debugging service boundaries.
-  geoid:
-    profiles: ["legacy"]
-    extends:
-      file: docker-compose.yml
-      service: geoid
-    build:
-      context: ../../../../..
-      dockerfile: packages/core/src/dynastore/docker/Dockerfile
-      target: development
-      args:
-        BUILD_JUPYTERLITE: "true"
-    volumes:
-      - ../../../..:/dynastore/packages # Hot reload mount (editable-install root; see catalog service)
-      - ./config/geoid:/dynastore/config:ro
-    env_file:
-      # geoid runs the full scope (incl. gcp). Declaring env_file here replaces
-      # the base list, so .env / .env.local are re-listed alongside the local
-      # GCP creds (gitignored, required:false — see catalog service).
-      - .env
-      - path: .env.local
-        required: false
-      - path: ../modules/gcp/.env
-        required: false
-    depends_on:
-      db:
-        condition: service_healthy
-      elasticsearch:
-        condition: service_healthy
-      keycloak:
-        condition: service_healthy
-      valkey:
-        condition: service_healthy
-    environment:
-      UVICORN_WORKERS: 1
-      ES_HOST: elasticsearch
-      ES_PORT: "9200"
-      DYNASTORE_CONFIG_ROOT: /dynastore/config
-    ports:
-      - "5682:5682" # Debug port
-    command: python -m debugpy --listen 0.0.0.0:5682 -m uvicorn dynastore.main:app --host 0.0.0.0 --port 80 --reload --reload-dir packages
-
-  # LEGACY (opt-in: `docker compose --profile legacy up`). On-prem/local folds
-  # the worker into the merged `catalog` node, which runs every task/process
-  # in-process via the background runner (DYNASTORE_TASK_ROUTING_PRESET=onprem).
-  worker:
-    profiles: ["legacy"]
-    extends:
-      file: docker-compose.yml
-      service: worker
-    build:
-      context: ../../../../..
-      dockerfile: packages/core/src/dynastore/docker/Dockerfile
-      target: development
-      args:
-        SCOPE: ${WORKER_SCOPE:-scope_worker}
-        BUILD_JUPYTERLITE: "false"
-    env_file:
-      - .env
-      - path: .env.local
-        required: false
-      # Local GCP creds (gitignored) — see catalog service. The worker handles
-      # GCS finalize/activation, so it needs the same credentials.
-      - path: ../modules/gcp/.env
-        required: false
-    depends_on:
-      db:
-        condition: service_healthy
-      elasticsearch:
-        condition: service_healthy
-      valkey:
-        condition: service_healthy
-    volumes:
-      - ../../../..:/dynastore/packages # Hot reload mount (editable-install root; see catalog service)
-      - ./config/worker:/dynastore/config:ro
-    environment:
-      UVICORN_WORKERS: 1
-      LOG_LEVEL: DEBUG
-      ACCESS_LOG: "-"
-      ERROR_LOG: "-"
-      ES_HOST: elasticsearch
-      ES_PORT: "9200"
-      DYNASTORE_CONFIG_ROOT: /dynastore/config
-    ports:
-      - "5679:5679" # Debug port for worker
-    command: python -m debugpy --listen 0.0.0.0:5679 -m uvicorn dynastore.main:app --host 0.0.0.0 --port 81 --reload --reload-dir packages
 
   tools:
     extends:
@@ -293,8 +204,8 @@ services:
     networks:
       - dynastore_net
 
-  # Valkey is referenced via depends_on on every app service (catalog/geoid/
-  # worker/tools/maps) so it must be declared in this file even though the
+  # Valkey is referenced via depends_on on every app service (catalog/tools/
+  # maps) so it must be declared in this file even though the
   # base compose owns the same definition. Compose `extends` pulls a single
   # service, not its transitive depends_on graph — VS Code's right-click
   # "Compose Up" runs `docker compose -f docker-compose.dev.yml up` against
