@@ -452,6 +452,18 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS as _SYSTEM_FIELD_KEYS
                 _requested = getattr(context, "requested_fields", None) or set()
                 _system_set = frozenset(_SYSTEM_FIELD_KEYS)
+                # Producer contract (#1826): user attributes live ONLY in
+                # ``feature.properties``. The attributes sidecar already placed
+                # every requested column there, so do NOT also echo it up as a
+                # top-level foreign member — that duplication is non-spec
+                # GeoJSON on the OGC Features wire (``{"CODE":..,"properties":
+                # {"CODE":..}}``) and forces every consumer to reconcile
+                # ``model_extra`` against ``properties`` (the band-aid added in
+                # #1818). Inter-sidecar internal keys (asset_id, *_langs,
+                # place, coordRefSys, …) are never in ``properties`` so they
+                # keep flowing; an explicitly requested SYSTEM field (#1827
+                # join key) is surfaced regardless.
+                _props_keys = set(feature.properties) if feature.properties else set()
                 for sid, data in sidecar_data.items():
                     if isinstance(data, dict):
                         # Merge dicts if it's a standard sidecar publication,
@@ -460,6 +472,8 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                         # inter-sidecar communication.
                         for k, v in data.items():
                             surface_requested = k in _requested and k in _system_set
+                            if k in _props_keys and not surface_requested:
+                                continue
                             if (k not in all_internal or surface_requested) and k not in model_fields:
                                 if feature.__pydantic_extra__ is not None:
                                     feature.__pydantic_extra__[k] = v

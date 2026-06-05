@@ -15,15 +15,23 @@
 """
 Driver-agnostic item stream normalization utilities.
 
-The PG read path leaves columns selected outside the declared attribute schema
-in the Feature's model_extra (extra='allow'), while the Elasticsearch canonical
-path puts them in feature.properties directly. This mismatch caused every
-feature to appear property-less on the PG path for consumers that join on
-feature.properties, silently dropping all rows (see #1818).
+Historically the PG read path could echo columns selected outside the declared
+attribute schema into the Feature's model_extra (extra='allow'), while the
+Elasticsearch canonical path puts them in feature.properties directly. That
+mismatch caused every feature to appear property-less on the PG path for
+consumers that join on feature.properties, silently dropping all rows (#1818).
+
+As of #1826 the PG producer (``item_service.map_row_to_feature``) guarantees
+the contract directly — user attributes live only in ``feature.properties`` and
+are no longer duplicated into model_extra — so ``normalize_feature_attributes``
+is now a defense-in-depth safety net (a no-op on a well-formed PG/ES feature)
+rather than the load-bearing fix. It is kept so any future driver that emits
+model_extra-only attributes still reads uniformly here.
 
 This module provides:
-  normalize_feature_attributes — lift model_extra keys into feature.properties,
-                                  making the Feature layout uniform across drivers.
+  normalize_feature_attributes — lift any stray model_extra keys into
+                                  feature.properties, making the Feature layout
+                                  uniform across drivers.
   stream_normalized_items      — the shared stream boundary: call stream_items
                                   and normalize each Feature before yielding.
 """
