@@ -168,7 +168,7 @@ async def test_rollback_deletes_notifications_and_topic_but_not_bucket(monkeypat
     # Bucket-level deletion is NEVER part of rollback (bucket may pre-exist with data).
     # MagicMock auto-creates attributes; .called on an auto-attr is False unless explicitly called.
     m._bucket_service.delete_bucket.assert_not_called()
-    m._bucket_service.delete_storage_for_catalog.assert_not_called()
+    m._bucket_service.drop_storage.assert_not_called()
 
 
 @pytest.mark.asyncio

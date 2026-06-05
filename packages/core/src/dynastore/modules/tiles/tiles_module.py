@@ -297,8 +297,13 @@ class TileStorageProtocol(Protocol):
         """
         ...
 
-    async def delete_storage_for_catalog(self, catalog_id: str):
-        """Deletes the entire storage infrastructure for a catalog (e.g., a table)."""
+    async def drop_storage(self, catalog_id: str) -> None:
+        """Remove the entire tile storage infrastructure for a catalog (e.g., preseed table).
+
+        Uniform teardown entry point for tile storage, parallel to the ``drop_storage``
+        contract on the four metadata-tier entity-store protocols. Called by
+        ``invalidate_catalog_tiles`` and by ``TilePreseedOwner`` (cascade registry).
+        """
         ...
 
     async def check_tile_exists(
@@ -676,20 +681,25 @@ class TilePGPreseedStorage(TileStorageProtocol):
             )
             return False
 
-    async def delete_storage_for_catalog(self, catalog_id: str):
-        """Drops the catalog-specific preseeded_tiles table."""
+    async def drop_storage(self, catalog_id: str) -> None:
+        """Drop the catalog-specific preseeded_tiles table.
+
+        Implements ``TileStorageProtocol.drop_storage``.  Idempotent (DROP TABLE IF EXISTS).
+        """
         schema = await self._get_schema(catalog_id)
         query_str = f'DROP TABLE IF EXISTS "{schema}".preseeded_tiles;'
         try:
             async with managed_transaction(self.engine) as conn:
                 await DDLQuery(query_str).execute(conn)
                 logger.info(
-                    f"Successfully dropped preseeded tiles table for catalog '{catalog_id}'."
+                    "TilePGPreseedStorage: dropped preseeded_tiles table for catalog %r.",
+                    catalog_id,
                 )
         except Exception as e:
-            # Don't raise on error, just log it, as the catalog is being deleted anyway.
+            # Fail-soft: the catalog is being deleted; log but do not raise.
             logger.error(
-                f"Error dropping preseeded tiles table for catalog '{catalog_id}': {e}",
+                "TilePGPreseedStorage: error dropping preseeded_tiles table for catalog %r: %s",
+                catalog_id, e,
                 exc_info=True,
             )
 
@@ -1233,9 +1243,9 @@ async def invalidate_catalog_tiles(catalog_id: str):
     provider = get_protocol(TileStorageProtocol)
     if provider is not None:
         try:
-            await provider.delete_storage_for_catalog(catalog_id)
+            await provider.drop_storage(catalog_id)
         except Exception as exc:
-            logger.error(f"Error during catalog tile invalidation: {exc}")
+            logger.error("Error during catalog tile invalidation: %s", exc)
 
 
 # ---------------------------------------------------------------------------

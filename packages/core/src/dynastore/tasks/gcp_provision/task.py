@@ -310,12 +310,12 @@ class GcpDestroyCatalogTask(TaskProtocol):
             except Exception as e:
                 logger.warning(f"GcpDestroyCatalogTask: Failed to teardown eventing for '{catalog_id}': {e}")
 
-        # 2. Delete/cleanup storage. Same fix: was dispatching via getattr to
-        # a non-existent `delete_catalog_bucket`; now calls the typed
-        # StorageProtocol.delete_storage_for_catalog directly.
+        # 2. Remove binary storage (bucket). Calls StorageProtocol.drop_storage — the
+        # uniform teardown entry point for binary storage (parallel to the four
+        # metadata-tier entity-store protocols).
         try:
             storage = _get_storage_protocol()
-            await storage.delete_storage_for_catalog(catalog_id)
+            await storage.drop_storage(catalog_id)
             logger.info(f"GcpDestroyCatalogTask: Bucket resources for '{catalog_id}' deleted.")
         except Exception as e:
             logger.warning(f"GcpDestroyCatalogTask: Failed to delete storage for '{catalog_id}': {e}")

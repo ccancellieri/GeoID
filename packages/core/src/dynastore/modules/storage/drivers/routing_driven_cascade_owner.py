@@ -35,12 +35,16 @@ This design correctly handles:
 - Private items DENY revoke: ``ItemsElasticsearchPrivateDriver.drop_storage``
   already calls ``_revoke_deny_policy`` — parity is preserved.
 
-GCS asset drivers are EXCLUDED from this owner.  GCS object-storage cleanup
+GCS asset drivers are EXCLUDED from this owner.  GCS binary storage cleanup
 is handled by the dedicated ``GcsCatalogPrefixOwner`` / ``GcsCollectionPrefixOwner``
-owners (task-runner based), which have their own lifecycle and retry semantics.
-Including GCS drivers here would duplicate cleanup and conflict with those
-owners.  The check is based on the driver class name: drivers whose snake_case
-id contains ``gcs`` or ``bigquery`` are skipped.
+owners (task-runner based), which call ``StorageProtocol.drop_storage`` (renamed
+from ``delete_storage_for_catalog`` in the vocabulary-consolidation pass) and have
+their own lifecycle and retry semantics.  Including GCS drivers here would duplicate
+cleanup and conflict with those owners.  The check is based on the driver class name:
+drivers whose snake_case id contains ``gcs`` or ``bigquery`` are skipped.
+
+Per-asset event-driven binary teardown (``AssetBlobReaper``-style) remains outside
+the cascade registry — it is a per-asset eventing concern, not a bulk cascade.
 
 Register via :func:`register_owners` from the catalog module lifespan BEFORE
 the CascadeCleanupRegistry is frozen.

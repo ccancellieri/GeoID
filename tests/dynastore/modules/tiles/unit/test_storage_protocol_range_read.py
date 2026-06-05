@@ -36,7 +36,7 @@ class _FakeStorage(StorageProtocol):
     async def ensure_storage_for_catalog(self, catalog_id, conn=None):
         return None
 
-    async def delete_storage_for_catalog(self, catalog_id, conn=None):
+    async def drop_storage(self, catalog_id, conn=None) -> bool:
         return True
 
 

@@ -76,7 +76,7 @@ class GcpCatalogOpsMixin:
         def generate_default_subscription_id(self, *args: Any, **kw: Any) -> str: ...
         async def setup_managed_eventing_channel(self, *args: Any, **kw: Any) -> Any: ...
         async def teardown_managed_eventing_channel(self, *args: Any, **kw: Any) -> Any: ...
-        async def delete_storage_for_catalog(self, *args: Any, **kw: Any) -> Any: ...
+        async def drop_storage(self, *args: Any, **kw: Any) -> Any: ...
 
         @property
         def engine(self) -> DbResource: ...
@@ -285,7 +285,7 @@ class GcpCatalogOpsMixin:
                 logger.info(
                     f"Deleting bucket '{bucket_name}' for catalog '{catalog_id}'..."
                 )
-                await bucket_manager.delete_storage_for_catalog(catalog_id)
+                await bucket_manager.drop_storage(catalog_id)
                 await log_info(
                     catalog_id, "gcp.bucket.deleted", f"Bucket {bucket_name} deleted."
                 )
@@ -488,7 +488,7 @@ class GcpCatalogOpsMixin:
             if provisioned_bucket:
                 logger.info(f"Cleanup: Deleting orphaned bucket {provisioned_bucket}...")
                 try:
-                    await self.delete_storage_for_catalog(catalog_id)
+                    await self.drop_storage(catalog_id)
                 except Exception as cleanup_e:
                     logger.warning(f"Failed to cleanup orphaned bucket: {cleanup_e}")
 

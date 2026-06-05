@@ -115,11 +115,11 @@ class GcpStorageOpsMixin:
             catalog_id, conn=conn
         )
 
-    async def delete_storage_for_catalog(
+    async def drop_storage(
         self, catalog_id: str, conn: Optional[Any] = None
     ) -> bool:
-        """StorageProtocol: Deletes all storage resources associated with a catalog."""
-        return await self.get_bucket_service().delete_storage_for_catalog(
+        """StorageProtocol: Remove all binary storage resources for a catalog (bucket deletion)."""
+        return await self.get_bucket_service().drop_storage(
             catalog_id, conn=conn
         )
 

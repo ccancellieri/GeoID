@@ -364,8 +364,12 @@ class TileBucketPreseedStorage(TileStorageProtocol):
             )
             return False
 
-    async def delete_storage_for_catalog(self, catalog_id: str):
-        """Deletes all tile storage for a catalog."""
+    async def drop_storage(self, catalog_id: str) -> None:
+        """Remove all GCS-backed tile cache blobs for a catalog.
+
+        Implements ``TileStorageProtocol.drop_storage``.  Idempotent: a missing
+        bucket or empty prefix is a no-op success.
+        """
         storage_provider = self._get_storage_provider()
         bucket_name = await storage_provider.get_storage_identifier(catalog_id)
         if not bucket_name:
@@ -376,7 +380,7 @@ class TileBucketPreseedStorage(TileStorageProtocol):
         client_provider = self._get_client_provider()
         storage_client = client_provider.get_storage_client()
         bucket = storage_client.bucket(bucket_name)
-        
+
         def _delete_all():
             blobs = list(bucket.list_blobs(prefix=prefix))
             if blobs:

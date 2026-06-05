@@ -41,8 +41,16 @@ class StorageProtocol(Protocol):
         """Returns the storage path (e.g., gs://...) for a catalog."""
         ...
 
-    async def delete_storage_for_catalog(self, catalog_id: str, conn: Optional[Any] = None) -> bool:
-        """Deletes all storage resources associated with a catalog."""
+    async def drop_storage(self, catalog_id: str, conn: Optional[Any] = None) -> bool:
+        """Remove all binary storage resources (e.g. bucket, prefix) associated with a catalog.
+
+        This is the uniform teardown entry point for binary storage, parallel to the
+        ``drop_storage`` contract on the four metadata-tier entity-store protocols
+        (AssetStore, CollectionItemsStore, CollectionStore, CatalogStore).
+
+        Returns True when cleanup completed (idempotent — a missing bucket/resource
+        is a no-op success, not a failure).
+        """
         ...
 
     async def get_collection_storage_path(self, catalog_id: str, collection_id: str) -> Optional[str]:

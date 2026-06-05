@@ -793,58 +793,71 @@ class BucketService:
 
         await run_in_thread(_delete_notification)
 
-    async def delete_storage_for_catalog(
+    async def drop_storage(
         self, catalog_id: str, conn: Optional[DbResource] = None
-    ):
-        """
-        Deletes the bucket associated with the catalog.
+    ) -> bool:
+        """Remove the GCS bucket and its DB link for a catalog.
+
+        Implements the ``StorageProtocol.drop_storage`` contract.  Idempotent:
+        a missing bucket or already-deleted DB row is a no-op success.
+        Returns True when cleanup completed successfully.
+
+        Raises on unexpected GCS errors so callers can retry.
         """
         bucket_name = await self.get_storage_identifier(catalog_id)
 
-        # Fallback: if DB record is gone (e.g. CASCADE delete), try deterministic name
+        # Fallback: if DB record is gone (e.g. schema already dropped), try deterministic name.
         if not bucket_name:
             try:
                 bucket_name = self.generate_bucket_name(catalog_id)
                 logger.info(
-                    f"Bucket DB record not found for '{catalog_id}'. Attempting deletion using deterministic name: '{bucket_name}'"
+                    "BucketService.drop_storage: DB record missing for %r; "
+                    "falling back to deterministic bucket name %r.",
+                    catalog_id, bucket_name,
                 )
             except Exception as e:
                 logger.warning(
-                    f"Could not determine bucket name for catalog '{catalog_id}': {e}"
+                    "BucketService.drop_storage: cannot determine bucket name "
+                    "for catalog %r: %s",
+                    catalog_id, e,
                 )
-                return
+                return True  # Nothing to clean up.
 
         if not bucket_name:
-            return
+            return True  # No bucket provisioned; idempotent success.
 
         try:
-            # First, delete from DB link (idempotent)
+            # Delete DB link first (idempotent — no-op if already gone).
             async with managed_transaction(self.engine) as conn:
                 await gcp_db.DDLQuery(
-                    f"DELETE FROM gcp.catalog_buckets WHERE catalog_id = :catalog_id"
+                    "DELETE FROM gcp.catalog_buckets WHERE catalog_id = :catalog_id"
                 ).execute(conn, catalog_id=catalog_id)
 
-            # Then force delete the bucket (including contents)
-            # This handles "NotFound" gracefully usually (or we should check)
+            # Force-delete the bucket (empties objects then deletes the bucket).
             try:
                 await bucket_tool.delete_bucket(
                     bucket_name, force=True, client=self.storage_client
                 )
                 logger.info(
-                    f"Successfully deleted bucket '{bucket_name}' for catalog '{catalog_id}'."
+                    "BucketService.drop_storage: deleted bucket %r for catalog %r.",
+                    bucket_name, catalog_id,
                 )
             except Exception as e:
-                # If it doesn't exist, that's fine
                 from google.api_core.exceptions import NotFound
-
                 if "404" in str(e) or isinstance(e, NotFound):
-                    logger.info(f"Bucket '{bucket_name}' already deleted or not found.")
+                    logger.info(
+                        "BucketService.drop_storage: bucket %r already absent for catalog %r.",
+                        bucket_name, catalog_id,
+                    )
                 else:
                     raise
 
+            return True
+
         except Exception as e:
             logger.error(
-                f"Failed to delete bucket '{bucket_name}' for catalog '{catalog_id}': {e}",
+                "BucketService.drop_storage: failed to remove bucket %r for catalog %r: %s",
+                bucket_name, catalog_id, e,
                 exc_info=True,
             )
             raise

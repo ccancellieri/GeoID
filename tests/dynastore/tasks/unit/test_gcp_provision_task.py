@@ -307,14 +307,13 @@ def test_storage_without_setup_method_falls_back():
 @pytest.mark.asyncio
 async def test_destroy_task_invokes_typed_destruction():
     """GcpDestroyCatalogTask must call EventingProtocol.teardown_catalog_eventing
-    AND StorageProtocol.delete_storage_for_catalog directly — previously these
-    were getattr-dispatched to non-existent methods and silently no-opped.
-    Path A bug-fix regression guard.
+    AND StorageProtocol.drop_storage directly — previously these were getattr-dispatched
+    to non-existent methods and silently no-opped.  Path A bug-fix regression guard.
     """
     from dynastore.tasks.gcp_provision.task import GcpDestroyCatalogTask
 
     mock_storage = MagicMock()
-    mock_storage.delete_storage_for_catalog = AsyncMock(return_value=True)
+    mock_storage.drop_storage = AsyncMock(return_value=True)
 
     mock_eventing = MagicMock()
     mock_eventing.teardown_catalog_eventing = AsyncMock(return_value=None)
@@ -339,5 +338,5 @@ async def test_destroy_task_invokes_typed_destruction():
         result = await task.run(_make_payload("destroy_test_cat"))
 
     mock_eventing.teardown_catalog_eventing.assert_awaited_once_with("destroy_test_cat")
-    mock_storage.delete_storage_for_catalog.assert_awaited_once_with("destroy_test_cat")
+    mock_storage.drop_storage.assert_awaited_once_with("destroy_test_cat")
     assert result["status"] == "destroyed"
