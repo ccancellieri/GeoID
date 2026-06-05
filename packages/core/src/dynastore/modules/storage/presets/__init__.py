@@ -50,6 +50,8 @@ from .registry import find_preset, get_preset, list_presets, register_preset, se
 from .bundle_preset import BundlePreset  # noqa: F401
 
 # Built-in presets — auto-register on import.
+from .assets_gcs_uploads import AssetsGcsUploadsPreset  # noqa: E402
+from .assets_local_only import AssetsLocalOnlyPreset, _local_backend_available  # noqa: E402
 from .defaults_postgres import DefaultsPostgresPreset  # noqa: E402
 from .demo_data import DEMO_DATA_PRESET  # noqa: E402
 from .items_es_private import ItemsEsPrivatePreset  # noqa: E402
@@ -65,6 +67,10 @@ register_preset(PrivateCollectionPreset())
 register_preset(ItemsEsPrivatePreset())
 register_preset(DEMO_DATA_PRESET)
 register_preset(StacPreset())
+register_preset(AssetsGcsUploadsPreset())
+# ``assets_local_only`` is on-prem only: only register when GCS is absent.
+if _local_backend_available():
+    register_preset(AssetsLocalOnlyPreset())
 
 # Curated composite presets — imported after all routing presets so their
 # children are already registered when the composites/__init__.py runs.
@@ -81,6 +87,8 @@ except Exception:  # noqa: BLE001
 
 __all__ = [
     "AppliedDescriptor",
+    "AssetsGcsUploadsPreset",
+    "AssetsLocalOnlyPreset",
     "BundlePreset",
     "CompositePreset",
     "DefaultsPostgresPreset",
