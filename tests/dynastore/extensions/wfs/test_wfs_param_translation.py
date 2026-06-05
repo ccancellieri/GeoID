@@ -12,6 +12,7 @@ pytest.importorskip("pyproj")  # SCOPE gate: wfs_service imports pyproj at modul
 
 from dynastore.extensions.wfs.wfs_service import (  # noqa: E402
     wfs_property_names,
+    wfs_skip_geometry,
     wfs_sortby_to_ogc,
 )
 
@@ -76,3 +77,47 @@ def test_property_names_empty_or_none_is_none():
     assert wfs_property_names(None) is None
     assert wfs_property_names("") is None
     assert wfs_property_names("  ,  ") is None
+
+
+def test_property_names_drops_geometry_aliases_from_projection():
+    # Geometry is not a ``properties`` member; naming it must not pollute the
+    # attribute projection (would otherwise try to SELECT a ``geom`` attribute).
+    assert wfs_property_names("geoid,geom,NAME") == ["geoid", "NAME"]
+    assert wfs_property_names("NAME,geometry") == ["NAME"]
+
+
+def test_property_names_geometry_only_returns_none():
+    # Only the geometry was named -> nothing left to narrow on attributes.
+    assert wfs_property_names("geom") is None
+    assert wfs_property_names("the_geom") is None
+
+
+# --- wfs_skip_geometry -------------------------------------------------------
+
+def test_skip_geometry_attributes_wildcard_omits_geometry():
+    # ``geoid,attributes.*`` selects attributes only; geometry is not an
+    # attribute, so the WFS client did not ask for it -> skip it. This is the
+    # regression: geometry must NOT come back for an attributes-only projection.
+    assert wfs_skip_geometry("geoid,attributes.*") is True
+
+
+def test_skip_geometry_concrete_attribute_projection_omits_geometry():
+    assert wfs_skip_geometry("geoid,NAME,CODE") is True
+
+
+def test_skip_geometry_named_geometry_keeps_it():
+    assert wfs_skip_geometry("geoid,geom") is False
+    assert wfs_skip_geometry("NAME,geometry") is False
+    assert wfs_skip_geometry("the_geom") is False
+
+
+def test_skip_geometry_bare_star_keeps_geometry():
+    # ``*`` means the whole feature -> geometry retained.
+    assert wfs_skip_geometry("*") is False
+
+
+def test_skip_geometry_no_projection_keeps_geometry():
+    # No ``PROPERTYNAME`` at all -> historical "return everything" behaviour.
+    assert wfs_skip_geometry(None) is False
+    assert wfs_skip_geometry("") is False
+    assert wfs_skip_geometry("  ,  ") is False

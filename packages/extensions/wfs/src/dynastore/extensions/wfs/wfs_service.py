@@ -91,6 +91,13 @@ def wfs_sortby_to_ogc(sort_by_str: Optional[str]) -> Optional[str]:
     return ",".join(clauses) if clauses else None
 
 
+# Names a WFS client uses to refer to the geometry property in ``PROPERTYNAME``.
+# Geometry is governed separately from attribute projection (it becomes
+# ``Feature.geometry``, not a ``properties`` member), so these are stripped from
+# the projection list and instead drive the ``skip_geometry`` decision.
+_WFS_GEOMETRY_PROPERTY_ALIASES = frozenset({"geom", "geometry", "the_geom"})
+
+
 def wfs_property_names(property_name_str: Optional[str]) -> Optional[list]:
     """Resolve a WFS ``PROPERTYNAME`` value into a concrete projection list.
 
@@ -101,6 +108,9 @@ def wfs_property_names(property_name_str: Optional[str]) -> Optional[list]:
     narrow the projection at all (return ``None`` -> all properties), preserving
     the historical "return everything" behaviour. A purely concrete list is
     passed through so explicit field selection still works.
+
+    Geometry property aliases are dropped from the returned list — geometry is
+    not a ``properties`` member and is governed by :func:`wfs_skip_geometry`.
     """
     if not property_name_str:
         return None
@@ -111,7 +121,35 @@ def wfs_property_names(property_name_str: Optional[str]) -> Optional[list]:
     if has_wildcard:
         # ``attributes.*`` / ``*`` -> no narrowing; return the full feature.
         return None
-    return names
+    concrete = [n for n in names if n.lower() not in _WFS_GEOMETRY_PROPERTY_ALIASES]
+    # If the only token was the geometry property, there is nothing left to
+    # narrow -> return all attribute properties (geometry handled separately).
+    return concrete or None
+
+
+def wfs_skip_geometry(property_name_str: Optional[str]) -> bool:
+    """Decide whether a WFS ``PROPERTYNAME`` selection excludes the geometry.
+
+    WFS ``PROPERTYNAME`` enumerates exactly the properties to return, so the
+    geometry is emitted only when it is explicitly named (or when no projection
+    is requested at all). ``attributes.*`` selects every *attribute* — geometry
+    is not an attribute — so it omits the geometry. A bare ``*`` means the whole
+    feature and keeps the geometry.
+
+    Returns ``True`` when the geometry should be omitted (``skip_geometry``).
+    """
+    if not property_name_str:
+        return False
+    names = [p.strip().lower() for p in property_name_str.split(",") if p.strip()]
+    if not names:
+        return False
+    if "*" in names:
+        # Whole-feature wildcard keeps the geometry.
+        return False
+    if any(n in _WFS_GEOMETRY_PROPERTY_ALIASES for n in names):
+        return False
+    # A projection was requested and it did not name the geometry -> omit it.
+    return True
 
 
 class WFSGlobalExceptionHandler(ExceptionHandler):
@@ -552,10 +590,15 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
 
         # WFS ``propertyName`` -> the shared driver-level projection
         # (``select_fields``), exactly as features/records/STAC narrow their
-        # attribute output. Geometry is governed separately and is retained.
-        # A namespace wildcard (``attributes.*`` / ``*``) means "all
-        # attributes" -> no narrowing (see ``wfs_property_names``).
+        # attribute output. A namespace wildcard (``attributes.*`` / ``*``)
+        # means "all attributes" -> no narrowing (see ``wfs_property_names``).
         property_names = wfs_property_names(property_name_str)
+
+        # Geometry is a property under WFS ``PROPERTYNAME`` semantics: it is
+        # returned only when explicitly named (or when no projection is given).
+        # ``propertyName=geoid,attributes.*`` selects attributes, not geometry,
+        # so omit the geometry in that case.
+        wfs_skip_geom = wfs_skip_geometry(property_name_str)
 
         # WFS ``SORTBY`` uses ``field ASC|DESC``; translate to the OGC
         # ``[+-]field`` form the shared parser expects.
@@ -572,6 +615,7 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             bbox_crs_srid=bbox_crs_srid,
             include_total_count=True,
             select_fields=property_names,
+            skip_geometry=wfs_skip_geom,
         )
 
         target_namespace_url = f"{root_wfs_url}/{schema_prefix}"

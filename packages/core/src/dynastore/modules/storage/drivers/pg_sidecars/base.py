@@ -86,6 +86,12 @@ HUB_INTERNAL_COLUMNS: frozenset = frozenset({
     "catalog_id",
     "collection_id",
     "geometry_hash",
+    # ``COUNT(*) OVER() AS _total_count`` — the pagination total injected by
+    # ``QueryOptimizer.build_optimized_query`` when ``include_total_count`` is
+    # set. It rides every streamed row purely as transport for the total and
+    # must never surface on the Feature (neither in ``properties`` nor as a
+    # top-level foreign member); the page consumer reads it off the row.
+    "_total_count",
 })
 
 
