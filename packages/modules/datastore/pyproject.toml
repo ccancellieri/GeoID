@@ -1,0 +1,57 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../../LICENSE.
+#
+# dynastore-module-datastore — thin packaging wheel for the sync-DB module.
+#
+# This wheel carries no source of its own: the DatastoreModule implementation
+# lives in dynastore-core (packages/core/src/dynastore/modules/datastore/).
+# Its sole purpose is to register the `datastore` entry-point under the
+# `dynastore.modules` group so that the discovery loop in
+# `dynastore.tools.discovery` loads DatastoreModule ONLY on services whose
+# SCOPE explicitly pulls in `module_datastore`.
+#
+# Why a separate wheel?  `dynastore-core` is always installed (every service
+# depends on it), so any entry-point declared there is always present in
+# importlib.metadata.  When `pyiceberg[sql-postgres]` (part of `drivers_grp`
+# used by `scope_catalog` / `scope_geoid`) transitively installs
+# psycopg2-binary, the top-level psycopg2 import in datastore_service.py
+# succeeds and the module is unexpectedly discovered on API/catalog services.
+# Moving the entry-point here ensures it is absent from importlib.metadata on
+# those services — which never install `module_datastore` — regardless of
+# which transitive deps land in their image.  See refs #1748.
+#
+# Sync-worker tasks (task_base -> db_sync -> module_datastore) DO install this
+# wheel via that extras chain and therefore DO get the entry-point registered.
+
+[project]
+name = "dynastore-module-datastore"
+dynamic = ["version"]
+description = "DynaStore DatastoreModule entry-point — sync psycopg2 engine for worker tasks."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+# The heavy runtime deps (psycopg2-binary, sqlalchemy) are pulled in by the
+# `module_datastore` extra in the root meta-package; they are NOT listed here
+# to avoid duplicating the version constraints in two places.
+dependencies = [
+    "dynastore-core",
+]
+
+# Entry-point declaration — the only reason this wheel exists.
+# Source is in packages/core/src/dynastore/modules/datastore/datastore_service.py
+# (always importable because dynastore-core is a dependency of every service).
+[project.entry-points."dynastore.modules"]
+datastore = "dynastore.modules.datastore.datastore_service:DatastoreModule"
+
+[build-system]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+# No source in this wheel — the implementation ships in dynastore-core.
+[tool.setuptools]
+packages = []
+
+[tool.uv.sources]
+dynastore-core = { workspace = true }
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"
