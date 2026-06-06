@@ -160,6 +160,61 @@ def _assert_stac_capable_collection_stack() -> None:
         )
 
 
+# Fields declared in STACCollectionRequest as explicit typed fields.
+# Everything NOT in this set that appears in model_dump(extra="allow") is a
+# STAC extension extra (e.g. cube:dimensions, themes, sci:citation, bands).
+# providers and summaries are declared but stored in collection_stac, which
+# requires StacStorageConfig to be active; we also fold them into extra_metadata
+# as a fallback so they survive catalogs where collection_stac is not active.
+_STAC_REQUEST_SCHEMA_FIELDS = frozenset({
+    "type", "stac_version", "stac_extensions", "id",
+    "title", "description", "keywords", "license",
+    "providers", "extent", "summaries",
+    "assets", "item_assets", "links", "extra_metadata",
+})
+
+
+def _pack_stac_extras(input_data: Dict[str, Any], language: str) -> Dict[str, Any]:
+    """Move STAC extras and declared-but-stac-only fields into extra_metadata.
+
+    Fields not in ``_STAC_REQUEST_SCHEMA_FIELDS`` are STAC extension extras
+    (``cube:dimensions``, ``themes``, ``sci:citation``, etc.).  They are
+    never stored in the core PG column set, so we fold them into
+    ``extra_metadata`` where the read path already exposes them via
+    ``collection.extra_fields`` (stac_generator lines 512-517).
+
+    ``providers`` and ``summaries`` ARE in ``collection_stac``, but that
+    sidecar is gated by ``StacStorageConfig``.  Folding them into
+    ``extra_metadata`` as well makes them round-trip even without the preset,
+    via the fallback in ``stac_generator.create_collection``.
+    """
+    extras: Dict[str, Any] = {}
+    # Collect non-schema STAC extension extras
+    for key in list(input_data.keys()):
+        if key not in _STAC_REQUEST_SCHEMA_FIELDS:
+            extras[key] = input_data.pop(key)
+    # Fold providers/summaries into extras as fallback storage
+    for key in ("providers", "summaries"):
+        if key in input_data and input_data[key] is not None:
+            extras[key] = input_data[key]
+    if not extras:
+        return input_data
+    # Merge into existing extra_metadata or create it
+    existing = input_data.get("extra_metadata")
+    if isinstance(existing, dict):
+        from dynastore.models.localization import _LANGUAGE_METADATA
+        if any(k in _LANGUAGE_METADATA for k in existing):
+            # Already language-keyed: merge into the request language bucket
+            bucket = existing.setdefault(language, {})
+            bucket.update(extras)
+        else:
+            # Flat dict — merge directly; wrap_extra_metadata will language-key it
+            existing.update(extras)
+    else:
+        input_data["extra_metadata"] = extras
+    return input_data
+
+
 STAC_API_URIS = [
     "https://api.stacspec.org/v1.0.0/core",
     "https://api.stacspec.org/v1.0.0/item-search",
@@ -667,6 +722,11 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             # Write-time STAC validation (lenient — warnings only; pystac/stac-pydantic
             # are too strict on optional fields like `links` to gate the request).
             validate_stac_collection(input_data)
+            # Fold STAC extras (cube:dimensions, themes, sci:citation, …) and the
+            # declared-but-stac-only fields (providers, summaries) into extra_metadata
+            # so they round-trip via collection_core even when collection_stac is not
+            # active (no StacStorageConfig applied to the catalog).
+            input_data = _pack_stac_extras(input_data, language)
             return await self._ogc_create_collection(
                 catalog_id, input_data, language, None
             )
@@ -743,6 +803,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             )
         input_data = request_body.model_dump(exclude_unset=False)
         validate_stac_collection(input_data)
+        input_data = _pack_stac_extras(input_data, language)
         input_data = normalize_i18n_for_replace(input_data, language)
         return await self._ogc_replace_collection(
             catalog_id, collection_id, input_data, language
@@ -758,6 +819,9 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         # Sidecars are handled transparently by ItemsProtocol / LifecycleRegistry.
         input_data = request_body.model_dump(exclude_unset=True)
+        # Fold any STAC extension extras in the PATCH payload (cube:dimensions,
+        # themes, …) and providers/summaries into extra_metadata for round-trip.
+        input_data = _pack_stac_extras(input_data, language)
         return await self._ogc_update_collection(
             catalog_id, collection_id, input_data, language, request
         )

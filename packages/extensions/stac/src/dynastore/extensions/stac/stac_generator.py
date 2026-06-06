@@ -63,6 +63,48 @@ SUPPORTED_STAC_EXTENSIONS = [
 ]
 
 
+def _apply_extra_metadata_fallbacks(
+    collection: "pystac.Collection",
+    merged_summaries: Dict[str, Any],
+) -> None:
+    """Resolve providers/summaries from extra_fields when the collection_stac
+    PG sidecar is not active.
+
+    Write-path: ``_pack_stac_extras`` (stac_service) folds them into
+    ``extra_metadata``.  Read-path: the generator copies ``extra_metadata``
+    content into ``collection.extra_fields``; this helper then promotes the
+    typed pystac fields and removes the duplicates so they are not
+    double-serialized by the ``stac_top_level`` cleanup that follows.
+
+    When ``collection.providers`` / ``collection.summaries`` are already set
+    (from the ``collection_stac`` sidecar) the fallback is skipped and the
+    duplicate key is still removed from ``extra_fields``.
+    """
+    if collection.providers is None:
+        extra_providers = collection.extra_fields.pop("providers", None)
+        if extra_providers and isinstance(extra_providers, list):
+            collection.providers = [
+                pystac.Provider(**p) if isinstance(p, dict) else p
+                for p in extra_providers
+            ]
+    else:
+        collection.extra_fields.pop("providers", None)
+
+    # pystac always initialises summaries to an empty Summaries(), never None.
+    # Use is_empty() to distinguish "no data yet" from "already populated".
+    summaries_empty = collection.summaries is None or collection.summaries.is_empty()
+    if summaries_empty:
+        extra_summaries = collection.extra_fields.pop("summaries", None)
+        if extra_summaries and isinstance(extra_summaries, dict):
+            if not merged_summaries:
+                collection.summaries = pystac.Summaries(extra_summaries)
+            else:
+                merged_summaries.update(extra_summaries)
+                collection.summaries = pystac.Summaries(merged_summaries)
+    else:
+        collection.extra_fields.pop("summaries", None)
+
+
 async def create_root_catalog(request: Request, lang: str = "en") -> Dict[str, Any]:
     """Generates the root STAC Catalog."""
     # NOTE: derive from get_root_url (includes ``root_path``) rather than
@@ -509,12 +551,20 @@ async def create_collection(
     if "languages" in meta_dict:
         collection.extra_fields["languages"] = meta_dict["languages"]
 
-    # Merge localized extra metadata into collection extra fields
+    # Merge localized extra metadata into collection extra fields.
+    # This path surfaces STAC extras (cube:dimensions, themes, sci:citation, …)
+    # stored by _pack_stac_extras at write time, as well as any other custom
+    # metadata the operator placed in extra_metadata directly.
     if "extra_metadata" in meta_dict and isinstance(meta_dict["extra_metadata"], dict):
         extra = meta_dict["extra_metadata"]
         for k, v in extra.items():
             if k not in ["language", "languages"]:
                  collection.extra_fields[k] = v
+
+    # Fallback: resolve providers / summaries from extra_metadata when the
+    # collection_stac PG sidecar is not active.  The helper also handles the
+    # case where they ARE set (sidecar active) by dropping the duplicate key.
+    _apply_extra_metadata_fallbacks(collection, merged_summaries)
 
     # Add datacube dimensions and variables from config
     if stac_config.cube_dimensions:
