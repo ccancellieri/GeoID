@@ -98,7 +98,7 @@ async def test_resolve_timeout_falls_back_to_platform_default(monkeypatch):
     target = RunnerTarget(runner="background", options={})  # no per-target timeout
     _patch_resolver(monkeypatch, targets=[target], selected=target)
 
-    result = await execution.resolve_routing_terminal("outbox_drain")
+    result = await execution.resolve_routing_terminal("index_drain")
     assert result.timeout_seconds == 3600.0
 
 

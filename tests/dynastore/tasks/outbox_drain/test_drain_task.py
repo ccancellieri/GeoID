@@ -288,3 +288,32 @@ async def test_outbox_drain_unconfigured_drain_raises():
     task = OutboxDrainTask()
     with pytest.raises(RuntimeError, match="not configured: missing"):
         await task.drain_once()
+
+
+def test_outbox_drain_task_type_is_index_drain():
+    """task_type must be 'index_drain' after the Phase 0 rename.
+
+    'outbox_drain' collided with the event-consumer routing key.  The new
+    name 'index_drain' unambiguously describes this task's role (draining
+    the storage_outbox into the ES index).
+    """
+    assert OutboxDrainTask.task_type == "index_drain", (
+        "OutboxDrainTask.task_type must be 'index_drain'; 'outbox_drain' was "
+        "the overloaded pre-rename value that collided with EVENT_TASK_KEY."
+    )
+
+
+def test_outbox_drain_task_legacy_alias_present():
+    """legacy_task_types must include 'outbox_drain' for the one-release shim.
+
+    The dispatcher's get_task_config() resolves legacy aliases so that rows
+    written with task_type='outbox_drain' before the rename are still
+    dispatched to OutboxDrainTask.  Remove once all old rows are drained.
+    """
+    assert hasattr(OutboxDrainTask, "legacy_task_types"), (
+        "OutboxDrainTask must declare legacy_task_types for the shim."
+    )
+    assert "outbox_drain" in OutboxDrainTask.legacy_task_types, (
+        "'outbox_drain' must appear in legacy_task_types so that old DB rows "
+        "continue to be claimed by OutboxDrainTask."
+    )

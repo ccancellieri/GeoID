@@ -67,7 +67,12 @@ class OutboxDrainTask(TaskProtocol):
     """
 
     priority: int = 100
-    task_type = "outbox_drain"
+    task_type = "index_drain"
+    # One-release legacy alias so that the task dispatcher and routing
+    # config lookup can still resolve rows / config entries written before
+    # the Phase 0 rename.  Remove once every deployment has drained all
+    # rows with the old task_type value and re-applied routing config.
+    legacy_task_types: frozenset[str] = frozenset({"outbox_drain"})
 
     def __init__(
         self,

@@ -63,7 +63,7 @@ async def _yield_to_async_writer(catalog_id: str) -> None:
     Items POSTed via STAC are written PG-first; a sibling row is
     atomically enqueued into ``storage_outbox`` for the ES driver. The
     in-process test harness does not run the Cloud Run Job that owns
-    ``outbox_drain``, so we step into the drain pathway directly here
+    ``index_drain``, so we step into the drain pathway directly here
     before flushing the index (#614).
     """
     # No need for an explicit ``asyncio.sleep(0)`` — ``drain_es_items_outbox``

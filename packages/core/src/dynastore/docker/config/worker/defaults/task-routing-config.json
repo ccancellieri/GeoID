@@ -1,0 +1,20 @@
+{
+  "class_key": "task_routing_config",
+  "value": {
+    "tasks": {
+      "event_drain": [
+        {
+          "runner": "background",
+          "consumers": ["catalog"]
+        }
+      ],
+      "index_drain": [
+        {
+          "runner": "background",
+          "consumers": ["worker"]
+        }
+      ]
+    },
+    "processes": {}
+  }
+}

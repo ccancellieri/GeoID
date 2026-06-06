@@ -87,7 +87,11 @@ from dynastore.modules.catalog.log_manager import LogService, initialize_system_
 logger = logging.getLogger(__name__)
 
 
-EVENT_TASK_KEY = "outbox_drain"
+EVENT_TASK_KEY = "event_drain"
+# One-release backward-compat alias: routing config rows written before
+# the Phase 0 rename used "outbox_drain" as the event-consumer routing
+# key.  Remove once all deployments have applied the new routing config.
+_LEGACY_EVENT_TASK_KEY = "outbox_drain"
 
 
 async def _routed_consumers(task_key: str) -> Optional[List[str]]:
@@ -129,8 +133,16 @@ async def is_event_consumer() -> bool:
     want to restrict draining to a dedicated worker tier (e.g. on-prem
     ``worker`` job).  It must never be the only line of defence against
     connection storms — that role belongs to the lock.
+
+    Legacy shim: also checks the pre-rename key ``"outbox_drain"`` so that
+    deployments with a stored routing config written before the Phase 0
+    rename continue to honour their consumer pin.  Remove the legacy fallback
+    once all stored configs have been migrated to ``"event_drain"``.
     """
     consumers = await _routed_consumers(EVENT_TASK_KEY)
+    if consumers is None:
+        # New key had no opinion; try the legacy key.
+        consumers = await _routed_consumers(_LEGACY_EVENT_TASK_KEY)
     if consumers is None:
         # No routing opinion: every CatalogModule-bearing process is eligible.
         # The advisory lock ensures only one drains.

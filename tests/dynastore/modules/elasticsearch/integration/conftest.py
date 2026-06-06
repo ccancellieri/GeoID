@@ -52,7 +52,7 @@ async def drain_es_items_outbox(catalog_id: str) -> int:
     """Drive the ES items OUTBOX drain in-process until the queue is empty.
 
     Production runs the drain inside a separate Cloud Run Job whose
-    ``CapabilityMap`` advertises ``outbox_drain``; the in-process test
+    ``CapabilityMap`` advertises ``index_drain``; the in-process test
     harness never claims that task, so a STAC POST's atomically-enqueued
     ``OutboxDrainTask`` sits forever and a follow-up ``refresh + search``
     hits an empty index (#614). We open a dedicated asyncpg connection,
