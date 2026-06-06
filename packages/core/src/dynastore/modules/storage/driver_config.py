@@ -1898,15 +1898,19 @@ ItemsElasticsearchDriverConfig.register_validate_handler(_validate_items_es_driv
 # driver layering inversion).
 _PRIVATE_RESERVED_ROOT_FIELDS: Tuple[str, ...] = (
     "geoid",
+    "id",
     "catalog_id",
     "collection_id",
+    "collection",
     "external_id",
     "asset_id",
     "geometry",
     "bbox",
-    "simplification_factor",
-    "simplification_mode",
     "properties",
+    "system",
+    "stats",
+    "metadata",
+    "access",
     "extras",
 )
 

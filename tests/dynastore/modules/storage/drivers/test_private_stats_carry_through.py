@@ -331,3 +331,88 @@ class TestPrivateDocRoundTrip:
             doc, _CAT, _COL, doc.get("id"),
         )
         assert str(feature.id) == _GEOID
+
+    def test_round_trip_geoid_alias_at_root_for_canonical_docs(self):
+        """Canonical docs (post-#1828) must carry ``geoid`` at root alongside ``id``.
+
+        ``build_tenant_feature_doc`` adds a ``geoid`` root alias equal to ``id``
+        so PRIVATE_ENVELOPE_FIELDS structural queries (targeting ``geoid``) can
+        find canonical private docs, and ``_private_source_to_feature`` never
+        reconstructs a feature with id=None from the search path.
+        """
+        from dynastore.modules.storage.drivers.elasticsearch_private.doc_builder import (
+            build_tenant_feature_doc,
+        )
+        from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
+            ItemsElasticsearchPrivateDriver,
+        )
+
+        item = _make_item_with_flat_stats(s2_res12="89c25a3ffffffff")
+        doc = build_tenant_feature_doc(item, catalog_id=_CAT, collection_id=_COL)
+
+        # The canonical doc must have both ``id`` and ``geoid`` at root.
+        assert doc.get("id") == _GEOID, f"id missing or wrong: {doc.get('id')!r}"
+        assert doc.get("geoid") == _GEOID, (
+            f"geoid alias missing or wrong: {doc.get('geoid')!r}"
+        )
+        assert doc["id"] == doc["geoid"], "id and geoid alias must be equal"
+
+        # Simulate the search path: ES hit passes _id as fallback, not src.get("geoid").
+        # _private_source_to_feature must prefer ``geoid`` at root (canonical alias)
+        # so Feature.id is always the correct geoid.
+        feature_from_search = ItemsElasticsearchPrivateDriver._private_source_to_feature(
+            doc, _CAT, _COL, "es-hit-fallback-id",
+        )
+        assert str(feature_from_search.id) == _GEOID, (
+            f"Search-path round-trip: Feature.id must be the geoid, "
+            f"got {feature_from_search.id!r}"
+        )
+
+    def test_round_trip_id_from_id_field_when_geoid_alias_missing(self):
+        """``_private_source_to_feature`` falls back to ``source['id']`` when
+        ``source['geoid']`` is absent (docs written without the alias).
+
+        This covers the transition window: docs written by old code that only
+        set ``id`` at root (no ``geoid`` alias). The fallback chain is:
+        ``geoid`` → ``id`` → caller-supplied fallback.
+        """
+        from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
+            ItemsElasticsearchPrivateDriver,
+        )
+
+        # Simulate a canonical doc that has ``id`` but no ``geoid`` alias.
+        source_without_geoid_alias = {
+            "id": _GEOID,
+            "catalog_id": _CAT,
+            "collection_id": _COL,
+            "properties": {"name": "Rome"},
+            "geometry": {"type": "Point", "coordinates": [12.5, 41.9]},
+        }
+        feature = ItemsElasticsearchPrivateDriver._private_source_to_feature(
+            source_without_geoid_alias, _CAT, _COL, "es-fallback",
+        )
+        assert str(feature.id) == _GEOID, (
+            f"Fallback to 'id' field failed: got {feature.id!r}"
+        )
+
+    def test_round_trip_falls_back_to_caller_id_when_both_root_keys_absent(self):
+        """``_private_source_to_feature`` uses the caller-supplied fallback
+        when neither ``geoid`` nor ``id`` is present in the source dict
+        (corrupt / minimal doc — defensive fallback).
+        """
+        from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
+            ItemsElasticsearchPrivateDriver,
+        )
+
+        # Pre-canonical legacy doc: only ``catalog_id``/``collection_id`` at root.
+        minimal_source = {
+            "catalog_id": _CAT,
+            "collection_id": _COL,
+            "properties": {"name": "x"},
+        }
+        feature = ItemsElasticsearchPrivateDriver._private_source_to_feature(
+            minimal_source, _CAT, _COL, "caller-supplied-geoid",
+        )
+        assert str(feature.id) == "caller-supplied-geoid", (
+            f"Fallback to caller-supplied id failed: got {feature.id!r}"
+        )

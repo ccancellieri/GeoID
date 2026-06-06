@@ -13,19 +13,22 @@
 #    limitations under the License.
 
 """TDD tests for Plan Task 6 — converge private builder onto canonical envelope
-(refs #1800).
+(refs #1800/#1828).
 
 Pins:
   1. ``build_tenant_feature_doc`` produces a canonical envelope shape:
-     - ``id`` == geoid (not ``geoid`` at root as a separate key).
+     - ``id`` == geoid (canonical identity, always present).
+     - ``geoid`` alias at root equals ``id`` (for PRIVATE_ENVELOPE_FIELDS
+       backward-compat: private queries target ``geoid`` root field).
      - ``properties`` contains only user attrs (no SYSTEM_FIELD_KEYS).
      - ``stats`` section present when sidecars produce values.
      - ``system`` section present for SYSTEM_FIELD_KEYS values.
      - ``_external_id`` tracker present when external_id supplied.
   2. Private mapping mirrors ``build_item_mapping``'s canonical containers
      (stats/system nested objects; properties typed for declared keys).
-  3. Private differs from public ONLY by target index/alias — same
-     canonical _source shape.
+  3. Private differs from public only by the ``geoid`` root alias (private only)
+     — all canonical sections (id, system, stats, properties, geometry) are
+     byte-identical for the same input.
 """
 from __future__ import annotations
 
@@ -92,10 +95,14 @@ class TestBuildTenantFeatureDocCanonical:
     """``build_tenant_feature_doc`` must produce the canonical envelope shape,
     not the old flat-geoid + properties-inclusive shape."""
 
-    def test_id_is_geoid_not_separate_geoid_key(self):
-        """``id`` in the returned doc must equal the geoid; the old top-level
-        ``geoid`` key (distinct from ``id``) must not appear unless it is
-        inside ``system``."""
+    def test_id_and_geoid_alias_equal_geoid(self):
+        """``id`` and ``geoid`` in the returned doc must both equal the geoid.
+
+        ``id`` is the canonical identity field (set by build_canonical_index_doc).
+        ``geoid`` is a root alias written by build_tenant_feature_doc so that
+        PRIVATE_ENVELOPE_FIELDS structural queries (which target the ``geoid``
+        root field) can find canonical private docs.
+        """
         from dynastore.modules.storage.drivers.elasticsearch_private.doc_builder import (
             build_tenant_feature_doc,
         )
@@ -107,6 +114,9 @@ class TestBuildTenantFeatureDocCanonical:
         )
         assert doc.get("id") == _GEOID, (
             f"doc['id'] must be the geoid; got {doc.get('id')!r}"
+        )
+        assert doc.get("geoid") == _GEOID, (
+            f"doc['geoid'] alias must equal id/geoid; got {doc.get('geoid')!r}"
         )
 
     def test_properties_user_only_no_system_keys(self):
@@ -189,8 +199,16 @@ class TestBuildTenantFeatureDocCanonical:
         assert doc["system"].get("geoid") == _GEOID
 
     def test_private_and_public_produce_same_source_for_same_input(self):
-        """Private and public canonical docs must be byte-identical for the
-        same canonical input — they differ ONLY by target index/alias."""
+        """Private and public canonical docs share the same canonical sections —
+        identity, geometry, stats, system, properties.
+
+        Private adds a ``geoid`` alias at the document root (in addition to
+        ``id``) so structural queries using PRIVATE_ENVELOPE_FIELDS (which
+        target the ``geoid`` root field for backward compat) can locate
+        canonical docs. The public doc does not carry this alias.
+
+        They differ ONLY by: the ``geoid`` root alias (private only).
+        """
         from dynastore.modules.elasticsearch.canonical_doc import build_canonical_index_doc
 
         ci = _canonical_input_for(_GEOID, _EXTERNAL_ID)
@@ -210,7 +228,7 @@ class TestBuildTenantFeatureDocCanonical:
         )
 
         # Private path — must call build_tenant_feature_doc which should now
-        # delegate to build_canonical_index_doc.
+        # delegate to build_canonical_index_doc and add the geoid root alias.
         from dynastore.modules.storage.drivers.elasticsearch_private.doc_builder import (
             build_tenant_feature_doc,
         )
@@ -221,10 +239,17 @@ class TestBuildTenantFeatureDocCanonical:
             known_fields=known_fields,
         )
 
-        assert public_doc == private_doc, (
-            f"Private doc diverges from public:\n"
+        # Private adds a ``geoid`` alias at root; compare after stripping it.
+        private_doc_without_alias = {k: v for k, v in private_doc.items() if k != "geoid"}
+        assert public_doc == private_doc_without_alias, (
+            f"Private doc (minus geoid alias) diverges from public:\n"
             f"public : {public_doc}\n"
-            f"private: {private_doc}\n"
+            f"private: {private_doc_without_alias}\n"
+        )
+        # The alias must point to the same value as ``id``.
+        assert private_doc.get("geoid") == private_doc.get("id") == _GEOID, (
+            f"Private doc geoid alias must equal id; "
+            f"geoid={private_doc.get('geoid')!r}, id={private_doc.get('id')!r}"
         )
 
 

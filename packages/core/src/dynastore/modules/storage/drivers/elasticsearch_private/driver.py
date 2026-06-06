@@ -354,8 +354,11 @@ class ItemsElasticsearchPrivateDriver(
         for hit in resp.get("hits", {}).get("hits", []):
             try:
                 src = hit["_source"]
+                # Use the ES document ``_id`` (always the geoid) as the
+                # caller-supplied fallback so read never produces a None id even
+                # when the source lacks both ``geoid`` and ``id`` root keys.
                 yield self._private_source_to_feature(
-                    src, catalog_id, collection_id, src.get("geoid"),
+                    src, catalog_id, collection_id, hit.get("_id"),
                 )
             except Exception:
                 pass
@@ -373,6 +376,13 @@ class ItemsElasticsearchPrivateDriver(
         simplification markers) in ``properties`` so callers can detect
         simplification without a separate API — shared by the by-id lookup and
         the structural-search read paths.
+
+        Canonical docs (post-#1800/#1828) carry ``id``=geoid at root with a
+        ``geoid`` alias written by ``build_tenant_feature_doc``. Pre-canonical
+        docs carry only ``geoid`` at root. Both shapes are handled: prefer
+        ``geoid`` (set on all private docs, canonical or legacy), then fall
+        back to ``id`` (canonical only), then ``fallback_id`` (caller-supplied,
+        typically the ES ``_id``).
         """
         props = dict(source.get("properties") or {})
         if "external_id" in source:
@@ -391,9 +401,14 @@ class ItemsElasticsearchPrivateDriver(
                 props["simplification_mode"] = source["simplification_mode"]
         props["catalog_id"] = source.get("catalog_id", catalog_id)
         props["collection_id"] = source.get("collection_id", collection_id)
+        # Resolve the feature id: prefer the ``geoid`` alias written by
+        # build_tenant_feature_doc on all private docs (canonical and legacy),
+        # fall back to ``id`` (canonical shape only), then the caller-supplied
+        # fallback (typically the ES document ``_id``).
+        feature_id = source.get("geoid") or source.get("id") or fallback_id
         return Feature(
             type="Feature",
-            id=source.get("geoid", fallback_id),
+            id=feature_id,
             geometry=source.get("geometry"),
             properties=props,
             bbox=source.get("bbox"),  # type: ignore[call-arg]

@@ -181,11 +181,12 @@ def _build_metadata_container() -> Dict[str, Any]:
 _METADATA_CONTAINER: Dict[str, Any] = _build_metadata_container()
 
 # geometry_simplification typed nested object inside the ``system`` container
-# (refs #1828).  Drivers currently write the flat ``_simplification_factor`` /
-# ``_simplification_mode`` root-level trackers (see COMMON_PROPERTIES below).
-# Those flat fields are KEPT for backward compatibility until drivers migrate in
-# Phase 2.  The typed nested version is added here so new writes can begin
-# populating ``system.geometry_simplification`` without breaking old reads.
+# (refs #1828 Phase 2).  All write paths (public write_entities/index/index_bulk,
+# private write_entities/index/index_bulk/PrivateIndexTask, envelope driver) now
+# use the canonical ``system.geometry_simplification`` container.  The old flat
+# ``_simplification_factor`` / ``_simplification_mode`` root entries in
+# COMMON_PROPERTIES are retained solely so old docs (written before the #1828
+# Phase 2 cutover) remain parseable; new writes never emit them.
 _SYSTEM_GEOMETRY_SIMPLIFICATION: Dict[str, Any] = {
     "dynamic": False,
     "properties": {
@@ -414,11 +415,10 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # Emit the ``system`` container only when there are tagged system fields.
-    # Always inject geometry_simplification into the system container when
-    # system is emitted, so the nested structure is available for new writes
-    # without a mapping update (refs #1828). The flat ``_simplification_factor``
-    # / ``_simplification_mode`` root entries in COMMON_PROPERTIES are kept for
-    # backward compatibility until Phase 2 drivers migrate.
+    # Always inject geometry_simplification into the system container so the
+    # nested structure is available for writes (refs #1828). The flat
+    # ``_simplification_factor`` / ``_simplification_mode`` root entries in
+    # COMMON_PROPERTIES are kept only for old-doc read-back compatibility.
     if system_fields:
         root_properties["system"] = {
             "dynamic": False,

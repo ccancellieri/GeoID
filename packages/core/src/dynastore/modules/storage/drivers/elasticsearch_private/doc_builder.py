@@ -124,7 +124,7 @@ def build_tenant_feature_doc(
     try:
         from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
         if isinstance(item, CanonicalIndexInput):
-            return build_canonical_index_doc(
+            doc = build_canonical_index_doc(
                 item.row,
                 resolved_sidecars=item.resolved_sidecars,
                 known_fields=known_fields or {},
@@ -135,6 +135,13 @@ def build_tenant_feature_doc(
                 user_properties=item.user_properties,
                 access=item.access,
             )
+            # The canonical builder writes ``id``=geoid; private queries
+            # target the ``geoid`` root field (PRIVATE_ENVELOPE_FIELDS).
+            # Write the alias so structural queries and the read inverse
+            # (_private_source_to_feature) can address either name.
+            if "id" in doc and "geoid" not in doc:
+                doc["geoid"] = doc["id"]
+            return doc
     except ImportError:
         pass
 
@@ -220,5 +227,12 @@ def build_tenant_feature_doc(
         existing_stats = doc.get("stats") or {}
         merged = {**flat_stats, **existing_stats}
         doc["stats"] = merged
+
+    # The canonical builder writes ``id``=geoid; private queries target
+    # the ``geoid`` root field (PRIVATE_ENVELOPE_FIELDS). Write the alias
+    # so structural queries and the read inverse (_private_source_to_feature)
+    # can address either name.
+    if "id" in doc and "geoid" not in doc:
+        doc["geoid"] = doc["id"]
 
     return doc
