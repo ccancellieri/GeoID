@@ -28,7 +28,7 @@ async def test_capture_returns_bbox_when_active(monkeypatch):
     async def _active(*_a, **_k):
         return True
 
-    async def _get_item(catalog_id, collection_id, item_id, ctx=None):
+    async def _get_item(catalog_id, collection_id, item_id, **_k):
         return {"id": item_id, "bbox": [12.0, 41.0, 13.0, 42.0]}
 
     monkeypatch.setattr(tcs, "is_tile_cache_active", _active)
