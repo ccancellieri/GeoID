@@ -59,6 +59,13 @@ from dynastore.modules.catalog.lifecycle_manager import LifecycleContext
 
 logger = logging.getLogger(__name__)
 
+# Bounded retry count for create_topic. Concurrent callers hitting the same
+# per-catalog topic (e.g. background lifecycle setup + an explicit
+# setup_catalog_gcp_resources call) can race and receive a 409/Aborted.
+# With base-1s exponential backoff this spans ~31s across 6 attempts
+# (1+2+4+8+16) before giving up.
+_TOPIC_CREATE_MAX_ATTEMPTS = 6
+
 # Bounded retry count for create_subscription. Binding a subscription needs
 # ``pubsub.topics.attachSubscription`` on the topic, which can transiently 403
 # right after the topic + its IAM policy are created (IAM eventual
@@ -228,12 +235,42 @@ class GcpEventingOpsMixin:
         topic_id = managed_config.topic_id or self.generate_default_topic_id(catalog_id)
         topic_path = publisher_client.topic_path(project_id, topic_id)
 
-        try:
-            logger.info(f"Attempting to create topic with path: '{topic_path}'")
-            await run_in_thread(publisher_client.create_topic, name=topic_path)
-            logger.info(f"Created managed Pub/Sub topic: {topic_path}")
-        except google_exceptions.AlreadyExists:
-            logger.debug(f"Managed Pub/Sub topic '{topic_path}' already exists.")
+        # Retry on transient concurrency conflicts (Pub/Sub 409 "raced with
+        # another user request" surfaces as Aborted when two concurrent callers
+        # attempt to create or configure the same topic simultaneously — e.g.
+        # the background lifecycle setup and an explicit setup_catalog_gcp_resources
+        # call overlapping on a shared project).  AlreadyExists is terminal-ok
+        # (idempotent adopt); everything else is re-raised after max attempts.
+        for _attempt in range(1, _TOPIC_CREATE_MAX_ATTEMPTS + 1):
+            try:
+                logger.info(f"Attempting to create topic with path: '{topic_path}'")
+                await run_in_thread(publisher_client.create_topic, name=topic_path)
+                logger.info(f"Created managed Pub/Sub topic: {topic_path}")
+                break
+            except google_exceptions.AlreadyExists:
+                logger.debug(f"Managed Pub/Sub topic '{topic_path}' already exists.")
+                break
+            except (
+                Aborted,
+                google_exceptions.Conflict,
+                google_exceptions.ServiceUnavailable,
+                google_exceptions.InternalServerError,
+                google_exceptions.Unknown,
+            ) as transient_err:
+                if _attempt == _TOPIC_CREATE_MAX_ATTEMPTS:
+                    logger.error(
+                        f"create_topic for '{topic_path}' failed after {_attempt} "
+                        f"attempts (last error: {transient_err})."
+                    )
+                    raise
+                delay = 1.0 * (2 ** (_attempt - 1))
+                logger.warning(
+                    f"Transient error creating topic '{topic_path}' "
+                    f"(concurrent create race): {transient_err}. "
+                    f"Attempt {_attempt}/{_TOPIC_CREATE_MAX_ATTEMPTS}, "
+                    f"retrying in {delay}s..."
+                )
+                await asyncio.sleep(delay)
         managed_config.topic_path = topic_path
 
         # Grant the GCS service account permission to publish to the newly created topic.
