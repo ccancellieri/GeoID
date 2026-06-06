@@ -557,28 +557,38 @@ class _RoutingConfigBase(PluginConfig):
         """
         return None
 
-    def _stamp_operator_provenance(self) -> None:
-        """Stamp ``source='operator'`` on every operation-driver entry the
-        operator sent — the API-boundary half of the Option-A list-level
+    def _stamp_operator_provenance(
+        self, changed_op_keys: Optional[Set[str]] = None
+    ) -> None:
+        """Stamp ``source='operator'`` on operation-driver entries the operator
+        actually changed — the API-boundary half of the Option-A list-level
         operator lock (#792/#889).
+
+        When ``changed_op_keys`` is provided (a set of operation key strings),
+        only entries in those operations are stamped.  Operations not in the
+        set keep their existing ``source`` values, so auto-augmentation remains
+        possible for lists the operator did not touch (#1865).
+
+        When ``changed_op_keys`` is ``None`` (create path or legacy callers),
+        all operations present are stamped — the original behaviour, applied
+        when there is no stored config to diff against.
 
         ``_is_operator_managed`` (and the self-register helpers it gates) keys
         on whether any entry in an operation list carries ``source='operator'``.
         Boot defaults and self-registered drivers are stamped ``'auto'``, and
         the configs API serialises that ``'auto'`` back to the operator — so a
         natural GET→edit→PUT round-trip returns lists that still read as
-        auto-managed.  Unless we re-assert operator intent, the self-register
-        helpers re-append the very driver the operator removed (the "deleted
-        driver comes back" symptom).
+        auto-managed.  Unless we re-assert operator intent for the changed
+        lists, the self-register helpers re-append the very driver the operator
+        removed (the "deleted driver comes back" symptom).
 
         This MUST run BEFORE ``_self_register_drivers`` (see
         ``_augment_and_validate_routing``): the stamp only sticks if it
-        precedes the re-append pass it is meant to suppress.  It is driven by
-        the ``dynastore_external_write`` validation-context flag set at the
-        configs-API deserialisation boundary, so it never fires for internal
-        DB-load / boot-default construction.  Idempotent.
+        precedes the re-append pass it is meant to suppress.  Idempotent.
         """
-        for entries in self.operations.values():
+        for op_key, entries in self.operations.items():
+            if changed_op_keys is not None and op_key not in changed_op_keys:
+                continue
             for i, entry in enumerate(entries):
                 if entry.source != "operator":
                     entries[i] = entry.model_copy(update={"source": "operator"})
@@ -596,16 +606,22 @@ class _RoutingConfigBase(PluginConfig):
         validation always runs — a dangling transformer ref is a hard error.
 
         On an **external operator write** (the configs API stamps
-        ``context={"dynastore_external_write": True}`` at deserialisation), the
-        operations the operator explicitly sent are authoritative: their entries
-        are stamped ``source='operator'`` *before* self-registration so a driver
-        the operator removed is not silently re-appended (#792/#889 GET→edit→PUT
-        round-trip).  Internal DB-load / boot-default construction carries no
-        such context, so discoverable drivers still auto-register there.
+        ``context={"dynastore_external_write": True}`` at deserialisation), only
+        the operation lists the operator actually changed are stamped
+        ``source='operator'`` before self-registration.  The set of changed
+        lists is computed at the service boundary (where the stored config is
+        available) and passed via ``context["dynastore_changed_operation_keys"]``
+        (#1865).  When that key is absent, all present lists are stamped
+        (create path / legacy callers).  Internal DB-load / boot-default
+        construction carries no such context, so discoverable drivers still
+        auto-register there (#792/#889).
         """
         label = type(self).__name__
         if _is_external_operator_write(info) and "operations" in self.model_fields_set:
-            self._stamp_operator_provenance()
+            changed_op_keys: Optional[Set[str]] = (info.context or {}).get(
+                "dynastore_changed_operation_keys"
+            )
+            self._stamp_operator_provenance(changed_op_keys)
         try:
             self._self_register_drivers()
             _self_register_transformers_into(self.transformers)
@@ -1213,6 +1229,42 @@ def _is_external_operator_write(info: ValidationInfo) -> bool:
     ``_augment_and_validate_routing`` (#792/#889).
     """
     return bool((info.context or {}).get("dynastore_external_write"))
+
+
+def _compute_changed_op_keys(
+    incoming_ops: Dict[str, Any],
+    stored_raw: Optional[Dict[str, Any]],
+) -> Optional[Set[str]]:
+    """Return the set of operation keys that differ between the incoming PUT
+    body and the tier-local stored config row, or ``None`` when there is no
+    stored config (create path).
+
+    An operation key is "changed" when its set of ``driver_ref`` values differs
+    from the stored list (order-insensitive).  This is the right semantic
+    because ``driver_ref`` is the identity of a routing entry; the operator's
+    intent is which drivers are present, not their position.
+
+    Called at the **service boundary** (where the stored config is available)
+    so the validator does not need DB access (#1865).  Passing ``None`` signals
+    the create path: the validator stamps all present lists as operator-managed.
+    """
+    if stored_raw is None:
+        return None
+    stored_ops: Dict[str, Any] = stored_raw.get("operations", {})
+    changed: Set[str] = set()
+    all_keys = set(incoming_ops) | set(stored_ops)
+    for op_key in all_keys:
+        incoming_refs = {
+            e.get("driver_ref") if isinstance(e, dict) else e
+            for e in incoming_ops.get(op_key, [])
+        }
+        stored_refs = {
+            e.get("driver_ref") if isinstance(e, dict) else e
+            for e in stored_ops.get(op_key, [])
+        }
+        if incoming_refs != stored_refs:
+            changed.add(op_key)
+    return changed
 
 
 def _is_operator_managed(
