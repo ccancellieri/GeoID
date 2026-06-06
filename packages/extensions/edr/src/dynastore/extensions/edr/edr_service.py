@@ -21,13 +21,14 @@ the position/area/cube query vocabulary on top.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional, cast
+from typing import FrozenSet, List, Optional, cast
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from dynastore.extensions.ogc_base import OGCServiceMixin, ogc_asset_href
 from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.protocols import CatalogsProtocol
 
@@ -339,8 +340,15 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         parameter_name: Optional[str] = Query(None, alias="parameter-name"),
         crs: Optional[str] = Query(None),
         f: Optional[str] = Query("CoverageJSON"),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
-        """Extract a coverage subset within a polygon (area query)."""
+        """Extract a coverage subset within a polygon (area query).
+
+        ``?hints=`` is accepted uniformly (e.g. ``hints=geometry_exact``) but
+        reserved for forward-compatible routing — EDR area data is read from a
+        raster asset directly and does not flow through a hints-capable vector
+        read seam, so the value has no effect on this route today.
+        """
         from dynastore.modules.edr.query_handlers.area import (
             extract_area_values,
             parse_wkt_polygon_bbox,
@@ -397,8 +405,15 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         parameter_name: Optional[str] = Query(None, alias="parameter-name"),
         crs: Optional[str] = Query(None),
         f: Optional[str] = Query("CoverageJSON"),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
-        """Extract a bounding-box coverage subset (cube query)."""
+        """Extract a bounding-box coverage subset (cube query).
+
+        ``?hints=`` is accepted uniformly (e.g. ``hints=geometry_exact``) but
+        reserved for forward-compatible routing — EDR cube data is read from a
+        raster asset directly and does not flow through a hints-capable vector
+        read seam, so the value has no effect on this route today.
+        """
         from dynastore.modules.edr.query_handlers.area import extract_area_values
         from dynastore.modules.edr.query_handlers.cube import parse_cube_bbox
         from dynastore.modules.edr.parameter_metadata import build_parameters
@@ -449,8 +464,13 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         catalog_id: str,
         collection_id: str,
         request: Request,
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> em.EDRLocations:
-        """Return an empty FeatureCollection — named locations require explicit metadata."""
+        """Return an empty FeatureCollection — named locations require explicit metadata.
+
+        ``?hints=`` is accepted uniformly for API consistency; this route
+        performs no data reads so the value has no effect today.
+        """
         return em.EDRLocations(features=[])
 
     async def get_location(

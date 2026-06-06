@@ -35,6 +35,27 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _get_db_engine() -> Optional[Any]:
+    """Resolve a DB engine via the registered DatabaseProtocol.
+
+    Used as the last-resort fallback in :func:`_fetch_raw_rows` when
+    ``db_resource`` is None — covers the Cloud Run JOB/worker context
+    where a bare ``ItemService()`` carries no engine but the process-wide
+    ``DatabaseProtocol`` does.  Returns ``None`` when no protocol is
+    registered (e.g. test or import-only context).
+    """
+    try:
+        from dynastore.models.protocols import DatabaseProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        db = get_protocol(DatabaseProtocol)
+        if db is None:
+            return None
+        return db.engine
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Public data type
 # ---------------------------------------------------------------------------
@@ -170,7 +191,23 @@ async def _fetch_raw_rows(
         validate_sql_identifier(collection_id)
 
         item_svc = ItemService()
-        async with managed_transaction(db_resource or item_svc.engine) as conn:
+        # Resolve the engine to use: prefer the explicitly-passed db_resource,
+        # then the engine on the locally-constructed ItemService (available in
+        # the API process where ItemService is registered with a live pool),
+        # then fall back to the process-wide DatabaseProtocol engine (available
+        # in Cloud Run JOB/worker processes where no ItemService engine is wired).
+        # If none of these yield an engine, managed_transaction raises ValueError
+        # which is caught by the outer except block and returns {} safely.
+        effective_resource = db_resource or item_svc.engine or _get_db_engine()
+        if effective_resource is None:
+            logger.warning(
+                "canonical_index_read._fetch_raw_rows: no DB engine available "
+                "for %s/%s — returning empty result. Ensure DatabaseProtocol is "
+                "registered in this process.",
+                catalog_id, collection_id,
+            )
+            return {}
+        async with managed_transaction(effective_resource) as conn:
             phys_schema = await item_svc._resolve_physical_schema(
                 catalog_id, db_resource=conn,
             )

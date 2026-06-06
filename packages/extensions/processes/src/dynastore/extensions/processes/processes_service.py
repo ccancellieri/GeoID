@@ -20,7 +20,7 @@ import logging
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import List, Union, Any, Optional, cast
+from typing import FrozenSet, List, Union, Any, Optional, cast
 
 import jsonschema as _jsonschema_scope_gate  # noqa: F401  # SCOPE gate: extension_processes requires jsonschema
 _ = _jsonschema_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
@@ -65,6 +65,7 @@ from dynastore.modules.processes.inventory import (
 )
 from dynastore.models.auth_models import SYSTEM_USER_ID
 from dynastore.models.driver_context import DriverContext
+from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
@@ -407,6 +408,7 @@ async def list_processes(
             "Comma-separated runner_type filter (e.g. `gcp_cloud_run,sync`)."
         ),
     ),
+    request_hints: FrozenSet = Depends(parse_hints_param),
 ):
     """Lists processes available in this deployment.
 
@@ -414,6 +416,8 @@ async def list_processes(
     process across all scopes with typology + parametric URL templates. Set
     ``typology=false`` to get a strict OGC Core payload.
     """
+    # Accepted for uniform cross-protocol routing-hints support; this route
+    # returns process inventory metadata and performs no vector-geometry read.
     return await _render_process_list(
         request,
         scope_param=scope,
@@ -433,8 +437,11 @@ async def list_processes_catalog(
     scope: Optional[str] = Query(default=None),
     typology: bool = Query(default=True),
     runner: Optional[str] = Query(default=None),
+    request_hints: FrozenSet = Depends(parse_hints_param),
 ):
     """Lists catalog-scoped processes available for this catalog."""
+    # Accepted for uniform cross-protocol routing-hints support; this route
+    # returns process inventory metadata and performs no vector-geometry read.
     return await _render_process_list(
         request,
         catalog_id=catalog_id,
@@ -456,8 +463,11 @@ async def list_processes_collection(
     scope: Optional[str] = Query(default=None),
     typology: bool = Query(default=True),
     runner: Optional[str] = Query(default=None),
+    request_hints: FrozenSet = Depends(parse_hints_param),
 ):
     """Lists collection-scoped processes available for this collection."""
+    # Accepted for uniform cross-protocol routing-hints support; this route
+    # returns process inventory metadata and performs no vector-geometry read.
     return await _render_process_list(
         request,
         catalog_id=catalog_id,

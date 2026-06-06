@@ -22,7 +22,7 @@ import os
 import asyncio
 import itertools
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 from dateutil import parser as _dateutil_parser
 
@@ -41,7 +41,182 @@ from .reporters import _ingestion_reporter_registry
 from dynastore.tasks.tools import initialize_reporters
 from .operations import initialize_operations, run_pre_operations, run_post_operations
 
+# Canonical task-enqueue path — imported at module level so unit tests can patch
+# ``dynastore.tasks.ingestion.main_ingestion.create_task_for_catalog``.
+from dynastore.modules.tasks.tasks_module import create_task_for_catalog
+from dynastore.models.tasks import TaskCreate as _TaskCreate
+
 logger = logging.getLogger(__name__)
+
+
+class _IndexMissFailed(RuntimeError):
+    """Sentinel raised after a total secondary-index miss.
+
+    Propagates out of ``run_ingestion_task`` so the task runner knows the
+    ingestion failed, without triggering the generic ``except Exception``
+    handler that would call ``task_finished("FAILED")`` a second time.
+    Callers should treat this identically to RuntimeError.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Secondary-index health check (FIX 2)
+# ---------------------------------------------------------------------------
+
+
+def _check_index_health(
+    rows_written: int,
+    index_results: Dict[str, Any],
+) -> Tuple[str, Optional[str]]:
+    """Classify the ingestion outcome based on secondary-index results.
+
+    Called after the write loop finishes.  Returns ``(status, message)``
+    where ``status`` is either ``"COMPLETED"`` or ``"FAILED"`` and
+    ``message`` is a human-readable explanation (or ``None`` on full
+    success).
+
+    Rules:
+    - No secondary indexers configured (empty dict) → COMPLETED, no message.
+    - All indexers succeeded for every written item → COMPLETED, no message.
+    - Total miss: every indexer reported ``succeeded == 0`` for a non-zero
+      ``total`` → FAILED with a structured message (retry re-attempts and,
+      with a working DB engine, succeeds).
+    - Partial miss: some items indexed, some not → COMPLETED with a warning
+      message so the caller can surface it in task outputs.
+    """
+    if not index_results or rows_written == 0:
+        return "COMPLETED", None
+
+    total_succeeded = sum(r.succeeded for r in index_results.values())
+    total_total = sum(r.total for r in index_results.values())
+    total_failed = sum(r.failed for r in index_results.values())
+
+    if total_total == 0:
+        # Ops were empty (e.g. all id-less features) — not a miss.
+        return "COMPLETED", None
+
+    if total_succeeded == 0:
+        # Complete secondary-index miss — mark FAILED so a retry re-attempts.
+        msg = (
+            f"Secondary index recorded 0 indexed items out of {rows_written} "
+            f"written to the source store "
+            f"(total_ops={total_total}, failed={total_failed}). "
+            "A restore task has been enqueued. Retry this task to re-attempt indexing."
+        )
+        return "FAILED", msg
+
+    if total_failed > 0 or total_succeeded < total_total:
+        # Partial miss — keep COMPLETED but surface the counts.
+        msg = (
+            f"Partial secondary-index write: {total_succeeded} indexed, "
+            f"{total_failed} failed out of {total_total} total ops "
+            f"({rows_written} rows written to source store). "
+            "Check driver logs for per-item failure reasons."
+        )
+        return "COMPLETED", msg
+
+    return "COMPLETED", None
+
+
+# ---------------------------------------------------------------------------
+# Restore task enqueue (FIX 3)
+# ---------------------------------------------------------------------------
+
+
+async def enqueue_collection_reindex_task(
+    catalog_id: str,
+    collection_id: str,
+    *,
+    pg_conn: Optional[Any],
+) -> None:
+    """Enqueue an idempotent ``elasticsearch_bulk_reindex_collection`` task.
+
+    Uses the canonical ``create_task`` path so application-layer dedup fires:
+    if a non-terminal task with the same ``(schema_name, dedup_key)`` already
+    exists, ``create_task`` returns ``None`` and no duplicate row is inserted.
+    This prevents unbounded PENDING row growth when the root cause recurs across
+    successive ingestion retries.
+
+    ``pg_conn`` is accepted for API compatibility but the canonical path opens
+    its own managed transaction via the engine.  When ``pg_conn`` is ``None``
+    the engine is also unavailable; the function logs a warning and returns.
+
+    The task re-streams the collection from the routing-resolved
+    source-of-truth (PG primary, via GEOMETRY_EXACT hint) into the
+    routing-resolved secondary-index writer — driver-agnostic.
+    """
+    if pg_conn is None:
+        logger.warning(
+            "enqueue_collection_reindex_task: pg_conn is None for %s/%s — "
+            "skipping reindex enqueue. The secondary index may remain empty "
+            "until a manual reindex or a future retry provides a live connection.",
+            catalog_id, collection_id,
+        )
+        return
+
+    try:
+        import hashlib
+
+        dedup_key = hashlib.sha256(
+            f"reindex|{catalog_id}|{collection_id}".encode()
+        ).hexdigest()[:64]
+
+        task_data = _TaskCreate(
+            task_type="elasticsearch_bulk_reindex_collection",
+            caller_id="ingestion:index_restore",
+            scope="CATALOG",
+            execution_mode="ASYNCHRONOUS",
+            inputs={"catalog_id": catalog_id, "collection_id": collection_id},
+            collection_id=collection_id,
+            dedup_key=dedup_key,
+        )
+
+        # create_task_for_catalog resolves the physical schema then calls
+        # create_task which performs the dedup pre-check (SELECT … WHERE
+        # dedup_key = … AND status NOT IN ('COMPLETED','FAILED','DEAD_LETTER'))
+        # inside its own managed_transaction.  Returns None on dedup hit.
+        task = await create_task_for_catalog(
+            engine=pg_conn,
+            task_data=task_data,
+            catalog_id=catalog_id,
+        )
+        if task is None:
+            logger.info(
+                "enqueue_collection_reindex_task: dedup hit — a non-terminal "
+                "reindex task already exists for %s/%s; skipping duplicate insert.",
+                catalog_id, collection_id,
+            )
+        else:
+            logger.info(
+                "enqueue_collection_reindex_task: enqueued restore for %s/%s "
+                "(task_id=%s)",
+                catalog_id, collection_id, task.task_id,
+            )
+    except Exception as exc:
+        logger.error(
+            "enqueue_collection_reindex_task: failed to enqueue restore for "
+            "%s/%s: %s",
+            catalog_id, collection_id, exc,
+        )
+
+
+def _merge_index_results(
+    accumulated: Dict[str, Any],
+    batch_results: Dict[str, Any],
+) -> None:
+    """Merge per-batch BulkResult entries into the running totals in-place."""
+    for indexer_id, bulk_res in batch_results.items():
+        if indexer_id in accumulated:
+            prev = accumulated[indexer_id]
+            from dynastore.models.protocols.indexer import BulkResult
+            accumulated[indexer_id] = BulkResult(
+                total=prev.total + bulk_res.total,
+                succeeded=prev.succeeded + bulk_res.succeeded,
+                failed=prev.failed + bulk_res.failed,
+                failures=prev.failures + bulk_res.failures,
+            )
+        else:
+            accumulated[indexer_id] = bulk_res
 
 
 # Canonical items-schema data types that denote a temporal value. A property
@@ -559,6 +734,9 @@ async def run_ingestion_task(
         batch_size = task_request.database_batch_size or 500
         current_batch = []
         rows_ingested = 0
+        # Accumulate per-indexer BulkResult totals across all batches so we can
+        # classify secondary-index health at the end of the loop.
+        accumulated_index_results: Dict[str, Any] = {}
 
         upsert_context = {"asset_id": asset_id}
 
@@ -746,6 +924,10 @@ async def run_ingestion_task(
                         processing_context=upsert_context,
                     )
                     rows_ingested += len(current_batch)
+                    _merge_index_results(
+                        accumulated_index_results,
+                        upsert_ctx.extensions.get("_index_results") or {},
+                    )
                     await _broadcast_batch_outcome(
                         reporters, current_batch, upsert_result,
                         upsert_ctx.extensions.get("_generated_stats"),
@@ -769,6 +951,10 @@ async def run_ingestion_task(
                     processing_context=upsert_context,
                 )
                 rows_ingested += len(current_batch)
+                _merge_index_results(
+                    accumulated_index_results,
+                    upsert_ctx.extensions.get("_index_results") or {},
+                )
                 await _broadcast_batch_outcome(
                     reporters, current_batch, upsert_result,
                     upsert_ctx.extensions.get("_generated_stats"),
@@ -802,15 +988,82 @@ async def run_ingestion_task(
                 f"({asset.asset_id} → {collection_id}): {ref_err}"
             )
 
+        # --- Secondary-index health check (FIX 2 + FIX 3) ---
+        # Inspect the per-indexer BulkResult totals accumulated across all
+        # batches.  A total miss (succeeded==0 on all indexers for a non-zero
+        # write) marks the task FAILED and enqueues an automatic restore so a
+        # retry self-heals.  A partial miss keeps COMPLETED but surfaces counts.
+        final_status, index_msg = _check_index_health(
+            rows_written=rows_ingested,
+            index_results=accumulated_index_results,
+        )
+
+        if final_status == "FAILED":
+            # Enqueue an idempotent collection reindex task.  The canonical
+            # create_task path opens its own managed transaction internally,
+            # so the restore row is committed independently and is not rolled
+            # back if the FAILED outcome causes a raise below.
+            try:
+                await enqueue_collection_reindex_task(
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    pg_conn=engine,
+                )
+            except Exception as restore_enqueue_err:
+                logger.error(
+                    "ingestion: restore enqueue failed for %s/%s: %s",
+                    catalog_id, collection_id, restore_enqueue_err,
+                )
+            logger.error(
+                "ingestion task %s: secondary index total miss for %s/%s "
+                "(%d rows written, 0 indexed). Marking FAILED. %s",
+                task_id, catalog_id, collection_id, rows_ingested, index_msg,
+            )
+            await asyncio.gather(
+                *(
+                    reporter.task_finished("FAILED", error_message=index_msg)
+                    for reporter in reporters
+                )
+            )
+            # Run post-operations for FAILED state and surface the failure.
+            if post_ops:
+                try:
+                    _cat = await catalog_module.get_catalog(
+                        catalog_id, ctx=DriverContext(db_resource=engine),
+                    )
+                    _coll = await catalog_module.get_collection(
+                        catalog_id, collection_id, ctx=DriverContext(db_resource=engine),
+                    )
+                    await run_post_operations(
+                        post_ops, _cat, _coll, asset, "FAILED",
+                        error_message=index_msg,
+                    )
+                except Exception as _post_err:
+                    logger.warning(
+                        "Post-operations for FAILED (index miss) errored: %s",
+                        _post_err,
+                    )
+            raise _IndexMissFailed(index_msg)
+
         # ``summary`` carries an optional proposed_items_schema (#1216). Every
         # reporter's ``task_finished`` accepts ``summary`` (it is on the abstract
         # base), so pass it explicitly — ``None`` when there's nothing to carry —
         # rather than a ``**dict`` splat that pyright cannot type-check.
-        summary = (
+        summary: Optional[Dict[str, Any]] = (
             {"proposed_items_schema": proposed_items_schema}
             if proposed_items_schema
             else None
         )
+        if index_msg:
+            # Partial miss: surface counts in summary outputs without failing.
+            logger.warning(
+                "ingestion task %s: %s/%s partial index miss — %s",
+                task_id, catalog_id, collection_id, index_msg,
+            )
+            if summary is None:
+                summary = {}
+            summary["index_warning"] = index_msg
+
         await asyncio.gather(
             *(
                 reporter.task_finished("COMPLETED", summary=summary)
@@ -826,6 +1079,10 @@ async def run_ingestion_task(
             )
             await run_post_operations(post_ops, catalog, collection, asset, "COMPLETED")
 
+    except _IndexMissFailed:
+        # task_finished("FAILED") was already called in the FAILED branch above;
+        # re-raise without calling it again so reporters are not notified twice.
+        raise
     except Exception as e:
         logger.critical(f"Ingestion task {task_id} failed: {e}", exc_info=True)
         await asyncio.gather(

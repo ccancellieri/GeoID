@@ -29,7 +29,7 @@ Implements the following endpoints:
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional, Set
+from typing import FrozenSet, Optional, Set
 
 # Dependency-free helper (no h3/s2sphere): safe to import before the SCOPE gate.
 from dynastore.modules.dggs.bbox import parse_bbox
@@ -38,7 +38,9 @@ import h3 as _h3_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires
 import s2sphere as _s2sphere_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires s2sphere
 _ = (_h3_scope_gate, _s2sphere_scope_gate)  # silence pyright "unused" — load-bearing for SCOPE filtering
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
+
+from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 
 from dynastore.extensions.dggs.config import DGGSConfig
 from dynastore.extensions.ogc_base import OGCServiceMixin
@@ -329,11 +331,17 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
             alias="dggs-id",
             description="DGGRS identifier: 'H3' or 'S2'",
         ),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> DGGSFeatureCollection:
         """Retrieve collection features aggregated into DGGS zones.
 
         Queries PostGIS for features in the requested bbox/datetime, then
         aggregates them on-the-fly into cells at the requested resolution.
+
+        Accepts ``?hints=`` to steer driver selection — e.g.
+        ``?hints=geometry_exact`` requests full-precision geometry from the
+        PostgreSQL driver instead of the simplified search-backend copy.
+        Omitting the parameter preserves the default routing behaviour.
         """
         dggs_id = dggs_id.upper()
         if dggs_id not in _SUPPORTED_DGGRS:
@@ -369,7 +377,9 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
                 limit=config.max_features_per_request,
             )
 
-        features = await self._fetch_features(catalog_id, collection_id, query)
+        features = await self._fetch_features(
+            catalog_id, collection_id, query, hints=request_hints,
+        )
         return aggregate_features(features, resolution, param_names, dggs_id)
 
     async def get_dggs_zone(
@@ -388,12 +398,18 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
             alias="dggs-id",
             description="DGGRS identifier: 'H3' or 'S2'",
         ),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> DGGSFeatureCollection:
         """Retrieve data aggregated within a specific DGGS zone.
 
         The zoneId must be a valid cell token for the requested DGGRS.
         Features intersecting the zone's bounding box are fetched from PostGIS
         and aggregated into the single requested cell.
+
+        Accepts ``?hints=`` to steer driver selection — e.g.
+        ``?hints=geometry_exact`` requests full-precision geometry from the
+        PostgreSQL driver instead of the simplified search-backend copy.
+        Omitting the parameter preserves the default routing behaviour.
         """
         dggs_id = dggs_id.upper()
         if dggs_id not in _SUPPORTED_DGGRS:
@@ -453,7 +469,9 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
                 limit=config.max_features_per_request,
             )
 
-        features = await self._fetch_features(catalog_id, collection_id, query)
+        features = await self._fetch_features(
+            catalog_id, collection_id, query, hints=request_hints,
+        )
 
         param_names = _parse_parameter_names(parameter_name)
         all_zones = aggregate_features(features, resolution, param_names, dggs_id=dggs_id)
@@ -500,9 +518,24 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
         catalog_id: str,
         collection_id: str,
         query,
+        hints: FrozenSet = frozenset(),
     ) -> list:
+        """Fetch features for DGGS aggregation.
+
+        When ``hints`` is non-empty (e.g. ``{Hint.GEOMETRY_EXACT}``), the
+        request is routed through ``stream_items`` so driver selection honours
+        the hints and, for example, returns full-precision geometry from the
+        PostgreSQL driver instead of the simplified search-backend copy.
+        When ``hints`` is empty (the default) the existing ``search_items``
+        path is preserved unchanged.
+        """
         catalogs_svc = await self._get_catalogs_service()
         try:
+            if hints:
+                response = await catalogs_svc.stream_items(
+                    catalog_id, collection_id, query, hints=hints,
+                )
+                return [feat async for feat in response.items]
             return await catalogs_svc.search_items(catalog_id, collection_id, query)
         except Exception as exc:
             logger.exception("DGGS query failed for collection '%s/%s'", catalog_id, collection_id)

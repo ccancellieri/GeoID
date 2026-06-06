@@ -28,7 +28,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Optional
+from typing import FrozenSet, List, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -38,6 +38,7 @@ from starlette import status
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.db import get_async_connection
+from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.models.protocols import MovingFeaturesProtocol
 from dynastore.modules.catalog import catalog_module
 from dynastore.modules.moving_features import db as mf_db
@@ -217,6 +218,9 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         conn: AsyncConnection = Depends(get_async_connection),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
+        # Accepted for uniform protocol consistency; moving-features reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[MovingFeature]:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
@@ -274,6 +278,9 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         collection_id: str,
         mf_id: uuid.UUID,
         conn: AsyncConnection = Depends(get_async_connection),
+        # Accepted for uniform protocol consistency; moving-features reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> MovingFeature:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
@@ -312,6 +319,9 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         conn: AsyncConnection = Depends(get_async_connection),
         dt_start: Optional[datetime] = Query(None, description="Temporal filter start (ISO 8601)."),
         dt_end: Optional[datetime] = Query(None, description="Temporal filter end (ISO 8601)."),
+        # Accepted for uniform protocol consistency; temporal-geometry reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[TemporalGeometry]:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)

@@ -167,3 +167,47 @@ class Hint(StrEnum):
     # vocabulary is one consolidated catalogue rather than scattered
     # asset-driver and storage-driver dialects.
     DEFAULT = "default"
+
+
+# ---------------------------------------------------------------------------
+# Named hint sets
+# ---------------------------------------------------------------------------
+
+# Protocol-level "request exact geometry" constant.  Pass this as the
+# ``hints=`` argument wherever the caller must receive full-precision
+# (non-simplified) geometry regardless of which concrete driver happens to
+# carry the exact tier.  The routing layer selects the first registered
+# driver whose ``supported_hints`` is a *superset* of this set — today PG,
+# tomorrow any driver that declares ``Hint.GEOMETRY_EXACT``.  No driver
+# class name appears here; adding a new exact-capable driver requires zero
+# changes to any call site that uses this constant.
+EXACT_READ_HINTS: frozenset = frozenset({Hint.GEOMETRY_EXACT})
+
+
+def parse_request_hints(values) -> frozenset:
+    """Parse caller-supplied hint tokens into a ``frozenset[Hint]``.
+
+    Accepts the value of the ``?hints=`` query parameter in either repeated
+    form (``?hints=geometry_exact&hints=tiles``) or comma-joined form
+    (``?hints=geometry_exact,tiles``); ``values`` is therefore an iterable of
+    strings (FastAPI hands a ``List[str]`` for a repeated param) or ``None``.
+
+    Tokens are matched case-insensitively against the canonical :class:`Hint`
+    vocabulary; unknown tokens are silently dropped so a typo or a hint this
+    deployment doesn't recognise simply has no effect (same tolerance the
+    routing matcher already applies to unrecognised ``supported_hints``).
+    Returns an empty frozenset when nothing valid is supplied, which keeps the
+    default (simplified / search-backend) read path byte-for-byte unchanged.
+    """
+    if not values:
+        return frozenset()
+    by_value = {h.value: h for h in Hint}
+    parsed = set()
+    for raw in values:
+        if raw is None:
+            continue
+        for token in str(raw).split(","):
+            member = by_value.get(token.strip().lower())
+            if member is not None:
+                parsed.add(member)
+    return frozenset(parsed)

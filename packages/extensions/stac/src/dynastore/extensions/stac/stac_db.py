@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, FrozenSet, Optional, Tuple
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -40,6 +40,7 @@ async def get_stac_items_paginated(
     stac_config: Optional[StacPluginConfig] = None,
     cql_filter: Optional[str] = None,
     request: "Optional[Request]" = None,
+    hints: FrozenSet = frozenset(),
 ) -> Tuple[list, int]:
     """
     Fetches a paginated list of items for STAC using the optimised QueryOptimizer path.
@@ -106,6 +107,7 @@ async def get_stac_items_paginated(
         request=query_request,
         ctx=DriverContext(db_resource=conn) if conn is not None else None,
         consumer=ConsumerType.STAC,
+        hints=hints,
     )
 
     if query_response is None:

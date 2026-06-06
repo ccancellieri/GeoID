@@ -25,7 +25,7 @@ no new storage layer is introduced.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, List, Optional, cast
+from typing import Any, FrozenSet, List, Optional, cast
 
 import pygeofilter as _pygeofilter_scope_gate  # noqa: F401  # SCOPE gate: extension_records requires pygeofilter
 _ = _pygeofilter_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
@@ -39,7 +39,11 @@ from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
 from dynastore.extensions.tools.db import get_async_connection
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.url import get_root_url
-from dynastore.extensions.tools.query import resolve_items_read_policy  # noqa: E402
+from dynastore.extensions.tools.query import (  # noqa: E402
+    parse_hints_param,
+    resolve_items_read_policy,
+)
+from dynastore.modules.storage.hints import Hint  # noqa: E402
 from dynastore.models.protocols import ItemsProtocol
 from dynastore.models.shared_models import Link
 from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
@@ -296,6 +300,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         ),
         sortby: Optional[str] = Query(None, description="Sort order (e.g., '-title,+created')."),
         q: Optional[str] = Query(None, description="Free-text search query."),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> Response:
         catalogs_svc = await self._get_catalogs_service()
 
@@ -376,9 +381,16 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         # read-primary (PG ``QUERY_FALLBACK_SOURCE``) driver, or a non-ES items
         # driver. Free-text ``q`` folds into a CQL ``ILIKE`` predicate, so it
         # defers to the PG path too.
+        #
+        # ``?hints=geometry_exact`` opt-in: when the caller requests the
+        # geometry_exact hint the simplified-geometry ES fast-path is skipped;
+        # the stream_items call below then carries the caller's hints to force
+        # the exact-capable driver.  No such hint keeps the default behaviour
+        # byte-for-byte.
+        wants_exact = Hint.GEOMETRY_EXACT in request_hints
         has_complex_filter = bool(filter) or bool(q)
         search_dispatch = None
-        if not has_complex_filter:
+        if not has_complex_filter and not wants_exact:
             search_dispatch = await maybe_dispatch_items_to_search_driver(
                 catalog_id=catalog_id,
                 collection_id=collection_id,
@@ -425,6 +437,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             search_dispatch=search_dispatch,
             ctx=DriverContext(db_resource=conn) if conn is not None else None,
             request=request,
+            hints=request_hints,
         )
 
         count = query_response.total_count or 0

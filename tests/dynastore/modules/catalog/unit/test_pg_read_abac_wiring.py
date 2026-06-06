@@ -81,6 +81,7 @@ def _make_items_protocol(response: QueryResponse) -> Any:
         request: QueryRequest,
         ctx: Any = None,
         consumer: Any = None,
+        hints: Any = None,
     ) -> QueryResponse:
         captured.append(request)
         return response

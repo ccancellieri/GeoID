@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 from dynastore.extensions.tools.formatters import format_map
 from dynastore.modules.concurrency import get_concurrency_backend
 from dynastore.modules.gcp.tools.bucket import upload_stream_to_gcs
+from dynastore.modules.storage.hints import EXACT_READ_HINTS
 from dynastore.modules.tools.features import FeatureStreamConfig, stream_features
 from dynastore.tools.async_utils import SyncQueueIterator
 from dynastore.tools.file_io import get_features_as_byte_stream
@@ -85,7 +86,8 @@ async def export_features(
                 include_geometry=True,
                 target_srid=request.target_srid,
             )
-            async for feature in stream_features(stream_config, engine):
+            async for feature in stream_features(stream_config, engine,
+                                                  hints=EXACT_READ_HINTS):
                 await queue.put(feature)
         except Exception:
             logger.exception("Feature export producer failed")

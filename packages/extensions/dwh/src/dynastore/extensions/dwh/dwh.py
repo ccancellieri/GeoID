@@ -49,7 +49,7 @@ from dynastore.models.protocols import (
     ItemsProtocol,
 )
 from dynastore.models.driver_context import DriverContext
-from dynastore.modules.storage.hints import Hint  # noqa: E402  # after pyproj SCOPE-gate stmt
+from dynastore.modules.storage.hints import Hint, EXACT_READ_HINTS  # noqa: E402  # after pyproj SCOPE-gate stmt
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
@@ -533,12 +533,13 @@ class DwhService(ExtensionProtocol):
 
         # stream_normalized_items lifts PG model_extra columns into
         # feature.properties so the join key is visible uniformly.
-        # No Hint.JOIN here: the raw_where spatial filter already pins this to
-        # the PG path; adding Hint.JOIN would be redundant and would suppress
-        # ES routing for collections that don't carry the PG geometry sidecar.
+        # EXACT_READ_HINTS: the tiled join emits MVT attributes from these
+        # features and the downstream geometry query (geom_sql) fetches raw
+        # WKB from PG — both require full-precision rows from the exact driver.
         normalized_stream = stream_normalized_items(
             items_svc, catalog_id, req.collection, query_req,
             ctx=DriverContext(db_resource=conn),
+            hints=EXACT_READ_HINTS,
         )
 
         # 8. Join with DWH data and materialize for MVT query.

@@ -20,7 +20,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, FrozenSet, List, Optional, Union, cast
 from dynastore.models.shared_models import Feature
 from dynastore.models.ogc import Feature as OGCFeature
 
@@ -1082,6 +1082,7 @@ async def create_item_collection(
     lang: str = "en",
     cql_filter: Optional[str] = None,
     search_dispatch: Optional[Any] = None,
+    hints: FrozenSet = frozenset(),
 ) -> Dict[str, Any]:
     """Generates a STAC ItemCollection for a single collection.
 
@@ -1091,6 +1092,12 @@ async def create_item_collection(
     ``QueryResponse`` here so this builder uses the driver-streamed features +
     ``total_count`` instead of running the PostgreSQL ``get_stac_items_paginated``
     fallback. ``None`` (the default) keeps the existing PG path byte-for-byte.
+
+    ``hints``: per-request routing preferences forwarded to
+    ``get_stac_items_paginated`` when the PG fallback path is taken (i.e. when
+    ``search_dispatch`` is ``None``). Pass ``EXACT_READ_HINTS`` to force the
+    exact-geometry driver; the default ``frozenset()`` preserves the existing
+    routing behaviour unchanged.
     """
     # Ensure logical IDs are available for row-to-feature conversion
     catalog_id = catalog_id or schema
@@ -1107,6 +1114,7 @@ async def create_item_collection(
             conn, catalog_id, collection_id, limit, offset, stac_config,
             cql_filter=cql_filter,
             request=request,
+            hints=hints,
         )
 
     stac_items_tasks = [

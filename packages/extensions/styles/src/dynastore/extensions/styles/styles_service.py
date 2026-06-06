@@ -33,7 +33,7 @@ _ = _lxml_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filt
 import json as _json
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import FrozenSet, List, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -61,6 +61,7 @@ from dynastore.modules.styles.models import (
     StyleUpdate,
 )
 from dynastore.tools.db import validate_sql_identifier
+from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +285,10 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         conn: AsyncConnection = Depends(get_async_connection),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[Style]:
+        # Accepted for uniform cross-protocol routing-hints support; this route
+        # reads style metadata rows and performs no vector-geometry read.
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 

@@ -15,12 +15,13 @@ _ = _bigquery_scope_gate  # silence pyright "unused" — load-bearing for SCOPE 
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, FrozenSet, Optional
 
-from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 from dynastore.models.ogc import Feature
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.joins.bq_secondary import stream_bigquery_secondary
@@ -37,11 +38,20 @@ from dynastore.modules.storage.router import resolve_drivers
 logger = logging.getLogger(__name__)
 
 
-async def _resolve_primary_driver(catalog_id: str, collection_id: str):
+async def _resolve_primary_driver(
+    catalog_id: str,
+    collection_id: str,
+    extra_hints: FrozenSet = frozenset(),
+) -> Optional[object]:
     """Resolve the first READ driver for the primary collection.
 
     Returns the driver instance (any CollectionItemsStore impl) or None
     if no driver is registered for this catalog/collection on READ.
+
+    ``extra_hints`` is unioned with the baseline JOIN hint so per-request
+    routing preferences (e.g. ``geometry_exact``) can steer driver selection
+    without overriding the join-specific routing intent. An empty set (the
+    default) preserves existing behaviour exactly.
     """
     # Use a join-specific hint so an operator can ship a deployment where
     # /join routes to a different driver than /features (e.g. BQ for joins,
@@ -50,8 +60,9 @@ async def _resolve_primary_driver(catalog_id: str, collection_id: str):
     # declare "join" in their supported_hints, so a zero-config deployment
     # resolves the platform-default items store via the empty-entry-hints
     # fallback in router._resolve_driver_ids_cached.
+    hints = frozenset({Hint.JOIN}) | extra_hints
     drivers = await resolve_drivers(
-        "READ", catalog_id, collection_id, hints=frozenset({Hint.JOIN}),
+        "READ", catalog_id, collection_id, hints=hints,
     )
     return drivers[0].driver if drivers else None
 
@@ -157,8 +168,16 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
     async def execute_join(
         self, catalog_id: str, collection_id: str, request: Request,
         body: JoinRequest = Body(...),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Execute the join.
+
+        Accepts ``?hints=`` to steer primary-driver selection — e.g.
+        ``?hints=geometry_exact`` routes to the PostgreSQL driver (exact
+        full-precision geometry) instead of a simplified-geometry search
+        backend. Hints are forwarded to driver resolution and unioned with
+        the baseline ``JOIN`` hint; omitting the parameter preserves the
+        existing routing behaviour.
 
         PR-3: BigQuerySecondarySpec runs the join end-to-end via the
         platform's driver registry for the primary side. NamedSecondarySpec
@@ -173,7 +192,10 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                 secondary_column=body.join.secondary_column,
             )
             # Resolve primary driver via the platform's storage router.
-            primary_driver = await _resolve_primary_driver(catalog_id, collection_id)
+            # Thread request_hints so ?hints=geometry_exact steers routing.
+            primary_driver = await _resolve_primary_driver(
+                catalog_id, collection_id, extra_hints=request_hints,
+            )
             if primary_driver is None:
                 raise HTTPException(
                     status_code=404,
@@ -214,6 +236,8 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
 
         if isinstance(body.secondary, NamedSecondarySpec):
             # Resolve secondary collection via the platform's driver registry.
+            # Secondary reads are always full-scan (no user-geometry preference);
+            # hints apply only to the primary driver below.
             secondary_driver = await _resolve_primary_driver(catalog_id, body.secondary.ref)
             if secondary_driver is None:
                 raise HTTPException(
@@ -234,8 +258,10 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
             secondary_index = await index_secondary(
                 secondary_stream, secondary_column=body.join.secondary_column,
             )
-            # Resolve primary driver.
-            primary_driver = await _resolve_primary_driver(catalog_id, collection_id)
+            # Resolve primary driver, forwarding request_hints.
+            primary_driver = await _resolve_primary_driver(
+                catalog_id, collection_id, extra_hints=request_hints,
+            )
             if primary_driver is None:
                 raise HTTPException(
                     status_code=404,

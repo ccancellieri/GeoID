@@ -941,12 +941,18 @@ class TestWriteEntitiesGeometryPolicy:
         # it busts the 10 MB ES limit (simplify_to_fit was NOT called).
         assert len(geom["coordinates"][0]) == 300_001
         # No simplification metadata stamped when simplify disabled.
-        assert "_simplification_mode" not in doc
-        assert "_simplification_factor" not in doc
+        # Since #1828 the canonical location is system.geometry_simplification;
+        # the legacy flat keys are no longer written.
+        system = doc.get("system", {})
+        assert "geometry_simplification" not in system
 
     @pytest.mark.asyncio
     async def test_simplification_runs_only_when_flag_enabled(self):
-        """simplify_geometry=True restores the lossy shrink path."""
+        """simplify_geometry=True restores the lossy shrink path.
+
+        Requires shapely — skipped in environments where it is not installed.
+        """
+        pytest.importorskip("shapely", reason="shapely required for geometry simplification")
         from dynastore.modules.storage.driver_config import (
             ItemsElasticsearchDriverConfig,
         )
@@ -959,7 +965,12 @@ class TestWriteEntitiesGeometryPolicy:
         body = es.bulk_calls[0]["body"]
         doc = body[1]
         # Lossy path stamped the metadata and shrank the geometry.
-        assert doc.get("_simplification_mode") in ("tolerance", "bbox")
+        # Since #1828 the simplification record lives at system.geometry_simplification.
+        system = doc.get("system", {})
+        simp = system.get("geometry_simplification", {})
+        assert simp.get("mode") in ("tolerance", "bbox"), (
+            f"expected simplification mode in (tolerance, bbox), got system={system!r}"
+        )
         geom = doc.get("geometry")
         assert geom
         assert len(geom["coordinates"][0]) < 300_001
@@ -1015,7 +1026,7 @@ def _make_ctx():
     return IndexContext(catalog="cat1", collection="col1", entity_type="item")
 
 
-def _fake_canonical_inputs(catalog_id, collection_id, geoids):
+def _fake_canonical_inputs(catalog_id, collection_id, geoids, db_resource=None):
     """Stand in for the raw-PG read (#1800): one minimal canonical input per
     geoid so ``build_canonical_index_doc`` runs for real with ``id``/
     ``catalog_id``/``collection_id`` populated, exercising the same body

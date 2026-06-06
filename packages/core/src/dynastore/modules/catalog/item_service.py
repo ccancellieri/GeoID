@@ -1008,11 +1008,30 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             # Phase 2f: pass the engine so the dispatcher can open its own
             # wrapping TX for atomic OUTBOX enqueue.
             if results:
-                await self._dispatch_index_upsert(
+                _index_results = await self._dispatch_index_upsert(
                     catalog_id, collection_id, results,
                     db_resource=db_resource or self.engine,
                     processing_context=processing_context,
                 )
+                # Propagate per-indexer results via ctx.extensions so callers
+                # (e.g. the ingestion task) can inspect secondary-index health
+                # without additional round-trips.
+                if ctx is not None and _index_results:
+                    existing = ctx.extensions.get("_index_results") or {}
+                    # Merge per-batch results: accumulate succeeded/failed totals.
+                    for indexer_id, bulk_res in _index_results.items():
+                        if indexer_id in existing:
+                            prev = existing[indexer_id]
+                            from dynastore.models.protocols.indexer import BulkResult
+                            existing[indexer_id] = BulkResult(
+                                total=prev.total + bulk_res.total,
+                                succeeded=prev.succeeded + bulk_res.succeeded,
+                                failed=prev.failed + bulk_res.failed,
+                                failures=prev.failures + bulk_res.failures,
+                            )
+                        else:
+                            existing[indexer_id] = bulk_res
+                    ctx.extensions["_index_results"] = existing
 
             # Write-reactive tile-cache invalidation (#1292 / #1297 Phase 2b):
             # mark stale the tiles the new feature bboxes touch, and also the
@@ -1519,6 +1538,9 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         # event listeners.  Phase 2f: pass the engine so the dispatcher
         # can open its own wrapping TX for atomic OUTBOX enqueue.
         if results:
+            # Return value is logged by the dispatcher — callers of upsert_bulk
+            # that need per-indexer health must call _dispatch_index_upsert
+            # directly and inspect the returned dict.
             await self._dispatch_index_upsert(
                 catalog_id, collection_id, results,
                 db_resource=engine,
@@ -1831,7 +1853,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         *,
         db_resource: Optional[DbResource] = None,
         processing_context: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """Fan items out to every configured Indexer for the collection.
 
         Single dispatcher call site for items, replacing the per-driver
@@ -1863,7 +1885,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         internal ``_*`` fields, so they never surface to clients.
         """
         if not results:
-            return
+            return {}
 
         from dynastore.models.protocols.indexer import IndexOp
         from dynastore.modules.storage.index_dispatcher import (
@@ -1903,22 +1925,21 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             if r.id is not None
         ]
         if not ops:
-            return
+            return {}
 
         engine = db_resource or self.engine
         if engine is None:
             # No engine available — degrade to non-atomic enqueue (matches
             # pre-Phase-2f behaviour).  Outbox writer logs its own warning
             # when ctx.pg_conn is None.
-            await self._do_dispatch(
+            return await self._do_dispatch(
                 dispatcher, catalog_id, collection_id, ops, pg_conn=None,
             )
-            return
 
         # Phase 2f: open a wrapping TX so the outbox INSERT (if any) is
         # atomic with the indexer attempt.
         async with managed_transaction(engine) as conn:
-            await self._do_dispatch(
+            return await self._do_dispatch(
                 dispatcher, catalog_id, collection_id, ops, pg_conn=conn,
             )
 
@@ -1930,9 +1951,14 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         ops: List[Any],
         *,
         pg_conn: Optional[DbResource],
-    ) -> None:
+    ) -> Dict[str, Any]:
         """Inner dispatch helper — split out so the wrapping TX in
-        :meth:`_dispatch_index_upsert` is a single ``async with`` block."""
+        :meth:`_dispatch_index_upsert` is a single ``async with`` block.
+
+        Returns the per-indexer :class:`BulkResult` dict from
+        :meth:`~IndexDispatcher.fan_out_bulk` so callers can inspect
+        secondary-index health without additional round-trips.
+        """
         from dynastore.models.protocols.indexer import IndexContext
         from dynastore.modules.storage.index_dispatcher import IndexerFatal
         from dynastore.tools.correlation import get_correlation_id
@@ -1945,7 +1971,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             entity_type="item",
         )
         try:
-            await dispatcher.fan_out_bulk(ctx, ops)
+            return await dispatcher.fan_out_bulk(ctx, ops)
         except IndexerFatal:
             # FATAL contract: a routing entry with on_failure=FATAL
             # MUST propagate so the caller's TX rolls back.  Don't
@@ -1956,6 +1982,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 "Index dispatcher fan-out failed for %s/%s (%d items): %s",
                 catalog_id, collection_id, len(ops), e,
             )
+            return {}
 
     async def _dispatch_tile_cache_invalidation(
         self,

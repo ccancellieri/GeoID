@@ -18,10 +18,11 @@
 
 import json
 import logging
-from typing import ClassVar, Dict, Any, Optional, List, Union, cast
+from typing import ClassVar, Dict, Any, FrozenSet, Optional, List, Union, cast
 from dynastore.modules import get_protocol
 from dynastore.tools.discovery import get_protocols
 from fastapi import (
+    Depends,
     FastAPI,
     APIRouter,
     HTTPException,
@@ -42,6 +43,7 @@ from dynastore.extensions.ogc_models_shared import (
 )
 from dynastore.extensions.assets.conformance import ASSETS_CONFORMANCE_URIS
 from dynastore.extensions.tools.fast_api import AppJSONResponse
+from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.models.protocols import (
     AssetsProtocol,
     AssetUploadProtocol,
@@ -669,8 +671,11 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         catalog_id: str = Path(..., description="The catalog ID"),
         limit: int = Query(10, ge=1, le=100),
         offset: int = Query(0, ge=0),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Returns a list of assets associated directly with the catalog (no collection)."""
+        # Accepted for uniform cross-protocol routing-hints support; this route
+        # reads asset metadata rows and performs no vector-geometry read.
         return await self.assets.list_assets(
             catalog_id=catalog_id, collection_id=None, limit=limit, offset=offset
         )
@@ -821,8 +826,11 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         collection_id: str = Path(..., description="The collection ID"),
         limit: int = Query(10, ge=1, le=100),
         offset: int = Query(0, ge=0),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Returns a list of assets associated with a specific collection."""
+        # Accepted for uniform cross-protocol routing-hints support; this route
+        # reads asset metadata rows and performs no vector-geometry read.
         return await self.assets.list_assets(
             catalog_id=catalog_id,
             collection_id=collection_id,

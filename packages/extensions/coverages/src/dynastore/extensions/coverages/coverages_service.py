@@ -21,18 +21,19 @@ and protocol-specific response models. Zero core changes needed.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import FrozenSet, Optional
 
 import rasterio as _rasterio_scope_gate  # noqa: F401  # SCOPE gate: extension_coverages requires rasterio
 _ = _rasterio_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from dynastore.extensions.coverages.config import CoveragesConfig
 from dynastore.extensions.coverages.links import build_coverage_links
 from dynastore.extensions.ogc_base import OGCServiceMixin, ogc_asset_href
 from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.modules.coverages.domainset import build_domainset
 from dynastore.modules.coverages.rangetype import build_rangetype
@@ -325,8 +326,15 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         collection_id: str,
         subset: Optional[str] = Query(None),
         f: Optional[str] = Query("geotiff"),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
-        """Stream a coverage by content-negotiated format with optional subset."""
+        """Stream a coverage by content-negotiated format with optional subset.
+
+        ``?hints=`` is accepted uniformly (e.g. ``hints=geometry_exact``) but
+        reserved for forward-compatible routing — coverage data is read from a
+        raster asset directly and does not flow through a hints-capable vector
+        read seam, so the value has no effect on this route today.
+        """
         fmt = _resolve_format(f)
         item = await self._get_first_item(catalog_id, collection_id)
         if item is None:

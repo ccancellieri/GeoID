@@ -25,7 +25,7 @@ Scoped per catalog; all write endpoints respect the catalog-readiness guard.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import FrozenSet, List, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
 from sqlalchemy.exc import IntegrityError
@@ -35,6 +35,7 @@ from starlette import status
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.db import get_async_connection
+from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.models.protocols import ConnectedSystemsProtocol
 from dynastore.modules.connected_systems import db as consys_db
 from dynastore.modules.connected_systems.models import (
@@ -221,6 +222,9 @@ class ConnectedSystemsService(
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
+        # Accepted for uniform protocol consistency; connected-systems reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[System]:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
@@ -294,6 +298,9 @@ class ConnectedSystemsService(
         system_id: str,
         catalog_id: str = Query(..., description="Catalog identifier"),
         conn: AsyncConnection = Depends(get_async_connection),
+        # Accepted for uniform protocol consistency; connected-systems reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> System:
         validate_sql_identifier(catalog_id)
         result = await consys_db.get_system(conn, catalog_id, system_id)
@@ -340,6 +347,9 @@ class ConnectedSystemsService(
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
+        # Accepted for uniform protocol consistency; connected-systems reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[Deployment]:
         validate_sql_identifier(catalog_id)
         existing = await consys_db.get_system(conn, catalog_id, system_id)
@@ -356,6 +366,9 @@ class ConnectedSystemsService(
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
+        # Accepted for uniform protocol consistency; connected-systems reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[DataStream]:
         validate_sql_identifier(catalog_id)
         existing = await consys_db.get_system(conn, catalog_id, system_id)
@@ -375,6 +388,9 @@ class ConnectedSystemsService(
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
+        # Accepted for uniform protocol consistency; connected-systems reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[DataStream]:
         validate_sql_identifier(catalog_id)
         return await consys_db.list_datastreams(conn, catalog_id, limit=limit, offset=offset)
@@ -413,6 +429,9 @@ class ConnectedSystemsService(
         datastream_id: str,
         catalog_id: str = Query(..., description="Catalog identifier"),
         conn: AsyncConnection = Depends(get_async_connection),
+        # Accepted for uniform protocol consistency; connected-systems reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> DataStream:
         validate_sql_identifier(catalog_id)
         result = await consys_db.get_datastream(conn, catalog_id, datastream_id)
@@ -431,6 +450,9 @@ class ConnectedSystemsService(
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
+        # Accepted for uniform protocol consistency; connected-systems reads go through
+        # a dedicated SQL path that does not yet implement the hints routing layer.
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[Observation]:
         validate_sql_identifier(catalog_id)
         ds = await consys_db.get_datastream(conn, catalog_id, datastream_id)
