@@ -152,3 +152,98 @@ async def test_delete_tile_variants_noop_on_empty_formats():
         "cat", "col", "WebMercatorQuad", 5, 1, 2, [],
     )
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for #1881 — cache_invalidate arity fix
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_tile_cache_invalidation_does_not_raise(caplog):
+    """Successful delete + real cache_invalidate must not log an error and must
+    return True.  Exercises the arity fix: without it, sig.bind() raises
+    ``TypeError: missing a required argument: 'format'``."""
+    import logging
+
+    storage = _make_storage()
+    with patch(
+        "dynastore.modules.tiles.tiles_module.managed_transaction"
+    ) as mtx, patch(
+        "dynastore.modules.tiles.tiles_module.DQLQuery"
+    ) as MockDQL:
+        mtx.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+        mtx.return_value.__aexit__ = AsyncMock(return_value=False)
+        MockDQL.return_value.execute = AsyncMock(return_value=1)
+
+        with caplog.at_level(logging.ERROR, logger="dynastore.modules.tiles.tiles_module"):
+            ok = await storage.delete_tile("cat", "col", "WebMercatorQuad", 5, 1, 2, "mvt")
+
+    assert ok is True
+    # No ERROR must appear — a TypeError from the old arity bug would be logged as ERROR.
+    error_msgs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+    assert error_msgs == [], f"Unexpected errors: {error_msgs}"
+
+
+@pytest.mark.asyncio
+async def test_delete_tile_variants_cache_invalidation_does_not_raise(caplog):
+    """Successful delete_tile_variants + real cache_invalidate must not log an
+    error and must return True.  Without the arity fix each format iteration
+    raised ``TypeError: missing a required argument: 'format'``, was caught by
+    the broad except, logged as a delete failure, and returned False."""
+    import logging
+
+    storage = _make_storage()
+    with patch(
+        "dynastore.modules.tiles.tiles_module.managed_transaction"
+    ) as mtx, patch(
+        "dynastore.modules.tiles.tiles_module.DQLQuery"
+    ) as MockDQL:
+        mtx.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+        mtx.return_value.__aexit__ = AsyncMock(return_value=False)
+        MockDQL.return_value.execute = AsyncMock(return_value=2)
+
+        with caplog.at_level(logging.ERROR, logger="dynastore.modules.tiles.tiles_module"):
+            ok = await storage.delete_tile_variants(
+                "cat", "col", "WebMercatorQuad", 5, 1, 2, ["mvt", "pbf"],
+            )
+
+    assert ok is True
+    error_msgs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+    assert error_msgs == [], f"Unexpected errors: {error_msgs}"
+
+
+@pytest.mark.asyncio
+async def test_delete_tile_variants_cache_invalidation_failure_returns_true(caplog):
+    """A successful DELETE followed by a cache-invalidation failure must still
+    return True (delete succeeded) and log WARNING, not ERROR."""
+    import logging
+
+    storage = _make_storage()
+    with patch(
+        "dynastore.modules.tiles.tiles_module.managed_transaction"
+    ) as mtx, patch(
+        "dynastore.modules.tiles.tiles_module.DQLQuery"
+    ) as MockDQL, patch(
+        "dynastore.modules.tiles.tiles_module.cache_invalidate",
+        side_effect=RuntimeError("cache backend unavailable"),
+    ):
+        mtx.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+        mtx.return_value.__aexit__ = AsyncMock(return_value=False)
+        MockDQL.return_value.execute = AsyncMock(return_value=1)
+
+        with caplog.at_level(logging.DEBUG, logger="dynastore.modules.tiles.tiles_module"):
+            ok = await storage.delete_tile_variants(
+                "cat", "col", "WebMercatorQuad", 5, 1, 2, ["mvt"],
+            )
+
+    # Delete succeeded → must return True regardless of invalidation failure.
+    assert ok is True
+    # Must warn (not error) about the invalidation failure.
+    warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("Cache invalidation failed" in m for m in warning_msgs), (
+        f"Expected a warning about invalidation failure; got: {caplog.records}"
+    )
+    # Must NOT log it as an error (that would be the old misleading behaviour).
+    error_msgs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+    assert error_msgs == [], f"Unexpected errors: {error_msgs}"

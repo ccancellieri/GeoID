@@ -590,12 +590,6 @@ class TilePGPreseedStorage(TileStorageProtocol):
                     y=y,
                     format=format,
                 )
-            # The existence-probe cache may now be stale for this tile.
-            cache_invalidate(
-                self.check_tile_exists,
-                catalog_id, collection_id, tms_id, z, x, y, format,
-            )
-            return True
         except Exception as e:
             if "UndefinedTableError" in str(type(e).__name__) or "42P01" in str(e):
                 return True  # No table → nothing to invalidate; idempotent success.
@@ -604,6 +598,20 @@ class TilePGPreseedStorage(TileStorageProtocol):
                 catalog_id, collection_id, tms_id, z, x, y, format, e,
             )
             return False
+        # The existence-probe cache may now be stale for this tile.
+        # Pass ``self`` explicitly: @cached captures the unbound-method signature
+        # (which includes ``self``), so the key builder needs it positionally.
+        try:
+            cache_invalidate(
+                self.check_tile_exists,
+                self, catalog_id, collection_id, tms_id, z, x, y, format,
+            )
+        except Exception as e:
+            logger.warning(
+                "Cache invalidation failed for tile %s/%s/%s/%s/%s/%s.%s: %s",
+                catalog_id, collection_id, tms_id, z, x, y, format, e,
+            )
+        return True
 
     async def delete_tile_variants(
         self,
@@ -665,13 +673,6 @@ class TilePGPreseedStorage(TileStorageProtocol):
                     p_tail_hash=f"%,{collection_id}@%",  # a,collection_id@hash (last)
                     p_mid=f"%,{collection_id},%",       # a,collection_id,b[,...][@hash]
                 )
-            # The existence-probe cache may now be stale for these variants.
-            for fmt in formats:
-                cache_invalidate(
-                    self.check_tile_exists,
-                    catalog_id, collection_id, tms_id, z, x, y, fmt,
-                )
-            return True
         except Exception as e:
             if "UndefinedTableError" in str(type(e).__name__) or "42P01" in str(e):
                 return True  # No table → nothing to invalidate; idempotent success.
@@ -680,6 +681,21 @@ class TilePGPreseedStorage(TileStorageProtocol):
                 catalog_id, collection_id, tms_id, z, x, y, list(formats), e,
             )
             return False
+        # The existence-probe cache may now be stale for these variants.
+        # Pass ``self`` explicitly: @cached captures the unbound-method signature
+        # (which includes ``self``), so the key builder needs it positionally.
+        for fmt in formats:
+            try:
+                cache_invalidate(
+                    self.check_tile_exists,
+                    self, catalog_id, collection_id, tms_id, z, x, y, fmt,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Cache invalidation failed for tile variant %s/%s/%s/%s/%s/%s.%s: %s",
+                    catalog_id, collection_id, tms_id, z, x, y, fmt, e,
+                )
+        return True
 
     async def drop_storage(self, catalog_id: str) -> None:
         """Drop the catalog-specific preseeded_tiles table.
