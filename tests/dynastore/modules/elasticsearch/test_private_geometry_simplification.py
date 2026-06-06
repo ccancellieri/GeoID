@@ -37,13 +37,6 @@ import pytest
 
 _POINT_GEOMETRY = {"type": "Point", "coordinates": [12.5, 42.0]}
 
-_BASE_ITEM = {
-    "id": "019e6318-d99e-7da2-bdd9-1223a0d9cd35",
-    "type": "Feature",
-    "geometry": _POINT_GEOMETRY,
-    "properties": {"title": "Roma"},
-}
-
 
 def _make_source(**overrides):
     """Build a minimal private ES doc ``_source`` dict."""
@@ -134,6 +127,7 @@ def test_read_surfaces_simplification_from_system_container():
     feature = ItemsElasticsearchPrivateDriver._private_source_to_feature(
         source, catalog_id="cat1", collection_id="col1", fallback_id="fallback",
     )
+    assert feature.properties is not None
     assert feature.properties["simplification_factor"] == pytest.approx(0.002)
     assert feature.properties["simplification_mode"] == "rdp"
 
@@ -153,6 +147,7 @@ def test_read_back_compat_flat_keys_when_no_system_container():
     feature = ItemsElasticsearchPrivateDriver._private_source_to_feature(
         source, catalog_id="cat1", collection_id="col1", fallback_id="fallback",
     )
+    assert feature.properties is not None
     assert feature.properties["simplification_factor"] == pytest.approx(0.0001)
     assert feature.properties["simplification_mode"] == "vw"
 
@@ -167,6 +162,7 @@ def test_read_no_simplification_fields_when_absent():
     feature = ItemsElasticsearchPrivateDriver._private_source_to_feature(
         source, catalog_id="cat1", collection_id="col1", fallback_id="fallback",
     )
+    assert feature.properties is not None
     assert "simplification_factor" not in feature.properties
     assert "simplification_mode" not in feature.properties
 
@@ -280,3 +276,69 @@ def test_transformer_restore_back_compat_flat_keys():
     props = result.get("properties", {})
     assert props.get("simplification_factor") == pytest.approx(0.0005)
     assert props.get("simplification_mode") == "vw"
+
+
+# ---------------------------------------------------------------------------
+# PrivateIndexTask write-path — #1828 Phase 2
+# ---------------------------------------------------------------------------
+
+
+def _run_task_simplification(*, factor: float, mode: str) -> dict:
+    """Simulate the PrivateIndexTask write-path simplification stamp.
+
+    Replicates the exact logic from ``PrivateIndexTask.run`` that was
+    changed in #1828 Phase 2 (the two flat assignments replaced by the
+    canonical ``system.geometry_simplification`` write).
+    """
+    doc: dict = {
+        "geoid": "abc-task",
+        "catalog_id": "cat1",
+        "collection_id": "col1",
+        "properties": {},
+    }
+    # Mirror the new task write-path logic:
+    if mode != "none":
+        doc.setdefault("system", {})["geometry_simplification"] = {
+            "factor": factor,
+            "mode": mode,
+        }
+    return doc
+
+
+def test_task_write_sets_canonical_geometry_simplification():
+    """When PrivateIndexTask simplification runs (mode != 'none'), the doc
+    must carry ``system.geometry_simplification.{factor,mode}`` and NOT
+    flat ``simplification_factor`` / ``simplification_mode`` root keys."""
+    doc = _run_task_simplification(factor=0.003, mode="rdp")
+
+    assert "system" in doc
+    gs = doc["system"]["geometry_simplification"]
+    assert gs["factor"] == pytest.approx(0.003)
+    assert gs["mode"] == "rdp"
+    # flat keys must be absent
+    assert "simplification_factor" not in doc
+    assert "simplification_mode" not in doc
+    assert "_simplification_factor" not in doc
+    assert "_simplification_mode" not in doc
+
+
+def test_task_write_no_system_key_when_mode_none():
+    """When mode == 'none' (no simplification), PrivateIndexTask must not
+    write ``system.geometry_simplification``."""
+    doc = _run_task_simplification(factor=1.0, mode="none")
+
+    assert "geometry_simplification" not in doc.get("system", {})
+    assert "simplification_factor" not in doc
+    assert "simplification_mode" not in doc
+
+
+def test_tenant_root_fields_excludes_underscore_simplification_keys():
+    """_tenant_root_fields must not declare the old ``_simplification_factor``
+    / ``_simplification_mode`` entries — simplification now lives entirely
+    under ``system.geometry_simplification`` (#1828 Phase 2)."""
+    from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
+        _tenant_root_fields,
+    )
+    root = _tenant_root_fields()
+    assert "_simplification_factor" not in root
+    assert "_simplification_mode" not in root

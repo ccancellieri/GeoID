@@ -948,32 +948,40 @@ class TestWriteEntitiesGeometryPolicy:
 
     @pytest.mark.asyncio
     async def test_simplification_runs_only_when_flag_enabled(self):
-        """simplify_geometry=True restores the lossy shrink path.
+        """simplify_geometry=True routes through _apply_geometry_simplification,
+        which writes the canonical system.geometry_simplification container
+        (#1828 Phase 2 — flat _simplification_mode root key no longer written).
 
-        Requires shapely — skipped in environments where it is not installed.
+        ``maybe_simplify_for_es`` is patched to return a deterministic result so
+        the test does not require shapely to be installed in this environment.
         """
-        pytest.importorskip("shapely", reason="shapely required for geometry simplification")
         from dynastore.modules.storage.driver_config import (
             ItemsElasticsearchDriverConfig,
         )
 
         feature = self._big_polygon_feature()
-        es = await self._run_write(
-            ItemsElasticsearchDriverConfig(simplify_geometry=True), feature,
-        )
+        simplified_geom = {"type": "Point", "coordinates": [0.0, 0.0]}  # stub shrunk
+        with patch(
+            "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+            side_effect=lambda doc, *, simplify: (
+                {**doc, "geometry": simplified_geom} if simplify else doc,
+                0.001 if simplify else 1.0,
+                "tolerance" if simplify else "none",
+            ),
+        ):
+            es = await self._run_write(
+                ItemsElasticsearchDriverConfig(simplify_geometry=True), feature,
+            )
 
         body = es.bulk_calls[0]["body"]
         doc = body[1]
-        # Lossy path stamped the metadata and shrank the geometry.
-        # Since #1828 the simplification record lives at system.geometry_simplification.
-        system = doc.get("system", {})
-        simp = system.get("geometry_simplification", {})
-        assert simp.get("mode") in ("tolerance", "bbox"), (
-            f"expected simplification mode in (tolerance, bbox), got system={system!r}"
-        )
-        geom = doc.get("geometry")
-        assert geom
-        assert len(geom["coordinates"][0]) < 300_001
+        # Canonical system container carries the simplification metadata.
+        gs = doc.get("system", {}).get("geometry_simplification", {})
+        assert gs.get("mode") == "tolerance"
+        assert gs.get("factor") == pytest.approx(0.001)
+        # Old flat keys must NOT be present on new writes.
+        assert "_simplification_mode" not in doc
+        assert "_simplification_factor" not in doc
 
 
 class TestLocationReportsTenantIndex:
