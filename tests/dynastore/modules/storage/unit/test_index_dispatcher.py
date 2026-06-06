@@ -700,3 +700,160 @@ async def test_fan_out_does_not_warn_when_no_ops_and_no_entries(caplog):
     assert not any(
         "routing returned NO secondary-index entries" in m for m in msgs
     ), msgs
+
+
+# ---------------------------------------------------------------------------
+# #1861 — silent no-op converted to retryable outbox failure
+# ---------------------------------------------------------------------------
+
+
+class _NoopIndexer:
+    """Stub indexer that always returns BulkResult(total=N, succeeded=0, failed=0)."""
+
+    def __init__(self, indexer_id: str) -> None:
+        self.indexer_id = indexer_id
+        self.bulk_calls: List[Sequence[IndexOp]] = []
+        self.ensure_calls: List[IndexContext] = []
+
+    async def ensure_indexer(self, ctx: IndexContext) -> None:
+        self.ensure_calls.append(ctx)
+
+    async def index(self, ctx: IndexContext, op: IndexOp) -> None:  # pragma: no cover
+        pass
+
+    async def index_bulk(
+        self, ctx: IndexContext, ops: Sequence[IndexOp],
+    ) -> BulkResult:
+        self.bulk_calls.append(ops)
+        return BulkResult(total=len(ops), succeeded=0, failed=0)
+
+
+def _make_dispatcher_with_outbox(
+    entries: List[OperationDriverEntry],
+    indexers: dict,
+    outbox,
+) -> IndexDispatcher:
+    routing = _StubRouting(entries)
+
+    async def routing_resolver(catalog, collection):
+        return routing
+
+    async def indexer_registry(indexer_id):
+        return indexers.get(indexer_id)
+
+    return IndexDispatcher(
+        routing_resolver=routing_resolver,
+        indexer_registry=indexer_registry,
+        outbox=outbox,
+    )
+
+
+@pytest.mark.asyncio
+async def test_silent_noop_upsert_batch_enqueues_and_returns_failed():
+    """A stub indexer returning BulkResult(total=2, succeeded=0, failed=0)
+    for 2 upsert ops must:
+      (a) trigger an outbox enqueue call with those ops, and
+      (b) return a result with failed == 2.
+    """
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    noop = _NoopIndexer("noop-es")
+    writer = _RecordingWriter()
+
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_entry("noop-es", on_failure=FailurePolicy.OUTBOX)],
+        indexers={"noop-es": noop},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    # (a) outbox must have been written
+    assert len(writer.rows) >= 1, "outbox enqueue must be called for noop upserts"
+    import json as _json
+    enqueued_ids = {
+        item["entity_id"]
+        for row in writer.rows
+        for item in _json.loads(row["params"]["inputs"])["ops"]
+    }
+    assert "i1" in enqueued_ids
+    assert "i2" in enqueued_ids
+
+    # (b) failed count must equal the number of noop upsert ops
+    assert results["noop-es"].failed == 2
+
+
+@pytest.mark.asyncio
+async def test_silent_noop_does_not_log_as_clean_success(caplog):
+    """A converted no-op must NOT produce an index_dispatch_path
+    post_commit_inline success log line.
+    """
+    import logging as _logging
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    noop = _NoopIndexer("noop-es")
+    writer = _RecordingWriter()
+
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_entry("noop-es", on_failure=FailurePolicy.OUTBOX)],
+        indexers={"noop-es": noop},
+        outbox=writer,
+    )
+    with caplog.at_level(_logging.INFO):
+        await dispatcher.fan_out_bulk(ctx_with_conn, [_op(entity_id="i1")])
+
+    rows = _extract_dispatch_path_records(caplog)
+    assert not any(r.get("mode") == "post_commit_inline" for r in rows), (
+        "A converted no-op must not appear as a clean post_commit_inline success"
+    )
+
+
+@pytest.mark.asyncio
+async def test_normal_success_does_not_enqueue():
+    """A real success (succeeded=N) must NOT trigger outbox enqueue."""
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_entry("a", on_failure=FailurePolicy.OUTBOX)],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, [_op(entity_id="i1")])
+
+    assert writer.rows == [], "normal success must not enqueue anything"
+    assert results["a"].succeeded == 1
+    assert results["a"].failed == 0
+
+
+@pytest.mark.asyncio
+async def test_silent_noop_delete_only_does_not_enqueue():
+    """A silent no-op batch composed only of delete ops must NOT be
+    enqueued (delete pass-through is unaffected by this change).
+    """
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    noop = _NoopIndexer("noop-es")
+    writer = _RecordingWriter()
+
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_entry("noop-es", on_failure=FailurePolicy.OUTBOX)],
+        indexers={"noop-es": noop},
+        outbox=writer,
+    )
+    delete_op = _op(op_type="delete", entity_id="d1")
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, [delete_op])
+
+    assert writer.rows == [], "delete-only no-op must not enqueue"
+    # failed count stays 0 for deletes (no upserts to convert)
+    assert results["noop-es"].failed == 0
