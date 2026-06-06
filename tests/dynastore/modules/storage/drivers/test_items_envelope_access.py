@@ -579,6 +579,12 @@ class _FakeStatsSidecar:
     def resolve_computed_value(self, row, name):
         return (True, 99.5) if name == "area" else (False, None)
 
+    def producible_metadata_names(self):
+        return set()
+
+    def resolve_metadata_value(self, row, resolved_name):
+        return (False, None)
+
 
 def _make_canonical_input():
     from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
