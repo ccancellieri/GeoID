@@ -976,7 +976,28 @@ async def app_lifespan(
     # 1. Set Environment (MUST be done before bootstrap for discovery)
     os.environ["DATABASE_URL"] = db_url
     os.environ["DYNASTORE_TESTING"] = "true"  # Ensure GCP/Cloud Run mocks work
-    
+
+    # When the Keycloak integration flag is set, point the IAM module at the
+    # local sidecar issuer/JWKS so that Bearer tokens issued by that sidecar
+    # are trusted by the in-process test app.  We only write these vars when
+    # they are not already set, so an operator-supplied override is honoured.
+    # The vars are cleared on fixture teardown to avoid cross-test pollution.
+    _keycloak_env_keys_injected: list = []
+    if os.getenv("KEYCLOAK_INTEGRATION", "").strip() in {"1", "true", "True"}:
+        from tests.dynastore.test_utils.keycloak import (
+            _DEFAULT_ISSUER as _KC_ISSUER,
+            _DEFAULT_CLIENT_ID as _KC_CLIENT_ID,
+            _DEFAULT_CLIENT_SECRET as _KC_CLIENT_SECRET,
+        )
+        for _key, _val in (
+            ("KEYCLOAK_ISSUER_URL", _KC_ISSUER),
+            ("KEYCLOAK_CLIENT_ID", _KC_CLIENT_ID),
+            ("KEYCLOAK_CLIENT_SECRET", _KC_CLIENT_SECRET),
+        ):
+            if _key not in os.environ:
+                os.environ[_key] = _val
+                _keycloak_env_keys_injected.append(_key)
+
     # 2. Mock App Instance (Production-like)
     app = FastAPI()
     app.state = State()  # Fresh state
@@ -1133,6 +1154,11 @@ async def app_lifespan(
         # Yield app state to the test
         yield app.state
 
+    # Teardown: remove any Keycloak env vars we injected so they don't bleed
+    # into subsequent test functions within the same process.
+    for _key in _keycloak_env_keys_injected:
+        os.environ.pop(_key, None)
+
 
 _DEFAULT_MODULE_LIST = [
     "db_config", "db", "catalog", "stats", "iam", "stac",
@@ -1237,6 +1263,24 @@ async def app_lifespan_module(request):
 
     os.environ["DATABASE_URL"] = db_url_val
     os.environ["DYNASTORE_TESTING"] = "true"
+
+    # When the Keycloak integration flag is set, point the IAM module at the
+    # local sidecar issuer/JWKS so Bearer tokens from the sidecar are trusted.
+    _keycloak_env_keys_injected_mod: list = []
+    if os.getenv("KEYCLOAK_INTEGRATION", "").strip() in {"1", "true", "True"}:
+        from tests.dynastore.test_utils.keycloak import (
+            _DEFAULT_ISSUER as _KC_ISSUER_MOD,
+            _DEFAULT_CLIENT_ID as _KC_CLIENT_ID_MOD,
+            _DEFAULT_CLIENT_SECRET as _KC_CLIENT_SECRET_MOD,
+        )
+        for _key_m, _val_m in (
+            ("KEYCLOAK_ISSUER_URL", _KC_ISSUER_MOD),
+            ("KEYCLOAK_CLIENT_ID", _KC_CLIENT_ID_MOD),
+            ("KEYCLOAK_CLIENT_SECRET", _KC_CLIENT_SECRET_MOD),
+        ):
+            if _key_m not in os.environ:
+                os.environ[_key_m] = _val_m
+                _keycloak_env_keys_injected_mod.append(_key_m)
 
     app = FastAPI()
     app.state = State()
@@ -1343,6 +1387,10 @@ async def app_lifespan_module(request):
     # Module-level teardown
     await reset_dynastore_state(engine=engine)
     await engine.dispose()
+
+    # Remove any Keycloak env vars injected for integration mode.
+    for _key_m in _keycloak_env_keys_injected_mod:
+        os.environ.pop(_key_m, None)
 
 
 @pytest_asyncio.fixture(loop_scope="function")
