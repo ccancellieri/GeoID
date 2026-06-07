@@ -2296,6 +2296,113 @@ class CatalogService(CatalogsProtocol):
                     await upsert_catalog_metadata(catalog_id, metadata)
         return True
 
+    async def drain_pending_checklist_steps(
+        self,
+        catalog_id: str,
+        terminal_status: str = "degraded",
+        ctx: Optional["DriverContext"] = None,
+    ) -> bool:
+        """Mark every still-pending checklist step terminal and re-evaluate (#1902).
+
+        Called by the provisioning-task runner when the task exits (any path)
+        without having marked every step itself, and by the reconciler sweep
+        for catalogs stuck in ``provisioning`` with no live task.
+
+        All steps that are still ``"pending"`` are set to ``terminal_status``
+        (default ``"degraded"`` so the catalog still becomes ready; pass
+        ``"failed"`` for a hard-failure path). Steps already in a terminal
+        state (``complete``/``skipped``/``degraded``/``failed``) are not
+        touched. After updating the checklist ``evaluate_checklist`` decides
+        the new catalog status exactly as ``mark_provisioning_step`` does.
+
+        Returns ``True`` when at least one step was updated; ``False`` when
+        the catalog was not found, has no checklist, or all steps were already
+        terminal.
+        """
+        from dynastore.modules.catalog.provisioning_registry import (
+            STEP_PENDING,
+            evaluate_checklist,
+        )
+
+        db_resource = ctx.db_resource if ctx else None
+        engine = get_catalog_engine(db_resource)
+
+        _NOT_FOUND = object()
+        _NO_CHECKLIST = object()
+        _ALREADY_TERMINAL = object()
+
+        async def _do_drain(conn: Any) -> Any:
+            row = await _get_provisioning_checklist_query.execute(conn, id=catalog_id)
+            if not row:
+                return _NOT_FOUND
+            raw = row.get("provisioning_checklist")
+            if raw is None:
+                return _NO_CHECKLIST
+            checklist = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            pending_keys = [k for k, v in checklist.items() if v == STEP_PENDING]
+            if not pending_keys:
+                return _ALREADY_TERMINAL
+            for key in pending_keys:
+                checklist[key] = terminal_status
+            new_status = evaluate_checklist(checklist)
+            if new_status is not None:
+                await DQLQuery(
+                    "UPDATE catalog.catalogs "
+                    "SET provisioning_checklist = CAST(:cl AS jsonb), "
+                    "provisioning_status = :st WHERE id = :id;",
+                    result_handler=ResultHandler.NONE,
+                ).execute(conn, id=catalog_id, cl=json.dumps(checklist), st=new_status)
+            else:
+                await DQLQuery(
+                    "UPDATE catalog.catalogs "
+                    "SET provisioning_checklist = CAST(:cl AS jsonb) "
+                    "WHERE id = :id;",
+                    result_handler=ResultHandler.NONE,
+                ).execute(conn, id=catalog_id, cl=json.dumps(checklist))
+            return (pending_keys, new_status)
+
+        result = await _provisioning_write_with_retry(engine, _do_drain)
+
+        if result is _NOT_FOUND:
+            logger.warning(
+                "drain_pending_checklist_steps: catalog '%s' not found.", catalog_id
+            )
+            return False
+        if result is _NO_CHECKLIST:
+            logger.debug(
+                "drain_pending_checklist_steps: catalog '%s' has no checklist.",
+                catalog_id,
+            )
+            return False
+        if result is _ALREADY_TERMINAL:
+            logger.debug(
+                "drain_pending_checklist_steps: catalog '%s' — all steps already "
+                "terminal, nothing to drain.",
+                catalog_id,
+            )
+            return False
+
+        pending_keys, new_status = result
+        logger.warning(
+            "drain_pending_checklist_steps: catalog '%s' — %d step(s) %s "
+            "still pending; marked '%s'. New catalog status: %s.",
+            catalog_id, len(pending_keys), pending_keys, terminal_status,
+            new_status or "unchanged (still provisioning)",
+        )
+        _invalidate_catalog_model_cache(catalog_id)
+
+        # Fan out when the overall status changed (mirrors mark_provisioning_step).
+        if new_status is not None:
+            catalog_model = await self.get_catalog_model(catalog_id)
+            if catalog_model is not None:
+                metadata = _build_catalog_metadata_payload(catalog_model)
+                if metadata:
+                    from dynastore.modules.catalog.catalog_router import (
+                        upsert_catalog_metadata,
+                    )
+                    await upsert_catalog_metadata(catalog_id, metadata)
+        return True
+
 
 # --- Standalone Utilities ---
 

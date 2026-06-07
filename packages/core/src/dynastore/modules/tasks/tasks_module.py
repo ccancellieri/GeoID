@@ -911,6 +911,100 @@ async def _warn_stuck_pending_tasks(
             logger.warning("stuck-pending warner: scan failed: %s", exc)
 
 
+async def sweep_wedged_provisioning_catalogs(
+    engine: DbResource,
+    min_age_s: float = 600.0,
+    sample_limit: int = 50,
+) -> int:
+    """Drain still-pending checklist steps for catalogs stuck in ``provisioning``
+    with no live or queued provisioning task (#1902).
+
+    The normal path is: provisioner task runs → marks each step terminal →
+    ``evaluate_checklist`` flips the catalog to ``ready``/``failed``.  When a
+    task dies before marking its own steps (crash, SIGKILL, DB unavailable at
+    mark time) the catalog is left ``provisioning`` indefinitely.
+
+    This sweep detects that condition — ``provisioning_status = 'provisioning'``
+    AND no ``PENDING``/``ACTIVE`` ``gcp_provision_catalog`` task pointing at the
+    same ``catalog_id`` in its ``inputs`` — and calls
+    ``drain_pending_checklist_steps`` on each such catalog.  The drain marks
+    still-``pending`` steps ``"degraded"`` so the catalog becomes ``ready``
+    rather than staying wedged.
+
+    Returns the number of catalogs drained this pass (0 = nothing to do).
+
+    Idempotent and fail-open: errors per catalog are logged and skipped.
+    The SQL is a read-only scan; the actual state mutation goes through the
+    catalog service's JSONB update path (SELECT … FOR UPDATE + evaluate).
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        SELECT c.id AS catalog_id
+        FROM catalog.catalogs c
+        WHERE c.provisioning_status = 'provisioning'
+          AND c.deleted_at IS NULL
+          AND c.provisioning_checklist IS NOT NULL
+          AND c.provisioning_checklist::text != '{{}}'
+          AND c.updated_at < NOW() - make_interval(secs => :min_age_s)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM "{task_schema}".tasks t
+              WHERE t.status IN ('PENDING', 'ACTIVE')
+                AND t.task_type = 'gcp_provision_catalog'
+                AND t.inputs->>'catalog_id' = c.id
+          )
+        LIMIT :sample_limit;
+    """
+    try:
+        async with managed_transaction(engine) as conn:
+            if not await check_table_exists(conn, "catalogs", "catalog"):
+                return 0
+            rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+                conn, min_age_s=min_age_s, sample_limit=sample_limit,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sweep_wedged_provisioning_catalogs: scan query failed: %s", exc)
+        return 0
+
+    rows = rows or []
+    if not rows:
+        return 0
+
+    from dynastore.tools.discovery import get_protocol
+    from dynastore.models.protocols.catalogs import CatalogsProtocol
+
+    catalogs = get_protocol(CatalogsProtocol)
+    if catalogs is None:
+        logger.warning(
+            "sweep_wedged_provisioning_catalogs: CatalogsProtocol not available; "
+            "skipping drain of %d wedged catalog(s).",
+            len(rows),
+        )
+        return 0
+
+    drained = 0
+    for row in rows:
+        catalog_id = row.get("catalog_id")
+        if not catalog_id:
+            continue
+        try:
+            updated = await catalogs.drain_pending_checklist_steps(
+                catalog_id, terminal_status="degraded",
+            )
+            if updated:
+                drained += 1
+                logger.warning(
+                    "sweep_wedged_provisioning_catalogs: drained wedged catalog '%s'.",
+                    catalog_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — one bad catalog must not stop the rest
+            logger.warning(
+                "sweep_wedged_provisioning_catalogs: drain failed for catalog '%s': %s",
+                catalog_id, exc,
+            )
+    return drained
+
+
 async def _run_mandatory_backstop_pass(
     engine: DbResource, schema: str, *, ttl_grace_seconds: float, min_age_s: float
 ) -> None:
@@ -1033,6 +1127,23 @@ async def _run_proactive_capability_sweep(
             await _run_mandatory_backstop_pass(
                 engine, schema, ttl_grace_seconds=capability_ttl_s, min_age_s=min_age_s,
             )
+            # Wedged-provisioning reconciler: drain still-pending checklist
+            # steps for catalogs stuck in 'provisioning' with no live task.
+            # Runs on every pod independently — drain_pending_checklist_steps
+            # uses SELECT … FOR UPDATE, so concurrent pods are serialised.
+            try:
+                drained = await sweep_wedged_provisioning_catalogs(
+                    engine, min_age_s=min_age_s,
+                )
+                if drained:
+                    logger.info(
+                        "proactive_sweep: drained %d wedged provisioning catalog(s).",
+                        drained,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "proactive_sweep: wedged-provisioning sweep failed: %s", exc,
+                )
         except Exception as exc:  # noqa: BLE001 — never crash the loop
             logger.warning("proactive_sweep: pass failed: %s", exc)
 
