@@ -340,3 +340,84 @@ async def test_destroy_task_invokes_typed_destruction():
     mock_eventing.teardown_catalog_eventing.assert_awaited_once_with("destroy_test_cat")
     mock_storage.drop_storage.assert_awaited_once_with("destroy_test_cat")
     assert result["status"] == "destroyed"
+
+
+# ---------------------------------------------------------------------------
+# Eventing step must ALWAYS reach a terminal checklist state — a permission
+# (or any) error escaping the soft handler must not leave gcp_eventing
+# 'pending', which would wedge the catalog in 'provisioning' forever.
+# Regression: dev Pub/Sub 403 left gcp_eventing 'pending' (catalog never ready).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_eventing_escape_marks_degraded_not_pending():
+    """An exception escaping _provision_eventing_soft is caught in run() and the
+    gcp_eventing step is marked terminal ('degraded') so the catalog still
+    reaches ready instead of being wedged in 'provisioning'."""
+    task = ProvisioningTask()
+    mock_catalogs = AsyncMock()
+    mock_storage = MagicMock()
+    mock_storage.ensure_storage_for_catalog = AsyncMock(return_value="bucket-c1")
+
+    with (
+        patch(
+            "dynastore.tasks.gcp_provision.task._get_storage_protocol",
+            return_value=mock_storage,
+        ),
+        patch(
+            "dynastore.tasks.gcp_provision.task._get_catalog_protocol",
+            return_value=mock_catalogs,
+        ),
+        patch(
+            "dynastore.tasks.gcp_provision.task._provision_eventing_soft",
+            new=AsyncMock(side_effect=RuntimeError("403 IAM_PERMISSION_DENIED")),
+        ),
+    ):
+        result = await task.run(_make_payload("c1"))
+
+    assert result["status"] == "ready"
+    assert result["eventing_status"] == "degraded"
+    mock_catalogs.mark_provisioning_step.assert_any_await("c1", "gcp_bucket", "complete")
+    mock_catalogs.mark_provisioning_step.assert_any_await(
+        "c1", "gcp_eventing", "degraded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_subscription_clash_marks_eventing_failed():
+    """A structural OrphanSubscriptionClash escaping the soft handler marks the
+    gcp_eventing step 'failed' (terminal) and re-raises so the task dead-letters
+    — the catalog is not left wedged with gcp_eventing 'pending'."""
+    from dynastore.modules.gcp.gcp_eventing_ops import OrphanSubscriptionClash
+
+    task = ProvisioningTask()
+    mock_catalogs = AsyncMock()
+    mock_storage = MagicMock()
+    mock_storage.ensure_storage_for_catalog = AsyncMock(return_value="bucket-c1")
+
+    with (
+        patch(
+            "dynastore.tasks.gcp_provision.task._get_storage_protocol",
+            return_value=mock_storage,
+        ),
+        patch(
+            "dynastore.tasks.gcp_provision.task._get_catalog_protocol",
+            return_value=mock_catalogs,
+        ),
+        patch(
+            "dynastore.tasks.gcp_provision.task._provision_eventing_soft",
+            new=AsyncMock(
+                side_effect=OrphanSubscriptionClash(
+                    sub_path="projects/p/subscriptions/ds-c1-default-sub",
+                    bound_to="projects/p/topics/other",
+                    expected="projects/p/topics/ds-c1-events",
+                    project_id="p",
+                )
+            ),
+        ),
+    ):
+        with pytest.raises((OrphanSubscriptionClash, PermanentTaskFailure)):
+            await task.run(_make_payload("c1"))
+
+    mock_catalogs.mark_provisioning_step.assert_any_await(
+        "c1", "gcp_eventing", "failed"
+    )

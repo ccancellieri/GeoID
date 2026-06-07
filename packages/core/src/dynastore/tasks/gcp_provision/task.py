@@ -265,7 +265,34 @@ class ProvisioningTask(TaskProtocol):
             # not fail the catalog; it marks the gcp_eventing checklist step
             # 'degraded' so the catalog still reaches 'ready' and operators can
             # inspect the status via GET /admin/catalogs/{id}.
-            eventing_status = await _provision_eventing_soft(storage, catalog_id)
+            #
+            # CRITICAL: the gcp_eventing step MUST reach a terminal state on
+            # every path, or the catalog is wedged in 'provisioning' forever
+            # (evaluate_checklist only flips the catalog when no step is still
+            # 'pending'). _provision_eventing_soft is designed to swallow
+            # non-structural failures into 'degraded', but we wrap the call here
+            # as a hard backstop: if anything escapes it (an exception type the
+            # soft path doesn't anticipate, or an OrphanSubscriptionClash), we
+            # still mark the step terminal before returning or re-raising —
+            # 'failed' for a structural clash (manual recovery), 'degraded' for
+            # anything else (catalog stays usable; reprovision repairs later).
+            # Observed on dev: a Pub/Sub 403 left gcp_eventing 'pending' and the
+            # catalog never became ready.
+            try:
+                eventing_status = await _provision_eventing_soft(storage, catalog_id)
+            except OrphanSubscriptionClash:
+                await self._mark_step("failed", catalog_id, step_key="gcp_eventing")
+                raise
+            except Exception as eventing_escape:  # noqa: BLE001 — never wedge
+                logger.warning(
+                    "GcpProvisionCatalogTask: eventing step raised past the "
+                    "soft handler for catalog '%s' (%s: %s); marking "
+                    "gcp_eventing 'degraded' so the catalog still reaches ready.",
+                    catalog_id,
+                    type(eventing_escape).__name__,
+                    eventing_escape,
+                )
+                eventing_status = "degraded"
             await catalogs.mark_provisioning_step(
                 catalog_id, "gcp_eventing", eventing_status
             )
@@ -367,8 +394,18 @@ class ProvisioningTask(TaskProtocol):
             await self._mark_failed(catalog_id)
             raise
 
-    async def _mark_step(self, step_status: str, catalog_id: Optional[str]) -> None:
-        """Mark the ``gcp_bucket`` provisioning-checklist step terminal (#1175).
+    async def _mark_step(
+        self,
+        step_status: str,
+        catalog_id: Optional[str],
+        step_key: str = "gcp_bucket",
+    ) -> None:
+        """Mark a provisioning-checklist step terminal (#1175).
+
+        Defaults to the ``gcp_bucket`` step (the bucket-phase error handlers),
+        but accepts ``step_key`` so the eventing handler can mark
+        ``gcp_eventing`` terminal too — no provisioner path may leave a step
+        ``pending`` or the catalog is wedged in ``provisioning`` forever.
 
         ``failed`` flips the catalog to ``failed`` (the fail-fast guard then
         rejects writes with 409); ``skipped`` lets the catalog become ready
@@ -383,15 +420,15 @@ class ProvisioningTask(TaskProtocol):
             return
         try:
             catalogs = _get_catalog_protocol()
-            await catalogs.mark_provisioning_step(catalog_id, "gcp_bucket", step_status)
+            await catalogs.mark_provisioning_step(catalog_id, step_key, step_status)
             logger.info(
-                "GcpProvisionCatalogTask: catalog '%s' gcp_bucket step → %s.",
-                catalog_id, step_status,
+                "GcpProvisionCatalogTask: catalog '%s' %s step → %s.",
+                catalog_id, step_key, step_status,
             )
         except Exception as mark_err:  # pragma: no cover — diagnostic best-effort
             logger.error(
-                "GcpProvisionCatalogTask: failed to mark catalog '%s' gcp_bucket "
-                "step '%s': %s", catalog_id, step_status, mark_err,
+                "GcpProvisionCatalogTask: failed to mark catalog '%s' %s "
+                "step '%s': %s", catalog_id, step_key, step_status, mark_err,
             )
 
     async def _mark_failed(self, catalog_id: Optional[str]) -> None:
