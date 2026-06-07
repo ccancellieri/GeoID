@@ -781,6 +781,72 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
 # that hosts the global table (default: "tasks").
 
 
+async def _redispatch_stuck_rows(
+    engine: DbResource,
+    rows: List[Dict[str, Any]],
+) -> None:
+    """Re-signal the dispatcher for stuck-PENDING rows that are potentially
+    claimable (not confirmed dead-capability).
+
+    Dead-capability rows (``cap_live is False``) are already handled by the
+    proactive capability sweep and will be DLQ'd on its next pass — skipping
+    them here avoids a redundant wakeup that accomplishes nothing.
+
+    Two signals are emitted so the self-heal works regardless of topology:
+
+    * ``signal_bus.emit`` — wakes the in-process dispatcher immediately on
+      the same event loop (most common case: single-pod dev/test env where
+      pg_notify was simply not received at enqueue time).
+    * ``SELECT pg_notify(...)`` — wakes all other pods' QueueListeners so
+      a capable dispatcher on a different pod can also claim the row.
+
+    Cross-pod dedup: ``claim_batch`` uses ``FOR UPDATE SKIP LOCKED`` —
+    only one pod claims each row even when many dispatchers wake
+    simultaneously. No double-execution is possible.
+
+    Idempotent and fail-open: errors are logged and swallowed; the caller
+    continues normally.
+    """
+    from dynastore.tools.async_utils import signal_bus
+    from dynastore.modules.tasks.queue import NEW_TASK_QUEUED
+
+    # Resolve capability liveness for all distinct caps in this batch so we
+    # can skip confirmed-dead rows (capability sweep owns those).
+    task_instance_cache: Dict[str, Any] = {}
+    live_per_cap: Dict[Optional[str], Optional[bool]] = {}
+    claimable: List[Dict[str, Any]] = []
+    for row in rows:
+        cap_id = _resolve_row_capability(row, task_instance_cache)
+        if cap_id not in live_per_cap:
+            live_per_cap[cap_id] = await _safe_is_live(cap_id) if cap_id else None
+        if live_per_cap.get(cap_id) is not False:
+            claimable.append(row)
+
+    if not claimable:
+        return
+
+    # In-process wakeup — zero latency on the same event loop.
+    try:
+        await signal_bus.emit(NEW_TASK_QUEUED)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("stuck-pending redispatch: signal_bus emit failed: %s", exc)
+
+    # Cross-pod wakeup via pg_notify so capable dispatchers on other pods
+    # also wake and attempt to claim.
+    try:
+        async with managed_transaction(engine) as conn:
+            await DQLQuery(
+                "SELECT pg_notify('new_task_queued', 'stuck_pending_sweep')",
+                result_handler=ResultHandler.SCALAR,
+            ).execute(conn)
+        logger.info(
+            "stuck-pending redispatch: emitted new_task_queued for %d claimable row(s)",
+            len(claimable),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("stuck-pending redispatch: pg_notify failed: %s", exc)
+
+
 async def _warn_stuck_pending_tasks(
     engine: DbResource,
     schema: str,
@@ -789,19 +855,27 @@ async def _warn_stuck_pending_tasks(
     min_age_s: float = 600.0,
     sample_limit: int = 50,
 ) -> None:
-    """Periodic read-only scan that logs WARNINGs for tasks that have been
-    PENDING with ``retry_count = 0`` for more than ``min_age_s`` seconds.
+    """Periodic scan that logs WARNINGs for PENDING/retry_count=0 tasks older
+    than ``min_age_s`` seconds, then re-signals the dispatcher so claimable
+    rows are recovered without relying on pg_notify delivery or pg_cron.
 
-    The most common cause is operator misconfiguration of
-    :class:`TaskRoutingConfig` — a typo in a service name or a target that
-    no deployed service maps to — which leaves tasks sitting unclaimable
-    forever. Today the dispatcher's CapabilityMap silently excludes them;
-    this coroutine surfaces the silence.
+    The most common cause is a missed ``pg_notify`` at enqueue time (no
+    listener active at that instant) combined with pg_cron being absent or
+    misconfigured (as on dev). In that case the task sits PENDING forever
+    with no actor to claim it.
 
-    Read-only by design: we never mutate the row. The pg_cron-driven
-    ``reap_stuck_tasks`` SQL function continues to handle stuck *ACTIVE*
-    tasks (lock expired); this coroutine handles stuck *PENDING* tasks
-    (never claimed). Two orthogonal failure modes, two independent signals.
+    Recovery: after logging, :func:`_redispatch_stuck_rows` emits the
+    in-process signal_bus (immediate same-pod wakeup) and ``pg_notify``
+    (cross-pod wakeup). ``claim_batch`` uses ``FOR UPDATE SKIP LOCKED`` so
+    only one pod claims each row — no double-execution across pods.
+
+    Rows whose required capability is confirmed dead (``cap_live is False``)
+    are skipped here — the proactive capability sweep owns their DLQ path.
+
+    The pg_cron-driven ``reap_stuck_tasks`` SQL function continues to handle
+    stuck *ACTIVE* tasks (heartbeat expired); this coroutine handles stuck
+    *PENDING* tasks (never claimed). Two orthogonal failure modes, two
+    independent recovery paths.
 
     Idempotent and crash-safe: any error is logged and swallowed; the loop
     sleeps and retries. Stops cleanly when ``shutdown_event`` is set.
@@ -829,7 +903,10 @@ async def _warn_stuck_pending_tasks(
                 rows = await query.execute(
                     conn, min_age_s=min_age_s, sample_limit=sample_limit,
                 )
-            await _emit_stuck_pending_logs(rows or [])
+            rows = rows or []
+            await _emit_stuck_pending_logs(rows)
+            if rows:
+                await _redispatch_stuck_rows(engine, rows)
         except Exception as exc:  # noqa: BLE001 — never crash on diagnostic
             logger.warning("stuck-pending warner: scan failed: %s", exc)
 
