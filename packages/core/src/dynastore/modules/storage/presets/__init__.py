@@ -59,6 +59,7 @@ from .private_catalog import PrivateCatalogPreset  # noqa: E402
 from .private_collection import PrivateCollectionPreset  # noqa: E402
 from .public_catalog import PublicCatalogPreset  # noqa: E402
 from .stac import StacPreset  # noqa: E402
+from .pg_only_catalog import PgOnlyCatalogPreset  # noqa: E402
 
 register_preset(PublicCatalogPreset())
 register_preset(PrivateCatalogPreset())
@@ -67,6 +68,7 @@ register_preset(PrivateCollectionPreset())
 register_preset(ItemsEsPrivatePreset())
 register_preset(DEMO_DATA_PRESET)
 register_preset(StacPreset())
+register_preset(PgOnlyCatalogPreset())
 register_preset(AssetsGcsUploadsPreset())
 # ``assets_local_only`` is on-prem only: only register when GCS is absent.
 if _local_backend_available():
@@ -94,6 +96,7 @@ __all__ = [
     "DefaultsPostgresPreset",
     "ItemsEsPrivatePreset",
     "NoParams",
+    "PgOnlyCatalogPreset",
     "Preset",
     "PresetBundle",
     "PresetBundleEntry",
