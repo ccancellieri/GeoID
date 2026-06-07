@@ -43,6 +43,24 @@ from dynastore.modules.db_config import shared_queries
 
 logger = logging.getLogger(__name__)
 
+# Process-local set of (catalog_id, collection_id) pairs whose physical table
+# has been confirmed to exist in the DB.  Positive results are cached
+# indefinitely — physical_table pins are WriteOnce so a table name never
+# changes once set.  Negative results are never stored here, so a diverged
+# collection (table dropped out-of-band) always goes through re-provisioning
+# via ensure_storage until it succeeds, at which point it is added back.
+_confirmed_active: "set[tuple[str, str]]" = set()
+
+
+def _mark_confirmed_active(catalog_id: str, collection_id: str) -> None:
+    """Record that (catalog_id, collection_id) has a confirmed physical table."""
+    _confirmed_active.add((catalog_id, collection_id))
+
+
+def _unmark_confirmed_active(catalog_id: str, collection_id: str) -> None:
+    """Remove the confirmation — used when re-provisioning is triggered."""
+    _confirmed_active.discard((catalog_id, collection_id))
+
 
 @cached(maxsize=1024, namespace="collection_model", ignore=["service"])
 async def _collection_model_cache(
@@ -160,13 +178,81 @@ class CollectionService:
         """True once storage has been provisioned for this collection.
 
         Activation state is derived from the PG driver config's
-        `physical_table` (`WriteOnce[Optional[str]]`) — pinned exactly
-        once at `_activate_collection`.
+        ``physical_table`` pin **and** a lightweight catalog existence
+        probe to guard against out-of-band divergence (table dropped
+        without clearing the pin, or partial-infra failure on an older
+        build).
+
+        Logic:
+        - No pin (physical_table is None) → False; no probe needed.
+        - Pin present + process-local confirmed set hit → True; steady-state
+          writes pay only an O(1) dict lookup after the first confirmation.
+        - Pin present + confirmed set miss → ``SELECT to_regclass(...)`` DB
+          read (one extra round-trip, ~0.1–0.3 ms).  If the table exists,
+          add to the confirmed set and return True.  If the table is absent
+          (diverged state), remove any stale confirmation and return False so
+          the caller's lazy-activation path re-provisions via ensure_storage.
         """
         phys_table = await self.resolve_physical_table(
             catalog_id, collection_id, db_resource=db_resource
         )
-        return phys_table is not None
+        if phys_table is None:
+            return False
+
+        # Fast path: table already confirmed in this process.
+        if (catalog_id, collection_id) in _confirmed_active:
+            return True
+
+        # Slow path: verify the physical table actually exists in PG.
+        phys_schema = await self._resolve_physical_schema(
+            catalog_id, db_resource=db_resource
+        )
+        if phys_schema is None:
+            # Cannot resolve schema — fall back to pin-only (original behaviour).
+            logger.warning(
+                "is_active: cannot resolve physical schema for %s/%s; "
+                "falling back to pin-only check",
+                catalog_id, collection_id,
+            )
+            return True
+
+        from dynastore.modules.db_config.locking_tools import check_table_exists
+
+        async def _probe(conn: DbResource) -> bool:
+            return await check_table_exists(conn, phys_table, schema=phys_schema)
+
+        try:
+            if db_resource is not None:
+                exists = await _probe(db_resource)
+            else:
+                async with managed_transaction(self.engine) as conn:
+                    exists = await _probe(conn)
+        except Exception as exc:
+            # Probe errors (connection issues, permission denied) must not
+            # silently swallow legitimate writes. Log and fall back to the
+            # pin-only check so a transient DB hiccup does not trigger
+            # spurious re-provisioning.
+            logger.warning(
+                "is_active: table existence probe failed for %s/%s.%s: %s; "
+                "falling back to pin-only",
+                catalog_id, collection_id, phys_table, exc,
+            )
+            return True
+
+        if exists:
+            _mark_confirmed_active(catalog_id, collection_id)
+            return True
+
+        # Table is missing despite pin — diverged state.  Clear any prior
+        # confirmation so a concurrent call also goes through re-provisioning.
+        _unmark_confirmed_active(catalog_id, collection_id)
+        logger.warning(
+            "is_active: physical table %r not found in schema %r for %s/%s "
+            "(pin present but table absent — diverged state); "
+            "re-provisioning will be triggered",
+            phys_table, phys_schema, catalog_id, collection_id,
+        )
+        return False
 
     async def _activate_collection(
         self,
@@ -243,12 +329,19 @@ class CollectionService:
         backs this method (activation happens transparently on the
         first ``POST /items``). Kept on ``CollectionsProtocol`` so
         ``item_service`` can invoke it via the protocol layer.
+
+        On success, the (catalog_id, collection_id) pair is added to the
+        process-local confirmed-active set so subsequent ``is_active`` calls
+        skip the DB existence probe.
         """
         db_resource = ctx.db_resource if ctx else None
         async with managed_transaction(db_resource or self.engine) as conn:
             await self._activate_collection(
                 catalog_id, collection_id, conn=conn,
             )
+        # Provisioning committed — the physical table exists.  Mark confirmed
+        # so the next is_active call on the write path takes the fast path.
+        _mark_confirmed_active(catalog_id, collection_id)
 
     async def _get_collection_model_db(
         self, catalog_id: str, collection_id: str
