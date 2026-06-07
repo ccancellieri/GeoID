@@ -35,6 +35,7 @@ from dynastore.modules.db_config.partition_tools import ensure_partition_exists
 from dynastore.modules.db_config.locking_tools import (
     acquire_startup_lock,  # noqa: F401  # re-export: consumed as maintenance_tools.acquire_startup_lock by 6 module lifespans (crs, notebooks, styles, proxy, connected_systems, moving_features)
     check_cron_job_exists,
+    check_extension_exists,
 )
 
 logger = logging.getLogger(__name__)
@@ -452,7 +453,19 @@ async def ensure_global_cron_cleanup(
     """
     Registers a global maintenance job to clean up orphaned cron jobs.
     This job runs daily and removes cron jobs for schemas/tables that no longer exist.
+
+    Best-effort: if pg_cron is not installed, skip with a WARNING instead of
+    letting the cron DDL raise and abort the caller's startup transaction
+    (this runs inside the catalog-init transaction that creates
+    ``catalog.catalogs`` — a hard failure here would leave the catalog table
+    uncreated). See :func:`register_cron_job` for the rationale.
     """
+    if not await check_extension_exists(conn, "pg_cron"):
+        logger.warning(
+            "pg_cron not installed — skipping orphaned-cron-job cleanup task. "
+            "Orphaned per-schema cron jobs will not be reaped automatically."
+        )
+        return
     func_name = "cleanup_orphaned_cron_jobs"
     job_name = "system_cleanup_orphaned_cron_jobs"
 
@@ -514,7 +527,22 @@ async def register_cron_job(
 ):
     """
     Registers a generic pg_cron job safely using the check-before-lock pattern.
+
+    pg_cron is an optional, superuser-installed extension and may be absent
+    (a fresh database, or an instance whose pg_cron is bound to a different
+    database — pg_cron services a single database per instance). Scheduled
+    jobs are best-effort maintenance, NOT a hard dependency: when pg_cron is
+    not installed, skip with a WARNING rather than letting the cron DDL raise
+    ``UndefinedTableError`` and abort the caller's (often foundational)
+    startup transaction.
     """
+    if not await check_extension_exists(conn, "pg_cron"):
+        logger.warning(
+            "pg_cron not installed — skipping cron job '%s'. This scheduled "
+            "maintenance will not run automatically until pg_cron is available.",
+            job_name,
+        )
+        return
     command = command.strip().rstrip(";")
     # Escape single quotes for safe interpolation into PL/pgSQL string literals
     safe_job_name = job_name.replace("'", "''")

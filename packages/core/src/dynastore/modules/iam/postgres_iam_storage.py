@@ -277,6 +277,29 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
 
             await DDLQuery(_prune_function_ddl).execute(conn)
 
+            # pg_cron is optional (a fresh DB, or an instance whose pg_cron is
+            # bound to a different database). The nightly prune is best-effort
+            # maintenance — skip its scheduling with a WARNING when pg_cron is
+            # absent rather than letting the cron DDL raise and abort IAM
+            # schema initialization. The prune FUNCTION is still created above
+            # so it can be invoked out-of-band if needed.
+            from dynastore.modules.db_config.locking_tools import (
+                check_extension_exists,
+            )
+
+            if not await check_extension_exists(conn, "pg_cron"):
+                logger.warning(
+                    "pg_cron not installed — skipping nightly '%s' scheduling. "
+                    "Expired %s rows will not be pruned automatically until "
+                    "pg_cron is available.",
+                    _prune_job_name,
+                    schema,
+                )
+                logger.info(
+                    f"PostgresIamStorage initialization complete for '{schema}'."
+                )
+                return
+
             # Cron registration is idempotent (unschedule-if-exists
             # then re-schedule) and the command never changes, so the
             # job-exists check_query can safely short-circuit warm
