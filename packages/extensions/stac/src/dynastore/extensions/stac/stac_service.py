@@ -392,6 +392,22 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             StacPluginConfig, catalog_id, collection_id, ctx=DriverContext(db_resource=db_resource
         ))
 
+    async def _should_validate_on_write(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+    ) -> bool:
+        """Return True only when write-time STAC validation is explicitly enabled.
+
+        Defaults to False to avoid synchronous remote schema fetches on the
+        async event loop during ingest (see #1884).
+        """
+        try:
+            cfg = await self._get_stac_config(catalog_id, collection_id)
+            return cfg.validate_on_write
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     # OGCServiceMixin hook overrides — STAC-specific behaviour
     # ------------------------------------------------------------------
@@ -433,6 +449,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         collection cannot be fetched.
         """
         if request is None:
+            return
+        if not await self._should_validate_on_write(catalog_id, collection_id):
             return
         existing = await stac_generator.create_collection(
             request, catalog_id=catalog_id, collection_id=collection_id, lang="en"
@@ -719,9 +737,11 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         try:
             input_data = request_body.model_dump(exclude_unset=True)
-            # Write-time STAC validation (lenient — warnings only; pystac/stac-pydantic
-            # are too strict on optional fields like `links` to gate the request).
-            validate_stac_collection(input_data)
+            # Write-time STAC validation is opt-in (StacPluginConfig.validate_on_write,
+            # default False): it is lenient (warnings only) and pystac's remote schema
+            # fetch must never block the ingest hot path (#1884).
+            if await self._should_validate_on_write(catalog_id):
+                validate_stac_collection(input_data)
             # Fold STAC extras (cube:dimensions, themes, sci:citation, …) and the
             # declared-but-stac-only fields (providers, summaries) into extra_metadata
             # so they round-trip via collection_core even when collection_stac is not
@@ -802,7 +822,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 ),
             )
         input_data = request_body.model_dump(exclude_unset=False)
-        validate_stac_collection(input_data)
+        if await self._should_validate_on_write(catalog_id, collection_id):
+            validate_stac_collection(input_data)
         input_data = _pack_stac_extras(input_data, language)
         input_data = normalize_i18n_for_replace(input_data, language)
         return await self._ogc_replace_collection(
@@ -1096,14 +1117,17 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         # 500 deep down the stack.
         await self._require_catalog_ready(catalog_id)
 
-        # Write-time STAC validation per item (lenient — warnings only)
+        # Write-time STAC validation per item (lenient — warnings only).
+        # Skipped by default (validate_on_write=False) to prevent blocking
+        # network schema fetches on the async event loop during batch ingest.
         items_to_validate: list[STACItem] = (
             list(item_payload.features)
             if isinstance(item_payload, STACItemCollection)
             else [item_payload]
         )
-        for item in items_to_validate:
-            validate_stac_item(item.model_dump(by_alias=True, exclude_unset=True))
+        if await self._should_validate_on_write(catalog_id, collection_id):
+            for item in items_to_validate:
+                validate_stac_item(item.model_dump(by_alias=True, exclude_unset=True))
 
         from dynastore.modules.storage.driver_config import ItemsWritePolicy
         policy_source = (
@@ -1196,8 +1220,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         # Fail-fast guard: no item writes on a not-ready catalog.
         await self._require_catalog_ready(catalog_id)
 
-        # Write-time STAC validation (lenient — warnings only)
-        validate_stac_item(item_payload.model_dump(by_alias=True, exclude_unset=True))
+        if await self._should_validate_on_write(catalog_id, collection_id):
+            validate_stac_item(item_payload.model_dump(by_alias=True, exclude_unset=True))
 
         stac_item = item_payload.to_pystac()
         if not stac_item.collection_id:

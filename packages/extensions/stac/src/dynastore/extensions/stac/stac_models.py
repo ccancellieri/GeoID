@@ -31,13 +31,6 @@ from dynastore.models.localization import (
     localize_dict,
 )
 
-try:
-    import jsonschema
-
-    PYSTAC_VALIDATION_AVAILABLE = True
-except ImportError:
-    PYSTAC_VALIDATION_AVAILABLE = False
-
 from dynastore.models.shared_models import Link, Provider, Extent, Internationalized
 
 # --- STAC API DTOs (Standard Compliance) ---
@@ -546,27 +539,13 @@ class STACItem(Feature):
                     )
                     validation_dict["links"] = links
 
-            # 2. Parse as pystac Item
-            stac_item = pystac.Item.from_dict(validation_dict)
-
-            # Always validate STAC compliance
-            if PYSTAC_VALIDATION_AVAILABLE:
-                try:
-                    stac_item.validate()
-                except Exception as e:
-                    # Log as warning if it's an extension validation failure that we want to be lenient about.
-                    # The datacube extension often fails due to strict type checks in its schema versioning.
-                    err_str = str(e)
-                    if stac_item.stac_extensions:
-                        logger.warning(f"STAC Extension validation warning: {err_str}")
-                    else:
-                        raise e
-
-                # Log extension validation success
-                if stac_item.stac_extensions:
-                    logger.debug(
-                        f"Validated STAC extensions: {stac_item.stac_extensions}"
-                    )
+            # 2. Parse as pystac Item to confirm the dict is structurally sound.
+            # Remote JSON-Schema validation (stac_item.validate()) is intentionally
+            # omitted here: it makes blocking network calls that starve the async
+            # event loop under batch ingest (#1884).  Schema validation is available
+            # via validate_stac_item() in the service layer, gated by
+            # StacPluginConfig.validate_on_write (default: False).
+            pystac.Item.from_dict(validation_dict)
         except Exception as ve:
             # If validation fails, we log it but don't block.
             # This makes the validation lenient as requested.

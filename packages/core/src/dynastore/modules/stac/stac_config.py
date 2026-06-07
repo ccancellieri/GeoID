@@ -339,3 +339,23 @@ class StacPluginConfig(ExposableConfigMixin, PluginConfig):
 
     # Geometry Simplification (Query time)
     simplification: Mutable[SimplificationConfig] = Field(default_factory=SimplificationConfig)
+
+    # Write-time STAC schema validation gate.
+    #
+    # When False (default) the pystac/stac-pydantic schema validation step is
+    # skipped on the write path entirely.  The validators fetch remote JSON
+    # schemas from stac-extensions.github.io, which is a synchronous network
+    # call that blocks the async event loop and starves the DB connection pool
+    # under batch ingest.  Validation is already lenient (warnings only), so
+    # the only observable effect of the default is that extension-schema
+    # warnings are suppressed.  Enable this flag only in low-traffic or
+    # offline-capable deployments that have local schema mirrors configured.
+    validate_on_write: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Gate write-time pystac/stac-pydantic schema validation.  "
+            "Defaults to False to prevent blocking network I/O on the async "
+            "event loop during ingest.  Set to True only when a local schema "
+            "cache is in place and the deployment can afford the latency."
+        ),
+    )
