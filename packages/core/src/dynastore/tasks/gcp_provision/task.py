@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # Hard runtime dep — fail entry-point load on services without ``module_gcp``
 # installed (e.g. SCOPEs that don't include the GCP module). Without this, the
@@ -43,9 +43,27 @@ from dynastore.models.protocols import (
 )
 from dynastore.modules.gcp.tools.bucket import BucketConflictError
 from dynastore.modules.gcp.gcp_eventing_ops import OrphanSubscriptionClash
-from dynastore.modules.catalog.log_manager import log_error
+from dynastore.modules.catalog.log_manager import log_error, log_warning
 
 logger = logging.getLogger(__name__)
+
+# Eventing failures that indicate a permanent IAM/permission problem — the
+# service account will not spontaneously gain access, so retrying is futile.
+# When the bounded retry inside ``setup_catalog_eventing`` exhausts these, the
+# exception propagates here and we downgrade to "eventing degraded" rather than
+# failing the whole provisioning task.
+_EVENTING_PERMISSION_ERRORS: Tuple[type, ...] = ()
+
+try:
+    from google.api_core import exceptions as _google_exceptions
+
+    _EVENTING_PERMISSION_ERRORS = (
+        _google_exceptions.PermissionDenied,
+        _google_exceptions.Forbidden,
+    )
+except Exception:  # pragma: no cover — google-cloud not installed
+    pass
+
 
 def _get_catalog_protocol() -> CatalogsProtocol:
     protocol = get_protocol(CatalogsProtocol)
@@ -97,6 +115,98 @@ def _get_storage_protocol() -> StorageProtocol:
         raise RuntimeError("StorageProtocol not available - GCP module not loaded")
     return protocol
 
+
+async def _provision_bucket_hard(
+    storage: StorageProtocol,
+    catalog_id: str,
+) -> str:
+    """Provision only the GCS bucket, using the appropriate protocol path.
+
+    Returns the bucket name. Raises on any failure — bucket is HARD.
+    """
+    if isinstance(storage, GcpCatalogProvisioning):
+        # The combined call does bucket + eventing; we call it here for the
+        # GcpCatalogProvisioning path and extract just the bucket name.  The
+        # eventing portion is handled separately in ``_provision_eventing_soft``
+        # for the fail-soft contract. Because ``setup_catalog_gcp_resources``
+        # is idempotent, calling it a second time in the eventing step is safe;
+        # but to avoid a redundant GCP round-trip we instead call the
+        # cross-vendor bucket-only path when available.
+        bucket_name = await storage.ensure_storage_for_catalog(catalog_id)
+        if bucket_name is None:
+            raise RuntimeError(
+                f"ensure_storage_for_catalog returned None for catalog '{catalog_id}'"
+            )
+        return bucket_name
+    else:
+        bucket_name = await storage.ensure_storage_for_catalog(catalog_id)
+        if bucket_name is None:
+            raise RuntimeError(
+                f"ensure_storage_for_catalog returned None for catalog '{catalog_id}'"
+            )
+        return bucket_name
+
+
+async def _provision_eventing_soft(
+    storage: StorageProtocol,
+    catalog_id: str,
+) -> str:
+    """Attempt eventing setup; return a status string indicating the outcome.
+
+    Returns:
+        ``"complete"`` when eventing was set up successfully.
+        ``"degraded"`` when eventing failed with a permission/permanent error.
+
+    Raises on OrphanSubscriptionClash — that is a structural clash requiring
+    manual recovery, not a transient permission issue, so the caller re-raises
+    it as ``PermanentTaskFailure`` to keep the bucket step unaffected while
+    still flagging the clash clearly.
+    """
+    try:
+        if isinstance(storage, GcpCatalogProvisioning):
+            await storage.setup_catalog_gcp_resources(catalog_id)
+        else:
+            eventing = get_protocol(EventingProtocol)
+            if eventing:
+                await eventing.setup_catalog_eventing(catalog_id)
+        return "complete"
+    except OrphanSubscriptionClash:
+        raise  # caller handles this as permanent failure
+    except Exception as eventing_err:
+        is_permission = (
+            _EVENTING_PERMISSION_ERRORS
+            and isinstance(eventing_err, _EVENTING_PERMISSION_ERRORS)
+        )
+        logger.warning(
+            "GcpProvisionCatalogTask: eventing setup failed for catalog '%s' "
+            "(%s: %s). Bucket is healthy; catalog will be marked ready with "
+            "eventing in 'degraded' state. Grant 'pubsub.topics.attachSubscription' "
+            "on the Pub/Sub project and call POST /admin/catalogs/%s/reprovision "
+            "to repair.",
+            catalog_id,
+            type(eventing_err).__name__,
+            eventing_err,
+            catalog_id,
+        )
+        try:
+            await log_warning(
+                catalog_id,
+                "gcp.provision.eventing_degraded",
+                (
+                    f"Eventing setup failed ({type(eventing_err).__name__}): "
+                    f"{eventing_err}. "
+                    f"{'IAM permission denied — grant pubsub.topics.attachSubscription. ' if is_permission else ''}"
+                    f"Use POST /admin/catalogs/{catalog_id}/reprovision after fixing."
+                ),
+            )
+        except Exception as log_err:  # pragma: no cover — diagnostic best-effort
+            logger.error(
+                "GcpProvisionCatalogTask: failed to write tenant log for "
+                "catalog '%s' eventing degraded: %s", catalog_id, log_err,
+            )
+        return "degraded"
+
+
 class GcpProvisionInputs(BaseModel):
     catalog_id: str
 
@@ -104,51 +214,79 @@ class ProvisioningTask(TaskProtocol):
     priority: int = 100
     """
     Durable task for creating and configuring a GCS bucket for a catalog.
-    
+
     Idempotent: checks if resources exist before creating.
     If it fails after max retries, the janitor will move it to DEAD_LETTER
     and the catalog will remain in 'provisioning' or 'failed' state.
+
+    Failure contract:
+      - Bucket failure  → catalog stays failed (HARD requirement).
+      - Eventing failure → catalog reaches ready; eventing step marked
+        'degraded' (best-effort). Use POST /admin/catalogs/{id}/reprovision
+        after fixing the IAM grant to repair the eventing layer.
     """
     task_type = "gcp_provision_catalog"
 
     async def run(self, payload: TaskPayload[GcpProvisionInputs]) -> Dict[str, Any]:
+        catalog_id: Optional[str] = None
         try:
             inputs = payload.inputs
             catalog_id = inputs.catalog_id
             if not catalog_id:
                 raise ValueError("Missing 'catalog_id' in task inputs")
 
-            logger.info(f"GcpProvisionCatalogTask: Provisioning resources for catalog '{catalog_id}'...")
+            logger.info(
+                "GcpProvisionCatalogTask: Provisioning resources for catalog '%s'...",
+                catalog_id,
+            )
 
             # 1. Resolve storage protocol (GCP)
             storage = _get_storage_protocol()
 
-            # 2. Setup the bucket and eventing idempotently. A storage
-            # implementation that satisfies GcpCatalogProvisioning provisions
-            # bucket + eventing in one call (more efficient on GCS where the
-            # two resources are interleaved). Mocks and non-GCP backends fall
-            # back to the cross-vendor sequence.
-            if isinstance(storage, GcpCatalogProvisioning):
-                bucket_name, _ = await storage.setup_catalog_gcp_resources(catalog_id)
-            else:
-                bucket_name = await storage.ensure_storage_for_catalog(catalog_id)
-                eventing = get_protocol(EventingProtocol)
-                if eventing:
-                    await eventing.setup_catalog_eventing(catalog_id)
+            # 2. Provision the bucket — HARD requirement. Any failure here
+            # propagates to the outer except handlers, which mark the catalog
+            # failed or retryable as appropriate.
+            bucket_name = await _provision_bucket_hard(storage, catalog_id)
+            logger.info(
+                "GcpProvisionCatalogTask: Bucket '%s' ensured for catalog '%s'.",
+                bucket_name, catalog_id,
+            )
 
-            logger.info(f"GcpProvisionCatalogTask: Bucket '{bucket_name}' ensured for catalog '{catalog_id}'.")
-
-            # 4. Mark the GCP provisioning-checklist step complete (#1175). When
-            # this is the last outstanding step the catalog flips to 'ready'.
+            # 3. Mark bucket step complete regardless of eventing outcome.
             catalogs = _get_catalog_protocol()
             await catalogs.mark_provisioning_step(catalog_id, "gcp_bucket", "complete")
+            logger.info(
+                "GcpProvisionCatalogTask: Catalog '%s' gcp_bucket step COMPLETE.",
+                catalog_id,
+            )
 
-            logger.info(f"GcpProvisionCatalogTask: Catalog '{catalog_id}' gcp_bucket step COMPLETE.")
-            
+            # 4. Provision eventing — SOFT (best-effort). A permission error
+            # (or any other eventing failure) after the bucket is healthy does
+            # not fail the catalog; it marks the gcp_eventing checklist step
+            # 'degraded' so the catalog still reaches 'ready' and operators can
+            # inspect the status via GET /admin/catalogs/{id}.
+            eventing_status = await _provision_eventing_soft(storage, catalog_id)
+            await catalogs.mark_provisioning_step(
+                catalog_id, "gcp_eventing", eventing_status
+            )
+            if eventing_status == "complete":
+                logger.info(
+                    "GcpProvisionCatalogTask: Catalog '%s' gcp_eventing step COMPLETE.",
+                    catalog_id,
+                )
+            else:
+                logger.warning(
+                    "GcpProvisionCatalogTask: Catalog '%s' gcp_eventing step DEGRADED. "
+                    "Catalog is ready for storage/STAC; eventing is disabled until "
+                    "reprovision.",
+                    catalog_id,
+                )
+
             return {
                 "catalog_id": catalog_id,
                 "bucket_name": bucket_name,
-                "status": "ready"
+                "eventing_status": eventing_status,
+                "status": "ready",
             }
         except PermanentTaskFailure:
             await self._mark_failed(catalog_id)
@@ -160,19 +298,19 @@ class ProvisioningTask(TaskProtocol):
             # message on the tenant log so the maintainer can act, and mark
             # the step failed terminally.
             logger.error(
-                f"GcpProvisionCatalogTask: subscription clash for catalog "
-                f"'{catalog_id}': {e}"
+                "GcpProvisionCatalogTask: subscription clash for catalog "
+                "'%s': %s", catalog_id, e,
             )
             try:
                 await log_error(
-                    catalog_id,
+                    catalog_id or "",
                     "gcp.provision.subscription_clash",
                     str(e),
                 )
             except Exception as log_err:  # pragma: no cover — diagnostic best-effort
                 logger.error(
-                    f"GcpProvisionCatalogTask: failed to write tenant log for "
-                    f"catalog '{catalog_id}' subscription clash: {log_err}"
+                    "GcpProvisionCatalogTask: failed to write tenant log for "
+                    "catalog '%s' subscription clash: %s", catalog_id, log_err,
                 )
             await self._mark_failed(catalog_id)
             raise PermanentTaskFailure(
@@ -187,8 +325,8 @@ class ProvisioningTask(TaskProtocol):
             # 'failed') and stop retrying. The bucket is NOT deleted: it is not
             # ours, and force-deleting it would destroy another owner's data.
             logger.error(
-                f"GcpProvisionCatalogTask: bucket-name CONFLICT for catalog "
-                f"'{catalog_id}': {e}"
+                "GcpProvisionCatalogTask: bucket-name CONFLICT for catalog "
+                "'%s': %s", catalog_id, e,
             )
             await self._mark_conflict(catalog_id)
             raise PermanentTaskFailure(
@@ -222,7 +360,10 @@ class ProvisioningTask(TaskProtocol):
             )
             raise
         except Exception as e:
-            logger.error(f"CRITICAL: GcpProvisionCatalogTask FAILED for {catalog_id}: {e}", exc_info=True)
+            logger.error(
+                "CRITICAL: GcpProvisionCatalogTask FAILED for %s: %s",
+                catalog_id, e, exc_info=True,
+            )
             await self._mark_failed(catalog_id)
             raise
 
@@ -272,20 +413,21 @@ class ProvisioningTask(TaskProtocol):
             catalogs = _get_catalog_protocol()
             await catalogs.update_provisioning_status(catalog_id, "conflict")
             logger.info(
-                f"GcpProvisionCatalogTask: catalog '{catalog_id}' marked CONFLICT "
-                f"(bucket name unavailable; not retried, no resources deleted)."
+                "GcpProvisionCatalogTask: catalog '%s' marked CONFLICT "
+                "(bucket name unavailable; not retried, no resources deleted).",
+                catalog_id,
             )
         except Exception as mark_err:  # pragma: no cover — diagnostic best-effort
             logger.error(
-                f"GcpProvisionCatalogTask: failed to mark catalog '{catalog_id}' "
-                f"provisioning_status='conflict': {mark_err}"
+                "GcpProvisionCatalogTask: failed to mark catalog '%s' "
+                "provisioning_status='conflict': %s", catalog_id, mark_err,
             )
 
 class GcpDestroyCatalogTask(TaskProtocol):
     priority: int = 100
     """
     Durable task for tearing down GCS resources associated with a catalog.
-    
+
     Idempotent: safe to run multiple times even if resources are already gone.
     """
     task_type = "gcp_destroy_catalog"
@@ -321,7 +463,7 @@ class GcpDestroyCatalogTask(TaskProtocol):
             logger.warning(f"GcpDestroyCatalogTask: Failed to delete storage for '{catalog_id}': {e}")
 
         logger.info(f"GcpDestroyCatalogTask: Cleanup completed for catalog '{catalog_id}'.")
-        
+
         return {
             "catalog_id": catalog_id,
             "status": "destroyed"

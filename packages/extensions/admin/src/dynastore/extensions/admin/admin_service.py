@@ -807,6 +807,60 @@ class AdminService(ExtensionProtocol):
             task=task_view,
         )
 
+    @router.post(
+        "/catalogs/{catalog_id}/reprovision",
+        status_code=202,
+        summary="Re-enqueue the gcp_provision_catalog task for a catalog (sysadmin/admin only).",
+    )
+    async def reprovision_catalog(catalog_id: str):  # type: ignore[reportGeneralTypeIssues]
+        """Re-trigger GCP provisioning for a catalog.
+
+        Idempotent: the underlying task is already idempotent (bucket ensure +
+        eventing attach). Useful when eventing was degraded due to a missing
+        IAM grant — fix the grant, then call this endpoint to repair without
+        recreating the catalog.
+
+        Gated by the same ``admin_access`` policy as the broader
+        ``/admin/catalogs/{id}`` surface (sysadmin + admin).
+        """
+        from dynastore.modules.tasks import tasks_module
+        from dynastore.modules.tasks.models import TaskCreate
+        from dynastore.models.protocols import DatabaseProtocol
+
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            raise HTTPException(status_code=503, detail="Catalogs service not available.")
+        catalog = await catalogs.get_catalog_model(catalog_id)
+        if catalog is None:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+
+        db = get_protocol(DatabaseProtocol)
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database unavailable.")
+
+        provisioning_status = getattr(catalog, "provisioning_status", "ready") or "ready"
+
+        task = await tasks_module.create_task_for_catalog(
+            engine=db.engine,
+            task_data=TaskCreate(
+                caller_id="system:admin",
+                task_type="gcp_provision_catalog",
+                inputs={"catalog_id": catalog_id},
+            ),
+            catalog_id=catalog_id,
+        )
+        if task is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Task enqueue returned None (possible dedup collision).",
+            )
+        return {
+            "task_id": str(task.task_id),
+            "catalog_id": catalog_id,
+            "provisioning_status": provisioning_status,
+            "status": "queued",
+        }
+
     @router.get(
         "/catalogs/{catalog_id}/dead-letter",
         summary="List dead-lettered tasks for this catalog (catalog-admin).",

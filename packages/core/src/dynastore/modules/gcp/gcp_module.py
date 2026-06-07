@@ -350,13 +350,18 @@ class GCPModule(
 
             # #1175: register GCP as a catalog provisioner so bucket setup is a
             # checklist step the catalog waits on, instead of GCP directly owning
-            # ``provisioning_status``. The 'gcp_bucket' step is contributed only
-            # when provisioning is enabled (see ``provisioner_is_active``); the
-            # provision task marks it terminal (complete / skipped / failed).
+            # ``provisioning_status``. Both 'gcp_bucket' (hard) and 'gcp_eventing'
+            # (soft/best-effort) steps are contributed only when provisioning is
+            # enabled (see ``provisioner_is_active``). The provision task marks each
+            # terminal: bucket → complete/skipped/failed; eventing → complete/degraded.
+            # A 'degraded' eventing step does NOT block readiness — see
+            # ``evaluate_checklist`` and the fail-soft eventing path in
+            # tasks/gcp_provision/task.py.
             from dynastore.modules.catalog.provisioning_registry import (
                 provisioning_registry,
             )
             provisioning_registry.register("gcp_bucket", self.provisioner_is_active)
+            provisioning_registry.register("gcp_eventing", self.provisioner_is_active)
             # We keep these as async because they don't block the core creation flow
             # and don't cause race conditions in tests as easily as the creation one.
             lifecycle_registry.async_catalog_destroyer()(self._on_async_destroy_catalog)

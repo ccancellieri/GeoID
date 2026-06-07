@@ -64,6 +64,7 @@ __all__ = [
     "STEP_COMPLETE",
     "STEP_FAILED",
     "STEP_SKIPPED",
+    "STEP_DEGRADED",
     "STATUS_PROVISIONING",
     "STATUS_READY",
     "STATUS_FAILED",
@@ -77,13 +78,20 @@ STEP_PENDING = "pending"
 STEP_COMPLETE = "complete"
 STEP_FAILED = "failed"
 STEP_SKIPPED = "skipped"
+# ``degraded``: the step's work completed partially (e.g. eventing setup failed
+# due to missing IAM permissions after the bucket was healthy). The catalog
+# still reaches ``ready`` — the feature is unavailable but storage/STAC works.
+# Operators can repair via POST /admin/catalogs/{id}/reprovision.
+STEP_DEGRADED = "degraded"
 
 # Catalog-level ``provisioning_status`` values this module drives.
 STATUS_PROVISIONING = "provisioning"
 STATUS_READY = "ready"
 STATUS_FAILED = "failed"
 
-_TERMINAL_GOOD = frozenset({STEP_COMPLETE, STEP_SKIPPED})
+# Terminal-good states: catalog flips to ``ready`` when all steps are in this set.
+# ``degraded`` is intentionally included — a degraded step must not block readiness.
+_TERMINAL_GOOD = frozenset({STEP_COMPLETE, STEP_SKIPPED, STEP_DEGRADED})
 
 # ``async (catalog_id, conn) -> bool``
 ProvisionerPredicate = Callable[[str, Optional[Any]], Awaitable[bool]]
@@ -94,10 +102,14 @@ def evaluate_checklist(checklist: Optional[Dict[str, str]]) -> Optional[str]:
 
     Returns:
         - :data:`STATUS_READY` when there are no items, or every item is
-          terminal-good (``complete``/``skipped``);
+          terminal-good (``complete``/``skipped``/``degraded``);
         - :data:`STATUS_FAILED` when any item is ``failed``;
         - ``None`` when at least one item is still ``pending`` (no change —
           the catalog stays ``provisioning``).
+
+    ``degraded`` steps are terminal-good: the catalog becomes usable for
+    storage/STAC even when a best-effort provisioning step (e.g. eventing)
+    could not complete.
     """
     if not checklist:
         return STATUS_READY
