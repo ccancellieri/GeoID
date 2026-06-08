@@ -117,6 +117,7 @@ function updateTabs() {
     curlGet: curlForGet(state.scope, knobs),
     docs: docsForClass(classKey),
     registryUrl: registryUrlFor(classKey),
+    pluginScope: state.schemas[classKey]?.scope,
   });
 }
 

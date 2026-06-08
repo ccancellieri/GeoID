@@ -954,6 +954,12 @@ hr.rule { border: 0; border-top: 1px solid var(--rule-hair); margin: 16px 0; }
   color: var(--terracotta-deep);
   border-left-color: var(--terracotta);
 }
+.schema-list .schema-list-item .item-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
 .schema-list .schema-list-item .item-title {
   font-family: var(--font-ui);
   font-weight: 500;
@@ -967,6 +973,29 @@ hr.rule { border: 0; border-top: 1px solid var(--rule-hair); margin: 16px 0; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* Scope badge — displayed next to the plugin title in the schema list.
+ * Indicates which config tiers the plugin is writable at:
+ *   waterfall = platform → catalog → collection (full stack, default)
+ *   intrinsic = collection-tier only
+ *   env       = deployment environment (env vars, read-only in Hub) */
+.ci-scope-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 5px;
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink-dim);
+  white-space: nowrap;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+.ci-scope-waterfall { color: var(--ink-dim);   border-color: var(--rule); }
+.ci-scope-intrinsic { color: var(--olive);     border-color: var(--olive); }
+.ci-scope-env       { color: var(--amber);     border-color: var(--amber); }
 .schema-list .schema-list-empty {
   color: var(--ink-dim);
   font-size: 0.82rem;

@@ -1,7 +1,9 @@
 // Left-rail schema picker. Categorizes entries by the top-level
 // `x-ui.category` emitted by Pydantic on each model's json_schema_extra;
 // falls back to a "other" bucket when absent. Search filters by
-// class_key and description.
+// class_key, description, and scope. Each item carries a scope badge
+// (derived from the registry's `scope` field) so operators immediately see
+// which tiers a plugin applies at without opening it.
 
 const CATEGORY_LABELS = {
   routing: "Routing",
@@ -23,6 +25,23 @@ const CATEGORY_ORDER = [
   "other",
 ];
 
+// Human-readable labels for the `scope` values the registry emits.
+// `platform_waterfall` means it applies at all tiers (platform → collection);
+// `collection_intrinsic` means it is only authored at collection tier;
+// `deployment_env`      means it is set by the deployment environment (env vars).
+const SCOPE_LABELS = {
+  platform_waterfall: "all tiers",
+  collection_intrinsic: "collection",
+  deployment_env: "env",
+};
+
+// CSS class suffix for each scope value.
+const SCOPE_CSS = {
+  platform_waterfall: "waterfall",
+  collection_intrinsic: "intrinsic",
+  deployment_env: "env",
+};
+
 function clearNode(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
@@ -41,6 +60,20 @@ function labelOf(entry, classKey) {
 
 function descOf(entry) {
   return entry?.description || entry?.json_schema?.description || "";
+}
+
+function scopeOf(entry) {
+  return entry?.scope || "platform_waterfall";
+}
+
+function scopeBadge(scope) {
+  const label = SCOPE_LABELS[scope] || scope;
+  const cls = SCOPE_CSS[scope] || "waterfall";
+  const el = document.createElement("span");
+  el.className = `ci-scope-badge ci-scope-${cls}`;
+  el.textContent = label;
+  el.title = `This config is authored at scope: ${scope}`;
+  return el;
 }
 
 export function mountSchemaList(container, { schemas, onSelect, selected }) {
@@ -79,7 +112,8 @@ export function mountSchemaList(container, { schemas, onSelect, selected }) {
     for (const cat of orderedCats) {
       const entries = grouped[cat].filter(({ classKey, entry }) => {
         if (!q) return true;
-        const hay = (classKey + " " + descOf(entry)).toLowerCase();
+        const scope = SCOPE_LABELS[scopeOf(entry)] || scopeOf(entry);
+        const hay = (classKey + " " + descOf(entry) + " " + scope).toLowerCase();
         return hay.includes(q);
       });
       if (!entries.length) continue;
@@ -97,15 +131,21 @@ export function mountSchemaList(container, { schemas, onSelect, selected }) {
         item.dataset.classKey = classKey;
         if (state.selected === classKey) item.classList.add("selected");
 
-        const title = document.createElement("div");
+        const titleRow = document.createElement("div");
+        titleRow.className = "item-title-row";
+
+        const title = document.createElement("span");
         title.className = "item-title";
         title.textContent = labelOf(entry, classKey);
+
+        titleRow.appendChild(title);
+        titleRow.appendChild(scopeBadge(scopeOf(entry)));
 
         const desc = document.createElement("div");
         desc.className = "item-desc";
         desc.textContent = descOf(entry).slice(0, 100);
 
-        item.appendChild(title);
+        item.appendChild(titleRow);
         if (desc.textContent) item.appendChild(desc);
 
         item.addEventListener("click", () => {

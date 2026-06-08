@@ -215,7 +215,22 @@ export function mountConfigTabs(host, { onKnobs } = {}) {
       classKey, lineage, tiers,
       resolved, explicit, inherited,
       patch, diff, curlPatch, curlGet, docs, registryUrl,
+      pluginScope,
     } = data || {};
+
+    // Show the scope label (e.g. "all tiers") in the tier-stack header so
+    // operators know at a glance which tiers this plugin is writable at.
+    if (pluginScope) {
+      const SCOPE_LABELS = {
+        platform_waterfall: "all tiers",
+        collection_intrinsic: "collection only",
+        deployment_env: "env-only (read-only)",
+      };
+      const label = SCOPE_LABELS[pluginScope] || pluginScope;
+      stackHdr.textContent = `Tier stack — ${label}`;
+    } else {
+      stackHdr.textContent = "Tier stack";
+    }
 
     renderTierStack(stackHost, { lineage: lineage || null, tiers: tiers || [] });
 
