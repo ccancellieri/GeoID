@@ -34,6 +34,21 @@ from dynastore.modules.elasticsearch.canonical_doc import build_canonical_envelo
 # Common Metadata at the top level on read.
 DEFAULT_LIFECYCLE_KEYS = ("created", "updated")
 
+# i18n fields whose values can be language-keyed dicts (e.g.
+# ``{"en": [...], "fr": [...]}``) and must land in the typed ``metadata``
+# container rather than the flat ``properties`` attribute bag. The ES
+# ``metadata`` mapping declares these with per-language sub-properties
+# (``_localized_text_field`` / ``_localized_keyword_field``); routing a
+# language-keyed dict through ``properties`` would hit a flat ``keyword``
+# type and be rejected with ``mapper_parsing_exception`` (refs #1932/#1828).
+#
+# Mirrors the ``_METADATA_CONTAINER`` block in ``mappings.py`` exactly:
+# ``title`` (localized text), ``description`` (localized text), ``keywords``
+# (localized keyword array). A value is lifted only when it is a dict
+# (language-keyed); a plain string/list stays in ``properties`` and is
+# indexed by the existing field type (backwards-compatible).
+_METADATA_I18N_FIELDS: frozenset = frozenset({"title", "description", "keywords"})
+
 
 def build_canonical_metadata_doc(
     metadata: Dict[str, Any],
@@ -53,6 +68,9 @@ def build_canonical_metadata_doc(
       ``collection_id``) added at the top level; dropped from the wire on read.
     * lifecycle (``lifecycle_keys``) → the ``system`` container.
     * structural members (``reserved_member_keys``) → carried verbatim.
+    * i18n fields with language-keyed dict values → the typed ``metadata``
+      container (refs #1932/#1828). Plain string/list values stay in
+      ``properties`` for backwards compatibility.
     * everything else → the ``properties`` attribute bag (unknown keys route to
       ``properties.extras``).
 
@@ -75,11 +93,22 @@ def build_canonical_metadata_doc(
     for key in identity:
         md.pop(key, None)
 
+    # Lift language-keyed i18n fields into the typed ``metadata`` container so
+    # they hit the per-language sub-property mappings (``_localized_text_field``
+    # / ``_localized_keyword_field``) instead of the flat ``keyword`` field
+    # declared under ``properties`` (refs #1932/#1828).
+    i18n: Dict[str, Any] = {}
+    for key in _METADATA_I18N_FIELDS:
+        val = md.get(key)
+        if isinstance(val, dict):
+            i18n[key] = md.pop(key)
+
     return build_canonical_envelope(
         identity=dict(identity),
         properties=md,
         known_fields=known_fields,
         reserved_members=reserved,
+        metadata=i18n or None,
         system=system or None,
         access=access or None,
     )
@@ -100,8 +129,11 @@ def unproject_metadata_from_es(
     * the ``properties`` attribute bag (with ``extras`` hoisted) spreads onto
       the **top level** — these entities have no ``properties`` member;
     * ``system`` lifecycle keys surface as top-level Common Metadata;
-    * internal identity axes and the ``system``/``access`` containers are
-      dropped from the wire.
+    * i18n fields stored in the ``metadata`` container are restored to the
+      top level unchanged (refs #1932/#1828). ``setdefault`` means a value
+      already present via ``properties`` (plain string/list) takes precedence;
+    * internal identity axes and the ``system``/``access``/``metadata``
+      containers are dropped from the wire.
 
     Pure function — *source* is not mutated.
     """
@@ -130,11 +162,21 @@ def unproject_metadata_from_es(
             if key in system:
                 out.setdefault(key, system[key])
 
+    # Restore language-keyed i18n fields from the typed ``metadata`` container
+    # back to the top-level STAC wire format. ``setdefault`` keeps any
+    # non-dict value already surfaced from ``properties`` (plain string/list).
+    meta = source.get("metadata")
+    if isinstance(meta, dict):
+        for key in _METADATA_I18N_FIELDS:
+            if key in meta:
+                out.setdefault(key, meta[key])
+
     return out
 
 
 __all__ = [
     "DEFAULT_LIFECYCLE_KEYS",
+    "_METADATA_I18N_FIELDS",
     "build_canonical_metadata_doc",
     "unproject_metadata_from_es",
 ]

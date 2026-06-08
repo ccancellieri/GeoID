@@ -128,3 +128,78 @@ def test_access_sidecar_stored_not_on_wire():
     assert doc["access"] == {"owner": "u1"}
     wire = unproject_collection_from_es(doc)
     assert "access" not in wire
+
+
+# ---------------------------------------------------------------------------
+# i18n / multilingual keywords regression (refs #1932/#1828)
+# ---------------------------------------------------------------------------
+
+_MULTILINGUAL_COLLECTION = {
+    "type": "Collection",
+    "stac_version": "1.1.0",
+    "id": "coll-i18n",
+    "title": {"en": "Sentinel-2 L2A", "fr": "Sentinel-2 N2A"},
+    "description": {"en": "Surface reflectance", "fr": "Réflectance de surface"},
+    "keywords": {"en": ["satellite", "sentinel"], "fr": ["satellite", "sentinelle"]},
+    "license": "proprietary",
+    "extent": {"spatial": {"bbox": [[-180, -90, 180, 90]]}},
+    "links": [],
+}
+
+
+def _build_i18n(metadata):
+    return build_canonical_collection_doc(
+        metadata,
+        catalog_id="cat",
+        collection_id="coll-i18n",
+        known_fields=dict(TIER_1_FIELDS),
+    )
+
+
+def test_multilingual_keywords_land_in_metadata_not_properties():
+    """Language-keyed keyword dicts must go into metadata, not the flat
+    properties bag that maps to keyword type in ES (refs #1932)."""
+    doc = _build_i18n(_MULTILINGUAL_COLLECTION)
+    assert "metadata" in doc
+    assert doc["metadata"]["keywords"] == {
+        "en": ["satellite", "sentinel"],
+        "fr": ["satellite", "sentinelle"],
+    }
+    assert doc["metadata"]["title"] == {"en": "Sentinel-2 L2A", "fr": "Sentinel-2 N2A"}
+    assert doc["metadata"]["description"] == {
+        "en": "Surface reflectance",
+        "fr": "Réflectance de surface",
+    }
+    # NOT in the flat properties bag (would cause mapper_parsing_exception in ES)
+    assert "keywords" not in doc.get("properties", {})
+    assert "title" not in doc.get("properties", {})
+    assert "description" not in doc.get("properties", {})
+
+
+def test_multilingual_keywords_round_trip():
+    """build → unproject restores language-keyed dicts unchanged to the
+    top-level STAC wire format (refs #1932)."""
+    doc = _build_i18n(_MULTILINGUAL_COLLECTION)
+    wire = unproject_collection_from_es(doc)
+    assert wire["keywords"] == {"en": ["satellite", "sentinel"], "fr": ["satellite", "sentinelle"]}
+    assert wire["title"] == {"en": "Sentinel-2 L2A", "fr": "Sentinel-2 N2A"}
+    assert wire["description"] == {"en": "Surface reflectance", "fr": "Réflectance de surface"}
+    # Internal containers excluded from the wire
+    assert "metadata" not in wire
+    assert "properties" not in wire
+
+
+def test_plain_keywords_stay_in_properties():
+    """Plain list keywords (non-i18n) must still land in properties,
+    not the metadata container (backwards compatibility)."""
+    doc = _build(_COLLECTION)
+    # _COLLECTION has keywords=["sentinel", "s2"] — a list, not a dict
+    assert doc["properties"]["keywords"] == ["sentinel", "s2"]
+    assert "metadata" not in doc or "keywords" not in doc.get("metadata", {})
+
+
+def test_metadata_container_excluded_from_wire():
+    """The internal metadata container must never appear on the STAC wire."""
+    doc = _build_i18n(_MULTILINGUAL_COLLECTION)
+    wire = unproject_collection_from_es(doc)
+    assert "metadata" not in wire
