@@ -236,11 +236,23 @@ function mountSelectMode(container, {
   autoSelectFirst = false,
   preferredCollection = null,
   enableVirtualCollections = false,
+  enableSearch = false,
 } = {}) {
   clearNode(container);
 
   const wrapper = document.createElement("div");
   wrapper.className = "context-selector-wrapper";
+
+  let searchInput = null;
+  let allCatalogItems = [];
+
+  if (enableSearch) {
+    searchInput = document.createElement("input");
+    searchInput.type = "text";
+    searchInput.className = "filter-input";
+    searchInput.placeholder = "Filter catalogs…";
+    wrapper.appendChild(searchInput);
+  }
 
   const catalogSelect = buildSelect({ placeholder: "-- catalog --", cls: "filter-select" });
   wrapper.appendChild(catalogSelect);
@@ -263,19 +275,31 @@ function mountSelectMode(container, {
     }
   }
 
-  async function populateCatalogSelect(catalogs) {
+  function applySearchFilter(term) {
+    const lower = (term || "").toLowerCase();
+    const visible = lower
+      ? allCatalogItems.filter((c) => (c.title || c.id).toLowerCase().includes(lower))
+      : allCatalogItems;
     while (catalogSelect.firstChild) catalogSelect.removeChild(catalogSelect.firstChild);
     const placeholder = document.createElement("option");
     placeholder.value = "";
     placeholder.textContent = "-- catalog --";
     catalogSelect.appendChild(placeholder);
-    for (const c of catalogs) {
+    for (const c of visible) {
       const o = document.createElement("option");
       o.value = c.id;
       o.textContent = c.title || c.id;
       if (c.id === currentCatalog) o.selected = true;
       catalogSelect.appendChild(o);
     }
+    if (currentCatalog && catalogSelect.value !== currentCatalog) {
+      currentCatalog = null;
+    }
+  }
+
+  async function populateCatalogSelect(catalogs) {
+    allCatalogItems = catalogs;
+    applySearchFilter(searchInput ? searchInput.value : "");
   }
 
   async function populateCollectionSelect(collections) {
@@ -329,6 +353,12 @@ function mountSelectMode(container, {
   catalogSelect.addEventListener("change", (e) => {
     onCatalogChanged(e.target.value || null);
   });
+
+  if (searchInput) {
+    searchInput.addEventListener("input", (e) => {
+      applySearchFilter(e.target.value);
+    });
+  }
 
   if (collectionSelect) {
     collectionSelect.addEventListener("change", (e) => {
@@ -416,6 +446,9 @@ function mountSelectMode(container, {
  * @param {boolean}     [options.autoSelectFirst=false]- Select mode: auto-pick first option.
  * @param {string}      [options.preferredCollection]  - Select mode: preferred collection id.
  * @param {boolean}     [options.enableVirtualCollections=false] - Select mode: include virtual collections.
+ * @param {boolean}     [options.enableSearch=false]            - Select mode: show a text filter above the
+ *   catalog select that narrows options by case-insensitive substring. Current selection is cleared when
+ *   filtered out. Does not affect bar mode.
  *
  * @returns {Object} Control handle.
  *   Bar mode:    { getScope(), setScope(scope) }

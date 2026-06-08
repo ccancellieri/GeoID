@@ -201,7 +201,10 @@
     /* The Catalog Permissions tab's catalog picker — keep the select wide. */
     #cp-catalog-select { min-width: 260px; max-width: 360px; }
   </style>
-  <script src="../website/context-selector.js?v={{VERSION}}"></script>
+  <script type="module">
+    import { mountContextBar } from "../static/common/context-bar.js";
+    window.mountContextBar = mountContextBar;
+  </script>
 </head>
 <body>
   <main>
@@ -809,8 +812,9 @@ async function loadPolicies() {
   tb.innerHTML = '<tr class="empty-row"><td colspan="7" class="loader-line">Loading…</td></tr>';
   try {
     let url = `/policies`;
-    if (_csPolicies && _csPolicies.state.catalogId && _csPolicies.state.catalogId !== '_system_') {
-      url += `?catalog_id=${encodeURIComponent(_csPolicies.state.catalogId)}`;
+    const cat = _csPolicies && _csPolicies.getCatalogId();
+    if (cat && cat !== '_system_') {
+      url += `?catalog_id=${encodeURIComponent(cat)}`;
     }
     _allPolicies = await apiFetch(url);
     renderPolicies(_allPolicies);
@@ -1149,9 +1153,9 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('pu-prev').addEventListener('click', () => pageUsage(-1));
   document.getElementById('pu-next').addEventListener('click', () => pageUsage(1));
 
-  _csPolicies = new ContextSelector({
-    containerId: 'cs-policies-container',
-    enableCollection: false,
+  _csPolicies = window.mountContextBar(document.getElementById('cs-policies-container'), {
+    mode: 'select',
+    catalogOnly: true,
     enableSearch: true,
     onChange: () => {
       if (document.getElementById('tab-policies').classList.contains('active')) {
