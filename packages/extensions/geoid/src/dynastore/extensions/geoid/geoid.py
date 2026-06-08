@@ -6,10 +6,9 @@ from contextlib import asynccontextmanager
 from typing import List, Any, Dict, Optional, Callable
 
 from fastapi import FastAPI, APIRouter
-from fastapi.responses import HTMLResponse
 
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.models.protocols.web import WebOverrideProtocol, WebPageProtocol, StaticFilesProtocol
+from dynastore.models.protocols.web import WebOverrideProtocol, StaticFilesProtocol
 
 # Use the module-level decorators so Web discovers pages and static files automatically
 from dynastore.modules.web.decorators import expose_web_page
@@ -141,21 +140,20 @@ _GEOID_HOME_COPY = {
 }
 
 
-class Geoid(ExtensionProtocol, WebOverrideProtocol, WebPageProtocol, StaticFilesProtocol):
+class Geoid(ExtensionProtocol, WebOverrideProtocol, StaticFilesProtocol):
     """
     GeoID extension — a content provider that plugs into the Web extension's
     routing infrastructure.
 
     Responsibilities:
     - Override the platform home section with GeoID branding (is_embed page).
-    - Provide the /web/pages/geoid service page.
     - Serve geoid static assets under the "geoid" prefix.
     - Declare style overrides for landing-page rebranding.
 
     Everything else (middleware, root redirects, /web/config/pages, /web/docs-*,
     /web/health, /{prefix}/{filename} static dispatch) is handled by the Web
     extension, which discovers this class through the StaticFilesProtocol,
-    WebPageProtocol and WebOverrideProtocol at configure_app time.
+    WebOverrideProtocol at configure_app time.
     """
 
     priority: int = -10  # Load before Web so policies are ready
@@ -218,61 +216,6 @@ class Geoid(ExtensionProtocol, WebOverrideProtocol, WebPageProtocol, StaticFiles
     # Static files are registered via the StaticFilesProtocol methods above
     # (get_static_prefix / list_static_files / is_file_provided), discovered by
     # WebModule's global protocol scan.  No @expose_static decorator needed here.
-
-    # ------------------------------------------------------------------ #
-    #  WebPageProtocol                                                     #
-    # ------------------------------------------------------------------ #
-
-    def get_web_page_config(self) -> Dict[str, Any]:
-        """
-        Metadata for the Geoid service page, used by WebModule for navigation
-        and role-based visibility.  Served at /web/pages/geoid via render_page().
-        """
-        return {
-            "id": "geoid",
-            "title": {
-                "en": "Geoid Service",
-                "es": "Servicio de Geoide",
-                "fr": "Service géoïde",
-            },
-            "icon": "fa-earth-americas",
-            "description": {
-                "en": "Geoid height calculation service.",
-                "es": "Cálculo de altura del geoide.",
-                "fr": "Calcul de la hauteur du géoïde.",
-            },
-            "priority": 0,
-            "is_embed": False,
-        }
-
-    async def render_page(self, request: Any, language: str = "en") -> Any:
-        """
-        Called by Web's /web/pages/geoid handler.  Delegates to geoid_page()
-        so all rendering logic lives in one place.
-        """
-        return self.geoid_page(language=language)
-
-    def geoid_page(self, language: str = "en") -> HTMLResponse:
-        """
-        Serve the language-specific Geoid SPA entry point.
-
-        Lookup order:
-          1. static/index_{lang}.html  (e.g. index_es.html)
-          2. static/index.html         (language-neutral fallback)
-          3. 404 response if neither exists
-        """
-        lang_code = language.lower().split("-")[0]
-        if lang_code not in ["en", "es", "fr"]:
-            lang_code = "en"
-
-        index_path = os.path.join(self.static_dir, f"index_{lang_code}.html")
-        if not os.path.exists(index_path):
-            index_path = os.path.join(self.static_dir, "index.html")
-
-        if os.path.exists(index_path):
-            with open(index_path, "r", encoding="utf-8") as f:
-                return HTMLResponse(content=f.read())
-        return HTMLResponse("Geoid service page not found", status_code=404)
 
     # ------------------------------------------------------------------ #
     #  WebOverrideProtocol                                                 #
