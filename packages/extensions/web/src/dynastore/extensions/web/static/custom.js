@@ -526,7 +526,11 @@ async function fetchDashboardStats() {
 async function fetchDashboardLogs() {
     try {
         const level = document.getElementById('log-filter-level')?.value || 'INFO';
-        const res = await fetch(`/logs/system?limit=50&level=${level}`);
+        // Must carry the proxy prefix: a bare /logs/system resolves against the
+        // proxy root (e.g. https://host/logs/system) and 404s behind a base path
+        // like /geospatial/dev/api/catalog. apiRoot() supplies the prefix, as it
+        // does for every other absolute API call in this file.
+        const res = await fetch(`${apiRoot()}/logs/system?limit=50&level=${level}`);
         if (!res.ok) return;
         const data = await res.json();
         const logs = data.logs || [];
@@ -563,7 +567,7 @@ async function fetchDashboardLogs() {
             row.appendChild(msgEl);
             container.appendChild(row);
         }
-    } catch(e) {}
+    } catch(e) { console.error('Failed to load dashboard logs', e); }
 }
 
 async function fetchDashboardTasks() {
