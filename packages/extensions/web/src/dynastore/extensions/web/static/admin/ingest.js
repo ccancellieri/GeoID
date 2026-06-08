@@ -4,7 +4,7 @@
 // been chosen.
 
 import {
-  fetchMe, postFeatures,
+  fetchMe, postFeatures, createStacCollection,
 } from "../common/api.js";
 import { mountContextBar } from "../common/context-bar.js";
 
@@ -15,6 +15,7 @@ const state = {
   totalFeatures: 0,
   selectedCatalog: null,
   selectedCollection: null,
+  cs: null,                  // mounted context picker handle
 };
 
 function clearNode(node) {
@@ -207,6 +208,69 @@ async function onSubmit() {
   }
 }
 
+// --- New collection ---------------------------------------------------
+// Inline "create a collection under the selected catalog" affordance so a
+// user can ingest into a brand-new collection without leaving the page.
+
+function setupNewCollection() {
+  const toggle = $("#ing-newcol-toggle");
+  const form = $("#ing-newcol-form");
+  const createBtn = $("#ing-newcol-create");
+  const idEl = $("#ing-newcol-id");
+  const titleEl = $("#ing-newcol-title");
+  const statusEl = $("#ing-newcol-status");
+  if (!toggle || !form || !createBtn) return;
+
+  const setColStatus = (msg, cls = "") => {
+    statusEl.textContent = msg || "";
+    statusEl.className = "status " + cls;
+  };
+
+  toggle.addEventListener("click", () => {
+    form.hidden = !form.hidden;
+    if (!form.hidden) idEl.focus();
+  });
+
+  createBtn.addEventListener("click", async () => {
+    const catalogId = state.cs && state.cs.getCatalogId();
+    if (!catalogId) { setColStatus("Pick a catalog first.", "err"); return; }
+    const id = (idEl.value || "").trim();
+    if (!id) { setColStatus("Collection id is required.", "err"); idEl.focus(); return; }
+    const title = (titleEl.value || "").trim();
+
+    createBtn.disabled = true;
+    setColStatus("Creating…");
+    try {
+      await createStacCollection(catalogId, {
+        type: "Collection",
+        id,
+        stac_version: "1.1.0",
+        description: title || id,
+        license: "proprietary",
+        extent: {
+          spatial: { bbox: [[-180, -90, 180, 90]] },
+          temporal: { interval: [[null, null]] },
+        },
+        links: [],
+        ...(title ? { title } : {}),
+      });
+      // Refresh the picker's collection list and select the new one, so the
+      // user can drop a file and Transmit immediately.
+      if (state.cs && state.cs.refreshCollections) {
+        await state.cs.refreshCollections(id);
+      }
+      setColStatus(`Created "${id}".`, "ok");
+      idEl.value = "";
+      titleEl.value = "";
+      form.hidden = true;
+    } catch (e) {
+      setColStatus(`Failed: ${e.message || e}`, "err");
+    } finally {
+      createBtn.disabled = false;
+    }
+  });
+}
+
 // --- Boot -------------------------------------------------------------
 
 async function boot() {
@@ -225,7 +289,7 @@ async function boot() {
   // Mount the canonical context picker into the target plate.
   const pickerEl = document.getElementById("ing-target-picker");
   if (pickerEl) {
-    mountContextBar(pickerEl, {
+    state.cs = mountContextBar(pickerEl, {
       mode: "select",
       onChange: ({ catalogId, collectionId }) => {
         state.selectedCatalog = catalogId;
@@ -233,6 +297,7 @@ async function boot() {
         updateButtons();
       },
     });
+    setupNewCollection();
   }
 
   // Dropzone + file picker

@@ -426,6 +426,22 @@ function mountSelectMode(container, {
       if (collectionSelect) collectionSelect.value = currentCollection || "";
       emitChange();
     },
+    // Re-fetch the current catalog's collections (busting the cache) and, if
+    // selectId is given, select it. Used after creating a collection so the
+    // new one appears in the dropdown without re-mounting the picker.
+    refreshCollections: async (selectId) => {
+      if (!collectionSelect || !currentCatalog) return [];
+      delete collectionsByCatalog[currentCatalog];
+      const cols = await fetchCollectionsFor(currentCatalog, collectionsByCatalog, enableVirtualCollections);
+      await populateCollectionSelect(cols);
+      if (selectId) {
+        currentCollection = selectId;
+        collectionSelect.value = selectId;
+        collectionSelect.disabled = false;
+        emitChange();
+      }
+      return cols;
+    },
   };
 }
 

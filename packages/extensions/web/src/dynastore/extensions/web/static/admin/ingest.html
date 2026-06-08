@@ -7,6 +7,12 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="../static/common/admin.css">
+  <style>
+    .ing-newcol { margin-top: 0.75rem; }
+    .ing-newcol-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+    .ing-newcol-form[hidden] { display: none; }
+    .ing-newcol-form .filter-input { flex: 1 1 12rem; min-width: 8rem; }
+  </style>
 </head>
 <body>
   <main>
@@ -32,6 +38,15 @@
         <div class="plate-meta">DESTINATION</div>
       </div>
       <div id="ing-target-picker" class="context-bar"></div>
+      <div class="ing-newcol">
+        <button type="button" class="btn btn-secondary" id="ing-newcol-toggle">+ New collection</button>
+        <div id="ing-newcol-form" class="ing-newcol-form" hidden>
+          <input type="text" id="ing-newcol-id" class="filter-input" placeholder="collection id (e.g. ndvi_monthly)">
+          <input type="text" id="ing-newcol-title" class="filter-input" placeholder="title (optional)">
+          <button type="button" class="btn" id="ing-newcol-create">Create</button>
+          <span id="ing-newcol-status" class="status"></span>
+        </div>
+      </div>
     </div>
 
     <div class="plate">
