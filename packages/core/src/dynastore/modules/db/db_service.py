@@ -252,6 +252,34 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                     "DBService: ASYNC Database connection pool established successfully."
                 )
 
+            # Self-heal the base Postgres extensions (postgis et al.) on the
+            # async engine before serving traffic. #1748 gated the sync-engine
+            # DatastoreModule — the historical owner of this bootstrap — off the
+            # API/catalog SCOPE, so on a freshly-provisioned database the catalog
+            # service would otherwise have NO path to ``CREATE EXTENSION postgis``
+            # and every geometry-typed write fails with "type geometry does not
+            # exist". Runs on the asyncpg engine, so it does NOT re-introduce the
+            # sync psycopg2 engine #1748 removed from API services. The call is
+            # guarded (DB-backed presence check, Valkey-cached positive keyed by
+            # database identity), so across the multi-Cloud-Run fleet the steady
+            # state is a single cache read, not repeated DDL on every pod boot.
+            # Best-effort: a failure here must never abort foundational startup.
+            _async_engine = getattr(app_state, "engine", None)
+            if _async_engine is not None:
+                try:
+                    from dynastore.modules.db_config.tools import (
+                        ensure_base_extensions,
+                    )
+
+                    await ensure_base_extensions(_async_engine)
+                except Exception:
+                    logger.warning(
+                        "DBService: base-extension ensure failed (best-effort) — "
+                        "continuing startup; geometry-typed writes may fail until "
+                        "the extensions exist.",
+                        exc_info=True,
+                    )
+
             yield
 
         except Exception as e:

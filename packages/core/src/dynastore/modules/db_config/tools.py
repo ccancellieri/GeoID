@@ -73,28 +73,105 @@ def normalize_db_url(url: str, is_async: bool = False) -> str:
     return url
 
 
-async def ensure_init_db(resource: DbResource):
-    """Initializes the database base extensions.
-
-    Every step is wrapped in ``retry_on_invalidated_connection`` so a
-    transient DB drop during dev startup (db_entrypoint_dev.sh reset) does
-    not abort the foundational DatastoreModule lifespan.  ``ensure_db_extension``
-    embeds its own retry; the platform-config initializer (which issues raw
-    DDL directly) is wrapped here at the call site so the entire bootstrap
-    sequence is uniformly resilient.
-    """
-    await maintenance_tools.ensure_db_extension(resource, "postgis")
-    await maintenance_tools.ensure_db_extension(resource, "postgis_topology")
-    await maintenance_tools.ensure_db_extension(resource, "btree_gist")
-    await maintenance_tools.ensure_db_extension(resource, "btree_gin")
-    # pgcrypto provides ``digest()`` used by the geometries / attributes
-    # sidecar GENERATED columns to maintain the SHA256 *_hash columns
-    # without application-side write code.
-    await maintenance_tools.ensure_db_extension(resource, "pgcrypto")
-    # pg_trgm powers lexical fuzzy matching (``similarity()`` / ``%`` operator).
-    # Used by the dimension Similarity conformance class to rank materialized
+# Base Postgres extensions every database needs before geometry / columnar
+# storage works. CREATE EXTENSION is independent per name; the order matters
+# only for readability EXCEPT that ``pg_trgm`` is created LAST and is reused as
+# the "all present" sentinel by the boot guard below — never reorder it off the
+# tail without updating ``_EXT_SENTINEL``.
+BASE_DB_EXTENSIONS: tuple[str, ...] = (
+    "postgis",
+    "postgis_topology",
+    "btree_gist",
+    "btree_gin",
+    # pgcrypto provides ``digest()`` used by the geometries / attributes sidecar
+    # GENERATED columns to maintain the SHA256 *_hash columns without
+    # application-side write code.
+    "pgcrypto",
+    # pg_trgm powers lexical fuzzy matching (``similarity()`` / ``%`` operator),
+    # used by the dimension Similarity conformance class to rank materialized
     # dimension members by trigram similarity against their member labels.
-    await maintenance_tools.ensure_db_extension(resource, "pg_trgm")
+    "pg_trgm",
+)
+
+# Presence of the last-created extension implies the whole set is present.
+_EXT_SENTINEL: str = BASE_DB_EXTENSIONS[-1]
+
+
+async def _resolve_db_identity(resource: DbResource) -> str:
+    """A stable per-database cache key (``host:port/dbname``).
+
+    Taken from the engine URL when available (no round-trip); falls back to
+    ``current_database()`` for a bare connection. The key MUST identify the
+    physical database: a repoint to a fresh database (different name) then
+    misses the cache and re-bootstraps instead of inheriting a stale "present"
+    marker from the previous database — the exact failure mode that left a
+    freshly-provisioned dev DB without PostGIS.
+    """
+    url = getattr(resource, "url", None)
+    if url is not None:
+        return (
+            f"{getattr(url, 'host', '') or ''}:"
+            f"{getattr(url, 'port', '') or ''}/"
+            f"{getattr(url, 'database', '') or ''}"
+        )
+    try:
+        res = await DQLQuery(
+            "SELECT current_database()", result_handler=ResultHandler.SCALAR
+        ).execute(resource)
+        return f"db/{res}"
+    except Exception:  # noqa: BLE001 — identity is best-effort; fall back to a constant
+        return "db/unknown"
+
+
+@cached(ttl=600, namespace="db_bootstrap", ignore=["resource"], condition=bool)
+async def _base_extensions_present(resource: DbResource, db_key: str) -> bool:
+    """True iff the base extensions are installed in ``db_key``'s database.
+
+    DB-backed truth (a ``pg_extension`` probe on the sentinel). ``condition=bool``
+    caches ONLY the positive result, keyed by database identity (``db_key``), so:
+
+      * steady state across the multi-Cloud-Run fleet costs one cache read — no
+        repeated ``CREATE EXTENSION`` on every pod boot;
+      * a fresh / repointed database (sentinel absent → ``False`` → uncached)
+        always re-probes cheaply and bootstraps. It can never inherit a stale
+        "true" from a different database.
+    """
+    from dynastore.modules.db_config.locking_tools import check_extension_exists
+
+    # ``db_key`` is consumed by the cache layer as the per-database key; logging
+    # it here both documents that contract and aids diagnosing a wrong-key skip.
+    logging.getLogger(__name__).debug(
+        "base-extension presence probe for database %s", db_key
+    )
+    return await check_extension_exists(resource, _EXT_SENTINEL)
+
+
+async def ensure_base_extensions(resource: DbResource) -> None:
+    """Ensure the base Postgres extensions exist — guarded for per-boot cheapness.
+
+    Safe to call from any service's startup on any (sync or async) engine: the
+    guard above collapses the steady-state cost to a single cache read. Only
+    when the sentinel extension is genuinely absent are the ``CREATE EXTENSION``
+    statements issued — each one advisory-locked + idempotent via
+    ``ensure_db_extension`` (which embeds its own connection-invalidation retry).
+    """
+    db_key = await _resolve_db_identity(resource)
+    if await _base_extensions_present(resource, db_key):
+        return
+    for ext in BASE_DB_EXTENSIONS:
+        await maintenance_tools.ensure_db_extension(resource, ext)
+
+
+async def ensure_init_db(resource: DbResource):
+    """Initializes the database base extensions + platform-config storage.
+
+    The base-extension step is delegated to :func:`ensure_base_extensions`,
+    whose boot guard makes repeated calls cheap; the platform-config initializer
+    (which issues raw DDL directly) is wrapped in ``retry_on_invalidated_connection``
+    so a transient DB drop during dev startup (db_entrypoint_dev.sh reset) does
+    not abort the foundational lifespan.
+    """
+    await ensure_base_extensions(resource)
 
     # --- Initialize Platform Config Storage ---
     from dynastore.modules.db_config.platform_config_service import PlatformConfigService
