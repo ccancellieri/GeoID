@@ -1408,12 +1408,66 @@ class GeometriesSidecar(SidecarProtocol):
                 except Exception as e:
                     logger.warning(f"Failed to convert Shapely geometry: {e}")
 
-        # 2. BBox Mapping
-        if self.config.write_bbox and "bbox_geom" in row:
-            # bbox_geom is a PostGIS geometry (box), we might want to convert it to a bbox array [minx, miny, maxx, maxy]
-            # but usually map_row_to_geojson handles list extraction if it's already a list.
-            # If it's a geom, we might need a utility to convert it.
-            pass
+        # 2. BBox Mapping — build [minx, miny, maxx, maxy] from whichever
+        # columns the read query projected.
+        #
+        # Priority A: scalar envelope columns (bbox_xmin / bbox_ymin /
+        #   bbox_xmax / bbox_ymax) — projected by the STAC search hydration
+        #   query via ST_XMin/YMin/XMax/YMax.
+        # Priority B: bbox_geom — the stored PostGIS geometry column written
+        #   when write_bbox=True; decoded through Shapely.
+        # Priority C: derive from the main geometry already set on the Feature.
+        #
+        # Sets feature.bbox only when all four coordinate values are available
+        # and numeric; leaves it untouched (None) on any failure so the caller
+        # can degrade gracefully.
+        _bbox_set = False
+        if all(k in row and row[k] is not None for k in ("bbox_xmin", "bbox_ymin", "bbox_xmax", "bbox_ymax")):
+            try:
+                feature.bbox = (
+                    float(row["bbox_xmin"]),
+                    float(row["bbox_ymin"]),
+                    float(row["bbox_xmax"]),
+                    float(row["bbox_ymax"]),
+                )
+                _bbox_set = True
+            except (TypeError, ValueError) as e:
+                logger.warning("GeometriesSidecar: failed to build bbox from scalar columns: %s", e)
+
+        if not _bbox_set and self.config.write_bbox and row.get("bbox_geom") is not None:
+            try:
+                import shapely.wkb
+                _bg_raw = row["bbox_geom"]
+                if isinstance(_bg_raw, str):
+                    _bg = shapely.wkb.loads(bytes.fromhex(_bg_raw))
+                elif isinstance(_bg_raw, (bytes, bytearray)):
+                    _bg = shapely.wkb.loads(bytes(_bg_raw))
+                elif hasattr(_bg_raw, "geom_type"):
+                    _bg = _bg_raw
+                else:
+                    _bg = None
+                if _bg is not None:
+                    _b = _bg.bounds  # (minx, miny, maxx, maxy)
+                    feature.bbox = (float(_b[0]), float(_b[1]), float(_b[2]), float(_b[3]))
+                    _bbox_set = True
+            except Exception as e:
+                logger.warning("GeometriesSidecar: failed to build bbox from bbox_geom: %s", e)
+
+        if not _bbox_set and feature.geometry is not None:
+            try:
+                from shapely.geometry import shape as _shape
+                _geom_dict = (
+                    feature.geometry
+                    if isinstance(feature.geometry, dict)
+                    else feature.geometry.model_dump(exclude_none=True)
+                    if hasattr(feature.geometry, "model_dump")
+                    else None
+                )
+                if _geom_dict is not None:
+                    _b = _shape(_geom_dict).bounds
+                    feature.bbox = (float(_b[0]), float(_b[1]), float(_b[2]), float(_b[3]))
+            except Exception as e:
+                logger.warning("GeometriesSidecar: failed to derive bbox from geometry: %s", e)
 
         # 3. Spatial Metadata (Hidden from properties by default unless configured)
         # These are usually internal but can be exposed if needed.

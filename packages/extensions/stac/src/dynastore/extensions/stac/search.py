@@ -42,6 +42,29 @@ from dynastore.modules.db_config.shared_queries import build_filter_clause
 from dynastore.modules.stac.stac_config import AggregationRule, StacPluginConfig
 from dynastore.models.driver_context import DriverContext
 
+# Internal columns produced by the STAC search hydration query that must
+# never surface in the serialized item properties.  These are SQL aliases
+# for JOIN-derived values (bbox envelope components, temporal sort anchor,
+# STAC sidecar columns, geometry hash) that the sidecar exclusion lists do
+# not cover because the hydration query generates them outside the normal
+# per-sidecar get_internal_columns() contract.
+_HYDRATION_INTERNAL_FIELDS: frozenset = frozenset({
+    "valid_from",
+    "valid_to",
+    "bbox_xmin",
+    "bbox_ymin",
+    "bbox_xmax",
+    "bbox_ymax",
+    "stac_title",
+    "stac_description",
+    "stac_keywords",
+    "stac_extra_fields",
+    "external_assets",
+    "external_extensions",
+    "geometry_hash",
+    "_total_count",
+})
+
 
 class AttributeFilter(BaseModel):
     field: str
@@ -1325,6 +1348,11 @@ async def search_items(
                 if feature:
                     if feature.properties is None:
                         feature.properties = {}
+                    # Strip hydration-internal columns that leaked into properties
+                    # because they are not covered by any sidecar get_internal_columns()
+                    # contract (they are SQL aliases from the hydration SELECT).
+                    for _hk in _HYDRATION_INTERNAL_FIELDS:
+                        feature.properties.pop(_hk, None)
                     feature.properties["_catalog_id"] = item_data["catalog_id"]
                     feature.properties["_collection_id"] = item_data["collection_id"]
                     rows.append(feature)

@@ -1,4 +1,4 @@
-#    Copyright 2025 FAO
+#    Copyright 2026 FAO
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -972,12 +972,20 @@ class QueryOptimizer:
 
         # Resolve the feature-ID expression. ``provides_feature_id`` on the
         # sidecar is a capability flag (at most one sidecar can provide it).
-        # The wire-shape decision lives on the read policy — when
-        # ``external_id_as_feature_id`` is False, ``feature.id == geoid``
-        # regardless of sidecar capability. Use COALESCE so rows without an
-        # ``external_id`` still expose their ``geoid``.
+        #
+        # Two cases:
+        # 1. Non-STAC consumers: the wire-shape decision lives on the read
+        #    policy — when ``external_id_as_feature_id`` is False,
+        #    ``feature.id == geoid`` regardless of sidecar capability.
+        # 2. STAC consumers: STAC items MUST expose the authored external_id
+        #    (the original STAC item id) as the stable, client-facing identifier.
+        #    Use COALESCE(external_id, geoid) unconditionally so that GET /items
+        #    and POST /search produce the same id regardless of the per-collection
+        #    read-policy setting (search.py uses the same COALESCE convention).
+        #    Items without an external_id fall back to the geoid UUID.
         feature_id_expr: str = "h.geoid"
-        if self._external_id_as_feature_id():
+        use_coalesce = self._external_id_as_feature_id() or self.consumer == ConsumerType.STAC
+        if use_coalesce:
             for sc_config in required_sidecars:
                 sidecar = SidecarRegistry.get_sidecar(sc_config, lenient=True)
                 if sidecar and sidecar.provides_feature_id and sidecar.feature_id_field_name:

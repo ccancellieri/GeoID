@@ -928,6 +928,12 @@ async def create_item_from_feature(
     # identity already lives at ``feature.id`` (-> ``item.id``). Keeps the
     # POST/PUT echo aligned with the GET read contract (#1232).
     properties = strip_reserved_members(feature.properties or {})
+    # Strip cross-search routing hints injected by the search path
+    # (_inject_search_hints / search_items) that must never appear in the
+    # serialized STAC item.  They are read by the caller before this function
+    # is invoked and are not part of the STAC item's authored properties.
+    properties.pop("_catalog_id", None)
+    properties.pop("_collection_id", None)
 
     # Resolve i18n dicts in properties down to a single string for the
     # requested language. Internal storage keeps Internationalized fields
