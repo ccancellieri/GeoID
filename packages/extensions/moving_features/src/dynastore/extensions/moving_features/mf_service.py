@@ -25,18 +25,20 @@ Conforms to OGC API - Moving Features Part 1 (approved Feb 2026).
 """
 
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import FrozenSet, List, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncConnection
 from starlette import status
 
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
+from dynastore.extensions.web.decorators import expose_web_page, expose_static
 from dynastore.extensions.tools.db import get_async_connection
 from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.models.protocols import MovingFeaturesProtocol
@@ -100,6 +102,12 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
     def _register_routes(self) -> None:
         self.router.add_api_route("/", self.get_landing_page, methods=["GET"])
         self.router.add_api_route("/conformance", self.get_conformance, methods=["GET"])
+        self.router.add_api_route(
+            "/catalogs",
+            self.list_catalogs,
+            methods=["GET"],
+            summary="List catalogs available to the Moving Features service",
+        )
 
         col = "/catalogs/{catalog_id}/collections/{collection_id}"
 
@@ -169,6 +177,22 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
 
     async def get_conformance(self, request: Request):
         return await self.ogc_conformance_handler(request)
+
+    async def list_catalogs(
+        self,
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ) -> JSONResponse:
+        catalogs_svc = await self._get_catalogs_service()
+        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
+        return JSONResponse(
+            content={
+                "catalogs": [
+                    {"id": c.id, "title": getattr(c, "title", None)}
+                    for c in (catalogs or [])
+                ]
+            }
+        )
 
     # ------------------------------------------------------------------
     # Collection endpoints (delegate to DynaStore catalog)
@@ -373,3 +397,42 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         if not created:
             raise HTTPException(status_code=500, detail="Failed to create temporal geometry sequence.")
         return created
+
+    # ------------------------------------------------------------------
+    # Web page contribution (WebPageContributor / StaticAssetProvider)
+    # ------------------------------------------------------------------
+
+    def get_web_pages(self):
+        from dynastore.extensions.tools.web_collect import collect_web_pages
+        return collect_web_pages(self)
+
+    def get_static_assets(self):
+        from dynastore.extensions.tools.web_collect import collect_static_assets
+        return collect_static_assets(self)
+
+    @expose_static("movingfeatures")
+    def provide_static_files(self) -> list[str]:
+        """Exposes the internal static directory for the MovingFeatures browser."""
+        static_dir = os.path.join(os.path.dirname(__file__), "static")
+        files = []
+        for root, _, filenames in os.walk(static_dir):
+            for filename in filenames:
+                files.append(os.path.join(root, filename))
+        return files
+
+    @expose_web_page(
+        page_id="movingfeatures_browser",
+        title="Moving Features Browser",
+        icon="fa-route",
+        description="Browse moving features and their trajectories.",
+    )
+    async def provide_movingfeatures_browser(self, request: Request):
+        return await self._serve_page_template("movingfeatures_browser.html")
+
+    async def _serve_page_template(self, filename: str):
+        from dynastore._version import VERSION
+        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
+        if not os.path.exists(file_path):
+            return Response(content=f"Template {filename} not found", status_code=404)
+        with open(file_path, "r", encoding="utf-8") as f:
+            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")

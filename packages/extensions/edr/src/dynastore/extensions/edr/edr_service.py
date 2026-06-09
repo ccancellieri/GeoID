@@ -24,16 +24,18 @@ the position/area/cube query vocabulary on top.
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import FrozenSet, List, Optional, cast
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from dynastore.extensions.ogc_base import OGCServiceMixin, ogc_asset_href
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.extensions.tools.url import get_root_url
+from dynastore.extensions.web.decorators import expose_static, expose_web_page
 from dynastore.models.protocols import CatalogsProtocol
 
 from . import edr_models as em
@@ -142,6 +144,12 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             response_model=em.Conformance,
         )
         self.router.add_api_route(
+            "/catalogs",
+            self.list_catalogs,
+            methods=["GET"],
+            summary="List catalogs available to the EDR service",
+        )
+        self.router.add_api_route(
             "/catalogs/{catalog_id}/collections",
             self.list_collections,
             methods=["GET"],
@@ -197,6 +205,21 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
     # Collections
     # ------------------------------------------------------------------
+
+    async def list_catalogs(
+        self,
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ):
+        """List catalogs available to the EDR service (web-browser nav)."""
+        catalogs_svc = await self._get_catalogs_service()
+        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
+        return {
+            "catalogs": [
+                {"id": c.id, "title": getattr(c, "title", None)}
+                for c in (catalogs or [])
+            ]
+        }
 
     async def list_collections(
         self,
@@ -488,6 +511,45 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             status_code=404,
             detail=f"Location {location_id!r} not found.",
         )
+
+    # ------------------------------------------------------------------
+    # Web page contribution (WebPageContributor / StaticAssetProvider)
+    # ------------------------------------------------------------------
+
+    def get_web_pages(self):
+        from dynastore.extensions.tools.web_collect import collect_web_pages
+        return collect_web_pages(self)
+
+    def get_static_assets(self):
+        from dynastore.extensions.tools.web_collect import collect_static_assets
+        return collect_static_assets(self)
+
+    @expose_static("edr")
+    def provide_static_files(self) -> list:
+        """Exposes the internal static directory for the EDR browser."""
+        static_dir = os.path.join(os.path.dirname(__file__), "static")
+        files = []
+        for root, _, filenames in os.walk(static_dir):
+            for filename in filenames:
+                files.append(os.path.join(root, filename))
+        return files
+
+    @expose_web_page(
+        page_id="edr_browser",
+        title="EDR Browser",
+        icon="fa-magnifying-glass-location",
+        description="Query environmental data by position and time.",
+    )
+    async def provide_edr_browser(self, request: Request):
+        return await self._serve_page_template("edr_browser.html")
+
+    async def _serve_page_template(self, filename: str):
+        from dynastore._version import VERSION
+        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
+        if not os.path.exists(file_path):
+            return Response(content=f"Template {filename} not found", status_code=404)
+        with open(file_path, "r", encoding="utf-8") as f:
+            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     # ------------------------------------------------------------------
     # Internal item access helpers
