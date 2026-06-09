@@ -42,6 +42,7 @@ from dynastore.models.protocols.policies import (
     PermissionProtocol,
 )
 
+from dynastore.extensions.tools.catalog_readiness import require_catalog_ready
 from dynastore.extensions.tools.auth_guards import (
     ensure_privileged_role_assignment,
     security_context_from_request,
@@ -2719,8 +2720,16 @@ class AdminService(ExtensionProtocol):
         """
         from dynastore.modules.storage.presets import PresetTier
 
-        await _assert_catalog_exists(catalog_id)
+        # Resolve the preset first: an unknown name (404) or tier mismatch
+        # (409) is a permanent client error that shouldn't depend on catalog
+        # state. Then enforce readiness — a preset is a bundle of set_config
+        # calls that can create data, so it must not run against a still-
+        # provisioning or failed catalog (#1935). require_catalog_ready is a
+        # strict superset of the old existence check (404 missing + 409
+        # provisioning/failed/conflict) — the same SSOT guard STAC
+        # create-collection uses.
         preset = _resolve_preset_for_scope(preset_name, PresetTier.CATALOG)
+        await require_catalog_ready(catalog_id)
         return await _apply_preset_bundle(
             preset, {"catalog_id": catalog_id}, force=force
         )
@@ -2780,9 +2789,14 @@ class AdminService(ExtensionProtocol):
         preset)."""
         from dynastore.modules.storage.presets import PresetTier
 
-        await _assert_catalog_exists(catalog_id)
-        await _assert_collection_exists(catalog_id, collection_id)
+        # Resolve first (404/409 permanent client errors), then the same
+        # provisioning guard as the catalog tier (#1935): a collection preset
+        # can also create data, so reject it until the catalog is ready. The
+        # collection-existence check runs last — it only matters once the
+        # catalog is confirmed ready.
         preset = _resolve_preset_for_scope(preset_name, PresetTier.COLLECTION)
+        await require_catalog_ready(catalog_id)
+        await _assert_collection_exists(catalog_id, collection_id)
         return await _apply_preset_bundle(
             preset,
             {"catalog_id": catalog_id, "collection_id": collection_id},
