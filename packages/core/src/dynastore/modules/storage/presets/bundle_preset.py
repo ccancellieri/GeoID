@@ -52,6 +52,7 @@ from typing import Any, Awaitable, ClassVar, Dict, List, Tuple, Type, cast
 
 from pydantic import BaseModel
 
+from .examples import PresetExample
 from .preset import AppliedDescriptor, NoParams, PresetContext, PresetPlan, PresetPlanEntry
 from .protocol import PresetBundle, PresetTier
 
@@ -102,6 +103,7 @@ class BundlePreset:
     tier: ClassVar[PresetTier]
     catalog_scopable: ClassVar[bool] = False
     params_model: ClassVar[Type[BaseModel]] = NoParams
+    examples: ClassVar[Tuple[PresetExample, ...]] = ()
 
     # ------------------------------------------------------------------
     # Subclass contract

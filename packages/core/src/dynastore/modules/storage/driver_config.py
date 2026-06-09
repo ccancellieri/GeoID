@@ -1306,6 +1306,39 @@ class ItemsDuckdbDriverConfig(CollectionDriverConfig):
         description="Source column holding the native feature id (fid) used to "
                     "derive a stable geoid. Falls back to a content hash if unset.",
     )
+    # GeoParquet geometry column. Only used when format is ``geoparquet`` or ``gpq``.
+    # The column contains raw WKB bytes that the driver decodes to a DuckDB GEOMETRY
+    # via ST_GeomFromWKB before any spatial operation. Default follows the GeoParquet
+    # convention ("geometry"). Set this only when the file uses a non-standard column
+    # name such as "geom" or "wkb_geometry".
+    geometry_column: Mutable[Optional[str]] = Field(
+        default=None,
+        description=(
+            "Name of the WKB geometry column in GeoParquet files. Defaults to "
+            "\"geometry\" (the GeoParquet 1.x convention). Set only when the "
+            "file uses a non-standard name such as \"geom\". Ignored for all "
+            "other formats."
+        ),
+    )
+
+    @field_validator("path", "write_path")
+    @classmethod
+    def _reject_sql_breakout_chars(cls, v: Optional[str]) -> Optional[str]:
+        """Reject paths containing characters that could break out of the
+        single-quoted string literal the DuckDB driver interpolates them into.
+
+        ``path``/``write_path`` are operator-set (admin configs / preset apply),
+        but they reach the SQL string via ``read_parquet('{path}')`` /
+        ``ST_Read('{path}')`` etc., so a single quote, newline, or null byte
+        would be an injection vector. Legitimate local paths, cloud URIs
+        (``s3://``/``gs://``/``https://``), and glob patterns never contain them.
+        """
+        if v is not None and any(ch in v for ch in ("'", "\n", "\r", "\x00")):
+            raise ValueError(
+                "path must not contain single-quotes, newlines, or null bytes "
+                "(they are interpolated into a DuckDB query)."
+            )
+        return v
 
 
 _ICEBERG_CONNECTION_FIELDS: frozenset[str] = frozenset({

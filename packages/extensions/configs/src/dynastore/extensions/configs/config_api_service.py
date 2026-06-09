@@ -331,53 +331,25 @@ class ConfigApiService:
     def _extract_docs(model_cls: Type[PluginConfig]) -> Dict[str, str]:
         """Extract ``{field_name: description}`` from a Pydantic class's JSON schema.
 
-        Lightweight alternative to attaching the full ``model_json_schema()``:
-        each class declares ``Field(..., description=...)`` per field; this
-        helper strips out just the description map. Cached per class since
-        the schema is static.
+        Delegates to :func:`dynastore.models.model_docs.extract_field_docs`.
+        The ``lru_cache`` on this method is kept so existing callers that
+        invoke ``ConfigApiService._extract_docs.cache_clear()`` continue to work.
         """
-        try:
-            schema = model_cls.model_json_schema()
-        except Exception:
-            return {}
-        props = schema.get("properties", {})
-        out: Dict[str, str] = {}
-        for name, spec in props.items():
-            if not isinstance(spec, dict):
-                continue
-            desc = spec.get("description")
-            if isinstance(desc, str) and desc:
-                out[name] = desc
-        return out
+        from dynastore.models.model_docs import extract_field_docs
+        return extract_field_docs(model_cls)
 
     @staticmethod
     @functools.lru_cache(maxsize=256)
     def _extract_mutability(model_cls: Type[PluginConfig]) -> Dict[str, str]:
         """Return ``{field_name: kind}`` for a PluginConfig class.
 
-        Delegates to the Protocol-based introspection API
-        (``MutabilityIntrospectionProtocol.mutability_map``) so the
-        renderer stays decoupled from the concrete ``PluginConfig`` —
-        any class that implements the Protocol surface works.
+        Delegates to :func:`dynastore.models.model_docs.extract_mutability`.
+        The ``lru_cache`` on this method is kept so existing callers that
+        invoke ``ConfigApiService._extract_mutability.cache_clear()`` continue
+        to work.
         """
-        from dynastore.models.mutability import (
-            MutabilityIntrospectionProtocol,
-            mutability_map,
-        )
-        if isinstance(model_cls, type) and issubclass(
-            model_cls, MutabilityIntrospectionProtocol  # type: ignore[arg-type]
-        ):
-            try:
-                return dict(model_cls.mutability_map())
-            except Exception:
-                pass
-        # Fallback: the standalone helper handles any class with
-        # Pydantic ``model_fields`` even if it doesn't formally implement
-        # the Protocol.
-        try:
-            return mutability_map(model_cls)
-        except Exception:
-            return {}
+        from dynastore.models.model_docs import extract_mutability
+        return extract_mutability(model_cls)
 
     @staticmethod
     def _physical_projection(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:

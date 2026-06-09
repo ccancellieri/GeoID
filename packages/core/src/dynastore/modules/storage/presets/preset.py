@@ -48,6 +48,7 @@ from typing import (
 
 from pydantic import BaseModel
 
+from .examples import PresetExample
 from .protocol import PresetTier
 
 
@@ -294,6 +295,7 @@ class CompositePreset:
     tier: ClassVar[PresetTier]
     catalog_scopable: ClassVar[bool] = False
     params_model: ClassVar[Type[BaseModel]] = NoParams
+    examples: ClassVar[Tuple[PresetExample, ...]] = ()
     compose: ClassVar[Tuple[str, ...]]
 
     async def dry_run(

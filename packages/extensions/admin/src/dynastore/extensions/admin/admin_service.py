@@ -2632,21 +2632,93 @@ class AdminService(ExtensionProtocol):
             next_cursor=next_cursor,
         )
 
+    @router.get(
+        "/presets/{preset_name}/describe",
+        summary="Rich self-documenting descriptor for a single preset",
+    )
+    async def get_preset_describe(
+        request: Request,  # type: ignore[reportGeneralTypeIssues]
+        preset_name: str,
+        format: str = Query(
+            "json",
+            description="Response format: json | md | html",
+        ),
+    ):
+        """Return a rich descriptor for *preset_name* with field docs and
+        worked examples whose resulting config is computed live (no DB).
+
+        ``format=json``  → ``application/json``
+        ``format=md``    → ``text/markdown``
+        ``format=html``  → ``text/html``
+        """
+        from fastapi.responses import HTMLResponse, Response
+
+        from dynastore.modules.storage.presets import get_preset
+        from dynastore.modules.storage.presets.describe import (
+            describe_preset,
+            descriptor_to_html,
+            descriptor_to_markdown,
+        )
+
+        try:
+            preset = get_preset(preset_name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        descriptor = describe_preset(preset, mode="field")
+
+        if format == "md":
+            return Response(
+                content=descriptor_to_markdown(descriptor),
+                media_type="text/markdown",
+            )
+        if format == "html":
+            return HTMLResponse(content=descriptor_to_html(descriptor))
+
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=descriptor)
+
     @router.get("/presets/{preset_name}", summary="Get a single preset definition")
     async def get_preset_detail(
         request: Request,  # type: ignore[reportGeneralTypeIssues]
         preset_name: str,
+        meta: str = Query(
+            "none",
+            description=(
+                "Include field metadata in the response. "
+                "Accepted values: none (default) | field | schema"
+            ),
+        ),
     ):
         from dynastore.modules.storage.presets import get_preset, search_presets
 
         try:
-            get_preset(preset_name)
+            preset = get_preset(preset_name)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         result = search_presets(name=preset_name, limit=1)
         items = result.get("items", [])
-        return items[0] if items else {}
+        payload: dict = items[0] if items else {}
+
+        if meta != "none" and payload:
+            from dynastore.models.model_docs import build_meta_block
+            from dynastore.modules.storage.presets.describe import _tier_value
+            from dynastore.modules.storage.presets.preset import NoParams
+
+            pm = getattr(preset, "params_model", None)
+            has_real_params = (
+                pm is not None
+                and pm is not NoParams
+                and hasattr(pm, "model_fields")
+            )
+            tier_str = _tier_value(preset) or None
+            # Only attach _meta when the preset has a documentable params model;
+            # a no-params preset gets no _meta envelope (rather than an empty {}).
+            if has_real_params:
+                payload["_meta"] = build_meta_block(pm, tier=tier_str, mode=meta)
+
+        return payload
 
     # ----- Platform tier: /admin/presets/{name} -----------------------------
 

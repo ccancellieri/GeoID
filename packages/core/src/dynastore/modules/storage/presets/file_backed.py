@@ -43,9 +43,9 @@ Parameters:
 from __future__ import annotations
 
 import logging
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Tuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dynastore.modules.storage.driver_config import (
     ItemsDuckdbDriverConfig,
@@ -61,6 +61,7 @@ from dynastore.modules.storage.routing_config import (
 )
 
 from .bundle_preset import BundlePreset, _scope_to_kwargs
+from .examples import PresetExample
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 logger = logging.getLogger(__name__)
@@ -69,12 +70,88 @@ logger = logging.getLogger(__name__)
 class FileBackedPresetParams(BaseModel):
     """Parameters for the ``file_backed`` preset."""
 
-    asset_id: Optional[str] = None
-    path: Optional[str] = None
-    format: str = "parquet"
-    id_column: Optional[str] = None
-    discoverable: bool = True
-    simplify_geometry: bool = True
+    asset_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Catalog asset identifier to bind the collection to. The driver resolves "
+            "the asset's storage URI at runtime via the assets service. Preferred over "
+            "``path`` when both are given. Either ``asset_id`` or ``path`` must be set."
+        ),
+        examples=["admin-boundaries-gpkg", "my-parquet-export"],
+    )
+    path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Direct read path when not binding a catalog asset. Accepts local file "
+            "paths, cloud URIs (``s3://``, ``gs://``, ``https://``), and DuckDB glob "
+            "patterns (e.g. ``s3://bucket/prefix/*.parquet``). Either ``path`` or "
+            "``asset_id`` must be set."
+        ),
+        examples=[
+            "/data/world-borders.gpkg",
+            "s3://my-bucket/exports/places/*.parquet",
+            "https://example.com/data.parquet",
+        ],
+    )
+    format: str = Field(
+        default="parquet",
+        description=(
+            "File format of the source data. Supported values:\n"
+            "- ``parquet`` — tabular Parquet (no geometry decode).\n"
+            "- ``geoparquet`` / ``gpq`` — cloud-native GeoParquet; geometry WKB column "
+            "is decoded to a DuckDB GEOMETRY automatically.\n"
+            "- ``gpkg`` / ``geopackage`` — GeoPackage (GDAL via ST_Read).\n"
+            "- ``shp`` / ``shapefile`` — ESRI Shapefile (GDAL via ST_Read).\n"
+            "- ``geojson`` — GeoJSON file (GDAL via ST_Read).\n"
+            "- ``fgb`` / ``flatgeobuf`` — FlatGeobuf (GDAL via ST_Read).\n"
+            "- ``csv`` — comma-separated values (no geometry).\n"
+            "- ``json`` / ``ndjson`` — JSON or newline-delimited JSON."
+        ),
+        examples=["geoparquet", "gpkg", "parquet", "geojson"],
+    )
+    id_column: Optional[str] = Field(
+        default=None,
+        description=(
+            "Source column whose value is used to derive a stable, deterministic geoid "
+            "for each feature. When unset, a content hash of the full row is used as the "
+            "fid — reproducible for the same data but sensitive to row additions and "
+            "reordering. Set this to a natural-key column (e.g. ``id``, ``fid``, "
+            "``placekey``) for stable, human-traceable identifiers."
+        ),
+        examples=["id", "fid", "placekey", "osm_id"],
+    )
+    discoverable: bool = Field(
+        default=True,
+        description=(
+            "Whether to index simplified features into the global Elasticsearch search "
+            "index and expose them via the SEARCH operation. When ``True`` (the default), "
+            "the preset wires a secondary async ES indexer and triggers an initial "
+            "file→ES reindex on apply. When ``False``, the collection is read-only and "
+            "only reachable via direct item requests using the DuckDB driver."
+        ),
+        examples=[True, False],
+    )
+    simplify_geometry: bool = Field(
+        default=True,
+        description=(
+            "Simplify geometry before writing to the Elasticsearch index. Reduces index "
+            "size and improves global-search performance at the cost of spatial precision "
+            "in search results. The file driver always returns the original exact geometry "
+            "for GEOMETRY_EXACT reads regardless of this setting. Ignored when "
+            "``discoverable`` is ``False``."
+        ),
+        examples=[True, False],
+    )
+    geometry_column: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the WKB geometry column for GeoParquet files (format ``geoparquet`` "
+            "or ``gpq`` only). Defaults to ``geometry`` per the GeoParquet 1.x "
+            "specification. Override only when the file uses a non-standard column name "
+            "such as ``geom`` or ``wkb_geometry``. Ignored for all other formats."
+        ),
+        examples=["geometry", "geom", "wkb_geometry"],
+    )
 
 
 def _file_backed_routing(params: FileBackedPresetParams) -> ItemsRoutingConfig:
@@ -128,6 +205,49 @@ class FileBackedPreset(BundlePreset):
         "while the file remains the source of truth for exact geometry."
     )
 
+    examples: ClassVar[Tuple[PresetExample, ...]] = (
+        PresetExample(
+            name="remote-geoparquet-https",
+            summary=(
+                "Read the OGC GeoParquet example file directly over HTTPS "
+                "(read-only, exact geometry, no global discovery)."
+            ),
+            params={
+                "path": "https://github.com/opengeospatial/geoparquet/raw/refs/heads/main/examples/example.parquet",
+                "format": "geoparquet",
+                "discoverable": False,
+            },
+        ),
+        PresetExample(
+            name="cloud-geoparquet-folder-discoverable",
+            summary=(
+                "Read a folder/glob of GeoParquet partitions from cloud object storage, "
+                "derive geoids from ``id``, and index simplified features into the global "
+                "search index."
+            ),
+            params={
+                "path": "s3://overturemaps-us-west-2/release/2024-09-18.0/theme=places/type=place/*.parquet",
+                "format": "geoparquet",
+                "id_column": "id",
+                "discoverable": True,
+                "simplify_geometry": True,
+            },
+        ),
+        PresetExample(
+            name="geopackage-asset",
+            summary=(
+                "Bind a catalog GeoPackage asset and read it via GDAL, "
+                "deriving geoids from ``fid``."
+            ),
+            params={
+                "asset_id": "admin-boundaries-gpkg",
+                "format": "gpkg",
+                "id_column": "fid",
+                "discoverable": True,
+            },
+        ),
+    )
+
     def _build_bundle(self, params: BaseModel, scope_kwargs) -> PresetBundle:  # type: ignore[override]
         p = params if isinstance(params, FileBackedPresetParams) else \
             FileBackedPresetParams.model_validate(params.model_dump())
@@ -141,6 +261,7 @@ class FileBackedPreset(BundlePreset):
                     path=p.path,
                     format=p.format,
                     id_column=p.id_column,
+                    geometry_column=p.geometry_column,
                 ),
                 rollback_priority=10,
             ),

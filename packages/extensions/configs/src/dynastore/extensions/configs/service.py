@@ -377,15 +377,15 @@ class ConfigsService(ExtensionProtocol):
     def _strip_response_envelopes(body: Dict[str, Any]) -> Dict[str, Any]:
         """Drop ``_meta`` / ``_links`` from a per-plugin PUT body (#946).
 
+        Delegates to :func:`dynastore.models.model_docs.strip_meta_envelopes`.
         Composed GETs may emit ``_meta`` and routing refs may emit ``_links``
         depending on the query knobs.  ``PersistentModel`` has
         ``extra="forbid"`` (#918), so a payload pulled from GET and PUT
         verbatim would 422 on the envelope keys.  Defensive strip preserves
         the round-trip semantic operators reasonably expect.
         """
-        if not isinstance(body, dict):
-            return body
-        return {k: v for k, v in body.items() if k not in ("_meta", "_links")}
+        from dynastore.models.model_docs import strip_meta_envelopes
+        return strip_meta_envelopes(body)
 
     @staticmethod
     def _gate_engine_writes_in_patch_body(

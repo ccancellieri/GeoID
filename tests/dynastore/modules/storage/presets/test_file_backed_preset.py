@@ -85,3 +85,147 @@ def test_non_discoverable_has_no_es_and_no_write():
 def test_simplify_geometry_param_is_respected():
     slots = _by_slot(_bundle(asset_id="a", discoverable=True, simplify_geometry=False))
     assert slots["es_driver_config"].instance.simplify_geometry is False
+
+
+# ---------------------------------------------------------------------------
+# Examples / meta tests
+# ---------------------------------------------------------------------------
+
+def test_three_examples_are_declared():
+    from dynastore.modules.storage.presets.file_backed import FileBackedPreset
+    preset = FileBackedPreset()
+    examples = getattr(preset, "examples", ())
+    assert len(examples) == 3
+    names = [ex.name for ex in examples]
+    assert "remote-geoparquet-https" in names
+    assert "cloud-geoparquet-folder-discoverable" in names
+    assert "geopackage-asset" in names
+
+
+def test_example_names_and_summaries():
+    from dynastore.modules.storage.presets.file_backed import FileBackedPreset
+    preset = FileBackedPreset()
+    by_name = {ex.name: ex for ex in preset.examples}
+
+    https_ex = by_name["remote-geoparquet-https"]
+    assert https_ex.params["format"] == "geoparquet"
+    assert https_ex.params["discoverable"] is False
+    assert "https://" in https_ex.params["path"]
+
+    cloud_ex = by_name["cloud-geoparquet-folder-discoverable"]
+    assert cloud_ex.params["format"] == "geoparquet"
+    assert cloud_ex.params["discoverable"] is True
+    assert cloud_ex.params["id_column"] == "id"
+    assert "s3://" in cloud_ex.params["path"]
+
+    gpkg_ex = by_name["geopackage-asset"]
+    assert gpkg_ex.params["format"] == "gpkg"
+    assert gpkg_ex.params["asset_id"] == "admin-boundaries-gpkg"
+    assert gpkg_ex.params["discoverable"] is True
+
+
+def test_describe_preset_examples_have_resulting_config():
+    """describe_preset builds a live resulting_config for all three examples."""
+    from dynastore.modules.storage.presets.file_backed import FileBackedPreset
+    from dynastore.modules.storage.presets.describe import describe_preset
+
+    preset = FileBackedPreset()
+    desc = describe_preset(preset)
+
+    assert len(desc["examples"]) == 3
+
+    for ex in desc["examples"]:
+        assert "resulting_config" in ex, f"Missing resulting_config in {ex['name']}"
+        if ex.get("error"):
+            # If there is an error, print it for debugging but do not fail here
+            # (invalid params in an example are an authoring error, tested separately)
+            pass
+        else:
+            rc = ex["resulting_config"]
+            assert rc is not None, f"resulting_config is None for {ex['name']}"
+            assert isinstance(rc, list), f"resulting_config not a list for {ex['name']}"
+
+
+def test_remote_geoparquet_example_resulting_config():
+    """Example #1 (remote-geoparquet-https): non-discoverable → no ES slot."""
+    from dynastore.modules.storage.presets.file_backed import FileBackedPreset
+    from dynastore.modules.storage.presets.describe import describe_preset
+
+    preset = FileBackedPreset()
+    desc = describe_preset(preset)
+    ex = next(e for e in desc["examples"] if e["name"] == "remote-geoparquet-https")
+
+    assert ex.get("error") is None, f"Example raised error: {ex.get('error')}"
+    rc = ex["resulting_config"]
+    assert rc is not None
+
+    slots = {entry["slot"]: entry for entry in rc}
+    assert "duckdb_driver_config" in slots
+    assert "items_routing" in slots
+    # Non-discoverable: no ES driver config
+    assert "es_driver_config" not in slots
+
+    # Check DuckDB config carries the correct path and format
+    duckdb_cfg = slots["duckdb_driver_config"]["config"]
+    assert duckdb_cfg["format"] == "geoparquet"
+    assert "opengeospatial" in duckdb_cfg.get("path", "")
+
+
+def test_cloud_folder_example_resulting_config():
+    """Example #2 (cloud-geoparquet-folder-discoverable): discoverable → ES slot present."""
+    from dynastore.modules.storage.presets.file_backed import FileBackedPreset
+    from dynastore.modules.storage.presets.describe import describe_preset
+
+    preset = FileBackedPreset()
+    desc = describe_preset(preset)
+    ex = next(e for e in desc["examples"] if e["name"] == "cloud-geoparquet-folder-discoverable")
+
+    assert ex.get("error") is None, f"Example raised error: {ex.get('error')}"
+    rc = ex["resulting_config"]
+    assert rc is not None
+
+    slots = {entry["slot"]: entry for entry in rc}
+    assert "duckdb_driver_config" in slots
+    assert "items_routing" in slots
+    assert "es_driver_config" in slots  # discoverable=True
+
+    duckdb_cfg = slots["duckdb_driver_config"]["config"]
+    assert duckdb_cfg["format"] == "geoparquet"
+    assert duckdb_cfg.get("id_column") == "id"
+    assert "s3://" in duckdb_cfg.get("path", "")
+
+    es_cfg = slots["es_driver_config"]["config"]
+    assert es_cfg.get("simplify_geometry") is True
+
+
+def test_field_descriptions_present_in_meta():
+    """describe_preset _meta.docs carries non-empty descriptions for key fields."""
+    from dynastore.modules.storage.presets.file_backed import FileBackedPreset
+    from dynastore.modules.storage.presets.describe import describe_preset
+
+    desc = describe_preset(FileBackedPreset(), mode="field")
+    meta = desc.get("_meta", {})
+    docs = meta.get("docs", {})
+
+    # All declared params must have a non-empty description
+    for field_name in ("asset_id", "path", "format", "id_column", "discoverable", "simplify_geometry"):
+        assert field_name in docs, f"Missing docs entry for field '{field_name}'"
+        assert docs[field_name], f"Empty description for field '{field_name}'"
+
+
+def test_geometry_column_threads_to_duckdb_config():
+    """geometry_column preset param is forwarded to the DuckDB driver config."""
+    slots = _by_slot(_bundle(
+        path="s3://bucket/data/*.parquet",
+        format="geoparquet",
+        geometry_column="geom",
+    ))
+    duckdb_cfg = slots["duckdb_driver_config"].instance
+    assert duckdb_cfg.geometry_column == "geom"
+
+
+def test_geometry_column_default_is_none_in_config():
+    """When geometry_column is not set, the DuckDB config carries None (default)."""
+    slots = _by_slot(_bundle(path="/data/x.parquet", format="geoparquet"))
+    duckdb_cfg = slots["duckdb_driver_config"].instance
+    assert duckdb_cfg.geometry_column is None

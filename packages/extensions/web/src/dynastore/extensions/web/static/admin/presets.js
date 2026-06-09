@@ -236,7 +236,11 @@ async function selectPreset(name) {
     const detail = await getJSON(`/admin/presets/${encodeURIComponent(name)}`);
     state.selectedPreset = detail;
     renderDetail(detail);
-    await refreshAppliedHistory();
+    // Fetch docs in parallel with history — errors are swallowed inside.
+    await Promise.all([
+      refreshAppliedHistory(),
+      fetchAndRenderDocs(name),
+    ]);
   } catch (e) {
     setStatus($("#detail-action-status"), `Failed to load preset: ${e.message}`, "error");
   }
@@ -304,13 +308,276 @@ function renderDetail(detail) {
   // Rollback is enabled only after we check applied history (done after init).
   $("#btn-rollback").disabled = true;
 
-  // Hide previous dry-run result
+  // Hide previous dry-run result and docs panel (refreshed async below).
   $("#dry-run-result").style.display = "none";
+  $("#preset-docs-panel").style.display = "none";
 }
 
 function renderParamsFallback(schema) {
   const pre = $("#detail-params-json");
   pre.textContent = JSON.stringify(schema, null, 2);
+}
+
+// ---------------------------------------------------------------- docs panel
+
+/**
+ * Fetch GET /admin/presets/{name}/describe?format=json and render the
+ * How-to / Docs panel. Silently hides the panel on failure so it never
+ * breaks the primary detail view.
+ */
+async function fetchAndRenderDocs(name) {
+  const panel = $("#preset-docs-panel");
+  const body = $("#preset-docs-body");
+  clear(body);
+  panel.style.display = "none";
+
+  try {
+    const docs = await getJSON(
+      `/admin/presets/${encodeURIComponent(name)}/describe?format=json`,
+    );
+    renderDocsPanel(docs);
+  } catch (_e) {
+    // Docs endpoint is best-effort — do not surface errors here.
+  }
+}
+
+/**
+ * Render the docs payload into #preset-docs-panel / #preset-docs-body.
+ * Uses .ci-docs definition-list style that already exists in admin.css.
+ */
+function renderDocsPanel(docs) {
+  const panel = $("#preset-docs-panel");
+  const body = $("#preset-docs-body");
+  clear(body);
+
+  // Description block.
+  if (docs.description) {
+    const descP = document.createElement("p");
+    descP.className = "hint";
+    descP.textContent = docs.description;
+    body.appendChild(descP);
+  }
+
+  // Tier + keywords summary row.
+  const metaRow = document.createElement("div");
+  metaRow.className = "form-row";
+
+  if (docs.tier) {
+    const tierDiv = document.createElement("div");
+    const tierLabel = document.createElement("span");
+    tierLabel.className = "kv-label";
+    tierLabel.textContent = "Tier";
+    const tierChip = document.createElement("span");
+    tierChip.className = "chip";
+    tierChip.textContent = docs.tier;
+    tierDiv.appendChild(tierLabel);
+    tierDiv.appendChild(tierChip);
+    metaRow.appendChild(tierDiv);
+  }
+
+  if (docs.keywords && docs.keywords.length) {
+    const kwDiv = document.createElement("div");
+    const kwLabel = document.createElement("span");
+    kwLabel.className = "kv-label";
+    kwLabel.textContent = "Keywords";
+    kwDiv.appendChild(kwLabel);
+    for (const kw of docs.keywords) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.textContent = kw;
+      kwDiv.appendChild(chip);
+    }
+    metaRow.appendChild(kwDiv);
+  }
+
+  if (metaRow.firstChild) body.appendChild(metaRow);
+
+  // Parameters section — definition list.
+  const paramDocs = buildParamDocs(docs);
+  if (paramDocs) {
+    const h5 = document.createElement("h5");
+    h5.className = "ci-subhead";
+    h5.textContent = "Parameters";
+    body.appendChild(h5);
+    body.appendChild(paramDocs);
+  }
+
+  // Examples section.
+  if (docs.examples && docs.examples.length) {
+    const h5 = document.createElement("h5");
+    h5.className = "ci-subhead";
+    h5.textContent = "Examples";
+    body.appendChild(h5);
+
+    for (const ex of docs.examples) {
+      body.appendChild(buildExampleBlock(docs, ex));
+    }
+  }
+
+  panel.style.display = "";
+}
+
+/**
+ * Build a <dl class="ci-docs"> from _meta.docs (preferred) or
+ * params_schema property descriptions (fallback).
+ * Returns null when no parameter documentation is available.
+ */
+function buildParamDocs(docs) {
+  const metaDocs = docs._meta && docs._meta.docs;
+  const schemaProps = docs.params_schema && docs.params_schema.properties;
+
+  if (!metaDocs && !schemaProps) return null;
+
+  const dl = document.createElement("dl");
+  dl.className = "ci-docs";
+
+  // Collect field names: _meta.docs keys first, then schema keys for any
+  // fields not covered by _meta.docs.
+  const fields = new Set([
+    ...Object.keys(metaDocs || {}),
+    ...Object.keys(schemaProps || {}),
+  ]);
+
+  if (!fields.size) return null;
+
+  for (const field of fields) {
+    const description = (metaDocs && metaDocs[field])
+      || (schemaProps && schemaProps[field] && schemaProps[field].description)
+      || "";
+
+    const dt = document.createElement("dt");
+    dt.textContent = field;
+    dl.appendChild(dt);
+
+    const dd = document.createElement("dd");
+    dd.textContent = description || "—";
+
+    // Mutability badge from _meta.mutability if present.
+    const mutability = docs._meta && docs._meta.mutability && docs._meta.mutability[field];
+    if (mutability) {
+      const badge = document.createElement("span");
+      badge.className = "chip";
+      badge.textContent = mutability;
+      badge.style.marginLeft = "6px";
+      dd.appendChild(badge);
+    }
+
+    dl.appendChild(dd);
+  }
+
+  return dl;
+}
+
+/**
+ * Build one example block: summary + params JSON + collapsible
+ * resulting_config JSON + "Load example" button.
+ */
+function buildExampleBlock(docs, ex) {
+  const wrap = document.createElement("div");
+  wrap.className = "plate-note";
+  wrap.style.borderLeft = "3px solid var(--rule-hair)";
+  wrap.style.paddingLeft = "10px";
+  wrap.style.marginBottom = "12px";
+
+  // Summary line.
+  if (ex.name || ex.summary) {
+    const sumP = document.createElement("p");
+    sumP.className = "hint";
+    const strong = document.createElement("strong");
+    strong.textContent = ex.name || "";
+    sumP.appendChild(strong);
+    if (ex.name && ex.summary) {
+      sumP.appendChild(document.createTextNode(" — "));
+    }
+    if (ex.summary) {
+      sumP.appendChild(document.createTextNode(ex.summary));
+    }
+    wrap.appendChild(sumP);
+  }
+
+  // Params JSON block.
+  if (ex.params && Object.keys(ex.params).length > 0) {
+    const paramsLabel = document.createElement("div");
+    paramsLabel.className = "plate-meta";
+    paramsLabel.textContent = "params (preset payload)";
+    wrap.appendChild(paramsLabel);
+
+    const paramsPre = document.createElement("pre");
+    paramsPre.className = "hint";
+    paramsPre.textContent = JSON.stringify(ex.params, null, 2);
+    wrap.appendChild(paramsPre);
+  }
+
+  // Resulting config — collapsible via <details>.
+  if (ex.resulting_config != null) {
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.className = "hint";
+    summary.textContent = "Resulting configuration";
+    details.appendChild(summary);
+
+    const cfgPre = document.createElement("pre");
+    cfgPre.className = "hint";
+    cfgPre.textContent = JSON.stringify(ex.resulting_config, null, 2);
+    details.appendChild(cfgPre);
+    wrap.appendChild(details);
+  } else if (ex.error) {
+    const errP = document.createElement("p");
+    errP.className = "hint";
+    errP.dataset.level = "error";
+    errP.textContent = ex.error;
+    wrap.appendChild(errP);
+  }
+
+  // "Load example" button — populates the schema form.
+  const loadBtn = document.createElement("button");
+  loadBtn.type = "button";
+  loadBtn.className = "btn btn-secondary";
+  loadBtn.textContent = "Load example";
+  loadBtn.setAttribute("aria-label", `Load example${ex.name ? ": " + ex.name : ""}`);
+  loadBtn.addEventListener("click", () => loadExample(docs, ex.params || {}));
+  wrap.appendChild(loadBtn);
+
+  return wrap;
+}
+
+/**
+ * Populate the schema form with example params.
+ *
+ * Mechanism: re-mount the schema form with the example params as both
+ * `resolved` (shown as initial values) and `explicit` (so all fields are
+ * pre-filled), then replace state.paramsForm with the new handle. If the
+ * form was never mounted (no params_schema or unsupported schema), this is
+ * a no-op — the "Load example" button remains available but inactive.
+ */
+function loadExample(docs, params) {
+  const detail = state.selectedPreset;
+  if (!detail) return;
+
+  const schema = detail.params_schema;
+  if (!schema || typeof schema !== "object") return;
+  const hasProperties = schema.properties && Object.keys(schema.properties).length > 0;
+  if (!hasProperties) return;
+
+  const paramsSection = $("#detail-params-section");
+  const paramsFallback = $("#detail-params-fallback");
+
+  try {
+    const formContainer = $("#detail-params-form");
+    clear(formContainer);
+    state.paramsForm = mountSchemaForm(formContainer, {
+      schema,
+      resolved: params,
+      explicit: params,
+      allowInherit: false,
+      onDirty: () => {},
+    });
+    state.paramsSchemaSupported = true;
+    paramsSection.style.display = "";
+    paramsFallback.style.display = "none";
+  } catch (_e) {
+    // Schema-form could not render — leave the existing form untouched.
+  }
 }
 
 // ---------------------------------------------------------------- dry-run
