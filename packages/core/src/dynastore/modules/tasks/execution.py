@@ -662,15 +662,12 @@ class ExecutionEngine:
             raise ValueError(f"Job '{job_id}' not found.")
 
         if job.status != TaskStatusEnum.CREATED:
-            from fastapi import HTTPException
+            from dynastore.modules.tasks.exceptions import JobLockedError
 
-            raise HTTPException(
-                status_code=423,
-                detail=(
-                    f"Job '{job_id}' is locked "
-                    f"(status={job.status.value}). "
-                    f"Only CREATED jobs can be updated."
-                ),
+            raise JobLockedError(
+                f"Job '{job_id}' is locked "
+                f"(status={job.status.value}). "
+                f"Only CREATED jobs can be updated."
             )
 
         # Update the task's inputs via a status-preserving update that
@@ -710,15 +707,12 @@ class ExecutionEngine:
             raise ValueError(f"Job '{job_id}' not found.")
 
         if job.status != TaskStatusEnum.CREATED:
-            from fastapi import HTTPException
+            from dynastore.modules.tasks.exceptions import JobStateConflictError
 
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Job '{job_id}' cannot be started "
-                    f"(status={job.status.value}). "
-                    f"Only CREATED jobs can be started."
-                ),
+            raise JobStateConflictError(
+                f"Job '{job_id}' cannot be started "
+                f"(status={job.status.value}). "
+                f"Only CREATED jobs can be started."
             )
 
         # Transition to PENDING (OGC "accepted")
@@ -768,14 +762,11 @@ class ExecutionEngine:
             raise ValueError(f"Job '{job_id}' not found.")
 
         if job.status in _TERMINAL_STATUSES:
-            from fastapi import HTTPException
+            from dynastore.modules.tasks.exceptions import JobStateConflictError
 
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Job '{job_id}' is already terminal "
-                    f"(status={job.status.value})."
-                ),
+            raise JobStateConflictError(
+                f"Job '{job_id}' is already terminal "
+                f"(status={job.status.value})."
             )
 
         await tasks_mgr.update_task(

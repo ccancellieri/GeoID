@@ -398,6 +398,43 @@ class AssetSidecarRejectedExceptionHandler(ExceptionHandler):
         )
 
 
+class JobLockedExceptionHandler(ExceptionHandler):
+    """Maps ``JobLockedError`` to HTTP 423 Locked.
+
+    Raised by ``ExecutionEngine.update_job`` when the job has already
+    left the CREATED state and its inputs can no longer be changed.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.tasks.exceptions import JobLockedError
+
+        return isinstance(exception, JobLockedError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(status_code=423, detail=str(exception))
+
+
+class JobStateConflictExceptionHandler(ExceptionHandler):
+    """Maps ``JobStateConflictError`` to HTTP 409 Conflict.
+
+    Raised by ``ExecutionEngine.start_job`` and ``ExecutionEngine.dismiss_job``
+    when the job's current status does not permit the requested transition
+    (e.g. starting an already-running job or dismissing a terminal one).
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.tasks.exceptions import JobStateConflictError
+
+        return isinstance(exception, JobStateConflictError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(status_code=409, detail=str(exception))
+
+
 class ImmutableConfigExceptionHandler(ExceptionHandler):
     """Handles immutable configuration modification attempts."""
 
@@ -502,6 +539,11 @@ class ExceptionHandlerRegistry:
         # ProblemException carries an explicit RFC 9457 status — must run
         # first so its 4xx isn't shadowed by a more generic handler downstream.
         self.register(ProblemExceptionHandler())
+        # Tasks domain: job-state transitions (423 Locked, 409 Conflict) must
+        # run before the generic ConflictExceptionHandler so their distinct
+        # status codes are preserved.
+        self.register(JobLockedExceptionHandler())
+        self.register(JobStateConflictExceptionHandler())
         self.register(ConflictExceptionHandler())
         self.register(ConstraintViolationExceptionHandler())
         self.register(UnknownFieldsExceptionHandler())
