@@ -30,7 +30,7 @@ both APIs return the same row.
 from typing import Protocol, Optional, Any, Dict, Type, TypeVar, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dynastore.modules.db_config.plugin_config import PluginConfig
+    from dynastore.models.plugin_config import PluginConfig
     from dynastore.models.driver_context import DriverContext
 
 _T_Config = TypeVar("_T_Config", bound="PluginConfig")

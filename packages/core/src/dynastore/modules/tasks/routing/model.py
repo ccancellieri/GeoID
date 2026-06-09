@@ -40,7 +40,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 from pydantic import BaseModel, Field, model_validator
 
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.tasks.routing.exec_hints import ExecHint
 
 

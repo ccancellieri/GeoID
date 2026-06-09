@@ -44,7 +44,7 @@ from typing import ClassVar, Optional, Tuple
 from pydantic import Field
 
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 
 
 class StacStorageBackend(str, Enum):

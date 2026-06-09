@@ -35,7 +35,7 @@ entry points hit the failure:
 
 The fix (#686) extracted the markers into the dependency-light leaf
 ``dynastore.models.mutability`` and ``PluginConfig`` into
-``dynastore.modules.db_config.plugin_config``.  ``authorization.py`` /
+``dynastore.models.plugin_config``.  ``authorization.py`` /
 ``exposure_mixin.py`` / ``tasks_config.py`` now import from those leaves,
 so subclassing ``PluginConfig`` no longer drags the protocols hub into a
 half-initialised config stack.  ``platform_config_service`` re-exports

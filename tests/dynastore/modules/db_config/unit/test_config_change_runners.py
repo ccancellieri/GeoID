@@ -45,7 +45,7 @@ from dynastore.modules.db_config.exceptions import (
     ConfigValidationError,
     ImmutableConfigError,
 )
-from dynastore.modules.db_config.plugin_config import PluginConfig, _APPLY_HANDLERS, _VALIDATE_HANDLERS
+from dynastore.models.plugin_config import PluginConfig, _APPLY_HANDLERS, _VALIDATE_HANDLERS
 from dynastore.modules.db_config.platform_config_service import run_apply_handlers, run_validate_handlers
 
 

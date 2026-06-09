@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Optional, Tuple
 
-from dynastore.modules.db_config.plugin_config import PluginConfig, _APPLY_HANDLERS, _VALIDATE_HANDLERS
+from dynastore.models.plugin_config import PluginConfig, _APPLY_HANDLERS, _VALIDATE_HANDLERS
 
 
 # Module-level concrete subclasses so Pydantic's metaclass picks up the

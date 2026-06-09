@@ -55,7 +55,7 @@ def test_class_key_is_idp_config() -> None:
 
 
 def test_registered_as_plugin_config() -> None:
-    from dynastore.modules.db_config.plugin_config import list_registered_configs
+    from dynastore.models.plugin_config import list_registered_configs
 
     reg = list_registered_configs()
     assert reg.get("idp_config") is IdpConfig

@@ -47,7 +47,7 @@ from typing import ClassVar, Optional, Tuple
 
 import pytest
 
-from dynastore.modules.db_config.plugin_config import PluginConfig, _APPLY_HANDLERS, list_registered_configs
+from dynastore.models.plugin_config import PluginConfig, _APPLY_HANDLERS, list_registered_configs
 
 
 def test_base_does_not_declare_on_apply():

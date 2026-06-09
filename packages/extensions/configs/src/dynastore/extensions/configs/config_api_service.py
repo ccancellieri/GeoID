@@ -51,7 +51,7 @@ from dynastore.extensions.configs.config_api_dto import (
     PlatformConfigResponse,
 )
 from dynastore.models.protocols import ConfigsProtocol
-from dynastore.modules.db_config.plugin_config import PluginConfig, list_registered_configs
+from dynastore.models.plugin_config import PluginConfig, list_registered_configs
 
 logger = logging.getLogger(__name__)
 

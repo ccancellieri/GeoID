@@ -24,7 +24,7 @@ from pydantic import (
     model_validator,
 )
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from typing import Any, ClassVar, List, Optional, Tuple
 from dynastore.modules.storage.hints import Hint
 

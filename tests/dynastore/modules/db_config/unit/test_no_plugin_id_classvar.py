@@ -36,7 +36,7 @@ def test_no_plugin_id_classvar():
     """No PluginConfig subclass may declare _plugin_id."""
     _load_all_modules()
     from dynastore.tools.typed_store.registry import TypedModelRegistry
-    from dynastore.modules.db_config.plugin_config import PluginConfig
+    from dynastore.models.plugin_config import PluginConfig
 
     offenders = [
         cls.__qualname__
@@ -61,7 +61,7 @@ def test_no_legacy_class_keys():
     """
     _load_all_modules()
     from dynastore.tools.typed_store.registry import TypedModelRegistry
-    from dynastore.modules.db_config.plugin_config import PluginConfig
+    from dynastore.models.plugin_config import PluginConfig
 
     bad = [
         cls.class_key()
@@ -75,7 +75,7 @@ def test_no_class_key_classvar_override():
     """No PluginConfig subclass may override _class_key — the class IS the identity."""
     _load_all_modules()
     from dynastore.tools.typed_store.registry import TypedModelRegistry
-    from dynastore.modules.db_config.plugin_config import PluginConfig
+    from dynastore.models.plugin_config import PluginConfig
 
     offenders = [
         cls.__qualname__
@@ -94,7 +94,7 @@ def test_no_records_in_class_key():
     """No class_key may contain 'Records' — drivers serve features/items, not OGC Records specifically."""
     _load_all_modules()
     from dynastore.tools.typed_store.registry import TypedModelRegistry
-    from dynastore.modules.db_config.plugin_config import PluginConfig
+    from dynastore.models.plugin_config import PluginConfig
 
     # Extension exposure configs are legitimately named after the extension they toggle.
     _EXEMPT = {"RecordsPluginConfig"}
@@ -124,7 +124,7 @@ def test_no_plugin_infix_in_config_class_key():
     """
     _load_all_modules()
     from dynastore.tools.typed_store.registry import TypedModelRegistry
-    from dynastore.modules.db_config.plugin_config import PluginConfig
+    from dynastore.models.plugin_config import PluginConfig
 
     # Base classes and modules not yet renamed — excluded from this guard.
     _ALLOWED = {
@@ -187,7 +187,7 @@ def test_driver_config_naming_convention():
     """
     _load_all_modules()
     from dynastore.tools.typed_store.registry import TypedModelRegistry
-    from dynastore.modules.db_config.plugin_config import PluginConfig
+    from dynastore.models.plugin_config import PluginConfig
     from dynastore.modules.storage.driver_config import (
         DriverPluginConfig,
         CollectionDriverConfig,

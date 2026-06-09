@@ -54,7 +54,7 @@ from dynastore.tools.ui_hints import ui
 
 from dynastore.models.protocols.typed_driver import _PluginDriverConfig
 from dynastore.models.mutability import Computed, Immutable, Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.storage.computed_fields import (
     _STATISTIC_STORAGE_KINDS,
     ComputedField,

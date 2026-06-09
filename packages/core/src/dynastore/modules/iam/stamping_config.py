@@ -18,7 +18,7 @@
 
 """Per-collection attribute-stamping policy config.
 
-:class:`AttributeStampingPolicy` is a :class:`~dynastore.modules.db_config.plugin_config.PluginConfig`
+:class:`AttributeStampingPolicy` is a :class:`~dynastore.models.plugin_config.PluginConfig`
 scoped to ``(catalog_id, collection_id)``.  When present it declares which
 Feature properties to lift onto the document's ``_attrs`` envelope at write
 time.  The ``_attrs`` envelope is then queried by the read-filter compiler to
@@ -49,7 +49,7 @@ from typing import Any, ClassVar, Dict, Mapping, Optional, Tuple
 from pydantic import Field
 
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 
 __all__ = ["AttributeStampingPolicy", "stamp_attrs_from_feature"]
 

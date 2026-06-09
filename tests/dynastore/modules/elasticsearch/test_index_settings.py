@@ -30,7 +30,7 @@ from typing import Optional, Type
 
 import pytest
 
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.elasticsearch.index_config import (
     ElasticsearchIndexConfig,
     get_assets_index_settings,

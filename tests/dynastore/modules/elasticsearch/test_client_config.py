@@ -33,7 +33,7 @@ from typing import Optional, Type
 
 import pytest
 
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.elasticsearch import client as es_client_mod
 from dynastore.modules.elasticsearch.client_config import (
     ElasticsearchClientConfig,

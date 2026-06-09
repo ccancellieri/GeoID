@@ -63,7 +63,7 @@ from dynastore.extensions.tools.exposure_mixin import (
     ExposableConfigMixin,
     find_dead_exposable_configs,
 )
-from dynastore.modules.db_config.plugin_config import list_registered_configs
+from dynastore.models.plugin_config import list_registered_configs
 
 
 # Test fixture, not framework state: the expected togglable extensions

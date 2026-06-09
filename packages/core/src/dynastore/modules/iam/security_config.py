@@ -27,7 +27,7 @@ Storage is fully pluggable — any PlatformConfigsProtocol implementation works.
 from typing import ClassVar, List, Tuple
 from pydantic import Field
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 
 class SecurityPluginConfig(PluginConfig):
     """Platform-level security configuration — changeable at runtime."""

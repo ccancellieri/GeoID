@@ -80,7 +80,7 @@ def find_dead_exposable_configs() -> list[tuple[type, str]]:
     """
     # Local import to avoid a registration-time cycle: this module is
     # imported by config files before the platform service is wired.
-    from dynastore.modules.db_config.plugin_config import list_registered_configs
+    from dynastore.models.plugin_config import list_registered_configs
 
     always_on, known = _get_dynamic_sets()
     dead: list[tuple[type, str]] = []

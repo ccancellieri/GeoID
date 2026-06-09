@@ -68,7 +68,7 @@ from dynastore.models.protocols import (
     StorageProtocol,
 )
 from dynastore.models.protocols.configs import ConfigsProtocol
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.gcp.tools.signed_urls import generate_gcs_signed_url
 from dynastore.modules.processes.models import Link, LocalizedText, StatusInfo
 from dynastore.modules.tasks.models import TaskStatusEnum

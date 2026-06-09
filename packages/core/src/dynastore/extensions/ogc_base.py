@@ -57,7 +57,7 @@ from dynastore.tools.discovery import get_protocol
 
 if TYPE_CHECKING:
     from dynastore.modules.catalog.catalog_config import CollectionKind
-    from dynastore.modules.db_config.plugin_config import PluginConfig
+    from dynastore.models.plugin_config import PluginConfig
 
 logger = logging.getLogger(__name__)
 

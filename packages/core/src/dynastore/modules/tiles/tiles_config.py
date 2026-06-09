@@ -19,7 +19,7 @@
 from typing import ClassVar, Dict, List, Optional, Tuple
 from pydantic import Field
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 from dynastore.tools.geospatial import SimplificationAlgorithm
 

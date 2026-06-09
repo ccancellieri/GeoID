@@ -57,7 +57,7 @@ from dynastore.models.protocols.indexer import (
     CollectionIndexer,
 )
 from dynastore.models.mutability import Immutable, Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.storage.hints import Hint
 from dynastore.tools.typed_store.base import _to_snake
 from dynastore.tools.ui_hints import ui
@@ -1170,7 +1170,7 @@ def _validate_routing_entries(
                 # this used PascalCase ``ClassName + "Config"`` which silently
                 # missed the registry — masked by the broad except below.
                 try:
-                    from dynastore.modules.db_config.plugin_config import resolve_config_class
+                    from dynastore.models.plugin_config import resolve_config_class
 
                     driver_config_key = _to_snake(type(driver).__name__ + "Config")
                     driver_cls = resolve_config_class(driver_config_key)

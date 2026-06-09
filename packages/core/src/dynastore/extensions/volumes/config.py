@@ -30,7 +30,7 @@ from pydantic import Field
 
 # Match the base-class import used by CoveragesConfig.
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 
 
 class VolumesConfig(PluginConfig):

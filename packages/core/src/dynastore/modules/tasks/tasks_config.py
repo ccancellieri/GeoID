@@ -21,7 +21,7 @@ import os
 from typing import ClassVar, Tuple
 from pydantic import Field, model_validator
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 
 class TasksPluginConfig(PluginConfig):
     """Configuration for the Background Tasks module."""

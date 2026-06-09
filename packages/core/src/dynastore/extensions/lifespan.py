@@ -48,7 +48,7 @@ from dynastore.extensions.tools.exposure_mixin import (
 )
 from dynastore.extensions.tools.exposure_openapi import install_filtered_openapi
 from dynastore.extensions.tools.exposure_route import make_exposure_dependency
-from dynastore.modules.db_config.plugin_config import list_registered_configs
+from dynastore.models.plugin_config import list_registered_configs
 from dynastore.models.protocols import ConfigsProtocol
 from dynastore.tools.discovery import get_protocol
 

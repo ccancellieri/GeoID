@@ -19,7 +19,7 @@
 from typing import ClassVar, Tuple
 
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 
 
 class ConnectedSystemsPluginConfig(ExposableConfigMixin, PluginConfig):

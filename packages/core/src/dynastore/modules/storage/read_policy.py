@@ -40,7 +40,7 @@ from pydantic import Field
 
 from dynastore.models.mutability import Mutable
 from dynastore.models.protocols.field_definition import FieldDefinition
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.storage.computed_fields import FeatureType
 
 _logger = logging.getLogger(__name__)

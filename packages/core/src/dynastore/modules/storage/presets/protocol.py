@@ -50,7 +50,7 @@ from typing import (
     cast,
 )
 
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.storage.routing_config import (
     AssetRoutingConfig,
     CatalogRoutingConfig,

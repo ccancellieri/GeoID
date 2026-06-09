@@ -297,7 +297,7 @@ def test_compose_collection_inherited_mirrors_configs_for_real_classes():
     ``inherited_from_catalog`` block (D.3 dropped it).
     """
     from dynastore.extensions.configs.config_api_service import ConfigApiService
-    from dynastore.modules.db_config.plugin_config import list_registered_configs
+    from dynastore.models.plugin_config import list_registered_configs
 
     # Use real registered classes — the registry is populated at import
     # time (extensions.features + modules.tiles imported above).

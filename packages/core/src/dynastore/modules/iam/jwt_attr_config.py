@@ -18,7 +18,7 @@
 
 """Platform-scope config for enriching Principal.attributes from validated JWT claims.
 
-:class:`JwtAttributeClaimsConfig` is a :class:`~dynastore.modules.db_config.plugin_config.PluginConfig`
+:class:`JwtAttributeClaimsConfig` is a :class:`~dynastore.models.plugin_config.PluginConfig`
 that maps Principal attribute keys to JWT claim names.  When populated, the
 IAM service merges those claim values into ``Principal.attributes`` after
 principal resolution, for every authenticated request.
@@ -43,7 +43,7 @@ from typing import ClassVar, Dict, List, Optional, Tuple
 from pydantic import Field, field_validator
 
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 
 __all__ = ["JwtAttributeClaimsConfig"]
 

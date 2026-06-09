@@ -27,7 +27,7 @@ operations) is handled by ``AssetRoutingConfig`` in
 
 from pydantic import ConfigDict
 
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from typing import ClassVar, Optional, Tuple
 
 class AssetPluginConfig(PluginConfig):

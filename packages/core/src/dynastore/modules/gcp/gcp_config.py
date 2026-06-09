@@ -19,7 +19,7 @@
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, ClassVar, Dict, List, Optional, TYPE_CHECKING, Tuple, Union
 from dynastore.models.mutability import Immutable, Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 import os
 if TYPE_CHECKING:

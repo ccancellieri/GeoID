@@ -19,7 +19,7 @@
 from typing import ClassVar, Tuple
 from pydantic import Field
 from dynastore.models.mutability import Mutable
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.storage.driver_config import WriteConflictPolicy
 
 # --- Main Ingestion Config ---

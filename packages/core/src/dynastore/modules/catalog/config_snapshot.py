@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Type
 
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.tools.typed_store.registry import TypedModelRegistry
 
 logger = logging.getLogger(__name__)

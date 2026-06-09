@@ -22,7 +22,7 @@ from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.catalog.config_service import (
     ConfigService,
 )
-from dynastore.modules.db_config.plugin_config import PluginConfig
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.db_config.platform_config_service import PlatformConfigService
 from dynastore.modules.tiles.tiles_config import TilesConfig
 from dynastore.models.driver_context import DriverContext

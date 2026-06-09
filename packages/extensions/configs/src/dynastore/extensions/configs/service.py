@@ -41,7 +41,7 @@ from dynastore.modules import get_protocol
 from dynastore.models.protocols import ConfigsProtocol
 from dynastore.models.protocols.collections import CollectionsProtocol
 from dynastore.modules.db_config.engine_config import EngineConfig
-from dynastore.modules.db_config.plugin_config import list_registered_configs, require_config_class, resolve_config_class
+from dynastore.models.plugin_config import list_registered_configs, require_config_class, resolve_config_class
 
 from .config_api_dto import PatchConfigBody
 from .config_api_service import ConfigApiService

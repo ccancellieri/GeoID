@@ -42,7 +42,7 @@ import pytest
 
 from dynastore.modules.cache import cache_module as cm
 from dynastore.modules.db_config.engine_config import ValkeyEngineConfig
-from dynastore.modules.db_config.plugin_config import (
+from dynastore.models.plugin_config import (
     PluginConfig,
     _APPLY_HANDLERS,
 )
