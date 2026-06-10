@@ -72,6 +72,12 @@ class CatalogListProvider(Protocol):
 
     priority: int
 
-    async def list_catalogs(
+    # Deliberately NOT named ``list_catalogs``: this protocol is
+    # runtime-checkable, so ``isinstance`` matches on attribute presence
+    # alone. A storage-layer ``CatalogsProtocol`` implementation also has a
+    # ``list_catalogs(limit, offset, ...)`` method and would satisfy the
+    # check, win the priority sort, and then be called with a ``Request``
+    # as ``limit``. The distinct name keeps structural matching unambiguous.
+    async def list_catalog_options(
         self, request: "Request", language: str = "en"
     ) -> List[CatalogOption]: ...

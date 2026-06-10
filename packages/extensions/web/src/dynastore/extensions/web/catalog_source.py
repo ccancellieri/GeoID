@@ -47,13 +47,13 @@ class DefaultCatalogListProvider:
     """Lists every catalog via the shared ``CatalogsProtocol``, localized.
 
     Structurally satisfies ``CatalogListProvider`` (``priority`` +
-    ``list_catalogs``); registered via ``register_plugin`` so
+    ``list_catalog_options``); registered via ``register_plugin`` so
     ``get_protocols(CatalogListProvider)`` discovers it.
     """
 
     priority: int = 100
 
-    async def list_catalogs(
+    async def list_catalog_options(
         self, request: "Request", language: str = "en"
     ) -> List[CatalogOption]:
         catalogs = get_protocol(CatalogsProtocol)

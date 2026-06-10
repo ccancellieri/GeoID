@@ -69,7 +69,7 @@ class IamCatalogListProvider:
 
     priority: int = 10
 
-    async def list_catalogs(
+    async def list_catalog_options(
         self, request: "Request", language: str = "en"
     ) -> List[CatalogOption]:
         catalogs = get_protocol(CatalogsProtocol)

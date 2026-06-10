@@ -1715,7 +1715,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             if not providers:
                 return {"catalogs": []}
             winner = providers[0]  # priority-sorted, is_available()-gated
-            options = await winner.list_catalogs(request, language)
+            options = await winner.list_catalog_options(request, language)
             return {
                 "catalogs": [{"id": o.id, "title": o.title} for o in options]
             }
