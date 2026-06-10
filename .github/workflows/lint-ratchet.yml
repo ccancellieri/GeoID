@@ -17,6 +17,7 @@ on:
     paths:
       - 'packages/**/*.py'
       - 'scripts/check_lint_ceilings.py'
+      - 'scripts/check_no_web_framework_in_core.py'
       - '.github/workflows/lint-ratchet.yml'
   workflow_dispatch:
 
@@ -42,3 +43,8 @@ jobs:
 
       - name: Check lint ceilings
         run: python scripts/check_lint_ceilings.py
+
+      # Hard zero-tolerance gate (not a ratchet): the framework-free core
+      # (modules/ + tasks/) must never import fastapi/starlette (#1969).
+      - name: Check core stays framework-free
+        run: python scripts/check_no_web_framework_in_core.py
