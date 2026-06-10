@@ -50,10 +50,10 @@ class WebModule(WebModuleProtocol, ModuleProtocol):
         # Registry for static content providers: { prefix: provider_callable }
         self.static_providers: Dict[str, Callable[[], List[str]]] = {}
 
-        # Metadata for static prefixes (owner, description) indexed by prefix.
-        # Populated alongside static_providers so the registry endpoint can
-        # return human-readable context without re-inspecting the callables.
-        self.static_prefix_meta: Dict[str, Dict[str, str]] = {}
+        # Metadata for static prefixes (owner, description, public) indexed by
+        # prefix. Populated alongside static_providers so the registry endpoint
+        # can return human-readable context without re-inspecting the callables.
+        self.static_prefix_meta: Dict[str, Dict[str, Any]] = {}
 
         # Documentation registry
         self.docs_registry: Dict[str, Dict[str, Any]] = {}
@@ -149,18 +149,25 @@ class WebModule(WebModuleProtocol, ModuleProtocol):
         provider: Any,
         owner: str = "",
         description: str = "",
+        public: bool = True,
     ) -> None:
         """Registers a static file provider.
 
         ``owner`` and ``description`` are optional human-readable metadata
         returned by the ``GET /web/config/static-prefixes`` registry endpoint.
+        ``public`` records whether anonymous users may read this prefix; the
+        web policy builder reads it when constructing the anonymous ALLOW list.
         """
         if prefix in self.static_providers:
             logger.warning(
                 f"WebModule: Overwriting static provider for prefix '{prefix}'"
             )
         self.static_providers[prefix] = provider
-        self.static_prefix_meta[prefix] = {"owner": owner, "description": description}
+        self.static_prefix_meta[prefix] = {
+            "owner": owner,
+            "description": description,
+            "public": public,
+        }
         logger.info(f"WebModule: Registered static provider for prefix '{prefix}'")
 
     async def is_static_file_provided(self, prefix: str, path: str) -> bool:
@@ -223,6 +230,7 @@ class WebModule(WebModuleProtocol, ModuleProtocol):
                         asset.files_provider,
                         owner=getattr(asset, "owner", "") or "",
                         description=getattr(asset, "description", "") or "",
+                        public=getattr(asset, "public", True),
                     )
             except Exception as e:
                 logger.error(
@@ -394,6 +402,17 @@ class WebModule(WebModuleProtocol, ModuleProtocol):
                 }
             )
         return result
+
+    def get_static_prefix_meta(self) -> Dict[str, Any]:
+        """Return the raw metadata dict keyed by prefix.
+
+        Each value contains at least ``owner``, ``description``, and
+        ``public`` (bool, defaults to True when absent for pre-existing
+        registrations). Used by the web policy builder to derive the
+        anonymous ALLOW list for prefixes that were registered after the
+        literal baseline was written.
+        """
+        return dict(self.static_prefix_meta)
 
     def list_page_providers(self, page_id: str) -> List[Dict[str, Any]]:
         """Return introspection data for every handler registered for *page_id*.

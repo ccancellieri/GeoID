@@ -117,6 +117,11 @@ class StaticAsset:
     human-readable summary surfaced by the static-prefix registry
     endpoint (``GET /web/config/static-prefixes``) so page authors can
     discover available CSS/JS namespaces without hardcoding paths.
+
+    ``public`` mirrors the ``public`` param of ``@expose_static``. When
+    ``True`` (the default) the web policy builder includes this prefix in
+    the anonymous ALLOW list so browser pages can load their JS/CSS
+    without authentication.
     """
 
     prefix: str
@@ -124,6 +129,7 @@ class StaticAsset:
     base_path: Optional[str] = None
     owner: str = ""
     description: str = ""
+    public: bool = True
 
 
 @runtime_checkable

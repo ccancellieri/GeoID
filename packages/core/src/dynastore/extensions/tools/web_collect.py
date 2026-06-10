@@ -75,12 +75,14 @@ def collect_static_assets(instance: object) -> List[StaticAsset]:
             continue
         owner = getattr(method, "_web_static_owner", "") or ""
         description = getattr(method, "_web_static_description", "") or ""
+        public = getattr(method, "_web_static_public", True)
         assets.append(
             StaticAsset(
                 prefix=prefix.strip("/"),
                 files_provider=method,  # type: ignore[arg-type]
                 owner=owner,
                 description=description,
+                public=public,
             )
         )
     return assets

@@ -37,6 +37,7 @@ def expose_static(
     virtual_path: str,
     owner: str = "",
     description: str = "",
+    public: bool = True,
 ):
     """Mark a method as a static-files provider.
 
@@ -48,12 +49,20 @@ def expose_static(
     human-readable summary surfaced by the registry endpoint at
     ``GET /web/config/static-prefixes`` so page authors can discover
     available CSS/JS namespaces without hardcoding URL paths.
+
+    ``public`` controls whether anonymous users may read files under this
+    prefix. Defaults to ``True`` (the common case: browser pages load their
+    JS/CSS anonymously). Set to ``False`` for prefixes that serve assets
+    behind authenticated routes (e.g. admin-only dashboards). The web
+    policy builder reads this flag when constructing the anonymous ALLOW
+    list so future extensions are covered without manual policy edits.
     """
 
     def decorator(func: Callable[..., List[str]]) -> Callable[..., List[str]]:
         setattr(func, "_web_static_prefix", virtual_path)
         setattr(func, "_web_static_owner", owner)
         setattr(func, "_web_static_description", description)
+        setattr(func, "_web_static_public", public)
         return func
 
     return decorator

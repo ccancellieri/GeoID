@@ -60,6 +60,99 @@ def _web_policies(sysadmin_role_name: Optional[str] = None) -> List[Policy]:
     and runtime bypass checks share a single source of truth.
     """
     sysadmin_role_name = sysadmin_role_name or IamRolesConfig().sysadmin_role_name
+
+    # Per-extension static prefixes registered via @expose_static are served
+    # at /web/{prefix}/. Anonymous browser pages load their JS/CSS from these
+    # paths, so each prefix must appear in the anonymous ALLOW list.
+    # Patterns are anchored to /web/{prefix}/ — an unanchored /web/stac
+    # pattern would also match /web/stac-authoring/… accidentally.
+    _literal_extension_prefixes: List[str] = [
+        "/web/stac/.*",
+        "/web/records/.*",
+        "/web/features/.*",
+        "/web/assets/.*",
+        "/web/edr/.*",
+        "/web/movingfeatures/.*",
+        "/web/tiles/.*",
+        "/web/auth/.*",
+        "/web/coverages/.*",
+    ]
+
+    # The complete set of /web/... resource patterns that are already
+    # authoritative in the policy (both the extension-prefix list above
+    # and the hardcoded entries in web_public_access.resources).  The
+    # dynamic block must not emit a wildcard pattern for any prefix that
+    # is already referenced here in any form — even a narrow entry like
+    # /web/dashboard/?$ must prevent the dynamic block from widening it
+    # to /web/dashboard/.*, which would open the gated data endpoints.
+    _all_literal_web_resources: List[str] = _literal_extension_prefixes + [
+        "/web/?$",
+        "/web/pages/.*",
+        "/web/extension-static/.*",
+        "/web/static/.*",
+        "/web/website/.*",
+        "/web/docs-content/.*",
+        "/web/docs-manifest$",
+        "/web/config/.*",
+        "/web/dashboard/?$",
+        "/web/lite/.*",
+    ]
+
+    # Best-effort dynamic derivation: if WebModule is already registered,
+    # collect every prefix whose metadata marks it public=True and append
+    # any that are not already covered by the literal list. Extensions
+    # added in the future are thereby covered without a manual edit here.
+    # The whole block is wrapped in try/except so a missing WebModule
+    # (startup ordering, test isolation) never prevents the literal floor
+    # from being returned.
+    #
+    # Prefix-aware skip: if ANY literal resource already references a
+    # prefix (anchored, bare, or regex-prefixed forms), the literal list
+    # is authoritative for that prefix and the dynamic block must not emit
+    # a pattern for it.  This prevents the dynamic block from widening a
+    # deliberately narrow literal entry — e.g. /web/dashboard/?$ allows
+    # only the shell page while the gated data endpoints stay protected.
+    def _literal_covers_prefix(pfx: str) -> bool:
+        bare = f"/web/{pfx}/"
+        anchored = f"^/web/{pfx}/"
+        bare_no_slash = f"/web/{pfx}"
+        for r in _all_literal_web_resources:
+            if (
+                r.startswith(bare)
+                or r.startswith(anchored)
+                or r == bare_no_slash
+                or r.startswith(bare_no_slash + "?")
+                or r.startswith(bare_no_slash + "$")
+            ):
+                return True
+        return False
+
+    _dynamic_extension_prefixes: List[str] = []
+    try:
+        _web_mod = get_protocol(WebModuleProtocol)
+        if _web_mod is not None and hasattr(_web_mod, "get_static_prefix_meta"):
+            for _pfx, _meta in _web_mod.get_static_prefix_meta().items():
+                if not _meta.get("public", True):
+                    continue
+                if _literal_covers_prefix(_pfx):
+                    continue
+                _pattern = f"/web/{re.escape(_pfx)}/.*"
+                _dynamic_extension_prefixes.append(_pattern)
+    except Exception:
+        logger.debug(
+            "_web_policies: could not derive dynamic extension prefixes from "
+            "WebModule; literal list remains the guaranteed floor.",
+            exc_info=True,
+        )
+
+    # Deduplicate preserving order (literals first, then novel dynamic ones).
+    _seen_pfx: set = set()
+    _all_extension_prefixes: List[str] = []
+    for _p in _literal_extension_prefixes + _dynamic_extension_prefixes:
+        if _p not in _seen_pfx:
+            _seen_pfx.add(_p)
+            _all_extension_prefixes.append(_p)
+
     return [
         # Anonymous-allowed web paths. Resource patterns are anchored where
         # ambiguity matters because PolicyService uses ``re.match`` (matches
@@ -94,6 +187,7 @@ def _web_policies(sysadmin_role_name: Optional[str] = None) -> List[Policy]:
                 "/configs/registry$",
                 "/configs/registry/.*",
                 f"/configs/plugins/{WebConfig.class_key()}$",
+                *_all_extension_prefixes,
             ],
             effect="ALLOW",
         ),
@@ -1249,9 +1343,18 @@ class Web(ExtensionProtocol, OGCServiceMixin):
         else:
             logger.error("WebService: Cannot register web page, WebModule not available")
 
-    def register_static_provider(self, prefix: str, provider: Callable[[], List[str]]):
+    def register_static_provider(
+        self,
+        prefix: str,
+        provider: Callable[[], List[str]],
+        owner: str = "",
+        description: str = "",
+        public: bool = True,
+    ) -> None:
         if self.web_module:
-            self.web_module.register_static_provider(prefix, provider)
+            self.web_module.register_static_provider(
+                prefix, provider, owner=owner, description=description, public=public
+            )
         else:
             logger.error("WebService: Cannot register static provider, WebModule not available")
 
@@ -1286,6 +1389,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
         "dashboard",
         owner="web",
         description="Per-catalog dashboard HTML shell and its assets.",
+        public=False,
     )
     def _provide_dashboard_static(self) -> List[str]:
         dashboard_dir = os.path.join(os.path.dirname(__file__), "static", "dashboard")

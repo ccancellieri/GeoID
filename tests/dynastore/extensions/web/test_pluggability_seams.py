@@ -131,6 +131,25 @@ def test_webmodule_stores_static_prefix_meta() -> None:
     meta = module.static_prefix_meta.get("geoid", {})
     assert meta["owner"] == "geoid-ext"
     assert meta["description"] == "GeoID static files."
+    # public defaults to True when not explicitly passed
+    assert meta.get("public", True) is True
+
+
+def test_webmodule_stores_static_prefix_meta_public_false() -> None:
+    """register_static_provider must store public=False when passed explicitly."""
+    module = WebModule()
+    module.register_static_provider(
+        "private-pfx",
+        lambda: [],
+        owner="myext",
+        description="Gated assets.",
+        public=False,
+    )
+    meta = module.static_prefix_meta.get("private-pfx", {})
+    assert meta.get("public") is False, (
+        "register_static_provider must store the public flag so _web_policies() "
+        "can skip non-public prefixes in the dynamic derivation block."
+    )
 
 
 def test_webmodule_list_static_prefix_info_sorted() -> None:
