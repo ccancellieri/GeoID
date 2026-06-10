@@ -47,9 +47,9 @@ The bundle emitted by ``build()`` contains:
 """
 from __future__ import annotations
 
-from typing import ClassVar, Dict, List, Optional
+from typing import ClassVar, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dynastore.modules.stac.stac_storage_config import (
     StacLevel,
@@ -72,14 +72,39 @@ from dynastore.modules.storage.routing_config import (
 )
 
 from .bundle_preset import BundlePreset
+from .examples import PresetExample
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
 class StacPresetParams(BaseModel):
     """Parameters for the ``stac`` preset."""
 
-    stac_level: StacLevel = StacLevel.COLLECTION
-    stac_storage: StacStorageBackend = StacStorageBackend.ES_PG
+    stac_level: StacLevel = Field(
+        default=StacLevel.COLLECTION,
+        description=(
+            "Cumulative depth of STAC materialization at the applied scope. "
+            "Each level includes the ones above it:\n"
+            "- ``none`` — revoke STAC from the scope (the bundle carries an empty "
+            "``StacStorageConfig`` that revoke removes, restoring the no-STAC default).\n"
+            "- ``catalog`` — materialize catalog-tier STAC only.\n"
+            "- ``collection`` (default) — also materialize collection-tier STAC.\n"
+            "- ``items`` — also add the per-item ``stac_metadata`` sidecar so "
+            "individual items carry full STAC item documents."
+        ),
+        examples=["collection", "items", "catalog", "none"],
+    )
+    stac_storage: StacStorageBackend = Field(
+        default=StacStorageBackend.ES_PG,
+        description=(
+            "Backend(s) the chosen STAC tiers are routed to:\n"
+            "- ``ES`` — Elasticsearch only (all ops routed to the ES driver).\n"
+            "- ``PG`` — PostgreSQL only; materializes the PG wrapper slices and, at "
+            "``items`` level, the items sidecar. No ES STAC routes.\n"
+            "- ``ES_PG`` (default) — both: PG preferred for WRITE/READ, ES for SEARCH "
+            "plus an async secondary index."
+        ),
+        examples=["ES_PG", "ES", "PG"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +387,10 @@ class StacPreset(BundlePreset):
     tier: ClassVar[PresetTier] = PresetTier.CATALOG
     catalog_scopable: ClassVar[bool] = True
     params_model = StacPresetParams
+    keywords: ClassVar[Tuple[str, ...]] = (
+        "routing", "stac", "catalog", "collection", "items",
+        "elasticsearch", "postgresql", "metadata",
+    )
     description = (
         "Kind-agnostic STAC opt-in preset.  Writes a ``StacStorageConfig`` "
         "entry (the SSOT signal) and wires per-tier routing entries for the "
@@ -369,6 +398,46 @@ class StacPreset(BundlePreset):
         "Default: level=collection, storage=ES_PG.  Set stac_level=none to "
         "revoke STAC from the scope.  Absent this preset, no STAC "
         "slices, sidecars, or ES STAC routes are materialized."
+    )
+
+    examples: ClassVar[Tuple[PresetExample, ...]] = (
+        PresetExample(
+            name="default-collection-es-pg",
+            summary=(
+                "Enable STAC down to the collection tier on both backends (the "
+                "defaults): PG preferred for WRITE/READ, ES for SEARCH plus an async "
+                "secondary index. Apply at catalog scope via "
+                "POST /admin/catalogs/{catalog_id}/presets/stac."
+            ),
+            params={"stac_level": "collection", "stac_storage": "ES_PG"},
+        ),
+        PresetExample(
+            name="full-items-elasticsearch-only",
+            summary=(
+                "Enable STAC all the way to per-item ``stac_metadata`` sidecars, "
+                "routed to Elasticsearch only — useful for an ES-backed STAC API with "
+                "no PostgreSQL wrapper slices."
+            ),
+            params={"stac_level": "items", "stac_storage": "ES"},
+        ),
+        PresetExample(
+            name="catalog-only-postgres",
+            summary=(
+                "Materialize catalog-tier STAC in PostgreSQL only (no collection/item "
+                "STAC, no Elasticsearch) — a minimal STAC catalog envelope without an "
+                "ES dependency."
+            ),
+            params={"stac_level": "catalog", "stac_storage": "PG"},
+        ),
+        PresetExample(
+            name="revoke-stac",
+            summary=(
+                "Revoke STAC from the scope: the bundle carries a "
+                "``StacStorageConfig(stac_level=none)`` entry that revoke removes, "
+                "restoring the default of no STAC slices, sidecars, or ES routes."
+            ),
+            params={"stac_level": "none"},
+        ),
     )
 
     def build(self, catalog_id: str = "", **_scope: str) -> PresetBundle:  # noqa: ARG002

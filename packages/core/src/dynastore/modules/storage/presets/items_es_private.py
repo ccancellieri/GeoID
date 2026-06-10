@@ -44,12 +44,13 @@ scope.
 """
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Tuple
 
 from dynastore.modules.catalog.catalog_config import _build_private_items_routing
 from dynastore.modules.storage.routing_config import ItemsRoutingConfig
 
 from .bundle_preset import BundlePreset
+from .examples import PresetExample
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
@@ -59,6 +60,9 @@ class ItemsEsPrivatePreset(BundlePreset):
     name = "items_es_private"
     tier: ClassVar[PresetTier] = PresetTier.ITEMS
     catalog_scopable: ClassVar[bool] = True
+    keywords: ClassVar[Tuple[str, ...]] = (
+        "routing", "items", "private", "tenant", "elasticsearch",
+    )
     description = (
         "Items-tier private Elasticsearch indexing. Pins "
         "items_postgresql_driver (system of record) + "
@@ -66,6 +70,33 @@ class ItemsEsPrivatePreset(BundlePreset):
         "Applied at catalog scope it sets the items template future "
         "collections inherit (inherit-only, no retro-apply); applied at "
         "collection scope it overrides the items routing for one collection."
+    )
+
+    examples: ClassVar[Tuple[PresetExample, ...]] = (
+        PresetExample(
+            name="private-items-catalog-template",
+            summary=(
+                "Set the items template that future collections of a catalog inherit: "
+                "PostgreSQL is the system of record and items are indexed into the "
+                "per-tenant private ES index. Inherit-only — already-materialized "
+                "collections are not retro-mutated. Apply at catalog scope via "
+                "POST /admin/catalogs/{catalog_id}/presets/items_es_private. Takes no "
+                "parameters."
+            ),
+            params={},
+        ),
+        PresetExample(
+            name="private-items-single-collection",
+            summary=(
+                "Override the items routing for one collection so its items are "
+                "indexed privately, regardless of the catalog template. Apply at "
+                "collection scope via POST "
+                "/admin/catalogs/{catalog_id}/collections/{collection_id}/presets/items_es_private. "
+                "Identical bundle to the catalog-scope example — the admin endpoint "
+                "layers the URL-derived scope on top."
+            ),
+            params={},
+        ),
     )
 
     def build(self, **_scope: str) -> PresetBundle:

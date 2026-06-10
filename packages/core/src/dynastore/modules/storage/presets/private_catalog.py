@@ -28,7 +28,7 @@ anonymous reads on the items URL patterns. No audience opt-ins.
 """
 from __future__ import annotations
 
-from typing import ClassVar, Any
+from typing import ClassVar, Any, Tuple
 
 from dynastore.modules.catalog.catalog_config import _build_private_items_routing
 from dynastore.modules.storage.routing_config import (
@@ -39,6 +39,7 @@ from dynastore.modules.storage.routing_config import (
 )
 
 from .bundle_preset import BundlePreset
+from .examples import PresetExample
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
@@ -164,12 +165,32 @@ class PrivateCatalogPreset(BundlePreset):
     name = "private_catalog"
     tier: ClassVar[PresetTier] = PresetTier.CATALOG
     catalog_scopable: ClassVar[bool] = False
+    keywords: ClassVar[Tuple[str, ...]] = (
+        "routing", "catalog", "private", "tenant", "iam", "deny", "elasticsearch",
+    )
     description = (
         "PG-only catalog/collection envelopes + per-tenant private "
         "Elasticsearch indexer on the items tier. No anonymous read paths; "
         "IAM DENY (private_deny_{catalog_id}) blocks all_users on item "
         "URL patterns. No audience opt-ins. Use as the foundation for fully "
         "isolated tenant catalogs."
+    )
+
+    examples: ClassVar[Tuple[PresetExample, ...]] = (
+        PresetExample(
+            name="isolated-tenant-catalog",
+            summary=(
+                "Provision a fully-isolated tenant catalog: catalog, collection and "
+                "asset envelopes are PostgreSQL-only (never reach the public ES index), "
+                "items are indexed into the per-tenant private ES index "
+                "({prefix}-{catalog_id}-private-items), and the items-private driver "
+                "installs the catalog-wide DENY policy that blocks anonymous reads. "
+                "Apply at catalog scope via "
+                "POST /admin/catalogs/{catalog_id}/presets/private_catalog. Takes no "
+                "parameters."
+            ),
+            params={},
+        ),
     )
 
     def build(self, catalog_id: str, **_scope: str) -> PresetBundle:  # noqa: ARG002

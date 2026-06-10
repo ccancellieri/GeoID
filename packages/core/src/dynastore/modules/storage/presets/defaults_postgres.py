@@ -30,7 +30,7 @@ anonymous surface.
 """
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Tuple
 
 from dynastore.modules.storage.routing_config import (
     CatalogRoutingConfig,
@@ -42,6 +42,7 @@ from dynastore.modules.storage.routing_config import (
 )
 
 from .bundle_preset import BundlePreset
+from .examples import PresetExample
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
@@ -105,12 +106,29 @@ class DefaultsPostgresPreset(BundlePreset):
     name = "defaults_postgres"
     tier: ClassVar[PresetTier] = PresetTier.PLATFORM
     catalog_scopable: ClassVar[bool] = False
+    keywords: ClassVar[Tuple[str, ...]] = (
+        "routing", "platform", "defaults", "baseline", "postgresql", "pg-only",
+    )
     description = (
         "Platform-tier PostgreSQL-first routing defaults across the "
         "catalog, collection, and items tiers. Applied with no scope "
         "(POST /admin/presets/defaults_postgres) so new catalogs inherit "
         "a PG-only baseline. No indexers, no audience opt-ins — a safe "
         "starting posture before catalog/collection overrides."
+    )
+
+    examples: ClassVar[Tuple[PresetExample, ...]] = (
+        PresetExample(
+            name="platform-postgres-baseline",
+            summary=(
+                "Pin a PostgreSQL-only routing baseline at the platform scope so "
+                "freshly-created catalogs inherit a safe PG-first posture (no "
+                "indexers, no anonymous surface) before any catalog/collection "
+                "override. Apply with no scope via "
+                "POST /admin/presets/defaults_postgres. Takes no parameters."
+            ),
+            params={},
+        ),
     )
 
     def build(self, **_scope: str) -> PresetBundle:

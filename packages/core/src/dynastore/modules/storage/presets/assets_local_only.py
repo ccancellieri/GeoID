@@ -50,11 +50,12 @@ either scope.
 from __future__ import annotations
 
 import importlib.util
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Tuple
 
 from dynastore.modules.storage.routing_config import AssetRoutingConfig
 
 from .bundle_preset import BundlePreset
+from .examples import PresetExample
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
@@ -121,6 +122,9 @@ class AssetsLocalOnlyPreset(BundlePreset):
     name = "assets_local_only"
     tier: ClassVar[PresetTier] = PresetTier.ASSETS
     catalog_scopable: ClassVar[bool] = True
+    keywords: ClassVar[Tuple[str, ...]] = (
+        "routing", "assets", "upload", "local", "on-prem", "docker-compose",
+    )
     description = (
         "Assets-tier local-disk upload preset (on-prem / docker-compose "
         "only). Pins local_upload_module as the UPLOAD driver "
@@ -130,6 +134,22 @@ class AssetsLocalOnlyPreset(BundlePreset):
         "catalog scope it sets the upload template future collections "
         "inherit (inherit-only, no retro-apply); applied at collection "
         "scope it overrides upload routing for one collection."
+    )
+
+    examples: ClassVar[Tuple[PresetExample, ...]] = (
+        PresetExample(
+            name="on-prem-local-uploads",
+            summary=(
+                "Route asset uploads to the local-disk backend for an on-prem / "
+                "docker-compose deployment: the client POSTs the file to the server "
+                "endpoint, which writes it to disk and registers the asset in one "
+                "synchronous transaction. WRITE/READ stay PG-only. Apply at catalog "
+                "scope via POST /admin/catalogs/{catalog_id}/presets/assets_local_only "
+                "(or at collection scope to override one collection). Takes no "
+                "parameters. Only registered when google.cloud.storage is absent."
+            ),
+            params={},
+        ),
     )
 
     def build(self, **_scope: str) -> PresetBundle:

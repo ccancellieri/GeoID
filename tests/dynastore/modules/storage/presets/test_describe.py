@@ -219,11 +219,30 @@ class TestDescribePreset:
         assert isinstance(docs, dict)
 
     def test_examples_classvar_default_empty(self) -> None:
-        """BundlePreset without declared examples has empty examples list."""
-        from dynastore.modules.storage.presets.public_catalog import PublicCatalogPreset
-        preset = PublicCatalogPreset()
-        desc = describe_preset(preset)
+        """A BundlePreset that declares no examples has an empty examples list."""
+
+        class _NoExamplePreset(BundlePreset):
+            name = "_no_example_describe_test"
+            description = "Fixture with no declared examples."
+            tier: ClassVar[PresetTier] = PresetTier.CATALOG
+
+            def build(self, catalog_id: str = "", **_scope: str) -> PresetBundle:
+                return PresetBundle(entries=())
+
+        desc = describe_preset(_NoExamplePreset())
         assert desc["examples"] == []
+
+    def test_parameterless_preset_example_has_resulting_config(self) -> None:
+        """A parameterless built-in (public_catalog) surfaces a worked example
+        whose resulting_config is computed from the empty params + synthetic scope."""
+        from dynastore.modules.storage.presets.public_catalog import PublicCatalogPreset
+        desc = describe_preset(PublicCatalogPreset())
+        assert len(desc["examples"]) >= 1
+        first = desc["examples"][0]
+        assert first["params"] == {}
+        assert first["resulting_config"] is not None
+        assert isinstance(first["resulting_config"], list)
+        assert len(first["resulting_config"]) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +306,74 @@ class TestDescriptorToHtml:
         html = descriptor_to_html(desc)
         # Either in rendered HTML tags or in escaped pre block
         assert "_fixture_describe_test" in html
+
+
+# ---------------------------------------------------------------------------
+# Ratchet: every named built-in routing preset is self-documenting (#1965)
+# ---------------------------------------------------------------------------
+
+def _builtin_routing_presets():
+    """Instantiate the built-in routing presets named in #1960 / #1965.
+
+    Imported lazily inside the helper so a collection-time import error in one
+    preset module surfaces as a test failure, not a collection error.
+    """
+    from dynastore.modules.storage.presets.public_catalog import PublicCatalogPreset
+    from dynastore.modules.storage.presets.private_catalog import PrivateCatalogPreset
+    from dynastore.modules.storage.presets.pg_only_catalog import PgOnlyCatalogPreset
+    from dynastore.modules.storage.presets.defaults_postgres import DefaultsPostgresPreset
+    from dynastore.modules.storage.presets.items_es_private import ItemsEsPrivatePreset
+    from dynastore.modules.storage.presets.assets_local_only import AssetsLocalOnlyPreset
+    from dynastore.modules.storage.presets.assets_gcs_uploads import AssetsGcsUploadsPreset
+    from dynastore.modules.storage.presets.stac import StacPreset
+    from dynastore.modules.storage.presets.file_backed import FileBackedPreset
+
+    return [
+        PublicCatalogPreset(),
+        PrivateCatalogPreset(),
+        PgOnlyCatalogPreset(),
+        DefaultsPostgresPreset(),
+        ItemsEsPrivatePreset(),
+        AssetsLocalOnlyPreset(),
+        AssetsGcsUploadsPreset(),
+        StacPreset(),
+        FileBackedPreset(),
+    ]
+
+
+@pytest.mark.parametrize(
+    "preset",
+    _builtin_routing_presets(),
+    ids=lambda p: p.name,
+)
+class TestBuiltinPresetSelfDocumentation:
+    """Every named built-in routing preset must carry rich keywords + at least
+    one worked example whose preview config builds without a DB (#1965)."""
+
+    def test_has_descriptive_keywords(self, preset) -> None:
+        # More than the bare default ("routing",) — authored, searchable keywords.
+        assert len(preset.keywords) >= 2
+        assert "routing" in preset.keywords
+
+    def test_has_at_least_one_example(self, preset) -> None:
+        assert len(preset.examples) >= 1
+        for ex in preset.examples:
+            assert ex.name
+            assert ex.summary
+
+    def test_first_example_builds_resulting_config(self, preset) -> None:
+        """The first worked example must render a non-None resulting_config —
+        proving the documented params actually drive a buildable bundle."""
+        desc = describe_preset(preset)
+        first = desc["examples"][0]
+        assert first["resulting_config"] is not None, (
+            f"{preset.name}: first example produced no preview config "
+            f"(error={first.get('error')!r})"
+        )
+        assert isinstance(first["resulting_config"], list)
+        assert len(first["resulting_config"]) >= 1
+
+    def test_describe_renders_markdown_with_example(self, preset) -> None:
+        md = descriptor_to_markdown(describe_preset(preset))
+        assert preset.name in md
+        assert "## Examples" in md

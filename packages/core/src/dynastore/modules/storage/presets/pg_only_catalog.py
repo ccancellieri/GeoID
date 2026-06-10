@@ -35,7 +35,7 @@ platform-level defaults that might include ES drivers.
 """
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Tuple
 
 from dynastore.modules.storage.routing_config import (
     AssetRoutingConfig,
@@ -48,6 +48,7 @@ from dynastore.modules.storage.routing_config import (
 )
 
 from .bundle_preset import BundlePreset
+from .examples import PresetExample
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
@@ -147,6 +148,9 @@ class PgOnlyCatalogPreset(BundlePreset):
     name = "pg_only_catalog"
     tier: ClassVar[PresetTier] = PresetTier.CATALOG
     catalog_scopable: ClassVar[bool] = False
+    keywords: ClassVar[Tuple[str, ...]] = (
+        "routing", "catalog", "postgresql", "pg-only", "no-elasticsearch",
+    )
     description = (
         "Catalog-tier PostgreSQL-only routing for all four resource tiers "
         "(catalog, collection, items, assets). No Elasticsearch at any level. "
@@ -154,6 +158,22 @@ class PgOnlyCatalogPreset(BundlePreset):
         "platform-level defaults that include ES drivers. "
         "SEARCH is pinned PG-only on catalog and collection tiers to prevent "
         "ES auto-registration."
+    )
+
+    examples: ClassVar[Tuple[PresetExample, ...]] = (
+        PresetExample(
+            name="lock-catalog-to-postgres",
+            summary=(
+                "Lock a catalog to PostgreSQL-only routing on all four tiers "
+                "(catalog, collection, items, assets), overriding any platform "
+                "default that would inject Elasticsearch drivers. SEARCH is pinned "
+                "PG-only on the catalog and collection tiers so a discoverable ES "
+                "store cannot be auto-registered. Apply at catalog scope via "
+                "POST /admin/catalogs/{catalog_id}/presets/pg_only_catalog. Takes no "
+                "parameters."
+            ),
+            params={},
+        ),
     )
 
     def build(self, catalog_id: str, **_scope: str) -> PresetBundle:  # noqa: ARG002

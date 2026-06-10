@@ -42,11 +42,12 @@ either scope.
 """
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Tuple
 
 from dynastore.modules.storage.routing_config import AssetRoutingConfig
 
 from .bundle_preset import BundlePreset
+from .examples import PresetExample
 from .protocol import PresetBundle, PresetBundleEntry, PresetTier
 
 
@@ -96,6 +97,9 @@ class AssetsGcsUploadsPreset(BundlePreset):
     name = "assets_gcs_uploads"
     tier: ClassVar[PresetTier] = PresetTier.ASSETS
     catalog_scopable: ClassVar[bool] = True
+    keywords: ClassVar[Tuple[str, ...]] = (
+        "routing", "assets", "upload", "gcs", "cloud", "eventing",
+    )
     description = (
         "Assets-tier GCS upload preset (cloud default). Pins gcp_module "
         "as the UPLOAD driver (operator-managed, no auto-augment). GCS "
@@ -104,6 +108,22 @@ class AssetsGcsUploadsPreset(BundlePreset):
         "template future collections inherit (inherit-only, no retro-apply); "
         "applied at collection scope it overrides upload routing for one "
         "collection."
+    )
+
+    examples: ClassVar[Tuple[PresetExample, ...]] = (
+        PresetExample(
+            name="cloud-gcs-uploads",
+            summary=(
+                "Route asset uploads to Google Cloud Storage for a cloud deployment: "
+                "gcp_module is pinned as the UPLOAD backend (operator-managed) and GCS "
+                "eventing (OBJECT_FINALIZE → finalize activator) fires automatically "
+                "once the GCP module is configured for the catalog. WRITE/READ stay "
+                "PG-only. Apply at catalog scope via "
+                "POST /admin/catalogs/{catalog_id}/presets/assets_gcs_uploads (or at "
+                "collection scope to override one collection). Takes no parameters."
+            ),
+            params={},
+        ),
     )
 
     def build(self, **_scope: str) -> PresetBundle:
