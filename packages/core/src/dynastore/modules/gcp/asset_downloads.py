@@ -29,11 +29,10 @@ import logging
 from datetime import timedelta
 from typing import Optional
 
-from fastapi import HTTPException, status
-
 from dynastore.models.protocols import CloudIdentityProtocol, CloudStorageClientProtocol
 from dynastore.modules.catalog.asset_service import Asset
 from dynastore.modules.gcp.tools.signed_urls import generate_gcs_signed_url
+from dynastore.modules.storage.errors import ConflictError
 
 logger = logging.getLogger(__name__)
 
@@ -66,19 +65,13 @@ class GcsAssetDownload:
         self, asset: Asset, ttl: Optional[int] = None
     ) -> str:
         if not self.applies_to(asset):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="download not applicable: asset is not GCS-owned.",
-            )
+            raise ConflictError("download not applicable: asset is not GCS-owned.")
 
         ttl_seconds = int(ttl) if ttl is not None else DEFAULT_DOWNLOAD_TTL_SECONDS
         if ttl_seconds < MIN_DOWNLOAD_TTL_SECONDS or ttl_seconds > self._max_ttl_seconds:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"ttl must be between {MIN_DOWNLOAD_TTL_SECONDS} and "
-                    f"{self._max_ttl_seconds} seconds (got {ttl_seconds})."
-                ),
+            raise ValueError(
+                f"ttl must be between {MIN_DOWNLOAD_TTL_SECONDS} and "
+                f"{self._max_ttl_seconds} seconds (got {ttl_seconds})."
             )
 
         assert asset.uri is not None  # narrowed by applies_to above
@@ -91,8 +84,5 @@ class GcsAssetDownload:
             check_exists=True,
         )
         if signed_url is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"GCS blob for asset {asset.asset_id!r} no longer exists.",
-            )
+            raise ValueError(f"GCS blob for asset {asset.asset_id!r} no longer exists.")
         return signed_url

@@ -525,6 +525,77 @@ class ConfigResolutionExceptionHandler(ExceptionHandler):
         )
 
 
+class GcpServiceUnavailableExceptionHandler(ExceptionHandler):
+    """Maps ``GcpServiceUnavailableError`` to HTTP 503.
+
+    Optionally forwards ``retry_after`` as a ``Retry-After`` response header
+    when the caller knows the back-off window.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.gcp.errors import GcpServiceUnavailableError
+
+        return isinstance(exception, GcpServiceUnavailableError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.modules.gcp.errors import GcpServiceUnavailableError
+
+        assert isinstance(exception, GcpServiceUnavailableError)
+        headers = {}
+        if exception.retry_after is not None:
+            headers["Retry-After"] = str(exception.retry_after)
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exception),
+            headers=headers or None,
+        )
+
+
+class GcpFailedDependencyExceptionHandler(ExceptionHandler):
+    """Maps ``GcpFailedDependencyError`` to HTTP 424 (Failed Dependency)."""
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.gcp.errors import GcpFailedDependencyError
+
+        return isinstance(exception, GcpFailedDependencyError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(
+            status_code=424,
+            detail=str(exception),
+        )
+
+
+class GcpInternalErrorHandler(ExceptionHandler):
+    """Maps ``GcpInternalError`` to HTTP 500 with the error message preserved.
+
+    Used for internal consistency failures within the GCP module that are
+    genuinely unexpected (e.g. GCS returns no session URI despite a
+    successful API call, or storage metadata is inconsistent with readiness
+    state).
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.gcp.errors import GcpInternalError
+
+        return isinstance(exception, GcpInternalError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        logger.error(
+            "GcpInternalError (500): %s", str(exception), exc_info=True
+        )
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exception),
+        )
+
+
 class ExceptionHandlerRegistry:
     """Central registry for managing pluggable exception handlers."""
 
@@ -545,6 +616,8 @@ class ExceptionHandlerRegistry:
         self.register(JobLockedExceptionHandler())
         self.register(JobStateConflictExceptionHandler())
         self.register(ConflictExceptionHandler())
+        self.register(GcpServiceUnavailableExceptionHandler())
+        self.register(GcpFailedDependencyExceptionHandler())
         self.register(ConstraintViolationExceptionHandler())
         self.register(UnknownFieldsExceptionHandler())
         self.register(IndexMappingMismatchExceptionHandler())
@@ -556,6 +629,7 @@ class ExceptionHandlerRegistry:
         self.register(
             ProgrammingErrorHandler()
         )  # Catch programming errors before generic validation
+        self.register(GcpInternalErrorHandler())  # GcpInternalError → 500 with message preserved
         self.register(DatabaseInputExceptionHandler())  # Catch DB input errors (400)
         self.register(ValidationExceptionHandler())  # Generic - must be last
 
