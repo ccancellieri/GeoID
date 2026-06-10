@@ -273,6 +273,10 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        # Read-side (output) transform chains are not applied here by design
+        # (geoid#1643). The restore_transform_chain is wired only on
+        # Elasticsearch read paths; the routing-config validator emits a WARN
+        # if output_transformers are declared against a non-ES driver.
         if request is None:
             request = QueryRequest(limit=limit, offset=offset, item_ids=entity_ids)
         else:

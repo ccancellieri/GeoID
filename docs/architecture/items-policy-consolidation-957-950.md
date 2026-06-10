@@ -190,7 +190,7 @@ A collection with no `items_schema` fields is permissive (a blob: no derived sch
    - `expose=["x","y"]` (non-empty list) — schema-declared fields still flow through as the baseline, **plus** the listed `ComputedField.resolved_name`s from `policy.compute` are merged in as additional read-only fields. The computed-value merge only runs in this case. The merge runs once at the read choke point (`SidecarProtocol.apply_exposed_computed_values`); each sidecar declares the names it can produce via `producible_computed_names` / `resolve_computed_value`. An exposed name with no produced value is skipped under `best_effort` and raises under `strict`.
 
    This projection applies to OGC API Features, MVT, EDR, and Coverages. STAC items bypass it entirely.
-4. Transformer chains, when configured, run via the routing config's `output_transformers` (#950) — not the read policy.
+4. Transformer chains, when configured, run via the routing config's `output_transformers` (#950) — not the read policy. Read-side (output) transformers are honored only on Elasticsearch read paths by design (#1643); `output_transformers` declared on a SEARCH entry that resolves to a non-ES driver (PostgreSQL, DuckDB, Iceberg, BigQuery) will not fire and the routing-config validator emits a WARN.
 
 ### Driver responsibilities
 

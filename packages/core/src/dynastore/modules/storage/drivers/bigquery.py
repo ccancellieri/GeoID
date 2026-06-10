@@ -233,6 +233,10 @@ class ItemsBigQueryDriver(TypedDriver[ItemsBigQueryDriverConfig]):
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        # Read-side (output) transform chains are not applied here by design
+        # (geoid#1643). The restore_transform_chain is wired only on
+        # Elasticsearch read paths; the routing-config validator emits a WARN
+        # if output_transformers are declared against a non-ES driver.
         cfg = await self.get_driver_config(catalog_id, collection_id)
         if cfg is None or not cfg.target.is_fully_qualified():
             raise ValueError(

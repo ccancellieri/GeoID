@@ -2385,6 +2385,10 @@ class AssetElasticsearchDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        # By-id lookup path. Read-side (output) transform chains are not
+        # applied here by design (geoid#1643); only search_assets (the SEARCH
+        # path on this driver) invokes restore_transform_chain. Declaring
+        # output_transformers on a by-id READ entry will not fire.
         from dynastore.modules.elasticsearch.mappings import get_assets_index_name
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 

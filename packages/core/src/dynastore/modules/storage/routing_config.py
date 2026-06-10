@@ -390,20 +390,20 @@ class TransformerEntry(BaseModel):
     )
 
 
-# Operations whose transformer hop is wired in this release. Declaring
+# Operations whose transformer hop is wired. Declaring
 # input_transformers / output_transformers on any other (operation, side)
 # pair logs a one-time WARN so operators see the silent-no-op early.
 #
 # INPUT (write-side ``apply_transform_chain``) is wired on ``WRITE`` for every
 # tier (secondary-index fan-out). OUTPUT (read-side ``restore_from_index``) is
-# wired on ``SEARCH`` for every tier whose search driver invokes
-# ``restore_transform_chain`` — the four ES-backed tiers (items, collection,
-# asset, catalog) since geoid#1574. The per-tier flag
+# wired on ``SEARCH`` for Elasticsearch read paths only — this is intentional
+# by design (geoid#1643). The four ES-backed tiers (items, collection, asset,
+# catalog) run the restore chain since geoid#1574. Non-ES ``read_entities``
+# implementations (PostgreSQL, DuckDB, Iceberg, BigQuery) do not run the
+# restore chain; the per-tier flag
 # ``_RoutingConfigBase._wired_output_search_hop`` carries that distinction so a
-# SEARCH ``output_transformers`` declared on a tier that does NOT run the
-# restore chain (e.g. a non-ES read path) warns instead of silently never
-# running. See geoid#1567, geoid#1574; non-ES read-side wiring tracked in
-# geoid#1643.
+# SEARCH ``output_transformers`` declared against a non-ES driver warns instead
+# of silently never running. See geoid#1567, geoid#1574.
 _WIRED_INPUT_HOPS: FrozenSet[str] = frozenset({Operation.WRITE})
 _WIRED_OUTPUT_HOPS: FrozenSet[str] = frozenset({Operation.SEARCH})
 _DEFERRED_HOP_WARNED: Set[Tuple[str, str, str, str]] = set()
@@ -420,10 +420,12 @@ def _warn_deferred_transformer_hops(
     at config-load instead of as a mysteriously inert transformer.
 
     ``output_search_wired`` reflects whether *this tier*'s SEARCH path runs the
-    read-side restore chain. The four ES-backed tiers (items, collection, asset,
-    catalog) do since geoid#1574; for a tier that does not, a SEARCH
-    ``output_transformers`` declaration validates but never fires, so it is
-    warned as a deferred hop.
+    read-side restore chain. Read-side (output) transformers are honored only on
+    Elasticsearch read paths by design (geoid#1643): the four ES-backed tiers
+    (items, collection, asset, catalog) do since geoid#1574. An
+    ``output_transformers`` declaration on a SEARCH entry whose resolved driver
+    is not an ES read path will not fire; this warning is the signal that the
+    declaration is a no-op for the current driver.
     """
     for op_name, entries in operations.items():
         for entry in entries:
@@ -448,8 +450,10 @@ def _warn_deferred_transformer_hops(
                     _DEFERRED_HOP_WARNED.add(key)
                     if op_name == Operation.SEARCH and not output_search_wired:
                         reason = (
-                            "read-side restore_from_index is wired only for the "
-                            "asset tier in this release (geoid#1567)"
+                            "read-side (output) transformers are honored only on "
+                            "Elasticsearch read paths by design (geoid#1643) — "
+                            "this SEARCH entry resolves to a non-ES driver so the "
+                            "restore chain will not fire"
                         )
                     else:
                         reason = (
