@@ -66,7 +66,11 @@ COLLECTION_RESERVED_MEMBERS: frozenset = frozenset({
     "summaries",
     "conformsTo",
 })
-_COLLECTION_I18N_FIELDS: frozenset = frozenset({"keywords"})
+# Multilingual ({"en": ..., "fr": ...}) values for these members are routed to
+# the typed ``metadata`` container instead of the flat properties bag (whose
+# keyword mapping would reject object values) — refs #1932. Plain (non-dict)
+# values keep their historical placement.
+_COLLECTION_I18N_FIELDS: frozenset = frozenset({"title", "description", "keywords"})
 
 
 def build_canonical_collection_doc(
@@ -120,7 +124,11 @@ def unproject_collection_from_es(source: Dict[str, Any]) -> Dict[str, Any]:
     ``extent`` is returned as stored (opaque) — the driver's ``_unenrich_doc``
     restores the STAC extent shape afterwards. Pure function.
     """
-    out = unproject_metadata_from_es(source, ...)
+    out = unproject_metadata_from_es(
+        source,
+        reserved_member_keys=COLLECTION_RESERVED_MEMBERS,
+        wire_type="Collection",
+    )
 
     meta = source.get("metadata")
     if isinstance(meta, dict):

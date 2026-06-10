@@ -152,12 +152,13 @@ def describe_preset(preset: Any, *, mode: str = "field") -> Dict[str, Any]:
     }
 
     # Inject _meta only when mode != "none" and params_model is meaningful.
-    has_real_params = (
-        pm is not None
+    # Conditions stay inline so the type checker narrows ``pm`` at the call.
+    if (
+        mode != "none"
+        and pm is not None
         and pm is not NoParams
         and hasattr(pm, "model_fields")
-    )
-    if mode != "none" and has_real_params:
+    ):
         tier_str = _tier_value(preset) or None
         descriptor["_meta"] = build_meta_block(pm, tier=tier_str, mode=mode)
 

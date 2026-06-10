@@ -20,12 +20,12 @@
 
 Covers the bundle shape and the ``catalog_scopable`` dispatch at both
 catalog and collection URL families via
-``admin_service._preset_reachable_at`` and
-``admin_service._resolve_preset_for_scope``.
+``presets_api._preset_reachable_at`` and
+``presets_api._resolve_preset_for_scope``.
 """
 from __future__ import annotations
 
-from dynastore.extensions.admin.admin_service import (
+from dynastore.extensions.configs.presets_api import (
     _preset_reachable_at,
     _resolve_preset_for_scope,
 )

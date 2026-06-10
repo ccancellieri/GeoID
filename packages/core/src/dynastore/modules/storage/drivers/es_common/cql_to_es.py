@@ -213,18 +213,23 @@ class _CqlToEsEvaluator(Evaluator):
         # behaviour unchanged.
         attr_name = getattr(getattr(node, "lhs", None), "name", None)
         fulltext_path = self.fulltext_mapping.get(attr_name) if attr_name else None
+        # pygeofilter types ``pattern`` as ScalarAstType; LIKE patterns are
+        # always textual on the wire, so coerce defensively for the helpers.
+        raw_pattern = (
+            node.pattern if isinstance(node.pattern, str) else str(node.pattern)
+        )
         if fulltext_path is not None:
             # Strip the LIKE wildcards/escapes for the free-text query string;
             # ``match`` tokenises rather than glob-matches.
             query_text = _like_to_match_text(
-                node.pattern, node.wildcard, node.singlechar, node.escapechar
+                raw_pattern, node.wildcard, node.singlechar, node.escapechar
             )
             q: Dict[str, Any] = {"match": {fulltext_path: query_text}}
             if node.not_:
                 return {"bool": {"must_not": [q]}}
             return q
         pattern = _like_to_wildcard(
-            node.pattern, node.wildcard, node.singlechar, node.escapechar
+            raw_pattern, node.wildcard, node.singlechar, node.escapechar
         )
         expr: Dict[str, Any] = {"value": pattern, "case_insensitive": node.nocase}
         q = {"wildcard": {lhs: expr}}
