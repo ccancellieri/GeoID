@@ -20,12 +20,12 @@
 
 Covers the bundle shape and, crucially, the previously-untested
 ``catalog_scopable`` dispatch branch in
-``admin_service._preset_reachable_at`` (#972: the branch existed but no
+``presets_api._preset_reachable_at`` (#972: the branch existed but no
 shipped ITEMS-tier preset exercised it).
 """
 from __future__ import annotations
 
-from dynastore.extensions.admin.admin_service import (
+from dynastore.extensions.configs.presets_api import (
     _preset_reachable_at,
     _resolve_preset_for_scope,
 )
@@ -75,7 +75,7 @@ def test_items_es_private_pins_private_es_driver():
     assert "items_elasticsearch_driver" not in refs
 
 
-# --- catalog_scopable dispatch branch (admin_service:254-258) ---------------
+# --- catalog_scopable dispatch branch (presets_api) --------------------------
 
 
 def test_reachable_at_collection_and_catalog_when_scopable():
