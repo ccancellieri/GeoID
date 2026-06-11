@@ -414,8 +414,8 @@ class GCPModule(
 
             # --- Liveness reconciler (#735) ---
             # Replaces the fixed spawn-lease guess: probe lapsed-lease Cloud Run
-            # task rows for real execution liveness before the pg_cron reaper
-            # blindly reclaims them. Gated by _should_register_gcp_job_runner()
+            # task rows for real execution liveness before the MaintenanceSupervisor
+            # task_reaper blindly reclaims them. Gated by _should_register_gcp_job_runner()
             # — Cloud Run Job containers and opted-out services must NOT run it
             # (they would compete needlessly and never own a gcp_cloud_run_ row).
             #
@@ -432,7 +432,7 @@ class GCPModule(
             except AssertionError:
                 # No DB engine available at all; schema-init's warning above
                 # already covers operator visibility. Reconciler stays inert,
-                # pg_cron reaper remains the backstop.
+                # MaintenanceSupervisor task_reaper remains the backstop.
                 reconciler_engine = None
             if _should_register_gcp_job_runner() and reconciler_engine is not None:
                 try:
@@ -457,7 +457,7 @@ class GCPModule(
                 except Exception as e:
                     logger.error(
                         "GCP Module: failed to start liveness reconciler "
-                        "(%s). pg_cron reaper remains the backstop.", e,
+                        "(%s). MaintenanceSupervisor task_reaper remains the backstop.", e,
                         exc_info=True,
                     )
                     self._liveness_reconciler = None

@@ -43,9 +43,10 @@ class TasksPluginConfig(PluginConfig):
             "refuses further retries once a row reaches retry_count >= "
             "hard_retry_cap, regardless of the row's individual max_retries. "
             "Defends against re-enqueue loops where a misbehaving runner "
-            "creates new rows or fails to mark the row terminal. The pg_cron "
-            "reaper SQL is rebuilt at startup; live changes only take effect "
-            "on the next service restart."
+            "creates new rows or fails to mark the row terminal. The "
+            "reap_stuck_tasks PL/pgSQL function is rebuilt via CREATE OR "
+            "REPLACE at startup; live changes only take effect on the next "
+            "service restart."
         ),
     )
 

@@ -74,8 +74,6 @@ class ParsedURL(BaseModel):
 # --- Standardized Folder Names ---
 CATALOG_FOLDER = "catalog"
 COLLECTIONS_FOLDER = "collections"
-# REPORTS_FOLDER = "reports"
-# INGESTIONS_FOLDER = "ingestions"
 
 # This aligns with CI/CD variables and common configurations.
 project_id = os.getenv("PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT"))
@@ -288,14 +286,6 @@ def get_gcs_collection_path(bucket_name: str, collection_id: str) -> str:
     """Returns the full GCS URI for a specific collection's folder (e.g., gs://bucket/collections/my-collection/)."""
     return f"gs://{bucket_name}/{COLLECTIONS_FOLDER}/{collection_id}/"
 
-# def get_gcs_ingestion_path(bucket_name: str) -> str:
-#     """Returns the full GCS URI for the ingestion folder (e.g., gs://bucket/ingestion/)."""
-#     return f"gs://{bucket_name}/{INGESTION_FOLDER}/"
-
-# def get_gcs_report_path(bucket_name: str) -> str:
-#     """Returns the full GCS URI for the reports folder (e.g., gs://bucket/reports/)."""
-#     return f"gs://{bucket_name}/{REPORTS_FOLDER}/"
-
 def get_blob_path_for_catalog_file(filename: str) -> str:
     """Returns the relative blob path for a file in the catalog folder (e.g., catalog/my-file.txt)."""
     return f"{CATALOG_FOLDER}/{filename}"
@@ -307,14 +297,6 @@ def get_blob_path_for_collection_folder(collection_id: str) -> str:
 def get_blob_path_for_collection_file(collection_id: str, filename: str) -> str:
     """Returns the relative blob path for a file in a collection's folder (e.g., collections/my-collection/my-file.txt)."""
     return f"{get_blob_path_for_collection_folder(collection_id)}{filename}"
-
-# def get_blob_path_for_ingestion_file(filename: str) -> str:
-#     """Returns the relative blob path for a file in the ingestion folder (e.g., ingestion/my-file.txt)."""
-#     return f"{INGESTION_FOLDER}/{filename}"
-
-# def get_blob_path_for_report_file(filename: str) -> str:
-#     """Returns the relative blob path for a file in the reports folder (e.g., reports/my-file.txt)."""
-#     return f"{REPORTS_FOLDER}/{filename}"
 
 def parse_url(url: str) -> ParsedURL:
     """

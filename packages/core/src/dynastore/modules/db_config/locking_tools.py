@@ -507,9 +507,16 @@ async def check_trigger_exists(
 
 
 async def check_cron_job_exists(conn: DbResource, job_name: str) -> bool:
-    """Checks if a pg_cron job exists."""
+    """Checks if a pg_cron job exists.
+
+    Returns ``False`` when the ``cron.job`` table is absent (pg_cron not
+    installed), mirroring the graceful-false behaviour of
+    :func:`check_extension_exists`.
+    """
     from dynastore.modules.db_config.maintenance_tools import DQLQuery, ResultHandler
 
+    if not await check_extension_exists(conn, "pg_cron"):
+        return False
     query = DQLQuery(
         "SELECT 1 FROM cron.job WHERE jobname = :job_name",
         result_handler=ResultHandler.SCALAR,

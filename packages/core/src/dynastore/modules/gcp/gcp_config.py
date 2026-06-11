@@ -203,8 +203,8 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
     liveness_reconciler_interval_seconds: Mutable[int] = Field(
         default=int(os.environ.get("GCP_LIVENESS_RECONCILER_INTERVAL", "20")),
         description="How often (seconds) the liveness reconciler scans lapsed-lease "
-                    "Cloud Run task rows. Kept below the 60s pg_cron reaper cadence "
-                    "so the reconciler gets first look."
+                    "Cloud Run task rows. Kept below the MaintenanceSupervisor "
+                    "task_reaper cadence so the reconciler gets first look."
     )
     liveness_extend_visibility_seconds: Mutable[int] = Field(
         default=int(os.environ.get("GCP_LIVENESS_EXTEND_VISIBILITY", "300")),
@@ -215,7 +215,8 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
         default=int(os.environ.get("GCP_LIVENESS_UNKNOWN_GRACE", "180")),
         description="Grace window (seconds) for a young task row whose runner_ref "
                     "is not captured yet: the reconciler extends its lease once to "
-                    "cover the spawn→capture gap before leaving it to the pg_cron reaper."
+                    "cover the spawn→capture gap before leaving it to the "
+                    "MaintenanceSupervisor task_reaper job."
     )
 
 class TriggeredAction(BaseModel):

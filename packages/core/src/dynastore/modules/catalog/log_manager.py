@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 #   - logs:              partitioned by collection_id (LIST) for efficient pruning.
 #   - logs_default:      DEFAULT partition for catalog-scoped logs (no collection).
 #
-#  Maintenance (pg_cron):
+#  Maintenance (MaintenanceSupervisor JOB_TENANT_LOGS_PRUNE / JOB_SYSTEM_LOGS_PRUNE):
 #   - Monthly: Prune logs older than 1 year.
 # ==============================================================================
 
@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS {schema}.logs_default
     PARTITION OF {schema}.logs FOR VALUES IN ('');
 """
 
-# Logs do not use dead-letter tables; old rows are pruned directly via pg_cron.
+# Logs do not use dead-letter tables; old rows are pruned directly by the
+# MaintenanceSupervisor (JOB_TENANT_LOGS_PRUNE / JOB_SYSTEM_LOGS_PRUNE jobs).
 
 # ----- System logs (flat, no partition) -----
 SYSTEM_LOGS_DDL = f"""

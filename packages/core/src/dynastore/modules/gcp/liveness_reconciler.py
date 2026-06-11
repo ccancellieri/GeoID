@@ -22,20 +22,21 @@
 cold-start duration, fragile the moment the image grows or a region throttles.
 This reconciler replaces the guess with a real signal.
 
-Every ``interval_seconds`` (default 20s — faster than the 60s pg_cron reaper,
-so it gets first look) it scans lapsed-lease ``gcp_cloud_run_*`` task rows and,
-for each, asks the owning runner — via :class:`LivenessProbeProtocol` — whether
-the Cloud Run execution backing the row is actually alive. It then acts on the
-verdict:
+Every ``interval_seconds`` (default 20s — faster than the MaintenanceSupervisor
+``task_reaper`` cadence, so it gets first look) it scans lapsed-lease
+``gcp_cloud_run_*`` task rows and, for each, asks the owning runner — via
+:class:`LivenessProbeProtocol` — whether the Cloud Run execution backing the row
+is actually alive. It then acts on the verdict:
 
 * ``ALIVE``              → extend the lease; the reaper's next pass skips the row.
 * ``DEAD`` / ``TERMINAL_FAILED`` → ``fail_task(retry=True)`` immediately.
 * ``TERMINAL_SUCCEEDED`` → reconcile the row to COMPLETED from the ``outputs``
   the container persisted before exiting 0.
 * ``UNKNOWN``            → a young row whose handle isn't captured yet gets one
-  short grace extension; otherwise no-op and the pg_cron reaper backstops.
+  short grace extension; otherwise no-op and the MaintenanceSupervisor
+  ``task_reaper`` job backstops.
 
-The pg_cron ``reap_stuck_tasks`` function is intentionally **unchanged** — it
+The ``reap_stuck_tasks`` PL/pgSQL function is intentionally **unchanged** — it
 stays the ultimate backstop and is correct for in-process runners (whose owner
 ids no probe maps, so the reconciler no-ops on them).
 """
@@ -81,9 +82,10 @@ class ReconcileOutcome(NamedTuple):
 
     ``verdict`` is the probe's verdict verbatim — truthful even when the
     follow-up action lost a race. ``race_lost`` is ``True`` only on the
-    ALIVE path when the conditional heartbeat matched 0 rows (the pg_cron
-    reaper won the SELECT→probe→act race); it lets ``_reconcile_once`` tally
-    race losses distinctly without re-deriving them.
+    ALIVE path when the conditional heartbeat matched 0 rows (the
+    MaintenanceSupervisor ``task_reaper`` job won the SELECT→probe→act race);
+    it lets ``_reconcile_once`` tally race losses distinctly without
+    re-deriving them.
     """
 
     verdict: LivenessVerdict
@@ -218,8 +220,9 @@ class GcpLivenessReconciler:
         #   → TERMINAL_SUCCEEDED + RACE_LOST
         #
         # In every case the same operator signal applies: the reconciler is
-        # losing the SELECT→probe→act race to the pg_cron reaper and
-        # ``liveness_reconciler_interval_seconds`` needs tuning down.
+        # losing the SELECT→probe→act race to the MaintenanceSupervisor
+        # ``task_reaper`` job and ``liveness_reconciler_interval_seconds``
+        # needs tuning down.
         parts = [f"{name}={count}" for name, count in sorted(verdicts.items())]
         if unmapped:
             parts.append(f"UNMAPPED={unmapped}")
@@ -237,7 +240,8 @@ class GcpLivenessReconciler:
         Returns a :class:`ReconcileOutcome` (verdict + race-loss flag) so
         :meth:`_reconcile_once` can build a per-pass distribution and tally
         race losses. Returns ``None`` when no probe owns the row (in-process /
-        ephemeral / unrecognized) — those rows are left for the pg_cron reaper.
+        ephemeral / unrecognized) — those rows are left for the MaintenanceSupervisor
+        ``task_reaper`` job.
         """
         from dynastore.models.tasks import Task
 
@@ -249,7 +253,7 @@ class GcpLivenessReconciler:
         probe = resolve_probe(owner_id)
         if probe is None:
             # In-process / ephemeral / unrecognized owner — no probe maps it.
-            # The pg_cron reaper handles this row exactly as today.
+            # The MaintenanceSupervisor task_reaper job handles this row.
             return None
 
         task = Task.model_validate(row)
@@ -264,10 +268,11 @@ class GcpLivenessReconciler:
             #
             # Conditional heartbeat: the helper updates only when the row is
             # still ``ACTIVE`` and returns whether it matched. A ``False``
-            # return means the row was reclaimed by the pg_cron reaper between
-            # this reconciler's SELECT-commit and its UPDATE — the accepted
-            # race window. Surface it so operators can see how often it fires
-            # in practice and tune the reconciler interval down (#741 item 3).
+            # return means the row was reclaimed by the MaintenanceSupervisor
+            # ``task_reaper`` job between this reconciler's SELECT-commit and
+            # its UPDATE — the accepted race window. Surface it so operators
+            # can see how often it fires in practice and tune the reconciler
+            # interval down (#741 item 3).
             extended = await tasks_module.heartbeat_task_if_active(
                 self._engine, task_id,
                 timedelta(seconds=self._extend_visibility_seconds),
@@ -280,7 +285,8 @@ class GcpLivenessReconciler:
             else:
                 logger.warning(
                     "GcpLivenessReconciler: task %s ALIVE (execution=%s) but heartbeat "
-                    "matched 0 rows — the pg_cron reaper won the SELECT→probe→act race. "
+                    "matched 0 rows — the MaintenanceSupervisor task_reaper won the "
+                    "SELECT→probe→act race. "
                     "Consider tuning liveness_reconciler_interval_seconds down.",
                     task_id, runner_ref,
                 )
@@ -294,8 +300,9 @@ class GcpLivenessReconciler:
                 else "Cloud Run execution gone/cancelled"
             )
             # Race-guarded by ``owner_id``: only fail the exact execution
-            # attempt the probe observed. If the pg_cron reaper reclaimed the
-            # row and the dispatcher re-claimed it as a fresh attempt between
+            # attempt the probe observed. If the MaintenanceSupervisor
+            # task_reaper job reclaimed the row and the dispatcher re-claimed
+            # it as a fresh attempt between
             # this reconciler's SELECT and now, ``fail_task`` matches 0 rows —
             # don't fail a task that is legitimately running again (#750).
             acted = await tasks_module.fail_task(
@@ -341,7 +348,8 @@ class GcpLivenessReconciler:
             else:
                 logger.warning(
                     "GcpLivenessReconciler: task %s %s (execution=%s) but fail_task "
-                    "matched 0 rows — the pg_cron reaper won the SELECT→probe→act race. "
+                    "matched 0 rows — the MaintenanceSupervisor task_reaper won the "
+                    "SELECT→probe→act race. "
                     "Consider tuning liveness_reconciler_interval_seconds down.",
                     task_id, verdict.value, runner_ref,
                 )
@@ -396,8 +404,8 @@ class GcpLivenessReconciler:
             else:
                 logger.warning(
                     "GcpLivenessReconciler: task %s TERMINAL_SUCCEEDED (execution=%s) but "
-                    "complete_task matched 0 rows — the pg_cron reaper won the "
-                    "SELECT→probe→act race. Consider tuning "
+                    "complete_task matched 0 rows — the MaintenanceSupervisor task_reaper "
+                    "won the SELECT→probe→act race. Consider tuning "
                     "liveness_reconciler_interval_seconds down.",
                     task_id, runner_ref,
                 )
@@ -423,9 +431,9 @@ class GcpLivenessReconciler:
                 )
             else:
                 # Inconclusive and not in the capture-gap window — leave it for
-                # the pg_cron reaper. Fail-safe by design.
+                # the MaintenanceSupervisor task_reaper job. Fail-safe by design.
                 logger.debug(
-                    "GcpLivenessReconciler: task %s UNKNOWN — leaving for pg_cron reaper.",
+                    "GcpLivenessReconciler: task %s UNKNOWN — leaving for MaintenanceSupervisor task_reaper.",
                     task_id,
                 )
             return ReconcileOutcome(verdict)

@@ -127,9 +127,10 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
     Path 2 used to call ``create_task`` unconditionally, producing one new row
     + one Cloud Run Job execution per dispatcher claim. Combined with the
-    pg_cron reaper resetting ACTIVE rows back to PENDING when ``locked_until``
-    lapsed, this caused an unbounded re-enqueue loop. See #726 for the full
-    diagnosis and #735 for the liveness-reconciler followup.
+    MaintenanceSupervisor ``task_reaper`` job resetting ACTIVE rows back to
+    PENDING when ``locked_until`` lapsed, this caused an unbounded re-enqueue
+    loop. See #726 for the full diagnosis and #735 for the
+    liveness-reconciler followup.
     """
 
     mode = TaskExecutionMode.ASYNCHRONOUS
@@ -235,7 +236,8 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         owner_id = f"gcp_cloud_run_{execution_id}"
         # Lease for a freshly-launched Cloud Run Job. Picked to outlast typical
         # job startup + run; the in-job heartbeat (main_task.py) extends it while
-        # the job runs, and the pg_cron reaper resets the row if the lease lapses.
+        # the job runs, and the MaintenanceSupervisor task_reaper resets the row
+        # if the lease lapses.
         _timeout_seconds = 3600
         try:
             from dynastore.tools.discovery import get_protocol
@@ -426,8 +428,9 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         # probe can later ask the Executions API "is this execution alive?".
         # Done on BOTH paths (REST born-claimed + dispatcher reuse) — the row
         # exists either way.  Best-effort: a missed write just leaves
-        # runner_ref NULL and the probe degrades to UNKNOWN (pg_cron reaper
-        # backstops) — never worth failing a successfully-dispatched job over.
+        # runner_ref NULL and the probe degrades to UNKNOWN (MaintenanceSupervisor
+        # task_reaper backstops) — never worth failing a successfully-dispatched
+        # job over.
         if runner_ref:
             try:
                 await tasks_module.set_runner_ref(
@@ -458,10 +461,10 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
     # LivenessProbeProtocol — #735
     #
     # GcpJobRunner spawns Cloud Run Job *executions* that outlive this
-    # process. The pg_cron reaper resetting a lapsed-lease row to PENDING
-    # is therefore wrong for these rows when the execution is still alive
-    # (cold start) — it spawns a duplicate. The liveness reconciler asks
-    # this runner whether the execution is actually alive before the
+    # process. The MaintenanceSupervisor task_reaper resetting a lapsed-lease
+    # row to PENDING is therefore wrong for these rows when the execution is
+    # still alive (cold start) — it spawns a duplicate. The liveness reconciler
+    # asks this runner whether the execution is actually alive before the
     # reaper acts; this is how it knows.
     # ------------------------------------------------------------------
 
@@ -526,7 +529,8 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         """Query the Cloud Run Executions API for the execution backing ``task``.
 
         Never raises — every failure mode degrades to ``UNKNOWN`` so the
-        reconciler loop survives and the pg_cron reaper remains the backstop:
+        reconciler loop survives and the MaintenanceSupervisor task_reaper
+        remains the backstop:
 
         * ``runner_ref`` not captured yet (sub-second spawn→capture gap) → UNKNOWN
         * execution ``NotFound`` (deleted / never materialized)         → DEAD
@@ -564,6 +568,6 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 return LivenessVerdict.DEAD
             logger.warning(
                 "GcpJobRunner.probe_liveness: inconclusive probe for '%s' (%s) "
-                "— UNKNOWN, pg_cron reaper backstops.", runner_ref, exc,
+                "— UNKNOWN, MaintenanceSupervisor task_reaper backstops.", runner_ref, exc,
             )
             return LivenessVerdict.UNKNOWN

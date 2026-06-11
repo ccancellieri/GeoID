@@ -18,14 +18,11 @@
 
 """Unit tests for the anonymous-create policy registered by the geoid extension.
 
-Policy registration moved from the global ``register_geoid_policies()`` (now a
-deprecated no-op) to the per-catalog ``register_geoid_policies_for_catalog()``,
+Policy registration lives in the per-catalog ``register_geoid_policies_for_catalog()``,
 invoked from the geoid preset's on-applied hook (CATALOG_CREATION). These tests
-pin both halves of that contract:
-
-  * the legacy global entry point registers nothing and warns;
-  * the per-catalog entry point emits ``geoid_anonymous_create_per_collection``
-    as an ALLOW on POST to the STAC/Features item-intake paths.
+pin the per-catalog contract: the entry point emits
+``geoid_anonymous_create_per_collection`` as an ALLOW on POST to the STAC/Features
+item-intake paths.
 
 Priority bands for the same policy set are pinned separately in
 ``test_catalog_policy_priorities.py``; here we focus on the create policy's
@@ -95,25 +92,6 @@ def _register_for_catalog(monkeypatch: Any, catalog_id: str) -> Dict[str, Policy
     ):
         _run(cp.register_geoid_policies_for_catalog(catalog_id))
     return {call.args[0].id: call.args[0] for call in mock_pm.create_policy.call_args_list}
-
-
-# ---------------------------------------------------------------------------
-# Legacy global entry point — now a deprecated no-op
-# ---------------------------------------------------------------------------
-
-def test_register_geoid_policies_legacy_is_deprecated_noop(caplog):
-    """The global ``register_geoid_policies()`` no longer registers anything;
-    registration moved to per-catalog hooks. It must stay a no-op that warns,
-    so any caller still wired to it surfaces the deprecation instead of
-    silently registering nothing."""
-    from dynastore.extensions.geoid import policies as geoid_policies
-
-    pm = MagicMock()
-    with caplog.at_level("WARNING"):
-        geoid_policies.register_geoid_policies()
-
-    pm.register_policy.assert_not_called()
-    assert any("deprecated" in rec.message.lower() for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------
