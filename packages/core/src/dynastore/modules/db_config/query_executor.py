@@ -527,8 +527,13 @@ class BaseExecutor:
                 # Ensure closed if something failed
                 try:
                     await conn.close()
-                except Exception:
-                    pass
+                except Exception as close_exc:
+                    # Connection is likely dead; log so operators can correlate
+                    # pool-slot leaks with the originating error.
+                    logger.warning(
+                        "query_executor: conn.close() failed during error cleanup: %s",
+                        close_exc,
+                    )
                 raise
         return await self._build_and_execute_async(db_resource, raw_params)
 
@@ -998,8 +1003,15 @@ class DDLExecutor(BaseExecutor):
                         try:
                             if conn.in_transaction():
                                 await conn.rollback()
-                        except Exception:
-                            pass
+                        except Exception as rb_exc:
+                            # Rollback of the autobegin transaction failed — the
+                            # connection is likely dead or in a bad state. Log so
+                            # operators can correlate DDL-skip symptoms with the
+                            # underlying wire failure.
+                            logger.warning(
+                                "query_executor: autobegin rollback failed before DDL lock: %s",
+                                rb_exc,
+                            )
                     if res:
                         return await self._apply_post_processing_async(None)
             except Exception as e:
@@ -1354,12 +1366,18 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
         # consumer in a poisoned state.
         try:
             await conn.invalidate()
-        except Exception:
-            pass
+        except Exception as inv_exc:
+            logger.warning(
+                "db_pool_acquire: conn.invalidate() failed during cleanup: %s",
+                inv_exc,
+            )
         try:
             await conn.close()
-        except Exception:
-            pass
+        except Exception as close_exc:
+            logger.warning(
+                "db_pool_acquire: conn.close() failed during cleanup: %s",
+                close_exc,
+            )
         raise
 
 
@@ -1447,6 +1465,8 @@ async def managed_transaction(db_resource: Optional[DbResource]):
                         try:
                             await conn.invalidate()
                         except Exception:
+                            # Best-effort eviction on a dead wire during cancel
+                            # drain; conn.close() below still removes the slot.
                             pass
                     drain_fut = asyncio.ensure_future(
                         _drain_rollback_exit(txn_cm, exc),

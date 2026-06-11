@@ -1595,8 +1595,12 @@ class ItemsElasticsearchDriver(
                                 ctx=restore_ctx,
                             )
                         yield feature
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "ItemsElasticsearchDriver: failed to fetch/transform item"
+                        " id=%s catalog=%s collection=%s: %s",
+                        eid, catalog_id, collection_id, exc,
+                    )
         else:
             # Single-collection scopes+routes to one collection's shard;
             # multi-collection (request.collections) queries all shards.
@@ -1610,6 +1614,7 @@ class ItemsElasticsearchDriver(
                     params=params,
                 )
                 for hit in resp.get("hits", {}).get("hits", []):
+                    hit_id = hit.get("_id", "<unknown>")
                     try:
                         feature = self._es_source_to_feature(
                             hit["_source"], read_policy,
@@ -1624,8 +1629,12 @@ class ItemsElasticsearchDriver(
                                 ctx=restore_ctx,
                             )
                         yield feature
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "ItemsElasticsearchDriver: failed to transform search hit"
+                            " id=%s catalog=%s collection=%s: %s",
+                            hit_id, catalog_id, collection_id, exc,
+                        )
             except Exception as e:
                 logger.warning(
                     "ItemsElasticsearchDriver: search failed for %s/%s: %s",
@@ -1656,8 +1665,12 @@ class ItemsElasticsearchDriver(
                     params={"routing": collection_id, "ignore": "404"},
                 )
                 deleted += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "ItemsElasticsearchDriver: failed to delete item"
+                    " id=%s catalog=%s collection=%s: %s",
+                    eid, catalog_id, collection_id, exc,
+                )
         return deleted
 
     async def ensure_storage(
@@ -2256,8 +2269,12 @@ class AssetElasticsearchDriver(
         es = self._get_client()
         try:
             await es.delete(index=index_name, id=asset_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "AssetElasticsearchDriver: failed to delete asset"
+                " id=%s catalog=%s: %s",
+                asset_id, catalog_id, exc,
+            )
 
     # ------------------------------------------------------------------
     # Generic Indexer Protocol — slim, dispatcher-facing surface
@@ -2418,8 +2435,12 @@ class AssetElasticsearchDriver(
                     geometry=None,
                     properties=source,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "AssetElasticsearchDriver: failed to fetch asset"
+                    " id=%s catalog=%s: %s",
+                    asset_id, catalog_id, exc,
+                )
 
     async def delete_entities(
         self,
@@ -2444,8 +2465,12 @@ class AssetElasticsearchDriver(
             try:
                 await es.delete(index=index_name, id=asset_id)
                 deleted += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "AssetElasticsearchDriver: failed to delete asset"
+                    " id=%s catalog=%s: %s",
+                    asset_id, catalog_id, exc,
+                )
         return deleted
 
     async def ensure_storage(

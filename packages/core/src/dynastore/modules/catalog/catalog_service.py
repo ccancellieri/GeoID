@@ -1036,8 +1036,11 @@ class CatalogService(CatalogsProtocol):
                 config_snapshot.update(
                     await config_mgr.list_catalog_configs(catalog_model.id)
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "catalog %s: failed to load config snapshot for lifecycle init: %s",
+                catalog_model.id, exc,
+            )
 
         lifecycle_registry.init_async_catalog(
             catalog_model.id,

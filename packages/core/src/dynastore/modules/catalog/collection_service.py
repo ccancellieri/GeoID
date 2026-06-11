@@ -750,8 +750,11 @@ class CollectionService:
             _cfg = get_protocol(ConfigsProtocol)
             if _cfg is not None:
                 config_snapshot.update(await _cfg.list_catalog_configs(catalog_id))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "collection %s/%s: failed to load config snapshot for lifecycle init: %s",
+                catalog_id, collection_model.id, exc,
+            )
 
         lifecycle_registry.init_async_collection(
             catalog_id,

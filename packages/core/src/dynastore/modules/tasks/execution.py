@@ -1075,8 +1075,11 @@ class ExecutionEngine:
                 await asyncio.sleep(interval)
                 try:
                     await heartbeat_tasks(engine, [task.task_id], visibility_timeout)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "task heartbeat failed task_id=%s: %s",
+                        task.task_id, exc,
+                    )
 
         hb = asyncio.create_task(_heartbeat())
         try:

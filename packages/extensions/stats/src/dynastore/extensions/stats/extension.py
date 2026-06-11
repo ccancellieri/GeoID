@@ -212,8 +212,12 @@ class StatsExtension(ExtensionProtocol, StatsProtocol):
         if catalog_id and catalog_id != "_system_":
             try:
                 schema = await catalogs.resolve_physical_schema(catalog_id) or "catalog"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "StatsExtension: failed to resolve physical schema"
+                    " for catalog_id=%s, falling back to 'catalog': %s",
+                    catalog_id, exc,
+                )
 
         summary = await self.stats_service.get_summary(
             schema=schema,

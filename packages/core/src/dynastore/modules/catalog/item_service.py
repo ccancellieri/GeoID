@@ -363,7 +363,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     driver = write_drivers[0].driver if write_drivers else None
                 else:
                     driver = await get_driver(_op, catalog_id, collection_id)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "_get_physical_table: driver resolution failed"
+                    " op=%s catalog=%s collection=%s: %s",
+                    _op, catalog_id, collection_id, exc,
+                )
                 continue
             if driver and hasattr(driver, "resolve_physical_table"):
                 result = await getattr(driver, "resolve_physical_table")(
@@ -398,7 +403,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     driver = write_drivers[0].driver if write_drivers else None
                 else:
                     driver = await get_driver(_op, catalog_id, collection_id)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "_get_collection_config: driver resolution failed"
+                    " op=%s catalog=%s collection=%s: %s",
+                    _op, catalog_id, collection_id, exc,
+                )
                 continue
             if driver is None:
                 continue
