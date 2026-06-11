@@ -103,6 +103,134 @@ def _apply_extra_metadata_fallbacks(
         collection.extra_fields.pop("summaries", None)
 
 
+def _parse_dt(value: Optional[Any]) -> Optional[datetime]:
+    """Parse a datetime value: pass-through datetime, parse ISO string, else None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.rstrip("Z"))
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def _restore_extent_from_extras(
+    stored_extent: Optional[Any],
+) -> tuple[Optional[pystac.SpatialExtent], Optional[pystac.TemporalExtent]]:
+    """Restore a pystac extent pair from the dict stored in extra_metadata.
+
+    Returns ``(spatial, temporal)`` — either component can be ``None`` when the
+    stored data lacks that half.  Never raises.
+    """
+    if not stored_extent or not isinstance(stored_extent, dict):
+        return None, None
+
+    spatial: Optional[pystac.SpatialExtent] = None
+    temporal: Optional[pystac.TemporalExtent] = None
+
+    try:
+        spatial_data = stored_extent.get("spatial")
+        if spatial_data and isinstance(spatial_data, dict):
+            bboxes = spatial_data.get("bbox")
+            if bboxes and isinstance(bboxes, list) and bboxes:
+                spatial = pystac.SpatialExtent([list(b) for b in bboxes])
+    except Exception:
+        pass
+
+    try:
+        temporal_data = stored_extent.get("temporal")
+        if temporal_data and isinstance(temporal_data, dict):
+            intervals = temporal_data.get("interval")
+            if intervals and isinstance(intervals, list) and intervals:
+                parsed: List[List[Optional[datetime]]] = []
+                for raw_interval in intervals:
+                    if isinstance(raw_interval, (list, tuple)) and len(raw_interval) >= 2:
+                        start = _parse_dt(raw_interval[0])
+                        end = _parse_dt(raw_interval[1])
+                        parsed.append([start, end])
+                if parsed:
+                    temporal = pystac.TemporalExtent(intervals=parsed)
+    except Exception:
+        pass
+
+    return spatial, temporal
+
+
+def _build_temporal_extent(
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+) -> pystac.TemporalExtent:
+    """Build a TemporalExtent from start/end, preserving half-open intervals.
+
+    Adds UTC timezone to naive datetimes.  Both ``None`` yields an open
+    ``[None, None]`` interval (STAC spec permits this).
+    """
+    def _tz(dt: Optional[datetime]) -> Optional[datetime]:
+        if dt is None:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    return pystac.TemporalExtent(intervals=[[_tz(start_dt), _tz(end_dt)]])
+
+
+def _resolve_collection_license(
+    localized: Optional[str],
+    stored_raw: Optional[str],
+) -> str:
+    """Return the best available license string.
+
+    Priority: localized value → stored raw value → STAC spec default
+    "proprietary".
+    """
+    if localized:
+        return localized
+    if stored_raw:
+        return stored_raw
+    return "proprietary"
+
+
+def _raw_license_fallback(raw: Optional[Any]) -> Optional[str]:
+    """Extract any non-empty license string from a raw Internationalized value.
+
+    When the stored value is a language-keyed dict ``{"en": "CC-BY-4.0"}`` and
+    the requested language did not match, localization returns ``None``.  This
+    helper picks the first available value so the correct license is preserved
+    instead of falling back to "proprietary".
+    """
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        return raw or None
+    if isinstance(raw, dict):
+        for v in raw.values():
+            if v and isinstance(v, str):
+                return v
+    return None
+
+
+def _apply_stac_extensions_from_extras(
+    collection: "pystac.Collection",
+    stored_extensions: Optional[List[str]],
+) -> None:
+    """Union stored stac_extensions into the collection's list (no duplicates).
+
+    Contributors (LanguageStacContributor etc.) have already appended their
+    URIs; this helper adds the operator-supplied extensions without removing
+    anything.
+    """
+    if not stored_extensions:
+        return
+    existing = set(collection.stac_extensions or [])
+    for uri in stored_extensions:
+        if uri and uri not in existing:
+            collection.stac_extensions.append(uri)
+            existing.add(uri)
+
+
 async def create_root_catalog(request: Request, lang: str = "en") -> Dict[str, Any]:
     """Generates the root STAC Catalog."""
     # NOTE: derive from get_root_url (includes ``root_path``) rather than
@@ -402,19 +530,24 @@ async def create_collection(
         StacPluginConfig, catalog_id, collection_id
     )
 
-    # Correctly handle the Extent object and its attributes
-    spatial_bbox = [0, 0, 0, 0]
+    # Correctly handle the Extent object and its attributes.
+    # Priority: DB model extent (collection_stac sidecar) → extra_metadata fallback
+    # (stored by _pack_stac_extras) → hardcoded defaults.
+    _stored_extras = meta_dict.get("extra_metadata") or {}
+    if not isinstance(_stored_extras, dict):
+        _stored_extras = {}
+
+    spatial_extent: Optional[pystac.SpatialExtent] = None
+    temporal_extent: Optional[pystac.TemporalExtent] = None
+
     if (
         metadata_model.extent
         and metadata_model.extent.spatial
         and metadata_model.extent.spatial.bbox
     ):
         # The model stores bbox as a list of tuples, get the first one.
-        spatial_bbox = metadata_model.extent.spatial.bbox[0]
+        spatial_extent = pystac.SpatialExtent([list(metadata_model.extent.spatial.bbox[0])])
 
-    spatial_extent = pystac.SpatialExtent([list(spatial_bbox)])
-
-    temporal_interval_dates: List[Optional[datetime]] = [None, None]
     if (
         metadata_model.extent
         and metadata_model.extent.temporal
@@ -422,12 +555,28 @@ async def create_collection(
     ):
         # The model stores interval as a list of tuples, get the first one.
         start_dt, end_dt = metadata_model.extent.temporal.interval[0]
-        if start_dt and end_dt:
-            temporal_interval_dates = [
-                dt.replace(tzinfo=timezone.utc) for dt in (start_dt, end_dt)
-            ]
+        temporal_extent = _build_temporal_extent(
+            start_dt.replace(tzinfo=timezone.utc) if start_dt and not start_dt.tzinfo else start_dt,
+            end_dt.replace(tzinfo=timezone.utc) if end_dt and not end_dt.tzinfo else end_dt,
+        )
 
-    temporal_extent = pystac.TemporalExtent(intervals=[temporal_interval_dates])
+    # Fallback: restore from extra_metadata when the collection_stac sidecar
+    # is not active (no StacStorageConfig) but _pack_stac_extras stored the extent.
+    if spatial_extent is None or temporal_extent is None:
+        _extras_spatial, _extras_temporal = _restore_extent_from_extras(
+            _stored_extras.get("extent")
+        )
+        if spatial_extent is None and _extras_spatial is not None:
+            spatial_extent = _extras_spatial
+        if temporal_extent is None and _extras_temporal is not None:
+            temporal_extent = _extras_temporal
+
+    # Last-resort defaults (STAC spec requires a valid Extent on every Collection).
+    if spatial_extent is None:
+        spatial_extent = pystac.SpatialExtent([[0, 0, 0, 0]])
+    if temporal_extent is None:
+        temporal_extent = pystac.TemporalExtent(intervals=[[None, None]])
+
     extent = pystac.Extent(spatial=spatial_extent, temporal=temporal_extent)
 
     # Language (and any future STAC extension) is contributed via the
@@ -470,7 +619,10 @@ async def create_collection(
         title=meta_dict.get("title") or collection_id,
         stac_extensions=stac_extensions_to_add,
         keywords=meta_dict.get("keywords"),
-        license=meta_dict.get("license") or "proprietary",
+        license=_resolve_collection_license(
+            meta_dict.get("license") if isinstance(meta_dict.get("license"), str) else None,
+            _raw_license_fallback(getattr(metadata_model, "license", None)),
+        ),
     )
 
     # --- Providers (DB model takes precedence, config as fallback) ---
@@ -583,6 +735,23 @@ async def create_collection(
     # collection_stac PG sidecar is not active.  The helper also handles the
     # case where they ARE set (sidecar active) by dropping the duplicate key.
     _apply_extra_metadata_fallbacks(collection, merged_summaries)
+
+    # Remove folded typed keys immediately after the extras merge so that any
+    # code inserted between here and the stac_top_level batch pop below cannot
+    # accidentally double-serialize them as top-level STAC fields.
+    for _folded_key in ("extent", "providers", "summaries"):
+        collection.extra_fields.pop(_folded_key, None)
+
+    # Union stored stac_extensions (from _pack_stac_extras) into the collection's
+    # list after contributors have already appended their URIs.  This preserves
+    # operator-supplied extension URIs that survive via extra_metadata without
+    # replacing anything the StacContributor registry added.
+    _stored_stac_extensions = _stored_extras.get("stac_extensions")
+    if isinstance(_stored_stac_extensions, list):
+        _apply_stac_extensions_from_extras(collection, _stored_stac_extensions)
+    # Also clean up the now-redundant extra_fields key so it is not
+    # double-serialized as a top-level STAC field.
+    collection.extra_fields.pop("stac_extensions", None)
 
     # Add datacube dimensions and variables from config
     if stac_config.cube_dimensions:

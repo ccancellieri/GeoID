@@ -90,6 +90,29 @@ def _quote_ident(name: str) -> str:
     return '"' + n.replace('"', '""') + '"'
 
 
+def _derive_bbox_from_shapely(geom: Any) -> Optional[Tuple[float, float, float, float]]:
+    """Derive a (minx, miny, maxx, maxy) bbox tuple from a shapely geometry.
+
+    Returns ``None`` when ``geom`` is ``None``, empty, or raises any error.
+    Never raises — degrade-safe for write-path use.
+    """
+    if geom is None:
+        return None
+    try:
+        bounds = geom.bounds
+        # bounds returns (minx, miny, maxx, maxy); empty geometries yield
+        # (inf, inf, -inf, -inf) which is not a valid bbox.
+        if len(bounds) != 4:
+            return None
+        minx, miny, maxx, maxy = bounds
+        import math
+        if any(math.isinf(v) or math.isnan(v) for v in bounds):
+            return None
+        return (minx, miny, maxx, maxy)
+    except Exception:
+        return None
+
+
 # ============================================================================
 # IMPLEMENTATION
 # ============================================================================
@@ -1174,6 +1197,14 @@ class GeometriesSidecar(SidecarProtocol):
                 payload[self.config.bbox_column] = wkb.dumps(
                     box(*geom_data["bbox_coords"]), hex=True
                 )
+            elif shapely_geom is not None:
+                derived = _derive_bbox_from_shapely(shapely_geom)
+                if derived is not None:
+                    from shapely.geometry import box
+                    from shapely import wkb
+                    payload[self.config.bbox_column] = wkb.dumps(
+                        box(*derived), hex=True
+                    )
             elif wkb_hex:
                 bbox_val = self._get_val(feature, self.config.bbox_column)
                 if bbox_val:  # Optimization: if passed directly

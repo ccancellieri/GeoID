@@ -193,10 +193,19 @@ def _pack_stac_extras(input_data: Dict[str, Any], language: str) -> Dict[str, An
     for key in list(input_data.keys()):
         if key not in _STAC_REQUEST_SCHEMA_FIELDS:
             extras[key] = input_data.pop(key)
-    # Fold providers/summaries into extras as fallback storage
+    # Fold providers/summaries/extent/stac_extensions into extras as fallback
+    # storage so they round-trip via collection_core even when collection_stac
+    # is not active (no StacStorageConfig).  The read path restores them via
+    # stac_generator helpers before falling back to hardcoded defaults.
+    # Only store non-empty values: an empty extent/stac_extensions carries no
+    # useful data to preserve and should not force extra_metadata creation.
     for key in ("providers", "summaries"):
         if key in input_data and input_data[key] is not None:
             extras[key] = input_data[key]
+    for key in ("extent", "stac_extensions"):
+        val = input_data.get(key)
+        if val:  # non-None and non-empty (empty dict/list skipped)
+            extras[key] = val
     if not extras:
         return input_data
     # Merge into existing extra_metadata or create it
