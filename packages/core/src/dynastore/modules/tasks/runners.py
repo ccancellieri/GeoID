@@ -151,9 +151,6 @@ def get_runners(mode: TaskExecutionMode) -> List[RunnerProtocol]:
     """
     Retrieves a prioritized list of registered runner instances for a given mode.
     """
-    # Ensure default runners are registered
-    register_default_runners()
-    
     from dynastore.tools.discovery import get_protocols
     return [r for r in get_protocols(RunnerProtocol) if r.mode == mode]
 
@@ -981,11 +978,22 @@ capability_map = CapabilityMap()
 
 def register_default_runners() -> None:
     """Ensures that default runners are registered in the global plugin registry.
-    Safe to call multiple times.
+
+    Idempotent: if a runner with the same ``runner_type`` is already present in
+    the plugin registry, this call is a no-op for that runner type.  This guards
+    against double-registration that previously occurred when ``get_runners()``
+    called this function on every invocation, causing ``get_protocols()`` to
+    return duplicate ``RunnerProtocol`` instances for the same logical runner.
     """
-    register_plugin(SyncRunner())
-    register_plugin(BackgroundRunner())
-    register_plugin(WorkerQueueRunner())
+    from dynastore.tools.discovery import get_protocols
+
+    registered_types = {
+        getattr(p, "runner_type", None) for p in get_protocols(RunnerProtocol)
+    }
+    for runner in (SyncRunner(), BackgroundRunner(), WorkerQueueRunner()):
+        if runner.runner_type not in registered_types:
+            register_plugin(runner)
+            registered_types.add(runner.runner_type)
 
 # Register default runners on module load
 register_default_runners()

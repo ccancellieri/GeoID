@@ -100,23 +100,37 @@ def resolve_typologies(task_type: str) -> List[models.ProcessTypology]:
     """Return the runners capable of executing ``task_type``, priority-desc.
 
     Iterates registered ``RunnerProtocol`` implementations and asks each
-    ``can_handle(task_type)``. The first element of the returned list is
+    ``can_handle(task_type)``.  The first element of the returned list is
     the runner the dispatcher would pick by default.
+
+    Deduplicates by ``(runner_type, mode, location)`` keeping the entry with
+    the highest priority, so duplicate runner registrations (which can occur
+    when a runner class is registered more than once) never produce duplicate
+    typology entries in the OGC ``/processes`` response.
     """
     runners: List[RunnerProtocol] = list(get_protocols(RunnerProtocol))
     capable = [r for r in runners if _safe_can_handle(r, task_type)]
     capable.sort(key=lambda r: getattr(r, "priority", 0), reverse=True)
-    return [
-        models.ProcessTypology(
-            runner_type=getattr(r, "runner_type", "unknown"),
-            mode=getattr(r, "mode", TaskExecutionMode.ASYNCHRONOUS),
-            priority=getattr(r, "priority", 0),
-            location=_RUNNER_LOCATIONS.get(
-                getattr(r, "runner_type", "unknown"), "in_process"
-            ),
+
+    seen: Set[tuple] = set()
+    deduped: List[models.ProcessTypology] = []
+    for r in capable:
+        runner_type = getattr(r, "runner_type", "unknown")
+        mode = getattr(r, "mode", TaskExecutionMode.ASYNCHRONOUS)
+        location = _RUNNER_LOCATIONS.get(runner_type, "in_process")
+        key = (runner_type, mode, location)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(
+            models.ProcessTypology(
+                runner_type=runner_type,
+                mode=mode,
+                priority=getattr(r, "priority", 0),
+                location=location,
+            )
         )
-        for r in capable
-    ]
+    return deduped
 
 
 def _safe_can_handle(runner: RunnerProtocol, task_type: str) -> bool:
