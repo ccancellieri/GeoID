@@ -696,9 +696,10 @@ class CatalogModule(ModuleProtocol):
         lang: str = "en",
         ctx: Optional[DriverContext] = None,
         q: Optional[str] = None,
+        ids: Optional[Set[str]] = None,
     ) -> List[Catalog]:
         return await self._cs.list_catalogs(
-            limit=limit, offset=offset, lang=lang, ctx=ctx, q=q
+            limit=limit, offset=offset, lang=lang, ctx=ctx, q=q, ids=ids
         )
 
     async def search_catalogs(

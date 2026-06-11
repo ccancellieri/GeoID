@@ -267,8 +267,13 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
+        ids: Optional[Set[str]] = None,
     ) -> List["Catalog"]:
         """
         Lists all catalogs.
+
+        ``ids`` — restrict results to these catalog ids; applied before
+        pagination so that LIMIT/OFFSET are consistent with the filtered
+        result set.  ``None`` means no restriction (all catalogs).
         """
         ...

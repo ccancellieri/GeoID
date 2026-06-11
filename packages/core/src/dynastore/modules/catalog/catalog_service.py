@@ -1473,14 +1473,31 @@ class CatalogService(CatalogsProtocol):
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
+        ids: Optional[Set[str]] = None,
     ) -> List[Catalog]:
-        """List all catalogs."""
+        """List all catalogs.
+
+        ``ids`` — restrict results to these catalog ids; applied before
+        pagination so LIMIT/OFFSET reflect the filtered set.  ``None``
+        means no restriction.
+        """
         db_resource = ctx.db_resource if ctx else None
         async with managed_transaction(get_catalog_engine(db_resource)) as conn:
             if not q:
-                results = await _list_catalogs_query.execute(
-                    conn, limit=limit, offset=offset
-                )
+                if ids is not None:
+                    sql = (
+                        "SELECT * FROM catalog.catalogs "
+                        "WHERE deleted_at IS NULL AND id = ANY(:ids) "
+                        "ORDER BY id LIMIT :limit OFFSET :offset;"
+                    )
+                    query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
+                    results = await query.execute(
+                        conn, limit=limit, offset=offset, ids=list(ids)
+                    )
+                else:
+                    results = await _list_catalogs_query.execute(
+                        conn, limit=limit, offset=offset
+                    )
             else:
                 # M2.5b — the legacy ``title`` / ``description`` columns
                 # are gone from ``catalog.catalogs``.  Search now joins
@@ -1489,18 +1506,22 @@ class CatalogService(CatalogsProtocol):
                 # same ILIKE pattern to the JSONB ``en`` field.  Left
                 # join so catalogs with no metadata row still match on
                 # ``id ILIKE``.
+                ids_clause = " AND c.id = ANY(:ids)" if ids is not None else ""
                 sql = (
                     "SELECT c.* FROM catalog.catalogs c "
                     "LEFT JOIN catalog.catalog_core m "
                     "  ON m.catalog_id = c.id "
-                    "WHERE c.deleted_at IS NULL AND ("
+                    f"WHERE c.deleted_at IS NULL{ids_clause} AND ("
                     "  c.id ILIKE :q "
                     "  OR m.title->>'en' ILIKE :q "
                     "  OR m.description->>'en' ILIKE :q"
                     ") ORDER BY c.id LIMIT :limit OFFSET :offset;"
                 )
                 query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
-                results = await query.execute(conn, limit=limit, offset=offset, q=f"%{q}%")
+                params: Dict[str, Any] = dict(limit=limit, offset=offset, q=f"%{q}%")
+                if ids is not None:
+                    params["ids"] = list(ids)
+                results = await query.execute(conn, **params)
                 
         # M2.4 — overlay router-supplied metadata per-row.  Each row carries
         # a catalog_id we look up through the router; the merged envelope wins

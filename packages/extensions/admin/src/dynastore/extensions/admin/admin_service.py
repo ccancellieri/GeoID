@@ -654,9 +654,11 @@ class AdminService(ExtensionProtocol):
             raise HTTPException(status_code=503, detail="Catalogs service not available.")
 
         admin_only_ids = await _catalog_admin_filter_ids(request)
-        items = await catalogs_svc.list_catalogs(limit=limit, offset=offset, lang=lang, q=q)
-        if admin_only_ids is not None:
-            items = [c for c in items if c.id in admin_only_ids]
+        if admin_only_ids is not None and len(admin_only_ids) == 0:
+            return []
+        items = await catalogs_svc.list_catalogs(
+            limit=limit, offset=offset, lang=lang, q=q, ids=admin_only_ids
+        )
         out = []
         for c in items:
             title_raw = c.model_dump(mode="json").get("title")
