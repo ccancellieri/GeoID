@@ -237,11 +237,13 @@ CREATE OR REPLACE FUNCTION "{schema}"."maintain_partitions_{schema}_tasks"() RET
 DECLARE
     row RECORD;
     cutoff_date DATE;
+    default_deleted BIGINT;
 BEGIN
     -- Bound AccessExclusiveLock wait: if a partition is being scanned
     -- fail this DROP fast and let the next supervisor tick retry.
     SET LOCAL lock_timeout = '10s';
-    cutoff_date := date_trunc('daily', NOW()) - INTERVAL '1 month';
+    -- 'daily' is not a valid PostgreSQL date_trunc unit; the correct unit is 'day'.
+    cutoff_date := date_trunc('day', NOW()) - INTERVAL '1 month';
     FOR row IN SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{schema}' AND c.relkind = 'r' AND c.relname ~ '^tasks_\\d{{4}}_\\d{{2}}$' LOOP
         DECLARE
             date_str TEXT;
@@ -257,6 +259,15 @@ BEGIN
             RAISE WARNING 'Failed to process partition {schema}.%: %', row.relname, SQLERRM;
         END;
     END LOOP;
+    -- Drain rows from the DEFAULT partition (catches clock-skew / far-future
+    -- timestamps that never land in a monthly partition).  Idempotent: a
+    -- DELETE WHERE nothing matches is a no-op.
+    DELETE FROM "{schema}".tasks_default
+    WHERE timestamp < (NOW() - INTERVAL '1 month');
+    GET DIAGNOSTICS default_deleted = ROW_COUNT;
+    IF default_deleted > 0 THEN
+        RAISE NOTICE 'Pruned % row(s) from {schema}.tasks_default', default_deleted;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 """

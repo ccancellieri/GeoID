@@ -392,3 +392,46 @@ async def test_unschedule_superseded_passes_task_reaper_prefix():
     # Names list must include the task partition/retention jobs
     assert "prune_tasks_tasks" in exec_calls[0]["names"]
     assert "partcreate_tasks_tasks" in exec_calls[0]["names"]
+
+
+# ---------------------------------------------------------------------------
+# Regression: retention DDL must use date_trunc('day') not 'daily' (#1998)
+# ---------------------------------------------------------------------------
+
+
+def test_retention_ddl_uses_day_not_daily():
+    """GLOBAL_TASKS_RETENTION_FUNC_DDL must use date_trunc('day', ...).
+
+    PostgreSQL does not recognise 'daily' as a valid field unit for
+    date_trunc.  The function body is deferred by PL/pgSQL, so the
+    CREATE OR REPLACE succeeds at startup but every invocation fails
+    with "unit 'daily' not recognized" — partitions are never pruned.
+    Regression guard for #1998.
+    """
+    from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_RETENTION_FUNC_DDL
+
+    assert "date_trunc('day'," in GLOBAL_TASKS_RETENTION_FUNC_DDL, (
+        "Retention DDL must call date_trunc('day', ...) — 'daily' is invalid PG syntax"
+    )
+    # The literal date_trunc call must not use 'daily'.  Comments may reference
+    # the old buggy value for documentation purposes — check only the call site.
+    assert "date_trunc('daily'" not in GLOBAL_TASKS_RETENTION_FUNC_DDL, (
+        "Retention DDL must not call date_trunc('daily', ...) — 'daily' is invalid PG syntax"
+    )
+
+
+def test_retention_ddl_drains_tasks_default():
+    """GLOBAL_TASKS_RETENTION_FUNC_DDL must include a DELETE sweep of tasks_default.
+
+    The DEFAULT partition absorbs rows with out-of-range timestamps.
+    Without an explicit sweep those rows accumulate forever since the
+    monthly partition DROP loop never touches tasks_default.
+    """
+    from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_RETENTION_FUNC_DDL
+
+    assert "tasks_default" in GLOBAL_TASKS_RETENTION_FUNC_DDL, (
+        "Retention DDL must include a sweep of the tasks_default partition"
+    )
+    assert "DELETE FROM" in GLOBAL_TASKS_RETENTION_FUNC_DDL, (
+        "Retention DDL must DELETE stale rows from tasks_default"
+    )
