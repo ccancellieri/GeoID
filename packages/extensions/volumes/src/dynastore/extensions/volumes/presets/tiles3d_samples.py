@@ -229,6 +229,8 @@ class Tiles3dSamplesParams(BaseModel):
     """Parameters for the tiles3d_samples preset."""
 
     catalog_id: str = _DEFAULT_CATALOG_ID
+    # CC0 Cesium samples seed by default; 3D BAG (Netherlands) ships real LoD2
+    # building meshes but is CC BY 4.0, so it stays opt-in (attribution-aware).
     include_3dbag: bool = False
     collection_prefix: str = ""
 

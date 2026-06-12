@@ -296,7 +296,11 @@ function buildContainerLayers(container) {
       wireframe: true,
       getPolygon:   (d) => d.contour,
       getElevation: (d) => d.extrudedHeight - d.elevation,
-      getFillColor: (d) => d.id === container.id ? [99, 102, 241, 100] : [99, 102, 241, 40],
+      // The selected container is drawn as a wireframe-only box (zero fill) so
+      // the per-building volumes rendered inside it (footprints layer below)
+      // remain visible; other containers keep a faint translucent fill so they
+      // read as surrounding context.
+      getFillColor: (d) => d.id === container.id ? [99, 102, 241, 0] : [99, 102, 241, 40],
       getLineColor:    [99, 102, 241, 180],
       lineWidthMinPixels: 1,
       pickable:  true,
@@ -324,14 +328,37 @@ function buildContainerLayers(container) {
       pickable: true,
       stroked:  true,
       filled:   true,
-      getFillColor:    [99, 200, 241, 40],
-      getLineColor:    [99, 200, 241, 180],
+      // Extrude each building footprint to its real height so CityJSON-ingested
+      // collections render as 3D LoD1 volumes (not flat outlines). Height comes
+      // from the per-building `height` attribute when present, otherwise the
+      // z-extent (zmax - zmin) stamped at ingest. Both arrive via OGC Features.
+      extruded:  true,
+      wireframe: true,
+      getElevation: featureElevation,
+      getFillColor:    [99, 200, 241, 180],
+      getLineColor:    [40, 120, 160, 220],
       lineWidthMinPixels: 1,
       onClick: (info) => { if (info.object) showBuildingPopup(info.object); },
     }));
   }
 
   return layers;
+}
+
+// Derive an extrusion height (metres) for a building feature from the
+// properties stamped at CityJSON ingest. Prefers the explicit `height`
+// attribute; falls back to the vertical extent (zmax - zmin); 0 when neither
+// is usable (e.g. external samples carry no footprints and never reach here).
+function featureElevation(feature) {
+  const p = (feature && feature.properties) || {};
+  const h = Number(p.height);
+  if (Number.isFinite(h) && h > 0) return h;
+  const zmin = Number(p.zmin);
+  const zmax = Number(p.zmax);
+  if (Number.isFinite(zmin) && Number.isFinite(zmax) && zmax > zmin) {
+    return zmax - zmin;
+  }
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
