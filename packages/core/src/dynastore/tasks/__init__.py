@@ -70,20 +70,12 @@ def set_task_app_state(app_state: object) -> None:
     _TASK_APP_STATE = app_state
 
 def get_task_config(task_type: str) -> Optional[TaskConfig]:
-    """Look up task config by registration name or task_type class attribute.
-
-    Also resolves legacy task type aliases declared via the
-    ``legacy_task_types`` frozenset class attribute, so that task rows
-    written before a rename are still dispatched to the renamed handler.
-    """
+    """Look up task config by registration name or task_type class attribute."""
     config = _DYNASTORE_TASKS.get(task_type)
     if config:
         return config
     for cfg in _DYNASTORE_TASKS.values():
         if getattr(cfg.cls, "task_type", None) == task_type:
-            return cfg
-        legacy = getattr(cfg.cls, "legacy_task_types", None)
-        if legacy and task_type in legacy:
             return cfg
     return None
 

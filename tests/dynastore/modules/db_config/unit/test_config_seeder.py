@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
@@ -45,17 +45,26 @@ def _write_seed(dir_, name, payload):
 
 
 @pytest.mark.asyncio
-async def test_no_defaults_dir_is_noop(monkeypatch, tmp_path):
+async def test_no_defaults_dir_seeds_nothing_but_runs_fixup(monkeypatch, tmp_path):
     monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "nope")
-    # No defaults/ subfolder — silent no-op.
-    await seeder.seed_default_configs(engine=object())
+    fixup = AsyncMock()
+    # No defaults/ subfolder — nothing seeded, but the legacy-key fixup
+    # still runs under the lock (stored rows never self-heal otherwise).
+    with patch.object(seeder, "acquire_startup_lock", _fake_lock), \
+         patch.object(seeder, "_fixup_legacy_outbox_drain_keys", fixup):
+        await seeder.seed_default_configs(engine=object())
+    fixup.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_no_files_is_noop(monkeypatch, tmp_path):
+async def test_no_files_seeds_nothing_but_runs_fixup(monkeypatch, tmp_path):
     (tmp_path / "defaults").mkdir()
     monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
-    await seeder.seed_default_configs(engine=object())
+    fixup = AsyncMock()
+    with patch.object(seeder, "acquire_startup_lock", _fake_lock), \
+         patch.object(seeder, "_fixup_legacy_outbox_drain_keys", fixup):
+        await seeder.seed_default_configs(engine=object())
+    fixup.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -287,7 +296,9 @@ async def test_no_protocol_registered_returns(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
 
     caplog.set_level("WARNING")
-    with patch("dynastore.tools.discovery.get_protocol", return_value=None):
+    with patch("dynastore.tools.discovery.get_protocol", return_value=None), \
+         patch.object(seeder, "acquire_startup_lock", _fake_lock), \
+         patch.object(seeder, "_fixup_legacy_outbox_drain_keys", AsyncMock()):
         await seeder.seed_default_configs(engine=object())
 
     assert any(
@@ -374,3 +385,201 @@ async def test_guard_unset_seeds_then_runs_normally(monkeypatch, tmp_path):
         await seeder.seed_default_configs(engine=object())
 
     config_mgr.set_config.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Legacy "outbox_drain" key fixup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fixup_routing_config_renames_outbox_drain(monkeypatch):
+    """_fixup_routing_config_rows rewrites outbox_drain → event_drain + index_drain."""
+    rows = [
+        {
+            "ref_key": "platform",
+            "config_data": json.dumps({
+                "tasks": {
+                    "outbox_drain": [{"consumers": ["worker"], "runner": "background"}],
+                },
+                "processes": {},
+            }),
+        }
+    ]
+
+    captured_updates: list = []
+
+    async def _fake_select(conn):
+        return rows
+
+    async def _fake_update(conn, *, ref_key, new_data):
+        captured_updates.append((ref_key, json.loads(new_data)))
+
+    monkeypatch.setattr(seeder._q_select_routing_configs, "execute", _fake_select)
+    monkeypatch.setattr(seeder._q_update_routing_config, "execute", _fake_update)
+
+    await seeder._fixup_routing_config_rows(object())
+
+    assert len(captured_updates) == 1
+    ref_key, new_data = captured_updates[0]
+    assert ref_key == "platform"
+    tasks_map = new_data["tasks"]
+    # Legacy key removed.
+    assert "outbox_drain" not in tasks_map
+    # Both new keys populated.
+    assert "event_drain" in tasks_map
+    assert "index_drain" in tasks_map
+    assert tasks_map["event_drain"][0]["consumers"] == ["worker"]
+    assert tasks_map["index_drain"][0]["consumers"] == ["worker"]
+
+
+@pytest.mark.asyncio
+async def test_fixup_routing_config_covers_processes_map(monkeypatch):
+    """A legacy key under 'processes' is split exactly like one under 'tasks'."""
+    rows = [
+        {
+            "ref_key": "platform",
+            "config_data": json.dumps({
+                "tasks": {},
+                "processes": {
+                    "outbox_drain": [{"consumers": ["worker"], "runner": "background"}],
+                },
+            }),
+        }
+    ]
+
+    captured_updates: list = []
+
+    async def _fake_select(conn):
+        return rows
+
+    async def _fake_update(conn, *, ref_key, new_data):
+        captured_updates.append((ref_key, json.loads(new_data)))
+
+    monkeypatch.setattr(seeder._q_select_routing_configs, "execute", _fake_select)
+    monkeypatch.setattr(seeder._q_update_routing_config, "execute", _fake_update)
+
+    await seeder._fixup_routing_config_rows(object())
+
+    assert len(captured_updates) == 1
+    _, new_data = captured_updates[0]
+    proc_map = new_data["processes"]
+    assert "outbox_drain" not in proc_map
+    assert "event_drain" in proc_map and "index_drain" in proc_map
+
+
+@pytest.mark.asyncio
+async def test_fixup_routing_config_no_op_when_clean(monkeypatch):
+    """_fixup_routing_config_rows is a no-op when no legacy key exists."""
+    rows = [
+        {
+            "ref_key": "platform",
+            "config_data": json.dumps({
+                "tasks": {
+                    "event_drain": [{"consumers": ["worker"], "runner": "background"}],
+                    "index_drain": [{"consumers": ["worker"], "runner": "background"}],
+                },
+                "processes": {},
+            }),
+        }
+    ]
+
+    captured_updates: list = []
+
+    async def _fake_select(conn):
+        return rows
+
+    async def _fake_update(conn, *, ref_key, new_data):
+        captured_updates.append(ref_key)
+
+    monkeypatch.setattr(seeder._q_select_routing_configs, "execute", _fake_select)
+    monkeypatch.setattr(seeder._q_update_routing_config, "execute", _fake_update)
+
+    await seeder._fixup_routing_config_rows(object())
+
+    assert captured_updates == [], "No UPDATE should be issued when no legacy key exists."
+
+
+@pytest.mark.asyncio
+async def test_fixup_routing_config_does_not_overwrite_existing_new_keys(monkeypatch):
+    """When event_drain or index_drain already exist, they are not overwritten."""
+    rows = [
+        {
+            "ref_key": "platform",
+            "config_data": json.dumps({
+                "tasks": {
+                    "outbox_drain": [{"consumers": ["old"], "runner": "legacy"}],
+                    "event_drain":  [{"consumers": ["worker"], "runner": "background"}],
+                    # index_drain absent → should be populated from outbox_drain
+                },
+                "processes": {},
+            }),
+        }
+    ]
+
+    captured_updates: list = []
+
+    async def _fake_select(conn):
+        return rows
+
+    async def _fake_update(conn, *, ref_key, new_data):
+        captured_updates.append((ref_key, json.loads(new_data)))
+
+    monkeypatch.setattr(seeder._q_select_routing_configs, "execute", _fake_select)
+    monkeypatch.setattr(seeder._q_update_routing_config, "execute", _fake_update)
+
+    await seeder._fixup_routing_config_rows(object())
+
+    assert len(captured_updates) == 1
+    _, new_data = captured_updates[0]
+    tasks_map = new_data["tasks"]
+    # Existing event_drain must not be overwritten.
+    assert tasks_map["event_drain"][0]["consumers"] == ["worker"]
+    # index_drain was absent → populated from legacy value.
+    assert tasks_map["index_drain"][0]["consumers"] == ["old"]
+    assert "outbox_drain" not in tasks_map
+
+
+@pytest.mark.asyncio
+async def test_fixup_routing_config_tolerates_missing_table(monkeypatch):
+    """_fixup_routing_config_rows is silent when configs table does not exist."""
+    async def _raise(conn):
+        raise Exception("relation configs.platform_configs does not exist")
+
+    monkeypatch.setattr(seeder._q_select_routing_configs, "execute", _raise)
+
+    # Must not propagate.
+    await seeder._fixup_routing_config_rows(object())
+
+
+@pytest.mark.asyncio
+async def test_fixup_pending_task_rows_rewrites(monkeypatch, caplog):
+    """_fixup_pending_task_rows issues an UPDATE for PENDING outbox_drain rows."""
+    updated_rows = [{"task_id": "abc"}, {"task_id": "def"}]
+
+    async def _fake_execute(conn):
+        return updated_rows
+
+    fake_q = AsyncMock()
+    fake_q.execute = _fake_execute
+
+    with patch.object(seeder, "DQLQuery", return_value=fake_q):
+        caplog.set_level("INFO")
+        await seeder._fixup_pending_task_rows(object())
+
+    assert any("2" in r.message and "outbox_drain" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_fixup_pending_task_rows_tolerates_missing_table(monkeypatch, caplog):
+    """_fixup_pending_task_rows is silent when the tasks table does not exist."""
+    async def _raise(conn):
+        raise Exception("relation tasks.tasks does not exist")
+
+    fake_q = MagicMock()
+    fake_q.execute = _raise
+
+    with patch.object(seeder, "DQLQuery", return_value=fake_q):
+        caplog.set_level("DEBUG")
+        # Must not propagate.
+        await seeder._fixup_pending_task_rows(object())

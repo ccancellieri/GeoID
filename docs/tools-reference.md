@@ -37,6 +37,7 @@ Developer guide for all shared utility modules. **Before writing new helpers, ch
 | OGC subset parsing | `tools.ogc_common` | `parse_subset_parameter()` |
 | SQL expression matching | `tools.expression` | `evaluate_sql_condition()` |
 | Advisory locks | `db_config.locking_tools` | `acquire_startup_lock()`, `retry_on_lock_conflict()` |
+| Advisory lock-id derivation | `durable.locks` | `stable_lock_id_sha256()`, `stable_lock_id_blake2b()` |
 | Partition management | `db_config.partition_tools` | `ensure_hierarchical_partitions_exist()` |
 | Schema/extension DDL | `db_config.maintenance_tools` | `ensure_schema_exists()`, `ensure_enum_type()` |
 | Timer/profiling | `tools.timer` | `Timer` context manager |
@@ -365,6 +366,15 @@ async def my_db_operation():
     ...
 ```
 
+Lock-id derivation lives in `dynastore.durable.locks` and is **frozen** (pin-tested):
+`stable_lock_id_sha256(key)` folds a string to the signed 64-bit id used by
+session-scoped leadership (`pg_advisory_leadership`, `acquire_startup_lock`);
+`stable_lock_id_blake2b(*parts)` produces the non-negative 63-bit id used by
+transaction-scoped guards (`pg_try_advisory_xact_lock`). The two are
+intentionally distinct; changing either re-keys live advisory locks and breaks
+single-leader guarantees during a rolling deploy. Leadership loops compose
+`pg_advisory_leadership` with `run_leader_loop` (`dynastore.tools.async_utils`).
+
 ### Partition Management
 
 **Import**: `from dynastore.modules.db_config.partition_tools import ensure_hierarchical_partitions_exist, ensure_partition_exists`
@@ -476,6 +486,9 @@ dynastore/
 │   ├── db.py                       # Extension-level DB utilities
 │   ├── exception_handlers.py       # FastAPI exception mappers
 │   └── language_utils.py           # i18n (re-export from core)
+│
+├── durable/                        # Durable-work primitives (shared SSOT)
+│   └── locks.py                    # Frozen advisory lock-id derivations
 │
 ├── modules/db_config/              # Database infrastructure
 │   ├── locking_tools.py            # Advisory locks, retry_on_lock_conflict

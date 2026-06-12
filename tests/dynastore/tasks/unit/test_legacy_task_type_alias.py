@@ -16,27 +16,20 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""``get_task_config`` resolves legacy task-type aliases.
+"""``get_task_config`` resolves tasks by task_type class attribute.
 
-When a task class declares ``legacy_task_types`` (a frozenset of old
-``task_type`` values), ``get_task_config`` must return the same config for
-both the current ``task_type`` and any legacy alias.  This ensures that
-DB rows written with the old ``task_type`` value are still dispatched to
-the renamed handler during the one-release transition window.
-
-Phase 0 context: ``OutboxDrainTask.task_type`` was renamed from
-``"outbox_drain"`` to ``"index_drain"``; the ``legacy_task_types`` shim
-keeps old rows routable without a DDL migration.
+The legacy_task_types shim (Phase 0 outbox_drain → index_drain) has been
+retired.  DB rows with the old task_type were rewritten at bootstrap by the
+config_seeder fixup.  Dispatcher now resolves tasks by direct task_type
+lookup only.
 """
 from __future__ import annotations
-
-from typing import Optional
-from unittest.mock import MagicMock
 
 import pytest
 
 import dynastore.tasks as tasks_mod
 from dynastore.tasks import TaskConfig, get_task_config
+from dynastore.tasks.outbox_drain.drain_task import OutboxDrainTask
 
 
 # ---------------------------------------------------------------------------
@@ -44,19 +37,9 @@ from dynastore.tasks import TaskConfig, get_task_config
 # ---------------------------------------------------------------------------
 
 
-class _RenamedTask:
-    """Minimal stub that mimics a renamed TaskProtocol implementation."""
-
-    task_type = "index_drain"
-    legacy_task_types: frozenset[str] = frozenset({"outbox_drain"})
-
-    def __init__(self) -> None:
-        pass
-
-
-def _make_config() -> TaskConfig:
+def _make_drain_config() -> TaskConfig:
     return TaskConfig(
-        cls=_RenamedTask,  # type: ignore[arg-type]
+        cls=OutboxDrainTask,  # type: ignore[arg-type]
         module_name=__name__,
         name="index_drain",
     )
@@ -68,57 +51,87 @@ def _make_config() -> TaskConfig:
 
 
 def test_get_task_config_by_current_type(monkeypatch):
-    """``get_task_config('index_drain')`` resolves the renamed task."""
-    cfg = _make_config()
+    """``get_task_config('index_drain')`` resolves the drain task."""
+    cfg = _make_drain_config()
     monkeypatch.setattr(tasks_mod, "_DYNASTORE_TASKS", {"index_drain": cfg})
 
     result = get_task_config("index_drain")
     assert result is cfg
 
 
-def test_get_task_config_by_legacy_alias(monkeypatch):
-    """``get_task_config('outbox_drain')`` resolves via legacy_task_types shim."""
-    cfg = _make_config()
-    monkeypatch.setattr(tasks_mod, "_DYNASTORE_TASKS", {"index_drain": cfg})
-
-    result = get_task_config("outbox_drain")
-    assert result is cfg, (
-        "get_task_config must resolve 'outbox_drain' to the OutboxDrainTask "
-        "config via the legacy_task_types shim so that old DB rows are "
-        "still dispatched to the renamed handler."
-    )
-
-
 def test_get_task_config_unknown_returns_none(monkeypatch):
-    """``get_task_config('totally_unknown')`` returns None — no shim match."""
-    cfg = _make_config()
+    """``get_task_config('totally_unknown')`` returns None."""
+    cfg = _make_drain_config()
     monkeypatch.setattr(tasks_mod, "_DYNASTORE_TASKS", {"index_drain": cfg})
 
     result = get_task_config("totally_unknown")
     assert result is None
 
 
-def test_legacy_alias_does_not_shadow_primary_when_both_registered(monkeypatch):
-    """When two tasks register under different names, the legacy alias of one
-    must not shadow the primary registration of the other."""
+def test_outbox_drain_is_not_resolvable_by_old_name(monkeypatch):
+    """After shim removal, 'outbox_drain' must NOT resolve to OutboxDrainTask.
+
+    The seeder fixup ensures no PENDING rows survive with the old task_type.
+    If a stale row somehow reached the dispatcher, it returns None (no handler)
+    rather than silently routing to the index_drain task under an old alias.
+    """
+    cfg = _make_drain_config()
+    monkeypatch.setattr(tasks_mod, "_DYNASTORE_TASKS", {"index_drain": cfg})
+
+    result = get_task_config("outbox_drain")
+    assert result is None, (
+        "get_task_config('outbox_drain') must return None after shim removal; "
+        "the seeder fixup rewrites PENDING rows before the dispatcher starts."
+    )
+
+
+def test_legacy_task_types_attribute_removed_from_drain_task():
+    """OutboxDrainTask must not declare legacy_task_types after shim removal."""
+    assert not hasattr(OutboxDrainTask, "legacy_task_types"), (
+        "OutboxDrainTask.legacy_task_types must be removed; "
+        "the Phase 0 shim is retired."
+    )
+
+
+def test_get_task_config_does_not_check_legacy_task_types(monkeypatch):
+    """get_task_config must not consult legacy_task_types on any class."""
+    # Inject a task class that still has legacy_task_types (simulating a
+    # not-yet-cleaned external task).  get_task_config must ignore it.
+    class _StaleTask:
+        task_type = "new_name"
+        legacy_task_types: frozenset = frozenset({"old_name"})
+
+    cfg = TaskConfig(
+        cls=_StaleTask,  # type: ignore[arg-type]
+        module_name=__name__,
+        name="new_name",
+    )
+    monkeypatch.setattr(tasks_mod, "_DYNASTORE_TASKS", {"new_name": cfg})
+
+    assert get_task_config("new_name") is cfg
+    assert get_task_config("old_name") is None, (
+        "get_task_config must not fall back to legacy_task_types lookup."
+    )
+
+
+def test_two_tasks_independent_resolution(monkeypatch):
+    """Two tasks with distinct task_types resolve independently."""
 
     class _OtherTask:
         task_type = "other_task"
-        legacy_task_types: frozenset[str] = frozenset()
 
     other_cfg = TaskConfig(
         cls=_OtherTask,  # type: ignore[arg-type]
         module_name=__name__,
         name="other_task",
     )
-    renamed_cfg = _make_config()
+    drain_cfg = _make_drain_config()
 
     monkeypatch.setattr(
         tasks_mod,
         "_DYNASTORE_TASKS",
-        {"index_drain": renamed_cfg, "other_task": other_cfg},
+        {"index_drain": drain_cfg, "other_task": other_cfg},
     )
 
-    assert get_task_config("index_drain") is renamed_cfg
+    assert get_task_config("index_drain") is drain_cfg
     assert get_task_config("other_task") is other_cfg
-    assert get_task_config("outbox_drain") is renamed_cfg

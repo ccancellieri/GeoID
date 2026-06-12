@@ -134,19 +134,6 @@ class RunnerTarget(BaseModel):
     )
 
 
-# One-release backward-compat aliases: routing config rows written before the
-# Phase 0 rename used the old key "outbox_drain".  resolved_targets() tries
-# all aliases so that:
-#   - old callers passing "outbox_drain" find stored "index_drain" entries, and
-#   - new callers passing "index_drain" find stored "outbox_drain" entries.
-# Remove once all stored configs have been re-applied with the new keys.
-_LEGACY_TASK_KEY_MAP: Dict[str, str] = {
-    "outbox_drain": "index_drain",
-}
-# Reverse: new key → old stored key (for reading old configs with new callers).
-_LEGACY_TASK_KEY_REVERSE_MAP: Dict[str, str] = {
-    v: k for k, v in _LEGACY_TASK_KEY_MAP.items()
-}
 
 
 class TaskRoutingConfig(PluginConfig):
@@ -187,26 +174,11 @@ class TaskRoutingConfig(PluginConfig):
         Checks the ``tasks`` bucket first (consistent with ``task_kind()``
         semantics), falls back to ``processes``, returns ``[]`` when the
         key is unknown in both.
-
-        Legacy shim: tries all known aliases for ``task_key`` so that:
-        - Old callers passing the pre-rename key find entries stored under
-          the new key, and
-        - New callers passing the post-rename key find entries stored under
-          the old key (old config not yet migrated).
-        Remove the alias maps once all stored configs use the new keys.
         """
-        candidates = [
-            task_key,
-            _LEGACY_TASK_KEY_MAP.get(task_key),
-            _LEGACY_TASK_KEY_REVERSE_MAP.get(task_key),
-        ]
-        for key in candidates:
-            if key is None:
-                continue
-            if key in self.tasks:
-                return list(self.tasks[key])
-            if key in self.processes:
-                return list(self.processes[key])
+        if task_key in self.tasks:
+            return list(self.tasks[task_key])
+        if task_key in self.processes:
+            return list(self.processes[task_key])
         return []
 
     @model_validator(mode="after")

@@ -16,7 +16,6 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-import hashlib
 import logging
 import asyncio
 import functools
@@ -25,6 +24,7 @@ from contextvars import ContextVar
 from typing import Optional, Callable, Awaitable, ClassVar, TypeVar, Dict, AsyncGenerator, Iterator, Set, Union, cast
 from sqlalchemy import text, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from dynastore.durable.locks import stable_lock_id_sha256 as _stable_lock_id_sha256
 from dynastore.tools.async_utils import LoopLocalLock
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
@@ -150,9 +150,12 @@ class _StartupCoordinator:
 
 
 def _get_stable_lock_id(key: str) -> int:
-    """Generates a stable 64-bit integer from a string key for Postgres advisory locks."""
-    hashed = hashlib.sha256(key.encode("utf-8")).digest()
-    return int.from_bytes(hashed[:8], byteorder="big", signed=True)
+    """Generates a stable 64-bit integer from a string key for Postgres advisory locks.
+
+    Alias of :func:`dynastore.durable.locks.stable_lock_id_sha256`.
+    The canonical home is the durable package; the output is frozen.
+    """
+    return _stable_lock_id_sha256(key)
 
 
 @asynccontextmanager

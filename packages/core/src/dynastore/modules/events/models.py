@@ -30,11 +30,16 @@ API_KEY_NAME = "X-DynaStore-Event-Key"
 # --- Event Models ---
 
 class EventStatusEnum(str, Enum):
-    """Defines the lifecycle status of an event."""
+    """Defines the lifecycle status of an event.
+
+    Values match the strings written by the event store queries:
+    - PENDING:      newly inserted, awaiting a consumer.
+    - PROCESSING:   claimed by a consumer (UPDATE status='PROCESSING').
+    - DEAD_LETTER:  exhausted retries (retry_count >= MAX_RETRIES).
+    """
     PENDING = "PENDING"
-    LOCKED = "LOCKED"
-    PROCESSED = "PROCESSED"
-    FAILED = "FAILED"
+    PROCESSING = "PROCESSING"
+    DEAD_LETTER = "DEAD_LETTER"
 
 class EventChannel(str, Enum):
     """Defines the notification channels."""

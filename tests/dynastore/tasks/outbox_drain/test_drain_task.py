@@ -321,17 +321,13 @@ def test_outbox_drain_task_type_is_index_drain():
     )
 
 
-def test_outbox_drain_task_legacy_alias_present():
-    """legacy_task_types must include 'outbox_drain' for the one-release shim.
+def test_outbox_drain_task_legacy_alias_retired():
+    """The one-release 'outbox_drain' alias shim is gone.
 
-    The dispatcher's get_task_config() resolves legacy aliases so that rows
-    written with task_type='outbox_drain' before the rename are still
-    dispatched to OutboxDrainTask.  Remove once all old rows are drained.
+    Stored rows and configs are rewritten at boot by the config-seeder
+    fixup, so OutboxDrainTask resolves by its canonical task_type only.
     """
-    assert hasattr(OutboxDrainTask, "legacy_task_types"), (
-        "OutboxDrainTask must declare legacy_task_types for the shim."
-    )
-    assert "outbox_drain" in OutboxDrainTask.legacy_task_types, (
-        "'outbox_drain' must appear in legacy_task_types so that old DB rows "
-        "continue to be claimed by OutboxDrainTask."
+    assert not hasattr(OutboxDrainTask, "legacy_task_types"), (
+        "legacy_task_types shim should be retired; the seeder fixup "
+        "rewrites stale 'outbox_drain' rows and config keys instead."
     )
