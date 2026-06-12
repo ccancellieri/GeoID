@@ -85,6 +85,22 @@ class _FakeDriverWithConfig:
         return _Cfg()
 
 
+class _FakeElasticsearchDriver:
+    """Stands in for ItemsElasticsearchDriver: the read-primary for STAC
+    collections. It carries no physical PG table and declares no PG
+    sidecars — the physical layout is a PG concern it cannot answer."""
+
+    async def get_driver_config(self, catalog_id, collection_id=None, **k):
+        class _Cfg:
+            sidecars: list = []
+
+        return _Cfg()
+
+    async def resolve_physical_table(self, catalog_id, collection_id, **k):
+        # ES has no physical PG table to resolve.
+        return None
+
+
 @pytest.mark.asyncio
 async def test_layout_resolver_reads_physical_table_and_geom_column():
     """The resolver must surface the driver's physical table + geom column,
@@ -107,6 +123,32 @@ async def test_layout_resolver_reads_physical_table_and_geom_column():
     assert layout.geometries_table == "phys_7c2_geometries"
     assert layout.geom_column == "footprint"
     assert layout.feature_id_column == "geoid"
+
+
+@pytest.mark.asyncio
+async def test_layout_resolver_picks_pg_store_when_read_routes_to_elasticsearch():
+    """STAC collections are ES-read-primary; the physical layout lives in the
+    PG write store. The resolver must skip the ES read driver (no geometries
+    sidecar) and lock onto the PG driver's physical table + geom column."""
+    import dynastore.extensions.volumes.platform_bounds_source as mod
+    from dynastore.modules.storage.routing_config import Operation
+
+    source = _register_and_capture_source()
+
+    pg = _FakeDriverWithConfig(physical_table="phys_7c2", geom_column="footprint")
+    es = _FakeElasticsearchDriver()
+
+    async def _fake_get_driver(op, cat, col):
+        # READ -> ES (primary), WRITE -> PG (primary), mirroring live routing.
+        return pg if op == Operation.WRITE else es
+
+    with patch.object(mod, "get_protocol", return_value=_FakeCatalogs()), \
+            patch("dynastore.modules.storage.router.get_driver", _fake_get_driver):
+        layout = await source._layout_resolver("demo-3d", "denhaag")
+
+    assert layout.hub_table == "phys_7c2"
+    assert layout.geometries_table == "phys_7c2_geometries"
+    assert layout.geom_column == "footprint"
 
 
 @pytest.mark.asyncio

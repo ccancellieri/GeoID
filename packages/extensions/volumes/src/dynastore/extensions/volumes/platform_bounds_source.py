@@ -110,10 +110,20 @@ def register_sidecar_bounds_source(
     async def _resolve_hub_and_geom(
         catalog_id: str, collection_id: str,
     ) -> tuple[str, str]:
-        """Resolve (physical hub table, geom column) from the READ driver.
+        """Resolve (physical hub table, geom column) from the PG store.
 
-        Degrades to (collection_id, fallback column) on any miss so the
-        tiler reads the standard layout instead of raising.
+        The geometries sidecar is a PostgreSQL-store concept, so the layout
+        must come from the PG driver — NOT whichever driver is read-primary.
+        STAC collections are Elasticsearch-read-primary (``op=READ`` routes
+        to ES, which has no physical table and no PG sidecars), while PG is
+        write-primary. Probe ``WRITE`` first, then ``READ``, and lock onto
+        the first driver that actually declares a ``GeometriesSidecarConfig``
+        — that is the PG store that owns the geometry. Read both the physical
+        table and the geom column from that same driver.
+
+        Degrades to (collection_id, fallback column) on any miss so the tiler
+        reads the standard layout instead of raising (a raise would silently
+        empty the tileset).
         """
         # Lazy import mirrors the stac/maps extensions — keeps the storage
         # router out of this module's import graph at load time.
@@ -122,50 +132,59 @@ def register_sidecar_bounds_source(
 
         hub = collection_id
         geom_column = cfg.geometry_column_fallback
-        try:
-            driver = await get_driver(Operation.READ, catalog_id, collection_id)
-        except Exception as exc:  # noqa: BLE001 — degrade-safe by design
-            logger.debug(
-                "volumes layout: no READ driver for %s/%s (%s); using defaults",
-                catalog_id, collection_id, exc,
-            )
-            return hub, geom_column
 
-        if hasattr(driver, "resolve_physical_table"):
+        for op in (Operation.WRITE, Operation.READ):
             try:
-                resolved = await driver.resolve_physical_table(
-                    catalog_id, collection_id,
-                )
-                if resolved:
-                    hub = resolved
-            except Exception as exc:  # noqa: BLE001
+                driver = await get_driver(op, catalog_id, collection_id)
+            except Exception as exc:  # noqa: BLE001 — degrade-safe by design
                 logger.debug(
-                    "volumes layout: resolve_physical_table failed for "
-                    "%s/%s (%s); using collection_id",
-                    catalog_id, collection_id, exc,
+                    "volumes layout: no %s driver for %s/%s (%s)",
+                    op, catalog_id, collection_id, exc,
                 )
-
-        if hasattr(driver, "get_driver_config"):
+                continue
+            if not hasattr(driver, "get_driver_config"):
+                continue
             try:
                 driver_cfg = await driver.get_driver_config(
                     catalog_id, collection_id,
                 )
-                geom_sidecar = next(
-                    (
-                        sc
-                        for sc in driver_sidecars(driver_cfg)
-                        if isinstance(sc, GeometriesSidecarConfig)
-                    ),
-                    None,
-                )
-                if geom_sidecar is not None and geom_sidecar.geom_column:
-                    geom_column = geom_sidecar.geom_column
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "volumes layout: get_driver_config failed for %s/%s "
-                    "(%s); using geom column fallback",
-                    catalog_id, collection_id, exc,
+                    "via %s (%s)",
+                    catalog_id, collection_id, op, exc,
                 )
+                continue
+
+            geom_sidecar = next(
+                (
+                    sc
+                    for sc in driver_sidecars(driver_cfg)
+                    if isinstance(sc, GeometriesSidecarConfig)
+                ),
+                None,
+            )
+            if geom_sidecar is None:
+                # Not the PG geometry store (e.g. the ES read driver) —
+                # try the next operation's driver.
+                continue
+
+            if geom_sidecar.geom_column:
+                geom_column = geom_sidecar.geom_column
+            if hasattr(driver, "resolve_physical_table"):
+                try:
+                    resolved = await driver.resolve_physical_table(
+                        catalog_id, collection_id,
+                    )
+                    if resolved:
+                        hub = resolved
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "volumes layout: resolve_physical_table failed for "
+                        "%s/%s (%s); using collection_id",
+                        catalog_id, collection_id, exc,
+                    )
+            break
 
         return hub, geom_column
 
