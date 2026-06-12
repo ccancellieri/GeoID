@@ -25,8 +25,21 @@ assumptions on every /volumes/* caller.
 
 ``register_sidecar_bounds_source()`` registers BOTH the bounds source
 (for tileset.json index building) AND the geometry fetcher (for tile
-content generation). Both share the same connection factory and table
-resolvers.
+content generation). Both share one connection factory and one
+``layout_resolver``.
+
+The layout resolver reads the *actual* physical layout from the storage
+driver + sidecar config rather than hardcoding conventions:
+
+- hub table   → ``ItemsPostgresqlDriver.resolve_physical_table`` (the
+  machine-assigned physical table, which is NOT always the collection_id);
+- geom column → the live ``GeometriesSidecarConfig.geom_column``;
+- geometries table → ``sidecar_table_name(hub, <geometries sidecar id>)``
+  (the one-and-only naming SSOT shared with the sidecar DDL).
+
+Everything is degrade-safe: a resolution miss falls back to the
+``VolumesConfig`` defaults so the tiler reads the standard layout instead
+of raising (which would silently empty the tileset).
 """
 
 from __future__ import annotations
@@ -37,8 +50,16 @@ from typing import Optional
 
 from dynastore.extensions.volumes.config import VolumesConfig
 from dynastore.models.protocols import CatalogsProtocol, DatabaseProtocol
+from dynastore.modules.storage.drivers.pg_sidecars import (
+    GeometriesSidecarConfig,
+    driver_sidecars,
+    sidecar_table_name,
+)
 from dynastore.modules.volumes.geometry_fetcher import SidecarGeometryFetcher
-from dynastore.modules.volumes.sidecar_bounds import SidecarBoundsSource
+from dynastore.modules.volumes.sidecar_bounds import (
+    CollectionPhysicalLayout,
+    SidecarBoundsSource,
+)
 from dynastore.tools.discovery import get_protocol, register_plugin
 
 logger = logging.getLogger(__name__)
@@ -50,9 +71,10 @@ def register_sidecar_bounds_source(
     """Register SidecarBoundsSource + SidecarGeometryFetcher.
 
     Resolves the platform's DatabaseProtocol + CatalogsProtocol at call
-    time — both must already be registered. Table-name conventions
-    follow the geometries sidecar's standard: hub ``<collection_id>``,
-    sidecar ``<collection_id>_geometries`` in the tenant schema.
+    time — both must already be registered. Physical table / column names
+    are resolved per-collection from the storage driver + sidecar config
+    (see module docstring), so the wiring is pluggable and configurable
+    rather than convention-hardcoded.
     """
     cfg = volumes_config or VolumesConfig()
 
@@ -85,17 +107,85 @@ def register_sidecar_bounds_source(
             )
         return schema
 
-    async def _hub_table(catalog_id: str, collection_id: str) -> str:
-        return collection_id
+    async def _resolve_hub_and_geom(
+        catalog_id: str, collection_id: str,
+    ) -> tuple[str, str]:
+        """Resolve (physical hub table, geom column) from the READ driver.
 
-    async def _geometries_table(catalog_id: str, collection_id: str) -> str:
-        return f"{collection_id}_geometries"
+        Degrades to (collection_id, fallback column) on any miss so the
+        tiler reads the standard layout instead of raising.
+        """
+        # Lazy import mirrors the stac/maps extensions — keeps the storage
+        # router out of this module's import graph at load time.
+        from dynastore.modules.storage.router import get_driver
+        from dynastore.modules.storage.routing_config import Operation
+
+        hub = collection_id
+        geom_column = cfg.geometry_column_fallback
+        try:
+            driver = await get_driver(Operation.READ, catalog_id, collection_id)
+        except Exception as exc:  # noqa: BLE001 — degrade-safe by design
+            logger.debug(
+                "volumes layout: no READ driver for %s/%s (%s); using defaults",
+                catalog_id, collection_id, exc,
+            )
+            return hub, geom_column
+
+        if hasattr(driver, "resolve_physical_table"):
+            try:
+                resolved = await driver.resolve_physical_table(
+                    catalog_id, collection_id,
+                )
+                if resolved:
+                    hub = resolved
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "volumes layout: resolve_physical_table failed for "
+                    "%s/%s (%s); using collection_id",
+                    catalog_id, collection_id, exc,
+                )
+
+        if hasattr(driver, "get_driver_config"):
+            try:
+                driver_cfg = await driver.get_driver_config(
+                    catalog_id, collection_id,
+                )
+                geom_sidecar = next(
+                    (
+                        sc
+                        for sc in driver_sidecars(driver_cfg)
+                        if isinstance(sc, GeometriesSidecarConfig)
+                    ),
+                    None,
+                )
+                if geom_sidecar is not None and geom_sidecar.geom_column:
+                    geom_column = geom_sidecar.geom_column
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "volumes layout: get_driver_config failed for %s/%s "
+                    "(%s); using geom column fallback",
+                    catalog_id, collection_id, exc,
+                )
+
+        return hub, geom_column
+
+    async def _resolve_layout(
+        catalog_id: str, collection_id: str,
+    ) -> CollectionPhysicalLayout:
+        schema = await _resolve_schema(catalog_id)
+        hub, geom_column = await _resolve_hub_and_geom(catalog_id, collection_id)
+        geoms = sidecar_table_name(hub, cfg.geometries_sidecar_id)
+        return CollectionPhysicalLayout(
+            schema=schema,
+            hub_table=hub,
+            geometries_table=geoms,
+            geom_column=geom_column,
+            feature_id_column=cfg.feature_id_column,
+        )
 
     source = SidecarBoundsSource(
         connection_factory=_connection_factory,
-        schema_resolver=_resolve_schema,
-        hub_table_for_collection=_hub_table,
-        geometries_table_for_collection=_geometries_table,
+        layout_resolver=_resolve_layout,
         height_column=cfg.default_height_attr,
     )
     register_plugin(source)
@@ -103,9 +193,7 @@ def register_sidecar_bounds_source(
 
     fetcher = SidecarGeometryFetcher(
         connection_factory=_connection_factory,
-        schema_resolver=_resolve_schema,
-        hub_table_for_collection=_hub_table,
-        geometries_table_for_collection=_geometries_table,
+        layout_resolver=_resolve_layout,
         height_column=cfg.default_height_attr,
     )
     register_plugin(fetcher)

@@ -37,6 +37,7 @@ from .item_metadata_config import ItemMetadataSidecarConfig
 from .access_envelope_config import AccessEnvelopeSidecarConfig
 from .registry import SidecarRegistry
 from .resolver import _effective_sidecars
+from .naming import sidecar_table_name
 
 
 def driver_sidecars(driver_or_config: Any) -> List[SidecarConfig]:
@@ -83,4 +84,5 @@ __all__ = [
     "SidecarRegistry",
     "_effective_sidecars",
     "driver_sidecars",
+    "sidecar_table_name",
 ]

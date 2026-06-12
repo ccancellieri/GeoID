@@ -49,6 +49,7 @@ from dynastore.modules.storage.computed_fields import (
     StatisticStorageMode,
     _PLACE_TABLE_KINDS,
 )
+from dynastore.modules.storage.drivers.pg_sidecars.naming import sidecar_table_name
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     GeometriesSidecarConfig,
     TargetDimension,
@@ -627,7 +628,7 @@ class GeometriesSidecar(SidecarProtocol):
                 pk_columns.append('"validity"')
 
         # Build DDL
-        table_name = f"{physical_table}_{self.sidecar_id}"
+        table_name = sidecar_table_name(physical_table, self.sidecar_id)
 
         create_sql = f'CREATE TABLE IF NOT EXISTS {{schema}}."{table_name}" ({", ".join(columns)}, PRIMARY KEY ({", ".join(pk_columns)})){partition_clause};'
 

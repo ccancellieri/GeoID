@@ -58,6 +58,25 @@ _BOUNDS_CACHE_JITTER_S = 300
 
 
 @dataclass(frozen=True)
+class CollectionPhysicalLayout:
+    """Resolved physical PG layout for one collection's geometry sidecar.
+
+    Returned by a ``layout_resolver`` so the volumes tiler can read the
+    *actual* hub table, geometries sidecar table, geometry column, and
+    feature-id column from the storage driver/sidecar config instead of
+    hardcoding the ``<collection_id>`` / ``<collection_id>_geometries`` /
+    ``geom`` / ``geoid`` conventions. Shared by both ``SidecarBoundsSource``
+    and ``SidecarGeometryFetcher``.
+    """
+
+    schema: str
+    hub_table: str
+    geometries_table: str
+    geom_column: str = "geom"
+    feature_id_column: str = "geoid"
+
+
+@dataclass(frozen=True)
 class BoundsQuerySpec:
     """Inputs needed to build the sidecar bounds query for one collection."""
 
@@ -169,16 +188,47 @@ class SidecarBoundsSource:
         self,
         *,
         connection_factory,
-        schema_resolver,
-        hub_table_for_collection,
-        geometries_table_for_collection,
+        schema_resolver=None,
+        hub_table_for_collection=None,
+        geometries_table_for_collection=None,
         height_column: Optional[str] = None,
+        layout_resolver=None,
     ) -> None:
+        """Wire the bounds source against a tenant DB.
+
+        Two resolution modes:
+
+        - ``layout_resolver`` (preferred): an async callable
+          ``(catalog_id, collection_id) -> CollectionPhysicalLayout`` that
+          returns the full physical layout (schema, hub table, geometries
+          table, geom column, feature-id column) resolved from the storage
+          driver/sidecar config. Pluggable + configurable end to end.
+        - the legacy ``schema_resolver`` + ``hub_table_for_collection`` +
+          ``geometries_table_for_collection`` trio, kept for callers/tests
+          that wire fixed table conventions and the default ``geom`` /
+          ``geoid`` columns.
+        """
         self._connect = connection_factory
         self._resolve_schema = schema_resolver
         self._hub_table_for_collection = hub_table_for_collection
         self._geometries_table_for_collection = geometries_table_for_collection
         self._height_column = height_column
+        self._layout_resolver = layout_resolver
+
+    async def _resolve_layout(
+        self, catalog_id: str, collection_id: str,
+    ) -> CollectionPhysicalLayout:
+        """Resolve the physical layout via the preferred or legacy path."""
+        if self._layout_resolver is not None:
+            return await self._layout_resolver(catalog_id, collection_id)
+        schema = await self._resolve_schema(catalog_id)
+        hub = await self._hub_table_for_collection(catalog_id, collection_id)
+        geoms = await self._geometries_table_for_collection(
+            catalog_id, collection_id,
+        )
+        return CollectionPhysicalLayout(
+            schema=schema, hub_table=hub, geometries_table=geoms,
+        )
 
     @cached(
         maxsize=1024,
@@ -199,19 +249,22 @@ class SidecarBoundsSource:
         for ident in (catalog_id, collection_id):
             validate_sql_identifier(ident)
 
-        schema = await self._resolve_schema(catalog_id)
-        validate_sql_identifier(schema)
-        hub = await self._hub_table_for_collection(catalog_id, collection_id)
-        geoms = await self._geometries_table_for_collection(
-            catalog_id, collection_id,
-        )
-        for t in (hub, geoms):
+        layout = await self._resolve_layout(catalog_id, collection_id)
+        for t in (
+            layout.schema,
+            layout.hub_table,
+            layout.geometries_table,
+            layout.geom_column,
+            layout.feature_id_column,
+        ):
             validate_sql_identifier(t)
 
         spec = BoundsQuerySpec(
-            schema=schema,
-            hub_table=hub,
-            geometries_table=geoms,
+            schema=layout.schema,
+            hub_table=layout.hub_table,
+            geometries_table=layout.geometries_table,
+            feature_id_column=layout.feature_id_column,
+            geom_column=layout.geom_column,
             height_column=self._height_column,
             limit=limit,
         )

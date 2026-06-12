@@ -50,6 +50,16 @@ class VolumesConfig(ExposableConfigMixin, PluginConfig):
     max_tree_depth: Mutable[int] = Field(default=20, ge=0, le=32)
     on_demand_cache_ttl_s: Mutable[int] = Field(default=3600, ge=0)
     default_height_attr: Mutable[str] = "height"
+    # Geometries-sidecar id used to resolve the physical sidecar table
+    # (``<hub>_<id>``) feeding the tiler. Matches GeometriesSidecar.sidecar_id.
+    geometries_sidecar_id: Mutable[str] = "geometries"
+    # Feature-id (hub PK) column joining hub ⋈ geometries sidecar. The PG
+    # core driver fixes this to ``geoid``; override only for a custom driver.
+    feature_id_column: Mutable[str] = "geoid"
+    # Fallback geometry column when the geometries sidecar config can't be
+    # resolved at runtime. Normally the live ``GeometriesSidecarConfig``
+    # supplies the real column; this is the degrade-safe default.
+    geometry_column_fallback: Mutable[str] = "geom"
     # Geometric error at tileset root (Cesium 3D Tiles unit — world-space distance).
     root_geometric_error: Mutable[float] = Field(default=500.0, gt=0)
     # Halving ratio per refinement step (4.0 matches quadtree refinement).

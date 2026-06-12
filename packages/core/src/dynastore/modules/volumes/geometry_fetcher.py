@@ -38,6 +38,7 @@ from dynastore.models.protocols.geometry_fetcher import (
     GeometryFetcherProtocol,
 )
 from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+from dynastore.modules.volumes.sidecar_bounds import CollectionPhysicalLayout
 from dynastore.tools.db import validate_sql_identifier
 
 logger = logging.getLogger(__name__)
@@ -133,16 +134,40 @@ class SidecarGeometryFetcher:
         self,
         *,
         connection_factory,
-        schema_resolver,
-        hub_table_for_collection,
-        geometries_table_for_collection,
+        schema_resolver=None,
+        hub_table_for_collection=None,
+        geometries_table_for_collection=None,
         height_column: Optional[str] = None,
+        layout_resolver=None,
     ) -> None:
+        """Wire the geometry fetcher; mirrors ``SidecarBoundsSource``.
+
+        Prefer ``layout_resolver`` (async ``(catalog_id, collection_id) ->
+        CollectionPhysicalLayout``) for protocol-resolved physical layout;
+        the legacy schema/hub/geometries resolver trio is retained for
+        fixed-convention callers and tests.
+        """
         self._connect = connection_factory
         self._resolve_schema = schema_resolver
         self._hub_table_for_collection = hub_table_for_collection
         self._geometries_table_for_collection = geometries_table_for_collection
         self._height_column = height_column
+        self._layout_resolver = layout_resolver
+
+    async def _resolve_layout(
+        self, catalog_id: str, collection_id: str,
+    ) -> CollectionPhysicalLayout:
+        """Resolve the physical layout via the preferred or legacy path."""
+        if self._layout_resolver is not None:
+            return await self._layout_resolver(catalog_id, collection_id)
+        schema = await self._resolve_schema(catalog_id)
+        hub = await self._hub_table_for_collection(catalog_id, collection_id)
+        geoms = await self._geometries_table_for_collection(
+            catalog_id, collection_id,
+        )
+        return CollectionPhysicalLayout(
+            schema=schema, hub_table=hub, geometries_table=geoms,
+        )
 
     async def get_geometries(
         self,
@@ -156,18 +181,23 @@ class SidecarGeometryFetcher:
         for ident in (catalog_id, collection_id):
             validate_sql_identifier(ident)
 
-        schema = await self._resolve_schema(catalog_id)
-        validate_sql_identifier(schema)
-        hub = await self._hub_table_for_collection(catalog_id, collection_id)
-        geoms = await self._geometries_table_for_collection(catalog_id, collection_id)
-        for t in (hub, geoms):
+        layout = await self._resolve_layout(catalog_id, collection_id)
+        for t in (
+            layout.schema,
+            layout.hub_table,
+            layout.geometries_table,
+            layout.geom_column,
+            layout.feature_id_column,
+        ):
             validate_sql_identifier(t)
 
         spec = GeometryQuerySpec(
-            schema=schema,
-            hub_table=hub,
-            geometries_table=geoms,
+            schema=layout.schema,
+            hub_table=layout.hub_table,
+            geometries_table=layout.geometries_table,
             feature_ids=list(feature_ids),
+            feature_id_column=layout.feature_id_column,
+            geom_column=layout.geom_column,
             height_column=self._height_column,
         )
         sql = build_geometry_query(spec)
