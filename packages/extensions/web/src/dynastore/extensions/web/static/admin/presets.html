@@ -7,17 +7,16 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="../static/common/admin.css">
+  <link rel="stylesheet" href="../static/common/page-shell.css">
+  <script src="../static/common/page-shell.js"></script>
 </head>
 <body>
+  <ds-page-shell
+    data-title="Presets"
+    data-breadcrumb="DynaStore — Atlas of governance"
+    data-back-label="Back to Home">
+  </ds-page-shell>
   <main>
-    <header class="masthead">
-      <div class="folio">V.</div>
-      <div>
-        <div class="kicker">DynaStore — Atlas of governance</div>
-        <h1>Presets</h1>
-      </div>
-      <div class="stamp" id="masthead-stamp"></div>
-    </header>
 
     <p class="subtitle">
       Presets are named bundles of configuration changes that bring a catalog,
@@ -194,10 +193,6 @@
     </section>
   </main>
 
-  <script>
-    document.getElementById("masthead-stamp").textContent =
-      `FOLIO ${new Date().toISOString().slice(0, 10)}\nREV. ${Math.floor(Math.random()*900+100)}`;
-  </script>
   <script type="module" src="../static/admin/presets.js"></script>
 </body>
 </html>

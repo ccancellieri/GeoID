@@ -6,6 +6,8 @@
 // since logs and task names carry untrusted text.
 
 import { mountContextBar } from "../static/common/context-bar.js";
+import { apiBase } from "../static/common/url.js";
+import { authHeader as _authHeader } from "../static/common/api.js";
 
 const app = {
     state: {
@@ -126,7 +128,11 @@ const app = {
             // result does not depend on where the shell HTML is served from.
             const url = this._statsUrl(catalogId, collectionId);
 
-            const res = await fetch(url);
+            const res = await fetch(url, {
+                credentials: "same-origin",
+                headers: { ..._authHeader() },
+            });
+            if (!res.ok) { throw new Error(`${res.status} ${url}`); }
             const data = await res.json();
 
             const setText = (id, value) => {
@@ -176,18 +182,10 @@ const app = {
         }
     },
 
-    // Proxy prefix for absolute API URLs: everything before '/web/' in this
-    // page's path (e.g. '/geospatial/dev/api/catalog'). Empty at the bare root.
-    _apiPrefix() {
-        const p = window.location.pathname;
-        const webIdx = p.indexOf('/web/');
-        return webIdx >= 0 ? p.substring(0, webIdx) : '';
-    },
-
     // Stats endpoint scoped to the picked catalog (and collection, if any).
     // With no catalog selected, fall back to the platform-tier summary.
     _statsUrl(catalogId, collectionId) {
-        const prefix = this._apiPrefix();
+        const prefix = apiBase();
         if (!catalogId) { return `${prefix}/web/dashboard/stats`; }
         const base = `${prefix}/web/dashboard/catalogs/${encodeURIComponent(catalogId)}`;
         return collectionId
@@ -197,7 +195,7 @@ const app = {
 
     // Tasks endpoint scoped to the picked catalog; platform-tier when unset.
     _tasksUrl(catalogId) {
-        const prefix = this._apiPrefix();
+        const prefix = apiBase();
         return catalogId
             ? `${prefix}/web/dashboard/catalogs/${encodeURIComponent(catalogId)}/tasks`
             : `${prefix}/web/dashboard/tasks`;
@@ -206,7 +204,7 @@ const app = {
     // Proxy-prefix-aware absolute URL to the canonical logs API, scoped to the
     // picked catalog/collection.
     _logsUrl(catalogId, collectionId) {
-        const prefix = this._apiPrefix();
+        const prefix = apiBase();
         if (collectionId) {
             return `${prefix}/logs/catalogs/${encodeURIComponent(catalogId)}/collections/${encodeURIComponent(collectionId)}/logs?limit=20`;
         }
@@ -224,7 +222,11 @@ const app = {
 
             if (!url) { return; }
 
-            const res = await fetch(url);
+            const res = await fetch(url, {
+                credentials: "same-origin",
+                headers: { ..._authHeader() },
+            });
+            if (!res.ok) { throw new Error(`${res.status} ${url}`); }
             // Response is LogsListResponse: {logs: [...], kibana_dashboard_url?, total?}
             const logs = (await res.json()).logs || [];
 
@@ -305,7 +307,11 @@ const app = {
 
     async loadTasks() {
         try {
-            const res = await fetch(this._tasksUrl(this.state.catalogId));
+            const res = await fetch(this._tasksUrl(this.state.catalogId), {
+                credentials: "same-origin",
+                headers: { ..._authHeader() },
+            });
+            if (!res.ok) { throw new Error(`${res.status} ${this._tasksUrl(this.state.catalogId)}`); }
             const tasks = await res.json();
             this.state._allTasks = Array.isArray(tasks) ? tasks : [];
             this._renderTasks(this.state._allTasks);

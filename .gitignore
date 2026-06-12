@@ -113,6 +113,8 @@ FullLogs*.txt
 # Test Artifacts
 test-results.xml
 test_run.log
+# CI badge placeholder — generated at test time, not a source file
+packages/extensions/web/src/dynastore/extensions/web/static/test-results.json
 geoid-refs.json
 # DWH ingestion report dumps written to CWD by manual report runs
 geodata_reports_*.json

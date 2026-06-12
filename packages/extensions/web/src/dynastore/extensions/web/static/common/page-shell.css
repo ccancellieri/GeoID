@@ -1,0 +1,103 @@
+/*
+ * page-shell.css — shared header styles for ds-page-shell and opt-in layout
+ * utilities for AIP browser pages.
+ *
+ * The .header / .header-title / .back-link rules consolidate the identical
+ * block duplicated inline in extension and admin browser pages.
+ *
+ * Opt-in utility classes (.ds-page-body, .ds-sidebar) are applied only by
+ * pages that explicitly reference them; existing pages are not affected.
+ */
+
+/* --- Shared header ---------------------------------------------------- */
+/*
+ * All rules below are scoped to ds-page-shell so they cannot collide with
+ * admin.css or inline .header CSS on non-migrated pages.
+ */
+
+ds-page-shell .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1.5rem;
+    background: rgba(15, 23, 42, 0.85);
+    backdrop-filter: blur(16px);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    flex-shrink: 0;
+    z-index: 10;
+}
+
+ds-page-shell .header-title {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    font-weight: bold;
+    font-size: 1.1rem;
+    color: white;
+}
+
+ds-page-shell .header-title img {
+    width: 2rem;
+    height: 2rem;
+    border-radius: 0.4rem;
+}
+
+ds-page-shell .header-breadcrumb {
+    color: #94a3b8;
+    font-size: 0.9rem;
+    font-weight: normal;
+}
+
+ds-page-shell .header-breadcrumb-sep {
+    color: #475569;
+    font-weight: normal;
+}
+
+ds-page-shell .back-link {
+    color: #94a3b8;
+    text-decoration: none;
+    font-size: 0.875rem;
+    transition: color 0.2s;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+ds-page-shell .back-link:hover { color: white; }
+
+/* --- Opt-in layout utilities ----------------------------------------- */
+
+/*
+ * .ds-page-body
+ *
+ * Full-viewport flex-column body replacement for browser pages that want the
+ * header + content-area stacking without inline body styles.
+ * Opt in by adding class="ds-page-body" to <body>.
+ */
+.ds-page-body {
+    font-family: 'Inter', sans-serif;
+    background-color: #020617;
+    color: #e2e8f0;
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/*
+ * .ds-sidebar
+ *
+ * Fixed-width sidebar panel matching the style used by the existing browser
+ * pages. Opt in by adding class="ds-sidebar" to the sidebar container.
+ * The width can be overridden locally with an inline style or a scoped rule.
+ */
+.ds-sidebar {
+    width: 300px;
+    min-width: 240px;
+    background: rgba(15, 23, 42, 0.95);
+    border-right: 1px solid rgba(255, 255, 255, 0.07);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}

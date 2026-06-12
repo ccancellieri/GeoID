@@ -12,51 +12,18 @@
     <!-- Favicon and Fonts -->
     <link rel="icon" type="image/png" href="../static/dynastore.png">
     <link rel="stylesheet" href="../static/vendor/vendor.css"/>
+    <link rel="stylesheet" href="../static/common/page-shell.css">
+    <script src="../static/common/page-shell.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
 
     <style>
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: #020617;
-            color: #e2e8f0;
-            margin: 0;
-            padding: 0;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-        .header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0.75rem 1.5rem;
-            background: rgba(15, 23, 42, 0.85);
-            backdrop-filter: blur(16px);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-            flex-shrink: 0;
-            z-index: 10;
-        }
-        .header-title { display: flex; align-items: center; gap: 0.75rem; font-weight: bold; font-size: 1.1rem; color: white; }
-        .header-title img { width: 2rem; height: 2rem; border-radius: 0.4rem; }
-        .back-link { color: #94a3b8; text-decoration: none; font-size: 0.875rem; transition: color 0.2s; }
-        .back-link:hover { color: white; }
-
         .main-layout {
             display: flex;
             flex: 1;
             overflow: hidden;
         }
 
-        /* Sidebar */
-        #sidebar {
-            width: 300px;
-            min-width: 240px;
-            background: rgba(15, 23, 42, 0.95);
-            border-right: 1px solid rgba(255,255,255,0.07);
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
+        /* Sidebar: uses .ds-sidebar utility from page-shell.css */
         #sidebar-header { padding: 1rem; border-bottom: 1px solid rgba(255,255,255,0.07); }
         #items-list { flex: 1; overflow-y: auto; padding: 0.5rem; }
 
@@ -126,22 +93,17 @@
         .loading-spinner { text-align: center; padding: 2rem 1rem; color: #64748b; font-size: 0.85rem; }
     </style>
 </head>
-<body>
+<body class="ds-page-body">
 
-    <header class="header">
-        <div class="header-title">
-            <img src="../static/dynastore.png" alt="AIP Logo">
-            <span id="page-title">Agro-Informatics Platform: Features Browser</span>
-        </div>
-        <a href="../" class="back-link" id="back-home-link"
-           onclick="(function(e){if(window.parent!==window&&typeof window.parent.switchTab==='function'){e.preventDefault();window.parent.switchTab('home');}})(event)">
-            <i class="fa-solid fa-arrow-left"></i> <span id="lbl-back">Back to Home</span>
-        </a>
-    </header>
+    <ds-page-shell
+        id="page-shell"
+        data-title="Agro-Informatics Platform: Features Browser"
+        data-back-label="Back to Home">
+    </ds-page-shell>
 
     <div class="main-layout">
         <!-- Sidebar: context picker + feature list -->
-        <div id="sidebar">
+        <div id="sidebar" class="ds-sidebar">
             <div id="sidebar-header">
                 <!-- Context bar (catalog + collection selector) -->
                 <div id="cs-container" style="margin-bottom:0.5rem;"></div>

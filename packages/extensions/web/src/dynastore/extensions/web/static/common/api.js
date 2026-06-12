@@ -14,7 +14,7 @@ import { apiUrl } from "./url.js";
 // window.DS_TOKEN_KEY (set from the platform config); we fall back to the
 // shipped default "ds_token". Returns {} when no token is present so the
 // call still goes out and surfaces the 401 to the page.
-function authHeader() {
+export function authHeader() {
   if (typeof window === "undefined") return {};
   const key = window.DS_TOKEN_KEY || "ds_token";
   const ls = (typeof localStorage !== "undefined") ? localStorage : null;

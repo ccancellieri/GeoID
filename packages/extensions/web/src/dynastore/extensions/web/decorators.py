@@ -25,6 +25,46 @@ class uses `collect_web_pages(self)` / `collect_static_assets(self)` from
 `get_web_pages()` / `get_static_assets()` implementation.
 
 No reflective class-walking happens outside the contributing class.
+
+
+ds-page-shell contract
+----------------------
+``static/common/page-shell.js`` registers the ``ds-page-shell`` custom element.
+``static/common/page-shell.css`` contains the shared header rules and opt-in
+utility classes (``.ds-page-body``, ``.ds-sidebar``).
+
+Attributes accepted by ``<ds-page-shell>``:
+
+    data-title       Page title text (pass a pre-localised string; server-side
+                     template substitution runs before the browser parses HTML).
+    data-breadcrumb  Optional supplementary breadcrumb shown before the title.
+    data-logo-src    URL to the brand logo.  Defaults to the ``dynastore.png``
+                     resolved from the script's own directory, which works in
+                     both serving contexts (see below).
+    data-back-label  Label for the back-link; defaults to "Back to Home".
+    data-back-href   Override the back-link href; defaults to ``../``.
+
+Serving context and path rules:
+
+    Every page — admin and extension — is served at ``/web/pages/{page_id}``.
+    Common assets therefore always resolve via ``../static/common/``, e.g.:
+
+        ``<link rel="stylesheet" href="../static/common/page-shell.css">``
+        ``<script src="../static/common/page-shell.js"></script>``
+
+    The component derives the logo URL from ``document.currentScript.src``
+    so it lands on ``/web/static/dynastore.png`` without a hard-coded depth.
+
+Adding a new page:
+
+    1. Load the stylesheet:
+       ``<link rel="stylesheet" href="../static/common/page-shell.css">``
+    2. Load the script (plain ``<script>``, not ``type="module"``):
+       ``<script src="../static/common/page-shell.js"></script>``
+    3. Place the element as the first child of ``<body>`` (before any layout
+       containers), passing a pre-localised ``data-title``::
+
+           <ds-page-shell data-title="My Page Title"></ds-page-shell>
 """
 
 from typing import Any, Callable, Dict, List, Optional, Union
