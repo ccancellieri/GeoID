@@ -48,5 +48,7 @@ register_preset(PolicyContributorPreset(
 ))
 
 # Import demo presets to trigger their self-registration on package import.
+# volumes_demo imports the other two, so it must come after them.
 from dynastore.extensions.volumes.presets import cityjson_demo as _cityjson_demo  # noqa: E402, F401
 from dynastore.extensions.volumes.presets import tiles3d_samples as _tiles3d_samples  # noqa: E402, F401
+from dynastore.extensions.volumes.presets import volumes_demo as _volumes_demo  # noqa: E402, F401
