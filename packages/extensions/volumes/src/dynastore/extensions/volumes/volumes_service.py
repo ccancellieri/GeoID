@@ -545,9 +545,33 @@ def _is_3d_collection(coll: Any) -> bool:
     return bool(extras.get("cityjson:version") or extras.get("geovolumes:enabled"))
 
 
+def _normalize_bbox(raw: Any) -> Optional[Tuple[float, float, float, float, float, float]]:
+    """Coerce a 4-element 2D or 6-element CRS84h bbox to (minx, miny, zmin, maxx, maxy, zmax).
+
+    Returns None when the value is not a usable bbox (wrong shape, non-numeric,
+    or all-zero horizontal axes).
+    """
+    if not isinstance(raw, (list, tuple)):
+        return None
+    try:
+        vals = [float(v) for v in raw]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) >= 6:
+        minx, miny, zmin, maxx, maxy, zmax = vals[:6]
+    elif len(vals) >= 4:
+        minx, miny, maxx, maxy = vals[:4]
+        zmin = zmax = 0.0
+    else:
+        return None
+    if not any((minx, miny, maxx, maxy)):
+        return None
+    return (minx, miny, zmin, maxx, maxy, zmax)
+
+
 def _collection_bbox_3d(coll: Any, extras: Dict[str, Any]) -> List[float]:
     """Build a 6-element 3D bbox from collection extent + z-range extras."""
-    bbox_2d: List[float] = []
+    bbox: Optional[Tuple[float, float, float, float, float, float]] = None
     extent = getattr(coll, "extent", None)
     if extent is not None:
         spatial = getattr(extent, "spatial", None)
@@ -555,26 +579,24 @@ def _collection_bbox_3d(coll: Any, extras: Dict[str, Any]) -> List[float]:
             raw = getattr(spatial, "bbox", None) or []
             if raw:
                 first = raw[0] if isinstance(raw[0], (list, tuple)) else raw
-                bbox_2d = list(first)
+                bbox = _normalize_bbox(first)
 
     # The collection ``extent`` column only persists where the optional
     # STAC collection sidecar is materialized; ingest therefore also
     # stamps the dataset bbox into extras (geovolumes:bbox), which the
     # always-present core driver persists.  Prefer a real extent, fall
-    # back to the stamped bbox.
-    if len(bbox_2d) < 4 or not any(bbox_2d[:4]):
-        stamped = extras.get("geovolumes:bbox")
-        if isinstance(stamped, (list, tuple)) and len(stamped) >= 4:
-            bbox_2d = [float(v) for v in stamped[:4]]
+    # back to the stamped bbox.  The stamped value is 4-element for
+    # ingested CityJSON collections (z carried by geovolumes:zrange) and
+    # 6-element CRS84h for external-reference containers.
+    if bbox is None:
+        bbox = _normalize_bbox(extras.get("geovolumes:bbox"))
 
-    if len(bbox_2d) >= 4:
-        minx, miny, maxx, maxy = bbox_2d[0], bbox_2d[1], bbox_2d[2], bbox_2d[3]
-    else:
-        minx, miny, maxx, maxy = 0.0, 0.0, 0.0, 0.0
+    minx, miny, zmin, maxx, maxy, zmax = bbox or (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-    zrange = extras.get("geovolumes:zrange") or {}
-    zmin = float(zrange.get("zmin", 0.0))
-    zmax = float(zrange.get("zmax", 0.0))
+    if zmin == 0.0 and zmax == 0.0:
+        zrange = extras.get("geovolumes:zrange") or {}
+        zmin = float(zrange.get("zmin", 0.0))
+        zmax = float(zrange.get("zmax", 0.0))
     return [minx, miny, zmin, maxx, maxy, zmax]
 
 

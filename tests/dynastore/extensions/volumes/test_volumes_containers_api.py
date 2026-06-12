@@ -361,6 +361,70 @@ def test_collection_bbox_3d_prefers_real_extent():
     assert _collection_bbox_3d(coll, extras)[:2] == [1.0, 2.0]
 
 
+# ---------------------------------------------------------------------------
+# _normalize_bbox — 4-element vs 6-element bbox coercion
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_bbox_6_element_preserves_order():
+    """6-element CRS84h bbox [minLon,minLat,minH,maxLon,maxLat,maxH] must map to
+    (minx, miny, zmin, maxx, maxy, zmax) in that exact order."""
+    from dynastore.extensions.volumes.volumes_service import _normalize_bbox
+
+    raw = [-75.62, 40.03, 0.0, -75.60, 40.05, 100.0]
+    result = _normalize_bbox(raw)
+    assert result == (-75.62, 40.03, 0.0, -75.60, 40.05, 100.0)
+
+
+def test_normalize_bbox_4_element_zero_z():
+    """4-element bbox gets zmin=zmax=0.0."""
+    from dynastore.extensions.volumes.volumes_service import _normalize_bbox
+
+    raw = [4.27, 52.06, 4.32, 52.09]
+    result = _normalize_bbox(raw)
+    assert result == (4.27, 52.06, 0.0, 4.32, 52.09, 0.0)
+
+
+def test_normalize_bbox_none_on_garbage():
+    """Non-numeric or too-short values return None."""
+    from dynastore.extensions.volumes.volumes_service import _normalize_bbox
+
+    assert _normalize_bbox(None) is None
+    assert _normalize_bbox("not-a-bbox") is None
+    assert _normalize_bbox([1.0, 2.0]) is None
+    assert _normalize_bbox([0.0, 0.0, 0.0, 0.0]) is None
+    assert _normalize_bbox(["a", "b", "c", "d"]) is None
+
+
+def test_collection_bbox_3d_6element_stamped_correct_output():
+    """Tiles3d-samples preset stamps a 6-element CRS84h bbox; the returned
+    contentExtent must preserve the correct [minx,miny,zmin,maxx,maxy,zmax] order."""
+    from dynastore.extensions.volumes.volumes_service import _collection_bbox_3d
+
+    coll = MagicMock()
+    coll.extent = None
+    extras = {
+        "geovolumes:bbox": [-75.62, 40.03, 0.0, -75.60, 40.05, 100.0],
+    }
+    result = _collection_bbox_3d(coll, extras)
+    assert result == [-75.62, 40.03, 0.0, -75.60, 40.05, 100.0]
+
+
+def test_collection_bbox_3d_6element_zero_z_picks_up_zrange():
+    """6-element bbox where z values are both 0 should still be overridden by
+    geovolumes:zrange when available."""
+    from dynastore.extensions.volumes.volumes_service import _collection_bbox_3d
+
+    coll = MagicMock()
+    coll.extent = None
+    extras = {
+        "geovolumes:bbox": [-75.62, 40.03, 0.0, -75.60, 40.05, 0.0],
+        "geovolumes:zrange": {"zmin": 5.0, "zmax": 200.0},
+    }
+    result = _collection_bbox_3d(coll, extras)
+    assert result == [-75.62, 40.03, 5.0, -75.60, 40.05, 200.0]
+
+
 def test_extract_cityjson_from_properties():
     """Items persist the CityJSONFeature under properties.cityjson — the
     only surface every driver round-trips."""
