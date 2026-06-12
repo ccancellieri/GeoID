@@ -39,9 +39,17 @@ os.environ.setdefault(
     "JWT_SECRET", "test-secret-padded-to-enough-chars-for-fernet-xx"
 )
 
-import dynastore.modules.iam.module as iam_module
-from dynastore.modules.iam.idp_config import IdpConfig
-from dynastore.modules.iam.module import IamModule
+iam_module = pytest.importorskip(
+    "dynastore.modules.iam.module",
+    reason="dynastore-ext-iam distribution not installed — skipping IDP lifespan tests",
+    exc_type=ImportError,
+)
+IdpConfig = pytest.importorskip(
+    "dynastore.modules.iam.idp_config",
+    reason="dynastore-ext-iam distribution not installed",
+    exc_type=ImportError,
+).IdpConfig
+IamModule = iam_module.IamModule
 
 
 class _FakeConfigs:

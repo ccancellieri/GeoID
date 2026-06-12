@@ -28,18 +28,24 @@ Also pins that platform_demo._COMPOSE includes these names.
 from __future__ import annotations
 
 
-def _import_preset_registry():
-    """Import presets sub-package for each extension so registration runs."""
+def _require_preset(module_path: str, preset_name: str) -> None:
+    """Import the given presets module; skip the calling test if unavailable.
+
+    The ``try/except ImportError: pass`` pattern in the old
+    ``_import_preset_registry`` helper silently swallowed missing
+    extensions and then let the test fail with a confusing KeyError from
+    ``find_preset``.  Each test now calls this helper directly so the
+    skip message names the missing extension unambiguously.
+    """
     import importlib
-    for mod in (
-        "dynastore.extensions.features.presets",
-        "dynastore.extensions.tiles.presets",
-        "dynastore.extensions.auth.presets",
-    ):
-        try:
-            importlib.import_module(mod)
-        except ImportError:
-            pass
+    import pytest
+    try:
+        importlib.import_module(module_path)
+    except ImportError:
+        pytest.skip(
+            f"{module_path} not importable in this environment "
+            f"(extension absent from PYTHONPATH) — cannot verify '{preset_name}' preset"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +54,7 @@ def _import_preset_registry():
 
 def test_features_enable_is_registered() -> None:
     """features_enable must appear in the global preset registry."""
-    _import_preset_registry()
+    _require_preset("dynastore.extensions.features.presets", "features_enable")
     from dynastore.modules.storage.presets.registry import find_preset
     preset = find_preset("features_enable")
     assert preset is not None
@@ -57,7 +63,7 @@ def test_features_enable_is_registered() -> None:
 
 def test_features_enable_contributor_returns_expected_policy_id() -> None:
     """features_enable contributor must yield the features_public_access policy."""
-    _import_preset_registry()
+    _require_preset("dynastore.extensions.features.presets", "features_enable")
     from dynastore.modules.storage.presets.registry import find_preset
     preset = find_preset("features_enable")
     contributor = preset._contributor_factory()
@@ -67,7 +73,7 @@ def test_features_enable_contributor_returns_expected_policy_id() -> None:
 
 def test_features_enable_contributor_binds_anonymous_role() -> None:
     """features_enable must bind features_public_access to the anonymous role."""
-    _import_preset_registry()
+    _require_preset("dynastore.extensions.features.presets", "features_enable")
     from dynastore.modules.storage.presets.registry import find_preset
     preset = find_preset("features_enable")
     contributor = preset._contributor_factory()
@@ -81,7 +87,7 @@ def test_features_enable_contributor_binds_anonymous_role() -> None:
 
 def test_tiles_enable_is_registered() -> None:
     """tiles_enable must appear in the global preset registry."""
-    _import_preset_registry()
+    _require_preset("dynastore.extensions.tiles.presets", "tiles_enable")
     from dynastore.modules.storage.presets.registry import find_preset
     preset = find_preset("tiles_enable")
     assert preset is not None
@@ -90,7 +96,7 @@ def test_tiles_enable_is_registered() -> None:
 
 def test_tiles_enable_contributor_returns_expected_policy_id() -> None:
     """tiles_enable contributor must yield the tiles_public_access policy."""
-    _import_preset_registry()
+    _require_preset("dynastore.extensions.tiles.presets", "tiles_enable")
     from dynastore.modules.storage.presets.registry import find_preset
     preset = find_preset("tiles_enable")
     contributor = preset._contributor_factory()
@@ -104,7 +110,7 @@ def test_tiles_enable_contributor_returns_expected_policy_id() -> None:
 
 def test_auth_enable_is_registered() -> None:
     """auth_enable must appear in the global preset registry."""
-    _import_preset_registry()
+    _require_preset("dynastore.extensions.auth.presets", "auth_enable")
     from dynastore.modules.storage.presets.registry import find_preset
     preset = find_preset("auth_enable")
     assert preset is not None
@@ -113,7 +119,7 @@ def test_auth_enable_is_registered() -> None:
 
 def test_auth_enable_contributor_returns_expected_policy_id() -> None:
     """auth_enable contributor must yield the auth_extension_public policy."""
-    _import_preset_registry()
+    _require_preset("dynastore.extensions.auth.presets", "auth_enable")
     from dynastore.modules.storage.presets.registry import find_preset
     preset = find_preset("auth_enable")
     contributor = preset._contributor_factory()

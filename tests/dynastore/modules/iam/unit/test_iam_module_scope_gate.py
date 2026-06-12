@@ -37,6 +37,17 @@ import importlib.metadata
 import sys
 from unittest.mock import patch
 
+import pytest
+
+
+def _iam_dist_installed() -> bool:
+    """Return True when the dynastore-ext-iam dist-info is present."""
+    try:
+        importlib.metadata.distribution("dynastore-ext-iam")
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
 
 def _drop_iam_module_from_cache():
     for name in list(sys.modules):
@@ -46,6 +57,10 @@ def _drop_iam_module_from_cache():
             sys.modules.pop(name, None)
 
 
+@pytest.mark.skipif(
+    not _iam_dist_installed(),
+    reason="dynastore-ext-iam distribution not installed — positive gate test requires it",
+)
 def test_iam_module_loads_when_distribution_present():
     """In a fully-installed dev env the distribution exists and import succeeds."""
     _drop_iam_module_from_cache()

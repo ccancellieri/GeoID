@@ -39,6 +39,8 @@ index). A dedicated catalog-tier schema is provisioned per module so the
 
 from __future__ import annotations
 
+import importlib.metadata
+
 import pytest
 
 from dynastore.tools.discovery import get_protocol
@@ -54,6 +56,23 @@ from dynastore.modules.iam.postgres_iam_storage import (
 from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.models.protocols import DatabaseProtocol
 
+
+def _iam_dist_installed() -> bool:
+    try:
+        importlib.metadata.distribution("dynastore-ext-iam")
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _iam_dist_installed(),
+    reason=(
+        "dynastore-ext-iam distribution not installed — IamModule will not "
+        "register, get_protocol(IamService) returns None; install the iam "
+        "extras or run inside the full dev environment"
+    ),
+)
 
 MARKER = pytest.mark.enable_extensions("features")
 
