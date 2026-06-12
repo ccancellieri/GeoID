@@ -25,6 +25,47 @@
         #detail-pane h3 { font-size:1.1rem; color:white; margin:0 0 0.75rem; }
         #detail-pane pre { background:rgba(15,23,42,0.9); padding:0.75rem; border-radius:0.4rem; overflow:auto; font-size:0.78rem; }
         .status-badge { padding:0.1rem 0.5rem; border-radius:0.3rem; font-size:0.75rem; }
+
+        /* --- Run panel styles --- */
+        #run-panel { border-top:1px solid rgba(255,255,255,0.07); padding:1rem 0 0; margin-top:1rem; }
+        #run-panel h4 { color:#93c5fd; margin:0 0 0.75rem; font-size:0.95rem; }
+        .scope-bar { display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; margin-bottom:0.75rem; }
+        .scope-bar select, .scope-bar label { font-size:0.82rem; color:#e2e8f0; background:rgba(30,41,59,0.8); border:1px solid rgba(255,255,255,0.12); border-radius:0.35rem; padding:0.3rem 0.5rem; }
+        .scope-bar select { min-width:150px; cursor:pointer; }
+        .exec-toggle { display:flex; align-items:center; gap:0.4rem; font-size:0.82rem; color:#94a3b8; }
+        .exec-toggle input[type=checkbox] { cursor:pointer; }
+        #exec-form-wrap { margin-top:0.75rem; }
+        #exec-submit { margin-top:0.75rem; padding:0.5rem 1.2rem; background:rgba(37,99,235,0.8); border:1px solid rgba(59,130,246,0.5); border-radius:0.4rem; color:white; cursor:pointer; font-size:0.85rem; }
+        #exec-submit:hover { background:rgba(37,99,235,1); }
+        #exec-submit:disabled { opacity:0.5; cursor:not-allowed; }
+        #exec-result { margin-top:1rem; }
+        #exec-result .result-ok { color:#4ade80; }
+        #exec-result .result-err { color:#f87171; }
+        #exec-result .result-warn { color:#fbbf24; }
+        .poll-row { display:flex; align-items:center; gap:0.5rem; margin-bottom:0.4rem; font-size:0.82rem; }
+        .job-status-label { padding:0.1rem 0.5rem; border-radius:0.3rem; font-size:0.75rem; background:rgba(30,41,59,0.7); }
+        .job-status-label.running { color:#60a5fa; }
+        .job-status-label.successful { color:#4ade80; }
+        .job-status-label.failed { color:#f87171; }
+        .job-status-label.dismissed { color:#94a3b8; }
+        a.result-link { color:#60a5fa; font-size:0.8rem; word-break:break-all; }
+        .schema-form .field-row { margin-bottom:0.6rem; }
+        .schema-form label { display:block; font-size:0.8rem; color:#94a3b8; margin-bottom:0.2rem; }
+        .schema-form input, .schema-form select, .schema-form textarea {
+            width:100%; font-size:0.82rem; background:rgba(15,23,42,0.8);
+            border:1px solid rgba(255,255,255,0.1); border-radius:0.3rem;
+            color:#e2e8f0; padding:0.3rem 0.5rem; box-sizing:border-box;
+        }
+        .schema-form input[type=checkbox] { width:auto; }
+        .schema-form .field-desc { font-size:0.75rem; color:#64748b; margin-bottom:0.2rem; }
+        .schema-form .array-row { display:flex; gap:0.4rem; margin-bottom:0.3rem; }
+        .schema-form .array-row-body { flex:1; }
+        .schema-form .object-wrap { border-left:2px solid rgba(255,255,255,0.07); padding-left:0.75rem; margin-top:0.3rem; }
+        .schema-form .btn { cursor:pointer; border:1px solid rgba(255,255,255,0.1); border-radius:0.3rem; background:rgba(30,41,59,0.5); color:#e2e8f0; padding:0.2rem 0.5rem; font-size:0.78rem; }
+        .schema-form .btn-secondary { background:rgba(30,41,59,0.3); }
+        .schema-form .btn-xs { font-size:0.73rem; padding:0.15rem 0.4rem; }
+        .schema-form fieldset.form-section { border:1px solid rgba(255,255,255,0.07); border-radius:0.4rem; padding:0.5rem 0.75rem; margin-bottom:0.5rem; }
+        .schema-form fieldset.form-section legend { font-size:0.78rem; color:#60a5fa; padding:0 0.25rem; }
     </style>
 </head>
 <body style="font-family:'Inter',sans-serif;background:#020617;color:#e2e8f0;margin:0;height:100vh;display:flex;flex-direction:column;">

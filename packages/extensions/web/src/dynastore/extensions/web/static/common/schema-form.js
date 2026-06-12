@@ -496,5 +496,9 @@ export function mountSchemaForm(container, {
     notifyDirty();
   }
 
-  return { getPatch, reset, getDirty: () => new Set(dirty), getDeleted: () => new Set(deleted) };
+  function get() {
+    return form.get();
+  }
+
+  return { get, getPatch, reset, getDirty: () => new Set(dirty), getDeleted: () => new Set(deleted) };
 }
