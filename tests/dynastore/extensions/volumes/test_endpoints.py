@@ -130,6 +130,86 @@ async def test_tileset_json_falls_back_to_empty_source(monkeypatch):
     assert "content" not in doc["root"]
 
 
+@pytest.mark.asyncio
+async def test_tileset_json_degrades_when_bounds_source_raises(monkeypatch):
+    """A collection with no geometries sidecar makes get_bounds raise;
+    the service must serve an empty tileset rather than a 500."""
+    import json
+    from unittest.mock import MagicMock
+    from fastapi import Request
+
+    from dynastore.extensions.volumes.volumes_service import VolumesService
+    import dynastore.extensions.volumes.volumes_service as mod
+
+    mod._TILESET_CACHE.clear()
+
+    class _RaisingSource:
+        async def get_bounds(self, catalog_id, collection_id, *, limit=None):
+            raise RuntimeError("relation \"x_geometries\" does not exist")
+
+    monkeypatch.setattr(mod, "get_protocol", lambda proto: _RaisingSource())
+
+    svc = VolumesService()
+    request = MagicMock(spec=Request)
+    request.url = "http://ex/volumes/catalogs/c/collections/l/3dtiles/tileset.json"
+
+    resp = await svc.get_tileset_json("c", "l", request)
+    body = b""
+    async for chunk in resp.body_iterator:
+        body += chunk if isinstance(chunk, bytes) else chunk.encode()
+
+    doc = json.loads(body.decode())
+    assert doc["root"]["boundingVolume"]["box"] == [0.0] * 12
+    assert "content" not in doc["root"]
+
+    mod._TILESET_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# lifespan wires the sidecar bounds source + geometry fetcher
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lifespan_registers_sidecar_bounds_source(monkeypatch):
+    """Startup must wire the runtime tiler by calling
+    register_sidecar_bounds_source exactly once."""
+    from unittest.mock import MagicMock
+
+    import dynastore.extensions.volumes.volumes_service as mod
+
+    calls = []
+    monkeypatch.setattr(
+        mod, "register_sidecar_bounds_source", lambda: calls.append(True),
+    )
+
+    svc = mod.VolumesService()
+    app = MagicMock()
+    async with svc.lifespan(app):
+        pass
+
+    assert calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_survives_registration_failure(monkeypatch):
+    """A registration failure must never block startup."""
+    from unittest.mock import MagicMock
+
+    import dynastore.extensions.volumes.volumes_service as mod
+
+    def _boom():
+        raise RuntimeError("DatabaseProtocol not registered")
+
+    monkeypatch.setattr(mod, "register_sidecar_bounds_source", _boom)
+
+    svc = mod.VolumesService()
+    app = MagicMock()
+    # Must not raise.
+    async with svc.lifespan(app):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Tile cache: second call returns cached tileset
 # ---------------------------------------------------------------------------

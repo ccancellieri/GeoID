@@ -70,6 +70,9 @@ from dynastore.models.protocols.bounds_source import (
     BoundsSourceProtocol,
     EmptyBoundsSource,
 )
+from dynastore.extensions.volumes.platform_bounds_source import (
+    register_sidecar_bounds_source,
+)
 from dynastore.models.protocols.geometry_fetcher import GeometryFetcherProtocol
 from dynastore.modules.volumes.mesh_builder import (
     build_mesh_from_geometries,
@@ -141,6 +144,17 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
+        # Wire the runtime tiler: register the sidecar-backed bounds source and
+        # geometry fetcher so tileset.json carries real content (and tiles
+        # render real geometry) for CityJSON collections. Registration is
+        # lazy — the DB is only touched per request — and the read paths
+        # degrade to an empty tileset for collections without a geometries
+        # sidecar (e.g. external 3D Tiles references), so this is safe to do
+        # unconditionally. A registration failure must never block startup.
+        try:
+            register_sidecar_bounds_source()
+        except Exception as exc:  # pragma: no cover - defensive startup guard
+            logger.warning("volumes: could not register sidecar bounds source: %s", exc)
         yield
 
     def _register_routes(self) -> None:
@@ -429,7 +443,17 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         bounds_source: BoundsSourceProtocol = (
             get_protocol(BoundsSourceProtocol) or EmptyBoundsSource()
         )
-        bounds = list(await bounds_source.get_bounds(catalog_id, collection_id))
+        try:
+            bounds = list(await bounds_source.get_bounds(catalog_id, collection_id))
+        except Exception as exc:
+            # A collection without a geometries sidecar (e.g. an external 3D
+            # Tiles reference or a non-CityJSON collection) makes the bounds
+            # query fail; serve an empty tileset rather than a 500.
+            logger.warning(
+                "volumes: bounds lookup failed for %s/%s (%s); serving empty tileset",
+                catalog_id, collection_id, exc,
+            )
+            bounds = []
 
         base = str(request.url).rstrip("/").rsplit("/", 1)[0]
         primary_fmt = cfg.supported_formats[0] if cfg.supported_formats else "b3dm"
@@ -477,7 +501,14 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
             )
             return pack_glb(empty_mesh())
 
-        geometries = await fetcher.get_geometries(catalog_id, collection_id, feature_ids)
+        try:
+            geometries = await fetcher.get_geometries(catalog_id, collection_id, feature_ids)
+        except Exception as exc:
+            logger.warning(
+                "volumes: geometry fetch failed for %s/%s (%s); returning empty tile",
+                catalog_id, collection_id, exc,
+            )
+            return pack_glb(empty_mesh())
         mesh = build_mesh_from_geometries(
             geometries,
             default_extrusion_height=cfg.default_extrusion_height,
