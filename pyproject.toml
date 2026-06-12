@@ -491,7 +491,11 @@ scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks
 scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,proxy]"]
 # scope_maps: vector producer + raster renderer (local docker), no auth.
 # Mirrors api_maps_open + module_cache + drivers_grp so local data reads work.
-scope_maps = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,module_cache,module_catalog_elasticsearch,drivers_grp]"]
+# worker_task_gdal pulls task_base (module_tasks dispatcher + capability
+# publisher) WITHOUT extension_tasks, so maps can claim background gdal work
+# (routing: gdal -> [catalog, maps]) while the task REST surface stays off
+# this no-auth service. Mirrors the scope_catalog_review pattern.
+scope_maps = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,module_cache,module_catalog_elasticsearch,drivers_grp,worker_task_gdal]"]
 # scope_onprem: single fat node for a worker-less on-prem / local deploy.
 # Union of scope_geoid (catalog API + auth/IAM + geoid UI/gateway) and
 # scope_worker (the heavy task/process runners + ingestion), so ONE process
