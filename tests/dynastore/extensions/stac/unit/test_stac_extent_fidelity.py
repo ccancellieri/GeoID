@@ -259,6 +259,64 @@ def test_resolve_collection_license_falls_back_to_proprietary_only_when_nothing(
     assert _resolve_collection_license("", "") == "proprietary"
 
 
+def test_raw_license_fallback_extracts_plain_string():
+    from dynastore.extensions.stac.stac_generator import _raw_license_fallback
+
+    assert _raw_license_fallback("CC-BY-4.0") == "CC-BY-4.0"
+    assert _raw_license_fallback("") is None
+    assert _raw_license_fallback(None) is None
+
+
+def test_raw_license_fallback_extracts_license_id_from_localized_dict():
+    """stac_localize emits the LicenseInfo dict form {"license_id": ...};
+    the fallback must read license_id, not return the whole dict or None.
+    Regression: the read path used to discard this and default to 'proprietary'.
+    """
+    from dynastore.extensions.stac.stac_generator import _raw_license_fallback
+
+    assert (
+        _raw_license_fallback({"license_id": "CC-BY-4.0", "is_osi_compliant": False})
+        == "CC-BY-4.0"
+    )
+
+
+def test_raw_license_fallback_extracts_license_id_from_model():
+    """get_collection_model reconstructs license as a LicenseInfo model;
+    the fallback must read its license_id attribute.
+    """
+    from dynastore.extensions.stac.stac_generator import _raw_license_fallback
+    from dynastore.models.shared_models import LicenseInfo
+
+    assert _raw_license_fallback(LicenseInfo(license_id="CC-BY-NC-SA-4.0")) == "CC-BY-NC-SA-4.0"
+
+
+def test_raw_license_fallback_handles_language_keyed_dict():
+    """A still-unresolved language-keyed dict yields its first value."""
+    from dynastore.extensions.stac.stac_generator import _raw_license_fallback
+
+    assert _raw_license_fallback({"en": "Apache-2.0"}) == "Apache-2.0"
+
+
+def test_license_roundtrip_does_not_default_to_proprietary():
+    """End-to-end of the read-path extraction: a stored non-proprietary license
+    in either the localized-dict or model form resolves to itself, never
+    'proprietary'.
+    """
+    from dynastore.extensions.stac.stac_generator import (
+        _raw_license_fallback,
+        _resolve_collection_license,
+    )
+    from dynastore.models.shared_models import LicenseInfo
+
+    localized = {"license_id": "CC-BY-4.0"}
+    model_license = LicenseInfo(license_id="CC-BY-4.0")
+    resolved = _resolve_collection_license(
+        _raw_license_fallback(localized),
+        _raw_license_fallback(model_license),
+    )
+    assert resolved == "CC-BY-4.0"
+
+
 # ---------------------------------------------------------------------------
 # 5. Read-path: stac_extensions — union of stored + contributor additions
 # ---------------------------------------------------------------------------

@@ -194,18 +194,34 @@ def _resolve_collection_license(
 
 
 def _raw_license_fallback(raw: Optional[Any]) -> Optional[str]:
-    """Extract any non-empty license string from a raw Internationalized value.
+    """Extract a non-empty license string from any stored/localized license form.
 
-    When the stored value is a language-keyed dict ``{"en": "CC-BY-4.0"}`` and
-    the requested language did not match, localization returns ``None``.  This
-    helper picks the first available value so the correct license is preserved
-    instead of falling back to "proprietary".
+    The license survives in several shapes by the time it reaches the read path:
+
+    * a plain ``str`` (``"CC-BY-4.0"``);
+    * a localized ``LicenseInfo`` dict ``{"license_id": "CC-BY-4.0", ...}`` —
+      what ``stac_localize`` produces from the stored model;
+    * a ``LicenseInfo`` Pydantic model carrying a ``license_id`` attribute —
+      what ``get_collection_model`` reconstructs from the PG ``license`` column;
+    * a language-keyed dict ``{"en": "CC-BY-4.0"}`` left unresolved when the
+      requested language did not match.
+
+    Pulling the id out of every form keeps the real license instead of letting
+    the caller fall back to the STAC default ``"proprietary"``.
     """
     if not raw:
         return None
     if isinstance(raw, str):
         return raw or None
+    # LicenseInfo model (or any object exposing license_id)
+    license_id = getattr(raw, "license_id", None)
+    if isinstance(license_id, str) and license_id:
+        return license_id
     if isinstance(raw, dict):
+        # LicenseInfo dict form takes precedence over language-keyed values.
+        keyed = raw.get("license_id")
+        if isinstance(keyed, str) and keyed:
+            return keyed
         for v in raw.values():
             if v and isinstance(v, str):
                 return v
@@ -620,7 +636,7 @@ async def create_collection(
         stac_extensions=stac_extensions_to_add,
         keywords=meta_dict.get("keywords"),
         license=_resolve_collection_license(
-            meta_dict.get("license") if isinstance(meta_dict.get("license"), str) else None,
+            _raw_license_fallback(meta_dict.get("license")),
             _raw_license_fallback(getattr(metadata_model, "license", None)),
         ),
     )
