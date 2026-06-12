@@ -202,10 +202,20 @@ def register_sidecar_bounds_source(
             feature_id_column=cfg.feature_id_column,
         )
 
+    # height_column is intentionally NOT wired here. The bounds/geometry
+    # queries join only the hub + geometries sidecar, but the height (and
+    # zmin/zmax) of a CityJSON feature are filterable attributes that the PG
+    # driver materializes in the SEPARATE feature_attributes sidecar, not on
+    # the hub. Passing a hub height column that does not exist made the whole
+    # bounds query raise ("column h.height does not exist"), degrading every
+    # tileset to empty. Leaving it None makes the z-range come from the
+    # geometry itself; per-feature 3D height sourced from the attributes
+    # sidecar (zmin/zmax) is tracked as a follow-up so buildings extrude
+    # to their true height.
     source = SidecarBoundsSource(
         connection_factory=_connection_factory,
         layout_resolver=_resolve_layout,
-        height_column=cfg.default_height_attr,
+        height_column=None,
     )
     register_plugin(source)
     logger.info("SidecarBoundsSource registered against BoundsSourceProtocol")
@@ -213,7 +223,7 @@ def register_sidecar_bounds_source(
     fetcher = SidecarGeometryFetcher(
         connection_factory=_connection_factory,
         layout_resolver=_resolve_layout,
-        height_column=cfg.default_height_attr,
+        height_column=None,
     )
     register_plugin(fetcher)
     logger.info("SidecarGeometryFetcher registered against GeometryFetcherProtocol")
