@@ -43,10 +43,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
-
-if TYPE_CHECKING:
-    from dynastore.modules.storage.storage_location import StorageLocation
+from typing import Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
 
 from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.protocols.storage_driver import Capability
@@ -60,29 +57,14 @@ from dynastore.modules.protocols import ModuleProtocol
 from dynastore.modules.storage.driver_config import (
     ItemsElasticsearchEnvelopeDriverConfig,
 )
-from dynastore.modules.storage.drivers.elasticsearch import _ItemsElasticsearchBase
+from dynastore.modules.storage.drivers.elasticsearch import (
+    _ItemsElasticsearchBase,
+    _stamp_simplification,
+)
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
 
 logger = logging.getLogger(__name__)
-
-
-def _stamp_simplification(doc: Dict[str, Any], factor: float, mode: str) -> None:
-    """Write simplification metadata into ``doc["system"]["geometry_simplification"]``.
-
-    Only emits the container when ``mode != "none"`` (exact geometry indexed,
-    no simplification applied). When simplification ran, the canonical shape is:
-
-        doc["system"]["geometry_simplification"] = {"factor": factor, "mode": mode}
-
-    ``system`` is created if absent; pre-existing system keys are preserved.
-    The old flat ``simplification_factor`` / ``simplification_mode`` root keys
-    are NOT written — only the canonical nested path is used.
-    """
-    if mode == "none":
-        return
-    system = doc.setdefault("system", {})
-    system["geometry_simplification"] = {"factor": factor, "mode": mode}
 
 
 class ItemsElasticsearchEnvelopeDriver(
@@ -158,6 +140,12 @@ class ItemsElasticsearchEnvelopeDriver(
     # ``geoid`` / ``external_id``) at the root, so structural queries built by
     # the shared SSOT must address that shape.
     _envelope_fields: ClassVar[EnvelopeFields] = ENVELOPE_FIELDS
+
+    # Config class resolved by :meth:`_ItemsElasticsearchBase._resolve_simplify_geometry`.
+    _driver_config_class: ClassVar[Any] = ItemsElasticsearchEnvelopeDriverConfig
+
+    # Backend label for StorageLocation (used by inherited location() method).
+    _location_backend: ClassVar[str] = "elasticsearch_envelope"
 
     def _items_index_name(self, catalog_id: str) -> str:
         """Per-tenant envelope index ``{prefix}-{catalog_id}-envelope-items``.
@@ -270,33 +258,6 @@ class ItemsElasticsearchEnvelopeDriver(
             owner=ctx.get("owner"),
             attrs=ctx.get("attrs"),
         )
-
-    async def _resolve_simplify_geometry(
-        self,
-        catalog_id: str,
-        collection_id: Optional[str] = None,
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> bool:
-        """Resolve the ``simplify_geometry`` flag for the envelope driver.
-
-        Exact geometry is indexed by default; simplification is opt-in via the
-        per-driver ``ItemsElasticsearchEnvelopeDriverConfig``.
-        """
-        from dynastore.models.protocols.configs import ConfigsProtocol
-        from dynastore.models.driver_context import DriverContext
-        from dynastore.tools.discovery import get_protocol
-
-        configs = get_protocol(ConfigsProtocol)
-        if configs is None:
-            return False
-        config = await configs.get_config(
-            ItemsElasticsearchEnvelopeDriverConfig,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            ctx=DriverContext(db_resource=db_resource),
-        )
-        return bool(getattr(config, "simplify_geometry", False))
 
     async def write_entities(
         self,
@@ -535,33 +496,6 @@ class ItemsElasticsearchEnvelopeDriver(
             bbox=source.get("bbox"),  # type: ignore[call-arg]
         )
 
-    async def delete_entities(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        entity_ids: List[str],
-        *,
-        soft: bool = False,
-        db_resource: Optional[Any] = None,
-    ) -> int:
-        if soft:
-            raise SoftDeleteNotSupportedError(
-                "ItemsElasticsearchEnvelopeDriver does not support soft delete."
-            )
-
-        index_name = self._items_index_name(catalog_id)
-        es = self._get_client()
-        deleted = 0
-
-        for geoid in entity_ids:
-            try:
-                await es.delete(index=index_name, id=geoid)
-                deleted += 1
-            except Exception:
-                pass
-
-        return deleted
-
     async def ensure_storage(
         self,
         catalog_id: str,
@@ -598,26 +532,11 @@ class ItemsElasticsearchEnvelopeDriver(
             index=index_name, params={"ignore_unavailable": "true"},
         )
 
-    async def export_entities(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        format: str = "parquet",
-        target_path: str = "",
-        db_resource: Optional[Any] = None,
-    ) -> str:
-        raise NotImplementedError(
-            "ItemsElasticsearchEnvelopeDriver.export_entities: not supported."
-        )
-
     # ------------------------------------------------------------------
     # Generic Indexer Protocol — slim, dispatcher-facing surface
     # ------------------------------------------------------------------
-
-    async def ensure_indexer(self, ctx) -> None:
-        """Idempotent bootstrap for the per-tenant envelope index."""
-        await self.ensure_storage(ctx.catalog, ctx.collection)
+    # export_entities and ensure_indexer are inherited from
+    # _ItemsElasticsearchBase.
 
     async def index(self, ctx, op) -> None:
         """Apply a single item :class:`IndexOp` to the envelope index.
@@ -734,27 +653,12 @@ class ItemsElasticsearchEnvelopeDriver(
             failures=failures,
         )
 
-    async def location(
-        self,
-        catalog_id: str,
-        collection_id: str,
-    ) -> "StorageLocation":
-        """Return typed physical storage coordinates for this envelope index."""
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-        from dynastore.modules.storage.storage_location import StorageLocation
-
-        prefix = _get_index_prefix()
-        index_name = self._items_index_name(catalog_id)
-        return StorageLocation(
-            backend="elasticsearch_envelope",
-            canonical_uri=f"es://{index_name}",
-            identifiers={"index": index_name, "prefix": prefix, "catalog_id": catalog_id},
-            display_label=index_name,
-        )
-
-    # ------------------------------------------------------------------
-    # CollectionItemsStore Protocol — data-side ops
-    # ------------------------------------------------------------------
+    # ``location``, ``get_entity_fields``, ``export_entities``,
+    # ``rename_storage``, ``restore_entities`` are inherited from
+    # :class:`_ItemsElasticsearchBase`.  ``_location_backend`` above supplies
+    # the correct backend label for ``location()``.
+    #
+    # CollectionItemsStore Protocol — data-side ops:
     # ``count_entities`` / ``compute_extents`` / ``aggregate`` /
     # ``introspect_schema`` are inherited from :class:`_ItemsElasticsearchBase`.
     # The envelope index is not sharded by collection, so the
@@ -762,47 +666,3 @@ class ItemsElasticsearchEnvelopeDriver(
     # inherited ops from sending a ``_routing`` param. ``count``/``aggregate``
     # route their query through the overridden ``_query_request_to_es``, so the
     # row-level access filter applies to those data-side ops too.
-
-    async def get_entity_fields(
-        self,
-        catalog_id: str,
-        collection_id: Optional[str] = None,
-        *,
-        entity_level: str = "item",
-        db_resource: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        """Return the introspected field set as a dict keyed by field name."""
-        if entity_level != "item" or not collection_id:
-            return {}
-        fields = await self.introspect_schema(catalog_id, collection_id)
-        return {getattr(f, "name", str(f)): f for f in fields}
-
-    # --- Admin ops not supported on this backend ---
-
-    async def rename_storage(
-        self,
-        catalog_id: str,
-        old_collection_id: str,
-        new_collection_id: str,
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> None:
-        raise NotImplementedError(
-            "ItemsElasticsearchEnvelopeDriver: rename_storage is not "
-            "supported. Renaming on this backend would require a full "
-            "reindex of the per-tenant envelope index."
-        )
-
-    async def restore_entities(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        entity_ids: List[str],
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> int:
-        raise SoftDeleteNotSupportedError(
-            "ItemsElasticsearchEnvelopeDriver: restore_entities is not "
-            "implemented; deletes on the envelope index are physical "
-            "removals (no soft-delete tombstone)."
-        )

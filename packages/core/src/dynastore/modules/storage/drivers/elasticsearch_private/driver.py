@@ -41,10 +41,7 @@ from __future__ import annotations
 import logging
 import re
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
-
-if TYPE_CHECKING:
-    from dynastore.modules.storage.storage_location import StorageLocation
+from typing import Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
 
 from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.protocols.storage_driver import Capability
@@ -58,7 +55,10 @@ from dynastore.modules.protocols import ModuleProtocol
 from dynastore.modules.storage.driver_config import (
     ItemsElasticsearchPrivateDriverConfig,
 )
-from dynastore.modules.storage.drivers.elasticsearch import _ItemsElasticsearchBase
+from dynastore.modules.storage.drivers.elasticsearch import (
+    _ItemsElasticsearchBase,
+    _stamp_simplification,
+)
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
 
@@ -148,6 +148,12 @@ class ItemsElasticsearchPrivateDriver(
     # structural queries built by the shared SSOT must address that shape.
     _envelope_fields: ClassVar[EnvelopeFields] = PRIVATE_ENVELOPE_FIELDS
 
+    # Config class resolved by :meth:`_ItemsElasticsearchBase._resolve_simplify_geometry`.
+    _driver_config_class: ClassVar[Any] = ItemsElasticsearchPrivateDriverConfig
+
+    # Backend label for StorageLocation (used by inherited location() method).
+    _location_backend: ClassVar[str] = "elasticsearch_private"
+
     def _items_index_name(self, catalog_id: str) -> str:
         """Private per-tenant index ``{prefix}-{catalog_id}-private-items``.
 
@@ -162,35 +168,6 @@ class ItemsElasticsearchPrivateDriver(
     def _collection_routing(self, collection_id: Optional[str]) -> Optional[str]:
         """The private index is not sharded by collection — no ``_routing``."""
         return None
-
-    async def _resolve_simplify_geometry(
-        self,
-        catalog_id: str,
-        collection_id: Optional[str] = None,
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> bool:
-        """Resolve the ``simplify_geometry`` flag for the private driver (#1248).
-
-        Exact geometry is indexed by default; simplification is opt-in via
-        the per-driver ``ItemsElasticsearchPrivateDriverConfig`` config. The
-        inherited ``_ElasticsearchBase.get_driver_config`` resolves the
-        *public* config class, so the private driver reads its own.
-        """
-        from dynastore.models.protocols.configs import ConfigsProtocol
-        from dynastore.models.driver_context import DriverContext
-        from dynastore.tools.discovery import get_protocol
-
-        configs = get_protocol(ConfigsProtocol)
-        if configs is None:
-            return False
-        config = await configs.get_config(
-            ItemsElasticsearchPrivateDriverConfig,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            ctx=DriverContext(db_resource=db_resource),
-        )
-        return bool(getattr(config, "simplify_geometry", False))
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
@@ -268,11 +245,7 @@ class ItemsElasticsearchPrivateDriver(
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry,
             )
-            if mode != "none":
-                doc.setdefault("system", {})["geometry_simplification"] = {
-                    "factor": factor,
-                    "mode": mode,
-                }
+            _stamp_simplification(doc, factor, mode)
             doc = project_private_doc(doc, known_fields)
             bulk_body.append({"index": {"_index": index_name, "_id": geoid}})
             bulk_body.append(doc)
@@ -411,33 +384,6 @@ class ItemsElasticsearchPrivateDriver(
             bbox=source.get("bbox"),  # type: ignore[call-arg]
         )
 
-    async def delete_entities(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        entity_ids: List[str],
-        *,
-        soft: bool = False,
-        db_resource: Optional[Any] = None,
-    ) -> int:
-        if soft:
-            raise SoftDeleteNotSupportedError(
-                "ItemsElasticsearchPrivateDriver does not support soft delete."
-            )
-
-        index_name = self._items_index_name(catalog_id)
-        es = self._get_client()
-        deleted = 0
-
-        for geoid in entity_ids:
-            try:
-                await es.delete(index=index_name, id=geoid)
-                deleted += 1
-            except Exception:
-                pass
-
-        return deleted
-
     async def ensure_storage(
         self,
         catalog_id: str,
@@ -488,37 +434,11 @@ class ItemsElasticsearchPrivateDriver(
         )
         await self._revoke_deny_policy(catalog_id)
 
-    async def export_entities(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        *,
-        format: str = "parquet",
-        target_path: str = "",
-        db_resource: Optional[Any] = None,
-    ) -> str:
-        raise NotImplementedError(
-            "ItemsElasticsearchPrivateDriver.export_entities: not supported."
-        )
-
     # ------------------------------------------------------------------
     # Generic Indexer Protocol — slim, dispatcher-facing surface
     # ------------------------------------------------------------------
-
-    async def ensure_indexer(self, ctx) -> None:
-        """Idempotent bootstrap for the private per-tenant index.
-
-        Creates ``{prefix}-{catalog_id}-private-items`` with the mapping
-        built from the tenant-scoped overlay (legacy fully-dynamic shape
-        when the overlay is empty) if missing, then re-applies the
-        catalog's DENY policies (recovers in-memory IAM state on cold
-        boot — same recovery path as :meth:`ensure_storage`).
-
-        No public alias today: the private index is intentionally
-        absent from the ``{prefix}-items-public`` discovery alias to
-        keep tenant isolation intact.
-        """
-        await self.ensure_storage(ctx.catalog, ctx.collection)
+    # ensure_indexer is inherited from _ItemsElasticsearchBase (delegates
+    # to ensure_storage); no public alias for the private index.
 
     async def index(self, ctx, op) -> None:
         """Apply a single item :class:`IndexOp` to the per-tenant private
@@ -579,11 +499,7 @@ class ItemsElasticsearchPrivateDriver(
             ctx.catalog, ctx.collection,
         )
         doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
-        if mode != "none":
-            doc.setdefault("system", {})["geometry_simplification"] = {
-                "factor": factor,
-                "mode": mode,
-            }
+        _stamp_simplification(doc, factor, mode)
         doc = project_private_doc(doc, known_fields)
         await es.index(index=index_name, id=op.entity_id, body=doc)
 
@@ -642,11 +558,7 @@ class ItemsElasticsearchPrivateDriver(
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry,
             )
-            if mode != "none":
-                doc.setdefault("system", {})["geometry_simplification"] = {
-                    "factor": factor,
-                    "mode": mode,
-                }
+            _stamp_simplification(doc, factor, mode)
             doc = project_private_doc(doc, known_fields)
             body.append({"index": {"_index": index_name, "_id": op.entity_id}})
             body.append(doc)
@@ -858,78 +770,14 @@ class ItemsElasticsearchPrivateDriver(
                 return False
             offset += batch
 
-    async def location(
-        self,
-        catalog_id: str,
-        collection_id: str,
-    ) -> "StorageLocation":
-        """Return typed physical storage coordinates for this private index."""
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-        from dynastore.modules.storage.storage_location import StorageLocation
-
-        prefix = _get_index_prefix()
-        index_name = self._items_index_name(catalog_id)
-        return StorageLocation(
-            backend="elasticsearch_private",
-            canonical_uri=f"es://{index_name}",
-            identifiers={"index": index_name, "prefix": prefix, "catalog_id": catalog_id},
-            display_label=index_name,
-        )
-
-    # ------------------------------------------------------------------
-    # CollectionItemsStore Protocol — data-side ops
-    # ------------------------------------------------------------------
+    # ``location``, ``get_entity_fields``, ``export_entities``,
+    # ``rename_storage``, ``restore_entities`` are inherited from
+    # :class:`_ItemsElasticsearchBase`.  ``_location_backend`` is set above
+    # so ``location()`` emits the correct backend label.
+    #
+    # CollectionItemsStore Protocol — data-side ops:
     # ``count_entities`` / ``compute_extents`` / ``aggregate`` /
     # ``introspect_schema`` are inherited from :class:`_ItemsElasticsearchBase`.
     # The private index is not sharded by collection, so the
     # :meth:`_collection_routing` override (returns ``None``) keeps the
-    # inherited ops from sending a ``_routing`` param — preserving the prior
-    # private-driver behaviour, which never passed routing on these ops.
-
-    async def get_entity_fields(
-        self,
-        catalog_id: str,
-        collection_id: Optional[str] = None,
-        *,
-        entity_level: str = "item",
-        db_resource: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        """Return the introspected field set as a dict keyed by field name.
-
-        Bridges the legacy dict-based contract (used by some queryables
-        contributors) over the protocol's list-returning ``introspect_schema``.
-        """
-        if entity_level != "item" or not collection_id:
-            return {}
-        fields = await self.introspect_schema(catalog_id, collection_id)
-        return {getattr(f, "name", str(f)): f for f in fields}
-
-    # --- Admin ops not supported on this backend ---
-
-    async def rename_storage(
-        self,
-        catalog_id: str,
-        old_collection_id: str,
-        new_collection_id: str,
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> None:
-        raise NotImplementedError(
-            "ItemsElasticsearchPrivateDriver: rename_storage is not "
-            "supported. Renaming on this backend would require a full "
-            "reindex of the per-tenant private index."
-        )
-
-    async def restore_entities(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        entity_ids: List[str],
-        *,
-        db_resource: Optional[Any] = None,
-    ) -> int:
-        raise SoftDeleteNotSupportedError(
-            "ItemsElasticsearchPrivateDriver: restore_entities is not "
-            "implemented; deletes on the private index are physical "
-            "removals (no soft-delete tombstone)."
-        )
+    # inherited ops from sending a ``_routing`` param.

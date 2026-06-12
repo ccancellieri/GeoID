@@ -85,65 +85,6 @@ class TestElasticsearchBase:
         assert result["id"] == "f1"
 
 
-class TestIsSecondaryFor:
-    @pytest.mark.asyncio
-    async def test_returns_true_when_listed(self):
-        from dynastore.modules.storage.routing_config import (
-            ItemsRoutingConfig, Operation, OperationDriverEntry,
-        )
-
-        mock_configs = AsyncMock()
-        routing = ItemsRoutingConfig(operations={
-            Operation.WRITE: [OperationDriverEntry(driver_ref="items_postgresql_driver")],
-            Operation.READ: [OperationDriverEntry(driver_ref="items_elasticsearch_driver")],
-        })
-        mock_configs.get_config = AsyncMock(return_value=routing)
-
-        with patch("dynastore.tools.discovery.get_protocol", return_value=mock_configs):
-            result = await _ElasticsearchBase._is_secondary_for(
-                "items_elasticsearch_driver", "cat1", "col1"
-            )
-            assert result is True
-
-    @pytest.mark.asyncio
-    async def test_returns_false_when_not_listed(self):
-        from dynastore.modules.storage.routing_config import (
-            ItemsRoutingConfig, Operation, OperationDriverEntry,
-        )
-
-        mock_configs = AsyncMock()
-        routing = ItemsRoutingConfig(operations={
-            Operation.WRITE: [OperationDriverEntry(driver_ref="items_postgresql_driver")],
-            Operation.READ: [OperationDriverEntry(driver_ref="items_duckdb_driver")],
-        })
-        mock_configs.get_config = AsyncMock(return_value=routing)
-
-        with patch("dynastore.tools.discovery.get_protocol", return_value=mock_configs):
-            result = await _ElasticsearchBase._is_secondary_for(
-                "elasticsearch", "cat1", "col1"
-            )
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_returns_false_on_error(self):
-        with patch(
-            "dynastore.tools.discovery.get_protocol",
-            side_effect=Exception("boom"),
-        ):
-            result = await _ElasticsearchBase._is_secondary_for(
-                "elasticsearch", "cat1", "col1"
-            )
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_returns_false_when_no_configs(self):
-        with patch("dynastore.tools.discovery.get_protocol", return_value=None):
-            result = await _ElasticsearchBase._is_secondary_for(
-                "elasticsearch", "cat1", "col1"
-            )
-            assert result is False
-
-
 class TestItemsElasticsearchDriverMeta:
     def test_driver_class_name(self):
         driver = ItemsElasticsearchDriver()
