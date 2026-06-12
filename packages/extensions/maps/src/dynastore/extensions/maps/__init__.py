@@ -18,3 +18,8 @@
 
 from . import config  # noqa: F401  -- service-exposure plugin registration
 from . import presets as _maps_presets  # noqa: F401  -- preset registration side-effect
+
+from dynastore.tools.discovery import register_plugin
+from dynastore.extensions.maps.wmts_web_map_links import WmtsWebMapLinksContributor
+
+register_plugin(WmtsWebMapLinksContributor())

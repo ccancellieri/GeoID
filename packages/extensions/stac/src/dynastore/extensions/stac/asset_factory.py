@@ -57,6 +57,17 @@ StacTarget = Union[pystac.Item, pystac.Collection]
 def _to_resource_ref(target: StacTarget, context: AssetContext) -> ResourceRef:
     is_item = isinstance(target, pystac.Item)
     bbox = tuple(target.bbox) if is_item and target.bbox is not None else None
+    extras: dict = {}
+    if context.asset_id:
+        extras["asset_id"] = context.asset_id
+    if is_item:
+        # Expose the item's raw asset hrefs so protocol-agnostic contributors
+        # (e.g. a WMTS web-map-links producer) can inspect existing assets
+        # without importing pystac or the STAC extension.
+        extras["item_assets"] = {
+            k: {"href": a.href, "type": a.media_type or "", "roles": list(a.roles or [])}
+            for k, a in target.assets.items()  # type: ignore[union-attr]
+        }
     return ResourceRef(
         catalog_id=context.catalog_id,
         collection_id=context.collection_id,
@@ -65,7 +76,7 @@ def _to_resource_ref(target: StacTarget, context: AssetContext) -> ResourceRef:
         geometry=getattr(target, "geometry", None) if is_item else None,
         base_url=context.base_url,
         style=context.request.query_params.get("style"),
-        extras={"asset_id": context.asset_id} if context.asset_id else {},
+        extras=extras,
     )
 
 
