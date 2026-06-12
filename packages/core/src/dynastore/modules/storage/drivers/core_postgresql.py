@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List, Optional
 
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.entity_store import (
+    CollectionLifecycle,
     EntityStoreCapability,
 )
 from dynastore.models.protocols.typed_driver import TypedDriver
@@ -444,6 +445,28 @@ class _PgCollectionCoreBase:
         """
         return None
 
+    async def get_lifecycle(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> "CollectionLifecycle":
+        """Default stub for domain-slice drivers that do not declare LIFECYCLE.
+
+        Only :class:`CollectionCorePostgresqlDriver` overrides this with a
+        real implementation — it owns the ``"{schema}".collections`` registry
+        row.  All other subclasses (STAC, custom domain slices) must not
+        declare ``EntityStoreCapability.LIFECYCLE`` and should never be
+        called through this path.  Raising here surfaces a routing
+        misconfiguration loudly rather than returning a silently wrong value.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not declare LIFECYCLE; "
+            "only CollectionCorePostgresqlDriver owns the registry row."
+        )
+
 
 class CollectionCorePostgresqlDriver(
     TypedDriver[CollectionCorePostgresqlDriverConfig], _PgCollectionCoreBase,
@@ -474,7 +497,40 @@ class CollectionCorePostgresqlDriver(
         EntityStoreCapability.SOFT_DELETE,
         EntityStoreCapability.PHYSICAL_ADDRESSING,
         EntityStoreCapability.QUERY_FALLBACK_SOURCE,
+        EntityStoreCapability.LIFECYCLE,
     })
+
+    async def get_lifecycle(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> "CollectionLifecycle":
+        """Return the authoritative lifecycle state from the registry row.
+
+        Reads ``deleted_at`` from ``"{schema}".collections`` — the system-of-
+        record table — bypassing secondary indexes and cached model reads.
+        No row → MISSING; deleted_at IS NOT NULL → TOMBSTONED; else ACTIVE.
+        Schema unresolvable → MISSING (catalog hard-deleted or never created).
+        """
+        engine = db_resource or _get_engine()
+        if not engine:
+            return CollectionLifecycle.MISSING
+        async with managed_transaction(engine) as conn:
+            phys = await _resolve_physical_schema(catalog_id, db_resource=conn)
+            if not phys:
+                return CollectionLifecycle.MISSING
+            row = await DQLQuery(
+                f'SELECT deleted_at FROM "{phys}".collections WHERE id = :id;',
+                result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, id=collection_id)
+            if row is None:
+                return CollectionLifecycle.MISSING
+            if row["deleted_at"] is not None:
+                return CollectionLifecycle.TOMBSTONED
+            return CollectionLifecycle.ACTIVE
 
     async def search_metadata(
         self,

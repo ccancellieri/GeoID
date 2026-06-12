@@ -698,6 +698,16 @@ class CatalogService(CatalogsProtocol):
             catalog_id, collection_id, db_resource=db_resource
         )
 
+    async def ensure_alive(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        db_resource: Optional[DbResource] = None,
+    ) -> None:
+        await self._col_svc.ensure_alive(
+            catalog_id, collection_id, db_resource=db_resource
+        )
+
     async def activate_collection(
         self,
         catalog_id: str,

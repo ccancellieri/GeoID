@@ -342,6 +342,7 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
         EntityStoreCapability.SPATIAL_FILTER,
         EntityStoreCapability.PHYSICAL_ADDRESSING,
         EntityStoreCapability.QUERY_FALLBACK_SOURCE,
+        EntityStoreCapability.LIFECYCLE,
     })
 
     def _resolve_inner_drivers(
@@ -725,6 +726,33 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
             drop = getattr(inner, "drop_storage", None)
             if drop is not None:
                 await drop(catalog_id, collection_id, soft=soft)
+
+    async def get_lifecycle(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Delegate to the first LIFECYCLE-capable inner driver.
+
+        The CORE inner driver owns the ``"{schema}".collections`` registry
+        row and declares ``LIFECYCLE``; no other inner needs to.  Returning
+        ``Any`` avoids importing ``CollectionLifecycle`` here — callers that
+        care about the type import it from ``entity_store`` directly.
+        """
+        for inner in self._default_inner_drivers:
+            if EntityStoreCapability.LIFECYCLE in getattr(
+                inner, "capabilities", frozenset()
+            ):
+                return await inner.get_lifecycle(
+                    catalog_id, collection_id,
+                    db_resource=db_resource, **kwargs,
+                )
+        # No LIFECYCLE-capable inner — schema unresolvable; return MISSING.
+        from dynastore.models.protocols.entity_store import CollectionLifecycle
+        return CollectionLifecycle.MISSING
 
     def stac_metadata_columns(self) -> Tuple[str, ...]:
         """Forward the STAC capability marker through to the first inner

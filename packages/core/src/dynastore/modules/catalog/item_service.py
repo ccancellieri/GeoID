@@ -1149,6 +1149,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             # commits atomically with the first item write.
             catalogs_for_activation = get_protocol(CatalogsProtocol)
             assert catalogs_for_activation is not None, "CatalogsProtocol not registered"
+            # Lifecycle gate: a deleted (tombstoned or hard-deleted) collection
+            # must never be silently re-provisioned by lazy activation. Raises
+            # CollectionNotAliveError before any DDL or routing pin happens.
+            await catalogs_for_activation.ensure_alive(
+                catalog_id, collection_id, db_resource=conn,
+            )
             if not await catalogs_for_activation.is_active(
                 catalog_id, collection_id, db_resource=conn,
             ):

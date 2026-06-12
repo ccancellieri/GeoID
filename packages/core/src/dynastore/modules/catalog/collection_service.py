@@ -102,6 +102,28 @@ def _make_collection_exists_query(phys_schema: str) -> DQLQuery:
     )
 
 
+class CollectionNotAliveError(Exception):
+    """Raised by :meth:`CollectionService.ensure_alive` when the collection
+    cannot accept writes.
+
+    Attributes:
+        catalog_id:    The catalog that owns the collection.
+        collection_id: The collection that failed the liveness check.
+        reason:        ``"missing"``   — no registry row (hard-deleted or never
+                                         created).
+                       ``"tombstoned"`` — registry row present with
+                                         ``deleted_at`` set (soft-deleted).
+    """
+
+    def __init__(self, catalog_id: str, collection_id: str, reason: str) -> None:
+        super().__init__(
+            f"Collection '{catalog_id}:{collection_id}' is not alive: {reason}"
+        )
+        self.catalog_id = catalog_id
+        self.collection_id = collection_id
+        self.reason = reason
+
+
 class CollectionService:
     """Service for collection-level operations."""
 
@@ -139,6 +161,91 @@ class CollectionService:
             if Capability.QUERY_FALLBACK_SOURCE in driver.capabilities:
                 return driver
         return None
+
+    async def is_alive(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        db_resource: Optional[DbResource] = None,
+    ) -> bool:
+        """Return ``True`` if the collection registry row exists with no
+        ``deleted_at``.  Returns ``False`` for MISSING and TOMBSTONED states.
+        Does NOT raise — use :meth:`ensure_alive` when a hard failure is
+        appropriate.
+        """
+        try:
+            lc = await self._get_lifecycle(catalog_id, collection_id, db_resource)
+        except Exception:
+            return False
+        from dynastore.models.protocols.entity_store import CollectionLifecycle
+        return lc == CollectionLifecycle.ACTIVE
+
+    async def ensure_alive(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        db_resource: Optional[DbResource] = None,
+    ) -> None:
+        """Assert the collection is ACTIVE; raise :exc:`CollectionNotAliveError`
+        otherwise.  Callers should use this at write-path boundaries to enforce
+        the lifecycle gate.  Fail-closed: any unexpected lookup error also
+        raises ``CollectionNotAliveError``.
+        """
+        try:
+            lc = await self._get_lifecycle(catalog_id, collection_id, db_resource)
+        except Exception as exc:
+            raise CollectionNotAliveError(
+                catalog_id, collection_id, "lookup-error"
+            ) from exc
+        from dynastore.models.protocols.entity_store import CollectionLifecycle
+        if lc == CollectionLifecycle.ACTIVE:
+            return
+        reason = lc.value if lc != CollectionLifecycle.MISSING else "missing"
+        raise CollectionNotAliveError(catalog_id, collection_id, reason)
+
+    async def _get_lifecycle(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        db_resource: Optional[DbResource] = None,
+    ) -> Any:
+        """Resolve lifecycle via a registered LIFECYCLE-capable CollectionStore
+        driver, or fall back to a direct registry SELECT when no such driver
+        is available.  Fail-closed — any error propagates to the caller.
+        """
+        from dynastore.tools.discovery import get_protocols
+        from dynastore.models.protocols.entity_store import (
+            CollectionLifecycle,
+            CollectionStore,
+            EntityStoreCapability,
+        )
+
+        for driver in get_protocols(CollectionStore):
+            caps = getattr(driver, "capabilities", frozenset())
+            if EntityStoreCapability.LIFECYCLE in caps:
+                return await driver.get_lifecycle(
+                    catalog_id, collection_id, db_resource=db_resource
+                )
+
+        # Degrade-safe fallback: no capable driver registered (e.g. storage
+        # module absent).  Query the registry table directly via the service's
+        # own engine.
+        _engine = db_resource or self.engine
+        if not _engine:
+            return CollectionLifecycle.MISSING
+        async with managed_transaction(_engine) as conn:
+            phys_schema = await self._resolve_physical_schema(catalog_id, db_resource=conn)
+            if not phys_schema:
+                return CollectionLifecycle.MISSING
+            row = await DQLQuery(
+                f'SELECT deleted_at FROM "{phys_schema}".collections WHERE id = :id;',
+                result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, id=collection_id)
+        if row is None:
+            return CollectionLifecycle.MISSING
+        if row["deleted_at"] is not None:
+            return CollectionLifecycle.TOMBSTONED
+        return CollectionLifecycle.ACTIVE
 
     async def resolve_physical_table(
         self,
@@ -273,6 +380,14 @@ class CollectionService:
         """
         from dynastore.modules.storage.router import get_driver
         from dynastore.modules.storage.routing_config import ItemsRoutingConfig
+
+        # Defense in depth: never provision storage for a collection that is
+        # not alive, regardless of which caller reached this point.
+        # Catalog-scoped activation (collection_id is None, e.g. catalog-level
+        # assets) has no collection registry row to check — bypass, matching
+        # the upsert funnel gate.
+        if collection_id is not None:
+            await self.ensure_alive(catalog_id, collection_id, db_resource=conn)
 
         # Provision storage. `ensure_storage` is idempotent; concurrent
         # first-inserts will both call it safely.  Each driver self-fetches

@@ -32,6 +32,7 @@ Drivers are registered through ``register_plugin`` and routed through
 ``CollectionRoutingConfig`` / ``CatalogRoutingConfig``.
 """
 
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -103,6 +104,40 @@ class EntityStoreCapability:
     # equality, and a sync test in
     # ``tests/dynastore/modules/catalog/unit/test_catalog_policy_apply_handler.py``
     # pins it.
+
+    # --- Authoritative lifecycle ---
+    LIFECYCLE = "lifecycle"
+    # Driver can answer get_lifecycle() by reading committed registry state
+    # (the "{schema}".collections row) directly, bypassing secondary indexes
+    # and in-process caches.  Eventually-consistent stores (ES, search
+    # indexes) MUST NOT declare this capability: during the async cleanup
+    # window after a hard delete they can still report a deleted collection
+    # as present — exactly what callers guard against.
+
+
+class CollectionLifecycle(str, Enum):
+    """Authoritative lifecycle state of a collection as seen by the
+    system-of-record store.
+
+    Drivers that declare ``EntityStoreCapability.LIFECYCLE`` return one of
+    these values from :meth:`CollectionStore.get_lifecycle`.  The enum
+    is typed as ``(str, Enum)`` so values round-trip cleanly through JSON
+    serialisation and can be compared against raw strings.
+
+    Transitional states (``provisioning``, ``deleting``) can be added as
+    new members without breaking the protocol — callers that only need the
+    three canonical states check for membership in {ACTIVE, TOMBSTONED,
+    MISSING} rather than exact equality.
+    """
+
+    MISSING = "missing"
+    """No registry row: collection was never created, or was hard-deleted."""
+
+    ACTIVE = "active"
+    """Registry row present with ``deleted_at IS NULL``."""
+
+    TOMBSTONED = "tombstoned"
+    """Registry row present with ``deleted_at`` set (soft-deleted)."""
 
 
 @runtime_checkable
@@ -284,6 +319,35 @@ class CollectionStore(Protocol):
         """
         ...
 
+    async def get_lifecycle(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> "CollectionLifecycle":
+        """Return the authoritative lifecycle state of a collection.
+
+        Contract:
+        - Requires ``EntityStoreCapability.LIFECYCLE`` in ``capabilities``.
+        - MUST reflect committed registry state — bypassing secondary indexes,
+          cached model reads, and in-process pins.
+        - Eventually-consistent stores (ES, search indexes) MUST NOT declare
+          LIFECYCLE: during the async cleanup window after a hard delete they
+          can still report a deleted collection as present — exactly what
+          callers are guarding against.
+        - Accepts ``db_resource`` to join the caller's transaction so the
+          check can see uncommitted writes on the same connection.
+
+        Returns:
+            ``CollectionLifecycle.ACTIVE``     — registry row present, not deleted.
+            ``CollectionLifecycle.TOMBSTONED`` — registry row present, deleted_at set.
+            ``CollectionLifecycle.MISSING``    — no registry row (hard-deleted or
+                                                 never created).
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Helper mixin: default-raising stubs for TRANSFORM-only drivers
@@ -378,6 +442,19 @@ class TransformOnlyCollectionStoreMixin:
     ) -> "StorageLocation":
         raise NotImplementedError(
             f"{type(self).__name__} does not declare PHYSICAL_ADDRESSING."
+        )
+
+    async def get_lifecycle(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> "CollectionLifecycle":
+        raise NotImplementedError(
+            f"{type(self).__name__} does not declare LIFECYCLE; "
+            "only system-of-record PG drivers implement this method."
         )
 
     async def ensure_storage(

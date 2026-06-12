@@ -398,6 +398,55 @@ class AssetSidecarRejectedExceptionHandler(ExceptionHandler):
         )
 
 
+class CollectionNotAliveExceptionHandler(ExceptionHandler):
+    """Maps ``CollectionNotAliveError`` to a lifecycle-aware HTTP status.
+
+    Raised by the write-path liveness gate when a request targets a
+    collection that can no longer accept writes:
+
+    * ``missing``    → 404 — no registry row (hard-deleted or never created)
+    * ``tombstoned`` → 410 — soft-deleted; the resource existed and is gone
+    * anything else  → 503 — the gate failed closed (e.g. ``lookup-error``);
+      the collection state could not be established, so the write is
+      refused as transient rather than misreported as a client error.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.catalog.collection_service import (
+            CollectionNotAliveError,
+        )
+
+        return isinstance(exception, CollectionNotAliveError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.modules.catalog.collection_service import (
+            CollectionNotAliveError,
+        )
+
+        assert isinstance(exception, CollectionNotAliveError)
+        status_by_reason = {
+            "missing": status.HTTP_404_NOT_FOUND,
+            "tombstoned": status.HTTP_410_GONE,
+        }
+        status_code = status_by_reason.get(
+            exception.reason, status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        return HTTPException(
+            status_code=status_code,
+            detail={
+                "type": "https://docs.dynastore.io/errors/collection-not-alive",
+                "title": "Collection cannot accept writes",
+                "status": status_code,
+                "catalog_id": exception.catalog_id,
+                "collection_id": exception.collection_id,
+                "reason": exception.reason,
+                "detail": str(exception),
+            },
+        )
+
+
 class JobLockedExceptionHandler(ExceptionHandler):
     """Maps ``JobLockedError`` to HTTP 423 Locked.
 
@@ -719,6 +768,7 @@ class ExceptionHandlerRegistry:
         self.register(UnknownFieldsExceptionHandler())
         self.register(IndexMappingMismatchExceptionHandler())
         self.register(AssetSidecarRejectedExceptionHandler())
+        self.register(CollectionNotAliveExceptionHandler())  # 404/410/503 — write gate
         self.register(ImmutableConfigExceptionHandler())
         self.register(PluginNotFoundExceptionHandler())
         self.register(ConfigResolutionExceptionHandler())  # 500 — ops misconfig

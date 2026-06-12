@@ -182,6 +182,20 @@ class CollectionsProtocol(Protocol):
         """
         ...
 
+    async def ensure_alive(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        db_resource: Any = None,
+    ) -> None:
+        """Assert the collection is ACTIVE; raise CollectionNotAliveError otherwise.
+
+        Called at write-path boundaries to enforce the lifecycle gate.
+        Fail-closed: any unexpected lookup error also raises
+        CollectionNotAliveError with reason='lookup-error'.
+        """
+        ...
+
     async def activate_collection(
         self,
         catalog_id: str,
