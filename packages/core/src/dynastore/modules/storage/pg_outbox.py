@@ -30,8 +30,27 @@ per-tenant schema. asyncpg's extended-query protocol is single-
 statement-only, which is why this is split into two ``execute`` calls
 rather than concatenated into a single string.
 
-* :meth:`enqueue_bulk` uses ``asyncpg.copy_records_to_table`` for
-  high-throughput ingest (100k/min target).
+* :meth:`enqueue_bulk` has two paths, selected by whether a caller
+  connection is provided:
+
+  - **Caller-conn path** (``conn is not None``): used by the atomic
+    co-transactional write seam (``ItemService.upsert_bulk`` /
+    ``_enqueue_index_deletes``). The caller holds a SQLAlchemy
+    ``AsyncConnection`` from ``managed_transaction(engine)``; this path
+    issues a schema-qualified ``INSERT`` per row via
+    :class:`~dynastore.modules.db_config.query_executor.DQLQuery` so
+    the enqueue runs on the caller's open transaction and rolls back
+    with the primary write on failure. The table name is schema-qualified
+    as ``"<catalog_id>".storage_outbox`` after validating ``catalog_id``
+    with :func:`~dynastore.tools.db.validate_sql_identifier`.
+
+  - **Own-conn fallback path** (``conn is None``): used by the
+    dispatcher's missing-indexer path. The store acquires its own raw
+    ``asyncpg`` connection (``single_conn`` for tests, otherwise a
+    pool-acquired connection) and uses ``asyncpg.copy_records_to_table``
+    for high-throughput ingest (100k/min target). ``search_path`` is
+    pinned via :meth:`_ensure_search_path` before the COPY.
+
 * :meth:`claim_batch` uses ``FOR UPDATE SKIP LOCKED`` so multiple
   drainers can claim disjoint subsets in parallel.
 * :meth:`listen` yields :class:`Notification` per ``pg_notify`` fired
@@ -107,20 +126,69 @@ class PgOutboxStore:
         catalog_id: str,
         rows: Sequence[OutboxRecord],
     ) -> None:
-        """Bulk-insert outbox rows via binary COPY.
+        """Bulk-insert outbox rows, selecting path based on caller context.
 
-        When ``conn`` is provided, runs on the caller's connection inside
-        the caller's transaction; ``search_path`` must already be set by
-        the caller (this is the atomic-with-upstream-write path).
+        When ``conn`` is provided (the atomic co-transactional path from
+        ``ItemService.upsert_bulk`` / ``_enqueue_index_deletes``), the
+        caller holds a SQLAlchemy ``AsyncConnection`` from
+        ``managed_transaction(engine)``. This path issues a
+        schema-qualified parameterised ``INSERT`` per row via
+        :class:`~dynastore.modules.db_config.query_executor.DQLQuery`,
+        executing on the caller's open transaction. Any exception
+        propagates so the caller's ``managed_transaction`` rolls back the
+        primary write atomically with the failed enqueue.
 
         When ``conn`` is ``None`` (the dispatcher's missing-indexer path
         — see ``IndexDispatcher._enqueue_outbox_record``) the store falls
         back to its own connection source: ``single_conn`` for tests,
-        otherwise a pool-acquired conn. In pool mode ``search_path`` is
-        pinned via :meth:`_ensure_search_path`; in ``single_conn`` mode
-        the caller has already set it.
+        otherwise a pool-acquired conn. That path uses
+        ``asyncpg.copy_records_to_table`` for high-throughput ingest. In
+        pool mode ``search_path`` is pinned via
+        :meth:`_ensure_search_path`; in ``single_conn`` mode the caller
+        has already set it.
         """
         if not rows:
+            return
+        if conn is not None:
+            # Caller-conn (co-transactional) path: conn is a SQLAlchemy
+            # AsyncConnection from managed_transaction(engine). Raw asyncpg
+            # methods (copy_records_to_table) are not available on SA
+            # connections. Use DQLQuery so the INSERT runs on the caller's
+            # transaction and rolls back atomically with the primary write on
+            # any failure. Schema-qualify the table with the validated
+            # catalog_id to ensure correct tenant namespace regardless of the
+            # caller's search_path setting.
+            #
+            # DQLQuery.execute() takes named bind parameters as kwargs; it has
+            # no executemany interface. Iterating per row is correct here:
+            # these batches are bounded by request size (the call site coalesces
+            # per-item duplicates first), never the 100k/min COPY path.
+            validate_sql_identifier(catalog_id)
+            _INSERT_SQL = (
+                f'INSERT INTO "{catalog_id}".storage_outbox ('
+                "    op_id, driver_id, driver_instance_id, collection_id,"
+                "    op, item_id, payload, idempotency_key"
+                ") VALUES ("
+                "    :op_id, :driver_id, :driver_instance_id, :collection_id,"
+                "    :op, :item_id, CAST(:payload AS jsonb), :idempotency_key"
+                ")"
+            )
+            from dynastore.modules.db_config.query_executor import (
+                DQLQuery, ResultHandler,
+            )
+            _query = DQLQuery(_INSERT_SQL, result_handler=ResultHandler.NONE)
+            for r in rows:
+                await _query.execute(
+                    conn,
+                    op_id=str(r.op_id),
+                    driver_id=r.driver_id,
+                    driver_instance_id=r.driver_instance_id,
+                    collection_id=r.collection_id,
+                    op=r.op,
+                    item_id=r.item_id,
+                    payload=json.dumps(r.payload),
+                    idempotency_key=r.idempotency_key,
+                )
             return
         records = [
             (
@@ -135,22 +203,6 @@ class PgOutboxStore:
             )
             for r in rows
         ]
-        if conn is not None:
-            await conn.copy_records_to_table(
-                "storage_outbox",
-                records=records,
-                columns=[
-                    "op_id",
-                    "driver_id",
-                    "driver_instance_id",
-                    "collection_id",
-                    "op",
-                    "item_id",
-                    "payload",
-                    "idempotency_key",
-                ],
-            )
-            return
         # Fallback: acquire from the store's own connection source so the
         # dispatcher seam doesn't have to plumb a conn through.
         own_conn = await self._conn()

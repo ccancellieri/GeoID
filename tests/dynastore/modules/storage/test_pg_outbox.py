@@ -142,7 +142,9 @@ async def test_pg_outbox_enqueue_bulk_persists(async_conn, async_schema):
         )
         for i in range(2000)
     ]
-    await store.enqueue_bulk(async_conn, catalog_id=async_schema, rows=rows)
+    # Pass conn=None so the store uses its own asyncpg single_conn and the
+    # COPY-based path (the production own-conn/dispatcher fallback).
+    await store.enqueue_bulk(None, catalog_id=async_schema, rows=rows)
     n = await async_conn.fetchval("SELECT count(*) FROM storage_outbox")  # type: ignore[attr-defined]
     assert n == 2000
 
@@ -167,8 +169,9 @@ async def test_pg_outbox_claim_batch_skip_locked(
     )
 
     store = PgOutboxStore(pool=None, single_conn=async_conn)
+    # Pass conn=None so the store uses its own asyncpg single_conn / COPY path.
     await store.enqueue_bulk(
-        async_conn, catalog_id=async_schema,
+        None, catalog_id=async_schema,
         rows=[
             OutboxRecord(
                 op_id=uuid4(), driver_id="d", driver_instance_id="di",
@@ -203,8 +206,9 @@ async def test_pg_outbox_mark_done_retry_failed(async_conn, async_schema):
     await ensure_storage_outbox_asyncpg(async_conn, async_schema)
     store = PgOutboxStore(pool=None, single_conn=async_conn)
     op_ids = [uuid4() for _ in range(3)]
+    # Pass conn=None so the store uses its own asyncpg single_conn / COPY path.
     await store.enqueue_bulk(
-        async_conn, catalog_id=async_schema,
+        None, catalog_id=async_schema,
         rows=[
             OutboxRecord(
                 op_id=op_ids[i], driver_id="d", driver_instance_id="di",
@@ -247,8 +251,9 @@ async def test_pg_outbox_mark_retry_bumps_attempts_and_delays_ready_at(
     await ensure_storage_outbox_asyncpg(async_conn, async_schema)
     store = PgOutboxStore(pool=None, single_conn=async_conn)
     op_id = uuid4()
+    # Pass conn=None so the store uses its own asyncpg single_conn / COPY path.
     await store.enqueue_bulk(
-        async_conn, catalog_id=async_schema,
+        None, catalog_id=async_schema,
         rows=[
             OutboxRecord(
                 op_id=op_id, driver_id="d", driver_instance_id="di",
