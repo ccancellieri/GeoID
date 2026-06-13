@@ -116,6 +116,7 @@ gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCl
 cascade_cleanup = "dynastore.tasks.cascade_cleanup.task:CascadeCleanupTask"
 requeue_dead_letter_tasks = "dynastore.tasks.requeue_dead_letter.task:RequeueDeadLetterTasksTask"
 stac_harvest = "dynastore.tasks.stac_harvest.task:StacHarvestTask"
+work_index_drain = "dynastore.tasks.workclass_drain.work_index_drain_task:WorkIndexDrainTask"
 
 [build-system]
 requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]

@@ -48,6 +48,7 @@ from typing import Any, Sequence, Tuple
 
 from dynastore.models.protocols.indexing import OutboxRecord
 from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.identifiers import generate_uuidv7
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,91 @@ async def _enqueue_work_index(
         )
 
 
+async def _enqueue_drain_trigger(conn: Any) -> None:
+    """Insert one global dedup'd ``work_index_drain`` PENDING task on ``conn``.
+
+    Co-transactional: the drain row commits if and only if the caller's work
+    rows commit. A single global dedup key ensures high write volume coalesces
+    to one pending drain regardless of which tenant triggered the write.  The
+    ``on_task_insert`` DB trigger fires ``NOTIFY new_task_queued`` on this
+    INSERT, waking the dispatcher without requiring a new connection or LISTEN.
+
+    Degrades gracefully when the tasks table does not exist (e.g. test
+    environments that only provision work_index): emits a DEBUG log and
+    returns without raising. The work_index rows are still committed; the
+    drain will run on its next scheduled tick even without this NOTIFY trigger.
+    """
+    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+    from dynastore.modules.tasks.tasks_module import get_task_schema
+
+    task_schema = get_task_schema()
+    validate_sql_identifier(task_schema)
+
+    # execution_mode uses the column-correct value 'ASYNCHRONOUS' (the column
+    # DEFAULT and the value recognised by the dispatcher). The spec draft used
+    # 'ASYNC' which is not a valid enum value in the tasks table.
+    insert_sql = (
+        f"INSERT INTO {task_schema}.tasks"
+        f" (task_id, schema_name, scope, task_type, type, execution_mode,"
+        f"  inputs, timestamp, status, dedup_key)"
+        f" SELECT :task_id, 'platform', 'platform', 'work_index_drain',"
+        f"        'task', 'ASYNCHRONOUS', '{{}}'::jsonb, now(), 'PENDING',"
+        f"        'work_index_drain'"
+        f" WHERE NOT EXISTS ("
+        f"     SELECT 1 FROM {task_schema}.tasks"
+        f"     WHERE dedup_key = 'work_index_drain'"
+        f"       AND schema_name = 'platform'"
+        # Full terminal set (matches the claim query in tasks_module). A
+        # DISMISSED (terminal) drain task must NOT block a fresh enqueue —
+        # otherwise the co-transactional NOTIFY trigger stays silenced until
+        # manual cleanup. CREATED/PENDING/ACTIVE are non-terminal and DO block
+        # (one live drain suffices).
+        f"       AND status NOT IN ('COMPLETED', 'FAILED', 'DISMISSED', 'DEAD_LETTER')"
+        f" )"
+    )
+    try:
+        # Use a nested transaction (SAVEPOINT) so a missing-tasks-table error
+        # does not abort the outer PG transaction carrying the work_index rows.
+        # A bare try/except does not help here: once asyncpg sees a statement
+        # error the outer PG TX enters the aborted state and must be rolled
+        # back in its entirety. The SAVEPOINT isolates the trigger INSERT so
+        # only it is rolled back on failure, leaving the work rows intact.
+        #
+        # ``conn.begin_nested()`` is only available on a SQLAlchemy
+        # AsyncConnection (not on an asyncpg connection or a raw SA
+        # AsyncEngine). We probe for the attribute and fall back to a fire-
+        # and-forget attempt if the caller's conn type does not support it.
+        begin_nested = getattr(conn, "begin_nested", None)
+        if begin_nested is not None:
+            try:
+                async with begin_nested():
+                    await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
+                        conn, task_id=generate_uuidv7()
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "work_index_drain: drain trigger skipped — tasks table "
+                    "not available in schema %r (normal during staged rollout).",
+                    task_schema,
+                    exc_info=True,
+                )
+        else:
+            # Conn type doesn't support nested transactions — attempt
+            # the INSERT directly. If it fails the outer TX aborts;
+            # production always uses SA AsyncConnection so this branch
+            # is a defensive fallback only.
+            await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
+                conn, task_id=generate_uuidv7()
+            )
+    except Exception:  # noqa: BLE001
+        # Last-resort catch: savepoint setup itself failed.
+        logger.debug(
+            "work_index_drain: drain trigger failed for schema %r.",
+            task_schema,
+            exc_info=True,
+        )
+
+
 async def dispatch_index_dual_write(
     conn: Any,
     *,
@@ -149,6 +235,11 @@ async def dispatch_index_dual_write(
 
     ``catalog_id`` is the tenant's physical schema (the outbox convention);
     it is the legacy table's namespace AND the new table's ``schema_name``.
+
+    When ``write_new`` is true, a dedup'd ``work_index_drain`` PENDING task
+    row is also inserted on the same ``conn`` so the drain is triggered
+    co-transactionally with the work rows (no permanent connection, no LISTEN
+    required — the ``on_task_insert`` trigger emits NOTIFY automatically).
     """
     if not rows:
         return
@@ -157,3 +248,4 @@ async def dispatch_index_dual_write(
         await outbox.enqueue_bulk(conn, catalog_id=catalog_id, rows=rows)
     if write_new:
         await _enqueue_work_index(conn, schema_name=catalog_id, rows=rows)
+        await _enqueue_drain_trigger(conn)
