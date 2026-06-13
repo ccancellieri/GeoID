@@ -31,6 +31,22 @@ def test_empty_bounds_emits_skeleton():
     assert ts["root"]["boundingVolume"]["box"] == [0.0] * 12
 
 
+def test_asset_declares_z_up_axis():
+    # The tile content (glTF) is authored Z-up in the ENU frame, but renderers
+    # default glTF content to Y-up and apply a Y->Z rotation. Declaring
+    # gltfUpAxis=Z in the tileset asset suppresses that rotation so buildings
+    # stand upright instead of being tipped over.
+    populated = build_tileset(
+        [FeatureBounds("f", 4.30, 52.07, 0.0, 4.31, 52.08, 20.0)],
+        VolumesConfig(),
+    )
+    assert populated["asset"]["gltfUpAxis"] == "Z"
+    # The empty skeleton must declare it too so an empty collection round-trips
+    # with the same convention.
+    empty = build_tileset([], VolumesConfig())
+    assert empty["asset"]["gltfUpAxis"] == "Z"
+
+
 def test_root_has_enu_ecef_transform():
     # A Den Haag-ish footprint: the root must carry a 16-float column-major
     # transform whose translation column is the ECEF of the collection centre

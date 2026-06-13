@@ -47,7 +47,7 @@ def build_tileset(
     """
     if not bounds:
         return {
-            "asset": {"version": "1.0"},
+            "asset": {"version": "1.0", "gltfUpAxis": "Z"},
             "geometricError": 0.0,
             "root": {
                 "boundingVolume": {"box": _zero_box()},
@@ -73,7 +73,10 @@ def build_tileset(
     )
     root["transform"] = enu_to_ecef_matrix(origin[0], origin[1], origin[2])
     return {
-        "asset": {"version": "1.0"},
+        # Tile content is authored Z-up in the ENU frame; declaring gltfUpAxis=Z
+        # suppresses the renderer's default glTF Y-up -> Z-up rotation, which
+        # would otherwise tip every building onto its side.
+        "asset": {"version": "1.0", "gltfUpAxis": "Z"},
         "geometricError": config.root_geometric_error,
         "root": root,
     }
