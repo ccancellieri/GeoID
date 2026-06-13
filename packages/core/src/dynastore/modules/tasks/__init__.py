@@ -17,3 +17,4 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from . import tasks_config  # noqa: F401  -- side-effect import: registers plugin configuration
+from . import workclass_config  # noqa: F401  -- side-effect import: registers plugin configuration
