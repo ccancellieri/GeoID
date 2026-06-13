@@ -587,6 +587,57 @@ class Web(ExtensionProtocol, OGCServiceMixin):
                 exc_info=True,
             )
 
+        # OGC conformance reachability: conditionally apply the anonymous
+        # GET grant for /{svc}/conformance and /{svc}/ landing pages.
+        # OGC API Common Part 1 expects these to be readable without credentials
+        # so automated conformance suites (ETS/TEAM Engine) can probe them.
+        # The ConformanceExposureConfig.public flag (default True) lets a
+        # deployment opt out — set it to False and restart to gate conformance.
+        try:
+            from dynastore.models.protocols import DatabaseProtocol, ConfigsProtocol
+            from dynastore.modules.storage.presets.lifecycle import (
+                bootstrap_preset_if_absent,
+            )
+            from dynastore.extensions.tools.conformance_config import (
+                ConformanceExposureConfig,
+            )
+            # Ensure the preset module is imported so it self-registers.
+            import dynastore.extensions.tools.conformance_preset  # noqa: F401
+
+            _db = get_protocol(DatabaseProtocol)
+            _conf_cfg: ConformanceExposureConfig = ConformanceExposureConfig()
+            try:
+                _configs_svc = get_protocol(ConfigsProtocol)
+                if _configs_svc is not None:
+                    _conf_cfg = await _configs_svc.get_config(ConformanceExposureConfig)
+            except Exception:  # noqa: BLE001 — fall back to default (public=True)
+                pass
+
+            if _conf_cfg.public:
+                await bootstrap_preset_if_absent(
+                    _db.engine if _db else None,
+                    preset_name="ogc_conformance_public",
+                    force=True,
+                )
+                logger.info(
+                    "WebService: 'ogc_conformance_public' preset applied — "
+                    "anonymous GET on /{svc}/conformance and /{svc}/ is now allowed."
+                )
+            else:
+                logger.info(
+                    "WebService: ConformanceExposureConfig.public=False — "
+                    "skipping 'ogc_conformance_public' preset; conformance endpoints "
+                    "remain gated by deny-by-default IAM."
+                )
+        except Exception as exc:  # noqa: BLE001 — conformance seeding must not abort boot
+            logger.error(
+                "WebService: cold-boot apply of 'ogc_conformance_public' preset "
+                "failed; anonymous users will not be able to read conformance "
+                "endpoints until it is applied manually: %s",
+                exc,
+                exc_info=True,
+            )
+
         yield
 
     # NotebookContributorProtocol — opt-in surface picked up by
