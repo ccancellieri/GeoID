@@ -7,38 +7,8 @@
     <title>AIP | Catalog Services</title>
     <link rel="icon" type="image/png" href="static/dynastore.png">
     
-    <!-- FIX: Use Tailwind CDN to restore original styling fidelity -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="static/common/tailwind.css">
     <link rel="stylesheet" href="static/vendor/vendor.css"/>
-    
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        dyna: {
-                            dark: '#0f172a',
-                            darker: '#020617',
-                            primary: '#3b82f6',
-                            secondary: '#64748b',
-                            accent: '#0ea5e9',
-                            success: '#10b981',
-                            warning: '#f59e0b',
-                            purple: '#8b5cf6',
-                            danger: '#ef4444'
-                        }
-                    },
-                    fontFamily: {
-                        sans: ['Inter', 'sans-serif'],
-                        mono: ['Fira Code', 'monospace'],
-                    },
-                    backgroundImage: {
-                        'grid-pattern': "linear-gradient(to right, #1e293b 1px, transparent 1px), linear-gradient(to bottom, #1e293b 1px, transparent 1px)",
-                    }
-                }
-            }
-        }
-    </script>
     <style>
         body { font-family: 'Inter', sans-serif; }
 

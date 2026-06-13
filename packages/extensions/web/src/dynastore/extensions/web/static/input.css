@@ -1,6 +1,37 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Content sources: web extension pages */
+@source "./website/*.html";
+@source "./dashboard/*.html";
+@source "./docs.html";
+
+/* Content sources: extension browser pages (relative to this static/ dir) */
+@source "../../../../../../edr/src/dynastore/extensions/edr/static/*.html";
+@source "../../../../../../stac/src/dynastore/extensions/stac/static/*.html";
+@source "../../../../../../features/src/dynastore/extensions/features/static/*.html";
+@source "../../../../../../coverages/src/dynastore/extensions/coverages/static/*.html";
+@source "../../../../../../moving_features/src/dynastore/extensions/moving_features/static/*.html";
+@source "../../../../../../assets/src/dynastore/extensions/assets/static/*.html";
+@source "../../../../../../volumes/src/dynastore/extensions/volumes/static/*.html";
+@source "../../../../../../tiles/src/dynastore/extensions/tiles/static/*.html";
+
+/* Custom theme tokens (dyna color palette, fonts, grid background) */
+@theme {
+  --color-dyna-dark: #0f172a;
+  --color-dyna-darker: #020617;
+  --color-dyna-primary: #3b82f6;
+  --color-dyna-secondary: #64748b;
+  --color-dyna-accent: #0ea5e9;
+  --color-dyna-success: #10b981;
+  --color-dyna-warning: #f59e0b;
+  --color-dyna-purple: #8b5cf6;
+  --color-dyna-danger: #ef4444;
+
+  --font-sans: 'Inter', sans-serif;
+  --font-mono: 'Fira Code', monospace;
+
+  --background-image-grid-pattern: linear-gradient(to right, #1e293b 1px, transparent 1px), linear-gradient(to bottom, #1e293b 1px, transparent 1px);
+}
 
 /* --- Markdown Prose Styles --- */
 /* Optimized for reading documentation in Dark Mode */
@@ -19,9 +50,9 @@
     margin-bottom: 1em;
     line-height: 1.3;
 }
-.prose h1 { 
-    font-size: 2.25em; 
-    border-bottom: 1px solid #334155; 
+.prose h1 {
+    font-size: 2.25em;
+    border-bottom: 1px solid #334155;
     padding-bottom: 0.5em;
 }
 .prose h2 { font-size: 1.75em; }
