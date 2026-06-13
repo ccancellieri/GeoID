@@ -42,6 +42,7 @@ Dependencies: shapely >= 2.0 (via geopandas).
 from __future__ import annotations
 
 import logging
+import math
 import struct
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Sequence, Tuple
@@ -91,6 +92,7 @@ class MeshBuffers:
     index_count: int
     min_pos: Tuple[float, float, float]
     max_pos: Tuple[float, float, float]
+    normals: bytes = b""   # float32 * 3 per vertex (smooth per-vertex normals)
 
     @property
     def triangle_count(self) -> int:
@@ -131,6 +133,8 @@ class _MeshAccumulator:
         for i, (a, b, c) in enumerate(self.tris):
             struct.pack_into("<3I", idx_buf, i * 12, a, b, c)
 
+        nrm_buf = self._compute_normals(n)
+
         return MeshBuffers(
             positions=bytes(pos_buf),
             indices=bytes(idx_buf),
@@ -138,7 +142,49 @@ class _MeshAccumulator:
             index_count=len(self.tris) * 3,
             min_pos=(min_x, min_y, min_z),
             max_pos=(max_x, max_y, max_z),
+            normals=bytes(nrm_buf),
         )
+
+    def _compute_normals(self, n: int) -> bytearray:
+        """Smooth per-vertex normals: accumulate area-weighted face normals.
+
+        Each triangle's geometric normal (the cross product of two edges, whose
+        magnitude is twice the triangle area) is added to all three of its
+        vertices, then every accumulated vector is normalised. Sharing a vertex
+        across faces with the same orientation (e.g. a flat roof cap) keeps that
+        normal axis-aligned; vertical wall edges blend their two faces, which
+        reads as a softly shaded corner. Without normals the renderer cannot
+        light the mesh and the whole tile collapses into one flat silhouette.
+        """
+        nx = [0.0] * n
+        ny = [0.0] * n
+        nz = [0.0] * n
+        for a, b, c in self.tris:
+            ax, ay, az = self.verts[a]
+            bx, by, bz = self.verts[b]
+            cx, cy, cz = self.verts[c]
+            e1x, e1y, e1z = bx - ax, by - ay, bz - az
+            e2x, e2y, e2z = cx - ax, cy - ay, cz - az
+            fnx = e1y * e2z - e1z * e2y
+            fny = e1z * e2x - e1x * e2z
+            fnz = e1x * e2y - e1y * e2x
+            for idx in (a, b, c):
+                nx[idx] += fnx
+                ny[idx] += fny
+                nz[idx] += fnz
+
+        nrm_buf = bytearray(n * 12)
+        for i in range(n):
+            x, y, z = nx[i], ny[i], nz[i]
+            mag = math.sqrt(x * x + y * y + z * z)
+            if mag > 1e-12:
+                x, y, z = x / mag, y / mag, z / mag
+            else:
+                # Degenerate (zero-area) accumulation — default to up so the
+                # vertex is still validly normalised.
+                x, y, z = 0.0, 0.0, 1.0
+            struct.pack_into("<3f", nrm_buf, i * 12, x, y, z)
+        return nrm_buf
 
 
 def empty_mesh() -> MeshBuffers:

@@ -110,6 +110,7 @@ def _make_triangle_mesh() -> MeshBuffers:
     import struct as s
     verts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
     pos = s.pack("<9f", *[v for xyz in verts for v in xyz])
+    nrm = s.pack("<9f", *([0.0, 0.0, 1.0] * 3))  # all facing +Z
     idx = s.pack("<3I", 0, 1, 2)
     return MeshBuffers(
         positions=pos,
@@ -118,7 +119,14 @@ def _make_triangle_mesh() -> MeshBuffers:
         index_count=3,
         min_pos=(0.0, 0.0, 0.0),
         max_pos=(1.0, 1.0, 0.0),
+        normals=nrm,
     )
+
+
+def _glb_json(data: bytes) -> dict:
+    json_chunk_len, _ = struct.unpack_from("<II", data, 12)
+    json_bytes = data[20:20 + json_chunk_len]
+    return json.loads(json_bytes.decode("utf-8").strip())
 
 
 def test_pack_glb_triangle_header_length_matches():
@@ -168,6 +176,44 @@ def test_pack_glb_bufferviews_non_overlapping():
     assert bvs[1]["byteOffset"] == bvs[0]["byteLength"]
 
 
+def test_pack_glb_triangle_has_normal_attribute():
+    """The primitive must expose a NORMAL accessor so the renderer can light
+    the mesh — otherwise the whole tile renders as one flat silhouette."""
+    mesh = _make_triangle_mesh()
+    doc = _glb_json(pack_glb(mesh))
+    prim = doc["meshes"][0]["primitives"][0]
+    assert "NORMAL" in prim["attributes"]
+    normal_acc = doc["accessors"][prim["attributes"]["NORMAL"]]
+    assert normal_acc["type"] == "VEC3"
+    assert normal_acc["count"] == 3
+
+
+def test_pack_glb_triangle_has_lit_material():
+    """A double-sided PBR material must be attached so the buildings render as
+    solid, shaded volumes rather than the default unlit gltf appearance."""
+    mesh = _make_triangle_mesh()
+    doc = _glb_json(pack_glb(mesh))
+    prim = doc["meshes"][0]["primitives"][0]
+    assert prim.get("material") == 0
+    mats = doc.get("materials")
+    assert mats and len(mats) == 1
+    mat = mats[0]
+    assert mat.get("doubleSided") is True
+    assert "pbrMetallicRoughness" in mat
+    assert len(mat["pbrMetallicRoughness"]["baseColorFactor"]) == 4
+
+
+def test_pack_glb_three_bufferviews_non_overlapping():
+    """positions, normals, indices each get their own contiguous bufferView."""
+    mesh = _make_triangle_mesh()
+    doc = _glb_json(pack_glb(mesh))
+    bvs = doc["bufferViews"]
+    assert len(bvs) == 3
+    assert bvs[0]["byteOffset"] == 0
+    assert bvs[1]["byteOffset"] == bvs[0]["byteLength"]
+    assert bvs[2]["byteOffset"] == bvs[1]["byteOffset"] + bvs[1]["byteLength"]
+
+
 def test_pack_glb_buffer_byte_length_is_logical_not_padded():
     """buffers[0].byteLength must be the logical size (pos+idx), not the
     padded BIN chunk length — per glTF 2.0 spec §5.1.2."""
@@ -177,5 +223,5 @@ def test_pack_glb_buffer_byte_length_is_logical_not_padded():
     json_bytes = data[20:20 + json_chunk_len]
     doc = json.loads(json_bytes.decode("utf-8").strip())
     bvs = doc["bufferViews"]
-    expected_logical = bvs[0]["byteLength"] + bvs[1]["byteLength"]
+    expected_logical = sum(bv["byteLength"] for bv in bvs)
     assert doc["buffers"][0]["byteLength"] == expected_logical
