@@ -32,6 +32,7 @@ from pydantic import Field
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
+from dynastore.modules.volumes.color_ramp import DEFAULT_HEIGHT_RAMP_HEX
 
 
 class VolumesConfig(ExposableConfigMixin, PluginConfig):
@@ -70,3 +71,15 @@ class VolumesConfig(ExposableConfigMixin, PluginConfig):
     # Tile content formats advertised in tileset.json content URIs.
     # First entry is the primary format; "glb" uses direct glTF 2.0 (3D Tiles 1.1).
     supported_formats: Mutable[List[Literal["b3dm", "glb"]]] = Field(default=["b3dm", "glb"])
+    # Colour buildings by height: each feature's vertices carry a COLOR_0 tint
+    # interpolated from its extrusion height against ``height_color_ramp``. When
+    # disabled (or the ramp is empty) tiles render in the neutral material grey.
+    color_by_height: Mutable[bool] = True
+    # Sequential height colour ramp as ``[stop_metres, "#rrggbb"]`` stops. The
+    # hex vocabulary matches Mapbox GL / SLD colour maps so the same ramp can
+    # later be sourced from an OGC API - Styles resource. Default is ColorBrewer
+    # RdYlBu reversed (low=blue → tall=red), shared with the ramp module so the
+    # baked tiles and any config-surfaced default stay in sync.
+    height_color_ramp: Mutable[List[Tuple[float, str]]] = Field(
+        default_factory=lambda: list(DEFAULT_HEIGHT_RAMP_HEX)
+    )

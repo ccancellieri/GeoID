@@ -214,3 +214,106 @@ def test_build_mesh_default_origin_still_runs():
     fg = FeatureGeometry("f", _square_wkb(0.0, 0.0), height=3.0)
     buf = build_mesh_from_geometries([fg])
     assert buf.vertex_count > 0
+
+
+# ---------------------------------------------------------------------------
+# Per-vertex normals (#2099) — without these the renderer cannot light the
+# mesh and the whole tile collapses into one flat, unshaded silhouette.
+# ---------------------------------------------------------------------------
+
+
+import math
+import struct
+
+
+def _normals(buf):
+    n = buf.vertex_count
+    return [struct.unpack_from("<3f", buf.normals, i * 12) for i in range(n)]
+
+
+def test_build_mesh_emits_one_normal_per_vertex():
+    fg = FeatureGeometry("f1", _square_wkb(), height=5.0)
+    buf = build_mesh_from_geometries([fg], origin=ORIGIN)
+    assert buf.vertex_count > 0
+    # 3 float32 per vertex.
+    assert len(buf.normals) == buf.vertex_count * 12
+
+
+def test_build_mesh_normals_are_unit_length():
+    fg = FeatureGeometry("f1", _square_wkb(), height=5.0)
+    buf = build_mesh_from_geometries([fg], origin=ORIGIN)
+    for nx, ny, nz in _normals(buf):
+        assert math.isclose(math.sqrt(nx * nx + ny * ny + nz * nz), 1.0, abs_tol=1e-5)
+
+
+def test_build_mesh_roof_normal_points_up():
+    # The top cap must have at least one vertex whose normal points up (+Z),
+    # i.e. the roof is lit from above rather than rendered as a flat shadow.
+    fg = FeatureGeometry("f1", _square_wkb(), height=5.0)
+    buf = build_mesh_from_geometries([fg], origin=ORIGIN)
+    up_normals = [n for n in _normals(buf) if n[2] > 0.9]
+    assert up_normals, "expected at least one upward (roof) normal"
+
+
+def test_empty_mesh_has_empty_normals():
+    from dynastore.modules.volumes.mesh_builder import empty_mesh
+    buf = empty_mesh()
+    assert buf.normals == b""
+
+
+# ---------------------------------------------------------------------------
+# Vertex colours (COLOR_0) from a height ramp
+# ---------------------------------------------------------------------------
+
+
+def _colors(buf):
+    n = buf.vertex_count
+    return [struct.unpack_from("<4B", buf.colors, i * 4) for i in range(n)]
+
+
+def test_build_mesh_without_ramp_has_no_colors():
+    fg = FeatureGeometry("f1", _square_wkb(), height=5.0)
+    buf = build_mesh_from_geometries([fg], origin=ORIGIN)
+    assert buf.colors == b""
+
+
+def test_build_mesh_with_ramp_emits_rgba_per_vertex():
+    ramp = [(0.0, (0, 0, 0)), (10.0, (200, 200, 200))]
+    fg = FeatureGeometry("f1", _square_wkb(), height=5.0)
+    buf = build_mesh_from_geometries([fg], origin=ORIGIN, color_ramp=ramp)
+    assert len(buf.colors) == buf.vertex_count * 4
+    # Height 5 is halfway up a 0..10 ramp → mid-grey, alpha opaque.
+    for r, g, b, a in _colors(buf):
+        assert (r, g, b) == (100, 100, 100)
+        assert a == 255
+
+
+def test_build_mesh_taller_feature_gets_warmer_color():
+    # A ramp where taller → higher red channel; verify per-feature stamping
+    # assigns each building's own colour rather than one global tint.
+    ramp = [(0.0, (0, 0, 0)), (20.0, (200, 0, 0))]
+    short = FeatureGeometry("short", _square_wkb(4.3007, 52.0705), height=5.0)
+    tall = FeatureGeometry("tall", _square_wkb(4.3017, 52.0705), height=20.0)
+    buf = build_mesh_from_geometries([short, tall], origin=ORIGIN, color_ramp=ramp)
+    reds = {c[0] for c in _colors(buf)}
+    # Short building → ~50 red, tall building → 200 red; both present.
+    assert 200 in reds
+    assert 50 in reds
+
+
+def test_build_mesh_height_fallback_uses_default_extrusion_for_color():
+    # height=0 falls back to default_extrusion_height; the colour must reflect
+    # that fallback height, not 0.
+    ramp = [(0.0, (0, 0, 0)), (10.0, (100, 100, 100))]
+    fg = FeatureGeometry("f1", _square_wkb(), height=0.0)
+    buf = build_mesh_from_geometries(
+        [fg], origin=ORIGIN, default_extrusion_height=10.0, color_ramp=ramp
+    )
+    for r, g, b, _a in _colors(buf):
+        assert (r, g, b) == (100, 100, 100)
+
+
+def test_empty_mesh_has_empty_colors():
+    from dynastore.modules.volumes.mesh_builder import empty_mesh
+    buf = empty_mesh()
+    assert buf.colors == b""

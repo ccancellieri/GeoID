@@ -524,10 +524,15 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
                 catalog_id, collection_id, exc,
             )
             return pack_glb(empty_mesh())
+        color_ramp = None
+        if cfg.color_by_height and cfg.height_color_ramp:
+            from dynastore.modules.volumes.color_ramp import parse_ramp
+            color_ramp = parse_ramp(cfg.height_color_ramp)
         mesh = build_mesh_from_geometries(
             geometries,
             origin=origin,
             default_extrusion_height=cfg.default_extrusion_height,
+            color_ramp=color_ramp,
         )
         return pack_glb(mesh)
 

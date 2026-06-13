@@ -46,6 +46,33 @@ _CHUNK_BIN  = 0x004E4942   # 'BIN\0'
 # glTF component types
 _FLOAT  = 5126
 _UINT32 = 5125
+_UBYTE  = 5121
+
+
+def _building_material(*, tinted: bool = False) -> Dict[str, Any]:
+    """A simple double-sided PBR material for extruded building volumes.
+
+    Fully dielectric (metallic 0) and mostly rough, so directional scene
+    lighting shades roofs and walls differently and adjacent buildings read as
+    distinct solids. ``doubleSided`` guards against any inward-facing triangles
+    from the centroid-fan caps so no surface drops out. Without a material the
+    renderer falls back to its default unlit look, which makes the whole tile
+    appear as one flat mass.
+
+    The PBR base colour is ``baseColorFactor * COLOR_0``. When the mesh carries
+    per-vertex colours (*tinted*), the factor is white so the vertex ramp shows
+    true; otherwise it is a neutral warm-grey applied uniformly.
+    """
+    base = [1.0, 1.0, 1.0, 1.0] if tinted else [0.82, 0.80, 0.76, 1.0]
+    return {
+        "name": "building",
+        "doubleSided": True,
+        "pbrMetallicRoughness": {
+            "baseColorFactor": base,
+            "metallicFactor": 0.0,
+            "roughnessFactor": 0.85,
+        },
+    }
 
 
 def _pad4(data: bytes, pad_byte: int = 0x20) -> bytes:
@@ -70,13 +97,100 @@ def pack_glb(mesh: MeshBuffers, *, title: str = "tile") -> bytes:
         return _empty_glb()
 
     positions = mesh.positions   # float32 * 3 per vertex
+    normals   = mesh.normals     # float32 * 3 per vertex (may be empty)
+    colors    = mesh.colors      # uint8 RGBA * 4 per vertex (may be empty)
     indices   = mesh.indices     # uint32 per index
 
-    # Buffer layout: [positions][indices]
-    bin_data = _pad4(b"".join([positions, indices]), pad_byte=0x00)
+    has_normals = bool(normals)
+    has_colors  = bool(colors)
 
-    pos_byte_length = len(positions)
-    idx_byte_length = len(indices)
+    # Buffer layout: [positions][normals?][colors?][indices]. Vertex attributes
+    # share one ARRAY_BUFFER region; accessor/bufferView indices are assigned in
+    # the same order the parts are concatenated so offsets line up exactly.
+    accessors: list = [
+        {
+            "bufferView": 0,
+            "byteOffset": 0,
+            "componentType": _FLOAT,
+            "count": mesh.vertex_count,
+            "type": "VEC3",
+            "min": list(mesh.min_pos),
+            "max": list(mesh.max_pos),
+        },
+    ]
+    buffer_views: list = [
+        {
+            "buffer": 0,
+            "byteOffset": 0,
+            "byteLength": len(positions),
+            "target": 34962,  # ARRAY_BUFFER
+        },
+    ]
+    attributes: Dict[str, int] = {"POSITION": 0}
+    parts: list = [positions]
+    offset = len(positions)
+
+    if has_normals:
+        attributes["NORMAL"] = len(accessors)
+        accessors.append({
+            "bufferView": len(buffer_views),
+            "byteOffset": 0,
+            "componentType": _FLOAT,
+            "count": mesh.vertex_count,
+            "type": "VEC3",
+        })
+        buffer_views.append({
+            "buffer": 0,
+            "byteOffset": offset,
+            "byteLength": len(normals),
+            "target": 34962,  # ARRAY_BUFFER
+        })
+        parts.append(normals)
+        offset += len(normals)
+
+    if has_colors:
+        attributes["COLOR_0"] = len(accessors)
+        accessors.append({
+            "bufferView": len(buffer_views),
+            "byteOffset": 0,
+            "componentType": _UBYTE,
+            "normalized": True,
+            "count": mesh.vertex_count,
+            "type": "VEC4",
+        })
+        buffer_views.append({
+            "buffer": 0,
+            "byteOffset": offset,
+            "byteLength": len(colors),
+            "target": 34962,  # ARRAY_BUFFER
+        })
+        parts.append(colors)
+        offset += len(colors)
+
+    idx_accessor = len(accessors)
+    accessors.append({
+        "bufferView": len(buffer_views),
+        "byteOffset": 0,
+        "componentType": _UINT32,
+        "count": mesh.index_count,
+        "type": "SCALAR",
+    })
+    buffer_views.append({
+        "buffer": 0,
+        "byteOffset": offset,
+        "byteLength": len(indices),
+        "target": 34963,  # ELEMENT_ARRAY_BUFFER
+    })
+    parts.append(indices)
+
+    bin_data = _pad4(b"".join(parts), pad_byte=0x00)
+
+    primitive: Dict[str, Any] = {
+        "attributes": attributes,
+        "indices": idx_accessor,
+        "mode": 4,  # TRIANGLES
+        "material": 0,
+    }
 
     gltf: Dict[str, Any] = {
         "asset": {
@@ -88,45 +202,12 @@ def pack_glb(mesh: MeshBuffers, *, title: str = "tile") -> bytes:
         "nodes": [{"mesh": 0}],
         "meshes": [{
             "name": title,
-            "primitives": [{
-                "attributes": {"POSITION": 0},
-                "indices": 1,
-                "mode": 4,  # TRIANGLES
-            }],
+            "primitives": [primitive],
         }],
-        "accessors": [
-            {
-                "bufferView": 0,
-                "byteOffset": 0,
-                "componentType": _FLOAT,
-                "count": mesh.vertex_count,
-                "type": "VEC3",
-                "min": list(mesh.min_pos),
-                "max": list(mesh.max_pos),
-            },
-            {
-                "bufferView": 1,
-                "byteOffset": 0,
-                "componentType": _UINT32,
-                "count": mesh.index_count,
-                "type": "SCALAR",
-            },
-        ],
-        "bufferViews": [
-            {
-                "buffer": 0,
-                "byteOffset": 0,
-                "byteLength": pos_byte_length,
-                "target": 34962,  # ARRAY_BUFFER
-            },
-            {
-                "buffer": 0,
-                "byteOffset": pos_byte_length,
-                "byteLength": idx_byte_length,
-                "target": 34963,  # ELEMENT_ARRAY_BUFFER
-            },
-        ],
-        "buffers": [{"byteLength": pos_byte_length + idx_byte_length}],
+        "materials": [_building_material(tinted=has_colors)],
+        "accessors": accessors,
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": sum(bv["byteLength"] for bv in buffer_views)}],
     }
 
     json_bytes = _pad4(json.dumps(gltf, separators=(",", ":")).encode("utf-8"),
