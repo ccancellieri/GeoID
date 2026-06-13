@@ -314,6 +314,12 @@ function buildContainerLayers(container) {
       id:       `3dtiles-${container.id}`,
       data:     tilesHref,
       pickable: true,
+      // Our tile content is authored Z-up in the ENU frame (the tileset asset
+      // declares gltfUpAxis=Z for spec-compliant clients). loaders.gl does not
+      // read that from the tileset.json — it defaults glTF content to Y-up and
+      // rotates it 90°, tipping every building onto its side. Pass the up-axis
+      // explicitly so it maps straight through the ENU->ECEF root transform.
+      loadOptions: { "3d-tiles": { assetGltfUpAxis: "Z" } },
       onTilesetLoad: () => {},
     }));
   }
