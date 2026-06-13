@@ -19,7 +19,7 @@
 from . import config  # noqa: F401  -- service-exposure plugin registration
 from . import presets as _maps_presets  # noqa: F401  -- preset registration side-effect
 
-from dynastore.tools.discovery import register_plugin
-from dynastore.extensions.maps.wmts_web_map_links import WmtsWebMapLinksContributor
-
-register_plugin(WmtsWebMapLinksContributor())
+# NOTE: the WMTS web-map-links contributor lives in the *stac* extension
+# (registered in StacService.lifespan), not here. STAC item assembly runs in
+# scope_catalog, which does not load the maps extension — registering it here
+# meant the enrichment never reached STAC reads.

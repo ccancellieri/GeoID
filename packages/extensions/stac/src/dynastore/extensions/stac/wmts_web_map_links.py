@@ -29,6 +29,17 @@ No tiling infrastructure is required — the contributor simply repoints
 the existing source WMTS by swapping ``GetPreview`` for ``GetTile`` and
 appending the ``{TileMatrix}/{TileRow}/{TileCol}`` placeholders.
 
+Placement
+---------
+This contributor lives in the **stac** extension (not maps) because STAC
+item assembly — which populates ``ref.extras["item_assets"]`` via
+``asset_factory`` and merges ``AssetContributor`` / ``StacContributor``
+output — runs wherever the STAC read path is served (the ``scope_catalog``
+service). The maps extension is not loaded there, so registering here is
+what makes the enrichment actually reach STAC reads. It also keeps the
+contributor free of any maps dependency: it only consumes the neutral
+``asset_contrib`` protocol and the stac-local ``StacContribution``.
+
 Design constraints
 ------------------
 - No inter-module imports; cross-module communication via protocols only.
@@ -135,8 +146,10 @@ def _derive_wmts_get_tile_href(preview_href: str) -> str | None:
 class WmtsWebMapLinksContributor:
     """AssetContributor that emits STAC web-map-links ``wmts`` typed assets.
 
-    Activated automatically when the maps extension is loaded (registered via
-    ``register_plugin`` in ``wmts_web_map_links`` module import side-effect).
+    Registered in ``StacService.lifespan`` so it is active wherever the STAC
+    read path is served (the ``scope_catalog`` service).  A single instance
+    satisfies both ``AssetContributor`` (``contribute``) and
+    ``StacContributor`` (``contribute_stac``).
 
     The contributor inspects ``ref.extras["item_assets"]`` (populated by
     ``asset_factory._to_resource_ref`` for items) and emits a GetTile
@@ -182,7 +195,7 @@ class WmtsWebMapLinksContributor:
 
     def contribute_stac(self, ref: ResourceRef) -> Iterable:
         """StacContributor: declare the web-map-links extension URI when emitting."""
-        from dynastore.extensions.stac.stac_contributor import StacContribution
+        from .stac_contributor import StacContribution
 
         item_assets: dict = ref.extras.get("item_assets") or {}
         has_wmts = any(

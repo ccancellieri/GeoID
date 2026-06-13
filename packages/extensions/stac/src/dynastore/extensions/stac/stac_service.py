@@ -279,14 +279,23 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     async def lifespan(self, app: FastAPI):
         from dynastore.tools.discovery import register_plugin, unregister_plugin
         from .stac_contributor import LanguageStacContributor
+        from .wmts_web_map_links import WmtsWebMapLinksContributor
 
         language_contributor = LanguageStacContributor()
+        # Web-map-links enrichment registers here, not in the maps extension:
+        # STAC item assembly runs in scope_catalog (which does not load maps),
+        # so registering on the STAC service is what makes the ``wmts_tiles``
+        # enrichment reach STAC reads. One instance satisfies both
+        # AssetContributor and StacContributor.
+        wmts_web_map_links_contributor = WmtsWebMapLinksContributor()
         register_plugin(language_contributor)
+        register_plugin(wmts_web_map_links_contributor)
         try:
             # Policies declared via PolicyContributor; IAM forwards centrally.
             yield
         finally:
             unregister_plugin(language_contributor)
+            unregister_plugin(wmts_web_map_links_contributor)
 
     # NotebookContributorProtocol — opt-in surface picked up by
     # NotebooksModule via discovery. Returning an empty list when

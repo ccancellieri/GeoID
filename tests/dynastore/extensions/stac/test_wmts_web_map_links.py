@@ -33,7 +33,7 @@ Covers:
 import pytest
 from urllib.parse import parse_qs, urlparse
 
-from dynastore.extensions.maps.wmts_web_map_links import (
+from dynastore.extensions.stac.wmts_web_map_links import (
     WEB_MAP_LINKS_EXTENSION_URI,
     WmtsWebMapLinksContributor,
     _derive_wmts_get_tile_href,
