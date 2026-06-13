@@ -7,6 +7,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="../static/common/admin.css">
+  <link rel="stylesheet" href="../static/common/page-shell.css">
+  <script src="../static/common/page-shell.js"></script>
   <style>
     .ing-newcol { margin-top: 0.75rem; }
     .ing-newcol-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
@@ -15,15 +17,12 @@
   </style>
 </head>
 <body>
+  <ds-page-shell
+    data-title="Drop &amp; Register"
+    data-breadcrumb="DynaStore — Atlas of ingest"
+    data-back-label="Back to Home">
+  </ds-page-shell>
   <main>
-    <header class="masthead">
-      <div class="folio">IV.</div>
-      <div>
-        <div class="kicker">DynaStore — Atlas of ingest</div>
-        <h1>Drop &amp; Register</h1>
-      </div>
-      <div class="stamp" id="masthead-stamp"></div>
-    </header>
 
     <p class="subtitle">
       Drag one or more GeoJSON documents — <em>Feature</em>,
@@ -75,10 +74,6 @@
     </div>
   </main>
 
-  <script>
-    document.getElementById("masthead-stamp").textContent =
-      `FOLIO ${new Date().toISOString().slice(0, 10)}\nREV. ${Math.floor(Math.random()*900+100)}`;
-  </script>
   <script type="module" src="../static/admin/ingest.js"></script>
 </body>
 </html>
