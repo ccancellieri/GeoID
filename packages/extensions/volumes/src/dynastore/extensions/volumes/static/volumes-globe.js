@@ -298,8 +298,16 @@ function selectContainer(container) {
 
 function buildContainerLayers(container) {
   /* global deck */
+  // The selected container is intentionally EXCLUDED from the extruded extent
+  // box. The overlay renders interleaved with the basemap, sharing one depth
+  // buffer — an extruded box drawn over the selection writes depth even at zero
+  // fill alpha, which occludes every per-building volume shorter than the box
+  // (only the single tallest building, reaching the box top, would poke
+  // through). Other containers keep a faint translucent box as surrounding
+  // context; they sit away from the selection so they don't occlude it.
   const polygonData = [];
   for (const c of _containers) {
+    if (c.id === container.id) continue;
     const ext  = c.contentExtent || {};
     const bbox = ext.bbox;
     if (!bbox || bbox.length < 6) continue;
@@ -321,11 +329,7 @@ function buildContainerLayers(container) {
       wireframe: true,
       getPolygon:   (d) => d.contour,
       getElevation: (d) => d.extrudedHeight - d.elevation,
-      // The selected container is drawn as a wireframe-only box (zero fill) so
-      // the per-building volumes rendered inside it (footprints layer below)
-      // remain visible; other containers keep a faint translucent fill so they
-      // read as surrounding context.
-      getFillColor: (d) => d.id === container.id ? [99, 102, 241, 0] : [99, 102, 241, 40],
+      getFillColor:    [99, 102, 241, 40],
       getLineColor:    [99, 102, 241, 180],
       lineWidthMinPixels: 1,
       pickable:  true,
@@ -349,7 +353,11 @@ function buildContainerLayers(container) {
     }));
   }
 
-  if (_catalogId) {
+  // The footprints layer extrudes building outlines from OGC Features as a
+  // LoD1 fallback for CityJSON collections that have no 3D Tiles content. When
+  // a tileset IS present it already renders the true LoD2 volumes, so drawing
+  // footprints too only duplicates geometry and z-fights the tiles — skip it.
+  if (_catalogId && !tilesHref) {
     const itemsUrl =
       `${FEATURES_BASE}/catalogs/${encodeURIComponent(_catalogId)}`
       + `/collections/${encodeURIComponent(container.id)}/items?limit=200`;
