@@ -2499,9 +2499,19 @@ class AssetElasticsearchDriver(
         collection_id: Optional[str] = None,
         db_resource=None,
     ) -> Optional[Dict[str, Any]]:
-        """Return a single asset document from ES by its ID, or None."""
+        """Return a single asset document from ES by its ID, or None.
+
+        Direct-get visibility contract: an asset the caller has no visibility
+        grant for is indistinguishable from a missing one — returns None so
+        the HTTP layer renders 404, never 403 or 200-with-data.
+        """
+        from dynastore.models.protocols.visibility import resolve_asset_listing_ids
         from dynastore.modules.elasticsearch.mappings import get_assets_index_name
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
+
+        visible_ids = await resolve_asset_listing_ids(catalog_id, collection_id)
+        if visible_ids is not None and asset_id not in visible_ids:
+            return None
 
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
@@ -2539,9 +2549,20 @@ class AssetElasticsearchDriver(
           PG scoping identical for the default catalog-tier search.
         - ``all_collections=True`` → no collection clause; spans every
           collection plus the catalog tier under the catalog.
+
+        Asset listing visibility: when the request published a caller snapshot,
+        the listing is transparently narrowed to the asset ids that caller may
+        see — applied as an ES ``terms`` clause, fail-closed when the visible
+        set is empty.
         """
+        from dynastore.models.protocols.visibility import resolve_asset_listing_ids
         from dynastore.modules.elasticsearch.mappings import get_assets_index_name
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
+
+        vis_collection_id = None if all_collections else collection_id
+        visible_ids = await resolve_asset_listing_ids(catalog_id, vis_collection_id)
+        if visible_ids is not None and not visible_ids:
+            return []
 
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
@@ -2563,6 +2584,15 @@ class AssetElasticsearchDriver(
                     "must_not": [{"exists": {"field": "collection_id"}}],
                 }
             }
+
+        if visible_ids is not None:
+            # Inject the asset_id allowlist as an ES ``terms`` filter.
+            # Mirroring the collection_es_driver visible_ids pattern.
+            existing = base_query if "bool" in base_query else {"bool": {"must": [base_query]}}
+            existing.setdefault("bool", {}).setdefault("filter", []).append(
+                {"terms": {"asset_id": sorted(visible_ids)}}
+            )
+            base_query = existing
 
         try:
             resp = await es.search(

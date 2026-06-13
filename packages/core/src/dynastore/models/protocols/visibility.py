@@ -88,6 +88,7 @@ __all__ = [
     "extract_id_constraint",
     "resolve_catalog_listing_ids",
     "resolve_collection_listing_ids",
+    "resolve_asset_listing_ids",
 ]
 
 
@@ -173,6 +174,10 @@ class ListingVisibilityProtocol(Protocol):
 
     async def collection_listing_filter(
         self, visibility: RequestVisibility, catalog_id: str
+    ) -> AccessFilter: ...
+
+    async def asset_listing_filter(
+        self, visibility: RequestVisibility, catalog_id: str, collection_id: Optional[str]
     ) -> AccessFilter: ...
 
 
@@ -268,3 +273,41 @@ async def resolve_collection_listing_ids(catalog_id: str) -> Optional[frozenset[
     """Collection ids of ``catalog_id`` the current request may list, or
     ``None`` for no filter."""
     return await _resolve_listing_ids(catalog_id)
+
+
+async def resolve_asset_listing_ids(
+    catalog_id: str, collection_id: Optional[str]
+) -> Optional[frozenset[str]]:
+    """Asset ids visible to the current request, or ``None`` for no filter.
+
+    ``None`` ⟹ no authorization layer is active — listings are unfiltered.
+    A non-None frozenset (possibly empty) is the set of asset ids the caller
+    may see. Fail-closed: an error or missing provider returns the empty set.
+    """
+    visibility = get_request_visibility()
+    if visibility is None:
+        return None
+
+    from dynastore.tools.discovery import get_protocol
+
+    provider = get_protocol(ListingVisibilityProtocol)
+    if provider is None:
+        logger.warning(
+            "Asset listing visibility requested (caller snapshot present) but no "
+            "ListingVisibilityProtocol provider is registered — failing "
+            "closed to an empty listing."
+        )
+        return frozenset()
+
+    try:
+        flt = await provider.asset_listing_filter(visibility, catalog_id, collection_id)
+    except Exception:
+        logger.warning(
+            "Listing-visibility provider failed for asset scope "
+            "(catalog_id=%s collection_id=%s) — failing closed to an empty listing.",
+            catalog_id,
+            collection_id,
+            exc_info=True,
+        )
+        return frozenset()
+    return extract_id_constraint(flt)

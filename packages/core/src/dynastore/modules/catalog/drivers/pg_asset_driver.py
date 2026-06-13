@@ -431,7 +431,22 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         collection_id: Optional[str] = None,
         db_resource: Optional[DbResource] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Return a single non-deleted asset document as a dict, or None."""
+        """Return a single non-deleted asset document as a dict, or None.
+
+        Direct-get visibility contract: an asset the caller has no visibility
+        grant for is indistinguishable from a missing one — returns None so
+        the HTTP layer renders 404, never 403 or 200-with-data.
+        """
+        from dynastore.models.protocols.visibility import resolve_asset_listing_ids
+
+        # Enforce the direct-get visibility contract: resolve the visible-id
+        # set for this caller. None = IAM off (unfiltered). A non-None set that
+        # does not contain asset_id means this asset is hidden for this caller;
+        # return None so the caller cannot distinguish it from a genuine miss.
+        visible_ids = await resolve_asset_listing_ids(catalog_id, collection_id)
+        if visible_ids is not None and asset_id not in visible_ids:
+            return None
+
         schema = await self._resolve_schema(catalog_id, db_resource)
         if not schema:
             return None
@@ -488,9 +503,26 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         matches a single collection (or the catalog tier when ``None``).
         When ``all_collections`` is True the predicate is dropped so the
         search spans every collection plus the catalog tier under the catalog.
+
+        Asset listing visibility: when the request published a caller snapshot,
+        the listing is transparently narrowed to the asset ids that caller may
+        see — applied before pagination, fail-closed when the visible set is
+        empty. Background/CLI work (no snapshot) lists unfiltered.
         """
+        from dynastore.models.protocols.visibility import resolve_asset_listing_ids
+
         schema = await self._resolve_schema(catalog_id, db_resource)
         if not schema:
+            return []
+
+        # Resolve the asset visibility constraint for this caller.
+        # ``None`` means no authorization layer is active — list unfiltered.
+        # An empty frozenset means the caller may see no assets — short-circuit.
+        # When ``all_collections`` is True the constraint is per-catalog (no
+        # collection pin) so we pass collection_id=None in that case.
+        vis_collection_id = None if all_collections else collection_id
+        visible_ids = await resolve_asset_listing_ids(catalog_id, vis_collection_id)
+        if visible_ids is not None and not visible_ids:
             return []
 
         where_parts = [
@@ -505,6 +537,10 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
         if not all_collections:
             where_parts.append("collection_id IS NOT DISTINCT FROM :collection_id")
             params["collection_id"] = collection_id
+
+        if visible_ids is not None:
+            where_parts.append("asset_id = ANY(:visible_asset_ids)")
+            params["visible_asset_ids"] = list(visible_ids)
 
         if filters:
             filter_parts, filter_params = build_pg_where(filters)

@@ -954,6 +954,7 @@ class PolicyService:
         principals: List[str],
         catalog_id: Optional[str] = None,
         collection_id: Optional[str] = None,
+        asset_id: Optional[str] = None,
         *,
         principal: Optional[Principal] = None,
         principal_id: Optional[UUID] = None,
@@ -983,6 +984,10 @@ class PolicyService:
             :meth:`AccessFilter.deny_everything` — over-denying is safe.
           * When no ALLOW compiles and the principal is not an unconditional
             super-admin, the result is :meth:`AccessFilter.deny_everything`.
+
+        ``asset_id`` (optional) pins the probe paths to a specific asset so
+        asset-level DENY policies are correctly matched during the per-asset
+        visibility check in ``IamListingVisibility._compute_asset_filter``.
         """
         schema = await self._resolve_schema(catalog_id)
         effective_policies = await self._resolve_effective_policies(
@@ -998,7 +1003,7 @@ class PolicyService:
         # policy's own ``matches_resource`` regex matcher (the exact matcher
         # ``evaluate_access`` uses) keeps relevance resolution drift-free —
         # we never re-implement resource matching here.
-        probe_paths = _read_scope_probe_paths(catalog_id, collection_id)
+        probe_paths = _read_scope_probe_paths(catalog_id, collection_id, asset_id)
 
         attributes = principal.attributes if principal else {}
 
@@ -1152,7 +1157,9 @@ def _policy_has_read_action(pol: Policy, *, is_deny: bool = False) -> bool:
 
 
 def _read_scope_probe_paths(
-    catalog_id: Optional[str], collection_id: Optional[str]
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    asset_id: Optional[str] = None,
 ) -> Tuple[str, ...]:
     """Representative read URLs for the requested scope.
 
@@ -1162,25 +1169,35 @@ def _read_scope_probe_paths(
     policy scoped to any of them is recognised. When no catalog is given we
     probe only the bare root, which a ``.*`` super-admin resource still
     matches (the generic platform-tier ``/search`` endpoint is gone).
+
+    When ``asset_id`` is supplied the probe set is extended with the canonical
+    asset read paths so asset-level DENY policies are recognised during the
+    per-asset visibility check.
     """
     if catalog_id is None:
         return ("/",)
     cat = catalog_id
     if collection_id:
         col = collection_id
-        return (
+        base = (
             f"/stac/catalogs/{cat}/collections/{col}/items",
             f"/stac/catalogs/{cat}/collections/{col}/items/_probe_",
             f"/features/catalogs/{cat}/collections/{col}/items",
             f"/search/catalogs/{cat}/geoid-search",
             f"/stac/catalogs/{cat}/search",
         )
+        if asset_id:
+            return base + (
+                f"/assets/catalogs/{cat}/collections/{col}/assets/{asset_id}",
+                f"/assets/catalogs/{cat}/collections/{col}",
+            )
+        return base
     # Catalog-wide read scope: also probe a representative collection-item
     # read path so a policy scoped to ``.../collections/{col}/items`` (the
     # common item-read grant) is recognised as relevant to a catalog-wide
     # read. ``_probe_`` is a placeholder collection/item id that the
     # per-segment ``[^/]+`` patterns match.
-    return (
+    base = (
         f"/stac/catalogs/{cat}",
         f"/stac/catalogs/{cat}/collections",
         f"/stac/catalogs/{cat}/collections/_probe_/items",
@@ -1190,6 +1207,12 @@ def _read_scope_probe_paths(
         f"/search/catalogs/{cat}/geoid-search",
         f"/stac/catalogs/{cat}/search",
     )
+    if asset_id:
+        return base + (
+            f"/assets/catalogs/{cat}/assets/{asset_id}",
+            f"/assets/catalogs/{cat}",
+        )
+    return base
 
 
 def _policy_matches_read_scope(pol: Policy, probe_paths: Tuple[str, ...]) -> bool:

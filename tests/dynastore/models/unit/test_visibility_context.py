@@ -218,6 +218,9 @@ async def test_resolve_catalog_provider_raises_returns_empty():
         async def collection_listing_filter(self, visibility, catalog_id):
             raise RuntimeError("simulated failure")
 
+        async def asset_listing_filter(self, visibility, catalog_id, collection_id):
+            raise RuntimeError("simulated failure")
+
     provider = _BrokenProvider()
     register_plugin(provider)
     vis = RequestVisibility(principals=("user:alice",))
@@ -243,6 +246,9 @@ async def test_resolve_catalog_provider_returns_ids():
         async def collection_listing_filter(self, visibility, catalog_id):
             return AccessFilter.allow_everything()
 
+        async def asset_listing_filter(self, visibility, catalog_id, collection_id):
+            return AccessFilter.allow_everything()
+
     provider = _AllowCatsProvider()
     register_plugin(provider)
     vis = RequestVisibility(principals=("user:alice",))
@@ -264,6 +270,9 @@ async def test_resolve_catalog_provider_returns_allow_everything_gives_none():
             return AccessFilter.allow_everything()
 
         async def collection_listing_filter(self, visibility, catalog_id):
+            return AccessFilter.allow_everything()
+
+        async def asset_listing_filter(self, visibility, catalog_id, collection_id):
             return AccessFilter.allow_everything()
 
     provider = _AllowAllProvider()

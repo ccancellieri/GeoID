@@ -614,6 +614,7 @@ class PermissionProtocol(Protocol):
         principals: List[str],
         catalog_id: Optional[str] = None,
         collection_id: Optional[str] = None,
+        asset_id: Optional[str] = None,
         *,
         principal: Optional[Principal] = None,
         principal_id: Optional[Any] = None,
@@ -640,6 +641,8 @@ class PermissionProtocol(Protocol):
         ``principals`` carries the same role/subject strings ``evaluate_access``
         takes; ``principal`` (optional) supplies ABAC attributes and
         per-principal ``custom_policies`` for compiling attribute conditions.
+        ``asset_id`` (optional) pins the probe paths to a specific asset so
+        asset-level DENY policies are detected during listing-filter computation.
         """
         ...
 

@@ -142,6 +142,26 @@ class IamListingVisibility:
         self._cache_put(key, flt)
         return flt
 
+    async def asset_listing_filter(
+        self, visibility: RequestVisibility, catalog_id: str, collection_id: Optional[str]
+    ) -> AccessFilter:
+        col_key = collection_id or ""
+        key = ("asset", catalog_id, col_key) + visibility.cache_key
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
+        try:
+            flt = await self._compute_asset_filter(visibility, catalog_id, collection_id)
+        except Exception:
+            logger.warning(
+                "asset_listing_filter failed for catalog=%s collection=%s principals=%s"
+                " — denying", catalog_id, collection_id, visibility.principals, exc_info=True,
+            )
+            return AccessFilter.deny_everything()
+        self._cache_put(key, flt)
+        return flt
+
     # ---- computation -------------------------------------------------- #
 
     async def _compile(
@@ -191,6 +211,49 @@ class IamListingVisibility:
                 visible.append(col_id)
         return _ids_filter(visible)
 
+    async def _compute_asset_filter(
+        self,
+        visibility: RequestVisibility,
+        catalog_id: str,
+        collection_id: Optional[str],
+    ) -> AccessFilter:
+        # Gate on the collection (or catalog) scope first — if the caller
+        # cannot see the owning collection, no assets within it are visible.
+        col_scope = await self._compile(visibility, catalog_id, collection_id)
+        if col_scope.deny_all:
+            return AccessFilter.deny_everything()
+
+        # Enumerate asset ids and compile the read filter per asset, using the
+        # same probe-path logic that already handles collection-level policy
+        # matching. An asset inherits visibility from its collection scope by
+        # default; an asset-specific DENY policy (matched by the asset probe
+        # paths added to _read_scope_probe_paths) can narrow it further.
+        visible: List[str] = []
+        for asset_id in await self._enumerate_asset_ids(catalog_id, collection_id):
+            scope = await self._compile_asset(
+                visibility, catalog_id, collection_id, asset_id
+            )
+            if not scope.deny_all:
+                visible.append(asset_id)
+        return _ids_filter(visible)
+
+    async def _compile_asset(
+        self,
+        visibility: RequestVisibility,
+        catalog_id: str,
+        collection_id: Optional[str],
+        asset_id: str,
+    ) -> AccessFilter:
+        """Compile a read filter scoped to a single asset."""
+        return await self._perms.compile_read_filter(
+            list(visibility.principals),
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            asset_id=asset_id,
+            principal=visibility.principal,
+            principal_id=visibility.principal_id,
+        )
+
     # ---- enumeration (under bypass — see module docstring) ------------- #
 
     async def _enumerate_catalog_ids(self) -> List[str]:
@@ -232,6 +295,34 @@ class IamListingVisibility:
                     catalog_id, limit=_PAGE, offset=offset
                 )
                 ids.extend(c.id for c in page or [])
+                if not page or len(page) < _PAGE:
+                    break
+                offset += _PAGE
+        return ids
+
+    async def _enumerate_asset_ids(
+        self, catalog_id: str, collection_id: Optional[str]
+    ) -> List[str]:
+        from dynastore.models.protocols.assets import AssetsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        assets = get_protocol(AssetsProtocol)
+        if assets is None:
+            raise RuntimeError(
+                "AssetsProtocol not available while computing asset listing "
+                "visibility — cannot enumerate assets."
+            )
+        ids: List[str] = []
+        with visibility_bypass():
+            offset = 0
+            while offset < _MAX_ENTRIES:
+                page = await assets.list_assets(
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    limit=_PAGE,
+                    offset=offset,
+                )
+                ids.extend(a.asset_id for a in page or [])
                 if not page or len(page) < _PAGE:
                     break
                 offset += _PAGE
