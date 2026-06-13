@@ -737,6 +737,10 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                             "initialization — refusing to start dispatcher."
                         )
                     await ensure_task_storage_exists(locked_conn, schema)
+                    from dynastore.modules.tasks.workclass_ddl import (
+                        ensure_workclass_storage_exists,
+                    )
+                    await ensure_workclass_storage_exists(locked_conn, schema)
 
                 # Ensure configs.task_capability_registry exists before the
                 # backstop/sweep loops start querying it. PlatformConfigService

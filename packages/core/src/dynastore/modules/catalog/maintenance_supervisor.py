@@ -84,6 +84,10 @@ JOB_IAM_PRUNE = "iam_prune"
 JOB_TASK_REAPER = "task_reaper"
 JOB_TASK_PARTITION_CREATE = "task_partition_create"
 JOB_TASK_RETENTION = "task_retention"
+JOB_WORK_EVENTS_PARTITION_CREATE = "work_events_partition_create"
+JOB_WORK_EVENTS_RETENTION = "work_events_retention"
+JOB_WORK_INDEX_PARTITION_CREATE = "work_index_partition_create"
+JOB_WORK_INDEX_RETENTION = "work_index_retention"
 
 # pg_cron job names this supervisor supersedes. On a non-fresh deploy these may
 # already be scheduled in cron.job from a prior boot; we unschedule them once so
@@ -113,6 +117,10 @@ _CADENCE_IAM_PRUNE = 86400        # daily
 _CADENCE_TASK_REAPER = 60         # every minute (matches old "* * * * *")
 _CADENCE_TASK_PARTITION_CREATE = 86400   # daily (idempotent CREATE IF NOT EXISTS)
 _CADENCE_TASK_RETENTION = 86400   # daily (idempotent DROP old partitions)
+_CADENCE_WORK_EVENTS_PARTITION_CREATE = 86400   # daily
+_CADENCE_WORK_EVENTS_RETENTION = 86400          # daily
+_CADENCE_WORK_INDEX_PARTITION_CREATE = 86400    # daily
+_CADENCE_WORK_INDEX_RETENTION = 86400           # daily
 
 # Bounded-batch DELETE size — no single DELETE removes more than this many rows.
 _PRUNE_BATCH = 1000
@@ -455,6 +463,75 @@ async def _run_task_retention(conn: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Workclass partition maintenance jobs (work_events + work_index)
+# ---------------------------------------------------------------------------
+
+
+async def _run_work_events_partition_create(conn: Any) -> int:
+    """Invoke the daily create-ahead function for ``tasks.work_events``.
+
+    The function ``{schema}.create_partitions_{schema}_work_events()`` is
+    provisioned by ``ensure_workclass_storage_exists``; it opens a 30-day
+    window of daily leaf partitions.  Returns 0 (function returns void).
+    """
+    schema = _TASKS_SCHEMA
+    func_name = f"create_partitions_{schema}_work_events"
+    await DQLQuery(
+        f'SELECT "{schema}"."{func_name}"()',
+        result_handler=ResultHandler.NONE,
+    ).execute(conn)
+    return 0
+
+
+async def _run_work_events_retention(conn: Any) -> int:
+    """Invoke the daily retention function for ``tasks.work_events``.
+
+    The function ``{schema}.maintain_partitions_{schema}_work_events()`` is
+    provisioned by ``ensure_workclass_storage_exists``; it drops daily
+    partitions older than 30 days.  Returns 0 (function returns void).
+    """
+    schema = _TASKS_SCHEMA
+    func_name = f"maintain_partitions_{schema}_work_events"
+    await DQLQuery(
+        f'SELECT "{schema}"."{func_name}"()',
+        result_handler=ResultHandler.NONE,
+    ).execute(conn)
+    return 0
+
+
+async def _run_work_index_partition_create(conn: Any) -> int:
+    """Invoke the daily create-ahead function for ``tasks.work_index``.
+
+    The function ``{schema}.create_partitions_{schema}_work_index()`` is
+    provisioned by ``ensure_workclass_storage_exists``; it opens a 30-day
+    window of daily leaf partitions.  Returns 0 (function returns void).
+    """
+    schema = _TASKS_SCHEMA
+    func_name = f"create_partitions_{schema}_work_index"
+    await DQLQuery(
+        f'SELECT "{schema}"."{func_name}"()',
+        result_handler=ResultHandler.NONE,
+    ).execute(conn)
+    return 0
+
+
+async def _run_work_index_retention(conn: Any) -> int:
+    """Invoke the daily retention function for ``tasks.work_index``.
+
+    The function ``{schema}.maintain_partitions_{schema}_work_index()`` is
+    provisioned by ``ensure_workclass_storage_exists``; it drops daily
+    partitions older than 30 days.  Returns 0 (function returns void).
+    """
+    schema = _TASKS_SCHEMA
+    func_name = f"maintain_partitions_{schema}_work_index"
+    await DQLQuery(
+        f'SELECT "{schema}"."{func_name}"()',
+        result_handler=ResultHandler.NONE,
+    ).execute(conn)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Job dispatch table
 # ---------------------------------------------------------------------------
 
@@ -489,6 +566,14 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
         return await _run_task_partition_create(conn)
     if job_name == JOB_TASK_RETENTION:
         return await _run_task_retention(conn)
+    if job_name == JOB_WORK_EVENTS_PARTITION_CREATE:
+        return await _run_work_events_partition_create(conn)
+    if job_name == JOB_WORK_EVENTS_RETENTION:
+        return await _run_work_events_retention(conn)
+    if job_name == JOB_WORK_INDEX_PARTITION_CREATE:
+        return await _run_work_index_partition_create(conn)
+    if job_name == JOB_WORK_INDEX_RETENTION:
+        return await _run_work_index_retention(conn)
     raise ValueError(f"maintenance_supervisor: unknown job_name {job_name!r}")
 
 
@@ -746,6 +831,10 @@ async def register_supervisor_jobs(engine: Any) -> None:
         (JOB_TASK_REAPER, _CADENCE_TASK_REAPER),
         (JOB_TASK_PARTITION_CREATE, _CADENCE_TASK_PARTITION_CREATE),
         (JOB_TASK_RETENTION, _CADENCE_TASK_RETENTION),
+        (JOB_WORK_EVENTS_PARTITION_CREATE, _CADENCE_WORK_EVENTS_PARTITION_CREATE),
+        (JOB_WORK_EVENTS_RETENTION, _CADENCE_WORK_EVENTS_RETENTION),
+        (JOB_WORK_INDEX_PARTITION_CREATE, _CADENCE_WORK_INDEX_PARTITION_CREATE),
+        (JOB_WORK_INDEX_RETENTION, _CADENCE_WORK_INDEX_RETENTION),
     ]
     async with managed_transaction(engine) as conn:
         for job_name, cadence in jobs:

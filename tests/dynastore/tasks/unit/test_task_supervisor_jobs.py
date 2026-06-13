@@ -124,8 +124,8 @@ async def test_register_supervisor_jobs_includes_task_jobs():
     cadence_map = dict(upserted)
     job_names = list(cadence_map.keys())
 
-    # Total: 6 original + 3 task = 9
-    assert len(job_names) == 9
+    # Total: 6 original + 3 task + 4 workclass = 13
+    assert len(job_names) == 13
 
     assert JOB_TASK_REAPER in cadence_map
     assert JOB_TASK_PARTITION_CREATE in cadence_map
