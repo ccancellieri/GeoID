@@ -793,6 +793,21 @@ class CatalogService(CatalogsProtocol):
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
     ) -> Catalog:
+        # Enforce the direct-get visibility contract (#2050): a catalog the
+        # caller has no visibility grant for must be indistinguishable from a
+        # missing one.  resolve_catalog_listing_ids() returns None when no
+        # authorization layer is active (IAM off) — in that case we skip the
+        # check and preserve prior behaviour.  An empty frozenset means the
+        # caller may see nothing; a non-empty frozenset that does not contain
+        # catalog_id means this specific catalog is filtered out for this
+        # caller.  Both map to the same ValueError the "genuinely missing"
+        # branch raises so the HTTP layer renders a uniform 404.
+        from dynastore.models.protocols.visibility import resolve_catalog_listing_ids
+
+        visible_ids = await resolve_catalog_listing_ids()
+        if visible_ids is not None and catalog_id not in visible_ids:
+            raise ValueError(f"Catalog '{catalog_id}' not found.")
+
         model = await self.get_catalog_model(catalog_id, ctx=ctx)
         if not model:
             raise ValueError(f"Catalog '{catalog_id}' not found.")
@@ -1889,6 +1904,18 @@ class CatalogService(CatalogsProtocol):
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
     ) -> Optional[Collection]:
+        # Enforce the direct-get visibility contract (#2050): a collection the
+        # caller has no visibility grant for is indistinguishable from a
+        # missing one.  resolve_collection_listing_ids() returns None when
+        # IAM is not active — preserve prior behaviour in that case.  When a
+        # non-None frozenset is returned and collection_id is absent from it,
+        # return None so the HTTP layer renders 404 (same as a genuine miss).
+        from dynastore.models.protocols.visibility import resolve_collection_listing_ids
+
+        visible_ids = await resolve_collection_listing_ids(catalog_id)
+        if visible_ids is not None and collection_id not in visible_ids:
+            return None
+
         db_resource = ctx.db_resource if ctx else None
         return await self._col_svc.get_collection_model(
             catalog_id, collection_id, db_resource=db_resource
