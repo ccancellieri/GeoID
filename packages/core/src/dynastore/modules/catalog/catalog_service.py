@@ -100,9 +100,15 @@ CREATE TABLE IF NOT EXISTS {schema}.collections (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     deleted_at TIMESTAMPTZ DEFAULT NULL,
+    lifecycle_status VARCHAR DEFAULT NULL,
     PRIMARY KEY (id)
 );
 """
+"""``lifecycle_status`` is the transitional-state overlay (#2066):
+``'provisioning'`` while external async init is in flight, ``'deleting'``
+while a hard-delete purge is in flight, ``NULL`` otherwise.  It is resolved
+*above* ``deleted_at`` by :meth:`CollectionStore.get_lifecycle`; a row with a
+NULL overlay and NULL ``deleted_at`` is ``ACTIVE``."""
 
 def _build_tenant_core_ddl_batch(schema: str) -> "DDLBatch":
     """Build the per-tenant core DDL batch.

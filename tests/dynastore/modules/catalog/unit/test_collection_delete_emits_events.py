@@ -49,6 +49,7 @@ import pytest
 from dynastore.modules.catalog import collection_service as collection_service_mod
 from dynastore.modules.catalog.collection_service import CollectionService
 from dynastore.modules.catalog.event_service import CatalogEventType
+from dynastore.models.protocols.entity_store import CollectionLifecycle
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +148,19 @@ def svc(monkeypatch):
 
     monkeypatch.setattr(CollectionService, "_resolve_physical_schema", _phys_schema)
     monkeypatch.setattr(CollectionService, "_purge_collection_storage", _purge)
+
+    # #2066: delete_collection now resolves the lifecycle gate up front and
+    # (hard path) pre-marks DELETING. Stub both so the emit assertions exercise
+    # an ACTIVE collection without a real registry SELECT/UPDATE. Tests that
+    # need a different starting state override ``_get_lifecycle`` themselves.
+    async def _alive(_self, catalog_id, collection_id, db_resource=None):
+        return CollectionLifecycle.ACTIVE
+
+    async def _noop_set_status(_self, catalog_id, collection_id, status, db_resource=None):
+        return True
+
+    monkeypatch.setattr(CollectionService, "_get_lifecycle", _alive)
+    monkeypatch.setattr(CollectionService, "_set_lifecycle_status", _noop_set_status)
     # Neutralise the post-commit async-destroyer fan-out — the hooks aren't
     # the unit under test and may pull in unrelated module state.
     monkeypatch.setattr(
@@ -243,3 +257,90 @@ async def test_soft_delete_no_emit_when_row_already_tombstoned(
     ok = await svc.delete_collection("cat_c", "col_c", force=False)
     assert ok is True  # preserves prior contract of returning True
     assert record_emit == []
+
+
+# ---------------------------------------------------------------------------
+# #2066 — lifecycle gate: no teardown against a MISSING collection, and the
+# hard-delete DELETING pre-mark fires before any purge/emit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_missing_is_noop_no_teardown(svc, record_emit, monkeypatch):
+    """force=True against a MISSING collection must return False and emit
+    nothing — running the purge/cascade against an id that owns no rows would
+    destroy external resources it never had (spurious double-teardown). #2066.
+    """
+
+    async def _missing(_self, catalog_id, collection_id, db_resource=None):
+        return CollectionLifecycle.MISSING
+
+    monkeypatch.setattr(CollectionService, "_get_lifecycle", _missing)
+
+    purge_calls: list = []
+
+    async def _track_purge(_self, conn, phys_schema, catalog_id, collection_id):
+        purge_calls.append((catalog_id, collection_id))
+        return "phys_table_test"
+
+    monkeypatch.setattr(CollectionService, "_purge_collection_storage", _track_purge)
+
+    ok = await svc.delete_collection("cat_x", "col_x", force=True)
+    assert ok is False
+    assert record_emit == []
+    assert purge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_tombstoned_is_noop_no_emit(svc, record_emit, monkeypatch):
+    """force=False against an already-TOMBSTONED collection short-circuits at
+    the gate: returns True, emits nothing (no re-fire of COLLECTION_DELETION).
+    """
+
+    async def _tombstoned(_self, catalog_id, collection_id, db_resource=None):
+        return CollectionLifecycle.TOMBSTONED
+
+    monkeypatch.setattr(CollectionService, "_get_lifecycle", _tombstoned)
+
+    ok = await svc.delete_collection("cat_y", "col_y", force=False)
+    assert ok is True
+    assert record_emit == []
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_premarks_deleting_before_purge(svc, record_emit, monkeypatch):
+    """The hard-delete DELETING pre-mark must be committed before the purge
+    emits BEFORE_COLLECTION_HARD_DELETION, so the teardown window is
+    observable/write-gated cross-pod. #2066.
+    """
+    order: list[str] = []
+
+    async def _record_set_status(_self, catalog_id, collection_id, status, db_resource=None):
+        order.append(f"set_status:{status}")
+        return True
+
+    async def _record_purge(_self, conn, phys_schema, catalog_id, collection_id):
+        order.append("purge")
+        return "phys_table_test"
+
+    monkeypatch.setattr(CollectionService, "_set_lifecycle_status", _record_set_status)
+    monkeypatch.setattr(CollectionService, "_purge_collection_storage", _record_purge)
+
+    # Splice emit ordering into the same list via the recorder fixture's symbol.
+    orig_emit = collection_service_mod.emit_event
+
+    async def _ordered_emit(event_type, *a, **kw):
+        order.append(f"emit:{getattr(event_type, 'name', event_type)}")
+        await orig_emit(event_type, *a, **kw)
+
+    monkeypatch.setattr(collection_service_mod, "emit_event", _ordered_emit)
+
+    ok = await svc.delete_collection("cat_z", "col_z", force=True)
+    assert ok is True
+
+    # DELETING pre-mark lands first, before the purge and its emits.
+    assert order[0] == "set_status:deleting"
+    assert order.index("set_status:deleting") < order.index(
+        "emit:BEFORE_COLLECTION_HARD_DELETION"
+    )
+    assert order.index("emit:BEFORE_COLLECTION_HARD_DELETION") < order.index("purge")

@@ -34,6 +34,7 @@ from dynastore.modules.catalog.catalog_config import (
     CollectionPluginConfig,
 )
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
+from dynastore.models.protocols.entity_store import CollectionLifecycle
 from dynastore.tools.discovery import get_protocol
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.async_utils import signal_bus
@@ -89,6 +90,35 @@ def _invalidate_collection_model_cache(catalog_id: str, collection_id: str) -> N
     _collection_model_cache.cache_invalidate(None, catalog_id, collection_id)
 
 
+def _invalidate_collection_lifecycle_caches(catalog_id: str, collection_id: str) -> None:
+    """Drop every in-process cache that can answer *liveness* or *routing* for a
+    collection, called post-commit on each lifecycle transition (#2066).
+
+    A lifecycle change (create / provisioning→active / soft-delete /
+    hard-delete / reclaim) must not leave a cache reporting a stale answer:
+
+    * ``_collection_model_cache`` — a model hit reads as "the collection
+      exists"; a stale entry answers ACTIVE for a deleted id.
+    * router resolution cache — maps a collection to its physical table /
+      driver; a stale entry routes a write at a dropped table after a hard
+      delete.
+
+    Both caches are tiered (in-process L1 + optional shared L2); invalidation
+    reaches the shared tier, so sibling pods converge within their L1 TTL cap
+    (≤60s) rather than relying on full TTL expiry.  Truly synchronous cross-pod
+    invalidation (an explicit distributed signal) is tracked as a follow-up.
+
+    The per-class collection *config* cache is intentionally not cleared here:
+    it is keyed per config class (no single-collection wildcard) and is already
+    shadowed by the model-cache liveness gate on every read.  See the #2066
+    follow-up for distributed + config-cache invalidation.
+    """
+    from dynastore.modules.storage.router import invalidate_router_cache
+
+    _invalidate_collection_model_cache(catalog_id, collection_id)
+    invalidate_router_cache(catalog_id, collection_id)
+
+
 def _make_collection_exists_query(phys_schema: str) -> DQLQuery:
     """SELECT id FROM ``phys_schema``.collections by id (non-deleted only).
 
@@ -109,10 +139,13 @@ class CollectionNotAliveError(Exception):
     Attributes:
         catalog_id:    The catalog that owns the collection.
         collection_id: The collection that failed the liveness check.
-        reason:        ``"missing"``   — no registry row (hard-deleted or never
-                                         created).
-                       ``"tombstoned"`` — registry row present with
-                                         ``deleted_at`` set (soft-deleted).
+        reason:        ``"missing"``      — no registry row (hard-deleted or
+                                            never created).
+                       ``"tombstoned"``   — registry row present with
+                                            ``deleted_at`` set (soft-deleted).
+                       ``"provisioning"`` — async init in flight; retry shortly.
+                       ``"deleting"``     — hard-delete purge in flight; retry.
+                       ``"lookup-error"`` — gate failed closed (state unknown).
     """
 
     def __init__(self, catalog_id: str, collection_id: str, reason: str) -> None:
@@ -177,7 +210,6 @@ class CollectionService:
             lc = await self._get_lifecycle(catalog_id, collection_id, db_resource)
         except Exception:
             return False
-        from dynastore.models.protocols.entity_store import CollectionLifecycle
         return lc == CollectionLifecycle.ACTIVE
 
     async def ensure_alive(
@@ -197,7 +229,6 @@ class CollectionService:
             raise CollectionNotAliveError(
                 catalog_id, collection_id, "lookup-error"
             ) from exc
-        from dynastore.models.protocols.entity_store import CollectionLifecycle
         if lc == CollectionLifecycle.ACTIVE:
             return
         reason = lc.value if lc != CollectionLifecycle.MISSING else "missing"
@@ -215,7 +246,6 @@ class CollectionService:
         """
         from dynastore.tools.discovery import get_protocols
         from dynastore.models.protocols.entity_store import (
-            CollectionLifecycle,
             CollectionStore,
             EntityStoreCapability,
         )
@@ -238,14 +268,49 @@ class CollectionService:
             if not phys_schema:
                 return CollectionLifecycle.MISSING
             row = await DQLQuery(
-                f'SELECT deleted_at FROM "{phys_schema}".collections WHERE id = :id;',
+                f'SELECT deleted_at, lifecycle_status FROM "{phys_schema}".collections '
+                "WHERE id = :id;",
                 result_handler=ResultHandler.ONE_DICT,
             ).execute(conn, id=collection_id)
         if row is None:
             return CollectionLifecycle.MISSING
+        # Transitional overlay outranks deleted_at — mirrors the authoritative
+        # driver resolver (core_postgresql.get_lifecycle). #2066.
+        status = row.get("lifecycle_status")
+        if status == CollectionLifecycle.DELETING.value:
+            return CollectionLifecycle.DELETING
+        if status == CollectionLifecycle.PROVISIONING.value:
+            return CollectionLifecycle.PROVISIONING
         if row["deleted_at"] is not None:
             return CollectionLifecycle.TOMBSTONED
         return CollectionLifecycle.ACTIVE
+
+    async def _set_lifecycle_status(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        status: Optional[str],
+        db_resource: Optional[DbResource] = None,
+    ) -> bool:
+        """Write the transitional overlay ``collections.lifecycle_status`` (#2066).
+
+        ``status=None`` clears the overlay (back to ACTIVE / TOMBSTONED per
+        ``deleted_at``); a value moves the row to PROVISIONING / DELETING.  The
+        UPDATE is scoped by id only — a tombstoned row can still be pre-marked
+        DELETING for a hard-delete purge.  Returns ``True`` when a row was
+        touched.  Runs in its own committed transaction when ``db_resource`` is
+        None so the new state is visible cross-pod before the caller proceeds.
+        """
+        async with managed_transaction(db_resource or self.engine) as conn:
+            phys_schema = await self._resolve_physical_schema(catalog_id, db_resource=conn)
+            if not phys_schema:
+                return False
+            rows = await DQLQuery(
+                f'UPDATE "{phys_schema}".collections SET lifecycle_status = :status '
+                "WHERE id = :id;",
+                result_handler=ResultHandler.ROWCOUNT,
+            ).execute(conn, id=collection_id, status=status)
+        return bool(rows)
 
     async def resolve_physical_table(
         self,
@@ -736,14 +801,25 @@ class CollectionService:
             init_kwargs.pop("physical_table", None)
             init_kwargs.pop("layer_config", None)
 
-            # 3. Insert thin registry row (id + catalog_id only)
+            # 3. Insert thin registry row (id + catalog_id + lifecycle overlay).
+            #    #2066: when external async initializers are registered the
+            #    collection is born PROVISIONING and write-gated (409) until the
+            #    async init window closes; the finalizer below flips it to
+            #    ACTIVE. With no async initializers the row is ACTIVE on commit
+            #    (lifecycle_status NULL) — no pointless provisioning window.
+            provisioning = lifecycle_registry.has_async_collection_initializers()
             insert_sql = f"""
-                INSERT INTO "{phys_schema}".collections (id, catalog_id)
-                VALUES (:id, :catalog_id)
+                INSERT INTO "{phys_schema}".collections (id, catalog_id, lifecycle_status)
+                VALUES (:id, :catalog_id, :lifecycle_status)
                 RETURNING id;
             """
             await DQLQuery(insert_sql, result_handler=ResultHandler.SCALAR_ONE).execute(
-                conn, id=collection_model.id, catalog_id=catalog_id,
+                conn,
+                id=collection_model.id,
+                catalog_id=catalog_id,
+                lifecycle_status=(
+                    CollectionLifecycle.PROVISIONING.value if provisioning else None
+                ),
             )
 
             # 4. Run infrastructure hooks (events partition, logs, proxy —
@@ -856,8 +932,8 @@ class CollectionService:
         except (ValueError, Exception):
             physical_table = None
 
-        # Invalidate caches
-        _invalidate_collection_model_cache(catalog_id, collection_model.id)
+        # Invalidate liveness/routing caches post-commit (#2066).
+        _invalidate_collection_lifecycle_caches(catalog_id, collection_model.id)
 
         # Trigger async lifecycle
         config_snapshot = {}
@@ -871,6 +947,21 @@ class CollectionService:
                 catalog_id, collection_model.id, exc,
             )
 
+        # #2066: when the row was born PROVISIONING, flip it back to ACTIVE once
+        # async init finishes.  The finalizer runs in the background task's
+        # `finally`, in its own committed transaction (db_resource=None), so the
+        # ACTIVE state is visible cross-pod; it then re-invalidates the liveness
+        # caches so the write-gate stops returning 409.
+        _on_complete = None
+        if provisioning:
+            _cat_id, _col_id = catalog_id, collection_model.id
+
+            async def _finalize_provisioning() -> None:
+                await self._set_lifecycle_status(_cat_id, _col_id, None)
+                _invalidate_collection_lifecycle_caches(_cat_id, _col_id)
+
+            _on_complete = _finalize_provisioning
+
         lifecycle_registry.init_async_collection(
             catalog_id,
             collection_model.id,
@@ -879,6 +970,7 @@ class CollectionService:
                 physical_table=physical_table,
                 config=config_snapshot,
             ),
+            on_complete=_on_complete,
         )
 
         # Emit signal to wake up background tasks (Visibility Gap fix)
@@ -1087,6 +1179,50 @@ class CollectionService:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        # Unit A (#2066): lifecycle gate BEFORE any teardown. Resolve the
+        # authoritative state up front so the hard-delete purge — which emits
+        # BEFORE/AFTER_HARD_DELETION, runs the cascade owners, and schedules the
+        # external-resource destroy — never fires against a MISSING collection
+        # (a double-teardown that destroyed resources the id never owned).
+        lifecycle = await self._get_lifecycle(
+            catalog_id, collection_id, db_resource=db_resource
+        )
+        if lifecycle == CollectionLifecycle.MISSING:
+            logger.info(
+                f"[LIFECYCLE] delete_collection no-op: "
+                f"'{catalog_id}:{collection_id}' is missing"
+            )
+            return False
+        if not force and lifecycle == CollectionLifecycle.TOMBSTONED:
+            # Already soft-deleted: idempotent no-op. Re-tombstoning would be a
+            # 0-row UPDATE anyway, but returning here also skips re-emitting
+            # COLLECTION_DELETION to the cascade subscribers.
+            logger.info(
+                f"[LIFECYCLE] delete_collection no-op: "
+                f"'{catalog_id}:{collection_id}' already tombstoned"
+            )
+            return True
+
+        # Unit C (#2066): for a hard delete, pre-mark DELETING in its own
+        # committed transaction (db_resource=None ⇒ autonomous commit) so the
+        # purge window is observable cross-pod and write-gated (409) instead of
+        # flickering ACTIVE↔MISSING. When the caller supplies a db_resource the
+        # mark joins their transaction and commits at their boundary.
+        #
+        # Recovery: if the purge below fails, the autonomous mark leaves the
+        # (still-present) row DELETING — write-gated but intact. Re-issuing
+        # delete_collection re-resolves DELETING, re-marks idempotently, and
+        # retries the purge; a lifecycle-state reaper is the systematic backstop
+        # for a creator/deleter pod that crashes mid-window (tracked follow-up).
+        if force:
+            await self._set_lifecycle_status(
+                catalog_id,
+                collection_id,
+                CollectionLifecycle.DELETING.value,
+                db_resource=db_resource,
+            )
+            _invalidate_collection_lifecycle_caches(catalog_id, collection_id)
+
         config_snapshot: Dict[str, Any] = {}
         phys_table: Optional[str] = None
         async with managed_transaction(db_resource or self.engine) as conn:
@@ -1187,7 +1323,16 @@ class CollectionService:
                 # which purge the residue via _purge_collection_storage for a
                 # clean reset (#317). Retained configs are inert while the row
                 # is tombstoned (every read filters deleted_at IS NULL).
-                soft_delete_sql = f'UPDATE "{phys_schema}".collections SET deleted_at = NOW() WHERE id = :id AND deleted_at IS NULL;'
+                #
+                # Also clear any transitional overlay (#2066): a collection
+                # soft-deleted mid-provisioning must resolve cleanly as
+                # TOMBSTONED, not keep reading PROVISIONING (the overlay outranks
+                # deleted_at).
+                soft_delete_sql = (
+                    f'UPDATE "{phys_schema}".collections '
+                    "SET deleted_at = NOW(), lifecycle_status = NULL "
+                    "WHERE id = :id AND deleted_at IS NULL;"
+                )
                 rows = await DQLQuery(
                     soft_delete_sql, result_handler=ResultHandler.ROWCOUNT
                 ).execute(conn, id=collection_id)
@@ -1206,7 +1351,11 @@ class CollectionService:
                     f"[LIFECYCLE] Soft deleted collection '{catalog_id}:{collection_id}'"
                 )
 
-        _invalidate_collection_model_cache(catalog_id, collection_id)
+        # Post-commit (#2066): drop every liveness/routing cache so neither the
+        # model cache nor the router answers ACTIVE / a dropped physical table
+        # for the transitioned id. The hard-delete row is now gone (MISSING),
+        # which also clears the DELETING overlay set in the pre-mark above.
+        _invalidate_collection_lifecycle_caches(catalog_id, collection_id)
         if force:
             _unmark_confirmed_active(catalog_id, collection_id)
 

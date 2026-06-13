@@ -16,10 +16,10 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""``CollectionNotAliveError`` → HTTP mapping for the write gate (#1995).
+"""``CollectionNotAliveError`` → HTTP mapping for the write gate (#1995, #2066).
 
-missing → 404, tombstoned → 410, any other reason (fail-closed lookup
-errors) → 503.
+missing → 404, tombstoned → 410, provisioning/deleting → 409 + Retry-After,
+any other reason (fail-closed lookup errors) → 503.
 """
 
 from __future__ import annotations
@@ -69,6 +69,31 @@ class TestHandle:
         assert result.status_code == 410
         assert isinstance(result.detail, dict)
         assert result.detail["reason"] == "tombstoned"
+
+    def test_provisioning_maps_to_409_with_retry_after(self) -> None:
+        result = CollectionNotAliveExceptionHandler().handle(_exc("provisioning"))
+        assert result is not None
+        assert result.status_code == 409
+        assert isinstance(result.detail, dict)
+        assert result.detail["reason"] == "provisioning"
+        # Transitional: client should back off and retry the same request.
+        assert (result.headers or {}).get("Retry-After") == "5"
+
+    def test_deleting_maps_to_409_with_retry_after(self) -> None:
+        result = CollectionNotAliveExceptionHandler().handle(_exc("deleting"))
+        assert result is not None
+        assert result.status_code == 409
+        assert isinstance(result.detail, dict)
+        assert result.detail["reason"] == "deleting"
+        assert (result.headers or {}).get("Retry-After") == "5"
+
+    def test_terminal_reasons_carry_no_retry_after(self) -> None:
+        # missing/tombstoned are terminal — retrying the same request is futile,
+        # so no Retry-After is advertised.
+        for reason in ("missing", "tombstoned"):
+            result = CollectionNotAliveExceptionHandler().handle(_exc(reason))
+            assert result is not None
+            assert (result.headers or {}).get("Retry-After") is None
 
     def test_lookup_error_fails_closed_to_503(self) -> None:
         result = CollectionNotAliveExceptionHandler().handle(_exc("lookup-error"))

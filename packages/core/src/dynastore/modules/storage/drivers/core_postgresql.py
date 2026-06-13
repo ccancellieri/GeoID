@@ -510,9 +510,17 @@ class CollectionCorePostgresqlDriver(
     ) -> "CollectionLifecycle":
         """Return the authoritative lifecycle state from the registry row.
 
-        Reads ``deleted_at`` from ``"{schema}".collections`` — the system-of-
-        record table — bypassing secondary indexes and cached model reads.
-        No row → MISSING; deleted_at IS NOT NULL → TOMBSTONED; else ACTIVE.
+        Reads ``deleted_at`` + ``lifecycle_status`` from ``"{schema}".collections``
+        — the system-of-record table — bypassing secondary indexes and cached
+        model reads.  A transitional overlay (``lifecycle_status``) outranks
+        ``deleted_at`` (#2066):
+
+            no row                  -> MISSING
+            status='deleting'       -> DELETING       (hard-delete purge in flight)
+            status='provisioning'   -> PROVISIONING   (async init in flight)
+            deleted_at IS NOT NULL  -> TOMBSTONED     (soft-deleted)
+            otherwise               -> ACTIVE
+
         Schema unresolvable → MISSING (catalog hard-deleted or never created).
         """
         engine = db_resource or _get_engine()
@@ -523,11 +531,17 @@ class CollectionCorePostgresqlDriver(
             if not phys:
                 return CollectionLifecycle.MISSING
             row = await DQLQuery(
-                f'SELECT deleted_at FROM "{phys}".collections WHERE id = :id;',
+                f'SELECT deleted_at, lifecycle_status FROM "{phys}".collections '
+                "WHERE id = :id;",
                 result_handler=ResultHandler.ONE_DICT,
             ).execute(conn, id=collection_id)
             if row is None:
                 return CollectionLifecycle.MISSING
+            status = row.get("lifecycle_status")
+            if status == CollectionLifecycle.DELETING.value:
+                return CollectionLifecycle.DELETING
+            if status == CollectionLifecycle.PROVISIONING.value:
+                return CollectionLifecycle.PROVISIONING
             if row["deleted_at"] is not None:
                 return CollectionLifecycle.TOMBSTONED
             return CollectionLifecycle.ACTIVE

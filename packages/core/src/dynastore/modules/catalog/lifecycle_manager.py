@@ -427,6 +427,16 @@ class LifecycleRegistry:
             return decorator(func)  # type: ignore[return-value]
         return decorator
 
+    def has_async_collection_initializers(self) -> bool:
+        """True if any external async collection initializer is registered.
+
+        ``create_collection`` consults this to decide whether a new collection
+        needs a ``PROVISIONING`` window (#2066): with no async initializers the
+        collection is ready the moment its registry row commits, so marking it
+        provisioning would only add a pointless 409 window.
+        """
+        return bool(self._async_collection_initializers)
+
     def async_collection_destroyer(
         self, priority: int = 0
     ) -> Callable[[AsyncCollectionDestroyer], AsyncCollectionDestroyer]:
@@ -812,9 +822,18 @@ class LifecycleRegistry:
         catalog_id: str,
         collection_id: str,
         context: LifecycleContext,
+        on_complete: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> asyncio.Task | None:
-        """Execute all registered async collection initializers (external)."""
-        if not self._async_collection_initializers:
+        """Execute all registered async collection initializers (external).
+
+        ``on_complete`` is an optional finalizer awaited once every initializer
+        has run (in a ``finally``, so it fires even if an initializer raised).
+        ``create_collection`` passes it to flip ``lifecycle_status`` from
+        ``provisioning`` to ``active`` (#2066) once the async window closes.
+        When ``on_complete`` is supplied the task is scheduled even if no
+        initializers are registered, so the flip is never skipped.
+        """
+        if not self._async_collection_initializers and on_complete is None:
             return None
 
         logger.info(
@@ -824,29 +843,43 @@ class LifecycleRegistry:
         from dynastore.modules.concurrency import run_in_background
 
         async def _run_all():
-            # Wait for the collection to be fully persisted (AFTER_COLLECTION_CREATION signal)
             try:
-                # 3 second timeout — signal should arrive within milliseconds in normal use
-                await signal_bus.wait_for(
-                    "AFTER_COLLECTION_CREATION", identifier=collection_id, timeout=3.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Background task for collection '{collection_id}' timed out waiting for AFTER_COLLECTION_CREATION signal. Proceeding anyway..."
-                )
-
-            for initializer in self._sort_hooks(self._async_collection_initializers):
+                # Wait for the collection to be fully persisted (AFTER_COLLECTION_CREATION signal)
                 try:
-                    await initializer(catalog_id, collection_id, context)
-                except Exception as e:
-                    logger.error(
-                        f"Async collection initializer {initializer.__module__}.{initializer.__name__} "
-                        f"failed for '{catalog_id}/{collection_id}': {e}",
-                        exc_info=True,
+                    # 3 second timeout — signal should arrive within milliseconds in normal use
+                    await signal_bus.wait_for(
+                        "AFTER_COLLECTION_CREATION", identifier=collection_id, timeout=3.0
                     )
-            
-            # Cleanup signal
-            await signal_bus.clear("AFTER_COLLECTION_CREATION", identifier=collection_id)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"Background task for collection '{collection_id}' timed out waiting for AFTER_COLLECTION_CREATION signal. Proceeding anyway..."
+                    )
+
+                for initializer in self._sort_hooks(self._async_collection_initializers):
+                    try:
+                        await initializer(catalog_id, collection_id, context)
+                    except Exception as e:
+                        logger.error(
+                            f"Async collection initializer {initializer.__module__}.{initializer.__name__} "
+                            f"failed for '{catalog_id}/{collection_id}': {e}",
+                            exc_info=True,
+                        )
+
+                # Cleanup signal
+                await signal_bus.clear("AFTER_COLLECTION_CREATION", identifier=collection_id)
+            finally:
+                # Close the provisioning window regardless of initializer
+                # outcome — a best-effort external init failure must not strand
+                # the collection in PROVISIONING (writes 409 forever). #2066.
+                if on_complete is not None:
+                    try:
+                        await on_complete()
+                    except Exception as e:
+                        logger.error(
+                            f"Provisioning finalizer failed for "
+                            f"'{catalog_id}:{collection_id}': {e}",
+                            exc_info=True,
+                        )
 
         task = run_in_background(
             _run_all(), name=f"init_collection_async_{catalog_id}_{collection_id}"

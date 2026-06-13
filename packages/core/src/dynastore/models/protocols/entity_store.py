@@ -134,10 +134,23 @@ class CollectionLifecycle(str, Enum):
     """No registry row: collection was never created, or was hard-deleted."""
 
     ACTIVE = "active"
-    """Registry row present with ``deleted_at IS NULL``."""
+    """Registry row present, ``deleted_at IS NULL``, no transitional overlay."""
 
     TOMBSTONED = "tombstoned"
     """Registry row present with ``deleted_at`` set (soft-deleted)."""
+
+    PROVISIONING = "provisioning"
+    """Registry row present but external async initializers (pubsub, buckets)
+    are still in flight: the id is reserved and committed, yet not ready to
+    accept writes.  Stored as ``collections.lifecycle_status = 'provisioning'``
+    and flipped to ``ACTIVE`` when async init completes.  Write-gated 409."""
+
+    DELETING = "deleting"
+    """Registry row present but a hard-delete purge is in flight: the row is
+    pre-marked ``collections.lifecycle_status = 'deleting'`` in its own
+    committed transaction before the purge transaction drops it, so the
+    teardown window is observable cross-pod instead of racing ACTIVE↔MISSING.
+    Write-gated 409."""
 
 
 @runtime_checkable
@@ -340,11 +353,12 @@ class CollectionStore(Protocol):
         - Accepts ``db_resource`` to join the caller's transaction so the
           check can see uncommitted writes on the same connection.
 
-        Returns:
-            ``CollectionLifecycle.ACTIVE``     — registry row present, not deleted.
-            ``CollectionLifecycle.TOMBSTONED`` — registry row present, deleted_at set.
-            ``CollectionLifecycle.MISSING``    — no registry row (hard-deleted or
-                                                 never created).
+        Resolution precedence (a transitional overlay outranks ``deleted_at``):
+            no row                          -> ``MISSING``
+            ``lifecycle_status='deleting'`` -> ``DELETING``     (purge in flight)
+            ``lifecycle_status='provisioning'`` -> ``PROVISIONING`` (async init in flight)
+            ``deleted_at IS NOT NULL``      -> ``TOMBSTONED``   (soft-deleted)
+            otherwise                       -> ``ACTIVE``
         """
         ...
 

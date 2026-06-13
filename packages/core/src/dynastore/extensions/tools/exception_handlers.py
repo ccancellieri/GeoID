@@ -32,7 +32,7 @@ Integration with FastAPI:
 import logging
 import functools
 from contextlib import asynccontextmanager
-from typing import Callable, Optional, List, Dict, Any, TypeVar, Awaitable
+from typing import Callable, ClassVar, Optional, List, Dict, Any, TypeVar, Awaitable
 from fastapi import FastAPI, HTTPException, status, Response, Request
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from fastapi.responses import JSONResponse
@@ -404,12 +404,23 @@ class CollectionNotAliveExceptionHandler(ExceptionHandler):
     Raised by the write-path liveness gate when a request targets a
     collection that can no longer accept writes:
 
-    * ``missing``    → 404 — no registry row (hard-deleted or never created)
-    * ``tombstoned`` → 410 — soft-deleted; the resource existed and is gone
-    * anything else  → 503 — the gate failed closed (e.g. ``lookup-error``);
+    * ``missing``      → 404 — no registry row (hard-deleted or never created)
+    * ``tombstoned``   → 410 — soft-deleted; the resource existed and is gone
+    * ``provisioning`` → 409 + Retry-After — async init in flight; transient
+    * ``deleting``     → 409 + Retry-After — hard-delete purge in flight; transient
+    * anything else    → 503 — the gate failed closed (e.g. ``lookup-error``);
       the collection state could not be established, so the write is
       refused as transient rather than misreported as a client error.
+
+    The transitional reasons carry a ``Retry-After`` header (#2066): the state
+    is temporary and the same request should succeed once the window closes,
+    so clients can back off rather than treat it as a terminal client error.
     """
+
+    # Transitional (in-flight) states the caller should retry, with their
+    # Retry-After hint in seconds.  The window is normally sub-second for
+    # provisioning and bounded by the purge duration for deleting.
+    _RETRYABLE_REASONS: ClassVar[Dict[str, str]] = {"provisioning": "5", "deleting": "5"}
 
     def can_handle(self, exception: Exception) -> bool:
         from dynastore.modules.catalog.collection_service import (
@@ -429,10 +440,16 @@ class CollectionNotAliveExceptionHandler(ExceptionHandler):
         status_by_reason = {
             "missing": status.HTTP_404_NOT_FOUND,
             "tombstoned": status.HTTP_410_GONE,
+            "provisioning": status.HTTP_409_CONFLICT,
+            "deleting": status.HTTP_409_CONFLICT,
         }
         status_code = status_by_reason.get(
             exception.reason, status.HTTP_503_SERVICE_UNAVAILABLE
         )
+        headers: Optional[Dict[str, str]] = None
+        retry_after = self._RETRYABLE_REASONS.get(exception.reason)
+        if retry_after is not None:
+            headers = {"Retry-After": retry_after}
         return HTTPException(
             status_code=status_code,
             detail={
@@ -444,6 +461,7 @@ class CollectionNotAliveExceptionHandler(ExceptionHandler):
                 "reason": exception.reason,
                 "detail": str(exception),
             },
+            headers=headers,
         )
 
 
