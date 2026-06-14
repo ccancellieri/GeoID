@@ -42,12 +42,16 @@ from dynastore.modules.iam.filter_inspectors import (
 # ---------------------------------------------------------------------------
 
 
-def _make_ctx(query_params: dict | None = None) -> EvaluationContext:
-    """Build a minimal EvaluationContext with query params."""
+def _make_ctx(
+    query_params: dict | None = None,
+    effect: str | None = None,
+) -> EvaluationContext:
+    """Build a minimal EvaluationContext with query params and optional policy effect."""
     return EvaluationContext(
         request=None,
         storage=None,  # type: ignore[arg-type]
         query_params=query_params or {},
+        effect=effect,
     )
 
 
@@ -72,17 +76,49 @@ GEO_CONFIG = {
 
 
 class TestFilterConditionHandler:
+    # --- Effect-aware fail-closed for unknown/missing inspector ---
+
     @pytest.mark.asyncio
-    async def test_missing_inspector_passes(self):
+    async def test_unknown_inspector_allow_ctx_returns_false(self):
+        """Unknown inspector + ALLOW policy → condition not met → ALLOW does not fire."""
         handler = FilterConditionHandler()
-        ctx = _make_ctx()
+        ctx = _make_ctx(effect="ALLOW")
+        assert await handler.evaluate({"inspector": "nonexistent"}, ctx) is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_inspector_deny_ctx_returns_true(self):
+        """Unknown inspector + DENY policy → condition treated as met → DENY fires."""
+        handler = FilterConditionHandler()
+        ctx = _make_ctx(effect="DENY")
         assert await handler.evaluate({"inspector": "nonexistent"}, ctx) is True
 
     @pytest.mark.asyncio
-    async def test_missing_inspector_key_passes(self):
+    async def test_unknown_inspector_no_effect_returns_false(self):
+        """Unknown inspector + no effect stamped → defaults to False (safe: no grant)."""
         handler = FilterConditionHandler()
-        ctx = _make_ctx()
+        ctx = _make_ctx(effect=None)
+        assert await handler.evaluate({"inspector": "nonexistent"}, ctx) is False
+
+    @pytest.mark.asyncio
+    async def test_missing_inspector_key_allow_ctx_returns_false(self):
+        """Missing 'inspector' key + ALLOW policy → condition not met → ALLOW does not fire."""
+        handler = FilterConditionHandler()
+        ctx = _make_ctx(effect="ALLOW")
+        assert await handler.evaluate({}, ctx) is False
+
+    @pytest.mark.asyncio
+    async def test_missing_inspector_key_deny_ctx_returns_true(self):
+        """Missing 'inspector' key + DENY policy → condition treated as met → DENY fires."""
+        handler = FilterConditionHandler()
+        ctx = _make_ctx(effect="DENY")
         assert await handler.evaluate({}, ctx) is True
+
+    @pytest.mark.asyncio
+    async def test_missing_inspector_key_no_effect_returns_false(self):
+        """Missing 'inspector' key + no effect → defaults to False (safe: no grant)."""
+        handler = FilterConditionHandler()
+        ctx = _make_ctx(effect=None)
+        assert await handler.evaluate({}, ctx) is False
 
     @pytest.mark.asyncio
     async def test_type_is_filter(self):

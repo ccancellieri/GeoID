@@ -120,13 +120,25 @@ class FilterConditionHandler(ConditionHandler):
     async def evaluate(self, config: Dict[str, Any], ctx: EvaluationContext) -> bool:
         inspector_id = config.get("inspector")
         if not inspector_id:
-            logger.warning("FilterConditionHandler: missing 'inspector' in config")
-            return True
+            logger.error(
+                "FilterConditionHandler: missing 'inspector' key in filter condition config"
+            )
+            # Effect-aware fail-closed: an unevaluable condition must not silently
+            # widen access.  For an ALLOW policy the condition is treated as not
+            # met (False → ALLOW does not fire).  For a DENY policy the condition
+            # is treated as met (True → DENY fires).  Unknown/None effect defaults
+            # to False (safe: the ALLOW is blocked, no unrestricted grant).
+            return ctx.effect == "DENY"
 
         inspector = self._inspectors.get(inspector_id)
         if not inspector:
-            logger.warning(f"Unknown filter inspector: {inspector_id}")
-            return True  # fail-open for unknown inspectors
+            logger.error(
+                "FilterConditionHandler: inspector %r is not registered on this pod; "
+                "cannot evaluate filter condition",
+                inspector_id,
+            )
+            # Same effect-aware fail-closed posture as above.
+            return ctx.effect == "DENY"
 
         if not inspector.can_inspect(ctx, config):
             return True  # inspector does not apply to this request
