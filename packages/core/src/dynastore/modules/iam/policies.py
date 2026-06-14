@@ -229,10 +229,52 @@ class PolicyService:
         if principal.roles:
             identities.extend(principal.roles)
 
-        # 2. Delegate to the main evaluation logic
-        # Note: we might need to extract catalog_id from resource if it's a catalog-scoped check
-        catalog_id_match = re.search(r"catalog[:/]([^:/]+)", resource)
-        catalog_id = catalog_id_match.group(1) if catalog_id_match else None
+        # 2. Extract catalog_id and collection_id from the resource path so
+        #    resource-scoped grants are resolved identically to the middleware
+        #    path (``_resolve_effective_policies`` step 4 is gated on
+        #    ``principal_id is not None`` and uses ``collection_id`` to filter
+        #    collection-scoped grant rows).
+        #
+        #    URL-path form first (mirrors IamMiddleware heuristic); fall back
+        #    to the legacy ``catalog[:/]{id}`` resource-string form so callers
+        #    that pass non-URL resource identifiers still resolve correctly.
+        catalog_id: Optional[str] = None
+        if "/catalogs/" in resource:
+            parts = resource.split("/")
+            try:
+                idx = parts.index("catalogs")
+                if idx + 1 < len(parts) and parts[idx + 1]:
+                    catalog_id = parts[idx + 1]
+            except ValueError:
+                pass
+        if catalog_id is None:
+            catalog_id_match = re.search(r"catalog[:/]([^:/]+)", resource)
+            catalog_id = catalog_id_match.group(1) if catalog_id_match else None
+
+        collection_id: Optional[str] = None
+        if "/collections/" in resource:
+            parts = resource.split("/")
+            try:
+                idx = parts.index("collections")
+                if idx + 1 < len(parts) and parts[idx + 1]:
+                    collection_id = parts[idx + 1]
+            except ValueError:
+                pass
+
+        # 3. Derive principal_id from the Principal object.  ``Principal.id``
+        #    is ``Optional[Union[UUID, str]]``; coerce str→UUID and fall back
+        #    to None for anonymous callers or malformed ids (grant resolution
+        #    is then skipped, preserving prior behaviour).
+        principal_uuid: Optional[UUID] = None
+        _pid = getattr(principal, "id", None)
+        if _pid is not None:
+            if isinstance(_pid, UUID):
+                principal_uuid = _pid
+            else:
+                try:
+                    principal_uuid = UUID(str(_pid))
+                except (ValueError, TypeError, AttributeError):
+                    principal_uuid = None
 
         allowed, reason = await self.evaluate_access(
             principals=identities,
@@ -240,6 +282,8 @@ class PolicyService:
             method=action,
             catalog_id=catalog_id,
             custom_policies=principal.custom_policies or None,
+            principal_id=principal_uuid,
+            collection_id=collection_id,
         )
         return allowed
 
