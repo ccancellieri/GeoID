@@ -426,6 +426,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         raster asset directly and does not flow through a hints-capable vector
         read seam, so the value has no effect on this route today.
         """
+        await self._require_collection_visible(catalog_id, collection_id)
         fmt = _resolve_format(f)
         item = await self._get_first_item(catalog_id, collection_id)
         if item is None:
@@ -456,6 +457,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         self, catalog_id: str, collection_id: str,
     ) -> dict:
         """Return the OGC Coverages DomainSet derived from the first item."""
+        await self._require_collection_visible(catalog_id, collection_id)
         item = await self._get_first_item(catalog_id, collection_id)
         return _extract_domainset(item)
 
@@ -463,12 +465,14 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         self, catalog_id: str, collection_id: str,
     ) -> dict:
         """Return the OGC Coverages RangeType derived from the first item."""
+        await self._require_collection_visible(catalog_id, collection_id)
         item = await self._get_first_item(catalog_id, collection_id)
         return _extract_rangetype(item)
 
     async def get_coverage_metadata(
         self, catalog_id: str, collection_id: str, request: Request,
     ):
+        await self._require_collection_visible(catalog_id, collection_id)
         item = await self._get_first_item(catalog_id, collection_id)
         if item is None:
             raise HTTPException(status_code=404, detail="No coverage item found.")

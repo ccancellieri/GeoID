@@ -361,6 +361,7 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
                 detail=f"Unsupported DGGRS '{dggs_id}'. Supported: {list(_SUPPORTED_DGGRS)}",
             )
 
+        await self._require_collection_visible(catalog_id, collection_id)
         config = await self._get_plugin_config(DGGSConfig, catalog_id, collection_id)
         resolution = zone_level if zone_level is not None else config.default_resolution
         resolution = min(resolution, config.max_resolution)
@@ -428,6 +429,8 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unsupported DGGRS '{dggs_id}'. Supported: {list(_SUPPORTED_DGGRS)}",
             )
+
+        await self._require_collection_visible(catalog_id, collection_id)
 
         # Validate zone ID and extract resolution using the correct indexer.
         if dggs_id == "H3":

@@ -325,6 +325,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
 
         fmt = _resolve_edr_format(f)
         await self._require_catalog_ready(catalog_id)
+        await self._require_collection_visible(catalog_id, collection_id)
         item = await self._get_item_for_datetime(catalog_id, collection_id, datetime)
         if item is None:
             raise HTTPException(
@@ -394,6 +395,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
                 detail="Area queries only support CoverageJSON output.",
             )
         await self._require_catalog_ready(catalog_id)
+        await self._require_collection_visible(catalog_id, collection_id)
         item = await self._get_item_for_datetime(catalog_id, collection_id, datetime)
         if item is None:
             raise HTTPException(
@@ -457,6 +459,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
                 detail="Cube queries only support CoverageJSON output.",
             )
         await self._require_catalog_ready(catalog_id)
+        await self._require_collection_visible(catalog_id, collection_id)
         item = await self._get_item_for_datetime(catalog_id, collection_id, datetime)
         if item is None:
             raise HTTPException(

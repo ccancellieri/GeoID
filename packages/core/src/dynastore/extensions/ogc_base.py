@@ -314,6 +314,28 @@ class OGCServiceMixin:
         return matched
 
     # ------------------------------------------------------------------
+    # Collection-visibility guard
+    # ------------------------------------------------------------------
+
+    async def _require_collection_visible(
+        self, catalog_id: str, collection_id: str
+    ) -> None:
+        """Raise 404 when the caller has no visibility grant for this collection.
+
+        Data routes (coverages/EDR/DGGS/tiles) resolve items or tiles directly
+        and bypass CatalogService.get_collection, so they must enforce the same
+        direct-get visibility contract (#2050/#2069): a collection the caller
+        cannot see is indistinguishable from a missing one.
+        resolve_collection_listing_ids returns None when IAM is inactive —
+        unfiltered, preserving prior behaviour.
+        """
+        from dynastore.models.protocols.visibility import resolve_collection_listing_ids
+
+        visible_ids = await resolve_collection_listing_ids(catalog_id)
+        if visible_ids is not None and collection_id not in visible_ids:
+            raise HTTPException(status_code=404, detail="Collection not found.")
+
+    # ------------------------------------------------------------------
     # Fail-fast catalog-readiness guard
     # ------------------------------------------------------------------
 
