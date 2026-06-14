@@ -2190,8 +2190,10 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         Test injection seams (set on the instance, not the constructor):
         ``_test_routing_resolver``, ``_test_driver_registry``,
-        ``_test_outbox_store``, ``_test_managed_transaction``. When None,
-        the method resolves through the production helpers.
+        ``_test_managed_transaction``. When None, the method resolves through
+        the production helpers. The async-OUTBOX enqueue always goes through
+        the module-level ``enqueue_storage_op`` (#1807 P4), which tests patch
+        directly — there is no separate outbox-store seam.
         """
         from dynastore.models.protocols.indexing import OutboxRecord
         from dynastore.modules.storage.driver_instance_id import (
@@ -2262,14 +2264,6 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             )
             return DriverRegistry.get_collection(driver_id)
 
-        # ── Resolve outbox (test seam first) ──────────────────────────
-        outbox = getattr(self, "_test_outbox_store", None)
-        if outbox is None and async_outbox_entries:
-            from dynastore.modules.storage.index_dispatcher import (
-                get_index_dispatcher,
-            )
-            outbox = get_index_dispatcher()._outbox
-
         # ── Resolve TX manager (test seam first) ──────────────────────
         tx_manager = getattr(
             self, "_test_managed_transaction", managed_transaction,
@@ -2312,11 +2306,6 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             # SAME conn. Failure here rolls back the PG write above — the
             # atomicity guarantee that closes the drift hole.
             if async_outbox_entries:
-                if outbox is None:
-                    raise RuntimeError(
-                        "upsert_bulk has ASYNC OUTBOX routing entries but "
-                        "no OutboxStore is wired."
-                    )
                 # Resolve the identity + access-envelope stamping inputs once
                 # for this collection (#1287). Applied to a per-record copy
                 # below so the inline FATAL primary write above keeps the

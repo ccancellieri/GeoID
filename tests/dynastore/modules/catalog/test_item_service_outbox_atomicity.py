@@ -219,14 +219,12 @@ def _service_with(
     svc = ItemService(engine=engine)  # type: ignore[arg-type]
     # Inject test seams. The new ``upsert_bulk`` honours these slots when
     # they are not None, bypassing the production routing/registry resolution
-    # helpers. ``_test_outbox_store`` is a non-None presence sentinel that
-    # satisfies the "outbox wired" guard; the actual enqueue goes through the
-    # patched module-level ``enqueue_storage_op``.
+    # helpers. The async-OUTBOX enqueue goes through the patched module-level
+    # ``enqueue_storage_op`` (#1807 P4), so no outbox-store seam is needed.
     svc._test_routing_resolver = _make_routing_resolver(  # type: ignore[attr-defined]
         fatal_drivers=fatal_drivers, outbox_drivers=outbox_drivers,
     )
     svc._test_driver_registry = _make_registry(driver_map)  # type: ignore[attr-defined]
-    svc._test_outbox_store = object()  # type: ignore[attr-defined]
     svc._test_managed_transaction = _fake_managed_transaction  # type: ignore[attr-defined]
     return svc
 

@@ -1195,9 +1195,10 @@ class ItemQueryMixin:
         ES ``_id`` on ``idempotency_key`` (the geoid), the same value the
         upsert path indexed under, so the document is actually purged.
 
-        Honours the same test seams as ``upsert_bulk``
-        (``_test_routing_resolver`` / ``_test_outbox_store``) so this can be
-        unit-tested without a live ConfigsProtocol or dispatcher.
+        Honours the ``_test_routing_resolver`` seam (as ``upsert_bulk`` does)
+        so this can be unit-tested without a live ConfigsProtocol; the enqueue
+        itself goes through the module-level ``enqueue_storage_op`` (#1807 P4),
+        which tests patch directly.
         """
         if not geoids:
             return
@@ -1232,15 +1233,6 @@ class ItemQueryMixin:
             ops_map, async_outbox_only=True,
         )
         if not async_outbox_entries:
-            return
-
-        outbox = getattr(self, "_test_outbox_store", None)
-        if outbox is None:
-            from dynastore.modules.storage.index_dispatcher import (
-                get_index_dispatcher,
-            )
-            outbox = get_index_dispatcher()._outbox
-        if outbox is None:
             return
 
         records: List[OutboxRecord] = []

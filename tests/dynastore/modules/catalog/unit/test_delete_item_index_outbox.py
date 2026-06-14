@@ -55,9 +55,8 @@ def _service_with(routing_entries: List[OperationDriverEntry]) -> ItemService:
 
     ``__new__`` skips ``__init__`` — ``_enqueue_index_deletes`` only reads the
     routing resolver plus module-level imports, so no engine/state is needed.
-    A non-None ``_test_outbox_store`` sentinel satisfies the "outbox wired"
-    presence guard; the actual enqueue goes through ``enqueue_storage_op``
-    (#1807 P4), which the tests patch.
+    The enqueue goes through ``enqueue_storage_op`` (#1807 P4), which the tests
+    patch, so no outbox-store seam is needed.
     """
     svc = ItemService.__new__(ItemService)
 
@@ -65,7 +64,6 @@ def _service_with(routing_entries: List[OperationDriverEntry]) -> ItemService:
         return SimpleNamespace(operations={Operation.WRITE: list(routing_entries)})
 
     svc._test_routing_resolver = _resolver  # type: ignore[attr-defined]
-    svc._test_outbox_store = object()  # type: ignore[attr-defined]
     return svc
 
 
