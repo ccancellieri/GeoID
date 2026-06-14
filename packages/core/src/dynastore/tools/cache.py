@@ -1149,6 +1149,47 @@ def cached(
                     except RuntimeError:
                         pass
 
+            def sync_cache_clear_prefix_impl(sub_namespace: str) -> None:
+                """Drop all entries whose key starts with ``sub_namespace + "|"``.
+
+                ``@cached`` functions build keys as ``"{ns}|{arg1}|{arg2}|..."``
+                where ``ns`` is the decorator's ``namespace`` parameter.  A
+                *sub-namespace* is a prefix of that key that identifies a
+                subset of entries — for example
+                ``"collection_config|'mycat'|'mycoll'"`` matches every
+                class-key entry for that (catalog, collection) pair.
+
+                Local backend: scans the in-process store directly using the
+                ``|`` separator so the match is exact.
+
+                Tiered/distributed backend: clears L2 (Valkey) by scheduling
+                ``clear(namespace=sub_namespace)``; Valkey scans with the
+                pattern ``{prefix}{sub_namespace}|*`` which matches the same
+                entries.  The L1 tier of a tiered backend is NOT cleared
+                synchronously here — that tier's ``l1_ttl`` cap bounds the
+                residual staleness window (≤2 s for correctness-critical
+                caches such as ``_collection_config_cache``).
+                """
+                if _backend is None:
+                    return
+                key_prefix = f"{sub_namespace}|"
+                if isinstance(_backend, LocalAsyncCacheBackend):
+                    # Direct in-process scan — no separator ambiguity.
+                    to_delete = [k for k in list(_backend._store.keys()) if k.startswith(key_prefix)]
+                    for k in to_delete:
+                        del _backend._store[k]
+                    _backend._stats.size = len(_backend._store)
+                else:
+                    # Distributed or tiered: Valkey's clear(namespace=X) scans
+                    # "ds:{X}|*" which matches the @cached key format.
+                    # For TieredAsyncBackend the local L1 tier is not reached
+                    # by this clear; residual L1 entries expire within l1_ttl.
+                    try:
+                        loop = asyncio.get_running_loop()
+                        _track(loop.create_task(_backend.clear(namespace=sub_namespace)))
+                    except RuntimeError:
+                        pass
+
             def cache_info() -> CacheStats:
                 if _backend is None:
                     return CacheStats()
@@ -1162,6 +1203,7 @@ def cached(
 
             setattr(async_wrapper, "cache_invalidate", sync_cache_invalidate_impl)
             setattr(async_wrapper, "cache_clear", sync_cache_clear_impl)
+            setattr(async_wrapper, "cache_clear_prefix", sync_cache_clear_prefix_impl)
             setattr(async_wrapper, "cache_info", cache_info)
             setattr(async_wrapper, "cache_namespace", ns)
             return async_wrapper

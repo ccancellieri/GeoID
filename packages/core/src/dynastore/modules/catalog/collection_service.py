@@ -91,8 +91,8 @@ def _invalidate_collection_model_cache(catalog_id: str, collection_id: str) -> N
 
 
 def _invalidate_collection_lifecycle_caches(catalog_id: str, collection_id: str) -> None:
-    """Drop every in-process cache that can answer *liveness* or *routing* for a
-    collection, called post-commit on each lifecycle transition (#2066).
+    """Drop every in-process cache that can answer *liveness*, *routing*, or
+    *config* for a collection, called post-commit on each lifecycle transition.
 
     A lifecycle change (create / provisioning→active / soft-delete /
     hard-delete / reclaim) must not leave a cache reporting a stale answer:
@@ -102,21 +102,25 @@ def _invalidate_collection_lifecycle_caches(catalog_id: str, collection_id: str)
     * router resolution cache — maps a collection to its physical table /
       driver; a stale entry routes a write at a dropped table after a hard
       delete.
+    * ``_collection_config_cache`` — keyed per ``(catalog, collection,
+      class_key)``; a stale entry would serve the old collection's config
+      to a reclaimed id (same collection_id, new collection).
 
-    Both caches are tiered (in-process L1 + optional shared L2); invalidation
+    All caches are tiered (in-process L1 + optional shared L2); invalidation
     reaches the shared tier, so sibling pods converge within their L1 TTL cap
-    (≤60s) rather than relying on full TTL expiry.  Truly synchronous cross-pod
-    invalidation (an explicit distributed signal) is tracked as a follow-up.
+    rather than relying on full TTL expiry.  The config cache uses a 2 s L1
+    cap (``l1_ttl=2``), so the cross-pod staleness window after a lifecycle
+    transition is at most 2 s for config and ≤60 s for the model/router caches.
 
-    The per-class collection *config* cache is intentionally not cleared here:
-    it is keyed per config class (no single-collection wildcard) and is already
-    shadowed by the model-cache liveness gate on every read.  See the #2066
-    follow-up for distributed + config-cache invalidation.
+    Truly synchronous cross-pod invalidation (an explicit distributed pub/sub
+    signal to collapse the model/router L1 window) remains a tracked follow-up.
     """
     from dynastore.modules.storage.router import invalidate_router_cache
+    from dynastore.modules.catalog.config_service import invalidate_collection_config_cache
 
     _invalidate_collection_model_cache(catalog_id, collection_id)
     invalidate_router_cache(catalog_id, collection_id)
+    invalidate_collection_config_cache(catalog_id, collection_id)
 
 
 def _make_collection_exists_query(phys_schema: str) -> DQLQuery:

@@ -194,6 +194,40 @@ async def _collection_config_cache(
 
 
 # ==============================================================================
+#  COLLECTION-SCOPED CONFIG CACHE INVALIDATION
+# ==============================================================================
+
+
+def invalidate_collection_config_cache(catalog_id: str, collection_id: str) -> None:
+    """Drop every ``_collection_config_cache`` entry for ``(catalog_id, collection_id)``.
+
+    ``_collection_config_cache`` is keyed per ``(catalog_id, collection_id,
+    class_key)``.  There is no single-key invalidation that covers all
+    class_key variants at once via the standard ``cache_invalidate`` helper,
+    because that requires knowing the exact class_key up front.
+
+    Instead, we use ``cache_clear_prefix`` — added to every ``@cached``
+    async wrapper — which scans for keys whose prefix matches the
+    ``(catalog_id, collection_id)`` sub-namespace.  The sub-namespace string
+    is constructed to match the format that ``_make_cache_key`` produces::
+
+        collection_config|repr(catalog_id)|repr(collection_id)|repr(class_key)
+
+    so the prefix ``collection_config|repr(catalog_id)|repr(collection_id)``
+    covers every class_key entry for that collection.
+
+    Called from ``_invalidate_collection_lifecycle_caches`` on every lifecycle
+    transition (create / PROVISIONING→ACTIVE / soft-delete / hard-delete /
+    reclaim) so stale configs cannot be served after a reclaim where the same
+    id is reused.
+    """
+    sub_ns = f"collection_config|{repr(catalog_id)}|{repr(collection_id)}"
+    clear_prefix = getattr(_collection_config_cache, "cache_clear_prefix", None)
+    if clear_prefix is not None:
+        clear_prefix(sub_ns)
+
+
+# ==============================================================================
 #  MANAGER
 # ==============================================================================
 
