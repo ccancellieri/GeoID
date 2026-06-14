@@ -60,6 +60,7 @@ from .defaults_postgres import DefaultsPostgresPreset  # noqa: E402
 from .demo_data import DEMO_DATA_PRESET  # noqa: E402
 from .file_backed import FileBackedPreset  # noqa: E402
 from .items_es_private import ItemsEsPrivatePreset  # noqa: E402
+from .items_es_public import ItemsEsPublicPreset  # noqa: E402
 from .private_catalog import PrivateCatalogPreset  # noqa: E402
 from .private_collection import PrivateCollectionPreset  # noqa: E402
 from .public_catalog import PublicCatalogPreset  # noqa: E402
@@ -71,6 +72,7 @@ register_preset(PrivateCatalogPreset())
 register_preset(DefaultsPostgresPreset())
 register_preset(PrivateCollectionPreset())
 register_preset(ItemsEsPrivatePreset())
+register_preset(ItemsEsPublicPreset())
 register_preset(DEMO_DATA_PRESET)
 # The two single-responsibility STAC children must register before the
 # ``stac`` composite — the registry validates ``compose`` references at
@@ -106,6 +108,7 @@ __all__ = [
     "CompositePreset",
     "DefaultsPostgresPreset",
     "ItemsEsPrivatePreset",
+    "ItemsEsPublicPreset",
     "NoParams",
     "PgOnlyCatalogPreset",
     "Preset",

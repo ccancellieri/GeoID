@@ -342,6 +342,67 @@ async def _register_virtual_assets(
     return written
 
 
+async def _apply_stac_presets_direct(
+    ctx: Any,
+    scope: str,
+    catalog_id: str,
+    backend: str,
+    storage_params: Any,
+    stac_backend: Any,
+) -> None:
+    """Fallback: apply presets via the direct (non-audited) preset.apply path.
+
+    Used when the IAM audit service / engine is unavailable so the harvest
+    can still pin routing/storage configs without a live ``iam.applied_presets``
+    table.
+    """
+    from dynastore.modules.storage.presets.registry import find_preset
+    from dynastore.modules.storage.presets.stac import (
+        StacPresetParams,
+        _items_routing_es,
+    )
+    from dynastore.modules.stac.stac_storage_config import StacLevel
+    from dynastore.modules.storage.routing_config import ItemsRoutingConfig
+
+    storage_preset = find_preset("stac_storage")
+    await storage_preset.apply(storage_params, scope, ctx)
+    logger.info(
+        "stac_harvest: pinned items storage backend=%s on %s (direct path)",
+        backend, catalog_id,
+    )
+
+    if backend == "es":
+        configs = ctx.config
+        if configs is not None:
+            items_routing = _items_routing_es()
+            await configs.set_config(
+                ItemsRoutingConfig,
+                items_routing,
+                catalog_id=catalog_id,
+            )
+            logger.info(
+                "stac_harvest: wrote ES-only ItemsRoutingConfig for catalog=%s (direct path)",
+                catalog_id,
+            )
+        else:
+            logger.warning(
+                "stac_harvest: ctx.config is None — cannot write "
+                "ItemsRoutingConfig for catalog=%s (ES-only preset incomplete)",
+                catalog_id,
+            )
+    else:
+        routing_params = StacPresetParams(
+            stac_level=StacLevel.ITEMS,
+            stac_storage=stac_backend,
+        )
+        routing_preset = find_preset("stac_routing")
+        await routing_preset.apply(routing_params, scope, ctx)
+        logger.info(
+            "stac_harvest: applied stac_routing preset (backend=%s) on %s (direct path)",
+            backend, catalog_id,
+        )
+
+
 async def _apply_stac_presets(
     ctx: Any,
     scope: str,
@@ -353,29 +414,36 @@ async def _apply_stac_presets(
     ``backend`` is the resolved storage backend: ``"es"``, ``"es_pg"``, or
     ``"pg"``.  Strategy:
 
-    - Always apply the ``stac_storage`` preset (the SSOT signal) scoped to
-      the ITEMS tier.  This validates on all backends.
-    - For ``"es"``: write the ES-only ``ItemsRoutingConfig`` directly via
-      ``ConfigsProtocol.set_config`` at catalog scope — the cumulative
-      ``stac_routing`` preset would also touch the collection tier where the
+    - Always apply the ``stac_storage`` preset (the SSOT signal) through the
+      audited ``apply_preset`` lifecycle, which records the apply in
+      ``iam.applied_presets`` for idempotency and stores a revoke descriptor.
+    - For ``"es"``: apply the new ``items_es_public`` preset (items-tier only)
+      through the lifecycle — avoids the cumulative ``stac_routing`` preset
+      which would also touch the collection tier where the
       ``collection_elasticsearch_driver`` is not registered on this deployment.
-    - For ``"es_pg"`` or ``"pg"``: apply the ``stac_routing`` preset normally
-      (these backends validate on all tiers).
+    - For ``"es_pg"`` or ``"pg"``: apply the ``stac_routing`` preset through
+      the lifecycle (these backends validate on all tiers).
+
+    IAM-optional: when the engine or ``AppliedPresetsService`` is unavailable,
+    the function falls back to the direct ``preset.apply(...)`` /
+    ``ConfigsProtocol.set_config(...)`` path so a deployment without IAM still
+    gets routing/storage configs applied.
+
+    ``PresetConflictError`` (already applied with same params — idempotent re-run,
+    or in-progress concurrent apply) is swallowed and logged at INFO; the harvest
+    continues.
 
     All operations are best-effort: failures are logged at WARNING (with the
     exception) and never abort the harvest.
     """
     try:
-        from dynastore.modules.storage.presets.registry import find_preset
         from dynastore.modules.storage.presets.stac import (
             StacPresetParams,
-            _items_routing_es,
         )
         from dynastore.modules.stac.stac_storage_config import (
             StacLevel,
             StacStorageBackend,
         )
-        from dynastore.modules.storage.routing_config import ItemsRoutingConfig
 
         backend_map: Dict[str, StacStorageBackend] = {
             "es": StacStorageBackend.ES,
@@ -384,40 +452,76 @@ async def _apply_stac_presets(
         }
         stac_backend = backend_map.get(backend, StacStorageBackend.ES)
 
-        # 1. Apply stac_storage (SSOT flip) — always safe on all backends.
         storage_params = StacPresetParams(
             stac_level=StacLevel.ITEMS,
             stac_storage=stac_backend,
         )
-        storage_preset = find_preset("stac_storage")
-        await storage_preset.apply(storage_params, scope, ctx)
-        logger.info(
-            "stac_harvest: pinned items storage backend=%s on %s",
-            backend, catalog_id,
-        )
 
-        # 2. Write routing config for the items tier.
+        # Resolve engine + audit service (IAM-optional).
+        engine = None
+        audit = None
+        try:
+            from dynastore.modules import get_protocol
+            from dynastore.models.protocols import DatabaseProtocol
+            from dynastore.modules.iam.applied_presets_service import AppliedPresetsService
+
+            db_proto = get_protocol(DatabaseProtocol)
+            engine = db_proto.engine if db_proto is not None else None
+            if engine is None and ctx is not None:
+                engine = getattr(ctx, "db", None)
+            if engine is not None:
+                audit = AppliedPresetsService(engine)
+        except Exception as iam_exc:
+            logger.info(
+                "stac_harvest: IAM audit service unavailable, using direct preset "
+                "path for catalog=%s: %s(%s)",
+                catalog_id, type(iam_exc).__name__, iam_exc,
+            )
+
+        if audit is None or engine is None:
+            # IAM not available — fall back to direct apply path.
+            await _apply_stac_presets_direct(
+                ctx, scope, catalog_id, backend, storage_params, stac_backend
+            )
+            return
+
+        # Audited path — routes through apply_preset lifecycle for audit row,
+        # idempotency, and stored revoke descriptor.
+        from dynastore.modules.storage.presets.lifecycle import apply_preset
+        from dynastore.modules.storage.presets.errors import PresetConflictError
+
+        # 1. Apply stac_storage (SSOT flip) — always safe on all backends.
+        try:
+            await apply_preset("stac_storage", scope, storage_params, ctx, engine, audit)
+            logger.info(
+                "stac_harvest: pinned items storage backend=%s on %s",
+                backend, catalog_id,
+            )
+        except PresetConflictError as conflict_exc:
+            logger.info(
+                "stac_harvest: stac_storage already applied at %s — leaving existing "
+                "config: %s",
+                scope, conflict_exc,
+            )
+
+        # 2. Apply routing preset for the items tier.
         if backend == "es":
-            # Write ES-only ItemsRoutingConfig directly — skip the cumulative
-            # stac_routing preset which would also attempt collection-tier ES
-            # routing (unregistered driver on this deployment).
-            configs = ctx.config
-            if configs is not None:
-                items_routing = _items_routing_es()
-                await configs.set_config(
-                    ItemsRoutingConfig,
-                    items_routing,
-                    catalog_id=catalog_id,
+            # items_es_public: items-tier only — avoids collection-tier ES routing
+            # (collection_elasticsearch_driver not registered on ES-primary deployments).
+            from dynastore.modules.storage.presets.preset import NoParams
+            try:
+                await apply_preset(
+                    "items_es_public", scope, NoParams(), ctx, engine, audit
                 )
                 logger.info(
-                    "stac_harvest: wrote ES-only ItemsRoutingConfig for catalog=%s",
+                    "stac_harvest: applied items_es_public preset on %s",
                     catalog_id,
                 )
-            else:
-                logger.warning(
-                    "stac_harvest: ctx.config is None — cannot write "
-                    "ItemsRoutingConfig for catalog=%s (ES-only preset incomplete)",
-                    catalog_id,
+            except PresetConflictError as conflict_exc:
+                logger.info(
+                    "stac_harvest: items_es_public already applied at %s — leaving "
+                    "existing config: %s",
+                    scope, conflict_exc,
                 )
         else:
             # es_pg / pg: the cumulative stac_routing preset validates fine.
@@ -425,12 +529,20 @@ async def _apply_stac_presets(
                 stac_level=StacLevel.ITEMS,
                 stac_storage=stac_backend,
             )
-            routing_preset = find_preset("stac_routing")
-            await routing_preset.apply(routing_params, scope, ctx)
-            logger.info(
-                "stac_harvest: applied stac_routing preset (backend=%s) on %s",
-                backend, catalog_id,
-            )
+            try:
+                await apply_preset(
+                    "stac_routing", scope, routing_params, ctx, engine, audit
+                )
+                logger.info(
+                    "stac_harvest: applied stac_routing preset (backend=%s) on %s",
+                    backend, catalog_id,
+                )
+            except PresetConflictError as conflict_exc:
+                logger.info(
+                    "stac_harvest: stac_routing already applied at %s — leaving "
+                    "existing config: %s",
+                    scope, conflict_exc,
+                )
 
     except Exception as exc:
         logger.warning(
