@@ -48,6 +48,7 @@ from starlette.responses import JSONResponse, Response
 from dynastore.extensions.iam.membership_cache import get_membership_cached as _get_membership
 from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.iam_query import IamQueryProtocol
+from dynastore.modules.iam.compiled_rule_cache import iam_rule_version
 from dynastore.tools.discovery import get_protocol
 
 from .tenant_scope_registry import (
@@ -214,7 +215,7 @@ class TenantScopeMiddleware(BaseHTTPMiddleware):
                 {"detail": "Identity not resolvable"}, status_code=403,
             )
 
-        membership = await _get_membership(iam_query, provider, subject_id)
+        membership = await _get_membership(iam_query, provider, subject_id, iam_rule_version())
         # Pin scope so downstream Protocols / handlers can read it without
         # round-tripping IAM again.
         request.state.authorized_catalogs = membership

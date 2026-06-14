@@ -162,10 +162,12 @@ class IamMiddleware(BaseHTTPMiddleware):
             from dynastore.extensions.iam.membership_cache import (
                 get_membership_cached,
             )
+            from dynastore.modules.iam.compiled_rule_cache import iam_rule_version
+
             iam_query = get_protocol(IamQueryProtocol)
             if iam_query is None:
                 return principal_role
-            membership = await get_membership_cached(iam_query, provider, subject_id)
+            membership = await get_membership_cached(iam_query, provider, subject_id, iam_rule_version())
             catalog_roles = membership.get("catalog_roles") or {}
             holds_catalog_admin = any(
                 self._effective_catalog_admin_role in (roles or [])

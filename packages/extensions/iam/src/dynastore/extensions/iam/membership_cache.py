@@ -18,15 +18,31 @@
 
 """Per-pod cached lookup of a principal's catalog memberships.
 
-Used by `CatalogMembershipHandler` (in `modules/iam/conditions.py`) and by
+Used by ``CatalogMembershipHandler`` (in ``modules/iam/conditions.py``) and by
 any future consumer that needs to know which catalogs a principal can see.
-Cache key is `(provider, subject_id)` only — the `IamQueryProtocol` singleton
-is excluded so cache hits survive test fixture teardown / setup boundaries.
 
-Per-pod L1 only (`distributed=False`). 60 s TTL is the safe upper bound on
-grant-change propagation; a Valkey RTT per request would cost more than the
-saved DB query for short dashboard sessions. Upgrade to `distributed=True`
-when Valkey is provisioned in dev + prod.
+Cache key is ``(provider, subject_id, rule_version)`` — the
+``IamQueryProtocol`` singleton is excluded so cache hits survive test fixture
+teardown / setup boundaries; ``rule_version`` is the current platform-level
+"iam" binding-version counter from Valkey (see
+``modules/iam/phantom_token.get_binding_version``).
+
+**Cross-pod invalidation**: when any pod writes a grant or revokes a role
+(``postgres_iam_storage._bump_binding_version``), it increments BOTH the
+affected schema's counter AND the platform "iam" counter.  Every pod's next
+call to :func:`get_membership_cached` fetches the "iam" counter (memoised
+in-process for ~2 s; see ``phantom_token._VERSION_L1_TTL``), finds it has
+changed, and the old cache key is no longer addressable — so the lookup
+falls through to the DB.  This is the same mechanism used by
+``compiled_rule_cache`` (see that module for the design rationale).
+
+When Valkey is absent (counter returns 0 on every read) the cache degrades
+to a pure TTL cache with the same 60 s window as before.
+
+Per-pod L1 only (``distributed=False``).  The return value is a plain dict
+and serialising it across Valkey is straightforward, but the membership query
+is already cheap (single joined SQL scan) and the primary goal here is
+reducing DB load per request, not cross-pod sharing.
 
 Non-IAM extension consumers (e.g. ``extensions/admin``) MUST reach this
 cache via ``get_protocol(MembershipCacheProtocol)`` rather than importing
@@ -55,8 +71,20 @@ from dynastore.tools.discovery import get_protocol
     ignore=["iam_query"],
 )
 async def get_membership_cached(
-    iam_query: IamQueryProtocol, provider: str, subject_id: str,
+    iam_query: IamQueryProtocol,
+    provider: str,
+    subject_id: str,
+    rule_version: int = 0,
 ) -> Dict[str, Any]:
+    """Return the catalog-membership map for a principal.
+
+    ``rule_version`` is the current platform binding-version counter.  It is
+    included in the cache key so that any IAM mutation (grant/revoke on any
+    schema) that bumps the "iam" Valkey counter invalidates this entry on
+    every pod, not just the pod that performed the write.  Pass
+    ``iam_rule_version()`` (sync snapshot, zero-cost) or
+    ``await get_binding_version("iam")`` from the call site.
+    """
     return await iam_query.list_catalog_memberships(
         provider=provider, subject_id=subject_id,
     )
@@ -80,10 +108,14 @@ class MembershipCacheProvider:
     async def get_membership(
         self, provider: str, subject_id: str
     ) -> Dict[str, Any]:
+        from dynastore.modules.iam.compiled_rule_cache import iam_rule_version
+
         iam_query: Optional[IamQueryProtocol] = get_protocol(IamQueryProtocol)
         if iam_query is None:
             return {"platform": False, "catalogs": [], "catalog_roles": {}, "total": 0}
-        return await get_membership_cached(iam_query, provider, subject_id)
+        return await get_membership_cached(
+            iam_query, provider, subject_id, iam_rule_version()
+        )
 
 
 # Module-level singleton — instantiated once and registered by the IAM

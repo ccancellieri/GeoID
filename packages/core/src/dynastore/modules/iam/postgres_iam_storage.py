@@ -390,7 +390,16 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         if not role_names:
             return []
 
-        cache_key = (tuple(sorted(role_names)), schema)
+        # Version-key the cache on the per-schema binding counter so that a
+        # role-hierarchy write on ANY pod shifts the key and forces a DB
+        # re-read on all pods — matching the compiled_rule_cache pattern.
+        # Falls back to version=0 when Valkey is absent (local-only TTL
+        # backstop still applies in that case).
+        from dynastore.modules.iam.phantom_token import get_binding_version
+
+        rule_version = await get_binding_version(schema)
+
+        cache_key = (tuple(sorted(role_names)), schema, rule_version)
         cached = self._role_hierarchy_cache.get(cache_key)
         if cached:
             result, ts = cached
@@ -618,13 +627,26 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             return count > 0
 
     async def _bump_binding_version(self, schema: str) -> None:
-        """Best-effort invalidation of the phantom-token cache (#1343).
+        """Best-effort invalidation of the phantom-token and role/membership
+        caches.
 
-        No-op unless the phantom cache is active (Valkey + flag); never raises.
+        Bumps the per-schema Valkey counter so that version-keyed caches on
+        every pod see the change on their next read (counter shift makes the
+        old key unreachable).  When the write targets a tenant schema, the
+        platform "iam" counter is also bumped so that the membership cache
+        — which spans all catalogs and version-keys on the "iam" counter —
+        converges cross-pod without a pub/sub channel.
+
+        No-op unless the Valkey backend is active; never raises.
         """
         from dynastore.modules.iam.phantom_token import bump_binding_version
 
         await bump_binding_version(schema)
+        # Any catalog-scoped write (grant/revoke) must also shift the
+        # platform-level version counter so the per-pod membership cache
+        # (keyed on the "iam" version) is invalidated on all pods.
+        if schema != "iam":
+            await bump_binding_version("iam")
 
     # ------------------------------------------------------------------
     # Role definitions — per-scope. `schema=` here denotes the role

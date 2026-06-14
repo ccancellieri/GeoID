@@ -864,6 +864,7 @@ class CatalogAdminHandler(ConditionHandler):
         from dynastore.models.protocols.iam_query import IamQueryProtocol
         from dynastore.tools.discovery import get_protocol
         from dynastore.extensions.iam.membership_cache import get_membership_cached
+        from dynastore.modules.iam.compiled_rule_cache import iam_rule_version
 
         catalog_id = ctx.catalog_id
         if not catalog_id:
@@ -890,7 +891,7 @@ class CatalogAdminHandler(ConditionHandler):
         iam_query = get_protocol(IamQueryProtocol)
         if iam_query is None:
             return False
-        membership = await get_membership_cached(iam_query, provider, subject_id)
+        membership = await get_membership_cached(iam_query, provider, subject_id, iam_rule_version())
         if cfg.allow_platform and membership.get("platform"):
             return True
         if not cfg.required_roles:
@@ -943,6 +944,7 @@ class CatalogMembershipHandler(ConditionHandler):
         from dynastore.models.protocols.iam_query import IamQueryProtocol
         from dynastore.tools.discovery import get_protocol
         from dynastore.extensions.iam.membership_cache import get_membership_cached
+        from dynastore.modules.iam.compiled_rule_cache import iam_rule_version
 
         catalog_id = ctx.catalog_id
         if not catalog_id:
@@ -964,7 +966,7 @@ class CatalogMembershipHandler(ConditionHandler):
         if iam_query is None:
             # IAM query Protocol not registered — fail closed
             return False
-        membership = await get_membership_cached(iam_query, provider, subject_id)
+        membership = await get_membership_cached(iam_query, provider, subject_id, iam_rule_version())
         if config.get("allow_platform", True) and membership.get("platform"):
             return True
         return catalog_id in (membership.get("catalogs") or [])
