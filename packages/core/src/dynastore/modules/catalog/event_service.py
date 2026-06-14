@@ -17,9 +17,6 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import asyncio
-import json
-import os
 from typing import (
     ClassVar,
     List,
@@ -45,26 +42,11 @@ from dynastore.models.protocols.event_bus import EventBusProtocol
 from dynastore.modules.db_config.query_executor import (
     DbResource,
 )
-from dynastore.modules.db_config.exceptions import TableNotFoundError
 from dynastore.tools.discovery import get_protocol
-from dynastore.modules.concurrency import get_background_executor, run_in_background
+from dynastore.modules.concurrency import run_in_background
 from dynastore.models.driver_context import DriverContext
-from dynastore.tools.async_utils import LoopLocalSemaphore
-from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 logger = logging.getLogger(__name__)
-
-# Cap on how many of the 16 shard consumers may hold a pooled DB connection at
-# once. The shards exist to partition the outbox for lock-free SKIP LOCKED
-# draining — NOT to each pin a connection. With a request pool of ~10, 16
-# concurrent FOR UPDATE checkouts starve both the drainer and request traffic,
-# raising ``sqlalchemy.exc.TimeoutError`` ("QueuePool limit reached"). Bounding
-# concurrent checkouts decouples shard count from connection count so the
-# drainer makes steady progress while leaving headroom for the rest of the
-# service. Tunable per deployment; default leaves margin under a size-10 pool.
-_EVENT_CONSUMER_MAX_CONCURRENCY = max(
-    1, int(os.getenv("DYNASTORE_EVENT_CONSUMER_CONCURRENCY", "4"))
-)
 
 
 class CatalogEventType(EventType):
@@ -232,17 +214,6 @@ class EventService(EventBusProtocol):
     # Shared state for listeners across all instances (Singleton behavior for registration)
     _sync_listeners: ClassVar[Dict[str, List[Listener]]] = defaultdict(list)
     _async_listeners: ClassVar[Dict[str, List[Listener]]] = defaultdict(list)
-
-    def __init__(self):
-        self._consumer_running = False
-        self._consumer_task = None
-        # Bounds how many of the 16 shard consumers hold a pooled DB connection
-        # at once (see ``_EVENT_CONSUMER_MAX_CONCURRENCY``). ``LoopLocalSemaphore``
-        # — not a raw ``asyncio.Semaphore`` — because EventService is constructed
-        # before any loop runs and is reused across loops (tests; leader
-        # re-election); it keeps one real semaphore per loop. Same primitive and
-        # rationale as the tasks ``BackgroundRunner`` (#1640).
-        self._consume_semaphore = LoopLocalSemaphore(_EVENT_CONSUMER_MAX_CONCURRENCY)
 
     def register(self, event_type: Union[EventType, str], listener: Listener):
         """Register an async listener for an event type (legacy, defaults to sync)."""
@@ -456,58 +427,6 @@ class EventService(EventBusProtocol):
             db_resource=db_resource,
         )
 
-    async def consume_batch(
-        self,
-        batch_size: int = 100,
-    ) -> List[Dict[str, Any]]:
-        """Claim and return a batch of pending events.
-
-        Delegates to :class:`EventDriverProtocol`.  The driver owns its
-        own connection pool — no ``engine``/``db_resource`` parameter
-        here because consume-side operations do NOT participate in the
-        caller's transaction: events have already committed at publish
-        time, and the claim → ACK cycle is a separate transaction the
-        driver manages internally.  Transaction-scoped ACK (e.g. "ACK
-        only if my downstream write committed") belongs in a future
-        ``consume_scoped`` / ``ack_scoped`` pair with an explicit
-        ``db_resource`` contract; adding an unused parameter here would
-        mislead callers into assuming one existed.
-        """
-        driver = get_protocol(EventDriverProtocol)
-        if not driver:
-            logger.warning("EventDriverProtocol not available for consume_batch")
-            return []
-        return await driver.consume_batch(scope="PLATFORM", batch_size=batch_size)
-
-    async def ack(
-        self,
-        event_ids: List[str],
-    ) -> None:
-        """Acknowledge consumed events.
-
-        See :meth:`consume_batch` for the no-``engine`` rationale — ACK
-        runs on the driver's own connection, separately from any
-        caller transaction.
-        """
-        if not event_ids:
-            return
-        driver = get_protocol(EventDriverProtocol)
-        if driver:
-            await driver.ack(event_ids=event_ids)
-
-    async def nack(
-        self,
-        event_id: str,
-        error: str,
-    ) -> None:
-        """Negative-acknowledge a consumed event.
-
-        See :meth:`consume_batch` for the no-``engine`` rationale.
-        """
-        driver = get_protocol(EventDriverProtocol)
-        if driver:
-            await driver.nack(event_id=event_id, error=error)
-
     def has_listeners(self) -> bool:
         """Returns True if any async event listeners are registered."""
         return bool(self._async_listeners)
@@ -518,22 +437,18 @@ class EventService(EventBusProtocol):
         """Await every registered async listener for *event_type*.
 
         The in-process async-listener registry (``_async_listeners``) is the
-        process-independent handler surface a durable consumer dispatches
+        process-independent handler surface the durable consumer dispatches
         through.  Each handler is awaited with the event payload's positional
         and keyword args (``payload["args"]`` / ``payload["kwargs"]``); the
-        first handler exception propagates so the caller can nack / retry the
-        event.
+        first handler exception propagates so the caller can retry the event.
 
-        Two consumers share this method:
-
-        * the legacy in-process shard loop (:meth:`_consume_shard`), and
-        * ``EventDrainTask`` — the control-plane drain of
-          ``tasks.events`` — which resolves this ``EventService`` via
-          ``get_protocol(EventBusProtocol)`` and invokes it per claimed row.
+        The sole consumer is ``EventDrainTask`` — the control-plane drain of
+        ``tasks.events`` — which resolves this ``EventService`` via
+        ``get_protocol(EventBusProtocol)`` and invokes this method per claimed
+        row, retrying the row on any handler exception.
 
         An ``event_type`` with no registered listeners is a successful no-op
-        (there is nothing to deliver), matching the legacy behaviour where the
-        empty-listener loop falls straight through to ACK.
+        (there is nothing to deliver): the drain treats it as a completed row.
         """
         async_listeners = self._async_listeners.get(event_type, [])
         if not async_listeners:
@@ -542,256 +457,6 @@ class EventService(EventBusProtocol):
         kwargs = payload.get("kwargs", {}) if isinstance(payload, dict) else {}
         for listener in async_listeners:
             await listener(*args, **kwargs)
-
-    async def _consume_shard(
-        self,
-        shard_id: int,
-        shutdown_event: Any,
-        *,
-        scope: str,
-    ) -> None:
-        """One consumer task per shard — own SKIP LOCKED scan, bounded checkout.
-
-        ``self._consume_semaphore`` (shared across all 16 shards) caps how many
-        shards hold a pooled DB connection at once, so the drainer cannot exhaust
-        the request pool. Only the active SKIP LOCKED pull + listener fan-out +
-        ack hold a slot; idle ``wait_for_events`` polling stays outside it.
-
-        On a pool-checkout timeout (``sqlalchemy.exc.TimeoutError`` — all
-        connections in use — or the builtin ``TimeoutError``), back off
-        exponentially up to 60 s instead of retrying every 5 s. Pile-on under
-        sustained pool pressure was the dominant amplifier of the production
-        storm; backing off lets the pool drain. The backoff resets to 5 s after
-        any successful ``consume_batch``.
-        """
-        if shard_id > 0:
-            await asyncio.sleep(shard_id * 0.25)
-        logger.info(
-            "EventService: shard consumer started (shard=%d, scope=%s).", shard_id, scope
-        )
-        timeout_backoff_s = 5.0
-        while not getattr(shutdown_event, "is_set", lambda: False)():
-            try:
-                driver = get_protocol(EventDriverProtocol)
-                if not driver:
-                    await asyncio.sleep(5.0)
-                    continue
-
-                # Bounded checkout: only ``_EVENT_CONSUMER_MAX_CONCURRENCY``
-                # shards may draw from the shared pool at once (pull + listener
-                # fan-out + ack/nack).
-                async with self._consume_semaphore:
-                    events = await driver.consume_batch(
-                        scope=scope, batch_size=100, shard=shard_id
-                    )
-                    timeout_backoff_s = 5.0  # successful checkout → reset
-
-                    for event in events:
-                        event_type_str = event.get("event_type", "")
-                        payload = event.get("payload", {})
-                        if isinstance(payload, str):
-                            payload = json.loads(payload)
-
-                        event_id = str(event.get("event_id") or event.get("id"))
-                        try:
-                            await self.dispatch_to_listeners(
-                                event_type_str, payload
-                            )
-                            await driver.ack(event_ids=[event_id])
-                        except Exception as e:
-                            logger.error(
-                                f"Failed to process event {event_id}: {e}",
-                                exc_info=True,
-                            )
-                            await driver.nack(event_id=event_id, error=str(e))
-
-                # Idle wait runs OUTSIDE the slot so a quiet shard never pins a
-                # drain slot while there is nothing to do.
-                if not events:
-                    await driver.wait_for_events(timeout=10.0)
-                    continue
-
-            except asyncio.CancelledError:
-                raise
-            except TableNotFoundError as e:
-                logger.warning(
-                    "EventService shard %d: table missing (%s); backing off 60s.",
-                    shard_id, e,
-                )
-                await asyncio.sleep(60.0)
-            except (asyncio.TimeoutError, TimeoutError, SQLAlchemyTimeoutError) as e:
-                logger.warning(
-                    "EventService shard %d: pool checkout timed out (%s); "
-                    "backing off %.0fs (next: %.0fs).",
-                    shard_id, e or "<no message>",
-                    timeout_backoff_s, min(timeout_backoff_s * 2, 60.0),
-                )
-                await asyncio.sleep(timeout_backoff_s)
-                timeout_backoff_s = min(timeout_backoff_s * 2, 60.0)
-            except Exception as e:
-                logger.error(
-                    "EventService shard %d consumer error: %s: %s",
-                    shard_id, type(e).__name__, e or "<no message>",
-                    exc_info=True,
-                )
-                await asyncio.sleep(5.0)
-
-        logger.info(
-            "EventService: shard consumer stopped (shard=%d, scope=%s).", shard_id, scope
-        )
-
-    async def _run_consume_loop(
-        self,
-        shutdown_event: Any,
-        *,
-        scope: str = "ALL",
-        channels: Optional[List[str]] = None,
-    ) -> None:
-        """Spawn 16 shard consumer tasks and wait for all to complete.
-
-        Concurrent DB checkouts across the shards are bounded by
-        ``self._consume_semaphore`` (a loop-local semaphore sized to
-        ``_EVENT_CONSUMER_MAX_CONCURRENCY``) so the 16 shards cannot exhaust the
-        shared request pool.
-        """
-        logger.info(
-            "EventService: starting 16-shard consume loop "
-            "(scope=%s, max_db_concurrency=%d).",
-            scope, _EVENT_CONSUMER_MAX_CONCURRENCY,
-        )
-        tasks = [
-            asyncio.create_task(
-                self._consume_shard(shard_id, shutdown_event, scope=scope),
-                name=f"EventShard:{shard_id}",
-            )
-            for shard_id in range(16)
-        ]
-        await asyncio.gather(*tasks)
-        logger.info("EventService: 16-shard consume loop stopped (scope=%s).", scope)
-
-    async def start_consumer(
-        self,
-        shutdown_event: Any,
-        *,
-        scope: str = "ALL",
-        leader_key: str = "dynastore.events.consumer.v1",
-        channels: Optional[List[str]] = None,
-    ) -> None:
-        """
-        Start the background event consumer under a distributed advisory lock.
-        Every worker fleet-wide calls this; exactly one wins and runs the
-        consume loop. On pod/worker death the lock is released automatically
-        and a waiter takes over.
-        """
-        if getattr(self, "_consumer_running", False):
-            logger.warning("EventService: Consumer already running.")
-            return
-
-        # Review #5 regression-fuse: the flag flip lives next to the
-        # ``executor.submit`` call (not at the top of ``_leader_loop``)
-        # so that a synchronous failure inside ``submit`` — e.g. the
-        # background executor has been shut down — rolls the flag back
-        # to ``False``.  Without the try/except below, the flag would
-        # stay ``True`` forever and every subsequent ``start_consumer``
-        # call would short-circuit at the guard above, bricking the
-        # consumer across the pod's lifetime.
-        self._consumer_running = True
-        self._consumer_task = None
-
-        from contextlib import asynccontextmanager
-        from dynastore.tools.async_utils import run_leader_loop
-
-        retry_s = 5.0
-
-        @asynccontextmanager
-        async def _acquire_leadership():
-            driver = get_protocol(EventDriverProtocol)
-            if not driver:
-                logger.warning(
-                    "EventService: EventDriverProtocol not available; retrying in 5s."
-                )
-                yield False
-                return
-            async with driver.acquire_consumer_lock(leader_key) as is_leader:
-                yield is_leader
-
-        async def _on_leader():
-            await self._run_consume_loop(
-                shutdown_event,
-                scope=scope,
-                channels=channels or ["dynastore_events_channel"],
-            )
-
-        async def _leader_loop():
-            try:
-                await run_leader_loop(
-                    acquire_leadership=_acquire_leadership,
-                    on_leader=_on_leader,
-                    name=f"EventService[{leader_key}]",
-                    cadence_seconds=retry_s,
-                    is_shutdown=lambda: getattr(
-                        shutdown_event, "is_set", lambda: False
-                    )(),
-                )
-            finally:
-                self._consumer_running = False
-                logger.info(
-                    "EventService: leader loop stopped (key=%s).", leader_key
-                )
-
-        executor = get_background_executor()
-        try:
-            self._consumer_task = executor.submit(
-                _leader_loop(), task_name=f"EventServiceLeader:{leader_key}"
-            )
-        except BaseException:
-            # ``submit`` failed synchronously — the coroutine never ran,
-            # so the ``_consumer_running = False`` reset inside
-            # ``_leader_loop`` will never execute.  Roll the flag back
-            # ourselves so a later ``start_consumer`` retry isn't
-            # blocked by the already-running guard.
-            self._consumer_running = False
-            self._consumer_task = None
-            raise
-        logger.info(
-            "EventService: leader-elected consumer started (key=%s, scope=%s).",
-            leader_key,
-            scope,
-        )
-
-    async def stop_consumer(self) -> None:
-        """Stop the background event consumer loop gracefully.
-
-        **Await-after-cancel is load-bearing.**  ``task.cancel()`` only
-        *requests* cancellation — the actual coroutine still has to run
-        to its next await, catch the ``CancelledError``, and exit.  If
-        the caller (fixture teardown, module shutdown) doesn't await
-        the task, the asyncio event loop keeps the task pending and
-        pytest's runner hangs forever waiting for it to finish.  This
-        was the root cause of the 30–50 min CI stalls: every test that
-        used ``app_lifespan`` + registered any async event listener
-        wired up the consumer via ``start_consumer``, and teardown
-        discarded the reference without draining the cancellation.
-        """
-        self._consumer_running = False
-        task = getattr(self, "_consumer_task", None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass  # expected — we just cancelled it
-            except Exception:
-                # A partially-executed consume loop can raise on reconnect-retry
-                # paths.  Teardown MUST continue (an unhandled shutdown error
-                # masking a test's real failure is worse), but the error is
-                # logged rather than silently swallowed.
-                logger.warning(
-                    "EventService: durable consumer task errored during shutdown",
-                    exc_info=True,
-                )
-            self._consumer_task = None
-            logger.info("EventService: Durable event consumer task cancelled.")
 
     @asynccontextmanager
     async def transaction(

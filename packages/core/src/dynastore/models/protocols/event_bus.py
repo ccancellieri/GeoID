@@ -19,8 +19,10 @@
 """
 Protocol for durable event bus operations.
 
-Extends EventsProtocol (in-process pub/sub) with outbox semantics:
-publish to durable storage, consume with SKIP LOCKED, ack/nack lifecycle.
+Extends EventsProtocol (in-process pub/sub) with the durable-outbox publish
+side and the in-process listener-dispatch surface that the control-plane
+EventDrainTask drives. The claim/ack/nack consume lifecycle now lives in the
+tasks module (EventDrainTask draining ``tasks.events``), not here.
 
 Implementations:
 - PostgreSQL outbox + LISTEN/NOTIFY (default, on-premise + Cloud Run)
@@ -30,7 +32,6 @@ Implementations:
 from typing import (
     Any,
     Dict,
-    List,
     Optional,
     Protocol,
     runtime_checkable,
@@ -44,14 +45,15 @@ class EventBusProtocol(EventsProtocol, Protocol):
     """
     Protocol for durable event bus operations.
 
-    Provides outbox semantics on top of EventsProtocol:
-    - Publish events to durable storage
-    - Consume events in batches (SKIP LOCKED)
-    - Acknowledge (delete) or negative-acknowledge (dead-letter)
-    - Automatic consumer lifecycle based on registered listeners
+    Provides, on top of EventsProtocol:
+    - Publish events to the durable outbox (transactional-outbox pattern)
+    - Report whether any async listeners are registered (``has_listeners``)
+    - Dispatch an event to the in-process async listeners
+      (``dispatch_to_listeners``)
 
-    Consumed events are logged to the appropriate scope (catalog logs or
-    system logs) via LogsProtocol before deletion.
+    The claim/ack/nack consume lifecycle is owned by ``EventDrainTask`` (the
+    control-plane drain of ``tasks.events``), which resolves an implementation
+    of this protocol and calls ``dispatch_to_listeners`` per claimed row.
     """
 
     async def publish(
@@ -74,54 +76,12 @@ class EventBusProtocol(EventsProtocol, Protocol):
         """
         ...
 
-    async def consume_batch(
-        self,
-        engine: Any,
-        batch_size: int = 100,
-    ) -> List[Dict[str, Any]]:
-        """
-        Claim and return a batch of pending events using FOR UPDATE SKIP LOCKED.
-
-        Each returned event dict contains at minimum:
-        event_id, event_type, scope, schema_name, collection_id, payload.
-
-        Claimed events are marked as PROCESSING to prevent re-consumption.
-        """
-        ...
-
-    async def ack(
-        self,
-        engine: Any,
-        event_ids: List[str],
-    ) -> None:
-        """
-        Acknowledge consumed events.
-
-        Logs to the appropriate scope via LogsProtocol, then DELETEs the
-        events from the outbox. Consumed events are not retained.
-        """
-        ...
-
-    async def nack(
-        self,
-        engine: Any,
-        event_id: str,
-        error: str,
-    ) -> None:
-        """
-        Negative-acknowledge a consumed event.
-
-        Increments retry_count. If max retries exceeded, moves to DEAD_LETTER
-        status. Otherwise resets to PENDING for re-delivery.
-        """
-        ...
-
     def has_listeners(self) -> bool:
         """
         Returns True if any async event listeners are registered.
 
-        Used to determine whether to automatically start the event consumer.
-        Modules opt in by registering listeners via @async_event_listener.
+        Modules opt in by registering listeners via @async_event_listener;
+        the EventDrainTask dispatches each claimed event to them.
         """
         ...
 
@@ -131,26 +91,12 @@ class EventBusProtocol(EventsProtocol, Protocol):
         """
         Await every registered async listener for *event_type*.
 
-        The process-independent handler surface: a durable consumer (the
-        in-process shard loop or the control-plane EventDrainTask) resolves
-        the event bus and dispatches each claimed event through this method.
-        Awaits each handler with the payload's positional/keyword args; the
-        first handler exception propagates so the caller can nack / retry.
-        An event_type with no registered listeners is a successful no-op.
+        The process-independent handler surface: the control-plane
+        EventDrainTask resolves the event bus and dispatches each claimed
+        event through this method. Awaits each handler with the payload's
+        positional/keyword args; the first handler exception propagates so the
+        drain can retry the row. An event_type with no registered listeners is
+        a successful no-op.
         """
-        ...
-
-    async def start_consumer(self, shutdown_event: Any) -> None:
-        """
-        Start the background event consumer loop.
-
-        The consumer claims events via consume_batch(), dispatches to
-        registered listeners, and acks/nacks based on outcome.
-        Uses leader election (advisory lock) to minimize DB connections.
-        """
-        ...
-
-    async def stop_consumer(self) -> None:
-        """Stop the background event consumer loop gracefully."""
         ...
 

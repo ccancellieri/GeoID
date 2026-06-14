@@ -314,7 +314,8 @@ def test_outbox_drain_task_type_is_index_drain():
     """
     assert OutboxDrainTask.task_type == "index_drain", (
         "OutboxDrainTask.task_type must be 'index_drain'; 'outbox_drain' was "
-        "the overloaded pre-rename value that collided with EVENT_TASK_KEY."
+        "the overloaded pre-rename value that collided with the 'event_drain' "
+        "task key."
     )
 
 

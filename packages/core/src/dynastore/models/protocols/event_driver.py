@@ -28,19 +28,10 @@ Implementations:
     DeliveryMode: AT_LEAST_ONCE
   - Other backends: implement a subset of capabilities and declare them accordingly.
 
-Backend-agnostic consumer loop:
-
-    while not shutdown.is_set():
-        async with storage.acquire_consumer_lock(leader_key) as is_leader:
-            if not is_leader:
-                await asyncio.sleep(retry_s)
-                continue
-            while not shutdown.is_set():
-                events = await storage.consume_batch(scope, batch_size, shard=shard_id)
-                if not events:
-                    await storage.wait_for_events(timeout=poll_interval)
-                    continue
-                # dispatch…
+The durable consume lifecycle (claim -> dispatch -> ack/retry) is owned by
+``EventDrainTask`` — the control-plane drain of ``tasks.events`` — not by this
+protocol. Drivers provide the publish side, the advisory consumer lock, the
+NOTIFY/wait signal, subscriptions, and event search.
 """
 
 from __future__ import annotations
@@ -267,47 +258,8 @@ class EventDriverProtocol(Protocol):
         ...
 
     # ------------------------------------------------------------------
-    # Consume
+    # Query
     # ------------------------------------------------------------------
-
-    async def consume_batch(
-        self,
-        scope: str = "PLATFORM",
-        batch_size: int = 100,
-        shard: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Claim and return a batch of PENDING events for the given scope.
-
-        Uses ``FOR UPDATE SKIP LOCKED`` (or an equivalent backend mechanism)
-        to avoid double-processing.  Claimed events are marked PROCESSING.
-
-        When *shard* is provided, only events for that shard are returned
-        (enables the 16-task sharded consumer pattern).
-
-        Each returned dict contains at minimum:
-            event_id, event_type, scope, schema_name, catalog_id, collection_id,
-            identity_id, payload
-        """
-        ...
-
-    async def ack(self, event_ids: List[str]) -> None:
-        """
-        Acknowledge successfully processed events.
-
-        Removes them permanently from the outbox.
-        """
-        ...
-
-    async def nack(self, event_id: str, error: str) -> None:
-        """
-        Negative-acknowledge a failed event.
-
-        Increments ``retry_count``.  If max retries are exceeded the event is
-        moved to ``DEAD_LETTER`` status; otherwise it is reset to ``PENDING``
-        for re-delivery.
-        """
-        ...
 
     async def search_events(
         self,

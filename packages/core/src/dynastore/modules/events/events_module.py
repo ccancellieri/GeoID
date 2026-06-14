@@ -107,8 +107,8 @@ $$;
 
 # Trigger is kept separate so we can guard creation with a pg_trigger
 # existence check. DROP+CREATE TRIGGER takes AccessExclusiveLock on
-# events.events and would deadlock against a concurrently-live consumer
-# in another pod (RowExclusiveLock from _consume_query). Trigger body
+# events.events and would deadlock against any concurrent writer holding a
+# RowExclusiveLock (e.g. a publish INSERT) in another pod. Trigger body
 # changes are a migration concern — never re-create in place on a hot table.
 GLOBAL_EVENTS_TRIGGER_DDL = f"""
 CREATE TRIGGER on_event_insert
@@ -129,7 +129,7 @@ CREATE TRIGGER on_event_insert
 # mis-parsed inferred check would silently fall through to a bare
 # CREATE TRIGGER on a hot DB and abort foundational-module startup with
 # DuplicateObject (PG has no CREATE TRIGGER IF NOT EXISTS, and DROP+CREATE
-# would deadlock against live consumers — see comment above the trigger DDL).
+# would deadlock against concurrent writers — see comment above the trigger DDL).
 def _check_events_trigger_exists(conn):
     return check_trigger_exists(
         conn, "on_event_insert", _EVENTS_SCHEMA, table="events"
@@ -222,33 +222,6 @@ _publish_query = DQLQuery(
     result_handler=ResultHandler.SCALAR_ONE,
 )
 
-_consume_query = DQLQuery(
-    f"""
-    UPDATE {_EVENTS_SCHEMA}.events
-    SET status = 'PROCESSING',
-        processed_at = NOW()
-    WHERE (shard, event_id) IN (
-        SELECT shard, event_id FROM {_EVENTS_SCHEMA}.events
-        WHERE status = 'PENDING'
-          AND (shard = :shard OR :shard IS NULL)
-          AND (:scope = 'ALL' OR scope = :scope)
-        ORDER BY created_at ASC
-        LIMIT :batch_size
-        FOR UPDATE SKIP LOCKED
-    )
-    RETURNING event_id::text, event_type, scope, schema_name, catalog_id,
-              collection_id, identity_id, payload, created_at, retry_count;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
-
-_ack_query = DQLQuery(
-    f"DELETE FROM {_EVENTS_SCHEMA}.events WHERE event_id = ANY(:event_ids);",
-    result_handler=ResultHandler.NONE,
-)
-
-
-
 _backlog_query = DQLQuery(
     f"""
     SELECT shard,
@@ -260,22 +233,6 @@ _backlog_query = DQLQuery(
     HAVING count(*) > :warn_threshold;
     """,
     result_handler=ResultHandler.ALL_DICTS,
-)
-
-
-_nack_query = DQLQuery(
-    f"""
-    UPDATE {_EVENTS_SCHEMA}.events
-    SET status = CASE
-            WHEN retry_count + 1 >= :max_retries THEN 'DEAD_LETTER'
-            ELSE 'PENDING'
-        END,
-        retry_count   = retry_count + 1,
-        error_message = :error,
-        processed_at  = NOW()
-    WHERE event_id = CAST(:event_id AS uuid);
-    """,
-    result_handler=ResultHandler.NONE,
 )
 
 
@@ -388,7 +345,8 @@ class EventsModule(ModuleProtocol):
 
     Responsibilities:
     - Create and manage events.events (global outbox, 16-shard partitioned)
-    - Implement publish / consume_batch / ack / nack / wait_for_events
+    - Implement publish / search_events / wait_for_events; events are drained
+      by the control-plane EventDrainTask (tasks.events), not an in-module loop
     - Manage webhook subscriptions (platform.event_subscriptions)
     - Expose distributed advisory lock via acquire_consumer_lock
     - Register catalog lifecycle listeners
@@ -699,46 +657,6 @@ class EventsModule(ModuleProtocol):
         engine = self._engine or get_engine()
         async with managed_transaction(engine) as conn:
             return await _run(conn)
-
-    # ------------------------------------------------------------------
-    # EventDriverProtocol — consume / ack / nack
-    # ------------------------------------------------------------------
-
-    async def consume_batch(
-        self,
-        scope: str = "PLATFORM",
-        batch_size: int = 100,
-        shard: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """Claim a batch of PENDING events for *scope* (and optionally *shard*) using SKIP LOCKED."""
-        from dynastore.tools.protocol_helpers import get_engine
-        engine = self._engine or get_engine()
-        async with managed_transaction(engine) as conn:
-            rows = await _consume_query.execute(
-                conn, scope=scope, batch_size=batch_size, shard=shard
-            )
-        return rows or []
-
-    async def ack(self, event_ids: List[str]) -> None:
-        """Delete successfully processed events from the outbox."""
-        if not event_ids:
-            return
-        from dynastore.tools.protocol_helpers import get_engine
-        engine = self._engine or get_engine()
-        async with managed_transaction(engine) as conn:
-            await _ack_query.execute(conn, event_ids=event_ids)
-
-    async def nack(self, event_id: str, error: str) -> None:
-        """Increment retry_count; move to DEAD_LETTER when retries exhausted."""
-        from dynastore.tools.protocol_helpers import get_engine
-        engine = self._engine or get_engine()
-        async with managed_transaction(engine) as conn:
-            await _nack_query.execute(
-                conn,
-                event_id=event_id,
-                error=error,
-                max_retries=_MAX_RETRIES,
-            )
 
     async def search_events(
         self,

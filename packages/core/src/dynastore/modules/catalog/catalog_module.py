@@ -87,61 +87,6 @@ from dynastore.modules.catalog.log_manager import LogService, initialize_system_
 logger = logging.getLogger(__name__)
 
 
-EVENT_TASK_KEY = "event_drain"
-
-
-async def _routed_consumers(task_key: str) -> Optional[List[str]]:
-    """Return first non-empty consumer list from routing config, or None (fail-open)."""
-    try:
-        from dynastore.modules.tasks.routing.resolver import resolved_targets
-        targets = await resolved_targets(task_key)
-        for t in targets:
-            if t.consumers:
-                return list(t.consumers)
-        return None
-    except Exception:  # noqa: BLE001 — routing read is best-effort
-        return None
-
-
-def _service_name() -> Optional[str]:
-    from dynastore.modules.db_config.instance import get_service_name
-    return get_service_name()
-
-
-async def is_event_consumer() -> bool:
-    """True iff this service is eligible to drain the event outbox.
-
-    Eligibility contract (aligns with the resolver's fail-open semantics):
-
-    * ``consumers is None``  — routing config is silent / unconfigured.
-      Any process that has registered listeners (i.e. loaded CatalogModule)
-      is eligible.  The Postgres advisory lock inside
-      ``EventService.start_consumer`` guarantees that exactly one process
-      across the entire fleet drains at a time, so fail-open here is safe.
-
-    * ``consumers`` is a non-empty list — operator has explicitly pinned
-      draining to those service tiers.  Only services whose name appears in
-      the list are eligible; all others (including services with an unknown
-      name) are excluded.
-
-    The advisory-lock single-runner guarantee is the authoritative election
-    mechanism.  This gate is an optional eligibility pin for deployments that
-    want to restrict draining to a dedicated worker tier (e.g. on-prem
-    ``worker`` job).  It must never be the only line of defence against
-    connection storms — that role belongs to the lock.
-    """
-    consumers = await _routed_consumers(EVENT_TASK_KEY)
-    if consumers is None:
-        # No routing opinion: every CatalogModule-bearing process is eligible.
-        # The advisory lock ensures only one drains.
-        return True
-    # Explicit pin: only named services are eligible.
-    svc = _service_name()
-    if svc is None:
-        return False
-    return svc in consumers
-
-
 def _register_cascade_owners(
     registry: Any,
     owner_modules: List[tuple[str, str]],
@@ -477,53 +422,17 @@ class CatalogModule(ModuleProtocol):
                 await self._on_task_failed(**kwargs)
 
             # M3.1b — register the catalog_metadata_changed → ReindexWorker
-            # listener so mutations emitted by ``catalog_router``
-            # propagate to every configured secondary-index driver.  Uses
-            # the shared
-            # ``_consume_shard`` machinery started below (step 6); see
+            # listener so mutations emitted by ``catalog_router`` propagate to
+            # every configured secondary-index driver. The listener is invoked
+            # by ``EventDrainTask`` (the control-plane drain of ``tasks.events``)
+            # via ``EventService.dispatch_to_listeners``; see
             # ``reindex_listener.py`` for the rationale on listener-over-
-            # standalone-consumer.  This registration itself is what causes
-            # ``event_service.has_listeners()`` to return True for catalog
-            # builds that don't otherwise register async listeners —
-            # so wiring the reindex path automatically turns on the durable
-            # consumer.
+            # standalone-consumer.
             from dynastore.modules.catalog.reindex_listener import (
                 register_reindex_listener,
             )
             register_reindex_listener(self.event_service)
 
-
-            # 6. Start Background Event Consumer (automatic)
-            # Both reindex and task.failed listeners are registered
-            # unconditionally above, so has_listeners() is True on every
-            # service that loads CatalogModule. Gate consumer startup on
-            # task routing: event consumers are exactly the routing
-            # consumers of the event/outbox task, resolved through the same
-            # admin-managed routing config that governs which tasks each
-            # service may claim. Fail-closed (no resolved consumers / unknown
-            # service name) means an unconfigured deployment fails noisy
-            # (event-outbox depth visible in monitoring) rather than silent
-            # (connection storm everywhere — see the marker-plugin failure in
-            # commit 3a3ceda which leaked through Python entry-point
-            # loading).
-            _consumer_shutdown = asyncio.Event()
-            service_name = _service_name()
-            is_consumer = await is_event_consumer()
-
-            if self.event_service.has_listeners() and is_consumer:
-                logger.info(
-                    "CatalogModule: service=%r is a placement consumer of %r "
-                    "— starting durable event consumer.",
-                    service_name, EVENT_TASK_KEY,
-                )
-                await self.event_service.start_consumer(_consumer_shutdown)
-            else:
-                logger.info(
-                    "CatalogModule: event consumer not started "
-                    "(has_listeners=%s, service=%r, is_consumer=%s).",
-                    self.event_service.has_listeners(), service_name,
-                    is_consumer,
-                )
 
             # 7. Start soft-delete TTL reaper background loop.
             # Leader-elected (pg advisory lock) — only one pod runs scans.
@@ -606,7 +515,6 @@ class CatalogModule(ModuleProtocol):
             try:
                 yield
             finally:
-                _consumer_shutdown.set()
                 _reaper_shutdown.set()
                 _supervisor_shutdown.set()
                 _lifecycle_reaper_shutdown.set()
@@ -616,7 +524,6 @@ class CatalogModule(ModuleProtocol):
                     await _supervisor.stop()
                 if _lifecycle_reaper is not None:
                     await _lifecycle_reaper.stop()
-                await self.event_service.stop_consumer()
                 # Services cleanup handled by AsyncExitStack (stack.close() via __aexit__)
                 # Remove the services from the discovery registry so a future
                 # lifespan does not leave stale instances behind them.

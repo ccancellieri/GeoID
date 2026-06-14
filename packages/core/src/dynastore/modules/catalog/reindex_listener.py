@@ -20,21 +20,21 @@
 Async-event-listener adapter for :class:`ReindexWorker` (M3.1b production wiring).
 
 Registers :func:`handle_catalog_metadata_changed` via
-``@async_event_listener("catalog_metadata_changed")`` so
-:class:`event_service.EventService._consume_shard` — the 16-shard
-consumer CatalogModule starts automatically whenever any async
-listener is registered — invokes it per event.  The listener's
-raise-or-return signals NACK-or-ACK back to the shared outbox
-claim machinery: raise → NACK + re-deliver, return → ACK.
+``@async_event_listener("catalog_metadata_changed")``.  The control-plane
+``EventDrainTask`` (the drain of ``tasks.events``) dispatches each claimed
+event through ``EventService.dispatch_to_listeners``, which invokes this
+listener per event.  The listener's raise-or-return signals retry-or-done
+back to the drain: raise → the drain retries the row, return → the row
+completes.
 
-Why reuse the shared consumer instead of building a dedicated loop
-------------------------------------------------------------------
+Why a listener instead of a dedicated consumer loop
+---------------------------------------------------
 
-A second consumer running on the same ``PLATFORM`` scope would
-``SKIP LOCKED``-claim from the same ``catalog_metadata_changed``
-rows — two consumers interleaving against one outbox is a race we
-do not want and have no use for at this scale.  Reusing the 16-shard
-consumer sidesteps it entirely.
+A second reader claiming from the same event plane would race the drain for
+the same ``catalog_metadata_changed`` rows — two readers interleaving against
+one queue is a race we do not want and have no use for at this scale.
+Registering as a listener that the single drain dispatches through sidesteps
+it entirely.
 
 Wire-up (in :meth:`CatalogModule.__aenter__`)::
 
@@ -74,10 +74,10 @@ async def handle_catalog_metadata_changed(
 ) -> None:
     """Dispatch one ``catalog_metadata_changed`` event through ``worker``.
 
-    Shape contract with ``_consume_shard``
-    --------------------------------------
+    Shape contract with ``dispatch_to_listeners``
+    ---------------------------------------------
 
-    ``event_service.EventService._consume_shard`` invokes registered
+    ``EventService.dispatch_to_listeners`` invokes registered
     listeners with ``payload["args"]`` as positional args and
     ``payload["kwargs"]`` as keyword args.  The router emits:
 
@@ -96,14 +96,14 @@ async def handle_catalog_metadata_changed(
     that's the shape the worker's ``_handle_one`` expects — and
     build a one-event batch for :meth:`ReindexWorker.handle_batch`.
 
-    ACK/NACK translation
-    --------------------
+    Retry translation
+    -----------------
 
-    ``_consume_shard`` wraps each listener call in a try/except:
-    return ⇒ ACK, raise ⇒ NACK.  We therefore translate
+    ``EventDrainTask`` retries any row whose listener raises and
+    completes any row whose listener returns.  We therefore translate
     :class:`_DispatchResult` back into an exception when any result
     signals ``should_retry=True`` — joining the per-driver error
-    messages so the NACK row records exactly what failed.
+    messages so the retried row records exactly what failed.
 
     Degraded results (``succeeded=True`` with recorded errors from
     an SLA ``degrade`` / ``skip`` branch) do NOT raise — the SLA
@@ -111,11 +111,10 @@ async def handle_catalog_metadata_changed(
     re-emitted at WARNING level so alerting still fires.
 
     ``event_id`` passed into the worker is ``None`` because the real
-    outbox id lives one layer up in ``_consume_shard``'s local scope
-    and doesn't flow through the listener API.  The worker's
-    per-result ``event_id`` is therefore informational-only in this
-    wiring; ACK/NACK correctness is the shared-consumer's
-    responsibility.
+    row id lives in the drain's scope and doesn't flow through the
+    listener API.  The worker's per-result ``event_id`` is therefore
+    informational-only in this wiring; retry correctness is the
+    drain's responsibility.
     """
     payload = kwargs.get("payload")
     if not isinstance(payload, dict):
@@ -151,8 +150,8 @@ async def handle_catalog_metadata_changed(
         )
 
     if retry_errors:
-        # _consume_shard catches this + calls driver.nack(event_id,
-        # error=str(e)).  Join errors so the NACK row records every
+        # EventDrainTask catches this and retries the row (bumping its
+        # retry_count).  Join errors so the retried row records every
         # per-driver failure, not just the first.
         raise RuntimeError("; ".join(retry_errors))
 

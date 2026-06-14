@@ -24,11 +24,11 @@ but exercises the real code paths in between:
 
 1. :func:`catalog_router._emit_catalog_metadata_changed`
    correctly wraps the emission.
-2. :meth:`EventService._consume_shard` dispatches via registered
-   async listeners.  We bypass the actual shard loop (which needs a
-   real ``EventDriverProtocol`` + asyncio scheduling) and invoke the
-   registered listener directly, exactly the way ``_consume_shard``
-   would at line 525-529 of event_service.py.
+2. :meth:`EventService.dispatch_to_listeners` dispatches via registered
+   async listeners.  We bypass the EventDrainTask (which needs a real
+   ``tasks.events`` row + asyncio scheduling) and invoke the registered
+   listener directly, exactly the way ``dispatch_to_listeners`` does per
+   claimed row.
 3. :func:`handle_catalog_metadata_changed` (the listener adapter)
    extracts the payload, builds a one-event batch, and calls
    :meth:`ReindexWorker.handle_batch`.
@@ -39,8 +39,8 @@ but exercises the real code paths in between:
 
 What this test would catch that the unit tests would not:
 
-- The listener signature contract with ``_consume_shard`` (listener
-  receives payload as kwargs) — no unit test exercises this
+- The listener signature contract with ``dispatch_to_listeners``
+  (listener receives payload as kwargs) — no unit test exercises this
   handoff.
 - The ``ReindexWorker`` sync/async resolver detection
   (``inspect.iscoroutinefunction`` branch) with the real
@@ -53,7 +53,6 @@ What this test would catch that the unit tests would not:
 from __future__ import annotations
 
 import logging
-from typing import List
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -109,10 +108,10 @@ async def test_pipeline_router_emit_listener_worker_indexer(
       two stub Primary drivers (domain=core, domain=stac), then emits
       ``catalog_metadata_changed`` through ``emit_event``.
     - ``emit_event`` invokes the registered async listener from
-      ``register_reindex_listener``.  (We bypass ``_consume_shard``
-      because it needs a real outbox; the listener is reachable
-      directly through ``event_service`` when ``has_listeners()`` is
-      True.)
+      ``register_reindex_listener``.  (We bypass the EventDrainTask
+      because it needs a real ``tasks.events`` row; the listener is
+      reachable directly through ``event_service`` when
+      ``has_listeners()`` is True.)
     - The listener builds a one-event batch and passes it to
       :class:`ReindexWorker`.
     - The worker resolves indexers via the real async

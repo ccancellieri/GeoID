@@ -24,9 +24,9 @@ Covers:
   and builds a one-event batch for ``ReindexWorker.handle_batch``.
 - Missing / non-dict payload raises loud so emission-shape drift is
   caught at the listener boundary.
-- ``should_retry=True`` result → raises (so ``_consume_shard`` NACKs).
+- ``should_retry=True`` result → raises (so EventDrainTask retries the row).
 - ``succeeded=True`` with degraded errors → logs WARNING but returns
-  (so ``_consume_shard`` ACKs).
+  (so EventDrainTask completes the row).
 - Joined retry-error message preserves every per-driver failure.
 - ``register_reindex_listener`` calls ``async_event_listener`` with the
   canonical event-type string.
@@ -66,8 +66,8 @@ async def test_listener_builds_one_event_batch_from_payload_kwarg():
     assert len(events) == 1
     evt = events[0]
     assert evt["event_type"] == "catalog_metadata_changed"
-    # event_id is None in this wiring — the real outbox id lives one
-    # layer up inside _consume_shard.
+    # event_id is None in this wiring — the real row id lives in the
+    # EventDrainTask's scope, not the listener API.
     assert evt["event_id"] is None
     assert evt["payload"] is payload
 
@@ -108,7 +108,7 @@ async def test_listener_non_dict_payload_raises():
 
 @pytest.mark.asyncio
 async def test_listener_retry_result_raises_with_joined_errors():
-    """``should_retry=True`` → raise, so ``_consume_shard`` NACKs."""
+    """``should_retry=True`` → raise, so EventDrainTask retries the row."""
     from dynastore.modules.catalog.reindex_listener import (
         handle_catalog_metadata_changed,
     )
@@ -284,7 +284,7 @@ async def test_registered_listener_delegates_to_handle_fn():
     register_reindex_listener(svc, worker=worker)
     (_, listener) = svc._registered[0]
 
-    # Invoke the listener as _consume_shard would.
+    # Invoke the listener as dispatch_to_listeners would.
     await listener(
         catalog_id="cat-42",
         payload={"catalog_id": "cat-42", "domain": "stac", "operation": "delete"},
