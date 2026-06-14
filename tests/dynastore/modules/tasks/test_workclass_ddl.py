@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for workclass_ddl.py (tasks.work_events + tasks.work_index DDL).
+"""Unit tests for workclass_ddl.py (tasks.work_events + tasks.storage DDL).
 
 All DDL-content and regex tests are pure-Python (no live DB required).
 The live-PG tests use the same ``async_conn`` fixture pattern as
@@ -50,11 +50,11 @@ from dynastore.modules.tasks.workclass_ddl import (
     WORK_EVENTS_INDEXES_DDL,
     WORK_EVENTS_PARTCREATE_FUNC_DDL,
     WORK_EVENTS_RETENTION_FUNC_DDL,
-    WORK_INDEX_TABLE_DDL,
-    WORK_INDEX_DEFAULT_PARTITION_DDL,
-    WORK_INDEX_INDEXES_DDL,
-    WORK_INDEX_PARTCREATE_FUNC_DDL,
-    WORK_INDEX_RETENTION_FUNC_DDL,
+    STORAGE_TABLE_DDL,
+    STORAGE_DEFAULT_PARTITION_DDL,
+    STORAGE_INDEXES_DDL,
+    STORAGE_PARTCREATE_FUNC_DDL,
+    STORAGE_RETENTION_FUNC_DDL,
     _WORKCLASS_CREATE_AHEAD_DAYS,
     _WORKCLASS_RETENTION_DAYS,
 )
@@ -128,45 +128,45 @@ def test_work_events_default_partition_ddl_idempotent():
 
 
 # ---------------------------------------------------------------------------
-# work_index DDL content
+# storage DDL content
 # ---------------------------------------------------------------------------
 
 
-def test_work_index_table_has_uuid_op_id():
-    sql = _render(WORK_INDEX_TABLE_DDL)
+def test_storage_table_has_uuid_op_id():
+    sql = _render(STORAGE_TABLE_DDL)
     assert "op_id" in sql
     assert "UUID" in sql
 
 
-def test_work_index_primary_key_includes_day():
-    sql = _render(WORK_INDEX_TABLE_DDL)
+def test_storage_primary_key_includes_day():
+    sql = _render(STORAGE_TABLE_DDL)
     assert "PRIMARY KEY (day, op_id)" in sql
 
 
-def test_work_index_partition_by_range_day():
-    sql = _render(WORK_INDEX_TABLE_DDL)
+def test_storage_partition_by_range_day():
+    sql = _render(STORAGE_TABLE_DDL)
     assert "PARTITION BY RANGE (day)" in sql
 
 
-def test_work_index_claim_version_column():
-    sql = _render(WORK_INDEX_TABLE_DDL)
+def test_storage_claim_version_column():
+    sql = _render(STORAGE_TABLE_DDL)
     assert "claim_version" in sql
     assert "INTEGER" in sql
     assert "NOT NULL" in sql
     assert "DEFAULT 0" in sql
 
 
-def test_work_index_fairness_index_leads_schema_name():
-    """Fairness partial index must lead with schema_name and be WHERE status='ready'."""
-    sql = _render(WORK_INDEX_INDEXES_DDL)
-    assert "(schema_name, ready_at)" in sql
+def test_storage_fairness_index_leads_catalog_id():
+    """Fairness partial index must lead with catalog_id and be WHERE status='ready'."""
+    sql = _render(STORAGE_INDEXES_DDL)
+    assert "(catalog_id, ready_at)" in sql
     assert "WHERE status = 'ready'" in sql
 
 
-def test_work_index_default_partition_ddl_idempotent():
-    sql = _render(WORK_INDEX_DEFAULT_PARTITION_DDL)
+def test_storage_default_partition_ddl_idempotent():
+    sql = _render(STORAGE_DEFAULT_PARTITION_DDL)
     assert "IF NOT EXISTS" in sql
-    assert "work_index_default" in sql
+    assert "storage_default" in sql
     assert "DEFAULT" in sql
 
 
@@ -186,30 +186,30 @@ def test_work_events_retention_func_name():
     assert "maintain_partitions_tasks_work_events" in sql
 
 
-def test_work_index_partcreate_func_name():
-    sql = _render(WORK_INDEX_PARTCREATE_FUNC_DDL)
-    assert "create_partitions_tasks_work_index" in sql
+def test_storage_partcreate_func_name():
+    sql = _render(STORAGE_PARTCREATE_FUNC_DDL)
+    assert "create_partitions_tasks_storage" in sql
 
 
-def test_work_index_retention_func_name():
-    sql = _render(WORK_INDEX_RETENTION_FUNC_DDL)
-    assert "maintain_partitions_tasks_work_index" in sql
+def test_storage_retention_func_name():
+    sql = _render(STORAGE_RETENTION_FUNC_DDL)
+    assert "maintain_partitions_tasks_storage" in sql
 
 
 def test_partcreate_funcs_use_create_or_replace():
     """Both create-ahead functions must be idempotent via CREATE OR REPLACE."""
-    for ddl in (WORK_EVENTS_PARTCREATE_FUNC_DDL, WORK_INDEX_PARTCREATE_FUNC_DDL):
+    for ddl in (WORK_EVENTS_PARTCREATE_FUNC_DDL, STORAGE_PARTCREATE_FUNC_DDL):
         assert "CREATE OR REPLACE FUNCTION" in ddl
 
 
 def test_retention_funcs_use_create_or_replace():
-    for ddl in (WORK_EVENTS_RETENTION_FUNC_DDL, WORK_INDEX_RETENTION_FUNC_DDL):
+    for ddl in (WORK_EVENTS_RETENTION_FUNC_DDL, STORAGE_RETENTION_FUNC_DDL):
         assert "CREATE OR REPLACE FUNCTION" in ddl
 
 
 def test_retention_funcs_have_lock_timeout():
     """Retention functions must set LOCAL lock_timeout to protect against long lock waits."""
-    for ddl in (WORK_EVENTS_RETENTION_FUNC_DDL, WORK_INDEX_RETENTION_FUNC_DDL):
+    for ddl in (WORK_EVENTS_RETENTION_FUNC_DDL, STORAGE_RETENTION_FUNC_DDL):
         assert "lock_timeout" in ddl
 
 
@@ -217,13 +217,13 @@ def test_retention_funcs_drain_default_partition():
     """Retention functions must DELETE stale rows from the DEFAULT partition."""
     assert "work_events_default" in WORK_EVENTS_RETENTION_FUNC_DDL
     assert "DELETE FROM" in WORK_EVENTS_RETENTION_FUNC_DDL
-    assert "work_index_default" in WORK_INDEX_RETENTION_FUNC_DDL
-    assert "DELETE FROM" in WORK_INDEX_RETENTION_FUNC_DDL
+    assert "storage_default" in STORAGE_RETENTION_FUNC_DDL
+    assert "DELETE FROM" in STORAGE_RETENTION_FUNC_DDL
 
 
 def test_partcreate_funcs_use_to_char_yyyy_mm_dd():
     """Daily leaf partition names must use YYYY_MM_DD format."""
-    for ddl in (WORK_EVENTS_PARTCREATE_FUNC_DDL, WORK_INDEX_PARTCREATE_FUNC_DDL):
+    for ddl in (WORK_EVENTS_PARTCREATE_FUNC_DDL, STORAGE_PARTCREATE_FUNC_DDL):
         assert "YYYY_MM_DD" in ddl
 
 
@@ -232,14 +232,14 @@ def test_create_ahead_days_constant_matches_loop_bound():
     # Loop is FOR i IN 0..29 → 30 iterations = _WORKCLASS_CREATE_AHEAD_DAYS
     expected_bound = str(_WORKCLASS_CREATE_AHEAD_DAYS - 1)
     assert f"0..{expected_bound}" in WORK_EVENTS_PARTCREATE_FUNC_DDL
-    assert f"0..{expected_bound}" in WORK_INDEX_PARTCREATE_FUNC_DDL
+    assert f"0..{expected_bound}" in STORAGE_PARTCREATE_FUNC_DDL
 
 
 def test_retention_days_constant_matches_interval_in_sql():
     """Retention INTERVAL in both functions must match _WORKCLASS_RETENTION_DAYS."""
     expected_interval = f"'{_WORKCLASS_RETENTION_DAYS} days'"
     assert expected_interval in WORK_EVENTS_RETENTION_FUNC_DDL
-    assert expected_interval in WORK_INDEX_RETENTION_FUNC_DDL
+    assert expected_interval in STORAGE_RETENTION_FUNC_DDL
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +251,7 @@ def test_retention_days_constant_matches_interval_in_sql():
 # {schema} via str.replace (NOT str.format), so the regex uses SINGLE braces;
 # the constant below must appear verbatim in the DDL source.
 _WORK_EVENTS_LEAF_REGEX = r"^work_events_\d{4}_\d{2}_\d{2}$"
-_WORK_INDEX_LEAF_REGEX = r"^work_index_\d{4}_\d{2}_\d{2}$"
+_STORAGE_LEAF_REGEX = r"^storage_\d{4}_\d{2}_\d{2}$"
 
 
 def test_retention_ddl_embeds_the_daily_leaf_regex():
@@ -260,9 +260,9 @@ def test_retention_ddl_embeds_the_daily_leaf_regex():
     # verbatim under .replace substitution, match no leaf, and silently disable
     # retention (verified against live PG). This test fails if that regresses.
     assert _WORK_EVENTS_LEAF_REGEX in WORK_EVENTS_RETENTION_FUNC_DDL
-    assert _WORK_INDEX_LEAF_REGEX in WORK_INDEX_RETENTION_FUNC_DDL
+    assert _STORAGE_LEAF_REGEX in STORAGE_RETENTION_FUNC_DDL
     assert r"\d{{4}}" not in WORK_EVENTS_RETENTION_FUNC_DDL
-    assert r"\d{{4}}" not in WORK_INDEX_RETENTION_FUNC_DDL
+    assert r"\d{{4}}" not in STORAGE_RETENTION_FUNC_DDL
 
 
 def test_retention_regex_matches_daily_leaf_work_events():
@@ -293,19 +293,19 @@ def test_retention_regex_rejects_tasks_monthly_partition():
     assert pattern.match("tasks_2026_06") is None
 
 
-def test_retention_regex_matches_daily_leaf_work_index():
-    pattern = re.compile(_WORK_INDEX_LEAF_REGEX)
-    assert pattern.match("work_index_2026_06_13") is not None
+def test_retention_regex_matches_daily_leaf_storage():
+    pattern = re.compile(_STORAGE_LEAF_REGEX)
+    assert pattern.match("storage_2026_06_13") is not None
 
 
-def test_retention_regex_rejects_parent_table_work_index():
-    pattern = re.compile(_WORK_INDEX_LEAF_REGEX)
-    assert pattern.match("work_index") is None
+def test_retention_regex_rejects_parent_table_storage():
+    pattern = re.compile(_STORAGE_LEAF_REGEX)
+    assert pattern.match("storage") is None
 
 
-def test_retention_regex_rejects_default_partition_work_index():
-    pattern = re.compile(_WORK_INDEX_LEAF_REGEX)
-    assert pattern.match("work_index_default") is None
+def test_retention_regex_rejects_default_partition_storage():
+    pattern = re.compile(_STORAGE_LEAF_REGEX)
+    assert pattern.match("storage_default") is None
 
 
 # ---------------------------------------------------------------------------
@@ -317,22 +317,22 @@ def test_supervisor_exports_workclass_job_constants():
     from dynastore.modules.catalog.maintenance_supervisor import (
         JOB_WORK_EVENTS_PARTITION_CREATE,
         JOB_WORK_EVENTS_RETENTION,
-        JOB_WORK_INDEX_PARTITION_CREATE,
-        JOB_WORK_INDEX_RETENTION,
+        JOB_STORAGE_PARTITION_CREATE,
+        JOB_STORAGE_RETENTION,
         _CADENCE_WORK_EVENTS_PARTITION_CREATE,
         _CADENCE_WORK_EVENTS_RETENTION,
-        _CADENCE_WORK_INDEX_PARTITION_CREATE,
-        _CADENCE_WORK_INDEX_RETENTION,
+        _CADENCE_STORAGE_PARTITION_CREATE,
+        _CADENCE_STORAGE_RETENTION,
     )
     assert JOB_WORK_EVENTS_PARTITION_CREATE == "work_events_partition_create"
     assert JOB_WORK_EVENTS_RETENTION == "work_events_retention"
-    assert JOB_WORK_INDEX_PARTITION_CREATE == "work_index_partition_create"
-    assert JOB_WORK_INDEX_RETENTION == "work_index_retention"
+    assert JOB_STORAGE_PARTITION_CREATE == "storage_partition_create"
+    assert JOB_STORAGE_RETENTION == "storage_retention"
     # All four must run daily
     assert _CADENCE_WORK_EVENTS_PARTITION_CREATE == 86400
     assert _CADENCE_WORK_EVENTS_RETENTION == 86400
-    assert _CADENCE_WORK_INDEX_PARTITION_CREATE == 86400
-    assert _CADENCE_WORK_INDEX_RETENTION == 86400
+    assert _CADENCE_STORAGE_PARTITION_CREATE == 86400
+    assert _CADENCE_STORAGE_RETENTION == 86400
 
 
 @pytest.mark.asyncio
@@ -343,12 +343,13 @@ async def test_register_supervisor_jobs_includes_workclass_jobs():
         register_supervisor_jobs,
         JOB_WORK_EVENTS_PARTITION_CREATE,
         JOB_WORK_EVENTS_RETENTION,
-        JOB_WORK_INDEX_PARTITION_CREATE,
-        JOB_WORK_INDEX_RETENTION,
+        JOB_STORAGE_PARTITION_CREATE,
+        JOB_STORAGE_RETENTION,
         _CADENCE_WORK_EVENTS_PARTITION_CREATE,
         _CADENCE_WORK_EVENTS_RETENTION,
-        _CADENCE_WORK_INDEX_PARTITION_CREATE,
-        _CADENCE_WORK_INDEX_RETENTION,
+        _CADENCE_STORAGE_PARTITION_CREATE,
+        _CADENCE_STORAGE_RETENTION,
+        _OBSOLETE_SCHEDULE_JOBS,
     )
     from dynastore.modules.catalog.db_init.maintenance_schedule import (
         MaintenanceScheduleRepository,
@@ -364,10 +365,28 @@ async def test_register_supervisor_jobs_includes_workclass_jobs():
 
     repo_mock.upsert_job = _capture_upsert
 
+    # The obsolete-row prune issues a raw DELETE via DQLQuery; capture its
+    # bound params so we can assert it retires exactly the renamed jobs.
+    prune_calls: list[dict] = []
+
+    def _dql_factory(sql, **_kw):
+        inst = MagicMock()
+
+        async def _exec(_conn, **params):
+            prune_calls.append({"sql": sql, **params})
+            return 0
+
+        inst.execute = AsyncMock(side_effect=_exec)
+        return inst
+
     with (
         patch(
             "dynastore.modules.catalog.maintenance_supervisor.MaintenanceScheduleRepository",
             return_value=repo_mock,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory,
         ),
         patch(
             "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
@@ -385,8 +404,13 @@ async def test_register_supervisor_jobs_includes_workclass_jobs():
 
     assert cadence_map[JOB_WORK_EVENTS_PARTITION_CREATE] == _CADENCE_WORK_EVENTS_PARTITION_CREATE
     assert cadence_map[JOB_WORK_EVENTS_RETENTION] == _CADENCE_WORK_EVENTS_RETENTION
-    assert cadence_map[JOB_WORK_INDEX_PARTITION_CREATE] == _CADENCE_WORK_INDEX_PARTITION_CREATE
-    assert cadence_map[JOB_WORK_INDEX_RETENTION] == _CADENCE_WORK_INDEX_RETENTION
+    assert cadence_map[JOB_STORAGE_PARTITION_CREATE] == _CADENCE_STORAGE_PARTITION_CREATE
+    assert cadence_map[JOB_STORAGE_RETENTION] == _CADENCE_STORAGE_RETENTION
+
+    # Obsolete work_index_* schedule rows are pruned with the renamed names.
+    assert len(prune_calls) == 1
+    assert "DELETE FROM platform.maintenance_schedule" in prune_calls[0]["sql"]
+    assert prune_calls[0]["names"] == list(_OBSOLETE_SCHEDULE_JOBS)
 
 
 @pytest.mark.asyncio
@@ -451,11 +475,11 @@ async def test_dispatch_work_events_retention():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_work_index_partition_create():
+async def test_dispatch_storage_partition_create():
     from unittest.mock import AsyncMock, MagicMock, patch
     from dynastore.modules.catalog.maintenance_supervisor import (
         _dispatch_job,
-        JOB_WORK_INDEX_PARTITION_CREATE,
+        JOB_STORAGE_PARTITION_CREATE,
     )
 
     conn = AsyncMock()
@@ -472,20 +496,20 @@ async def test_dispatch_work_index_partition_create():
         MockDQL.side_effect = lambda sql, **kw: (executed_sqls.append(sql), instance)[1]
 
         result = await _dispatch_job(
-            JOB_WORK_INDEX_PARTITION_CREATE, conn,
+            JOB_STORAGE_PARTITION_CREATE, conn,
             {"hard_cap": 5, "dead_letter_days": 30, "timeout_minutes": 15, "max_retries": 3},
         )
 
     assert result == 0
-    assert any("create_partitions" in sql and "work_index" in sql for sql in executed_sqls)
+    assert any("create_partitions" in sql and "storage" in sql for sql in executed_sqls)
 
 
 @pytest.mark.asyncio
-async def test_dispatch_work_index_retention():
+async def test_dispatch_storage_retention():
     from unittest.mock import AsyncMock, MagicMock, patch
     from dynastore.modules.catalog.maintenance_supervisor import (
         _dispatch_job,
-        JOB_WORK_INDEX_RETENTION,
+        JOB_STORAGE_RETENTION,
     )
 
     conn = AsyncMock()
@@ -502,12 +526,12 @@ async def test_dispatch_work_index_retention():
         MockDQL.side_effect = lambda sql, **kw: (executed_sqls.append(sql), instance)[1]
 
         result = await _dispatch_job(
-            JOB_WORK_INDEX_RETENTION, conn,
+            JOB_STORAGE_RETENTION, conn,
             {"hard_cap": 5, "dead_letter_days": 30, "timeout_minutes": 15, "max_retries": 3},
         )
 
     assert result == 0
-    assert any("maintain_partitions" in sql and "work_index" in sql for sql in executed_sqls)
+    assert any("maintain_partitions" in sql and "storage" in sql for sql in executed_sqls)
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +570,7 @@ async def test_ensure_workclass_storage_exists_calls_ddl_query():
     combined_ddl = " ".join(ddl_sqls)
     # Tables
     assert "work_events" in combined_ddl
-    assert "work_index" in combined_ddl
+    assert "storage" in combined_ddl
     # IF NOT EXISTS for idempotency
     assert "IF NOT EXISTS" in combined_ddl
     # Maintenance functions
@@ -556,7 +580,7 @@ async def test_ensure_workclass_storage_exists_calls_ddl_query():
     combined_dql = " ".join(dql_sqls)
     assert "create_partitions" in combined_dql
     assert "work_events" in combined_dql
-    assert "work_index" in combined_dql
+    assert "storage" in combined_dql
 
 
 @pytest.mark.asyncio
@@ -629,21 +653,21 @@ async def test_live_pg_ensure_workclass_creates_tables(workclass_async_conn):
         from dynastore.modules.tasks.workclass_ddl import (
             WORK_EVENTS_TABLE_DDL,
             WORK_EVENTS_DEFAULT_PARTITION_DDL,
-            WORK_INDEX_TABLE_DDL,
-            WORK_INDEX_DEFAULT_PARTITION_DDL,
+            STORAGE_TABLE_DDL,
+            STORAGE_DEFAULT_PARTITION_DDL,
         )
 
         for ddl_template in (
             WORK_EVENTS_TABLE_DDL,
             WORK_EVENTS_DEFAULT_PARTITION_DDL,
-            WORK_INDEX_TABLE_DDL,
-            WORK_INDEX_DEFAULT_PARTITION_DDL,
+            STORAGE_TABLE_DDL,
+            STORAGE_DEFAULT_PARTITION_DDL,
         ):
             rendered = ddl_template.replace("{schema}", schema)
             await conn.execute(rendered)
 
         # Verify tables exist
-        for table_name in ("work_events", "work_index"):
+        for table_name in ("work_events", "storage"):
             row = await conn.fetchrow(
                 "SELECT 1 FROM information_schema.tables "
                 "WHERE table_schema = $1 AND table_name = $2",
@@ -653,7 +677,7 @@ async def test_live_pg_ensure_workclass_creates_tables(workclass_async_conn):
             assert row is not None, f"Expected table {schema}.{table_name} to exist"
 
         # Verify default partitions exist
-        for partition_name in ("work_events_default", "work_index_default"):
+        for partition_name in ("work_events_default", "storage_default"):
             row = await conn.fetchrow(
                 "SELECT 1 FROM information_schema.tables "
                 "WHERE table_schema = $1 AND table_name = $2",
@@ -666,8 +690,8 @@ async def test_live_pg_ensure_workclass_creates_tables(workclass_async_conn):
         for ddl_template in (
             WORK_EVENTS_TABLE_DDL,
             WORK_EVENTS_DEFAULT_PARTITION_DDL,
-            WORK_INDEX_TABLE_DDL,
-            WORK_INDEX_DEFAULT_PARTITION_DDL,
+            STORAGE_TABLE_DDL,
+            STORAGE_DEFAULT_PARTITION_DDL,
         ):
             rendered = ddl_template.replace("{schema}", schema)
             await conn.execute(rendered)  # second run — must be no-op
@@ -729,12 +753,12 @@ async def test_live_pg_work_events_table_structure(workclass_async_conn):
 
 
 @pytest.mark.asyncio
-async def test_live_pg_work_index_table_structure(workclass_async_conn):
-    """Verify column structure of work_index after DDL execution."""
+async def test_live_pg_storage_table_structure(workclass_async_conn):
+    """Verify column structure of storage after DDL execution."""
     from dynastore.tools.identifiers import generate_id_hex
     from dynastore.modules.tasks.workclass_ddl import (
-        WORK_INDEX_TABLE_DDL,
-        WORK_INDEX_DEFAULT_PARTITION_DDL,
+        STORAGE_TABLE_DDL,
+        STORAGE_DEFAULT_PARTITION_DDL,
     )
 
     conn = workclass_async_conn
@@ -742,8 +766,8 @@ async def test_live_pg_work_index_table_structure(workclass_async_conn):
 
     try:
         await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-        await conn.execute(WORK_INDEX_TABLE_DDL.replace("{schema}", schema))
-        await conn.execute(WORK_INDEX_DEFAULT_PARTITION_DDL.replace("{schema}", schema))
+        await conn.execute(STORAGE_TABLE_DDL.replace("{schema}", schema))
+        await conn.execute(STORAGE_DEFAULT_PARTITION_DDL.replace("{schema}", schema))
 
         cols = await conn.fetch(
             "SELECT column_name, data_type, column_default, is_nullable "
@@ -751,13 +775,13 @@ async def test_live_pg_work_index_table_structure(workclass_async_conn):
             "WHERE table_schema = $1 AND table_name = $2 "
             "ORDER BY ordinal_position",
             schema,
-            "work_index",
+            "storage",
         )
         col_names = {r["column_name"] for r in cols}
 
         expected = {
-            "op_id", "day", "schema_name", "driver_id", "catalog_id",
-            "collection_id", "op", "item_id", "status", "ready_at",
+            "op_id", "day", "catalog_id", "driver_id", "collection_id",
+            "entity_kind", "entity_id", "op", "status", "ready_at",
             "op_payload", "idempotency_key", "claim_version", "claimed_by",
             "claimed_at", "attempts", "created_at", "finished_at",
         }

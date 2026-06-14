@@ -107,10 +107,21 @@ async def test_register_supervisor_jobs_includes_task_jobs():
 
     repo_mock.upsert_job = _capture_upsert
 
+    # register_supervisor_jobs also prunes obsolete schedule rows via a raw
+    # DELETE through DQLQuery; stub it so it doesn't hit a real executor.
+    def _dql_factory(sql, **_kw):
+        inst = MagicMock()
+        inst.execute = AsyncMock(return_value=0)
+        return inst
+
     with (
         patch(
             "dynastore.modules.catalog.maintenance_supervisor.MaintenanceScheduleRepository",
             return_value=repo_mock,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory,
         ),
         patch(
             "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
@@ -444,7 +455,7 @@ def test_retention_ddl_partition_regex_is_single_brace():
     doubled brace (\d{{4}}) is NOT collapsed — PostgreSQL would receive the
     literal "\d{{4}}", which matches no partition name and silently disables
     monthly retention. Regression guard for #2106 (mirrors the work_events /
-    work_index guard in test_workclass_ddl.py).
+    storage guard in test_workclass_ddl.py).
     """
     from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_RETENTION_FUNC_DDL
 

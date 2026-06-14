@@ -129,8 +129,8 @@ def _work_events_insert_query(task_schema: str) -> "DQLQuery":
 async def _enqueue_event_drain_trigger(conn: Any) -> None:
     """Insert one global dedup'd ``work_event_drain`` PENDING task on ``conn``.
 
-    Co-transactional twin of the index plane's
-    ``work_index_dual_write._enqueue_drain_trigger``: the drain row commits if
+    Co-transactional twin of the storage plane's
+    ``storage_dual_write._enqueue_drain_trigger``: the drain row commits if
     and only if the caller's event row commits.  A single global dedup key
     coalesces high event volume to one pending drain.  The ``on_task_insert``
     DB trigger fires ``NOTIFY new_task_queued`` on this INSERT, waking the
@@ -316,7 +316,7 @@ async def dispatch_event_dual_write(
         # ``work_event_drain`` PENDING task on the caller's own connection so
         # the drain is woken via the existing ``on_task_insert`` -> NOTIFY path
         # without holding a permanent LISTEN connection per tenant. Mirrors the
-        # index plane (``work_index_dual_write._enqueue_drain_trigger``).
+        # storage plane (``storage_dual_write._enqueue_drain_trigger``).
         await _enqueue_event_drain_trigger(conn)
 
     # Return the canonical event_id: legacy if present, otherwise new.

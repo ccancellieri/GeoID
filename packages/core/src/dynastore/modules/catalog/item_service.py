@@ -2374,8 +2374,8 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                         ))
                 if records:
                     # Dual-write dispatch: the legacy {schema}.storage_outbox
-                    # row and/or the new global tasks.work_index row, gated by
-                    # WorkClassConfig.emit_target_index. Default config writes
+                    # row and/or the new global tasks.storage row, gated by
+                    # WorkClassConfig.emit_target_storage. Default config writes
                     # only the legacy table (today's path); both writes ride
                     # this conn so either failing rolls back the primary write.
                     # ConfigsProtocol is re-imported (aliased) here because the
@@ -2386,10 +2386,10 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     from dynastore.models.protocols import (
                         ConfigsProtocol as _ConfigsProtocol,
                     )
-                    from dynastore.modules.storage.work_index_dual_write import (
-                        dispatch_index_dual_write,
+                    from dynastore.modules.storage.storage_dual_write import (
+                        dispatch_storage_dual_write,
                     )
-                    await dispatch_index_dual_write(
+                    await dispatch_storage_dual_write(
                         conn,
                         outbox=outbox,
                         catalog_id=catalog_id,

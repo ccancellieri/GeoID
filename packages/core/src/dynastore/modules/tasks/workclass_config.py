@@ -20,11 +20,11 @@
 """``WorkClassConfig`` — migration control for the WorkClass durable-work unification.
 
 Two net-new global hot-plane tables — ``tasks.work_events`` (replacing the
-legacy ``events.events`` domain-event outbox) and ``tasks.work_index``
+legacy ``events.events`` domain-event outbox) and ``tasks.storage``
 (replacing the per-tenant ``{schema}.storage_outbox`` ES-index outbox) — are
 cut over from their legacy tables behind a per-plane three-state switch.
 
-``emit_target_events`` and ``emit_target_index`` each take one of:
+``emit_target_events`` and ``emit_target_storage`` each take one of:
 
 * ``legacy`` — write only to the legacy table (current behaviour, the default).
 * ``both``   — dual-write to legacy AND the new table (cutover step 1: both
@@ -65,7 +65,7 @@ class EmitTarget(str, Enum):
 class WorkClassConfig(PluginConfig):
     """Per-plane emit-target switches for the WorkClass cutover.
 
-    Read by the dual-write seams (event emit; the co-transactional index
+    Read by the dual-write seams (event emit; the co-transactional storage
     enqueue inside the item-write transaction). The derived ``emit_*_to_*``
     predicates are the intended read API — call them rather than comparing
     the enum at each seam, so the legacy/new split lives in one place.
@@ -88,13 +88,13 @@ class WorkClassConfig(PluginConfig):
         ),
     )
 
-    emit_target_index: Mutable[EmitTarget] = Field(
+    emit_target_storage: Mutable[EmitTarget] = Field(
         EmitTarget.LEGACY,
         description=(
-            "Durable-write target for the ES-index outbox plane. 'legacy' "
+            "Durable-write target for the storage outbox plane. 'legacy' "
             "(default) writes only {schema}.storage_outbox; 'both' dual-writes "
-            "storage_outbox AND tasks.work_index inside the item-write "
-            "transaction (cutover step 1); 'new' writes only tasks.work_index "
+            "storage_outbox AND tasks.storage inside the item-write "
+            "transaction (cutover step 1); 'new' writes only tasks.storage "
             "(cutover step 3, after storage_outbox drains to empty per tenant). "
             "Runtime-reloadable; no restart, no DDL."
         ),
@@ -113,11 +113,11 @@ class WorkClassConfig(PluginConfig):
         return self.emit_target_events in (EmitTarget.BOTH, EmitTarget.NEW)
 
     @property
-    def emit_index_to_legacy(self) -> bool:
-        """Whether the index plane should write the legacy ``storage_outbox`` row."""
-        return self.emit_target_index in (EmitTarget.LEGACY, EmitTarget.BOTH)
+    def emit_storage_to_legacy(self) -> bool:
+        """Whether the storage plane should write the legacy ``storage_outbox`` row."""
+        return self.emit_target_storage in (EmitTarget.LEGACY, EmitTarget.BOTH)
 
     @property
-    def emit_index_to_new(self) -> bool:
-        """Whether the index plane should write the new ``tasks.work_index`` row."""
-        return self.emit_target_index in (EmitTarget.BOTH, EmitTarget.NEW)
+    def emit_storage_to_new(self) -> bool:
+        """Whether the storage plane should write the new ``tasks.storage`` row."""
+        return self.emit_target_storage in (EmitTarget.BOTH, EmitTarget.NEW)

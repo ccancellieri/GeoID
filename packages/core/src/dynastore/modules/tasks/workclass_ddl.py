@@ -28,32 +28,35 @@
     ``events.events`` stored mixed-case values; this table requires lowercase
     from day one (see PR #1804).
 
-``tasks.work_index``
-    Global indexing outbox replacing per-tenant ``storage_outbox`` tables.
-    Partitioned daily by ``day``.  Tenancy is column-based via
-    ``schema_name`` (the catalog physical schema that owns the operation).
+``tasks.storage``
+    Global storage-operation outbox replacing per-tenant ``storage_outbox``
+    tables.  Partitioned daily by ``day``.  Tenancy is column-based via
+    ``catalog_id`` (the logical tenant identifier; physical PG schema is
+    derived at the boundary).  Generalised across entity tiers:
+    ``entity_kind`` (item|collection|catalog|asset) distinguishes the tier;
+    ``entity_id`` holds the tier-specific identifier.
 
 Both tables:
 - Use ``PARTITION BY RANGE (day)`` with a plain ``shard`` / ``driver_id``
   column (NOT a second partition level — flat RANGE only).
-- Include a fairness partial index leading with ``schema_name`` so
+- Include a fairness partial index leading with ``catalog_id`` so
   per-tenant claim queries get index-only scans without cross-tenant
   interference.
 - Ship a DEFAULT partition so inserts never fail on an out-of-range day
   (e.g. clock skew, far-future test data).
 - Are accompanied by a daily PL/pgSQL create-ahead function
   (``create_partitions_{schema}_work_events`` /
-  ``create_partitions_{schema}_work_index``) that opens a 30-day window,
+  ``create_partitions_{schema}_storage``) that opens a 30-day window,
   and a daily retention function
   (``maintain_partitions_{schema}_work_events`` /
-  ``maintain_partitions_{schema}_work_index``) that drops day-leaves older
+  ``maintain_partitions_{schema}_storage``) that drops day-leaves older
   than 30 days.  Both windows are intentionally short — these tables are
   queues, not archives.
 
 Partition naming convention: ``work_events_YYYY_MM_DD`` /
-``work_index_YYYY_MM_DD``.  The retention regex
+``storage_YYYY_MM_DD``.  The retention regex
 ``'^work_events_\\d{4}_\\d{2}_\\d{2}$'`` (and equivalent for
-work_index) matches ONLY daily leaves, never the parent table or the
+storage) matches ONLY daily leaves, never the parent table or the
 DEFAULT partition.
 
 ``ensure_workclass_storage_exists(conn, schema)`` runs at
@@ -83,7 +86,7 @@ logger = logging.getLogger(__name__)
 _WORKCLASS_CREATE_AHEAD_DAYS: int = 30
 
 # Daily leaves older than this many days are dropped by the retention function.
-# Events and index ops are consumed within seconds to minutes; 30 days is a
+# Events and storage ops are consumed within seconds to minutes; 30 days is a
 # safety margin for replay / debugging before rows are considered archivable.
 _WORKCLASS_RETENTION_DAYS: int = 30
 
@@ -132,19 +135,19 @@ CREATE INDEX IF NOT EXISTS idx_work_events_shard
 """
 
 # ---------------------------------------------------------------------------
-# work_index table DDL
+# storage table DDL
 # ---------------------------------------------------------------------------
 
-WORK_INDEX_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS {schema}.work_index (
+STORAGE_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS {schema}.storage (
     op_id           UUID            NOT NULL,
     day             DATE            NOT NULL,
-    schema_name     TEXT            NOT NULL,
-    driver_id       TEXT            NOT NULL,
     catalog_id      TEXT            NOT NULL,
+    driver_id       TEXT            NOT NULL,
     collection_id   TEXT,
+    entity_kind     TEXT            NOT NULL DEFAULT 'item',
+    entity_id       TEXT,
     op              TEXT            NOT NULL,
-    item_id         TEXT,
     status          TEXT            NOT NULL DEFAULT 'ready',
     ready_at        TIMESTAMPTZ     NOT NULL DEFAULT now(),
     op_payload      JSONB           NOT NULL DEFAULT '{}'::jsonb,
@@ -159,20 +162,20 @@ CREATE TABLE IF NOT EXISTS {schema}.work_index (
 ) PARTITION BY RANGE (day);
 """
 
-WORK_INDEX_DEFAULT_PARTITION_DDL = """
-CREATE TABLE IF NOT EXISTS {schema}.work_index_default
-    PARTITION OF {schema}.work_index DEFAULT;
+STORAGE_DEFAULT_PARTITION_DDL = """
+CREATE TABLE IF NOT EXISTS {schema}.storage_default
+    PARTITION OF {schema}.storage DEFAULT;
 """
 
-WORK_INDEX_INDEXES_DDL = """
--- Fairness partial index: leads with (schema_name, ready_at) so per-tenant
+STORAGE_INDEXES_DDL = """
+-- Fairness partial index: leads with (catalog_id, ready_at) so per-tenant
 -- drain workers claim the oldest ready ops first without cross-tenant noise.
-CREATE INDEX IF NOT EXISTS idx_work_index_fairness
-    ON {schema}.work_index (schema_name, ready_at)
+CREATE INDEX IF NOT EXISTS idx_storage_fairness
+    ON {schema}.storage (catalog_id, ready_at)
     WHERE status = 'ready';
 -- Driver index: enables driver-affine workers to restrict their scan.
-CREATE INDEX IF NOT EXISTS idx_work_index_driver
-    ON {schema}.work_index (driver_id, schema_name, status, ready_at);
+CREATE INDEX IF NOT EXISTS idx_storage_driver
+    ON {schema}.storage (driver_id, catalog_id, status, ready_at);
 """
 
 # ---------------------------------------------------------------------------
@@ -272,9 +275,9 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
-# work_index: create-ahead (daily leaves, 30 days window — 0..29 inclusive)
-WORK_INDEX_PARTCREATE_FUNC_DDL = """
-CREATE OR REPLACE FUNCTION "{schema}"."create_partitions_{schema}_work_index"() RETURNS void AS $$
+# storage: create-ahead (daily leaves, 30 days window — 0..29 inclusive)
+STORAGE_PARTCREATE_FUNC_DDL = """
+CREATE OR REPLACE FUNCTION "{schema}"."create_partitions_{schema}_storage"() RETURNS void AS $$
 DECLARE
     i INT;
     target_date DATE;
@@ -284,7 +287,7 @@ BEGIN
     FOR i IN 0..29 LOOP
         target_date := CURRENT_DATE + (i || ' days')::INTERVAL;
         next_date   := target_date + INTERVAL '1 day';
-        part_name   := 'work_index_' || to_char(target_date, 'YYYY_MM_DD');
+        part_name   := 'storage_' || to_char(target_date, 'YYYY_MM_DD');
         IF NOT EXISTS (
             SELECT 1 FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -292,7 +295,7 @@ BEGIN
         ) THEN
             EXECUTE format(
                 'CREATE TABLE IF NOT EXISTS "{schema}".%I '
-                'PARTITION OF "{schema}".work_index '
+                'PARTITION OF "{schema}".storage '
                 'FOR VALUES FROM (%L) TO (%L)',
                 part_name,
                 target_date::TEXT,
@@ -305,9 +308,9 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
-# work_index: retention (drop daily leaves older than 30 days)
-WORK_INDEX_RETENTION_FUNC_DDL = """
-CREATE OR REPLACE FUNCTION "{schema}"."maintain_partitions_{schema}_work_index"() RETURNS void AS $$
+# storage: retention (drop daily leaves older than 30 days)
+STORAGE_RETENTION_FUNC_DDL = """
+CREATE OR REPLACE FUNCTION "{schema}"."maintain_partitions_{schema}_storage"() RETURNS void AS $$
 DECLARE
     row RECORD;
     cutoff_date DATE;
@@ -322,7 +325,7 @@ BEGIN
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = '{schema}'
           AND c.relkind = 'r'
-          AND c.relname ~ '^work_index_\\d{4}_\\d{2}_\\d{2}$'
+          AND c.relname ~ '^storage_\\d{4}_\\d{2}_\\d{2}$'
     LOOP
         BEGIN
             date_str := substring(row.relname from '\\d{4}_\\d{2}_\\d{2}$');
@@ -335,11 +338,11 @@ BEGIN
             RAISE WARNING 'Failed to process partition {schema}.%: %', row.relname, SQLERRM;
         END;
     END LOOP;
-    DELETE FROM "{schema}".work_index_default
+    DELETE FROM "{schema}".storage_default
     WHERE day < (CURRENT_DATE - INTERVAL '30 days');
     GET DIAGNOSTICS default_deleted = ROW_COUNT;
     IF default_deleted > 0 THEN
-        RAISE NOTICE 'Pruned % row(s) from {schema}.work_index_default', default_deleted;
+        RAISE NOTICE 'Pruned % row(s) from {schema}.storage_default', default_deleted;
     END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -352,7 +355,7 @@ $$ LANGUAGE plpgsql;
 
 
 async def ensure_workclass_storage_exists(conn: DbResource, schema: str) -> None:
-    """Provision ``tasks.work_events`` and ``tasks.work_index`` partitioned tables.
+    """Provision ``tasks.work_events`` and ``tasks.storage`` partitioned tables.
 
     Called once at ``TasksModule.lifespan`` startup under the same
     ``acquire_startup_lock`` guard as ``ensure_task_storage_exists``.
@@ -376,21 +379,21 @@ async def ensure_workclass_storage_exists(conn: DbResource, schema: str) -> None
     """
     # 1. Parent tables
     await DDLQuery(WORK_EVENTS_TABLE_DDL).execute(conn, schema=schema)
-    await DDLQuery(WORK_INDEX_TABLE_DDL).execute(conn, schema=schema)
+    await DDLQuery(STORAGE_TABLE_DDL).execute(conn, schema=schema)
 
     # 2. DEFAULT partitions — absorbs out-of-range days; idempotent on re-deploy.
     await DDLQuery(WORK_EVENTS_DEFAULT_PARTITION_DDL).execute(conn, schema=schema)
-    await DDLQuery(WORK_INDEX_DEFAULT_PARTITION_DDL).execute(conn, schema=schema)
+    await DDLQuery(STORAGE_DEFAULT_PARTITION_DDL).execute(conn, schema=schema)
 
     # 3. Indexes
     await DDLQuery(WORK_EVENTS_INDEXES_DDL).execute(conn, schema=schema)
-    await DDLQuery(WORK_INDEX_INDEXES_DDL).execute(conn, schema=schema)
+    await DDLQuery(STORAGE_INDEXES_DDL).execute(conn, schema=schema)
 
     # 4. Maintenance functions (CREATE OR REPLACE — always up to date)
     await DDLQuery(WORK_EVENTS_PARTCREATE_FUNC_DDL).execute(conn, schema=schema)
     await DDLQuery(WORK_EVENTS_RETENTION_FUNC_DDL).execute(conn, schema=schema)
-    await DDLQuery(WORK_INDEX_PARTCREATE_FUNC_DDL).execute(conn, schema=schema)
-    await DDLQuery(WORK_INDEX_RETENTION_FUNC_DDL).execute(conn, schema=schema)
+    await DDLQuery(STORAGE_PARTCREATE_FUNC_DDL).execute(conn, schema=schema)
+    await DDLQuery(STORAGE_RETENTION_FUNC_DDL).execute(conn, schema=schema)
 
     # 5. Materialise initial day window by calling the create-ahead functions once.
     await DQLQuery(
@@ -398,12 +401,12 @@ async def ensure_workclass_storage_exists(conn: DbResource, schema: str) -> None
         result_handler=ResultHandler.NONE,
     ).execute(conn)
     await DQLQuery(
-        f'SELECT "{schema}"."create_partitions_{schema}_work_index"()',
+        f'SELECT "{schema}"."create_partitions_{schema}_storage"()',
         result_handler=ResultHandler.NONE,
     ).execute(conn)
 
     logger.info(
-        "TasksModule: provisioned workclass storage (work_events + work_index) "
+        "TasksModule: provisioned workclass storage (work_events + storage) "
         "for schema %r with %d-day create-ahead window and %d-day retention.",
         schema,
         _WORKCLASS_CREATE_AHEAD_DAYS,

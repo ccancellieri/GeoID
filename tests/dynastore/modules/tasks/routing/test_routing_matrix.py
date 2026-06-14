@@ -196,21 +196,21 @@ def test_workclass_drains_are_tier_agnostic():
     from dynastore.tasks.workclass_drain.work_event_drain_task import (
         WorkEventDrainTask,
     )
-    from dynastore.tasks.workclass_drain.work_index_drain_task import (
-        WorkIndexDrainTask,
+    from dynastore.tasks.workclass_drain.storage_drain_task import (
+        StorageDrainTask,
     )
 
     assert WorkEventDrainTask.affinity_tier is None
-    assert WorkIndexDrainTask.affinity_tier is None
+    assert StorageDrainTask.affinity_tier is None
 
 
 def test_workclass_drains_route_to_catalog_not_worker():
     for preset in ("cloud", "review", "onprem"):
         tasks, _ = build_routing_matrix(
-            [_task("work_event_drain"), _task("work_index_drain")],
+            [_task("work_event_drain"), _task("storage_drain")],
             preset=preset,
         )
-        for key in ("work_event_drain", "work_index_drain"):
+        for key in ("work_event_drain", "storage_drain"):
             assert tasks[key][0].consumers == ["catalog"], (
                 f"{key} under {preset} must route to catalog, not {tasks[key][0].consumers}"
             )

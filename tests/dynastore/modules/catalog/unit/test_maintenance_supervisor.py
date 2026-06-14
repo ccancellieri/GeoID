@@ -57,11 +57,15 @@ from dynastore.modules.catalog.maintenance_supervisor import (
     JOB_EVENTS_PENDING_ALERT,
     JOB_EVENTS_STUCK_REAPER,
     JOB_IAM_PRUNE,
+    JOB_STORAGE_PARTITION_CREATE,
+    JOB_STORAGE_RETENTION,
     JOB_SYSTEM_LOGS_PRUNE,
     JOB_TASK_PARTITION_CREATE,
     JOB_TASK_REAPER,
     JOB_TASK_RETENTION,
     JOB_TENANT_LOGS_PRUNE,
+    JOB_WORK_EVENTS_PARTITION_CREATE,
+    JOB_WORK_EVENTS_RETENTION,
     MaintenanceSupervisor,
     _CADENCE_DLQ_PRUNE,
     _CADENCE_IAM_PRUNE,
@@ -594,8 +598,8 @@ def test_build_supervisor_config_reads_env_vars(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_register_supervisor_jobs_upserts_all_nine():
-    """register_supervisor_jobs calls upsert_job for each of the 9 jobs (6 original + 3 task)."""
+async def test_register_supervisor_jobs_upserts_all_expected_jobs():
+    """register_supervisor_jobs upserts all 13 jobs (6 original + 3 task + 4 workclass)."""
     engine = _fake_engine()
     upserted: list[tuple[str, int]] = []
 
@@ -606,10 +610,21 @@ async def test_register_supervisor_jobs_upserts_all_nine():
 
     repo_mock.upsert_job = _capture_upsert
 
+    # register_supervisor_jobs also prunes obsolete schedule rows via a raw
+    # DELETE through DQLQuery; stub it so it doesn't hit a real executor.
+    def _dql_factory(sql, **_kw):
+        inst = MagicMock()
+        inst.execute = AsyncMock(return_value=0)
+        return inst
+
     with (
         patch(
             "dynastore.modules.catalog.maintenance_supervisor.MaintenanceScheduleRepository",
             return_value=repo_mock,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory,
         ),
         patch(
             "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
@@ -632,6 +647,10 @@ async def test_register_supervisor_jobs_upserts_all_nine():
         JOB_TASK_REAPER,
         JOB_TASK_PARTITION_CREATE,
         JOB_TASK_RETENTION,
+        JOB_WORK_EVENTS_PARTITION_CREATE,
+        JOB_WORK_EVENTS_RETENTION,
+        JOB_STORAGE_PARTITION_CREATE,
+        JOB_STORAGE_RETENTION,
     ])
 
     cadence_map = dict(upserted)

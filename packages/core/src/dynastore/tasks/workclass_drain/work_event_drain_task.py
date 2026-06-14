@@ -20,7 +20,7 @@
 
 """``WorkEventDrainTask`` — control-plane-native drain for ``tasks.work_events``.
 
-The event-plane counterpart of :class:`WorkIndexDrainTask`.  Drains the GLOBAL
+The event-plane counterpart of :class:`StorageDrainTask`.  Drains the GLOBAL
 ``tasks.work_events`` table for ALL tenants (tenancy is the ``schema_name``
 column, not the physical table) and delivers each event to the in-process
 async listeners registered on the resolved :class:`EventBusProtocol`.
@@ -65,7 +65,7 @@ delay while ``PENDING``.
 Drain loop
 ----------
 ``run(payload)`` loops ``drain_once()`` until it returns 0, then exits
-(one-shot drain-to-empty, matching ``WorkIndexDrainTask`` / ``OutboxDrainTask``).
+(one-shot drain-to-empty, matching ``StorageDrainTask`` / ``OutboxDrainTask``).
 The dispatcher re-enters via NOTIFY / periodic catch-up.
 """
 from __future__ import annotations
@@ -82,7 +82,7 @@ from dynastore.tools.db import validate_sql_identifier
 logger = logging.getLogger(__name__)
 
 
-# Per-attempt retry backoff in seconds (mirrors WorkIndexDrainTask /
+# Per-attempt retry backoff in seconds (mirrors StorageDrainTask /
 # pg_outbox._BACKOFF_SECONDS). Indexed by ``retry_count`` (0-based); the last
 # entry caps the backoff at ~30 min.
 _BACKOFF_SECONDS: List[int] = [1, 5, 30, 5 * 60, 30 * 60]

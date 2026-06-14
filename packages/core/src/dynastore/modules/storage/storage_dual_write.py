@@ -16,23 +16,23 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-# dynastore/modules/storage/work_index_dual_write.py
+# dynastore/modules/storage/storage_dual_write.py
 
-"""Index-plane dual-write into the global ``tasks.work_index`` table.
+"""Storage-plane dual-write into the global ``tasks.storage`` table.
 
 The legacy ES-index outbox is a per-tenant ``{schema}.storage_outbox`` table
 written co-transactionally with the item write — ``pg_outbox.enqueue_bulk`` on
 the caller's open transaction (see ``ItemService.upsert_bulk`` and the delete
 twin ``ItemService._enqueue_index_deletes``). The WorkClass migration (#1807)
-introduces a single GLOBAL ``tasks.work_index`` table where tenancy is carried
-by a ``schema_name`` column instead of the table's physical location.
+introduces a single GLOBAL ``tasks.storage`` table where tenancy is carried
+by a ``catalog_id`` column instead of the table's physical location.
 
 During cutover the same outbox records are written to both tables, gated
-per-plane by :class:`WorkClassConfig.emit_target_index`:
+per-plane by :class:`WorkClassConfig.emit_target_storage`:
 
 * ``legacy`` (default) — only ``{schema}.storage_outbox`` (today's behaviour).
 * ``both``   — both tables, on the same transaction.
-* ``new``    — only ``tasks.work_index``.
+* ``new``    — only ``tasks.storage``.
 
 This module owns the new-table writer and the emit-target resolution so the
 seam stays a thin one-call dispatch and the legacy/new split lives in one
@@ -53,11 +53,11 @@ from dynastore.tools.identifiers import generate_uuidv7
 logger = logging.getLogger(__name__)
 
 
-async def _resolve_index_emit_targets(configs: Any) -> Tuple[bool, bool]:
-    """Return ``(write_legacy, write_new)`` for the index plane.
+async def _resolve_storage_emit_targets(configs: Any) -> Tuple[bool, bool]:
+    """Return ``(write_legacy, write_new)`` for the storage plane.
 
     Fail-safe to ``(True, False)`` — legacy-only, exactly today's behaviour —
-    on a missing ConfigsProtocol or ANY resolution error. The index plane is
+    on a missing ConfigsProtocol or ANY resolution error. The storage plane is
     the atomicity-critical seam in the item-write path: a config lookup must
     never break a write nor silently drop the legacy outbox row.
     """
@@ -68,31 +68,35 @@ async def _resolve_index_emit_targets(configs: Any) -> Tuple[bool, bool]:
 
         cfg = await configs.get_config(WorkClassConfig)
         if isinstance(cfg, WorkClassConfig):
-            return cfg.emit_index_to_legacy, cfg.emit_index_to_new
+            return cfg.emit_storage_to_legacy, cfg.emit_storage_to_new
     except Exception:  # noqa: BLE001 — degrade to legacy-only, never fail the write
         logger.debug(
-            "WorkClassConfig resolution failed; index dual-write stays "
+            "WorkClassConfig resolution failed; storage dual-write stays "
             "legacy-only for this write.",
             exc_info=True,
         )
     return True, False
 
 
-async def _enqueue_work_index(
+async def _enqueue_storage(
     conn: Any,
     *,
-    schema_name: str,
+    catalog_id: str,
     rows: Sequence[OutboxRecord],
 ) -> None:
-    """Insert outbox records into the global ``tasks.work_index`` on ``conn``.
+    """Insert outbox records into the global ``tasks.storage`` on ``conn``.
 
     Runs a schema-qualified parameterised ``INSERT`` per row on the caller's
     open SQLAlchemy transaction (the co-transactional path), mirroring the
-    legacy ``pg_outbox.enqueue_bulk`` caller-conn branch. ``schema_name`` is
-    the tenant's physical schema (the value the legacy outbox uses both as the
-    table namespace and as the catalog identity); it is bound as a column
-    VALUE, never interpolated into SQL. ``day`` is ``CURRENT_DATE`` so the row
-    lands in today's daily leaf (or the DEFAULT partition on a gap day).
+    legacy ``pg_outbox.enqueue_bulk`` caller-conn branch. ``catalog_id`` is
+    the tenant's logical identifier (the value the legacy outbox uses as the
+    catalog identity); it is bound as a column VALUE, never interpolated into
+    SQL. ``day`` is ``CURRENT_DATE`` so the row lands in today's daily leaf
+    (or the DEFAULT partition on a gap day).
+
+    The ``entity_kind`` defaults to ``'item'`` for the current items tier.
+    ``entity_id`` carries the item identifier (``r.item_id``).
+    # TODO(#1807 P1.3): branch on entity_kind for collection/catalog/asset tiers.
     """
     if not rows:
         return
@@ -104,13 +108,13 @@ async def _enqueue_work_index(
     # placed in identifier position, so validate it like every other qualifier.
     validate_sql_identifier(task_schema)
     insert_sql = (
-        f"INSERT INTO {task_schema}.work_index ("
-        "    op_id, day, schema_name, driver_id, catalog_id, collection_id,"
-        "    op, item_id, op_payload, idempotency_key"
+        f"INSERT INTO {task_schema}.storage ("
+        "    op_id, day, catalog_id, driver_id, collection_id,"
+        "    entity_kind, entity_id, op, op_payload, idempotency_key"
         ") VALUES ("
-        "    :op_id, CURRENT_DATE, :schema_name, :driver_id, :catalog_id,"
-        "    :collection_id, :op, :item_id, CAST(:op_payload AS jsonb),"
-        "    :idempotency_key"
+        "    :op_id, CURRENT_DATE, :catalog_id, :driver_id,"
+        "    :collection_id, 'item', :entity_id,"
+        "    :op, CAST(:op_payload AS jsonb), :idempotency_key"
         ")"
     )
     query = DQLQuery(insert_sql, result_handler=ResultHandler.NONE)
@@ -118,21 +122,18 @@ async def _enqueue_work_index(
         await query.execute(
             conn,
             op_id=str(r.op_id),
-            schema_name=schema_name,
+            catalog_id=catalog_id,
             driver_id=r.driver_id,
-            # In the outbox model the tenant's physical schema name is the
-            # catalog identity; the legacy store carries no separate value.
-            catalog_id=schema_name,
             collection_id=r.collection_id,
+            entity_id=r.item_id,
             op=r.op,
-            item_id=r.item_id,
             op_payload=json.dumps(r.payload),
             idempotency_key=r.idempotency_key,
         )
 
 
 async def _enqueue_drain_trigger(conn: Any) -> None:
-    """Insert one global dedup'd ``work_index_drain`` PENDING task on ``conn``.
+    """Insert one global dedup'd ``storage_drain`` PENDING task on ``conn``.
 
     Co-transactional: the drain row commits if and only if the caller's work
     rows commit. A single global dedup key ensures high write volume coalesces
@@ -141,8 +142,8 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
     INSERT, waking the dispatcher without requiring a new connection or LISTEN.
 
     Degrades gracefully when the tasks table does not exist (e.g. test
-    environments that only provision work_index): emits a DEBUG log and
-    returns without raising. The work_index rows are still committed; the
+    environments that only provision storage): emits a DEBUG log and
+    returns without raising. The storage rows are still committed; the
     drain will run on its next scheduled tick even without this NOTIFY trigger.
     """
     from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
@@ -158,12 +159,12 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
         f"INSERT INTO {task_schema}.tasks"
         f" (task_id, schema_name, scope, task_type, type, execution_mode,"
         f"  inputs, timestamp, status, dedup_key)"
-        f" SELECT :task_id, 'platform', 'platform', 'work_index_drain',"
+        f" SELECT :task_id, 'platform', 'platform', 'storage_drain',"
         f"        'task', 'ASYNCHRONOUS', '{{}}'::jsonb, now(), 'PENDING',"
-        f"        'work_index_drain'"
+        f"        'storage_drain'"
         f" WHERE NOT EXISTS ("
         f"     SELECT 1 FROM {task_schema}.tasks"
-        f"     WHERE dedup_key = 'work_index_drain'"
+        f"     WHERE dedup_key = 'storage_drain'"
         f"       AND schema_name = 'platform'"
         # Full terminal set (matches the claim query in tasks_module). A
         # DISMISSED (terminal) drain task must NOT block a fresh enqueue —
@@ -175,7 +176,7 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
     )
     try:
         # Use a nested transaction (SAVEPOINT) so a missing-tasks-table error
-        # does not abort the outer PG transaction carrying the work_index rows.
+        # does not abort the outer PG transaction carrying the storage rows.
         # A bare try/except does not help here: once asyncpg sees a statement
         # error the outer PG TX enters the aborted state and must be rolled
         # back in its entirety. The SAVEPOINT isolates the trigger INSERT so
@@ -194,7 +195,7 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
                     )
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "work_index_drain: drain trigger skipped — tasks table "
+                    "storage_drain: drain trigger skipped — tasks table "
                     "not available in schema %r (normal during staged rollout).",
                     task_schema,
                     exc_info=True,
@@ -210,13 +211,13 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
     except Exception:  # noqa: BLE001
         # Last-resort catch: savepoint setup itself failed.
         logger.debug(
-            "work_index_drain: drain trigger failed for schema %r.",
+            "storage_drain: drain trigger failed for schema %r.",
             task_schema,
             exc_info=True,
         )
 
 
-async def dispatch_index_dual_write(
+async def dispatch_storage_dual_write(
     conn: Any,
     *,
     outbox: Any,
@@ -224,28 +225,28 @@ async def dispatch_index_dual_write(
     rows: Sequence[OutboxRecord],
     configs: Any,
 ) -> None:
-    """Write index-outbox ``rows`` to the legacy and/or new table per config.
+    """Write storage-outbox ``rows`` to the legacy and/or new table per config.
 
-    The single dispatch point for the index-plane dual-write, shared by the
+    The single dispatch point for the storage-plane dual-write, shared by the
     upsert seam (``ItemService.upsert_bulk``) and the delete twin
     (``ItemService._enqueue_index_deletes``). Both writes ride ``conn`` (the
     caller's open item-write transaction), so either failing rolls back the
     primary write. With the default config this calls only
     ``outbox.enqueue_bulk`` — byte-for-byte today's path.
 
-    ``catalog_id`` is the tenant's physical schema (the outbox convention);
-    it is the legacy table's namespace AND the new table's ``schema_name``.
+    ``catalog_id`` is the tenant's logical identifier (the outbox convention);
+    it is the legacy table's namespace AND the new table's ``catalog_id``.
 
-    When ``write_new`` is true, a dedup'd ``work_index_drain`` PENDING task
+    When ``write_new`` is true, a dedup'd ``storage_drain`` PENDING task
     row is also inserted on the same ``conn`` so the drain is triggered
     co-transactionally with the work rows (no permanent connection, no LISTEN
     required — the ``on_task_insert`` trigger emits NOTIFY automatically).
     """
     if not rows:
         return
-    write_legacy, write_new = await _resolve_index_emit_targets(configs)
+    write_legacy, write_new = await _resolve_storage_emit_targets(configs)
     if write_legacy:
         await outbox.enqueue_bulk(conn, catalog_id=catalog_id, rows=rows)
     if write_new:
-        await _enqueue_work_index(conn, schema_name=catalog_id, rows=rows)
+        await _enqueue_storage(conn, catalog_id=catalog_id, rows=rows)
         await _enqueue_drain_trigger(conn)

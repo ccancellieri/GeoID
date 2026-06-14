@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Live-PG tests for WorkIndexDrainTask (#1807 PR-5a).
+"""Live-PG tests for StorageDrainTask (#1807 PR-5a).
 
 All tests run against a per-test throwaway schema to avoid collisions.
 ``DYNASTORE_TASK_SCHEMA`` is patched to point at that schema so every
@@ -33,8 +33,8 @@ Scenarios covered:
    in_flight is not.
 5. Retry backoff: mark_retry sets status='ready', bumps attempts,
    pushes ready_at into the future.
-6. Drain trigger: dispatch_index_dual_write with emit_target_index='new'
-   or 'both' inserts exactly ONE pending work_index_drain task row on the
+6. Drain trigger: dispatch_storage_dual_write with emit_target_storage='new'
+   or 'both' inserts exactly ONE pending storage_drain task row on the
    same conn (dedup) and rolls back with the outer transaction.
 """
 from __future__ import annotations
@@ -65,18 +65,18 @@ def _sa_db_url() -> str:
     return url
 
 
-# Flat (un-partitioned) work_index for tests — mirrors production column set
+# Flat (un-partitioned) storage for tests — mirrors production column set
 # including NOT NULL constraints and defaults.
-_WORK_INDEX_DDL = """
-CREATE TABLE IF NOT EXISTS "{schema}".work_index (
+_STORAGE_DDL = """
+CREATE TABLE IF NOT EXISTS "{schema}".storage (
     op_id           UUID            NOT NULL,
     day             DATE            NOT NULL DEFAULT CURRENT_DATE,
-    schema_name     TEXT            NOT NULL,
-    driver_id       TEXT            NOT NULL,
     catalog_id      TEXT            NOT NULL,
+    driver_id       TEXT            NOT NULL,
     collection_id   TEXT,
+    entity_kind     TEXT            NOT NULL DEFAULT 'item',
+    entity_id       TEXT,
     op              TEXT            NOT NULL,
-    item_id         TEXT,
     status          TEXT            NOT NULL DEFAULT 'ready',
     ready_at        TIMESTAMPTZ     NOT NULL DEFAULT now(),
     op_payload      JSONB           NOT NULL DEFAULT '{{}}'::jsonb,
@@ -138,7 +138,7 @@ async def sa_engine():
 async def drain_env(
     sa_engine, monkeypatch  # noqa: ANN001
 ) -> AsyncIterator[Tuple[str, Any]]:
-    """Provision a throwaway schema with work_index + tasks tables.
+    """Provision a throwaway schema with storage + tasks tables.
 
     Patches ``DYNASTORE_TASK_SCHEMA`` so ``get_task_schema()`` resolves to
     the throwaway schema. Yields ``(task_schema, engine)``.
@@ -157,7 +157,7 @@ async def drain_env(
             result_handler=ResultHandler.NONE,
         ).execute(conn)
         await DQLQuery(
-            _WORK_INDEX_DDL.format(schema=task_schema),
+            _STORAGE_DDL.format(schema=task_schema),
             result_handler=ResultHandler.NONE,
         ).execute(conn)
         await DQLQuery(
@@ -195,7 +195,7 @@ async def _seed_rows(
     claimed_at_offset: Optional[str] = None,  # e.g. "- INTERVAL '10 minutes'"
     claim_version: int = 0,
 ) -> List[str]:
-    """Insert N rows into work_index; return list of op_id strings."""
+    """Insert N rows into storage; return list of op_id strings."""
     from dynastore.modules.db_config.query_executor import (
         DQLQuery, ResultHandler, managed_transaction,
     )
@@ -207,10 +207,10 @@ async def _seed_rows(
             claimed_at_expr = f"now() {claimed_at_offset}"
 
         sql = (
-            f"INSERT INTO {task_schema}.work_index"
-            f" (op_id, day, schema_name, driver_id, catalog_id, op, status,"
+            f"INSERT INTO {task_schema}.storage"
+            f" (op_id, day, driver_id, catalog_id, op, status,"
             f"  claimed_by, claimed_at, claim_version)"
-            f" VALUES (:op_id, CURRENT_DATE, :schema_name, :driver_id,"
+            f" VALUES (:op_id, CURRENT_DATE, :driver_id,"
             f"         :catalog_id, 'upsert', :status,"
             f"         :claimed_by, {claimed_at_expr}, :claim_version)"
         )
@@ -218,7 +218,6 @@ async def _seed_rows(
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
                 conn,
                 op_id=op_id,
-                schema_name=catalog_id,
                 driver_id=driver_id,
                 catalog_id=catalog_id,
                 status=status,
@@ -235,7 +234,7 @@ async def _fetch_rows(engine: Any, task_schema: str) -> List[Dict[str, Any]]:
     async with managed_transaction(engine) as conn:
         return await DQLQuery(
             f"SELECT op_id, status, claim_version, claimed_by, attempts,"
-            f"       ready_at, finished_at FROM {task_schema}.work_index",
+            f"       ready_at, finished_at FROM {task_schema}.storage",
             result_handler=ResultHandler.ALL_DICTS,
         ).execute(conn) or []
 
@@ -248,7 +247,7 @@ async def _fetch_row(engine: Any, task_schema: str, op_id: str) -> Optional[Dict
     return None
 
 
-async def _count_tasks(engine: Any, task_schema: str, task_type: str = "work_index_drain") -> int:
+async def _count_tasks(engine: Any, task_schema: str, task_type: str = "storage_drain") -> int:
     from dynastore.modules.db_config.query_executor import (
         DQLQuery, ResultHandler, managed_transaction,
     )
@@ -260,11 +259,11 @@ async def _count_tasks(engine: Any, task_schema: str, task_type: str = "work_ind
 
 
 def _make_task(engine: Any, task_schema: str) -> Any:
-    """Construct a WorkIndexDrainTask with a small batch size for test control."""
-    from dynastore.tasks.workclass_drain.work_index_drain_task import (
-        WorkIndexDrainTask,
+    """Construct a StorageDrainTask with a small batch size for test control."""
+    from dynastore.tasks.workclass_drain.storage_drain_task import (
+        StorageDrainTask,
     )
-    return WorkIndexDrainTask(batch_size=10, lease_seconds=300)
+    return StorageDrainTask(batch_size=10, lease_seconds=300)
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +382,7 @@ async def test_stale_claim_fence_cas_prevents_double_finalization(drain_env):
     )
     async with managed_transaction(engine) as conn:
         await DQLQuery(
-            f"UPDATE {task_schema}.work_index"
+            f"UPDATE {task_schema}.storage"
             f" SET claimed_at = now() - INTERVAL '1 hour'"
             f" WHERE op_id = :op_id",
             result_handler=ResultHandler.NONE,
@@ -500,7 +499,7 @@ async def test_retry_backoff_bumps_attempts_and_delays_ready_at(drain_env):
     async with managed_transaction(engine) as conn:
         result = await DQLQuery(
             f"SELECT status, attempts, ready_at, claimed_by"
-            f" FROM {task_schema}.work_index WHERE op_id = :op_id",
+            f" FROM {task_schema}.storage WHERE op_id = :op_id",
             result_handler=ResultHandler.ONE_DICT,
         ).execute(conn, op_id=op_id)
 
@@ -526,12 +525,12 @@ async def test_retry_backoff_bumps_attempts_and_delays_ready_at(drain_env):
 
 @pytest.mark.asyncio
 async def test_drain_trigger_inserts_one_pending_task_row(drain_env):
-    """dispatch_index_dual_write with emit_target_index='new' inserts exactly
-    one work_index_drain task row via the co-transactional drain trigger.
+    """dispatch_storage_dual_write with emit_target_storage='new' inserts exactly
+    one storage_drain task row via the co-transactional drain trigger.
     """
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.work_index_dual_write import (
-        dispatch_index_dual_write,
+    from dynastore.modules.storage.storage_dual_write import (
+        dispatch_storage_dual_write,
     )
     from dynastore.models.protocols.indexing import OutboxRecord
     from dynastore.modules.storage.pg_outbox import PgOutboxStore
@@ -554,7 +553,7 @@ async def test_drain_trigger_inserts_one_pending_task_row(drain_env):
     outbox = PgOutboxStore(pool=object(), single_conn=None)
 
     async with managed_transaction(engine) as conn:
-        await dispatch_index_dual_write(
+        await dispatch_storage_dual_write(
             conn,
             outbox=outbox,
             catalog_id=task_schema,
@@ -572,8 +571,8 @@ async def test_drain_trigger_dedup_multiple_writes_one_row(drain_env):
     task due to the dedup WHERE NOT EXISTS guard.
     """
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.work_index_dual_write import (
-        dispatch_index_dual_write,
+    from dynastore.modules.storage.storage_dual_write import (
+        dispatch_storage_dual_write,
     )
     from dynastore.models.protocols.indexing import OutboxRecord
     from dynastore.modules.storage.pg_outbox import PgOutboxStore
@@ -598,7 +597,7 @@ async def test_drain_trigger_dedup_multiple_writes_one_row(drain_env):
     # Three separate writes — each calls _enqueue_drain_trigger.
     for i in range(3):
         async with managed_transaction(engine) as conn:
-            await dispatch_index_dual_write(
+            await dispatch_storage_dual_write(
                 conn,
                 outbox=outbox,
                 catalog_id=task_schema,
@@ -614,8 +613,8 @@ async def test_drain_trigger_dedup_multiple_writes_one_row(drain_env):
 async def test_drain_trigger_rolls_back_with_outer_transaction(drain_env):
     """An aborted outer transaction leaves no task row in tasks."""
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.work_index_dual_write import (
-        dispatch_index_dual_write,
+    from dynastore.modules.storage.storage_dual_write import (
+        dispatch_storage_dual_write,
     )
     from dynastore.models.protocols.indexing import OutboxRecord
     from dynastore.modules.storage.pg_outbox import PgOutboxStore
@@ -639,7 +638,7 @@ async def test_drain_trigger_rolls_back_with_outer_transaction(drain_env):
 
     with pytest.raises(RuntimeError, match="simulated abort"):
         async with managed_transaction(engine) as conn:
-            await dispatch_index_dual_write(
+            await dispatch_storage_dual_write(
                 conn,
                 outbox=outbox,
                 catalog_id=task_schema,
@@ -670,7 +669,7 @@ def _config(target: Optional[str] = None) -> Any:
 
     if target is None:
         return WorkClassConfig()
-    return WorkClassConfig(emit_target_index=EmitTarget(target))
+    return WorkClassConfig(emit_target_storage=EmitTarget(target))
 
 
 # ---------------------------------------------------------------------------

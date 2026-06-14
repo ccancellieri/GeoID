@@ -1265,13 +1265,13 @@ class ItemQueryMixin:
                 ))
         if records:
             # Dual-write dispatch (delete twin of ItemService.upsert_bulk):
-            # legacy {schema}.storage_outbox and/or new tasks.work_index per
-            # WorkClassConfig.emit_target_index. Default writes only legacy;
+            # legacy {schema}.storage_outbox and/or new tasks.storage per
+            # WorkClassConfig.emit_target_storage. Default writes only legacy;
             # both writes ride this conn for co-transactional rollback.
-            from dynastore.modules.storage.work_index_dual_write import (
-                dispatch_index_dual_write,
+            from dynastore.modules.storage.storage_dual_write import (
+                dispatch_storage_dual_write,
             )
-            await dispatch_index_dual_write(
+            await dispatch_storage_dual_write(
                 conn,
                 outbox=outbox,
                 catalog_id=catalog_id,

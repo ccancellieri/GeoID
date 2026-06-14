@@ -16,11 +16,11 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""End-to-end tests for the index-plane dual-write dispatch (#1807 PR-3).
+"""End-to-end tests for the storage-plane dual-write dispatch (#1807 PR-3).
 
-``dispatch_index_dual_write`` writes index-outbox records to the legacy
+``dispatch_storage_dual_write`` writes storage-outbox records to the legacy
 per-tenant ``{schema}.storage_outbox`` table and/or the new global
-``tasks.work_index`` table, gated by ``WorkClassConfig.emit_target_index``.
+``tasks.storage`` table, gated by ``WorkClassConfig.emit_target_storage``.
 
 Properties proven against live PG:
 
@@ -28,11 +28,12 @@ Properties proven against live PG:
    ConfigsProtocol, and a ConfigsProtocol whose ``get_config`` raises all
    write ONLY ``storage_outbox`` (byte-for-byte today's behaviour). A config
    lookup must never break the write nor drop the legacy row.
-2. **``both`` writes both tables**; **``new`` writes only ``work_index``**.
+2. **``both`` writes both tables**; **``new`` writes only ``tasks.storage``**.
 3. **Co-transactional atomicity** — both writes ride the caller's transaction,
    so an outer-transaction abort leaves NO rows in EITHER table.
-4. **Field mapping** — the ``work_index`` row carries the tenant schema as
-   both ``schema_name`` and ``catalog_id`` and preserves op/item/payload.
+4. **Field mapping** — the ``tasks.storage`` row carries the tenant identity in
+   the ``catalog_id`` column (no ``schema_name``) and preserves
+   op/entity_kind/entity_id/payload.
 
 The new table is created uniquely-named per test and pointed at via
 ``DYNASTORE_TASK_SCHEMA`` so concurrent test runs don't collide on the real
@@ -62,23 +63,23 @@ def _sa_db_url() -> str:
     return url
 
 
-_WORK_INDEX_TEST_DDL = """
-CREATE TABLE IF NOT EXISTS "{schema}".work_index (
+_STORAGE_TEST_DDL = """
+CREATE TABLE IF NOT EXISTS "{schema}".storage (
     op_id           UUID            NOT NULL,
     day             DATE            NOT NULL,
-    schema_name     TEXT            NOT NULL,
-    driver_id       TEXT            NOT NULL,
     catalog_id      TEXT            NOT NULL,
+    driver_id       TEXT            NOT NULL,
     collection_id   TEXT,
+    entity_kind     TEXT            NOT NULL DEFAULT 'item',
+    entity_id       TEXT,
     op              TEXT            NOT NULL,
-    item_id         TEXT,
     status          TEXT            NOT NULL DEFAULT 'ready',
     ready_at        TIMESTAMPTZ     NOT NULL DEFAULT now(),
     op_payload      JSONB           NOT NULL DEFAULT '{{}}'::jsonb,
     idempotency_key TEXT,
     claim_version   INTEGER         NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
-    -- Match production's composite PK (workclass_ddl.WORK_INDEX_TABLE_DDL):
+    -- Match production's composite PK (workclass_ddl.STORAGE_TABLE_DDL):
     -- a partitioned table requires its partition key (day) in the PK. This
     -- test table is un-partitioned, but the PK is kept faithful so the INSERT
     -- path faces the same uniqueness constraint as production.
@@ -113,7 +114,7 @@ async def sa_engine():
 async def dual_write_env(
     sa_engine, monkeypatch  # noqa: ANN001
 ) -> AsyncIterator[Tuple[str, str]]:
-    """Provision a tenant schema (storage_outbox) + a task schema (work_index).
+    """Provision a tenant schema (storage_outbox) + a task schema (storage).
 
     Points ``get_task_schema()`` at the throwaway task schema via
     ``DYNASTORE_TASK_SCHEMA`` so the dual-write writer targets it instead of
@@ -139,7 +140,7 @@ async def dual_write_env(
             result_handler=ResultHandler.NONE,
         ).execute(conn)
         await DQLQuery(
-            _WORK_INDEX_TEST_DDL.format(schema=task_schema),
+            _STORAGE_TEST_DDL.format(schema=task_schema),
             result_handler=ResultHandler.NONE,
         ).execute(conn)
     # Legacy per-tenant outbox via the production DDL helper.
@@ -218,17 +219,17 @@ def _config(target: Optional[str] = None):
 
     if target is None:
         return WorkClassConfig()
-    return WorkClassConfig(emit_target_index=EmitTarget(target))
+    return WorkClassConfig(emit_target_storage=EmitTarget(target))
 
 
 async def _dispatch(engine, configs, tenant_schema: str, rows) -> None:
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.work_index_dual_write import (
-        dispatch_index_dual_write,
+    from dynastore.modules.storage.storage_dual_write import (
+        dispatch_storage_dual_write,
     )
 
     async with managed_transaction(engine) as conn:
-        await dispatch_index_dual_write(
+        await dispatch_storage_dual_write(
             conn,
             outbox=_new_store(),
             catalog_id=tenant_schema,
@@ -247,7 +248,7 @@ async def test_default_config_writes_only_legacy(sa_engine, dual_write_env):
     tenant, task = dual_write_env
     await _dispatch(sa_engine, _StubConfigs(_config()), tenant, _records(3))
     assert await _count(sa_engine, tenant, "storage_outbox") == 3
-    assert await _count(sa_engine, task, "work_index") == 0
+    assert await _count(sa_engine, task, "storage") == 0
 
 
 @pytest.mark.asyncio
@@ -255,7 +256,7 @@ async def test_none_configs_writes_only_legacy(sa_engine, dual_write_env):
     tenant, task = dual_write_env
     await _dispatch(sa_engine, None, tenant, _records(2))
     assert await _count(sa_engine, tenant, "storage_outbox") == 2
-    assert await _count(sa_engine, task, "work_index") == 0
+    assert await _count(sa_engine, task, "storage") == 0
 
 
 @pytest.mark.asyncio
@@ -265,7 +266,7 @@ async def test_raising_configs_writes_only_legacy(sa_engine, dual_write_env):
     tenant, task = dual_write_env
     await _dispatch(sa_engine, _RaisingConfigs(), tenant, _records(2))
     assert await _count(sa_engine, tenant, "storage_outbox") == 2
-    assert await _count(sa_engine, task, "work_index") == 0
+    assert await _count(sa_engine, task, "storage") == 0
 
 
 @pytest.mark.asyncio
@@ -273,23 +274,23 @@ async def test_both_writes_both_tables(sa_engine, dual_write_env):
     tenant, task = dual_write_env
     await _dispatch(sa_engine, _StubConfigs(_config("both")), tenant, _records(4))
     assert await _count(sa_engine, tenant, "storage_outbox") == 4
-    assert await _count(sa_engine, task, "work_index") == 4
+    assert await _count(sa_engine, task, "storage") == 4
 
 
 @pytest.mark.asyncio
-async def test_new_writes_only_work_index(sa_engine, dual_write_env):
+async def test_new_writes_only_storage(sa_engine, dual_write_env):
     tenant, task = dual_write_env
     await _dispatch(sa_engine, _StubConfigs(_config("new")), tenant, _records(3))
     assert await _count(sa_engine, tenant, "storage_outbox") == 0
-    assert await _count(sa_engine, task, "work_index") == 3
+    assert await _count(sa_engine, task, "storage") == 3
 
 
 @pytest.mark.asyncio
 async def test_both_rolls_back_atomically(sa_engine, dual_write_env):
     """An outer-transaction abort after dispatch leaves NO rows in either table."""
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.work_index_dual_write import (
-        dispatch_index_dual_write,
+    from dynastore.modules.storage.storage_dual_write import (
+        dispatch_storage_dual_write,
     )
 
     tenant, task = dual_write_env
@@ -297,7 +298,7 @@ async def test_both_rolls_back_atomically(sa_engine, dual_write_env):
 
     with pytest.raises(RuntimeError, match="simulated primary write failure"):
         async with managed_transaction(sa_engine) as conn:
-            await dispatch_index_dual_write(
+            await dispatch_storage_dual_write(
                 conn,
                 outbox=_new_store(),
                 catalog_id=tenant,
@@ -307,11 +308,11 @@ async def test_both_rolls_back_atomically(sa_engine, dual_write_env):
             raise RuntimeError("simulated primary write failure")
 
     assert await _count(sa_engine, tenant, "storage_outbox") == 0
-    assert await _count(sa_engine, task, "work_index") == 0
+    assert await _count(sa_engine, task, "storage") == 0
 
 
 @pytest.mark.asyncio
-async def test_work_index_row_field_mapping(sa_engine, dual_write_env):
+async def test_storage_row_field_mapping(sa_engine, dual_write_env):
     from dynastore.modules.db_config.query_executor import (
         DQLQuery, ResultHandler, managed_transaction,
     )
@@ -321,21 +322,22 @@ async def test_work_index_row_field_mapping(sa_engine, dual_write_env):
 
     async with managed_transaction(sa_engine) as conn:
         rows = await DQLQuery(
-            f'SELECT schema_name, catalog_id, driver_id, collection_id, op, '
-            f'item_id, op_payload, idempotency_key, status, claim_version, '
-            f'day FROM "{task}".work_index',
+            f'SELECT catalog_id, driver_id, collection_id, op, '
+            f'entity_kind, entity_id, op_payload, idempotency_key, status, '
+            f'claim_version, day FROM "{task}".storage',
             result_handler=ResultHandler.ALL_DICTS,
         ).execute(conn)
 
     assert len(rows) == 1
     row = rows[0]
-    # Tenant identity carried by the column, not the table location.
-    assert row["schema_name"] == tenant
+    # Tenant identity carried by the catalog_id column, not the table location.
     assert row["catalog_id"] == tenant
     assert row["driver_id"] == "elasticsearch_private"
     assert row["collection_id"] == "my_collection"
     assert row["op"] == "upsert"
-    assert row["item_id"] == "item_0"
+    # Items tier today; entity_kind branches for other tiers in #1807 P1.3.
+    assert row["entity_kind"] == "item"
+    assert row["entity_id"] == "item_0"
     assert row["idempotency_key"] == "ik_0"
     # DDL defaults applied.
     assert row["status"] == "ready"

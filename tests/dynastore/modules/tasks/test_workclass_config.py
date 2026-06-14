@@ -33,12 +33,12 @@ from dynastore.modules.tasks.workclass_config import EmitTarget, WorkClassConfig
 def test_defaults_are_legacy_so_install_is_no_behaviour_change() -> None:
     cfg = WorkClassConfig()
     assert cfg.emit_target_events is EmitTarget.LEGACY
-    assert cfg.emit_target_index is EmitTarget.LEGACY
+    assert cfg.emit_target_storage is EmitTarget.LEGACY
     # Legacy-only writes, nothing to the new tables — identical to today.
     assert cfg.emit_events_to_legacy is True
     assert cfg.emit_events_to_new is False
-    assert cfg.emit_index_to_legacy is True
-    assert cfg.emit_index_to_new is False
+    assert cfg.emit_storage_to_legacy is True
+    assert cfg.emit_storage_to_new is False
 
 
 @pytest.mark.parametrize(
@@ -65,25 +65,25 @@ def test_event_plane_predicates_track_emit_target(
         (EmitTarget.NEW, False, True),
     ],
 )
-def test_index_plane_predicates_track_emit_target(
+def test_storage_plane_predicates_track_emit_target(
     target: EmitTarget, to_legacy: bool, to_new: bool
 ) -> None:
-    cfg = WorkClassConfig(emit_target_index=target)
-    assert cfg.emit_index_to_legacy is to_legacy
-    assert cfg.emit_index_to_new is to_new
+    cfg = WorkClassConfig(emit_target_storage=target)
+    assert cfg.emit_storage_to_legacy is to_legacy
+    assert cfg.emit_storage_to_new is to_new
 
 
 def test_planes_are_independent() -> None:
-    # Cutover advances one plane at a time (event plane first, index last):
-    # flipping events must not disturb the index plane's decision.
+    # Cutover advances one plane at a time (event plane first, storage last):
+    # flipping events must not disturb the storage plane's decision.
     cfg = WorkClassConfig(
         emit_target_events=EmitTarget.NEW,
-        emit_target_index=EmitTarget.LEGACY,
+        emit_target_storage=EmitTarget.LEGACY,
     )
     assert cfg.emit_events_to_new is True
     assert cfg.emit_events_to_legacy is False
-    assert cfg.emit_index_to_legacy is True
-    assert cfg.emit_index_to_new is False
+    assert cfg.emit_storage_to_legacy is True
+    assert cfg.emit_storage_to_new is False
 
 
 def test_address_lives_under_the_tasks_bucket() -> None:
@@ -106,13 +106,13 @@ def test_enum_values_are_the_stable_persisted_strings() -> None:
 def test_round_trips_through_string_persistence() -> None:
     # Config persistence stores/loads the enum by its string value.
     cfg = WorkClassConfig.model_validate(
-        {"emit_target_events": "both", "emit_target_index": "new"}
+        {"emit_target_events": "both", "emit_target_storage": "new"}
     )
     assert cfg.emit_target_events is EmitTarget.BOTH
-    assert cfg.emit_target_index is EmitTarget.NEW
+    assert cfg.emit_target_storage is EmitTarget.NEW
     dumped = cfg.model_dump(mode="json")
     assert dumped["emit_target_events"] == "both"
-    assert dumped["emit_target_index"] == "new"
+    assert dumped["emit_target_storage"] == "new"
 
 
 def test_rejects_unknown_emit_target() -> None:

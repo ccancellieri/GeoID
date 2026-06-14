@@ -86,8 +86,19 @@ JOB_TASK_PARTITION_CREATE = "task_partition_create"
 JOB_TASK_RETENTION = "task_retention"
 JOB_WORK_EVENTS_PARTITION_CREATE = "work_events_partition_create"
 JOB_WORK_EVENTS_RETENTION = "work_events_retention"
-JOB_WORK_INDEX_PARTITION_CREATE = "work_index_partition_create"
-JOB_WORK_INDEX_RETENTION = "work_index_retention"
+JOB_STORAGE_PARTITION_CREATE = "storage_partition_create"
+JOB_STORAGE_RETENTION = "storage_retention"
+
+# Obsolete supervisor job names retired by the #1807 work_index -> storage
+# rename. An environment that booted a prior build holds these rows in
+# platform.maintenance_schedule; register_supervisor_jobs now upserts the
+# storage_* names but never overwrites these, so the loop would dispatch an
+# unknown job_name and record a recurring error. Prune them once at startup
+# (DML on an operational table, not schema DDL). Safe no-op on a fresh DB.
+_OBSOLETE_SCHEDULE_JOBS = (
+    "work_index_partition_create",
+    "work_index_retention",
+)
 
 # pg_cron job names this supervisor supersedes. On a non-fresh deploy these may
 # already be scheduled in cron.job from a prior boot; we unschedule them once so
@@ -119,8 +130,8 @@ _CADENCE_TASK_PARTITION_CREATE = 86400   # daily (idempotent CREATE IF NOT EXIST
 _CADENCE_TASK_RETENTION = 86400   # daily (idempotent DROP old partitions)
 _CADENCE_WORK_EVENTS_PARTITION_CREATE = 86400   # daily
 _CADENCE_WORK_EVENTS_RETENTION = 86400          # daily
-_CADENCE_WORK_INDEX_PARTITION_CREATE = 86400    # daily
-_CADENCE_WORK_INDEX_RETENTION = 86400           # daily
+_CADENCE_STORAGE_PARTITION_CREATE = 86400    # daily
+_CADENCE_STORAGE_RETENTION = 86400           # daily
 
 # Bounded-batch DELETE size — no single DELETE removes more than this many rows.
 _PRUNE_BATCH = 1000
@@ -463,7 +474,7 @@ async def _run_task_retention(conn: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Workclass partition maintenance jobs (work_events + work_index)
+# Workclass partition maintenance jobs (work_events + storage)
 # ---------------------------------------------------------------------------
 
 
@@ -499,15 +510,15 @@ async def _run_work_events_retention(conn: Any) -> int:
     return 0
 
 
-async def _run_work_index_partition_create(conn: Any) -> int:
-    """Invoke the daily create-ahead function for ``tasks.work_index``.
+async def _run_storage_partition_create(conn: Any) -> int:
+    """Invoke the daily create-ahead function for ``tasks.storage``.
 
-    The function ``{schema}.create_partitions_{schema}_work_index()`` is
+    The function ``{schema}.create_partitions_{schema}_storage()`` is
     provisioned by ``ensure_workclass_storage_exists``; it opens a 30-day
     window of daily leaf partitions.  Returns 0 (function returns void).
     """
     schema = _TASKS_SCHEMA
-    func_name = f"create_partitions_{schema}_work_index"
+    func_name = f"create_partitions_{schema}_storage"
     await DQLQuery(
         f'SELECT "{schema}"."{func_name}"()',
         result_handler=ResultHandler.NONE,
@@ -515,15 +526,15 @@ async def _run_work_index_partition_create(conn: Any) -> int:
     return 0
 
 
-async def _run_work_index_retention(conn: Any) -> int:
-    """Invoke the daily retention function for ``tasks.work_index``.
+async def _run_storage_retention(conn: Any) -> int:
+    """Invoke the daily retention function for ``tasks.storage``.
 
-    The function ``{schema}.maintain_partitions_{schema}_work_index()`` is
+    The function ``{schema}.maintain_partitions_{schema}_storage()`` is
     provisioned by ``ensure_workclass_storage_exists``; it drops daily
     partitions older than 30 days.  Returns 0 (function returns void).
     """
     schema = _TASKS_SCHEMA
-    func_name = f"maintain_partitions_{schema}_work_index"
+    func_name = f"maintain_partitions_{schema}_storage"
     await DQLQuery(
         f'SELECT "{schema}"."{func_name}"()',
         result_handler=ResultHandler.NONE,
@@ -570,10 +581,10 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
         return await _run_work_events_partition_create(conn)
     if job_name == JOB_WORK_EVENTS_RETENTION:
         return await _run_work_events_retention(conn)
-    if job_name == JOB_WORK_INDEX_PARTITION_CREATE:
-        return await _run_work_index_partition_create(conn)
-    if job_name == JOB_WORK_INDEX_RETENTION:
-        return await _run_work_index_retention(conn)
+    if job_name == JOB_STORAGE_PARTITION_CREATE:
+        return await _run_storage_partition_create(conn)
+    if job_name == JOB_STORAGE_RETENTION:
+        return await _run_storage_retention(conn)
     raise ValueError(f"maintenance_supervisor: unknown job_name {job_name!r}")
 
 
@@ -833,15 +844,24 @@ async def register_supervisor_jobs(engine: Any) -> None:
         (JOB_TASK_RETENTION, _CADENCE_TASK_RETENTION),
         (JOB_WORK_EVENTS_PARTITION_CREATE, _CADENCE_WORK_EVENTS_PARTITION_CREATE),
         (JOB_WORK_EVENTS_RETENTION, _CADENCE_WORK_EVENTS_RETENTION),
-        (JOB_WORK_INDEX_PARTITION_CREATE, _CADENCE_WORK_INDEX_PARTITION_CREATE),
-        (JOB_WORK_INDEX_RETENTION, _CADENCE_WORK_INDEX_RETENTION),
+        (JOB_STORAGE_PARTITION_CREATE, _CADENCE_STORAGE_PARTITION_CREATE),
+        (JOB_STORAGE_RETENTION, _CADENCE_STORAGE_RETENTION),
     ]
     async with managed_transaction(engine) as conn:
         for job_name, cadence in jobs:
             await repo.upsert_job(conn, job_name, interval_seconds=cadence)
+        # Retire schedule rows for jobs this build no longer dispatches (e.g. the
+        # #1807 work_index -> storage rename). Without this, get_due_jobs keeps
+        # surfacing an orphaned row and _dispatch_job rejects its unknown name.
+        pruned = await DQLQuery(
+            "DELETE FROM platform.maintenance_schedule WHERE job_name = ANY(:names)",
+            result_handler=ResultHandler.ROWCOUNT,
+        ).execute(conn, names=list(_OBSOLETE_SCHEDULE_JOBS))
     logger.info(
-        "maintenance_supervisor: registered %d job cadences in platform.maintenance_schedule.",
+        "maintenance_supervisor: registered %d job cadences in "
+        "platform.maintenance_schedule (pruned %d obsolete row(s)).",
         len(jobs),
+        pruned or 0,
     )
 
 
