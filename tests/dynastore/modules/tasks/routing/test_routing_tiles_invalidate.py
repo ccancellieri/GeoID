@@ -101,23 +101,25 @@ def test_cloud_tiles_preseed_unchanged_cloud_run():
 
 
 def test_onprem_tiles_invalidate_gets_background():
-    """Onprem: tiles_invalidate routes to background runner on worker tier."""
+    """Onprem (worker-less): tiles_invalidate routes background to the catalog tier."""
     _, procs = build_routing_matrix([_proc("tiles_invalidate")], preset="onprem")
     t = procs["tiles_invalidate"][0]
     assert t.runner == "background"
-    assert t.consumers == ["worker"]
+    assert t.consumers == ["catalog"]
     assert ExecHint.BACKGROUND in t.hints
     assert ExecHint.HEAVY not in t.hints
 
 
-def test_onprem_tiles_preseed_gets_heavy():
-    """Onprem: tiles_preseed is heavy, routes to worker tier with HEAVY hint."""
+def test_onprem_tiles_preseed_runs_background():
+    """Onprem (worker-less): no worker tier to offload to, so the otherwise-heavy
+    tiles_preseed is downgraded to a background run on the maps tier (the tier that
+    carries the tile-rendering capability). HEAVY/offload only applies on cloud."""
     _, procs = build_routing_matrix([_proc("tiles_preseed")], preset="onprem")
     t = procs["tiles_preseed"][0]
     assert t.runner == "background"
-    assert t.consumers == ["worker"]
-    assert ExecHint.HEAVY in t.hints
-    assert ExecHint.BACKGROUND not in t.hints
+    assert t.consumers == ["maps"]
+    assert ExecHint.BACKGROUND in t.hints
+    assert ExecHint.HEAVY not in t.hints
 
 
 # ---------------------------------------------------------------------------

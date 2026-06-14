@@ -70,7 +70,6 @@ async def test_drain_processes_ready_rows(
     captured = _capture_log_event(monkeypatch)
     store = PgOutboxStore(single_conn=async_conn)
     await store.enqueue_bulk(
-        async_conn,
         catalog_id=async_schema,
         rows=[
             OutboxRecord(
@@ -134,7 +133,6 @@ async def test_drain_emits_retry_event_when_threshold_reached(
     store = PgOutboxStore(single_conn=async_conn)
     op_id = uuid4()
     await store.enqueue_bulk(
-        async_conn,
         catalog_id=async_schema,
         rows=[
             OutboxRecord(
@@ -217,7 +215,6 @@ async def test_drain_marks_poison_and_emits_persistent_event(
     store = PgOutboxStore(single_conn=async_conn)
     op_id = uuid4()
     await store.enqueue_bulk(
-        async_conn,
         catalog_id=async_schema,
         rows=[
             OutboxRecord(
