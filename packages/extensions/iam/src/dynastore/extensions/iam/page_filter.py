@@ -43,6 +43,8 @@ from typing import Any, Dict, List, Optional, Set
 from starlette.requests import Request
 
 from dynastore.models.protocols.authorization import IamRolesConfig
+from dynastore.models.protocols.role_admin import RoleAdminProtocol
+from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -74,15 +76,21 @@ class IamPageVisibilityFilter:
         is_sysadmin = self._sysadmin_role in user_roles
         anonymous = self._anonymous_role
 
-        # Build a lazy policy_id → {role_names} map. Single ``list_roles``
-        # call covers every page that declares an audience_policy_id.
+        # Catalog context: IamMiddleware writes request.state.catalog_id when
+        # the request targets a /catalogs/{cat}/… path. Use it to include
+        # tenant-schema roles in the audience map so a page gated on a
+        # catalog-tier role is visible to holders of that role.
+        catalog_id: Optional[str] = getattr(request.state, "catalog_id", None)
+
+        # Build a lazy policy_id → {role_names} map. Covers platform-scope
+        # roles plus, when a catalog context is present, catalog-tier roles.
         policy_audience: Optional[Dict[str, Set[str]]] = None
 
         async def _resolve_policy_audience() -> Dict[str, Set[str]]:
             nonlocal policy_audience
             if policy_audience is not None:
                 return policy_audience
-            policy_audience = await self._build_policy_audience_map()
+            policy_audience = await self._build_policy_audience_map(catalog_id=catalog_id)
             return policy_audience
 
         visible: List[Dict[str, Any]] = []
@@ -115,29 +123,37 @@ class IamPageVisibilityFilter:
             return [str(r) for r in state_roles]
         return [str(state_roles)]
 
-    async def _build_policy_audience_map(self) -> Dict[str, Set[str]]:
+    async def _build_policy_audience_map(
+        self,
+        catalog_id: Optional[str] = None,
+    ) -> Dict[str, Set[str]]:
         """Return ``{policy_id: {role_name, ...}}`` snapshot.
 
-        Reads via ``RoleAdminProtocol.list_roles`` (one call) and
-        inverts the role.policies relation. Failure modes (no
-        provider registered, list_roles raises) yield an empty map so
-        ``audience_policy_id`` pages fall back to anonymous-only
-        admission rather than blocking the entire response.
-        """
-        from dynastore.models.protocols.role_admin import RoleAdminProtocol
-        from dynastore.tools.discovery import get_protocol
+        Reads via ``RoleAdminProtocol.list_roles`` and inverts the
+        role.policies relation. When ``catalog_id`` is provided the map
+        is built from the union of platform-scope roles (``iam.roles``)
+        and catalog-tier roles (the tenant schema). This ensures pages
+        gated on a catalog-tier ``audience_policy_id`` are visible to
+        holders of that catalog role.
 
+        Failure modes (no provider registered, list_roles raises) yield
+        an empty map so ``audience_policy_id`` pages fall back to
+        anonymous-only admission rather than blocking the entire response.
+        """
         ra = get_protocol(RoleAdminProtocol)
         if ra is None:
             return {}
         try:
-            roles = await ra.list_roles()
+            platform_roles = await ra.list_roles()
+            catalog_roles: List[Any] = []
+            if catalog_id:
+                catalog_roles = await ra.list_roles(catalog_id=catalog_id)
         except Exception as e:
             logger.debug("PageVisibilityFilter: list_roles failed: %s", e)
             return {}
 
         out: Dict[str, Set[str]] = {}
-        for role in roles or []:
+        for role in (platform_roles or []) + (catalog_roles or []):
             for policy_id in getattr(role, "policies", None) or []:
                 out.setdefault(str(policy_id), set()).add(str(role.name))
         return out
