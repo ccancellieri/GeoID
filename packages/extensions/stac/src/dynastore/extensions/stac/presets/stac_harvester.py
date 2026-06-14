@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 from typing import Any, ClassVar, Literal, Optional, Tuple, Type
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 from dynastore.modules.storage.presets.preset import (
     AppliedDescriptor,
@@ -94,17 +94,7 @@ class StacHarvesterParams(BaseModel):
             "``es`` routes item WRITE and READ directly to Elasticsearch so "
             "harvested items are immediately searchable without waiting for the "
             "async ES-index drain.  ``es_pg`` writes to PG primary with async "
-            "ES secondary index.  ``pg`` uses PG only.  Takes precedence over "
-            "the legacy ``es_only`` flag when both are supplied."
-        ),
-    )
-    es_only: Optional[bool] = Field(
-        default=None,
-        description=(
-            "Legacy flag — prefer ``storage_backend``.  When set and "
-            "``storage_backend`` is not explicitly provided: ``True`` maps to "
-            "``storage_backend='es'``; ``False`` maps to ``storage_backend='es_pg'``.  "
-            "Ignored when ``storage_backend`` is given explicitly."
+            "ES secondary index.  ``pg`` uses PG only."
         ),
     )
 
@@ -114,15 +104,6 @@ class StacHarvesterParams(BaseModel):
         if not v.startswith("https://") and not v.startswith("http://"):
             raise ValueError("url must start with http:// or https://")
         return v.rstrip("/")
-
-    @model_validator(mode="after")
-    def _resolve_backend(self) -> "StacHarvesterParams":
-        """Map legacy ``es_only`` → ``storage_backend`` when the caller did not
-        supply ``storage_backend`` explicitly.  ``storage_backend`` always wins
-        when both are given."""
-        if self.es_only is not None and self.storage_backend == "es":
-            self.storage_backend = "es" if self.es_only else "es_pg"
-        return self
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +130,7 @@ class _StacHarvesterPreset:
     Tier: CATALOG.  Apply endpoint:
         POST /configs/catalogs/{catalog_id}/presets/stac_harvester
         Body: {"url": "https://...", "max_collections": 0, "max_items": 0,
-               "with_assets": true, "es_only": true}
+               "with_assets": true, "storage_backend": "es"}
 
     Mechanism: ``apply()`` resolves the target catalog id (from params or
     from the scope), builds the ``StacHarvestRequest`` inputs dict, and

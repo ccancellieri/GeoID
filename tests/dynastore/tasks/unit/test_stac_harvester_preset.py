@@ -140,7 +140,7 @@ async def test_preset_apply_explicit_target_catalog_overrides_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_preset_apply_maps_all_params() -> None:
-    """Custom max_collections / max_items / with_assets / es_only are forwarded."""
+    """Custom max_collections / max_items / with_assets / storage_backend are forwarded."""
     from dynastore.extensions.stac.presets.stac_harvester import (
         STAC_HARVESTER_PRESET,
         StacHarvesterParams,
@@ -158,7 +158,7 @@ async def test_preset_apply_maps_all_params() -> None:
         max_collections=5,
         max_items=100,
         with_assets=False,
-        es_only=False,
+        storage_backend="es_pg",
     )
 
     with patch(
@@ -274,77 +274,12 @@ def test_harvest_request_default_backend_is_es() -> None:
     assert req.storage_backend == "es"
 
 
-def test_harvest_request_es_only_true_maps_to_es() -> None:
-    """Legacy es_only=True maps to storage_backend='es'."""
-    from dynastore.tasks.stac_harvest.models import StacHarvestRequest
-
-    req = StacHarvestRequest(
-        catalog_url="https://example.test/stac",
-        target_catalog="my-cat",
-        es_only=True,
-    )
-    assert req.storage_backend == "es"
-
-
-def test_harvest_request_es_only_false_maps_to_es_pg() -> None:
-    """Legacy es_only=False maps to storage_backend='es_pg'."""
-    from dynastore.tasks.stac_harvest.models import StacHarvestRequest
-
-    req = StacHarvestRequest(
-        catalog_url="https://example.test/stac",
-        target_catalog="my-cat",
-        es_only=False,
-    )
-    assert req.storage_backend == "es_pg"
-
-
-def test_harvest_request_storage_backend_wins_over_es_only() -> None:
-    """Explicit storage_backend wins when both storage_backend and es_only are set."""
-    from dynastore.tasks.stac_harvest.models import StacHarvestRequest
-
-    req = StacHarvestRequest(
-        catalog_url="https://example.test/stac",
-        target_catalog="my-cat",
-        storage_backend="pg",
-        es_only=True,  # should be ignored since storage_backend is explicit
-    )
-    assert req.storage_backend == "pg"
-
-
 def test_preset_params_default_backend_is_es() -> None:
     """StacHarvesterParams defaults storage_backend to 'es'."""
     from dynastore.extensions.stac.presets.stac_harvester import StacHarvesterParams
 
     p = StacHarvesterParams(url="https://example.test/stac")
     assert p.storage_backend == "es"
-
-
-def test_preset_params_es_only_true_maps_to_es() -> None:
-    """StacHarvesterParams: legacy es_only=True maps to storage_backend='es'."""
-    from dynastore.extensions.stac.presets.stac_harvester import StacHarvesterParams
-
-    p = StacHarvesterParams(url="https://example.test/stac", es_only=True)
-    assert p.storage_backend == "es"
-
-
-def test_preset_params_es_only_false_maps_to_es_pg() -> None:
-    """StacHarvesterParams: legacy es_only=False maps to storage_backend='es_pg'."""
-    from dynastore.extensions.stac.presets.stac_harvester import StacHarvesterParams
-
-    p = StacHarvesterParams(url="https://example.test/stac", es_only=False)
-    assert p.storage_backend == "es_pg"
-
-
-def test_preset_params_storage_backend_wins_over_es_only() -> None:
-    """StacHarvesterParams: explicit storage_backend wins over es_only."""
-    from dynastore.extensions.stac.presets.stac_harvester import StacHarvesterParams
-
-    p = StacHarvesterParams(
-        url="https://example.test/stac",
-        storage_backend="pg",
-        es_only=True,
-    )
-    assert p.storage_backend == "pg"
 
 
 @pytest.mark.asyncio
