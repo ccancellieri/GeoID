@@ -134,12 +134,18 @@ class StorageDrainTask(TaskProtocol):
         callers and existing tests are unaffected.
         """
         from dynastore.modules.db_config.db_config import DBConfig
+        from dynastore.modules.db_config.tools import normalize_db_url
         from sqlalchemy.ext.asyncio import create_async_engine
         from sqlalchemy.pool import NullPool
 
-        db_url = DBConfig.database_url
-        if not db_url.startswith("postgresql+asyncpg://"):
-            db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        # ``normalize_db_url`` both swaps the prefix to ``postgresql+asyncpg://``
+        # AND converts the libpq ``sslmode=`` query parameter to asyncpg's
+        # ``ssl=``.  A bare prefix swap leaves ``sslmode=`` in the URL, which
+        # makes asyncpg's ``connect()`` raise "unexpected keyword argument
+        # 'sslmode'" against a Cloud SQL DSN — failing every drain unrecoverably
+        # and leaving the rows stuck.  Mirror the canonical engine build in
+        # ``db_service`` rather than re-deriving the URL by hand.
+        db_url = normalize_db_url(DBConfig.database_url, is_async=True)
 
         # One engine for the lifetime of this run — shared across all
         # claim and terminal-write statements so connection overhead is paid
