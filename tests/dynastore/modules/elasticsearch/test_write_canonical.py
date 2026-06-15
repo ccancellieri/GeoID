@@ -631,6 +631,112 @@ class TestWriteEntitiesCanonicalSource:
             "fallback doc must have some id"
         )
 
+    @pytest.mark.asyncio
+    async def test_write_entities_geoid_only_under_id_uses_canonical_path(self):
+        """Regression: on the post-write secondary fan-out (PG-primary, e.g.
+        pg+es collections), the dispatched Feature carries the geoid ONLY under
+        the canonical ``id`` field — there is NO top-level ``geoid``, no
+        ``system.geoid``, no ``properties.geoid``, and no ``context['geoid']``.
+
+        The geoid lookup must still resolve it (``id`` is the last-resort
+        source) so the batched PG read runs and the canonical ``stats`` /
+        ``system`` lanes land. Without that source the feature-derived fallback
+        is taken, silently dropping the ``stats`` lane and every ``system``
+        field except geoid — exactly the data loss observed on dev (statistics
+        absent; ``system`` carrying only ``geoid``, no ``external_id``)."""
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+
+        geoid = _GEOID
+        ext_id = _EXTERNAL_ID
+        driver = ItemsElasticsearchDriver.__new__(ItemsElasticsearchDriver)
+
+        # Feature exactly as the secondary index fan-out dispatches it: the
+        # canonical ``id`` IS the geoid and there is no other geoid carrier.
+        feature = MagicMock()
+        feature.id = geoid
+        feature.geometry = {"type": "Point", "coordinates": [12.5, 41.9]}
+        feature.properties = {"NAME": "Rome"}
+        feature.model_dump = MagicMock(
+            return_value={
+                "id": geoid,
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [12.5, 41.9]},
+                "properties": {"NAME": "Rome"},
+            }
+        )
+
+        mock_config = MagicMock()
+        mock_config.simplify_geometry = False
+        mock_config.external_id_path = MagicMock(return_value=None)
+        mock_config.on_batch_conflict = None
+        mock_config.on_conflict = None
+        mock_config.validity = None
+
+        canonical_input = _make_canonical_input(geoid=geoid, external_id=ext_id)
+        captured_bulk: List[Dict] = []
+        read_calls: List[list] = []
+
+        async def _fake_bulk(body, params=None):
+            captured_bulk.extend(body)
+            return {
+                "errors": False,
+                "items": [{"index": {"_id": geoid, "_index": "test", "status": 200}}],
+            }
+
+        async def _fake_read(catalog_id, collection_id, geoids, **kwargs):
+            read_calls.append(list(geoids))
+            return {geoid: canonical_input}
+
+        es_mock = AsyncMock()
+        es_mock.bulk = _fake_bulk
+
+        with (
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+                return_value=es_mock,
+            ),
+            patch.object(driver, "get_driver_config", new=AsyncMock(return_value=mock_config)),
+            patch.object(driver, "_enforce_field_constraints", new=AsyncMock()),
+            patch.object(driver, "_resolve_write_policy", new=AsyncMock(return_value=mock_config)),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=_fake_read,
+            ),
+        ):
+            # No context geoid — the canonical ``id`` is the only geoid carrier.
+            await driver.write_entities("cat1", "col1", [feature])
+
+        # The batched PG read MUST have run with the geoid resolved from ``id``.
+        assert read_calls and geoid in read_calls[0], (
+            "read_canonical_index_inputs must receive the geoid resolved from "
+            f"the canonical 'id'; got calls={read_calls}"
+        )
+
+        doc_lines = [b for b in captured_bulk if isinstance(b, dict) and "index" not in b]
+        assert len(doc_lines) == 1, f"Expected 1 doc; got {doc_lines}"
+        doc = doc_lines[0]
+
+        # Canonical path taken → stats + system populated (NOT the fallback).
+        assert doc.get("id") == geoid, f"id must be geoid; got {doc.get('id')}"
+        assert "stats" in doc, (
+            f"stats missing — feature-derived fallback was taken: {list(doc.keys())}"
+        )
+        assert doc["stats"].get("area") == 99999.0
+        assert "system" in doc, (
+            f"system missing — feature-derived fallback was taken: {list(doc.keys())}"
+        )
+        # external_id from the PG row must land in the system lane (bug #2).
+        assert doc["system"].get("external_id") == ext_id, (
+            f"system.external_id must be projected from the PG row; "
+            f"got system={doc.get('system')}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Pass-C Task 1 — convergence invariant: write_entities ≡ index_bulk

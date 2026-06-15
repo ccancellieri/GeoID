@@ -1210,6 +1210,14 @@ class ItemsElasticsearchDriver(
         #   2. system.geoid (expose_all=True path)
         #   3. properties.geoid (some callers surface it there)
         #   4. context["geoid"] (explicitly supplied by the call-site, e.g. outbox)
+        #   5. top-level "id" — last resort. On the post-write secondary fan-out
+        #      (PG-primary, e.g. pg+es collections) the canonical ``id`` already
+        #      IS the geoid. Without this source the batched PG read is skipped
+        #      and the feature-derived fallback emits a minimal doc, silently
+        #      dropping the ``stats`` lane and every ``system`` field except
+        #      geoid (external_id, *_hash, validity). A non-geoid id (ES-only
+        #      producer id) simply misses the PG SELECT and lands on the same
+        #      fallback as before, so adding it here is safe.
         item_stac_docs: List[dict] = []
         item_geoids: List[Optional[str]] = []
         for item in items:
@@ -1220,6 +1228,7 @@ class ItemsElasticsearchDriver(
                 or (stac_doc.get("system") or {}).get("geoid")
                 or (stac_doc.get("properties") or {}).get("geoid")
                 or ctx.get("geoid")
+                or stac_doc.get("id")
             )
             item_geoids.append(geoid_for_item)
 
