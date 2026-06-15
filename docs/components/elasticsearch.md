@@ -55,6 +55,35 @@ Domain Event  ──>  ElasticsearchModule listener  ──>  Task Queue  ──
 
 Dynamic templates are applied in order (first match wins) to handle multilingual text fields, projection metadata, and generic catch-all mappings — preventing mapping explosions while preserving aggregation capability.
 
+### Canonical item envelope
+
+Item `_source` is assembled by `build_canonical_index_doc` (`modules/elasticsearch/canonical_doc.py`) into a fixed set of lanes, one modular shape for every entity level (refs #1285/#1800/#1828). The lanes are the contract; what fills them is the per-level concern:
+
+| Lane | Content | Indexing |
+|---|---|---|
+| flat root (`id`, `catalog_id`, `collection_id`, `collection`, `external_id`, `asset_id`, `validity`, `geometry`, `bbox`) | identity axes + reserved GeoJSON/STAC members | typed (`COMMON_PROPERTIES`, `geo_shape`) |
+| `system` | identity + lifecycle fields (see table below) | typed when seeded as known fields — see caveat |
+| `stats` | geometry-derived computed values (`area`, `centroid`, `s2_*`/`h3_*`/`geohash_*` cells) | typed when seeded as known fields — see caveat |
+| `properties` | per-collection user attributes | known → flat typed; unknown → `properties.extras` (`flattened`, exact-match only) + analyzed catch-all on root `_search_text` |
+| `metadata` | multilingual `title`/`description`/`keywords` from the `ItemMetadataSidecar` | typed `dynamic:false`, per-language analyzed sub-fields |
+
+**System lane.** Populated from the bounded `SYSTEM_FIELD_KEYS` vocabulary (`modules/storage/computed_fields.py`) — every key whose value is present on the PG row lands; the three identity axes (`geoid`/`external_id`/`asset_id`) are *also* mirrored flat at the document root:
+
+| `system.*` key | Source | Present when | ES type |
+|---|---|---|---|
+| `geoid` | identity | always (also flat root `id`) | `keyword` |
+| `external_id` | identity | set at ingest (e.g. a `CODE` column) | `keyword` |
+| `asset_id` | identity | asset-derived items only | `keyword` |
+| `geometry_hash` | computed | always (geometry digest) | `keyword` |
+| `attributes_hash` | computed | always (attribute digest) | `keyword` |
+| `validity` | lifecycle | item has a validity window | `date_range` |
+| `transaction_time` | lifecycle | always (write timestamp) | `date` |
+| `deleted_at` | lifecycle | tombstones only (omitted on live items) | `date` |
+
+The full set is emitted on every normal write — not just `geoid`/`external_id`. A regression where the pg+es **secondary** write dropped `system`/`stats` (the secondary path failed to resolve the geoid from the canonical `id` and fell back to a `{geoid}`-only row) was fixed in #2199: resolving the geoid from `id` routes the secondary write back through `build_canonical_index_doc`, so the whole row — all system columns and all stats — is rebuilt.
+
+**Caveat — `_source` presence vs. typed searchability.** `build_canonical_index_doc` *always* writes the `system`/`stats` lanes into `_source` (so they are visible in the index and round-trip on read). Whether they are **typed and searchable** depends on `build_item_mapping` declaring the `system`/`stats` containers, which it does *only* when the catalog's `known_fields` carries entries tagged `container="system"`/`"stats"`. The platform baseline `TIER_1_FIELDS` seeds only properties-lane STAC/EO fields — it does **not** yet seed the bounded system/stats vocabulary — and the index root is `dynamic:false`, so on a catalog without those known fields the lanes are stored but not queryable. Baking the bounded system/stats vocabulary into the base mapping is tracked in #1285.
+
 ### Configuration
 
 **Environment variables** (connection-level, set at deploy time):
