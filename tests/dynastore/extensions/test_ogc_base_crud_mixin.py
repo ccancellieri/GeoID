@@ -33,8 +33,10 @@ Tests prove:
 All collaborators are mocked — no database is touched.
 """
 
+import json as _json_mod
+import uuid as _uuid_mod
 from typing import Any, Dict, Tuple
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -549,3 +551,191 @@ async def test_ogc_create_collection_readiness_failure_propagates():
         await svc._ogc_create_collection("cat1", {"id": "col1"}, "en", None)
     assert exc_info.value.status_code == 409
     catalogs_svc.create_collection.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# M-3b: collection hard delete — async 202 path (force=True)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_task(task_id: str = "11111111-1111-1111-1111-111111111111", task_status: str = "PENDING"):
+    """Return a minimal Task-like object for mocking create_task / get_task."""
+    task = MagicMock()
+    task.task_id = _uuid_mod.UUID(task_id)
+    task.jobID = _uuid_mod.UUID(task_id)
+    task.status = task_status
+    return task
+
+
+def _make_fake_request(url_for_result: str = "http://test/tasks/catalogs/cat1/11111111-1111-1111-1111-111111111111"):
+    """Return a minimal Request-like mock."""
+    req = MagicMock()
+    req.url_for.return_value = url_for_result
+    req.base_url = "http://test/"
+    req.scope = {"root_path": ""}
+    return req
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_collection_hard_returns_202():
+    """force=True enqueues a task and returns HTTP 202 with Location + body."""
+    catalogs_svc = _make_catalogs_svc()
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    fake_task = _make_fake_task()
+    fake_request = _make_fake_request()
+
+    # The imports inside _ogc_delete_collection are local, so we patch their
+    # canonical module locations rather than the ogc_base namespace.
+    mock_conn_ctx = AsyncMock()
+    mock_conn_ctx.__aenter__ = AsyncMock(return_value=AsyncMock())
+    mock_conn_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "dynastore.tools.protocol_helpers.get_engine",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module._resolve_catalog_schema",
+            new=AsyncMock(return_value="s_abc123"),
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module.create_task",
+            new=AsyncMock(return_value=fake_task),
+        ),
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+            return_value=mock_conn_ctx,
+        ),
+    ):
+        resp = await svc._ogc_delete_collection("cat1", "col1", True, None, fake_request)
+
+    assert resp.status_code == 202
+    assert "Location" in resp.headers
+    assert resp.headers["Location"] == str(fake_request.url_for.return_value)
+
+    body = _json_mod.loads(resp.body)
+    assert body["task_id"] == "11111111-1111-1111-1111-111111111111"
+    assert body["collection_id"] == "col1"
+    assert len(body["links"]) == 1
+    assert body["links"][0]["rel"] == "monitor"
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_collection_hard_dedup_returns_202():
+    """When create_task returns None (dedup hit), the existing task link is returned as 202."""
+    catalogs_svc = _make_catalogs_svc()
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    fake_request = _make_fake_request()
+
+    existing_task_dict = {
+        "task_id": "22222222-2222-2222-2222-222222222222",
+        "schema_name": "s_abc123",
+        "scope": "CATALOG",
+        "caller_id": "user@example.com",
+        "task_type": "collection_hard_delete",
+        "type": "task",
+        "execution_mode": "ASYNCHRONOUS",
+        "status": "PENDING",
+        "progress": 0,
+        "inputs": None,
+        "outputs": None,
+        "error_message": None,
+        "dedup_key": "collection_hard_delete:cat1:col1",
+        "timestamp": "2026-06-15T00:00:00+00:00",
+        "started_at": None,
+        "finished_at": None,
+        "collection_id": "col1",
+        "locked_until": None,
+        "last_heartbeat_at": None,
+        "owner_id": None,
+        "runner_ref": None,
+        "retry_count": 0,
+        "max_retries": 3,
+    }
+
+    mock_conn = AsyncMock()
+    mock_conn_ctx_schema = AsyncMock()
+    mock_conn_ctx_schema.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn_ctx_schema.__aexit__ = AsyncMock(return_value=None)
+
+    mock_conn_ctx_dedup = AsyncMock()
+    mock_conn_ctx_dedup.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn_ctx_dedup.__aexit__ = AsyncMock(return_value=None)
+
+    # managed_transaction is called twice: once for schema resolution, once for
+    # the dedup lookup. Return different ctx objects for each call.
+    managed_tx_mock = MagicMock(side_effect=[mock_conn_ctx_schema, mock_conn_ctx_dedup])
+
+    with (
+        patch(
+            "dynastore.tools.protocol_helpers.get_engine",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module._resolve_catalog_schema",
+            new=AsyncMock(return_value="s_abc123"),
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module.create_task",
+            new=AsyncMock(return_value=None),  # dedup hit
+        ),
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+            managed_tx_mock,
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module.get_task_schema",
+            return_value="tasks",
+        ),
+        patch(
+            "dynastore.modules.db_config.query_executor.DQLQuery",
+        ) as mock_dql,
+    ):
+        mock_dql.return_value.execute = AsyncMock(return_value=existing_task_dict)
+        resp = await svc._ogc_delete_collection("cat1", "col1", True, None, fake_request)
+
+    assert resp.status_code == 202
+    body = _json_mod.loads(resp.body)
+    assert body["task_id"] == "22222222-2222-2222-2222-222222222222"
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_collection_hard_no_engine_503():
+    """When no DB engine is available the endpoint returns 503."""
+    catalogs_svc = _make_catalogs_svc()
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    with patch("dynastore.tools.protocol_helpers.get_engine", return_value=None):
+        with pytest.raises(HTTPException) as exc_info:
+            await svc._ogc_delete_collection("cat1", "col1", True, None, None)
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_collection_soft_still_204():
+    """force=False path is unchanged — synchronous 204."""
+    catalogs_svc = _make_catalogs_svc()
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    resp = await svc._ogc_delete_collection("cat1", "col1", False, None, None)
+    assert resp.status_code == 204
+    catalogs_svc.delete_collection.assert_awaited_once_with("cat1", "col1", False)
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_collection_soft_404_still_works():
+    """force=False 404 path is unchanged."""
+    catalogs_svc = _make_catalogs_svc(delete_collection=AsyncMock(return_value=False))
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._ogc_delete_collection("cat1", "col1", False, None, None)
+    assert exc_info.value.status_code == 404

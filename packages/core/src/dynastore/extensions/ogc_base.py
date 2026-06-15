@@ -847,22 +847,145 @@ class OGCServiceMixin:
         collection_id: str,
         force: bool,
         db_resource: Any,
+        request: Optional[Request] = None,
     ) -> Response:
-        """Shared delete-collection body used by Features and STAC."""
-        catalogs_svc = await self._get_catalogs_service()
-        ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
-        delete_kwargs: Dict[str, Any] = {}
-        if ctx is not None:
-            delete_kwargs["ctx"] = ctx
+        """Shared delete-collection body used by Features and STAC.
 
-        if not await catalogs_svc.delete_collection(
-            catalog_id, collection_id, force, **delete_kwargs
-        ):
+        Soft delete (force=False): synchronous tombstone; returns 204.
+        Hard delete (force=True): enqueues a durable ``collection_hard_delete``
+        task and returns 202 with a Location header pointing at the polling
+        endpoint.  The collection is observable as lifecycle_status='deleting'
+        while the task runs, then disappears when the purge completes.
+
+        Idempotency: if a non-terminal delete task for the same collection
+        already exists (dedup hit), the endpoint still returns 202 with the
+        existing task's id so the caller can poll it.
+        """
+        catalogs_svc = await self._get_catalogs_service()
+
+        if not force:
+            # --- Soft delete: unchanged synchronous path ---
+            ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
+            delete_kwargs: Dict[str, Any] = {}
+            if ctx is not None:
+                delete_kwargs["ctx"] = ctx
+            if not await catalogs_svc.delete_collection(
+                catalog_id, collection_id, False, **delete_kwargs
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Collection not found.",
+                )
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        # --- Hard delete: async task path ---
+        import json as _json
+
+        from dynastore.extensions.tools.url import enforce_https
+        from dynastore.models.tasks import TaskCreate, TaskScope
+        from dynastore.modules.db_config.query_executor import (
+            DQLQuery,
+            ResultHandler,
+            managed_transaction,
+        )
+        from dynastore.modules.tasks.tasks_module import (
+            _resolve_catalog_schema,
+            create_task,
+            get_task_schema,
+        )
+        from dynastore.tools.caller import current_caller_id
+        from dynastore.tools.protocol_helpers import get_engine
+
+        # Resolve physical schema so the task lands in the catalog's namespace
+        # and is discoverable via GET /tasks/catalogs/{catalog_id}/{task_id}.
+        engine = get_engine()
+        if engine is None:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Collection not found.",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database engine not available; cannot enqueue delete task.",
             )
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        async with managed_transaction(engine) as _conn:
+            physical_schema = await _resolve_catalog_schema(catalog_id, _conn)
+
+        dedup_key = f"collection_hard_delete:{catalog_id}:{collection_id}"
+        task_data = TaskCreate(
+            task_type="collection_hard_delete",
+            caller_id=current_caller_id(),
+            inputs={"catalog_id": catalog_id, "collection_id": collection_id},
+            scope=TaskScope.CATALOG,
+            collection_id=collection_id,
+            dedup_key=dedup_key,
+        )
+
+        task = await create_task(engine, task_data, schema=physical_schema)
+
+        if task is None:
+            # Dedup hit — a non-terminal delete is already in flight.
+            # Look it up so we can still return a status link.
+            task_schema = get_task_schema()
+            async with managed_transaction(engine) as _conn2:
+                existing_dict = await DQLQuery(
+                    f"SELECT * FROM {task_schema}.tasks"
+                    " WHERE dedup_key = :dk AND schema_name = :sn"
+                    " AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')"
+                    " ORDER BY timestamp DESC LIMIT 1;",
+                    result_handler=ResultHandler.ONE_DICT,
+                ).execute(_conn2, dk=dedup_key, sn=physical_schema)
+
+            if existing_dict is None:
+                # Edge case: task completed between create_task dedup check
+                # and this read.  Return a 409 so the caller knows to retry.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"A delete task for '{catalog_id}:{collection_id}' just"
+                        " completed; reissue the request if the collection still exists."
+                    ),
+                )
+            from dynastore.modules.tasks.models import Task as _Task
+            task = _Task.model_validate(existing_dict)
+
+        # Build the external-facing status URL.
+        task_id_str = str(task.task_id if hasattr(task, "task_id") else task.jobID)
+        if request is not None:
+            try:
+                raw_url = request.url_for(
+                    "get_task_status_catalog",
+                    catalog_id=catalog_id,
+                    task_id=task_id_str,
+                )
+                status_url = enforce_https(str(raw_url))
+            except Exception:
+                # url_for fails when the tasks extension isn't mounted; fall
+                # back to a path-relative construction.
+                base = enforce_https(str(request.base_url).rstrip("/"))
+                root_path = request.scope.get("root_path", "").rstrip("/")
+                status_url = (
+                    f"{base}{root_path}/tasks/catalogs/{catalog_id}/{task_id_str}"
+                )
+        else:
+            status_url = f"/tasks/catalogs/{catalog_id}/{task_id_str}"
+
+        body = _json.dumps({
+            "status": task.status if hasattr(task, "status") else "PENDING",
+            "task_id": task_id_str,
+            "collection_id": collection_id,
+            "links": [
+                {
+                    "rel": "monitor",
+                    "href": status_url,
+                    "type": "application/json",
+                    "title": "Deletion status",
+                }
+            ],
+        })
+        return Response(
+            status_code=status.HTTP_202_ACCEPTED,
+            headers={"Location": status_url},
+            media_type="application/json",
+            content=body,
+        )
 
 
 class OGCTransactionMixin:

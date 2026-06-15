@@ -865,6 +865,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         self,
         catalog_id: str,
         collection_id: str,
+        request: Request,
         force: bool = Query(
             False,
             description=(
@@ -875,7 +876,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ),
         ),
     ):
-        return await self._ogc_delete_collection(catalog_id, collection_id, force, None)
+        return await self._ogc_delete_collection(catalog_id, collection_id, force, None, request)
 
     async def get_stac_collection_items(
         self,
