@@ -211,6 +211,7 @@ class Authentication(ExtensionProtocol):
             check) when the token was issued for a different audience (e.g.
             ``account``) but signature + expiry + issuer are still verified.
             """
+            logger.info("DEBUG: userinfo endpoint called")
             if bearer is None:
                 raise HTTPException(401, "Missing or invalid Authorization header")
 
