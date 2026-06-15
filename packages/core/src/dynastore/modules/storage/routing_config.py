@@ -735,7 +735,7 @@ class ItemsRoutingConfig(_RoutingConfigBase):
                 ),
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",
-                    hints={Hint.GEOMETRY_EXACT, Hint.TILES},
+                    hints={Hint.GEOMETRY_EXACT, Hint.TILES, Hint.JOIN},
                     on_failure=FailurePolicy.FATAL,
                     source="auto",
                 ),
@@ -747,8 +747,15 @@ class ItemsRoutingConfig(_RoutingConfigBase):
                 # CollectionRoutingConfig SEARCH). Each set is the driver's
                 # ``supported_hints`` restricted to search-applicable flavours:
                 # operation-specific hints stay out (e.g. ``TILES`` is a READ
-                # concern and lives only on the PG READ entry, never here;
-                # ``WRITE``/``METADATA``/``JOIN`` are not search flavours).
+                # concern and lives only on the PG READ entry, never here).
+                #
+                # Hint.JOIN is declared on the PG SEARCH entry so that JOIN
+                # requests carrying a CQL filter (_pick_operation → SEARCH)
+                # also resolve to PG, not ES. The DWH join and OGC Joins
+                # extension both request {Hint.JOIN}; without it on SEARCH the
+                # best-overlap matcher finds no match and the relaxation path
+                # returns ES first — wrong because ES lacks full-precision
+                # geometry and cannot run ST_Transform.
                 #
                 # Consequence of declaring these explicitly: the best-overlap
                 # matcher (router.py) now ranks by the DECLARED surface rather
@@ -771,7 +778,7 @@ class ItemsRoutingConfig(_RoutingConfigBase):
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",
                     hints={
-                        Hint.GEOMETRY_EXACT,
+                        Hint.JOIN, Hint.GEOMETRY_EXACT,
                         Hint.SPATIAL_FILTER, Hint.ATTRIBUTE_FILTER, Hint.SORT,
                         Hint.GROUP_BY, Hint.AGGREGATION, Hint.COUNT,
                         Hint.STATISTICS,
@@ -2273,3 +2280,64 @@ def _self_register_transformers_into(
             "driver '%s' to transformers registry (source=auto)",
             driver_ref,
         )
+
+
+async def patch_routing_entry_hints(
+    catalog_id: Optional[str],
+    collection_id: Optional[str],
+    operation: str,
+    driver_ref: str,
+    hints: FrozenSet[Hint],
+    *,
+    routing_plugin_cls: Any = ItemsRoutingConfig,
+    merge: bool = True,
+) -> None:
+    """Update hints on a specific entry in a stored routing config.
+
+    Fetches the current persisted config (or the model default when no row
+    exists), locates the ``driver_ref`` entry under ``operation``, replaces
+    (``merge=False``) or unions (``merge=True``) its ``hints`` set, then
+    writes the config back through ``ConfigsProtocol.set_config`` so the
+    normal validate + apply handlers fire (cache invalidation, DENY-policy
+    sync, etc.).
+
+    ``merge=True`` (default) unions the supplied hints with the entry's
+    existing hints — safe for additive changes such as enabling ``Hint.JOIN``
+    on an existing PG READ entry without losing the operator's other hints.
+    ``merge=False`` replaces the hints set entirely.
+
+    Raises ``KeyError`` if ``driver_ref`` is not found in ``operation``.
+    Raises ``ValueError`` if the resolved hint set contains hints not in the
+    driver's ``supported_hints`` (propagated from ``_validate_routing_entries``
+    at apply time).
+    """
+    from dynastore.models.protocols.configs import ConfigsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    configs = get_protocol(ConfigsProtocol)
+    if configs is None:
+        raise RuntimeError("ConfigsProtocol not available")
+
+    raw = await configs.get_config(
+        routing_plugin_cls,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+    config = cast(Any, raw)
+
+    entries: "List[OperationDriverEntry]" = config.operations.get(operation, [])
+    target = next((e for e in entries if e.driver_ref == driver_ref), None)
+    if target is None:
+        raise KeyError(
+            f"driver_ref '{driver_ref}' not found in operation '{operation}' "
+            f"for catalog={catalog_id!r} collection={collection_id!r}"
+        )
+
+    target.hints = (target.hints | hints) if merge else set(hints)
+
+    await configs.set_config(
+        routing_plugin_cls,
+        config,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
