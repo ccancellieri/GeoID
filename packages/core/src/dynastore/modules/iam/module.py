@@ -265,7 +265,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
 
              # IdP factory — config-first (IdpConfig PluginConfig), with a
              # one-release deprecated ENV fallback. See _register_identity_provider.
-             logger.info("DEBUG: IamModule lifespan - about to register identity provider")
              await self._register_identity_provider()
 
             yield
@@ -308,7 +307,6 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     if isinstance(resolved, IdpConfig)
                     else IdpConfig.model_validate(resolved)
                 )
-                logger.info("DEBUG: IdpConfig loaded: type=%s, issuer_url=%s, is_configured=%s", cfg.type, cfg.issuer_url, cfg.is_configured)
             except Exception:
                 logger.debug("IdpConfig unavailable", exc_info=True)
 
@@ -316,6 +314,8 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             from .identity_providers.oidc_identity import OidcIdentityProvider
 
             secret = cfg.client_secret.reveal() if cfg.client_secret else None
+            logger.info("IdP: issuer_url=%s, client_id=%s, audience=%s, roles_claim_path=%s",
+                cfg.issuer_url, cfg.client_id, cfg.audience, cfg.roles_claim_path)
             register_plugin(
                 OidcIdentityProvider(
                     issuer_url=cast(str, cfg.issuer_url),
@@ -338,7 +338,10 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                 "registered. See modules/iam/identity_providers/README.md."
             )
         
-        logger.info("DEBUG: _register_identity_provider end: cfg=%s, is_configured=%s", cfg is not None, cfg.is_configured if cfg else None)
+        if cfg is None:
+            logger.warning("IdP: No IdpConfig found in database")
+        elif not cfg.is_configured:
+            logger.warning("IdP: IdpConfig not configured (type=%s, issuer_url=%s)", cfg.type, cfg.issuer_url)
 
     async def _register_usage_counter_drivers(self, stack: AsyncExitStack) -> None:
         """Wire a :class:`UsageCounterProtocol` driver for rate-limit / quota.

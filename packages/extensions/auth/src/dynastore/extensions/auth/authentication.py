@@ -211,12 +211,10 @@ class Authentication(ExtensionProtocol):
             check) when the token was issued for a different audience (e.g.
             ``account``) but signature + expiry + issuer are still verified.
             """
-            logger.info("DEBUG: userinfo endpoint called")
             if bearer is None:
                 raise HTTPException(401, "Missing or invalid Authorization header")
 
             token = bearer.credentials
-            logger.info("DEBUG: userinfo called - identity_provider=%s", self.identity_provider is not None)
 
             if self.identity_provider:
                 identity = await self.identity_provider.validate_token(token)
@@ -227,11 +225,11 @@ class Authentication(ExtensionProtocol):
                         token, verify_audience=False
                     )
                 if identity:
-                    logger.info("DEBUG: userinfo identity validated")
                     return identity
-                logger.info("DEBUG: userinfo identity validation failed")
+                logger.warning("userinfo: token validation failed (both strict and lax)")
+            else:
+                logger.warning("userinfo: no identity_provider registered")
 
-            logger.info("DEBUG: userinfo no identity_provider or invalid token")
             raise HTTPException(401, "Invalid access token")
 
         @self.router.post("/token")
