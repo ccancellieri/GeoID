@@ -263,9 +263,9 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     exc_info=True,
                 )
 
-             # IdP factory — config-first (IdpConfig PluginConfig), with a
-             # one-release deprecated ENV fallback. See _register_identity_provider.
-             await self._register_identity_provider()
+            # IdP factory — config-first (IdpConfig PluginConfig), with a
+            # one-release deprecated ENV fallback. See _register_identity_provider.
+            await self._register_identity_provider()
 
             yield
 
