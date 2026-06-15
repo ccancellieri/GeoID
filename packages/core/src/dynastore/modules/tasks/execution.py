@@ -934,7 +934,11 @@ class ExecutionEngine:
 
         raw_payload = {
             "task_id": task_id,
-            "caller_id": task_row.get("caller_id") or "",
+            # ``caller_id`` is NOT NULL-able on RunnerContext (min_length=1).
+            # A row may carry no caller (system-internal enqueues such as the
+            # ``event_drain`` trigger): default to the system id rather than the
+            # empty string, matching every other call site in this module.
+            "caller_id": task_row.get("caller_id") or SYSTEM_USER_ID,
             "inputs": (
                 task_row["inputs"]
                 if isinstance(task_row.get("inputs"), dict)

@@ -121,17 +121,24 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
         ResultHandler,
     )
     from dynastore.modules.tasks.tasks_module import get_task_schema  # noqa: PLC0415
+    from dynastore.tools.caller import current_caller_id  # noqa: PLC0415
     from dynastore.tools.db import validate_sql_identifier  # noqa: PLC0415
     from dynastore.tools.identifiers import generate_uuidv7  # noqa: PLC0415
 
     task_schema = get_task_schema()
     validate_sql_identifier(task_schema)
 
+    # Stamp the originating caller so the drain row records who triggered it —
+    # the authenticated principal when this runs inside a request, the system
+    # id otherwise. RunnerContext.caller_id is NOT NULL-able (min_length=1), so
+    # a NULL here would crash dispatch before the drain ever runs.
+    caller_id = current_caller_id()
+
     insert_sql = (
         f"INSERT INTO {task_schema}.tasks"
-        f" (task_id, schema_name, scope, task_type, type, execution_mode,"
-        f"  inputs, timestamp, status, dedup_key)"
-        f" SELECT :task_id, 'platform', 'platform', 'event_drain',"
+        f" (task_id, schema_name, scope, caller_id, task_type, type,"
+        f"  execution_mode, inputs, timestamp, status, dedup_key)"
+        f" SELECT :task_id, 'platform', 'platform', :caller_id, 'event_drain',"
         f"        'task', 'ASYNCHRONOUS', '{{}}'::jsonb, now(), 'PENDING',"
         f"        'event_drain'"
         f" WHERE NOT EXISTS ("
@@ -150,7 +157,7 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
             try:
                 async with begin_nested():
                     await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                        conn, task_id=generate_uuidv7()
+                        conn, task_id=generate_uuidv7(), caller_id=caller_id
                     )
             except Exception:  # noqa: BLE001
                 logger.debug(
@@ -161,7 +168,7 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
                 )
         else:
             await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                conn, task_id=generate_uuidv7()
+                conn, task_id=generate_uuidv7(), caller_id=caller_id
             )
     except Exception:  # noqa: BLE001
         logger.debug(
