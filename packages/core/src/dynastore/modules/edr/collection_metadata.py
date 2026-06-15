@@ -22,17 +22,29 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from dynastore.extensions.tools.response_i18n import resolve_localized
+
 
 def build_edr_collection(
     catalog_id: str,
     collection: Any,
     *,
     base_url: str,
+    language: str = "en",
 ) -> Dict[str, Any]:
-    """Build EDR collection metadata dict from a STAC collection model."""
+    """Build EDR collection metadata dict from a STAC collection model.
+
+    ``language`` controls how multi-language ``LocalizedText`` values on the
+    STAC collection (title, description) are resolved before being written into
+    the response dict.  ``language='*'`` leaves them as full multi-language
+    objects; any other value collapses to a single string, falling back to
+    ``"en"`` if the requested language is absent.
+    """
     collection_id = getattr(collection, "id", None) or ""
-    title = getattr(collection, "title", None) or collection_id
-    description = getattr(collection, "description", None) or ""
+    raw_title = getattr(collection, "title", None)
+    title = resolve_localized(raw_title, language) or collection_id
+    raw_description = getattr(collection, "description", None)
+    description = resolve_localized(raw_description, language) or ""
 
     extent: Dict[str, Any] = {}
     raw_extent = getattr(collection, "extent", None)

@@ -156,13 +156,11 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             "/catalogs/{catalog_id}/collections",
             self.list_collections,
             methods=["GET"],
-            response_model=em.EDRCollections,
         )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/collections/{collection_id}",
             self.get_collection,
             methods=["GET"],
-            response_model=em.EDRCollection,
         )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/collections/{collection_id}/position",
@@ -253,7 +251,8 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         self,
         catalog_id: str,
         request: Request,
-    ) -> em.EDRCollections:
+        language: str = Depends(get_language),
+    ) -> JSONResponse:
         catalogs = await self._get_catalogs_service()
         try:
             collections = await catalogs.list_collections(catalog_id)
@@ -269,7 +268,9 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         items: List[em.EDRCollection] = []
         for col in collections or []:
             try:
-                col_dict = build_edr_collection(catalog_id, col, base_url=base_url)
+                col_dict = build_edr_collection(
+                    catalog_id, col, base_url=base_url, language=language
+                )
                 items.append(em.EDRCollection(**col_dict))
             except Exception as exc:
                 logger.warning(
@@ -280,7 +281,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
 
         from dynastore.models.shared_models import Link
 
-        return em.EDRCollections(
+        result = em.EDRCollections(
             collections=items,
             links=[
                 Link(
@@ -291,13 +292,15 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
                 ),
             ],
         )
+        return JSONResponse(content=localize_model(result, language))
 
     async def get_collection(
         self,
         catalog_id: str,
         collection_id: str,
         request: Request,
-    ) -> em.EDRCollection:
+        language: str = Depends(get_language),
+    ) -> JSONResponse:
         catalogs = await self._get_catalogs_service()
         try:
             collection = await catalogs.get_collection(catalog_id, collection_id)
@@ -313,7 +316,9 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         base_url = get_root_url(request).rstrip("/")
         from dynastore.modules.edr.collection_metadata import build_edr_collection
 
-        col_dict = build_edr_collection(catalog_id, collection, base_url=base_url)
+        col_dict = build_edr_collection(
+            catalog_id, collection, base_url=base_url, language=language
+        )
 
         item = await self._get_first_item(catalog_id, collection_id)
         if item:
@@ -321,7 +326,8 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
 
             col_dict["parameter_names"] = build_parameters(item)
 
-        return em.EDRCollection(**col_dict)
+        result = em.EDRCollection(**col_dict)
+        return JSONResponse(content=localize_model(result, language))
 
     # ------------------------------------------------------------------
     # EDR query endpoints
