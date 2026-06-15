@@ -896,6 +896,142 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         return kept
 
+    async def _enforce_es_geometry_poison_check(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        items_list: List[Any],
+        resolved_drivers: List[Any],
+        *,
+        db_resource: Optional[DbResource] = None,
+        ctx: Optional[DriverContext] = None,
+        is_single: bool = True,
+    ) -> List[Any]:
+        """Pre-write poison-geometry guard for ES-backed collections (#2112).
+
+        ES is an async secondary: the PG primary commits before the ES write
+        ever runs.  Certain geometry shapes cause ES to permanently reject a
+        document (``invalid_shape_exception`` for duplicate/degenerate
+        coordinates, ``mapper_parsing_exception`` for wrong-type inputs such as
+        a ``GeometryCollection`` where a polygon field is mapped).  These are
+        listed in
+        :data:`~dynastore.modules.elasticsearch.bulk_classify._POISON_ERROR_TYPES`
+        as the authoritative classification.
+
+        This guard runs at the same scope as the 10 MB size guard: it activates
+        only when the resolved WRITE routing includes an ES items secondary
+        whose ``simplify_geometry`` is disabled.  PG-only catalogs are never
+        affected — PG stores geometry as-is with no shape restrictions.
+
+        Repair-first contract (#2044 / #2112):
+        For each item the guard attempts to repair the geometry (``make_valid``
+        + polygonal coercion) before deciding:
+
+        * **Already valid** → accept unchanged.
+        * **Repairable** → mutate the item's geometry in place and accept
+          (the ES driver receives a clean shape without an extra round-trip).
+        * **Poison-after-repair** (collapses to empty; no polygonal area
+          survives) → reject.  Rejection delivery follows the same channel as
+          the size guard:
+
+          - Single-item ingest, or no rejection channel: raise
+            ``ValueError`` (→ HTTP 400 via ``_ingest_items``).
+          - Bulk ingest with a rejection channel: drain to
+            ``ctx.extensions["_rejections"]`` (→ HTTP 207 IngestionReport).
+
+        Returns the items that may proceed to the write path (the input list
+        unchanged when no item is rejected or repaired in a way that removes
+        it).
+        """
+        from dynastore.tools.geometry_repair import repair_geometry_for_es
+
+        # Activate only when an ES items secondary without simplification is
+        # present — mirrors the size-guard activation logic exactly.
+        guarded = False
+        for resolved in resolved_drivers:
+            driver = getattr(resolved, "driver", resolved)
+            if not self._resolved_driver_is_es_items(driver):
+                continue
+            if await self._es_items_driver_simplify_enabled(
+                driver, catalog_id, collection_id, db_resource=db_resource,
+            ):
+                continue
+            guarded = True
+            break
+
+        if not guarded:
+            return items_list
+
+        def _poison_reason(item_id: Any, geom_type: Optional[str]) -> str:
+            type_hint = f" (type '{geom_type}')" if geom_type else ""
+            return (
+                f"Item '{item_id}' has a geometry{type_hint} that collapses to "
+                f"empty after repair (make_valid + polygonal coercion) and would "
+                f"always be rejected by Elasticsearch with an "
+                f"'invalid_shape_exception' or 'mapper_parsing_exception'. "
+                f"Fix the geometry before re-submitting."
+            )
+
+        # The per-item rejection out-list, when the caller seeded one.
+        sink = None
+        if ctx is not None and isinstance(getattr(ctx, "extensions", None), dict):
+            seeded = ctx.extensions.get("_rejections")
+            if isinstance(seeded, list):
+                sink = seeded
+
+        kept: List[Any] = []
+        for item in items_list:
+            if isinstance(item, dict):
+                geometry = item.get("geometry")
+                item_id = item.get("id")
+            else:
+                geometry = getattr(item, "geometry", None)
+                item_id = getattr(item, "id", None)
+
+            geom_type = (
+                geometry.get("type") if isinstance(geometry, dict) else None
+            )
+
+            repaired, was_repaired, is_poison = repair_geometry_for_es(geometry)
+
+            if is_poison:
+                reason = _poison_reason(item_id, geom_type)
+                if is_single or sink is None:
+                    raise ValueError(reason)
+                sink.append(
+                    {
+                        "geoid": None,
+                        "external_id": str(item_id) if item_id is not None else None,
+                        "sidecar_id": "geometries",
+                        "matcher": None,
+                        "reason": "geometry_poison",
+                        "message": reason,
+                    }
+                )
+                continue
+
+            # Repair succeeded — mutate the item in place so the ES driver
+            # receives the fixed geometry without a separate repair step.
+            if was_repaired and repaired is not None:
+                if isinstance(item, dict):
+                    item["geometry"] = repaired
+                else:
+                    try:
+                        object.__setattr__(item, "geometry", repaired)
+                    except (AttributeError, TypeError):
+                        # Frozen model or non-settable attribute: accept as-is.
+                        # The ES indexer will encounter the invalid geometry and
+                        # the async classify path will surface it.
+                        logger.debug(
+                            "geometry_repair: could not mutate geometry on item %s "
+                            "(model is frozen or non-dict); accepted unchanged",
+                            item_id,
+                        )
+
+            kept.append(item)
+
+        return kept
+
     async def upsert(
         self,
         catalog_id: str,
@@ -980,6 +1116,17 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             # rejection (single-item oversized raises above, so this is only
             # reachable for bulk). Skip the no-op primary write; the seeded
             # ``_rejections`` out-list already carries the per-item 207 report.
+            return []
+
+        # Pre-write poison-shape guard (#2112). Runs after the size guard so
+        # we never attempt repair on a geometry that is already too large.
+        # Repairs are applied in place (geometry mutated on the item dict)
+        # so the write path receives an immediately-indexable shape.
+        items_list = await self._enforce_es_geometry_poison_check(
+            catalog_id, collection_id, items_list, resolved_drivers,
+            db_resource=db_resource, ctx=ctx, is_single=is_single,
+        )
+        if not items_list:
             return []
 
         from dynastore.models.protocols.storage_driver import Capability
