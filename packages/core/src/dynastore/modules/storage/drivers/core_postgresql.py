@@ -582,7 +582,14 @@ class CollectionCorePostgresqlDriver(
             phys = await _resolve_physical_schema(catalog_id, db_resource=conn)
             if not phys:
                 return [], 0
-            where_clauses = ["c.deleted_at IS NULL"]
+            # Hide transient collections (#2194): a non-null ``lifecycle_status``
+            # overlay (#2066) means the collection is mid-provisioning or
+            # mid-hard-delete — write-gated and not yet (or no longer) a live
+            # member of the catalog, so it must not surface in listings/search.
+            # Only ACTIVE rows (overlay NULL) are visible. A direct GET-by-id
+            # still resolves it so a client can watch its status. Applied to both
+            # the COUNT and the data query below, so the page total stays honest.
+            where_clauses = ["c.deleted_at IS NULL", "c.lifecycle_status IS NULL"]
             params: Dict[str, Any] = {"limit": limit, "offset": offset}
             if visible_ids is not None:
                 where_clauses.append("c.id = ANY(:visible_ids)")
