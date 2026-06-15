@@ -1750,13 +1750,20 @@ async def create_task(
             "execution_mode", "inputs", "timestamp", "collection_id", "dedup_key",
             "status",
         ]
+        # The ``type`` column is a denormalised cache of ``task_kind``: derive
+        # it from the registry so every row is labelled consistently regardless
+        # of which runner created it (the OGC Processes execution path goes
+        # through runners that historically left ``type`` at its default,
+        # mislabelling genuine processes such as ``gdal``/``ingestion``).
+        from dynastore.tasks import resolve_task_type_kind
+        resolved_type = resolve_task_type_kind(task_data.task_type, task_data.type)
         insert_kwargs: Dict[str, Any] = dict(
             task_id=task_id,
             schema_name=schema,
             scope=task_data.scope,
             caller_id=task_data.caller_id,
             task_type=task_data.task_type,
-            type=task_data.type,
+            type=resolved_type,
             execution_mode=task_data.execution_mode,
             inputs=_serialize_inputs(inputs),
             timestamp=creation_time,
@@ -1965,6 +1972,10 @@ async def enqueue(
                 RETURNING *;
             """
 
+        # ``type`` is a denormalised cache of ``task_kind`` — derive from the
+        # registry (see create_task) so the queue path labels rows identically.
+        from dynastore.tasks import resolve_task_type_kind
+        resolved_type = resolve_task_type_kind(task_data.task_type, task_data.type)
         task_dict = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
             conn,
             task_id=task_id,
@@ -1972,7 +1983,7 @@ async def enqueue(
             scope=scope,
             caller_id=task_data.caller_id,
             task_type=task_data.task_type,
-            type=task_data.type,
+            type=resolved_type,
             execution_mode=execution_mode,
             inputs=_serialize_inputs(task_data.inputs),
             timestamp=creation_time,

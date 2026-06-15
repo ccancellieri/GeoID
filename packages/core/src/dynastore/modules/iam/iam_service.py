@@ -1244,10 +1244,10 @@ class IamService:
         catalog_id = getattr(getattr(request, "state", {}), "catalog_id", None)
         schema = await self._resolve_schema(catalog_id)
 
-         # Authenticate via registered Identity Providers (OAuth2 / OIDC)
-         identity_providers = self.get_identity_providers()
-         logger.info("authenticate_token: Checking %d identity providers (providers=%s)", len(identity_providers), [p.get_provider_id() if hasattr(p, 'get_provider_id') else str(p) for p in identity_providers])
-         logger.debug("Checking %d identity providers", len(identity_providers))
+        # Authenticate via registered Identity Providers (OAuth2 / OIDC)
+        identity_providers = self.get_identity_providers()
+        logger.info("authenticate_token: Checking %d identity providers (providers=%s)", len(identity_providers), [p.get_provider_id() if hasattr(p, 'get_provider_id') else str(p) for p in identity_providers])
+        logger.debug("Checking %d identity providers", len(identity_providers))
         scale_cfg: Any = None
         for provider in identity_providers:
             provider_id = provider.get_provider_id()
