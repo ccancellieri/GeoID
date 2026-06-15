@@ -519,10 +519,9 @@ def _route_target_kind(process_key: str) -> str:
     not by this column — so an unknown key safely defaults to 'task'.
     """
     try:
-        from dynastore.tasks import _DYNASTORE_TASKS, task_kind
+        from dynastore.tasks import resolve_task_type_kind
 
-        cfg = _DYNASTORE_TASKS.get(process_key)
-        return task_kind(cfg) if cfg is not None else "task"
+        return resolve_task_type_kind(process_key, "task")
     except Exception:  # noqa: BLE001
         return "task"
 

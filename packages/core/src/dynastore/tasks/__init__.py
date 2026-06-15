@@ -79,6 +79,27 @@ def get_task_config(task_type: str) -> Optional[TaskConfig]:
             return cfg
     return None
 
+def resolve_task_type_kind(task_type: str, default: str = "task") -> str:
+    """Authoritative ``'task' | 'process'`` for a persisted row, by task_type.
+
+    The stored ``type`` column is a denormalised cache of :func:`task_kind`:
+    a row is a ``'process'`` iff its task ships an OGC Process ``definition``
+    (and is therefore reachable via the OGC Processes API under policy); it is
+    a ``'task'`` otherwise (system task — enqueueable only by
+    events/listeners/system orchestration, e.g. ``gcp_provision_catalog``).
+
+    Resolving here, at the DB write boundary, keeps the column consistent no
+    matter which runner created the row — the OGC Processes execution path goes
+    through several runners that historically left ``type`` at its ``'task'``
+    default, mislabelling genuine processes (e.g. ``gdal``, ``ingestion``).
+
+    Unknown ``task_type`` values (not in the in-process registry — e.g. a
+    remote runner context where discovery has not populated the registry) fall
+    back to ``default`` so behaviour is never worse than the caller's intent.
+    """
+    cfg = get_task_config(task_type)
+    return task_kind(cfg) if cfg is not None else default
+
 def get_all_task_configs() -> Dict[str, TaskConfig]:
     return _DYNASTORE_TASKS
 
