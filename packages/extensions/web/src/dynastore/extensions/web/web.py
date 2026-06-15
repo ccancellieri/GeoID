@@ -1182,11 +1182,39 @@ class Web(ExtensionProtocol, OGCServiceMixin):
         """
 
     @staticmethod
-    async def _serve_html_template(html_path: str) -> HTMLResponse:
-        """Read an HTML file and replace {{VERSION}} with the running package version."""
+    def _asset_version_token(asset_paths: Optional[List[str]] = None) -> str:
+        """Cache-busting token for the static assets a shell page references.
+
+        Returns the newest mtime (epoch seconds) across ``asset_paths`` so the
+        token changes on every real asset edit -- including same-version
+        redeploys, which a package-version token would miss. Falls back to the
+        package version when no readable asset path is given.
+        """
+        from dynastore._version import VERSION
+        mtimes: List[float] = []
+        for path in asset_paths or []:
+            try:
+                mtimes.append(os.path.getmtime(path))
+            except OSError:
+                continue
+        return str(int(max(mtimes))) if mtimes else VERSION
+
+    async def _serve_html_template(
+        self, html_path: str, asset_paths: Optional[List[str]] = None
+    ) -> HTMLResponse:
+        """Serve an app-shell HTML entry-point with the canonical cache policy.
+
+        Substitutes ``{{VERSION}}`` (package version) and ``{{ASSET_V}}`` (a
+        cache-busting token derived from ``asset_paths``), then stamps the
+        no-cache policy that ``_cache_headers_for`` assigns to HTML entry-points
+        so the shell always revalidates while its long-cached JS/CSS bust on
+        change. Single serving path for every web shell page.
+        """
         from dynastore._version import VERSION
         content = await asyncio.to_thread(Path(html_path).read_text, encoding="utf-8")
-        return HTMLResponse(content.replace("{{VERSION}}", VERSION))
+        content = content.replace("{{VERSION}}", VERSION)
+        content = content.replace("{{ASSET_V}}", self._asset_version_token(asset_paths))
+        return HTMLResponse(content, headers=self._cache_headers_for("static", "index.html"))
 
     @expose_web_page(
         page_id="exposure",
@@ -1513,16 +1541,27 @@ class Web(ExtensionProtocol, OGCServiceMixin):
 
         @self.router.get("/", include_in_schema=False)
         async def read_extension_root():
-            website_index = os.path.join(
-                os.path.dirname(__file__), "static", "website", "index.html"
-            )
+            static_root = os.path.join(os.path.dirname(__file__), "static")
+            website_index = os.path.join(static_root, "website", "index.html")
             if os.path.exists(website_index):
-                return await self.serve_file(website_index)
+                return await self._serve_html_template(
+                    website_index,
+                    asset_paths=[
+                        os.path.join(static_root, "custom.js"),
+                        os.path.join(static_root, "common", "tailwind.css"),
+                        os.path.join(static_root, "vendor", "vendor.css"),
+                    ],
+                )
             return HTMLResponse("Not Found", status_code=404)
 
-        _dashboard_index = os.path.join(
-            os.path.dirname(__file__), "static", "dashboard", "index.html"
-        )
+        _static_root = os.path.join(os.path.dirname(__file__), "static")
+        _dashboard_index = os.path.join(_static_root, "dashboard", "index.html")
+        # Assets every dashboard/processes shell references; used to derive the
+        # {{ASSET_V}} cache-busting token (see _serve_html_template).
+        _dashboard_assets = [
+            os.path.join(_static_root, "common", "admin.css"),
+            os.path.join(_static_root, "dashboard", "styles.css"),
+        ]
 
         @self.router.get("/dashboard/")
         async def read_dashboard_root():
@@ -1530,7 +1569,9 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             caller can see (filtered downstream by IAM) and lets them pick
             a per-catalog dashboard."""
             if os.path.exists(_dashboard_index):
-                return await self._serve_html_template(_dashboard_index)
+                return await self._serve_html_template(
+                    _dashboard_index, asset_paths=_dashboard_assets
+                )
             return HTMLResponse("Dashboard Not Found", status_code=404)
 
         @self.router.get("/dashboard/catalogs/{catalog_id}/")
@@ -1540,18 +1581,20 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             uses relative URLs (``stats``, ``logs``, ``events``) which
             resolve against this base path."""
             if os.path.exists(_dashboard_index):
-                return await self._serve_html_template(_dashboard_index)
+                return await self._serve_html_template(
+                    _dashboard_index, asset_paths=_dashboard_assets
+                )
             return HTMLResponse("Dashboard Not Found", status_code=404)
 
         @self.router.get("/dashboard/catalogs/{catalog_id}/processes/")
         async def read_processes_page(catalog_id: str):
             """Per-catalog processes HTML shell. Same template as before;
             authz gated upstream by web_dashboard_per_catalog_access policy."""
-            processes_index = os.path.join(
-                os.path.dirname(__file__), "static", "dashboard", "processes.html"
-            )
+            processes_index = os.path.join(_static_root, "dashboard", "processes.html")
             if os.path.exists(processes_index):
-                return await self.serve_file(processes_index)
+                return await self._serve_html_template(
+                    processes_index, asset_paths=_dashboard_assets
+                )
             return HTMLResponse("Processes Page Not Found", status_code=404)
 
         @self.router.get("/config/pages", response_class=JSONResponse)
