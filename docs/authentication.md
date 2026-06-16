@@ -14,9 +14,42 @@ DynaStore v2.0 delegates authentication to external OIDC-compliant identity prov
 | `IDP_CLIENT_SECRET` (alias: `KEYCLOAK_CLIENT_SECRET`) | If client is confidential | OAuth2 client secret for the SPA / login client. |
 | `IDP_PUBLIC_URL` (alias: `KEYCLOAK_PUBLIC_URL`) | No | Browser-reachable IdP URL (if different from internal `IDP_ISSUER_URL`). |
 | `IDP_ROLES_CLAIM_PATH` | No | Dotted JSON path used to locate roles inside the JWT. Defaults to `resource_access.${IDP_AUDIENCE}.roles`. See "Role claim path" below. |
-| `SESSION_SECRET_KEY` | Recommended | Secret for session cookie encryption. Auto-generated if not set. |
+| `SESSION_SECRET_KEY` | Recommended | Signs the Starlette session cookie. Auto-generated per-process if unset (inconsistent across pods — set it). Also the **last-resort source** for the config secret-encryption key (see "Secret encryption key" below). |
 
 *Required when using Keycloak. Other IdP implementations may use different env vars.
+
+### Bootstrap vs steady state — `IDP_*` env is a one-time seed
+
+The `IDP_*` variables are read **only to seed the platform `idp_config` row on a
+cold boot where none exists**. The cold-boot seed never overwrites an existing
+row, so once the first boot has materialised `idp_config` in the platform-config
+store, that DB row is the single source of truth and the `IDP_*` env becomes
+redundant.
+
+Practical consequence for deployments: keep `IDP_*` set for the **first** boot of
+a fresh database, then you may remove `IDP_ISSUER_URL` / `IDP_CLIENT_ID` /
+`IDP_AUDIENCE` / `IDP_CLIENT_SECRET` from the runtime environment. Change the live
+configuration afterwards via the Configs API (`platform_configs`, class key
+`idp_config`) — no restart and no env edit required. To re-seed from env on a
+fresh database, simply delete the `idp_config` row first.
+
+The minimum to cold-boot a working sysadmin on a fresh DB is therefore just
+`IDP_ISSUER_URL` (plus the `geoid.sysadmin` realm role on the operator's account,
+which `OidcRoleSyncConfig` maps to the internal `sysadmin` grant). `IDP_CLIENT_ID`
+defaults to `dynastore-api`; `IDP_CLIENT_SECRET` is only needed for confidential
+OAuth2 flows — bearer-token validation does not use it.
+
+### Secret encryption key
+
+Config fields typed as secrets (e.g. `idp_config.client_secret`) are encrypted at
+rest with a key derived, in order, from `DYNASTORE_SECRET_KEY` → `JWT_SECRET` →
+`SESSION_SECRET_KEY`. Provisioning any one of them satisfies encryption; a
+deployment that already sets `SESSION_SECRET_KEY` needs no separate key. Provision
+a dedicated `DYNASTORE_SECRET_KEY` when you need to rotate the session key
+independently of stored secrets — rotating the active source orphans anything
+encrypted under it. If no source is set, the `idp_config` cold-boot seed still
+registers a working (public-client) OIDC provider without the secret, so
+token-authenticated login is never blocked purely by a missing encryption key.
 
 ### Choosing the audience
 

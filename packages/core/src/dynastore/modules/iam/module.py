@@ -745,8 +745,43 @@ async def _seed_idp_config(engine: Any) -> None:
             seed.issuer_url,
             seed.client_id,
         )
+        return
     except Exception:
-        logger.warning("IdpConfig seed failed.", exc_info=True)
+        # The dominant failure here is secret encryption being unavailable:
+        # persisting ``client_secret`` requires a Fernet key (see
+        # ``dynastore.tools.secrets._derive_key``), and a tier that provisions
+        # IDP_CLIENT_SECRET but no key source will raise while serialising it.
+        # ``client_secret`` is NOT needed to register the OIDC provider or to
+        # validate incoming bearer tokens — ``IdpConfig.is_configured`` gates on
+        # ``issuer_url`` alone. So when a secret is present, retry once WITHOUT
+        # it: a public-client IdP that can still authenticate tokens beats no
+        # IdP at all (which 401s every request, the #2210 symptom). Confidential
+        # flows (e.g. /auth/userinfo code exchange) stay degraded until a key is
+        # provisioned and the secret is set via the Configs API.
+        if seed.client_secret is None:
+            logger.warning("IdpConfig seed failed.", exc_info=True)
+            return
+        logger.warning(
+            "IdpConfig seed could not persist client_secret (secret encryption "
+            "unavailable — no DYNASTORE_SECRET_KEY / JWT_SECRET / "
+            "SESSION_SECRET_KEY). Retrying WITHOUT client_secret so the OIDC "
+            "provider still registers and bearer-token validation works. Set a "
+            "key source and re-seed client_secret via the Configs API to restore "
+            "confidential flows.",
+            exc_info=True,
+        )
+
+    public_seed = seed.model_copy(update={"client_secret": None})
+    try:
+        await configs.set_config(IdpConfig, public_seed)
+        logger.info(
+            "Seeded IdpConfig from environment WITHOUT client_secret "
+            "(issuer_url=%s, client_id=%s).",
+            public_seed.issuer_url,
+            public_seed.client_id,
+        )
+    except Exception:
+        logger.warning("IdpConfig seed failed even without client_secret.", exc_info=True)
 
 
 async def _warn_jwt_attr_no_issuer_allowlist() -> None:

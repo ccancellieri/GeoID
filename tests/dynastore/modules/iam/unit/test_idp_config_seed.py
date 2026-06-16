@@ -231,3 +231,83 @@ async def test_cold_boot_initializes_storage_and_retries(monkeypatch, caplog):
     assert isinstance(cfg_arg, IdpConfig)
     assert cfg_arg.is_configured is True
     assert cfg_arg.issuer_url == "https://keycloak.example.com/realms/cold"
+
+
+# ---------------------------------------------------------------------------
+# Test: #2210 defense-in-depth — persist WITHOUT client_secret when secret
+# encryption is unavailable, so the OIDC provider still registers.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_persists_without_secret_when_encryption_unavailable(monkeypatch, caplog):
+    """When the secret-bearing seed cannot persist (set_config raises because
+    no Fernet key is provisioned to encrypt client_secret — the exact #2210
+    dev/review failure), the seed retries WITHOUT client_secret so an OIDC
+    provider still registers and bearer-token validation works.
+
+    Asserts: set_config is called twice; the second (succeeding) call carries
+    an IdpConfig that is_configured (issuer present) but has client_secret=None;
+    a WARNING explains the secret was dropped.
+    """
+    monkeypatch.setenv("IDP_ISSUER_URL", "https://keycloak.example.com/realms/nokeys")
+    monkeypatch.setenv("IDP_CLIENT_ID", "nokeys-client")
+    monkeypatch.setenv("IDP_CLIENT_SECRET", "cannot-encrypt-me")
+    monkeypatch.delenv("KEYCLOAK_ISSUER_URL", raising=False)
+    monkeypatch.delenv("KEYCLOAK_CLIENT_ID", raising=False)
+    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
+
+    configs = AsyncMock()
+    configs.list_configs = AsyncMock(return_value={})
+    # First persist (with secret) raises as if Fernet key is missing; the
+    # retry (without secret) succeeds.
+    configs.set_config = AsyncMock(
+        side_effect=[
+            RuntimeError("Error calling _serialize: secret encryption unavailable"),
+            None,
+        ]
+    )
+
+    with patch(
+        "dynastore.modules.iam.module.get_protocol",
+        return_value=configs,
+    ), caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.module"):
+        await _seed()
+
+    assert configs.set_config.await_count == 2
+    # The first attempt carried the secret; the second dropped it.
+    first_cfg = configs.set_config.await_args_list[0].args[1]
+    second_cfg = configs.set_config.await_args_list[1].args[1]
+    assert first_cfg.client_secret is not None
+    assert second_cfg.client_secret is None
+    assert second_cfg.is_configured is True
+    assert second_cfg.issuer_url == "https://keycloak.example.com/realms/nokeys"
+    assert any(
+        "without client_secret" in rec.getMessage().lower()
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING
+    ), "Expected a WARNING that client_secret was dropped"
+
+
+@pytest.mark.asyncio
+async def test_no_secret_retry_when_no_client_secret(monkeypatch):
+    """A public-client seed (no IDP_CLIENT_SECRET) that fails to persist must
+    NOT trigger the secret-less retry — there is no secret to drop, so a single
+    failed attempt is correct (avoids a misleading double write)."""
+    monkeypatch.setenv("IDP_ISSUER_URL", "https://keycloak.example.com/realms/pub")
+    monkeypatch.setenv("IDP_CLIENT_ID", "public-client")
+    monkeypatch.delenv("IDP_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("KEYCLOAK_ISSUER_URL", raising=False)
+    monkeypatch.delenv("KEYCLOAK_CLIENT_ID", raising=False)
+    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
+
+    configs = AsyncMock()
+    configs.list_configs = AsyncMock(return_value={})
+    configs.set_config = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with patch(
+        "dynastore.modules.iam.module.get_protocol",
+        return_value=configs,
+    ):
+        await _seed()
+
+    configs.set_config.assert_awaited_once()

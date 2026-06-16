@@ -36,7 +36,7 @@ Design:
   ``reveal()`` is called.
 - ``Secret.encrypt(plaintext)`` / ``Secret.decrypt(token)`` use Fernet
   (AES-128-CBC + HMAC-SHA256) with a key derived from ``DYNASTORE_SECRET_KEY``
-  (falling back to ``JWT_SECRET``) via SHA-256.
+  (falling back to ``JWT_SECRET``, then ``SESSION_SECRET_KEY``) via SHA-256.
 - Persistence layer calls ``encode_secrets_for_persistence(model_dump_dict)``
   before writing to Postgres — every Secret becomes
   ``{"__secret__": "<fernet-token>"}``.
@@ -45,10 +45,18 @@ Design:
 - API-response layer calls ``mask_secrets_for_response(model_dump_dict)`` —
   every Secret becomes the string ``"***"`` (no envelope, no ciphertext).
 
-Absence of a key (neither DYNASTORE_SECRET_KEY nor JWT_SECRET set) is a fatal
-misconfiguration in production. In dev / test we fall back to a deterministic
-dev key with a prominent warning; this must never be used to store real
-credentials.
+Absence of a key (none of DYNASTORE_SECRET_KEY, JWT_SECRET, or
+SESSION_SECRET_KEY set) is a fatal misconfiguration in production. In dev / test
+we fall back to a deterministic dev key with a prominent warning; this must
+never be used to store real credentials.
+
+``SESSION_SECRET_KEY`` is accepted as a last resort because every deployment
+tier already provisions it (it signs the Starlette session cookie); accepting
+it here means a working install no longer needs a *separate* secret just to
+encrypt config credentials. Caveat: when SESSION_SECRET_KEY is the active
+source, rotating it also orphans any secret encrypted under it — provision a
+dedicated DYNASTORE_SECRET_KEY before storing credentials you intend to rotate
+the session key independently of.
 """
 
 from __future__ import annotations
@@ -78,28 +86,37 @@ def _derive_key() -> bytes:
         1. ``DYNASTORE_SECRET_KEY`` — dedicated secret-encryption key.
         2. ``JWT_SECRET`` — reused so single-tenant deploys don't need to
            configure two keys.
-        3. Hard-coded dev fallback — only allowed when
+        3. ``SESSION_SECRET_KEY`` — last-resort reuse of the
+           already-provisioned Starlette session-signing key, so a working
+           install does not need a *separate* secret purely to encrypt config
+           credentials. See the module docstring for the rotation caveat.
+        4. Hard-coded dev fallback — only allowed when
            ``DYNASTORE_ALLOW_DEV_SECRET=1`` is set. Raises ``RuntimeError``
            otherwise so production containers fail fast instead of silently
            encrypting credentials with a publicly known key.
 
     Returns a URL-safe base64 32-byte blob suitable for ``cryptography.fernet.Fernet``.
     """
-    source = os.getenv("DYNASTORE_SECRET_KEY") or os.getenv("JWT_SECRET")
+    source = (
+        os.getenv("DYNASTORE_SECRET_KEY")
+        or os.getenv("JWT_SECRET")
+        or os.getenv("SESSION_SECRET_KEY")
+    )
     if not source:
         if os.getenv("DYNASTORE_ALLOW_DEV_SECRET") != "1":
             raise RuntimeError(
-                "Neither DYNASTORE_SECRET_KEY nor JWT_SECRET is set and "
-                "DYNASTORE_ALLOW_DEV_SECRET is not '1'. "
-                "Set one of DYNASTORE_SECRET_KEY or JWT_SECRET to a strong "
-                "random secret before starting in a non-development environment."
+                "None of DYNASTORE_SECRET_KEY, JWT_SECRET, or SESSION_SECRET_KEY "
+                "is set and DYNASTORE_ALLOW_DEV_SECRET is not '1'. "
+                "Set one of DYNASTORE_SECRET_KEY, JWT_SECRET, or SESSION_SECRET_KEY "
+                "to a strong random secret before starting in a non-development "
+                "environment."
             )
         global _warned_about_dev_key
         if not _warned_about_dev_key:
             logger.warning(
-                "SECRET ENCRYPTION: neither DYNASTORE_SECRET_KEY nor JWT_SECRET is "
-                "set; using a deterministic development key because "
-                "DYNASTORE_ALLOW_DEV_SECRET=1. NEVER use this in "
+                "SECRET ENCRYPTION: none of DYNASTORE_SECRET_KEY, JWT_SECRET, or "
+                "SESSION_SECRET_KEY is set; using a deterministic development key "
+                "because DYNASTORE_ALLOW_DEV_SECRET=1. NEVER use this in "
                 "production — rotate immediately after setting a real key."
             )
             _warned_about_dev_key = True

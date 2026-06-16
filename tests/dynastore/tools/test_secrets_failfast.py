@@ -45,6 +45,7 @@ def test_derive_key_raises_without_flag(monkeypatch):
     """Without DYNASTORE_ALLOW_DEV_SECRET=1 and no secret key, must raise."""
     monkeypatch.delenv("DYNASTORE_SECRET_KEY", raising=False)
     monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.delenv("SESSION_SECRET_KEY", raising=False)
     monkeypatch.delenv("DYNASTORE_ALLOW_DEV_SECRET", raising=False)
 
     secrets = _reload_secrets_module()
@@ -89,10 +90,46 @@ def test_derive_key_uses_jwt_secret_fallback(monkeypatch):
     assert len(key) == 44
 
 
+def test_derive_key_uses_session_secret_fallback(monkeypatch):
+    """SESSION_SECRET_KEY is used when neither DYNASTORE_SECRET_KEY nor
+    JWT_SECRET is set — it is the key source every deployment tier already
+    provisions (it signs the Starlette session cookie), so a working install
+    needs no separate secret to encrypt config credentials. Regression for
+    #2210: dev/review provision only SESSION_SECRET_KEY, so without this the
+    IdpConfig seed crashes while encrypting client_secret and no IdP registers.
+    """
+    monkeypatch.delenv("DYNASTORE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.setenv("SESSION_SECRET_KEY", "session-secret-for-testing")
+    monkeypatch.delenv("DYNASTORE_ALLOW_DEV_SECRET", raising=False)
+
+    secrets = _reload_secrets_module()
+    key = secrets._derive_key()
+    assert isinstance(key, bytes)
+    assert len(key) == 44
+
+
+def test_dedicated_key_precedence_over_session_secret(monkeypatch):
+    """DYNASTORE_SECRET_KEY wins over SESSION_SECRET_KEY so the dedicated,
+    independently-rotatable key always takes precedence over the shared one."""
+    monkeypatch.setenv("DYNASTORE_SECRET_KEY", "dedicated-key")
+    monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.setenv("SESSION_SECRET_KEY", "session-key")
+    monkeypatch.delenv("DYNASTORE_ALLOW_DEV_SECRET", raising=False)
+
+    import base64
+    import hashlib
+
+    secrets = _reload_secrets_module()
+    expected = base64.urlsafe_b64encode(hashlib.sha256(b"dedicated-key").digest())
+    assert secrets._derive_key() == expected
+
+
 def test_flag_value_must_be_exactly_one(monkeypatch):
     """DYNASTORE_ALLOW_DEV_SECRET='true' is NOT sufficient — only '1'."""
     monkeypatch.delenv("DYNASTORE_SECRET_KEY", raising=False)
     monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.delenv("SESSION_SECRET_KEY", raising=False)
     monkeypatch.setenv("DYNASTORE_ALLOW_DEV_SECRET", "true")
 
     secrets = _reload_secrets_module()
