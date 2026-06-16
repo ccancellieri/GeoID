@@ -88,8 +88,10 @@ def test_default_items_search_declares_op_appropriate_hints():
 
 
 def test_default_items_search_excludes_read_only_hints():
-    """``tiles`` (and other non-search hints) only make sense on READ — they
-    must NOT appear in SEARCH entries."""
+    """``tiles``, ``write``, and ``metadata`` only make sense on READ — they
+    must NOT appear in any SEARCH entry.  ``join`` IS declared on the PG SEARCH
+    entry so that a JOIN request with a CQL filter (_pick_operation → SEARCH)
+    still routes to PG rather than relaxing to ES."""
     from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.routing_config import (
         ItemsRoutingConfig, Operation,
@@ -99,18 +101,31 @@ def test_default_items_search_excludes_read_only_hints():
         assert Hint.TILES not in e.hints
         assert Hint.WRITE not in e.hints
         assert Hint.METADATA not in e.hints
-        assert Hint.JOIN not in e.hints
-    # tiles is still declared where it belongs: the PG READ entry
+    # JOIN must NOT appear on the ES SEARCH entry (ES cannot serve join queries).
+    es_search = next(
+        e for e in cfg.operations[Operation.SEARCH]
+        if e.driver_ref == "items_elasticsearch_driver"
+    )
+    assert Hint.JOIN not in es_search.hints
+    # JOIN MUST appear on the PG SEARCH entry (for CQL-filtered JOIN requests).
+    pg_search = next(
+        e for e in cfg.operations[Operation.SEARCH]
+        if e.driver_ref == "items_postgresql_driver"
+    )
+    assert Hint.JOIN in pg_search.hints
+    # tiles is still declared where it belongs: the PG READ entry.
     read = cfg.operations[Operation.READ]
     pg_read = next(e for e in read if e.driver_ref == "items_postgresql_driver")
     assert Hint.TILES in pg_read.hints
+    # JOIN is also declared on the PG READ entry (DWH join / OGC Joins).
+    assert Hint.JOIN in pg_read.hints
 
 
 def test_default_items_filtered_search_resolves_es_first():
     """A filtered/sorted search routes to ES first (the search engine): the
-    declared ES search surface is a strict superset-by-size of PG's, so the
-    best-overlap matcher's longest-effective tiebreak ranks ES above PG for any
-    flavour both serve. Unfiltered search keeps declared order (ES then PG)."""
+    best-overlap matcher's longest-effective tiebreak ranks ES above PG when
+    their hint surfaces are equal in size (ES wins via entry-order index 0).
+    Unfiltered search keeps declared order (ES then PG)."""
     from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.routing_config import (
         ItemsRoutingConfig, Operation,
@@ -130,7 +145,9 @@ def test_default_items_filtered_search_resolves_es_first():
         matched.sort(key=lambda t: (-len(t[1].hints), t[0]))
         return [e.driver_ref for _, e in matched]
 
-    assert len(es.hints) > len(pg.hints)  # ES wins the longest-effective tiebreak
+    # ES and PG now have equal surface size; ES wins common-flavour requests via
+    # entry-order tiebreak (index 0), not by being strictly larger.
+    assert len(es.hints) >= len(pg.hints)
     assert resolve(frozenset()) == [
         "items_elasticsearch_driver", "items_postgresql_driver",
     ]
@@ -138,6 +155,8 @@ def test_default_items_filtered_search_resolves_es_first():
         assert resolve(frozenset({flavour}))[0] == "items_elasticsearch_driver"
     # group_by is relational-only → PG even though ES is listed first
     assert resolve(frozenset({Hint.GROUP_BY})) == ["items_postgresql_driver"]
+    # join routes to PG (ES does not declare it).
+    assert resolve(frozenset({Hint.JOIN})) == ["items_postgresql_driver"]
 
 
 def test_collection_routing_default_write_is_pg_fatal():

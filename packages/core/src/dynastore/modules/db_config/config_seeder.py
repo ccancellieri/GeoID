@@ -143,6 +143,27 @@ async def seed_default_configs(engine: DbResource) -> None:
                 _SEED_LOCK_KEY,
             )
             return
+        if json_files and config_mgr is not None:
+            # Cold-boot guard (#2209): ensure ``configs.platform_configs`` exists
+            # before writing any seed. ``PlatformConfigService`` (module priority
+            # 0) skips its DDL when the DB engine is not yet up (DBService is
+            # priority 10), so on a fresh DB the table can be absent when this
+            # seeder runs — silently dropping every seed (notably ``idp_config``),
+            # which leaves authentication with no IdP registered until a restart.
+            # Idempotent ``CREATE ... IF NOT EXISTS`` under the advisory lock we
+            # already hold — a bootstrap ensure, not a migration.
+            try:
+                from dynastore.modules.db_config.platform_config_service import (
+                    PlatformConfigService,
+                )
+
+                await PlatformConfigService.initialize_storage(conn)
+            except Exception:
+                logger.warning(
+                    "config_seeder: platform config storage ensure failed; "
+                    "seeds may be skipped if the table is absent.",
+                    exc_info=True,
+                )
         await _seed_from_files(conn, config_mgr, json_files)
 
 

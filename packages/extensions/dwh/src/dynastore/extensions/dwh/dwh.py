@@ -276,9 +276,10 @@ class DwhService(ExtensionProtocol):
         # Stream via ItemService. Force the full-precision PG read path with
         # Hint.JOIN: the public default routing puts Elasticsearch first for
         # READ, but ES only carries simplified geometry and cannot run the
-        # ST_Transform projection this join builds into the request — only the
-        # PG driver advertises Hint.JOIN, so resolution selects it (and, being
-        # the read-primary fallback, hands the read to the inline PG SQL path).
+        # ST_Transform projection this join builds into the request. The
+        # default PG READ entry declares Hint.JOIN so the best-overlap matcher
+        # selects PG (and, being the read-primary fallback, hands the read to
+        # the inline PG SQL path).
         # The access_filter set above rides along on query_req into the
         # optimiser, so the forced PG path stays per-row ABAC-enforced.
         # stream_normalized_items lifts PG model_extra columns into

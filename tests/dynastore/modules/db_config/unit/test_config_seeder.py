@@ -363,6 +363,107 @@ async def test_guard_set_still_applies_override_seeds(monkeypatch, tmp_path):
     config_mgr.set_config.assert_awaited_once()
 
 
+# ---------------------------------------------------------------------------
+# Cold-boot storage ensure (#2209)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensures_platform_storage_before_seeding(monkeypatch, tmp_path):
+    """The seeder ensures configs.platform_configs exists before any set_config.
+
+    Cold-boot regression #2209: PlatformConfigService (priority 0) skips its DDL
+    when the engine is not yet up, so on a fresh DB the table can be absent when
+    this priority-15 seeder runs — silently dropping idp_config and breaking
+    auth. The seeder must self-heal by calling initialize_storage first.
+    """
+    _write_seed(tmp_path / "defaults", "task-routing.json", {
+        "class_key": "task_routing_config",
+        "value": {"tasks": {"t_a": [{"consumers": ["catalog"], "runner": "background"}]}},
+    })
+    monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
+
+    order: list[str] = []
+    config_mgr = AsyncMock()
+    config_mgr.list_configs = AsyncMock(return_value={})
+    config_mgr.set_config = AsyncMock(side_effect=lambda *a, **k: order.append("set_config"))
+
+    init_storage = AsyncMock(side_effect=lambda *a, **k: order.append("initialize_storage"))
+
+    with patch("dynastore.tools.discovery.get_protocol", return_value=config_mgr), \
+         patch.object(seeder, "acquire_startup_lock", _fake_lock), \
+         patch(
+             "dynastore.modules.db_config.platform_config_service."
+             "PlatformConfigService.initialize_storage",
+             init_storage,
+         ):
+        await seeder.seed_default_configs(engine=object())
+
+    init_storage.assert_awaited_once()
+    config_mgr.set_config.assert_awaited_once()
+    # Storage must be ensured BEFORE the first config write, else the write
+    # races the missing table on a fresh DB.
+    assert order == ["initialize_storage", "set_config"]
+
+
+@pytest.mark.asyncio
+async def test_storage_ensure_failure_does_not_abort_seeding(
+    monkeypatch, tmp_path, caplog,
+):
+    """A failed storage-ensure is non-fatal: seeding still proceeds (warn only).
+
+    The ensure is a best-effort self-heal; if it fails (e.g. transient DB error)
+    boot must not abort — the existing per-row failure handling still applies.
+    """
+    _write_seed(tmp_path / "defaults", "task-routing.json", {
+        "class_key": "task_routing_config",
+        "value": {"tasks": {"t_a": [{"consumers": ["catalog"], "runner": "background"}]}},
+    })
+    monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
+
+    config_mgr = AsyncMock()
+    config_mgr.list_configs = AsyncMock(return_value={})
+    config_mgr.set_config = AsyncMock()
+
+    init_storage = AsyncMock(side_effect=RuntimeError("transient DB error"))
+
+    caplog.set_level("WARNING")
+    with patch("dynastore.tools.discovery.get_protocol", return_value=config_mgr), \
+         patch.object(seeder, "acquire_startup_lock", _fake_lock), \
+         patch(
+             "dynastore.modules.db_config.platform_config_service."
+             "PlatformConfigService.initialize_storage",
+             init_storage,
+         ):
+        # Must NOT raise — ensure failure is best-effort.
+        await seeder.seed_default_configs(engine=object())
+
+    init_storage.assert_awaited_once()
+    config_mgr.set_config.assert_awaited_once()
+    assert any(
+        "platform config storage ensure failed" in r.message.lower()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_storage_ensure_when_no_seeds(monkeypatch, tmp_path):
+    """No defaults → no storage-ensure attempt (nothing to write)."""
+    monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "nope")
+
+    init_storage = AsyncMock()
+    with patch("dynastore.tools.discovery.get_protocol", MagicMock()), \
+         patch.object(seeder, "acquire_startup_lock", _fake_lock), \
+         patch(
+             "dynastore.modules.db_config.platform_config_service."
+             "PlatformConfigService.initialize_storage",
+             init_storage,
+         ):
+        await seeder.seed_default_configs(engine=object())
+
+    init_storage.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_guard_unset_seeds_then_runs_normally(monkeypatch, tmp_path):
     """When the guard is not set, normal seeding logic runs unchanged."""

@@ -152,10 +152,11 @@ async def _try_driver_dispatch(
 
     ``hints`` are forwarded to driver resolution. A caller that needs the
     full-precision PG geometry path (e.g. the DWH join / feature export) passes
-    ``{Hint.JOIN}`` (or ``{Hint.GEOMETRY_EXACT}``): only PG advertises those, so
-    resolution yields the PG read-primary, ``is_query_fallback_driver`` is True,
-    and this returns ``None`` to hand the read to the inline PG SQL path. With
-    the default empty hints the public default routing (ES-first) is preserved.
+    ``{Hint.JOIN}`` (or ``{Hint.GEOMETRY_EXACT}``): the default READ routing
+    declares those on the PG entry, so the best-overlap matcher selects PG,
+    ``is_query_fallback_driver`` is True, and this returns ``None`` to hand the
+    read to the inline PG SQL path. With the default empty hints the public
+    default routing (ES-first) is preserved.
     """
     try:
         from dynastore.modules.storage.router import get_driver

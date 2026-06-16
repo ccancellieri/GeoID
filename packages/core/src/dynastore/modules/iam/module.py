@@ -263,8 +263,12 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     exc_info=True,
                 )
 
-            # IdP factory — config-first (IdpConfig PluginConfig), with a
-            # one-release deprecated ENV fallback. See _register_identity_provider.
+            # IdP factory — config-first from IdpConfig (PluginConfig). The
+            # legacy IDP_*/KEYCLOAK_* ENV fallback was retired in #2024, so a
+            # missing idp_config row means no IdP is registered and auth fails
+            # closed. The config_seeder now ensures configs.platform_configs
+            # exists before seeding idp_config (#2209), closing the cold-boot
+            # race that previously left the row unseeded on a fresh DB.
             await self._register_identity_provider()
 
             yield
@@ -571,6 +575,11 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
 async def _seed_oidc_role_sync_config(engine: Any) -> None:
     """Idempotent one-shot seed of OidcRoleSyncConfig(reconcile_enabled=True).
 
+    Persists the COMPLETE config (every field marked as set) so the stored
+    row is self-describing and ``role_mapping`` is pinned for this install,
+    rather than a partial ``{"reconcile_enabled": true}`` row that drops the
+    mapping under ``set_config``'s ``exclude_unset`` serialization (#2210).
+
     Skipped when a row already exists so operator PATCHes are preserved.
     Handles the cold-boot race where configs storage may not yet exist.
     """
@@ -599,10 +608,29 @@ async def _seed_oidc_role_sync_config(engine: Any) -> None:
 
     existing = cast(Any, persisted.get(OidcRoleSyncConfig))
     if existing is None:
-        seed = OidcRoleSyncConfig(reconcile_enabled=True)
+        # Persist the COMPLETE config, not just ``reconcile_enabled`` (#2210).
+        # ``set_config`` serializes with ``model_dump(exclude_unset=True)``, so
+        # ``OidcRoleSyncConfig(reconcile_enabled=True)`` would store a row of
+        # only ``{"reconcile_enabled": true}`` and drop ``role_mapping``. The
+        # read path re-applies model defaults via ``model_validate``, so a
+        # fresh install still resolves the default mapping at auth time — but
+        # the stored row is misleadingly partial: an operator inspecting or
+        # PATCHing ``configs.platform_configs`` sees no mapping, and any future
+        # raw-dict merge over that row could drop it entirely. Round-tripping
+        # through a full ``model_dump`` marks every field as set so the seeded
+        # row is self-describing and the mapping is pinned for this
+        # installation (deliberately opting this one seed out of the
+        # default-propagation that ``exclude_unset`` gives ordinary writes).
+        seed = OidcRoleSyncConfig.model_validate(
+            OidcRoleSyncConfig(reconcile_enabled=True).model_dump()
+        )
         try:
             await configs.set_config(OidcRoleSyncConfig, seed)
-            logger.info("Seeded OidcRoleSyncConfig(reconcile_enabled=True).")
+            logger.info(
+                "Seeded OidcRoleSyncConfig (reconcile_enabled=True, "
+                "role_mapping=%s).",
+                seed.role_mapping,
+            )
         except Exception:
             logger.warning("OidcRoleSyncConfig seed failed.", exc_info=True)
         effective = seed
