@@ -147,6 +147,17 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             except Exception as e:
                 logger.warning("IamModule: OidcRoleSyncConfig seed failed (non-fatal): %s", e)
 
+            # Seed IdpConfig from IDP_* ENV on cold boot when no configured row
+            # exists, so IamModule registers an identity provider and token auth
+            # works without a manually-seeded row (#2210). Fail-closed when no
+            # ENV issuer is present. Must run before _register_identity_provider().
+            try:
+                db = get_protocol(DatabaseProtocol)
+                engine = db.engine if db else None
+                await _seed_idp_config(engine)
+            except Exception as e:
+                logger.warning("IamModule: IdpConfig seed failed (non-fatal): %s", e)
+
             # Warn operators when JWT-claim attribute enrichment is active
             # (claim_map non-empty) but no issuer_allowlist is configured.
             # In multi-provider deployments any verified issuer's claim values
@@ -154,20 +165,23 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             # or restricting ABAC access silently.
             await _warn_jwt_attr_no_issuer_allowlist()
 
-            # Cold-boot preset bootstrapping: apply each foundational preset
-            # exactly once per DB. Each call is idempotent — an
-            # iam.applied_presets sentinel prevents re-application on restarts.
-            # Sysadmin DELETE of a preset removes the sentinel, re-arming
-            # the bootstrap on the next restart.
-            # Each preset is bootstrapped in its OWN try/except: they are
-            # independent (default_roles_baseline seeds the role rows;
-            # iam_baseline seeds the platform policy DEFINITIONS + the admin /
-            # unauthenticated role->policy bindings that gate /iam/me,
-            # /auth/userinfo and /web/static/*; public_access_baseline unions
-            # public_access). A failure seeding one MUST NOT abort the others —
-            # otherwise a single flaky cold-boot query leaves the whole platform
-            # deny-by-default (an empty `unauthenticated` role => 403 on every
-            # static asset, so the login UI itself cannot load).
+            # Cold-boot preset bootstrapping: foundational auth presets MUST
+            # self-heal every cold-boot (force=True), exactly like
+            # public_access_baseline below.  Without force=True the platform
+            # bootstrap guard (platform.bootstrap_initialized) short-circuits
+            # bootstrap_preset_if_absent BEFORE the per-preset sentinel is
+            # checked — once a DB has booted once, force=False presets are
+            # permanently skipped and never re-create a lost policy or binding
+            # (e.g. a lost sysadmin_full_access policy means sysadmin is DENIED
+            # on every admin route).  apply() is idempotent: default_roles_baseline
+            # uses _upsert_role (preserves existing policy lists; no destructive
+            # replace), and iam_baseline uses bind_policy_to_role (ADDITIVE append,
+            # never full-replace) — so re-applying on a live DB is a no-op once
+            # the grants are present.  public_access_baseline still runs LAST with
+            # force=True so any binding a re-applied default_roles_baseline
+            # transiently drops is fully restored before any request is served.
+            # Each preset is bootstrapped in its OWN try/except so a failure
+            # in one does NOT abort the others (partial bootstrap > full abort).
             db = get_protocol(DatabaseProtocol)
             engine = db.engine if db else None
             from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
@@ -176,7 +190,7 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                 "iam_baseline",
             ):
                 try:
-                    await bootstrap_preset_if_absent(engine, preset_name=_preset_name)
+                    await bootstrap_preset_if_absent(engine, preset_name=_preset_name, force=True)
                 except Exception as exc:
                     logger.error(
                         "IamModule: cold-boot bootstrap of preset %r failed; "
@@ -646,6 +660,93 @@ async def _seed_oidc_role_sync_config(engine: Any) -> None:
             "is not set. OIDC role sync will accept tokens from any issuer. "
             "Set issuer_whitelist to restrict mapped-role grants to trusted issuers."
         )
+
+
+async def _seed_idp_config(engine: Any) -> None:
+    """Idempotent cold-boot seed of IdpConfig from IDP_* / KEYCLOAK_* ENV.
+
+    Runs only when NO IdpConfig row exists in the platform-configs table
+    (presence is checked via ``list_configs`` — exactly like
+    ``_seed_oidc_role_sync_config``). When any row is found the function returns
+    immediately so operator or seed-file edits are never overwritten — even a
+    deliberately ``type='saml2'`` or partially-configured row. Healing targets
+    the *absent*-row case (the dev / Cloud Run failure in #2210); it never
+    second-guesses an operator-written config.
+
+    When no ENV issuer is set, the function logs a clear WARNING and returns
+    without writing (fail-closed per #2024 — no anonymous IdP registration).
+
+    Handles the cold-boot race where the platform-configs table may not yet
+    exist: ``list_configs`` raises, storage is initialized, then retried once.
+    """
+    import os
+
+    from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+    from dynastore.tools.secrets import Secret
+
+    configs = get_protocol(PlatformConfigsProtocol)
+    if configs is None:
+        logger.debug("IdpConfig seed skipped: PlatformConfigsProtocol not registered.")
+        return
+
+    try:
+        persisted = await configs.list_configs()
+    except Exception:
+        try:
+            from dynastore.modules.db_config.platform_config_service import PlatformConfigService
+            await PlatformConfigService.initialize_storage(engine)
+            persisted = await configs.list_configs()
+        except Exception:
+            logger.warning(
+                "IdpConfig seed skipped: platform configs storage "
+                "unavailable after ensure-and-retry.",
+                exc_info=True,
+            )
+            return
+
+    if persisted.get(IdpConfig) is not None:
+        # A row already exists — operator or seed-file wins. Never overwrite,
+        # even a deliberately type='saml2' or partially-configured row; the
+        # seed heals only the absent-row case (#2210).
+        return
+
+    issuer = os.getenv("IDP_ISSUER_URL") or os.getenv("KEYCLOAK_ISSUER_URL")
+    if not issuer:
+        logger.warning(
+            "IdpConfig: no configured idp_config row and neither IDP_ISSUER_URL "
+            "nor KEYCLOAK_ISSUER_URL is set in the environment. No identity "
+            "provider will be registered — token-authenticated requests will "
+            "receive 401. To fix: seed 'idp_config' via the Configs API "
+            "(platform_configs class_key 'idp_config') or set IDP_ISSUER_URL "
+            "and IDP_CLIENT_ID in the environment before starting."
+        )
+        return
+
+    client_id = os.getenv("IDP_CLIENT_ID") or os.getenv("KEYCLOAK_CLIENT_ID") or "dynastore-api"
+    raw_secret = os.getenv("IDP_CLIENT_SECRET") or os.getenv("KEYCLOAK_CLIENT_SECRET")
+    client_secret = Secret(raw_secret) if raw_secret else None
+
+    seed = IdpConfig(
+        type="oidc",
+        issuer_url=issuer,
+        client_id=client_id,
+        client_secret=client_secret,
+        audience=os.getenv("IDP_AUDIENCE") or os.getenv("KEYCLOAK_AUDIENCE"),
+        public_url=os.getenv("IDP_PUBLIC_URL") or os.getenv("KEYCLOAK_PUBLIC_URL"),
+        roles_claim_path=os.getenv("IDP_ROLES_CLAIM_PATH") or "realm_access.roles",
+    )
+
+    try:
+        await configs.set_config(IdpConfig, seed)
+        logger.info(
+            "Seeded IdpConfig from environment (issuer_url=%s, client_id=%s). "
+            "This is a one-shot cold-boot bridge — edit via the Configs API "
+            "(platform_configs class_key 'idp_config') to change without restart.",
+            seed.issuer_url,
+            seed.client_id,
+        )
+    except Exception:
+        logger.warning("IdpConfig seed failed.", exc_info=True)
 
 
 async def _warn_jwt_attr_no_issuer_allowlist() -> None:
