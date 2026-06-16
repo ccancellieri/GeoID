@@ -113,14 +113,18 @@ def test_stats_area_is_double() -> None:
     assert m["properties"]["stats"]["properties"]["area"]["type"] == "double"
 
 
-def test_stats_centroid_is_keyword() -> None:
-    """centroid is stored as WKB hex — keyword type, NOT geo_point."""
-    # A geo_point would parse the WKB hex as text and misinterpret it, whereas a
-    # keyword field gives us a single sortable/filterable token that round-trips
-    # to WKB for further decoding client-side.
+def test_stats_centroid_is_geo_point() -> None:
+    """centroid is a ``[x, y]`` WGS84 coordinate pair → geo_point (refs #1285).
+
+    The PG geometries sidecar emits the centroid via ``ARRAY[ST_X, ST_Y]``, a
+    coordinate pair ES ingests natively as a geo_point. ``ignore_malformed`` is
+    pinned so a stray projected-SRID coordinate is kept in ``_source`` rather
+    than rejecting the whole doc.
+    """
     m = _mapping()
     centroid_mapping = m["properties"]["stats"]["properties"]["centroid"]
-    assert centroid_mapping["type"] == "keyword"
+    assert centroid_mapping["type"] == "geo_point"
+    assert centroid_mapping.get("ignore_malformed") is True
 
 
 def test_stats_spatial_cells_are_keyword() -> None:
@@ -194,16 +198,26 @@ def test_system_fields_not_leaked_into_properties_lane() -> None:
 # identity fields — flat at root
 # ---------------------------------------------------------------------------
 
-def test_identity_fields_are_flat_at_root_not_in_system_or_stats() -> None:
-    """Identity fields (external_id, asset_id, geoid) are part of COMMON_PROPERTIES
-    and must be routable flat at the doc root, not buried in stats/system objects."""
+def test_identity_fields_are_searchable_keyword_at_root() -> None:
+    """Identity fields (external_id, asset_id, geoid) are flat-at-root keyword
+    fields — the canonical SEARCHABLE identity lane (refs #1285).
+
+    Per ``classify_container`` the identity axes live flat at the document root,
+    and the read-side resolvers route their filters/sorts there. Pre-#1285 the
+    public items mapping declared neither ``external_id`` nor ``asset_id`` at
+    root, so they rode in ``_source`` un-indexed and every term filter silently
+    missed. They must be indexed keyword at root and must NOT leak into the
+    ``system`` or ``stats`` nested objects."""
     m = _mapping()
-    # They must not appear under stats or system nested objects.
-    stats_props = m["properties"].get("stats", {}).get("properties", {})
-    system_props = m["properties"].get("system", {}).get("properties", {})
+    root_props = m["properties"]
+    stats_props = root_props.get("stats", {}).get("properties", {})
+    system_props = root_props.get("system", {}).get("properties", {})
     for name in ("external_id", "asset_id", "geoid"):
-        assert name not in stats_props, f"{name!r} leaked into stats"
+        assert root_props.get(name) == {"type": "keyword"}, (
+            f"{name!r} must be a searchable keyword at the document root"
+        )
         assert name not in system_props, f"{name!r} leaked into system"
+        assert name not in stats_props, f"{name!r} leaked into stats"
 
 
 # ---------------------------------------------------------------------------
@@ -248,22 +262,51 @@ def test_unknown_container_field_routes_to_properties() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ITEM_MAPPING backward compat — Tier-1 only, no stats/system yet
+# ITEM_MAPPING — canonical system/stats vocab is ALWAYS emitted (refs #1285)
 # ---------------------------------------------------------------------------
 
-def test_item_mapping_default_has_no_stats_or_system_when_tier1_only() -> None:
-    """The default ITEM_MAPPING (Tier 1 only via build_known_fields()) does not
-    emit stats/system containers — those only appear when FieldDefinition values
-    carry the container tag, which the Tier-1 plain-dict fields do not."""
+def test_item_mapping_default_always_has_canonical_system_and_stats() -> None:
+    """The default ITEM_MAPPING (Tier-1 only, no FieldDefinition container tags)
+    STILL emits the typed ``system`` and ``stats`` containers, seeded from the
+    bounded canonical vocab (refs #1285).
+
+    Pre-#1285 these containers appeared only when a known-field carried a
+    container tag, so a plain Tier-1 catalog left ``system.*`` / ``stats.*``
+    stored-but-not-indexed. The bounded vocab is now baked in unconditionally so
+    every system/stats field is queryable and uniformly typed across the
+    cross-catalog alias regardless of per-collection config."""
     from dynastore.modules.elasticsearch.mappings import ITEM_MAPPING
-    # Tier-1 is plain dicts, not FieldDefinition objects; no container tag.
-    # build_item_mapping should handle both shapes gracefully.
     assert ITEM_MAPPING["dynamic"] is False
-    # The standard properties lane must be intact.
     assert "properties" in ITEM_MAPPING["properties"]
-    # stats / system are absent from the Tier-1 default mapping (no tagged fields).
-    assert "stats" not in ITEM_MAPPING["properties"]
-    assert "system" not in ITEM_MAPPING["properties"]
+    # Both canonical containers present even with Tier-1 plain dicts only.
+    sys_props = ITEM_MAPPING["properties"]["system"]["properties"]
+    stats_props = ITEM_MAPPING["properties"]["stats"]["properties"]
+    # Independent expected oracles (NOT the module SSOT) so the assertion also
+    # guards against accidental mutation of CANONICAL_* leaking into the build.
+    expected_system = {
+        "geometry_hash": {"type": "keyword"},
+        "attributes_hash": {"type": "keyword"},
+        "validity": {"type": "date_range"},
+        "transaction_time": {"type": "date"},
+        "deleted_at": {"type": "date"},
+    }
+    # Identity axes are flat-at-root keyword, NOT system members.
+    for ident in ("external_id", "asset_id", "geoid"):
+        assert ITEM_MAPPING["properties"].get(ident) == {"type": "keyword"}
+        assert ident not in sys_props
+    expected_stats = {
+        "area": {"type": "double"},
+        "length": {"type": "double"},
+        "perimeter": {"type": "double"},
+        "vertex_count": {"type": "long"},
+        "hole_count": {"type": "long"},
+        "centroid": {"type": "geo_point", "ignore_malformed": True},
+        "bbox": {"type": "float"},
+    }
+    for name, es_type in expected_system.items():
+        assert sys_props.get(name) == es_type, f"system.{name} missing/mistyped"
+    for name, es_type in expected_stats.items():
+        assert stats_props.get(name) == es_type, f"stats.{name} missing/mistyped"
 
 
 # ---------------------------------------------------------------------------

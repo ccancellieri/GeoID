@@ -214,6 +214,69 @@ _SYSTEM_GEOMETRY_SIMPLIFICATION: Dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
+# Canonical container type SSOT (refs #1285).
+#
+# The ``system`` and ``stats`` lanes carry a BOUNDED, well-known vocabulary, so
+# the strict items mapping declares them UNCONDITIONALLY — unlike ``properties``
+# (whose per-key growth is capped by the ``extras`` flattened lane), a fixed set
+# of names can never explode the index. Declaring them on every per-catalog
+# index — regardless of which collections it currently hosts — is what makes
+# every system/stats field queryable AND uniformly typed across the
+# cross-catalog ``/search`` alias: a field cannot be a ``double`` in one member
+# index and a ``keyword`` in another, because the canonical type below always
+# wins over any per-collection (queryable- or Tier-2-derived) override.
+#
+# Types are pinned to the values the write path actually emits
+# (``canonical_doc.build_canonical_index_doc`` + the PG geometries sidecar):
+#   * content-hash strings  -> keyword
+#   * lifecycle timestamps   -> date ; validity window -> date_range
+#   * scalar geometry stats  -> double ; integer counts -> long
+#   * centroid ([x, y] WGS84 pair)    -> geo_point (``ignore_malformed`` so a
+#       stray projected-SRID coordinate is kept in ``_source`` but never rejects
+#       the doc — the canonical ES envelope is WGS84, matching the root
+#       ``geometry``/``bbox``)
+#   * bbox ([minx, miny, maxx, maxy]) -> float (mirrors the root ``bbox`` type)
+#
+# NOTE: the three IDENTITY axes (``geoid`` / ``external_id`` / ``asset_id``)
+# are NOT in this container — per ``classify_container`` they live FLAT at the
+# document root and are declared (and indexed as keyword) in COMMON_PROPERTIES.
+# The read-side resolvers (``resolve_es_field_path`` / ``build_es_field_mapping``
+# / ``parse_sort``) route identity filters/sorts to that flat root path, so the
+# root declaration is what makes them queryable. ``system`` carries only the
+# lifecycle + content-hash vocabulary below.
+CANONICAL_SYSTEM_TYPES: Dict[str, Any] = {
+    "geometry_hash":    {"type": "keyword"},
+    "attributes_hash":  {"type": "keyword"},
+    "validity":         {"type": "date_range"},
+    "transaction_time": {"type": "date"},
+    "deleted_at":       {"type": "date"},
+}
+
+# Only the fixed-name geometry stats whose emitted shape is verified are pinned
+# here. Dynamically-named spatial cells (``s2_7``, ``h3_10``, ``geohash_6`` —
+# resolution-dependent per collection) and 3D/temporal stats whose wire shape is
+# not yet verified (``centroid_3d``, ``z_range``, ``temporal_duration``) are
+# intentionally omitted: they are typed on demand from the collection queryables
+# when present, and otherwise ride in ``_source`` (no type mismatch risk).
+CANONICAL_STATS_TYPES: Dict[str, Any] = {
+    "area":                    {"type": "double"},
+    "volume":                  {"type": "double"},
+    "perimeter":               {"type": "double"},
+    "length":                  {"type": "double"},
+    "circularity":             {"type": "double"},
+    "convexity":               {"type": "double"},
+    "aspect_ratio":            {"type": "double"},
+    "surface_area":            {"type": "double"},
+    "surface_to_volume_ratio": {"type": "double"},
+    "net_floor_area":          {"type": "double"},
+    "vertical_gradient":       {"type": "double"},
+    "vertex_count":            {"type": "long"},
+    "hole_count":              {"type": "long"},
+    "centroid":                {"type": "geo_point", "ignore_malformed": True},
+    "bbox":                    {"type": "float"},
+}
+
+# ---------------------------------------------------------------------------
 # Common top-level fields. Extended with the internal ``_*`` write-time
 # trackers attached by ItemsElasticsearchDriver.write_entities so the
 # strict items root mapping accepts them.
@@ -224,6 +287,16 @@ COMMON_PROPERTIES: Dict[str, Any] = {
     "id":              {"type": "keyword"},
     "catalog_id":      {"type": "keyword"},
     "collection_id":   {"type": "keyword"},
+    # Identity axes that live FLAT at the document root (refs #1285). The write
+    # path mirrors these from the canonical envelope's identity section, and the
+    # read-side resolvers route ``external_id`` / ``asset_id`` filters & sorts
+    # here (see ``cql_to_es._ENVELOPE_FIELD_PATHS`` and ``resolve_es_field_path``
+    # → identity branch). Without an explicit keyword mapping they fall under the
+    # strict ``dynamic: false`` root, ride in ``_source`` un-indexed, and every
+    # ``term``/``terms`` filter on them silently returns nothing — which is the
+    # exact bug this declaration fixes. ``geoid`` is already declared below.
+    "external_id":     {"type": "keyword"},
+    "asset_id":        {"type": "keyword"},
     # STAC Item documents use the field name ``collection`` (not
     # ``collection_id``) — and that's the field both /search and the
     # ``items_es_ops`` term-filter target. Without an explicit keyword
@@ -312,16 +385,22 @@ def _field_def_es_type(field_def: Any) -> Dict[str, Any]:
 
     Pinned types for the canonical containers (refs #1800):
 
-    * ``system.external_id`` / ``system.asset_id`` / ``system.geometry_hash``
-      / ``system.attributes_hash`` / ``system.validity`` → ``keyword``
+    * ``system.geometry_hash`` / ``system.attributes_hash`` → ``keyword``
+      (``system.validity`` → ``date_range``; identity ``external_id`` /
+      ``asset_id`` are flat-root keyword fields, not system members)
     * ``system.transaction_time`` / ``system.deleted_at`` → ``date``
     * ``stats.area`` → ``double``
-    * ``stats.centroid`` → ``keyword`` (WKB hex — single sortable/filterable
-      token; NOT geo_point: the WKB encoding is not a lat/lon pair, so ES
-      would either reject it or silently misinterpret the bytes.  Clients
-      that need point queries on centroid should index a separate geo_point
-      projection; the keyword field is for exact CQL2 matches and sorting).
+    * ``stats.centroid`` → ``geo_point`` (the geometries sidecar emits a
+      ``[x, y]`` WGS84 coordinate pair via ``ARRAY[ST_X, ST_Y]``, which ES
+      ingests natively as a geo_point; pinned with ``ignore_malformed`` in
+      :data:`CANONICAL_STATS_TYPES` so a stray projected coordinate is kept in
+      ``_source`` rather than rejecting the doc).
     * ``stats.s2_*`` / ``stats.h3_*`` / ``stats.geohash_*`` → ``keyword``
+
+    NOTE: the canonical system/stats types are pinned in
+    :data:`CANONICAL_SYSTEM_TYPES` / :data:`CANONICAL_STATS_TYPES` and win over
+    whatever this function would derive for those well-known names; this mapping
+    governs only the per-collection (queryable/Tier-2) fields the SSOT omits.
     """
     if not hasattr(field_def, "data_type"):
         # Plain dict — return as-is.
@@ -360,14 +439,18 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
       the unknown tail rides on the root ``_search_text`` field, which
       :func:`items_projection.project_item_for_es` populates from the
       same extras values at write time.
-    * ``stats.dynamic = false`` (new, refs #1800) — typed nested object for
+    * ``stats.dynamic = false`` (refs #1800/#1285) — typed nested object for
       geometry-derived statistics (``area``, ``centroid``, spatial cells).
-      Only present when the ``known_fields`` map carries at least one entry
-      with ``container="stats"``.
-    * ``system.dynamic = false`` (new, refs #1800) — typed nested object for
-      identity + lifecycle fields (``geometry_hash``, ``attributes_hash``,
-      ``validity``, ``transaction_time``, ``deleted_at``).
-      Only present when ``known_fields`` carries a system-tagged entry.
+      ALWAYS emitted: seeded from the bounded :data:`CANONICAL_STATS_TYPES`
+      vocab, then extended with any extra stats names the ``known_fields`` map
+      carries (e.g. resolution-dependent spatial cells).
+    * ``system.dynamic = false`` (refs #1800/#1285) — typed nested object for
+      lifecycle + content-hash fields (``geometry_hash``, ``attributes_hash``,
+      ``validity``, ``transaction_time``, ``deleted_at``). ALWAYS emitted:
+      seeded from the bounded :data:`CANONICAL_SYSTEM_TYPES` vocab so every
+      system field is queryable and uniformly typed across the cross-catalog
+      alias. The identity axes (``geoid``/``external_id``/``asset_id``) are NOT
+      here — they are flat-at-root keyword fields in COMMON_PROPERTIES.
 
     The projection helper (``items_projection.project_item_for_es``)
     enforces the shape at write time; ES enforces it at the mapping
@@ -379,29 +462,38 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
     # the right nested object.  Plain-dict Tier-1 entries carry no container
     # attribute and always route to ``properties``.
     props_fields: Dict[str, Any] = {}
-    stats_fields: Dict[str, Any] = {}
-    system_fields: Dict[str, Any] = {}
+    # Seed the bounded canonical vocab so ``system`` and ``stats`` are ALWAYS
+    # declared with their canonical types. Per-collection (queryable- or
+    # Tier-2-derived) entries may add NEW names below, but ``setdefault`` means
+    # they can never override a canonical type — this is what keeps the
+    # cross-catalog ``/search`` alias uniformly typed (refs #1285). ``validity``
+    # is seeded as ``date_range`` here, matching the driver-side conversion in
+    # ``canonical_doc._validity_to_es_range`` (a raw tstzrange would be rejected).
+    # Deep-ish copy: the leaf type dicts must NOT be shared with the module-level
+    # CANONICAL_* SSOT (or with the cached ITEM_MAPPING constant), else a caller
+    # that mutates a built mapping's leaf would corrupt the SSOT for every later
+    # build. The leaves are flat one-level dicts, so a per-value ``dict(v)`` copy
+    # is sufficient and cheap.
+    stats_fields: Dict[str, Any] = {k: dict(v) for k, v in CANONICAL_STATS_TYPES.items()}
+    system_fields: Dict[str, Any] = {k: dict(v) for k, v in CANONICAL_SYSTEM_TYPES.items()}
 
     for name, field_def in known_fields.items():
         container = _field_def_container(name, field_def)
         es_type = _field_def_es_type(field_def)
         if container == "stats":
-            stats_fields[name] = es_type
+            # Canonical wins; queryables only contribute names the SSOT omits
+            # (e.g. resolution-dependent spatial cells ``s2_7`` / ``h3_10``).
+            stats_fields.setdefault(name, es_type)
         elif container == "system":
-            # validity is the temporal window — typed as an ES ``date_range``
-            # (#1828). The driver-side write converts the PG ``tstzrange`` Range
-            # object into the matching range body ({gte|gt, lte|lt}) in
-            # ``canonical_doc._validity_to_es_range``; the two MUST stay in sync
-            # (a raw tstzrange value would be rejected by a date_range field).
-            if name == "validity":
-                system_fields[name] = {"type": "date_range"}
-            else:
-                system_fields[name] = es_type
+            # Canonical (incl. ``validity`` as date_range) is already seeded, so
+            # ``setdefault`` only ever adds NEW system names the SSOT omits.
+            system_fields.setdefault(name, es_type)
         elif container in ("metadata", "identity"):
             # metadata: lands in the _METADATA_CONTAINER block below (emitted
             # statically with per-language analyzed sub-fields, not per-field).
-            # identity: declared in COMMON_PROPERTIES at the doc root; not
-            # duplicated inside properties/stats/system.
+            # identity (external_id / asset_id / geoid): seeded into the system
+            # container above as the canonical searchable lane, and mirrored flat
+            # at the doc root for the STAC/GeoJSON wire shape.
             pass
         else:
             # Default: properties lane.
@@ -425,26 +517,24 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
-    # Emit the ``stats`` container only when there are tagged stats fields.
-    if stats_fields:
-        root_properties["stats"] = {
-            "dynamic": False,
-            "properties": stats_fields,
-        }
-
-    # Emit the ``system`` container only when there are tagged system fields.
-    # Always inject geometry_simplification into the system container so the
-    # nested structure is available for writes (refs #1828). The flat
+    # Both containers are ALWAYS emitted (the canonical seed guarantees they are
+    # non-empty), so every per-catalog index — and the cross-catalog alias — can
+    # query the full bounded system/stats vocabulary uniformly (refs #1285).
+    # geometry_simplification is injected into the system container so the nested
+    # structure is available for writes (refs #1828). The flat
     # ``_simplification_factor`` / ``_simplification_mode`` root entries in
     # COMMON_PROPERTIES are kept only for old-doc read-back compatibility.
-    if system_fields:
-        root_properties["system"] = {
-            "dynamic": False,
-            "properties": {
-                **system_fields,
-                "geometry_simplification": _SYSTEM_GEOMETRY_SIMPLIFICATION,
-            },
-        }
+    root_properties["stats"] = {
+        "dynamic": False,
+        "properties": stats_fields,
+    }
+    root_properties["system"] = {
+        "dynamic": False,
+        "properties": {
+            **system_fields,
+            "geometry_simplification": _SYSTEM_GEOMETRY_SIMPLIFICATION,
+        },
+    }
 
     return {
         "dynamic": False,
