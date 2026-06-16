@@ -401,6 +401,60 @@ def test_read_policy_disables_external_id_as_feature_id(mock_col_config, mock_re
     assert "COALESCE(sc_attributes.external_id, h.geoid::text) AS id" in sql_on
 
 
+def test_item_ids_filter_casts_geoid_uuid(mock_col_config, mock_registry):
+    """item_ids filter must not emit a bare ``uuid = text`` comparison.
+
+    When the feature-id expression is the bare ``h.geoid`` uuid column (the
+    canonical-index read / GENERIC path with no external-id COALESCE), the
+    ``_item_ids`` text[] parameter must be cast to ``uuid[]`` — otherwise
+    Postgres raises ``operator does not exist: uuid = text`` and the canonical
+    read silently returns nothing, degrading the ES doc to a stats-less,
+    geoid-only fallback. The COALESCE (text) branch must stay a plain text
+    comparison.
+    """
+    from dynastore.modules.storage.read_policy import ItemsReadPolicy
+    from dynastore.modules.storage.computed_fields import FeatureType
+
+    mock_attr = MagicMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {
+        "external_id": FieldDefinition(
+            name="external_id", sql_expression="sc_attr.external_id",
+            capabilities=[FieldCapability.FILTERABLE], data_type="string",
+        )
+    }
+    mock_attr.get_join_clause.return_value = "LEFT JOIN attr_table sc_attr ON h.geoid = sc_attr.geoid"
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.provides_feature_id = True
+    mock_attr.feature_id_field_name = "external_id"
+    mock_attr.get_main_geometry_field.return_value = None
+
+    mock_registry.get_sidecar.side_effect = lambda sc, lenient=True: mock_attr
+
+    req = QueryRequest(
+        item_ids=["019ecf75-882f-7d74-8e35-fcb165bbff37"],
+        filters=[FilterCondition(field="external_id", operator="=", value="X")],
+        raw_where=None, include_total_count=False,
+    )
+
+    # Default (no policy): feature id is the bare h.geoid uuid → cast required.
+    optimizer = QueryOptimizer(mock_col_config)
+    sql_default, params_default = optimizer.build_optimized_query(req, "schema", "table")
+    assert "h.geoid = ANY(CAST(:_item_ids AS uuid[]))" in sql_default
+    assert "(h.geoid) = ANY(:_item_ids)" not in sql_default
+    assert params_default["_item_ids"] == ["019ecf75-882f-7d74-8e35-fcb165bbff37"]
+
+    # Policy opts in → COALESCE(...) text expression → plain text comparison.
+    policy = ItemsReadPolicy(feature_type=FeatureType(external_id_as_feature_id=True))
+    optimizer_on = QueryOptimizer(mock_col_config, read_policy=policy)
+    sql_on, _ = optimizer_on.build_optimized_query(req, "schema", "table")
+    assert "= ANY(:_item_ids)" in sql_on
+    assert "CAST(:_item_ids AS uuid[])" not in sql_on
+
+
 def test_map_row_to_feature_forwards_read_policy(mock_col_config) -> None:
     """The optimizer must thread its resolved ``read_policy`` into the items
     service so the row mapper can honour ``feature_type.expose`` /

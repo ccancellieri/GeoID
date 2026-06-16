@@ -999,7 +999,22 @@ class QueryOptimizer:
         # Filter by item_ids using the resolved feature-ID expression.
         if query.item_ids:
             params["_item_ids"] = query.item_ids
-            where_conditions.append(f"({feature_id_expr}) = ANY(:_item_ids)")
+            # ``_item_ids`` is always bound as a text[] (QueryRequest.item_ids is
+            # List[str]). When the feature-id expression is the bare ``h.geoid``
+            # uuid column — i.e. no external-id/STAC COALESCE was applied, which
+            # is exactly the canonical-index read (read_policy=None) — Postgres
+            # rejects the ``uuid = text`` comparison with
+            # ``operator does not exist: uuid = text``. That error was being
+            # swallowed by ``canonical_index_read._fetch_raw_rows`` (returns {}),
+            # silently dropping the enriched row so the ES indexer fell back to a
+            # minimal doc with no ``stats`` lane and only ``system.geoid``. Cast
+            # the parameter array to ``uuid[]`` on this branch so the comparison
+            # is uuid = uuid (and the geoid index stays usable). The COALESCE
+            # branch is already text, so it is left untouched.
+            if feature_id_expr == "h.geoid":
+                where_conditions.append("h.geoid = ANY(CAST(:_item_ids AS uuid[]))")
+            else:
+                where_conditions.append(f"({feature_id_expr}) = ANY(:_item_ids)")
 
         # Build GROUP BY
         group_by_clause = ""
