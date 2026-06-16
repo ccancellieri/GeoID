@@ -268,6 +268,17 @@ def build_canonical_index_doc(
             if found and value is not None:
                 stats[name] = value
 
+    # stats.centroid is typed ``geo_point`` ([lon, lat]); a POINTZ-configured
+    # centroid column yields a 3-element [x, y, z] array that ES geo_point
+    # rejects (silently dropped by ``ignore_malformed``), so 3D items would
+    # lose their indexed centroid. Project to 2D for the geo_point lane and
+    # keep Z as the separate typed scalar ``stats.centroid_z`` (refs #2232).
+    _centroid = stats.get("centroid")
+    if isinstance(_centroid, (list, tuple)) and len(_centroid) >= 3:
+        stats["centroid"] = [_centroid[0], _centroid[1]]
+        if _centroid[2] is not None:
+            stats["centroid_z"] = float(_centroid[2])
+
     # metadata: multilingual descriptive metadata from the ItemMetadataSidecar
     # (item_title / item_description / item_keywords JSONB columns). The sidecar
     # declares which canonical names it produces via producible_metadata_names()

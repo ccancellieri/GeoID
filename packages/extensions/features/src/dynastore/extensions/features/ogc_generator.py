@@ -280,6 +280,17 @@ async def create_queryables_response(
                     continue
                 properties[col_name] = {"title": col_name, "type": "string"}
 
+    # Advertise the bounded canonical system/stats lanes (refs #2230). They are
+    # baked into build_item_mapping unconditionally (refs #2228) and resolved
+    # end-to-end by the read path, but were not discoverable via /queryables so
+    # a conformant client could not know they are filterable. ``setdefault`` so
+    # a per-collection field of the same name keeps precedence over the generic
+    # canonical type. Driver-agnostic — sourced from the mapping SSOT.
+    from dynastore.modules.elasticsearch.mappings import canonical_queryable_properties
+
+    for _qname, _frag in canonical_queryable_properties().items():
+        properties.setdefault(_qname, _frag)
+
     localized, _ = collection.localize(language)
     payload: Dict[str, Any] = {
         "$id": queryables_url,

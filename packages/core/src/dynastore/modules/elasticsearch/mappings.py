@@ -273,8 +273,62 @@ CANONICAL_STATS_TYPES: Dict[str, Any] = {
     "vertex_count":            {"type": "long"},
     "hole_count":              {"type": "long"},
     "centroid":                {"type": "geo_point", "ignore_malformed": True},
+    # Z component of a 3D (POINTZ) centroid, split out from the 2D ``geo_point``
+    # so a 3D source keeps its elevation as a queryable scalar (refs #2232).
+    "centroid_z":              {"type": "double"},
     "bbox":                    {"type": "float"},
 }
+
+# ---------------------------------------------------------------------------
+# Queryable advertisement (OGC API Part 3 / STAC Filter) — refs #2230
+# ---------------------------------------------------------------------------
+
+
+def _es_type_to_json_schema(es_def: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a canonical ES field type to a JSON-Schema queryable fragment."""
+    t = es_def.get("type")
+    if t in ("keyword", "text"):
+        return {"type": "string"}
+    if t == "date":
+        return {"type": "string", "format": "date-time"}
+    if t == "date_range":
+        # JSON Schema has no native temporal-range type; advertise it as a
+        # date-time string filterable with temporal operators.
+        return {
+            "type": "string",
+            "format": "date-time",
+            "description": "Temporal validity range; filter with temporal operators.",
+        }
+    if t in ("double", "float", "half_float", "scaled_float"):
+        return {"type": "number"}
+    if t in ("long", "integer", "short", "byte"):
+        return {"type": "integer"}
+    if t == "boolean":
+        return {"type": "boolean"}
+    if t in ("geo_point", "geo_shape"):
+        return {"type": "object", "description": "Geo-point [longitude, latitude]."}
+    return {"type": "string"}
+
+
+def canonical_queryable_properties() -> Dict[str, Dict[str, Any]]:
+    """JSON-Schema queryable fragments for the bounded canonical system/stats
+    vocabulary that :func:`build_item_mapping` always emits (refs #2228).
+
+    Keyed by the flat canonical field name (``area``, ``validity``,
+    ``transaction_time`` …). The read resolver routes ``properties.<name>`` to
+    its canonical ``stats.*`` / ``system.*`` ES path via ``classify_container``
+    (see ``items_projection.resolve_es_field_path``), so advertising the flat
+    name makes the field both discoverable and filterable. Driver-agnostic: any
+    driver whose items live in the canonical ES index inherits these queryables
+    (refs #2230, #1285).
+    """
+    props: Dict[str, Dict[str, Any]] = {}
+    for name, es_def in {**CANONICAL_SYSTEM_TYPES, **CANONICAL_STATS_TYPES}.items():
+        frag = _es_type_to_json_schema(es_def)
+        frag.setdefault("title", name)
+        props[name] = frag
+    return props
+
 
 # ---------------------------------------------------------------------------
 # Common top-level fields. Extended with the internal ``_*`` write-time

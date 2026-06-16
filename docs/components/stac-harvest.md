@@ -26,6 +26,46 @@ instead of reindexing, you harvest items in with the desired storage backend.
 harvest creates the *collections* but not the catalog. Create the target first
 with `POST /stac/catalogs` (`id` + `description` are required).
 
+## Running the process
+
+`stac_harvest` is a standard OGC API Processes execution — there is no admin
+endpoint or special tooling. The flow is **discover → execute (async) → poll the
+job**. The [worked example](#worked-example) gives the exact calls; this section
+is the reference for each step.
+
+### 1. Discover
+
+| Action | Request |
+|---|---|
+| List the processes available on a catalog | `GET /processes/catalogs/{catalog_id}/processes` |
+| Inspect `stac_harvest` and its input JSON Schema | `GET /processes/processes/stac_harvest` |
+| List the jobs launched on a catalog | `GET /processes/catalogs/{catalog_id}/jobs` |
+| Get one job's status / result | `GET /processes/catalogs/{catalog_id}/jobs/{jobID}` |
+
+The process description is catalog-agnostic, so the inspect path is
+`…/processes/processes/stac_harvest` (no `{catalog_id}`).
+
+### 2. Permissions
+
+Execution is **not** gated by a process-level IAM policy — the caller principal
+is recorded only for job attribution (`caller_id`). On the **dev** catalog
+service, which runs without IAM enforcement, execution is open and **no token is
+required**. Behind the platform gateway the usual tenant/auth middleware still
+applies, so send your normal bearer token (scoped to the target catalog) in
+`review` / production.
+
+### 3. Execute: async vs sync
+
+| Mode | `Prefer` header | Behaviour |
+|---|---|---|
+| Async (default) | `Prefer: respond-async` | Returns a `jobID` immediately; the harvest runs in the background (see [execution mode](#execution-mode-cloud-run-job-vs-in-process-background-task) below). Poll the job for completion. Use for anything but the smallest harvests. |
+| Sync | `Prefer: respond-sync` | Blocks until the harvest finishes and returns the result inline. Only for small harvests (a handful of items). |
+
+The execution body is a JSON object with a single `inputs` member (see
+[Inputs](#inputs)). Always send it with a request that sets `Content-Length`
+(curl's `-d` / `--data` does this automatically); a chunked POST with no length
+can be rejected by the gateway before it reaches the service.
+
 ## Inputs
 
 | Input | Type | Default | Meaning |
@@ -119,6 +159,9 @@ the Job so a long harvest does not occupy a request-serving pod.
 ```bash
 BASE='https://<host>/geospatial/<env>/api/catalog'
 TC='my_target_catalog'
+
+# 0. (optional) Inspect the process and its input schema
+curl -s "$BASE/processes/processes/stac_harvest" | jq '.inputs'
 
 # 1. Create the target catalog (must exist before harvest)
 curl -s -X POST "$BASE/stac/catalogs" -H 'Content-Type: application/json' \

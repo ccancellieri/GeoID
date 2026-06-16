@@ -543,3 +543,44 @@ def test_license_object_survives_in_item_mapping() -> None:
     assert lic.get("dynamic") is False
     assert lic["properties"]["license_id"]["type"] == "keyword"
     assert lic["properties"]["is_osi_compliant"]["type"] == "boolean"
+
+
+# ---------------------------------------------------------------------------
+# Canonical queryable advertisement (OGC API Part 3 / STAC Filter) — #2230
+# ---------------------------------------------------------------------------
+
+def test_canonical_queryable_properties_covers_system_and_stats() -> None:
+    """Every canonical system/stats field is advertised as a queryable with a
+    JSON-Schema type derived from its ES mapping type (refs #2230)."""
+    from dynastore.modules.elasticsearch.mappings import (
+        CANONICAL_STATS_TYPES,
+        CANONICAL_SYSTEM_TYPES,
+        canonical_queryable_properties,
+    )
+    q = canonical_queryable_properties()
+    for name in CANONICAL_SYSTEM_TYPES:
+        assert name in q, f"system field {name} missing from queryables"
+    for name in CANONICAL_STATS_TYPES:
+        assert name in q, f"stats field {name} missing from queryables"
+
+
+def test_canonical_queryable_types_mapped_correctly() -> None:
+    """ES types map to the expected JSON-Schema queryable types."""
+    from dynastore.modules.elasticsearch.mappings import canonical_queryable_properties
+    q = canonical_queryable_properties()
+    # keyword -> string
+    assert q["geometry_hash"]["type"] == "string"
+    # double -> number
+    assert q["area"]["type"] == "number"
+    # long -> integer
+    assert q["vertex_count"]["type"] == "integer"
+    # date -> string/date-time
+    assert q["transaction_time"]["type"] == "string"
+    assert q["transaction_time"]["format"] == "date-time"
+    # date_range (validity) -> string/date-time with range note
+    assert q["validity"]["type"] == "string"
+    assert q["validity"]["format"] == "date-time"
+    # geo_point -> object
+    assert q["centroid"]["type"] == "object"
+    # every fragment carries a default title
+    assert q["area"]["title"] == "area"

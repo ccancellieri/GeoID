@@ -379,6 +379,43 @@ def test_sidecar_none_value_not_written_to_stats():
 
 
 # ---------------------------------------------------------------------------
+# stats.centroid 2D projection for geo_point (#2232)
+# ---------------------------------------------------------------------------
+
+def test_centroid_2d_passes_through_unchanged():
+    sc = _FakeSidecar({"centroid": [12.5, 41.9]})
+    doc = build_canonical_index_doc(
+        _row(), resolved_sidecars=[sc], known_fields={},
+        catalog_id="c", collection_id="k",
+    )
+    assert doc["stats"]["centroid"] == [12.5, 41.9]
+    assert "centroid_z" not in doc["stats"]
+
+
+def test_centroid_3d_projected_to_2d_with_z_split_out():
+    """A POINTZ-configured centroid yields [x, y, z]; ES ``geo_point`` only
+    accepts [lon, lat], so the builder projects to 2D and keeps Z as the
+    separate typed scalar ``stats.centroid_z`` (refs #2232)."""
+    sc = _FakeSidecar({"centroid": [12.5, 41.9, 137.0]})
+    doc = build_canonical_index_doc(
+        _row(), resolved_sidecars=[sc], known_fields={},
+        catalog_id="c", collection_id="k",
+    )
+    assert doc["stats"]["centroid"] == [12.5, 41.9]
+    assert doc["stats"]["centroid_z"] == 137.0
+
+
+def test_centroid_3d_with_null_z_drops_centroid_z():
+    sc = _FakeSidecar({"centroid": [12.5, 41.9, None]})
+    doc = build_canonical_index_doc(
+        _row(), resolved_sidecars=[sc], known_fields={},
+        catalog_id="c", collection_id="k",
+    )
+    assert doc["stats"]["centroid"] == [12.5, 41.9]
+    assert "centroid_z" not in doc["stats"]
+
+
+# ---------------------------------------------------------------------------
 # metadata section — via ItemMetadataSidecar (refs #1828 Phase 2 / #1838)
 # ---------------------------------------------------------------------------
 
