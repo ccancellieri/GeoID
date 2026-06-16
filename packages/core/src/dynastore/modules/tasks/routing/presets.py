@@ -51,10 +51,18 @@ logger = logging.getLogger(__name__)
 def _osgeo_available() -> bool:
     """True when GDAL's ``osgeo`` bindings are importable.
 
-    The review preset routes the gdal process to an in-process background
-    runner on the catalog service; that only works on an image that ships
-    GDAL.  On a GDAL-less image the preset would mis-route gdal work, so it
-    is only registered where osgeo is present.
+    Vestigial gate — kept for callers that reference this helper but no longer
+    used to condition ``ReviewTaskRoutingPreset`` registration.
+
+    Historical context: the review preset formerly routed gdal to an in-process
+    background runner on the catalog service, which required osgeo on that image.
+    The review preset now mirrors cloud exactly — gdal offloads to a Cloud Run
+    Job (``gcp_cloud_run`` runner, consumers ``["catalog", "maps"]``), same as
+    the cloud preset.  Gdal sync execution lives on the maps service, which ships
+    osgeo + ``worker_task_gdal`` and handles ``Prefer: respond-sync`` via
+    ``SyncRunner``.  Neither path requires osgeo on the catalog image, so the
+    gate is functionally pointless and ``ReviewTaskRoutingPreset`` is now
+    registered unconditionally.
     """
     return importlib.util.find_spec("osgeo") is not None
 
@@ -160,8 +168,9 @@ def _register() -> None:
         from dynastore.modules.storage.presets import register_preset
         register_preset(CloudTaskRoutingPreset)
         register_preset(OnpremTaskRoutingPreset)
-        if _osgeo_available():
-            register_preset(ReviewTaskRoutingPreset)
+        # ReviewTaskRoutingPreset is registered unconditionally: it mirrors the
+        # cloud preset (gdal -> gcp_cloud_run) and does not require local osgeo.
+        register_preset(ReviewTaskRoutingPreset)
     except Exception:
         logger.warning(
             "task routing presets not registered in storage registry",

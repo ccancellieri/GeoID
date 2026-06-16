@@ -19,7 +19,9 @@
 """Tests for the review routing preset and the scope_catalog_review extra.
 
 Covers four concerns:
-(a) review preset routes gdal to background runner on catalog with BACKGROUND hint.
+(a) review preset mirrors cloud for gdal — gcp_cloud_run with consumers=["catalog","maps"].
+    The former in-process catalog special-case has been removed; gdal sync now lives on
+    the maps service (which ships osgeo + worker_task_gdal + processes).
 (b) cloud preset remains unchanged — gdal still gcp_cloud_run with {OFFLOAD, HEAVY}.
 (c) ReviewTaskRoutingPreset is registered only when osgeo is present.
 (d) Prod-bleed guard: scope_catalog and scope_geoid do NOT pull in scope_catalog_review
@@ -49,34 +51,41 @@ def _task(key: str, affinity: str | None = None) -> InventoryItem:
 
 
 # ---------------------------------------------------------------------------
-# (a) review preset — gdal target
+# (a) review preset mirrors cloud for gdal
 # ---------------------------------------------------------------------------
 
 
-def test_review_gdal_runner_is_background():
+def test_review_gdal_runner_is_gcp_cloud_run():
+    """review now mirrors cloud: gdal routes to gcp_cloud_run, not background."""
     _, procs = build_routing_matrix([_proc("gdal")], preset="review")
     t = procs["gdal"][0]
-    assert t.runner == "background"
+    assert t.runner == "gcp_cloud_run"
 
 
-def test_review_gdal_consumers_is_catalog_only():
+def test_review_gdal_consumers_match_cloud():
+    """review gdal consumers == CLOUD_PROCESS_CONSUMERS["gdal"] == ["catalog", "maps"]."""
     _, procs = build_routing_matrix([_proc("gdal")], preset="review")
-    assert procs["gdal"][0].consumers == ["catalog"]
+    assert procs["gdal"][0].consumers == CLOUD_PROCESS_CONSUMERS["gdal"]
+    assert "catalog" in procs["gdal"][0].consumers
+    assert "maps" in procs["gdal"][0].consumers
 
 
-def test_review_gdal_hints_contain_background():
+def test_review_gdal_hints_offload_heavy():
     _, procs = build_routing_matrix([_proc("gdal")], preset="review")
-    assert ExecHint.BACKGROUND in procs["gdal"][0].hints
+    hints = procs["gdal"][0].hints
+    assert ExecHint.OFFLOAD in hints
+    assert ExecHint.HEAVY in hints
 
 
-def test_review_gdal_hints_contain_interactive():
+def test_review_gdal_no_background_hint():
     _, procs = build_routing_matrix([_proc("gdal")], preset="review")
-    assert ExecHint.INTERACTIVE in procs["gdal"][0].hints
+    assert ExecHint.BACKGROUND not in procs["gdal"][0].hints
 
 
-def test_review_gdal_no_offload_hint():
+def test_review_gdal_no_interactive_hint():
+    """INTERACTIVE hint was the marker for the old in-process catalog path; gone now."""
     _, procs = build_routing_matrix([_proc("gdal")], preset="review")
-    assert ExecHint.OFFLOAD not in procs["gdal"][0].hints
+    assert ExecHint.INTERACTIVE not in procs["gdal"][0].hints
 
 
 def test_review_non_gdal_process_still_gcp_cloud_run():
@@ -132,30 +141,28 @@ def test_cloud_gdal_no_background_hint():
 
 
 # ---------------------------------------------------------------------------
-# (c) ReviewTaskRoutingPreset registered only when osgeo present
+# (c) ReviewTaskRoutingPreset always registered (gate removed)
 # ---------------------------------------------------------------------------
 
 
-def test_osgeo_present_registers_review(monkeypatch):
+def test_review_always_registered_regardless_of_osgeo(monkeypatch):
+    """ReviewTaskRoutingPreset is registered unconditionally.
+
+    The osgeo gate was removed: review mirrors cloud (gdal -> gcp_cloud_run)
+    and does not require local osgeo on the registering image.
+    """
     from dynastore.modules.tasks.routing import presets as routing_presets
     fake = MagicMock()
     monkeypatch.setattr("dynastore.modules.storage.presets.register_preset", fake)
-    monkeypatch.setattr(routing_presets, "_osgeo_available", lambda: True)
-    routing_presets._register()
-    registered = [c.args[0].name for c in fake.call_args_list]
-    assert "review" in registered
-    assert "cloud" in registered and "onprem" in registered
-
-
-def test_osgeo_absent_skips_review(monkeypatch):
-    from dynastore.modules.tasks.routing import presets as routing_presets
-    fake = MagicMock()
-    monkeypatch.setattr("dynastore.modules.storage.presets.register_preset", fake)
-    monkeypatch.setattr(routing_presets, "_osgeo_available", lambda: False)
-    routing_presets._register()
-    registered = [c.args[0].name for c in fake.call_args_list]
-    assert "review" not in registered
-    assert "cloud" in registered and "onprem" in registered
+    for osgeo_present in (True, False):
+        fake.reset_mock()
+        monkeypatch.setattr(routing_presets, "_osgeo_available", lambda: osgeo_present)
+        routing_presets._register()
+        registered = [c.args[0].name for c in fake.call_args_list]
+        assert "review" in registered, (
+            f"review must be registered when osgeo_available={osgeo_present}"
+        )
+        assert "cloud" in registered and "onprem" in registered
 
 
 def test_review_preset_platform_tier():

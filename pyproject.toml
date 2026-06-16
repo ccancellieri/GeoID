@@ -453,13 +453,19 @@ api_open = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,process
 # api_catalog: api_open + auth (most common production deployment)
 api_catalog = ["dynastore[api_open,auth_grp]"]
 # api_maps_open: vector producer + raster renderer, no auth.
-# Surface limited to: /maps /tiles /styles /wfs /features /coverages /crs /gdal /dwh /joins
+# Surface limited to: /maps /tiles /styles /wfs /features /coverages /crs /gdal /dwh /joins /processes
 # (plus ALWAYS_ON: /configs /web /tools /template /httpx).
 # Removed from always-on: /events (now gated by catalog_grp); /admin /iam /auth
 # (now gated by auth_grp post per-extension wheel migration).
 # Excluded vs. legacy: catalog_routes_grp (stac/assets/search/records),
 # gcp_routes_grp, monitor_grp (stats/logs), dimensions, notebooks.
-api_maps_open = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,module_catalog_elasticsearch]"]
+# `processes` mounts the /processes router + FastAPIBackgroundRunner so the maps service
+# can run gdal synchronously in-process (Prefer: respond-sync).
+# `task_base` pulls module_tasks (dispatcher + capability-publisher) + extension_processes
+# WITHOUT extension_tasks, keeping the task REST surface off this no-auth service.
+# osgeo + the gdal task instance arrive via maps_grp → gdal → module_gdal (already in
+# maps_grp). No auth surface is added; maps stays a public-read service.
+api_maps_open = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,module_catalog_elasticsearch,processes,task_base]"]
 # api_maps: same surface WITH auth (kept for reference / future use)
 api_maps = ["dynastore[api_maps_open,auth_grp]"]
 # api_features: lightweight local-dev service — OGC Features + STAC, no GCP/tools/index
@@ -496,8 +502,9 @@ scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,proxy]"]
 # worker_task_gdal pulls task_base (module_tasks dispatcher + capability
 # publisher) WITHOUT extension_tasks, so maps can claim background gdal work
 # (routing: gdal -> [catalog, maps]) while the task REST surface stays off
-# this no-auth service. Mirrors the scope_catalog_review pattern.
-scope_maps = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,module_cache,module_catalog_elasticsearch,drivers_grp,worker_task_gdal]"]
+# this no-auth service. `processes` adds the /processes router +
+# FastAPIBackgroundRunner; task_base is already pulled by worker_task_gdal.
+scope_maps = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,module_cache,module_catalog_elasticsearch,drivers_grp,worker_task_gdal,processes]"]
 # scope_onprem: single fat node for a worker-less on-prem / local deploy.
 # Union of scope_geoid (catalog API + auth/IAM + geoid UI/gateway) and
 # scope_worker (the heavy task/process runners + ingestion), so ONE process

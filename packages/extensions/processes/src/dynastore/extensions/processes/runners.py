@@ -92,6 +92,9 @@ class FastAPIBackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
     mode = TaskExecutionMode.ASYNCHRONOUS
     runner_type = "fastapi_background"
 
+    def can_handle(self, task_type: str) -> bool:
+        return get_task_instance(task_type) is not None
+
     @property
     def capabilities(self):
         from dynastore.modules.tasks.models import RunnerCapabilities
