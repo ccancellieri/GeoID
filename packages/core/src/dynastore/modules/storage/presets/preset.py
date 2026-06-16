@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import (
+    TYPE_CHECKING,
     Any,
     ClassVar,
     Dict,
@@ -50,6 +51,9 @@ from pydantic import BaseModel
 
 from .examples import PresetExample
 from .protocol import PresetTier
+
+if TYPE_CHECKING:
+    from dynastore.modules.storage.routing_config import ItemsRoutingConfig
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +120,14 @@ class DataSeed:
     manage_catalog: bool = True
     manage_collection: bool = True
     lang: str = "*"
+    # Optional per-collection routing applied at the seed's own
+    # catalog/collection scope before the items are upserted. A seed that needs
+    # its items to be searchable (e.g. an Elasticsearch secondary index) declares
+    # it here so the collection is searchable *by construction* — the
+    # MultiContributorPreset otherwise applies at platform scope and cannot infer
+    # per-collection routing. When None the collection inherits the ambient
+    # catalog/platform routing (#1285 / #2241).
+    items_routing: Optional["ItemsRoutingConfig"] = None
 
 
 @dataclass(frozen=True)

@@ -480,6 +480,47 @@ class TestValidityValueExtraction:
         assert "valid_from" not in ctx
         assert ctx["valid_to"].year == 2022  # end bound still resolved
 
+    def test_stac_range_start_end_datetime_resolve_validity(self):
+        """#2242 — STAC range pattern (``datetime`` null, ``start_datetime`` /
+        ``end_datetime`` set) back-fills the validity bounds, so a harvested range
+        item keeps its authored interval instead of an ingestion-time bound."""
+        sc = self._sidecar()  # heuristic resolution (defaults)
+        ctx: dict = {"geoid": "g1"}
+        sc.prepare_upsert_payload(
+            {
+                "id": "f1",
+                "properties": {
+                    "datetime": None,
+                    "start_datetime": "2020-01-01T00:00:00Z",
+                    "end_datetime": "2021-12-31T00:00:00Z",
+                },
+            },
+            ctx,
+        )
+        assert ctx["valid_from"].year == 2020
+        assert ctx["valid_to"].year == 2021
+
+    def test_instant_datetime_takes_precedence_and_ignores_end_datetime(self):
+        """An instant item (``datetime`` present) keeps a ``datetime`` lower bound
+        and an open upper bound. Even a (malformed) ``end_datetime`` earlier than
+        ``datetime`` is ignored rather than producing an inverted validity range —
+        start/end_datetime apply only when ``datetime`` is null (#2242)."""
+        sc = self._sidecar()
+        ctx: dict = {"geoid": "g1"}
+        sc.prepare_upsert_payload(
+            {
+                "id": "f1",
+                "properties": {
+                    "datetime": "2024-03-03T00:00:00Z",
+                    "start_datetime": "2020-01-01T00:00:00Z",
+                    "end_datetime": "2019-01-01T00:00:00Z",  # would invert if mixed
+                },
+            },
+            ctx,
+        )
+        assert ctx["valid_from"].year == 2024  # datetime wins for the lower bound
+        assert "valid_to" not in ctx  # end_datetime ignored → open, never inverted
+
 
 class TestOpenLowerBoundFinalize:
     """#1172 — ``finalize_upsert_payload`` must thread an open lower bound

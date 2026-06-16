@@ -107,6 +107,25 @@ def test_contributor_seed_manage_collection_true() -> None:
     assert seed.manage_collection is True
 
 
+def test_contributor_seed_declares_es_secondary_routing() -> None:
+    """The seed carries an items routing with an Elasticsearch secondary WRITE
+    entry (source="auto"), so demo_collection items are searchable rather than
+    PG-only — regression cover for #2241."""
+    from dynastore.modules.storage.routing_config import Operation
+
+    seed = list(_DemoDataContributor().get_data())[0]
+    assert seed.items_routing is not None
+    write_entries = seed.items_routing.operations[Operation.WRITE]
+    es = [e for e in write_entries if e.driver_ref == "items_elasticsearch_driver"]
+    assert es, "demo seed must declare an ES secondary write entry"
+    assert es[0].secondary_index is True
+    assert es[0].source == "auto"
+    # A SEARCH entry routed to ES is what makes /stac/.../items return matches.
+    assert seed.items_routing.operations[Operation.SEARCH][0].driver_ref == (
+        "items_elasticsearch_driver"
+    )
+
+
 # ---------------------------------------------------------------------------
 # DEMO_DATA_PRESET metadata
 # ---------------------------------------------------------------------------

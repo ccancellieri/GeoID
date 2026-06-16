@@ -235,6 +235,27 @@ async def _apply_data_kind(
             )
             record["created_collection"] = True
 
+        # --- Per-collection routing (applied before items so the upsert fans
+        # out to the declared secondary indexers) ---
+        # The preset itself runs at platform scope, so _apply_config_kind cannot
+        # target this seed's collection. Persist the seed's routing directly at
+        # its own catalog/collection scope: the write router resolves routing via
+        # a collection→catalog→platform waterfall, so a collection-scoped
+        # ItemsRoutingConfig (ES secondary entry, source="auto") makes the seeded
+        # items searchable even under a PG-only ambient routing (#1285 / #2241).
+        # Intentionally NOT best-effort (unlike the extent recompute below): if
+        # routing cannot be persisted the items would land in a silently
+        # non-searchable collection — the exact #2241 failure — so a failure here
+        # should abort the apply loudly rather than reproduce the bug.
+        if seed.items_routing is not None and ctx.config is not None:
+            await ctx.config.set_config(
+                config_cls=type(seed.items_routing),
+                config=seed.items_routing,
+                catalog_id=seed.catalog_id,
+                collection_id=seed.collection_id,
+                check_immutability=False,
+            )
+
         # --- Items ---
         if seed.items:
             await catalogs.upsert(
@@ -243,6 +264,30 @@ async def _apply_data_kind(
             record["item_ids"] = [
                 it["id"] for it in seed.items if isinstance(it, dict) and "id" in it
             ]
+
+            # Recompute the collection extent from the just-seeded items so the
+            # spatial bbox and temporal interval reflect the data instead of the
+            # collection's default ([[0,0,0,0]] / open interval). The recompute
+            # reads from Postgres — the source of truth written just above — so it
+            # is not subject to async-write/index lag. Best-effort: a failure here
+            # must not fail the preset apply; the extent can be recomputed later.
+            if ctx.db is not None:
+                try:
+                    from dynastore.modules.catalog.tools import (
+                        recalculate_and_update_extents,
+                    )
+
+                    await recalculate_and_update_extents(
+                        ctx.db, seed.catalog_id, seed.collection_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "%s: extent recompute failed for %s:%s after seed; the "
+                        "collection extent may stay at its default until a later "
+                        "recompute.",
+                        preset_name, seed.catalog_id, seed.collection_id,
+                        exc_info=True,
+                    )
 
         applied_data.append(record)
 

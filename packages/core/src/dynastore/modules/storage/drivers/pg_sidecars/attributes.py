@@ -1122,8 +1122,19 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 valid_to = None
         elif isinstance(feature, Feature):
             props = feature.properties or {}
-            valid_from = props.get("valid_from") or props.get("datetime")
-            valid_to = props.get("valid_to")
+            # STAC range pattern: "start_datetime"/"end_datetime" are meaningful
+            # only when "datetime" is null. Resolve them as a *pair* and only when
+            # no primary datetime/valid_from is present, so a range item keeps its
+            # authored interval while an instant item keeps an open upper bound —
+            # never mixing a datetime lower bound with an end_datetime upper bound
+            # (which could invert the range for malformed input). (#2242)
+            primary_from = props.get("valid_from") or props.get("datetime")
+            if primary_from:
+                valid_from = primary_from
+                valid_to = props.get("valid_to")
+            else:
+                valid_from = props.get("start_datetime")
+                valid_to = props.get("valid_to") or props.get("end_datetime")
         else:
             time_val = feature.get("time")
             if time_val:
@@ -1137,14 +1148,27 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                     valid_from = time_val
                     valid_to = None
             else:
-                valid_from = (
+                props = feature.get("properties", {}) or {}
+                # STAC range pattern paired fallback (see the Feature branch
+                # above): start_datetime/end_datetime back-fill the validity
+                # bounds only when no primary datetime/valid_from is present, so a
+                # datetime lower bound is never paired with an end_datetime upper
+                # bound. (#2242)
+                primary_from = (
                     feature.get("valid_from")
-                    or feature.get("properties", {}).get("valid_from")
-                    or feature.get("properties", {}).get("datetime")
+                    or props.get("valid_from")
+                    or props.get("datetime")
                 )
-                valid_to = feature.get("valid_to") or feature.get("properties", {}).get(
-                    "valid_to"
-                )
+                if primary_from:
+                    valid_from = primary_from
+                    valid_to = feature.get("valid_to") or props.get("valid_to")
+                else:
+                    valid_from = props.get("start_datetime")
+                    valid_to = (
+                        feature.get("valid_to")
+                        or props.get("valid_to")
+                        or props.get("end_datetime")
+                    )
 
         # 5b. Explicit value-source override (#1126/#1172 ValiditySpec.start_from
         # / end_from). Each bound is independent:

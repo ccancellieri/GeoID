@@ -40,6 +40,14 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from dynastore.modules.storage.routing_config import (
+    FailurePolicy,
+    ItemsRoutingConfig,
+    Operation,
+    OperationDriverEntry,
+    WriteMode,
+)
+
 from .multi_contributor import MultiContributorPreset
 from .preset import DataSeed
 
@@ -110,6 +118,44 @@ _DEMO_ITEMS = tuple(
 # Data contributor
 # ---------------------------------------------------------------------------
 
+def _demo_items_routing() -> ItemsRoutingConfig:
+    """PG-primary + Elasticsearch-secondary routing for the demo collection.
+
+    Without this, demo_collection inherits the ambient (often PG-only) routing
+    and its items never reach Elasticsearch, so the STAC view returns
+    ``numberMatched: 0`` (#2241). The ES WRITE entry is ``source="auto"`` so the
+    secondary indexer is self-registered rather than suppressed as
+    operator-managed, and ASYNC + OUTBOX keeps the write durable without blocking
+    the PG primary.
+    """
+    return ItemsRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="items_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+                OperationDriverEntry(
+                    driver_ref="items_elasticsearch_driver",
+                    write_mode=WriteMode.ASYNC,
+                    on_failure=FailurePolicy.OUTBOX,
+                    secondary_index=True,
+                    source="auto",
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(driver_ref="items_postgresql_driver"),
+            ],
+            Operation.SEARCH: [
+                OperationDriverEntry(
+                    driver_ref="items_elasticsearch_driver",
+                    source="auto",
+                ),
+            ],
+        },
+    )
+
+
 class _DemoDataContributor:
     """Yields the single demo seed that ``MultiContributorPreset`` will apply."""
 
@@ -122,6 +168,7 @@ class _DemoDataContributor:
             items=_DEMO_ITEMS,
             manage_catalog=True,
             manage_collection=True,
+            items_routing=_demo_items_routing(),
         )
 
 

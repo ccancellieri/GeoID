@@ -103,8 +103,15 @@ class _FakeCatalogs:
 
 
 def _ctx(catalogs: Any) -> Any:
-    """A PresetContext-shaped object — only ``catalogs`` is exercised here."""
-    return SimpleNamespace(catalogs=catalogs, config=None, iam=None, policy=None)
+    """A PresetContext-shaped object — only ``catalogs`` is exercised here.
+
+    ``db`` and ``config`` are present (matching ``PresetContext``) but left
+    ``None`` so the per-seed extent recompute and routing persistence are skipped
+    — those paths are exercised in their own dedicated tests.
+    """
+    return SimpleNamespace(
+        catalogs=catalogs, config=None, iam=None, policy=None, db=None,
+    )
 
 
 def _preset(seeds) -> MultiContributorPreset:
@@ -155,6 +162,73 @@ def test_apply_is_idempotent_when_catalog_and_collection_exist():
     rec = descriptor.payload["data"][0]
     assert rec["created_catalog"] is False
     assert rec["created_collection"] is False
+
+
+def test_apply_persists_items_routing_before_upsert_and_recomputes_extent(monkeypatch):
+    """A seed carrying ``items_routing`` persists it at the seed's own
+    catalog/collection scope *before* the upsert (so the write fans out to the
+    declared secondary indexers), and the collection extent is recomputed
+    *after* the upsert. Regression cover for #2241 / #2240."""
+    from dynastore.modules.storage.routing_config import (
+        ItemsRoutingConfig,
+        Operation,
+        OperationDriverEntry,
+    )
+
+    routing = ItemsRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(driver_ref="items_postgresql_driver"),
+                OperationDriverEntry(
+                    driver_ref="items_elasticsearch_driver",
+                    secondary_index=True,
+                    source="auto",
+                ),
+            ],
+        },
+    )
+
+    catalogs = _FakeCatalogs()
+
+    class _FakeConfig:
+        async def set_config(
+            self, *, config_cls, config, catalog_id, collection_id, check_immutability
+        ):
+            catalogs.calls.append(("set_config", catalog_id, collection_id))
+            assert config is routing
+            assert config_cls is ItemsRoutingConfig
+            assert check_immutability is False
+
+    async def _fake_recompute(db, catalog_id, collection_id):
+        catalogs.calls.append(("recompute", catalog_id, collection_id))
+
+    monkeypatch.setattr(
+        "dynastore.modules.catalog.tools.recalculate_and_update_extents",
+        _fake_recompute,
+    )
+
+    seed = DataSeed(
+        catalog_id="demo_catalog",
+        collection_id="demo_collection",
+        items=({"id": "a"},),
+        items_routing=routing,
+    )
+    ctx = SimpleNamespace(
+        catalogs=catalogs,
+        config=_FakeConfig(),
+        iam=None,
+        policy=None,
+        db=object(),  # non-None sentinel; recompute is monkeypatched
+    )
+    preset = _preset([seed])
+    asyncio.run(preset.apply(NoParams(), "platform", ctx))
+
+    names = _names(catalogs)
+    # routing persisted at the seed's own collection scope, before upsert,
+    # and the extent recomputed after the upsert.
+    assert ("set_config", "demo_catalog", "demo_collection") in catalogs.calls
+    assert ("recompute", "demo_catalog", "demo_collection") in catalogs.calls
+    assert names.index("set_config") < names.index("upsert") < names.index("recompute")
 
 
 def test_revoke_deletes_only_what_apply_created():
