@@ -2206,6 +2206,7 @@ async def complete_task(
     sql = f"""
         UPDATE {task_schema}.tasks
         SET status = 'COMPLETED',
+            progress = 100,
             finished_at = :finished_at,
             outputs = :outputs,
             locked_until = NULL,

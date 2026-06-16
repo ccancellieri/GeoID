@@ -139,11 +139,15 @@ async def test_maintenance_fn_without_inputs_match_keeps_old_shape():
     captured: dict = {}
 
     class _FakeDQL:
+        # The requeue helper now issues a *second* DQLQuery (the pg_notify
+        # dispatcher wakeup) after a non-empty requeue. Capture the FIRST
+        # query (the requeue UPDATE) so the assertions stay meaningful and are
+        # not clobbered by the trailing notify query.
         def __init__(self, sql, **_kwargs):
-            captured["sql"] = sql
+            captured.setdefault("sql", sql)
 
         async def execute(self, _conn, **params):
-            captured["params"] = params
+            captured.setdefault("params", params)
             return [{"task_id": "t1"}, {"task_id": "t2"}]
 
     from contextlib import asynccontextmanager

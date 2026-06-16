@@ -93,6 +93,41 @@ async def get_task_statistics(
 # Dead-letter management
 # ---------------------------------------------------------------------------
 
+#: Statuses an operator may requeue back to PENDING. DEAD_LETTER = retries
+#: exhausted; FAILED = a permanent (retry=False) failure the operator has since
+#: addressed. DISMISSED is intentionally excluded (an explicit cancel, not a
+#: failure to retry).
+_REQUEUEABLE_STATUSES = "('DEAD_LETTER', 'FAILED')"
+
+
+async def _notify_requeued(engine: AsyncEngine, reason: str) -> None:
+    """Wake dispatchers after a committed requeue so PENDING rows are claimed
+    immediately instead of waiting for the next ~35s dispatcher poll.
+
+    Mirrors the two-signal wakeup in ``tasks_module._redispatch_stuck_rows``:
+    an in-process ``signal_bus`` emit (zero-latency, same pod) plus a
+    ``pg_notify`` on ``new_task_queued`` so capable dispatchers on other pods
+    also wake. Both are best-effort — a wakeup miss only delays pickup to the
+    defensive poll, it never drops the requeued row. Claiming stays safe under
+    the resulting wakeup flood because ``claim_batch`` uses FOR UPDATE SKIP
+    LOCKED, so each row is still claimed exactly once.
+    """
+    from dynastore.tools.async_utils import signal_bus
+    from dynastore.modules.tasks.queue import NEW_TASK_QUEUED
+
+    try:
+        await signal_bus.emit(NEW_TASK_QUEUED)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("requeue wakeup: signal_bus emit failed: %s", exc)
+    try:
+        async with managed_transaction(engine) as conn:
+            await DQLQuery(
+                "SELECT pg_notify('new_task_queued', :reason)",
+                result_handler=ResultHandler.SCALAR,
+            ).execute(conn, reason=reason)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("requeue wakeup: pg_notify failed: %s", exc)
+
 
 async def list_dead_letter_tasks(
     engine: AsyncEngine, schema_name: Optional[str] = None
@@ -126,8 +161,12 @@ async def requeue_dead_letter_task(
     schema_name: Optional[str] = None,
 ) -> bool:
     """
-    Resets a DEAD_LETTER task back to PENDING for another attempt.
+    Resets a DEAD_LETTER or FAILED task back to PENDING for another attempt.
     Only an operator with awareness of why it failed should call this.
+
+    DEAD_LETTER = retries exhausted; FAILED = a permanent (retry=False) failure.
+    Both are requeueable once the operator has addressed the root cause;
+    DISMISSED is excluded (an explicit cancel, not a failure to retry).
 
     Args:
         reset_retries: If True, resets retry_count to 0 (full fresh start).
@@ -152,7 +191,7 @@ async def requeue_dead_letter_task(
             error_message = NULL,
             owner_id     = NULL
         WHERE task_id = :task_id
-          AND status  = 'DEAD_LETTER'
+          AND status  IN {_REQUEUEABLE_STATUSES}
           {tenant_clause}
         RETURNING task_id;
     """
@@ -164,9 +203,13 @@ async def requeue_dead_letter_task(
             conn, **params
         )
     if row:
-        logger.info(f"Maintenance: Task {task_id} re-queued from DEAD_LETTER.")
+        logger.info(f"Maintenance: Task {task_id} re-queued from DEAD_LETTER/FAILED.")
+        await _notify_requeued(engine, "dlq_requeue")
         return True
-    logger.warning(f"Maintenance: Task {task_id} not found in DEAD_LETTER state.")
+    logger.warning(
+        f"Maintenance: Task {task_id} not found in a requeueable "
+        f"(DEAD_LETTER/FAILED) state."
+    )
     return False
 
 
@@ -179,9 +222,9 @@ async def requeue_dead_letter_tasks_by_type(
     reset_retries: bool = True,
     inputs_match: Optional[Mapping[str, str]] = None,
 ) -> int:
-    """Bulk-requeue every DEAD_LETTER row of ``task_type`` (optionally
-    filtered by ``finished_at >= since`` and/or JSONB equality on selected
-    ``inputs`` keys).
+    """Bulk-requeue every DEAD_LETTER or FAILED row of ``task_type``
+    (optionally filtered by ``finished_at >= since`` and/or JSONB equality on
+    selected ``inputs`` keys).
 
     Companion to the reactive reaper added in #502: after fixing a
     persistent SCOPE drift, operators run this to replay reaped
@@ -222,7 +265,7 @@ async def requeue_dead_letter_tasks_by_type(
         WITH victims AS (
             SELECT task_id, timestamp
             FROM {task_schema}.tasks
-            WHERE status    = 'DEAD_LETTER'
+            WHERE status    IN {_REQUEUEABLE_STATUSES}
               AND task_type = :task_type
               {since_filter}
               {extra_filters}
@@ -247,11 +290,13 @@ async def requeue_dead_letter_tasks_by_type(
         ).execute(conn, **params) or []
     count = len(rows)
     logger.info(
-        "Maintenance: requeued %d DEAD_LETTER row(s) of type %r%s%s.",
+        "Maintenance: requeued %d DEAD_LETTER/FAILED row(s) of type %r%s%s.",
         count, task_type,
         f" since {since.isoformat()}" if since else "",
         f" matching {dict(inputs_match)!r}" if inputs_match else "",
     )
+    if count:
+        await _notify_requeued(engine, "dlq_requeue_bulk")
     return count
 
 
