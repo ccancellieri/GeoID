@@ -1743,10 +1743,23 @@ async def create_task(
                 return None
 
         from dynastore.tools.correlation import _INTERNAL_KEY, get_correlation_id
-        inputs = dict(task_data.inputs) if task_data.inputs else {}
+        from dynastore.models.tasks import DEFAULT_TASK_TITLE
+        # Fold the title into the inputs dict that will be persisted in the
+        # inputs JSONB column under the reserved "title" key.
+        # Process executions already stamp their title before reaching here,
+        # so we only supply the generic default when the key is missing entirely.
+        effective_inputs = dict(task_data.inputs or {})
+        explicit_title = (
+            task_data.title.model_dump(exclude_none=True) if task_data.title else None
+        )
+        if explicit_title:
+            effective_inputs["title"] = explicit_title
+        elif not effective_inputs.get("title"):
+            effective_inputs["title"] = DEFAULT_TASK_TITLE.model_dump(exclude_none=True)
         cid = get_correlation_id()
         if cid is not None:
-            inputs[_INTERNAL_KEY] = cid
+            effective_inputs[_INTERNAL_KEY] = cid
+        inputs = effective_inputs
 
         # Always-present columns + values.
         # max_retries: caller may override the column DEFAULT (3) per-row.

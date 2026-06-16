@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from enum import Enum
 from typing import List, Dict, Any, Literal, Optional, TYPE_CHECKING
 from dynastore.models.localization import LocalizedText
@@ -245,6 +245,11 @@ class StatusInfo(BaseModel):
     progress: Optional[int] = None
     created: Optional[datetime] = None
     updated: Optional[datetime] = None
+    # OGC API — Processes additive fields (non-breaking; clients may ignore)
+    processID: Optional[str] = None
+    started: Optional[datetime] = None
+    finished: Optional[datetime] = None
+    title: Optional[Any] = None
     links: List[Link]
 
 class OutputExecutionRequest(BaseModel):
@@ -278,9 +283,26 @@ class ExecuteRequest(BaseModel):
         },
     )
 
+    title: Optional[LocalizedText] = Field(
+        default=None,
+        description=(
+            "Optional operator-supplied display title for this job, in one or more "
+            "languages. A plain string is accepted and treated as an English value. "
+            "Stored under the reserved 'title' key in the task inputs alongside the "
+            "process inputs dict; never validated as a process input parameter."
+        ),
+    )
     inputs: Dict[str, Any]
     outputs: Optional[Dict[str, OutputExecutionRequest]] = None
     response: str = Field(default="document", pattern="^(document|raw)$")
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _coerce_title_string(cls, v: Any) -> Any:
+        """Accept a plain string and wrap it as an English LocalizedText."""
+        if isinstance(v, str):
+            return LocalizedText(en=v)
+        return v
 
 # Type alias for clarity: a process execution task payload
 ProcessTaskPayload = TaskPayload[ExecuteRequest] # This remains for type hinting
@@ -346,6 +368,11 @@ def task_to_status_info(task: "Task", links: Optional[List[Link]] = None) -> Sta
         elif task.status == TaskStatusEnum.DISMISSED:
             status_message = f"Job '{task.task_type}' was dismissed."
 
+    # Resolve the stored title: prefer the model-validator-surfaced attribute,
+    # fall back to reading the raw inputs dict directly for tasks built outside
+    # the normal Task validation path.
+    task_title = task.title if task.title is not None else (task.inputs or {}).get("title")
+
     info = StatusInfo(
         jobID=task.jobID,
         status=api_status,
@@ -354,6 +381,10 @@ def task_to_status_info(task: "Task", links: Optional[List[Link]] = None) -> Sta
         progress=task.progress,
         created=task.timestamp,
         updated=task.finished_at or task.started_at or task.timestamp,
+        processID=task.task_type,
+        started=task.started_at,
+        finished=task.finished_at,
+        title=task_title,
         # Prefer caller-supplied HATEOAS links; fall back to any links already
         # on the task, else empty. The parentheses are load-bearing: without
         # them the conditional bound looser than ``or`` and the whole

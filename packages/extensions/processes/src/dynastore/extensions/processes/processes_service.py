@@ -410,9 +410,11 @@ def _localize_process_list(pl: models.ProcessList, language: str) -> dict:
 
 
 def _localize_status_info(si: models.StatusInfo, language: str) -> dict:
-    """Serialize a StatusInfo and resolve all link titles to *language*."""
+    """Serialize a StatusInfo, resolve the job title to *language*, and resolve link titles."""
     data = si.model_dump(by_alias=True, exclude_none=True)
-    localize_response_dict(data, language, text_fields=(), link_keys=("links",))
+    localize_response_dict(
+        data, language, text_fields=("title", "message"), link_keys=("links",)
+    )
     return data
 
 
@@ -883,7 +885,10 @@ async def get_job_status(
             detail=f"Job '{job_id}' not found.",
         )
     si = _task_to_status_info(task, request)
-    return JSONResponse(content=_localize_status_info(si, language))
+    return JSONResponse(
+        content=_localize_status_info(si, language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.get(
@@ -931,7 +936,10 @@ async def get_job_status_collection(
             detail=f"Job '{job_id}' does not belong to collection '{collection_id}'.",
         )
     si = _task_to_status_info(task, request)
-    return JSONResponse(content=_localize_status_info(si, language))
+    return JSONResponse(
+        content=_localize_status_info(si, language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.get(
@@ -969,7 +977,10 @@ async def get_job_status_catalog(
     """Gets the status of a specific job (Catalog context)."""
     task = await _get_job_internal(job_id, catalog_id, conn)
     si = _task_to_status_info(task, request)
-    return JSONResponse(content=_localize_status_info(si, language))
+    return JSONResponse(
+        content=_localize_status_info(si, language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.get(
@@ -1000,7 +1011,10 @@ async def list_jobs(
 ) -> JSONResponse:
     """Lists jobs (System context)."""
     tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset)
-    return JSONResponse(content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks])
+    return JSONResponse(
+        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks],
+        headers={"Content-Language": language},
+    )
 
 
 @router.get(
@@ -1018,7 +1032,10 @@ async def list_jobs_catalog(
     """Lists jobs (Catalog context)."""
     schema = await _resolve_catalog_schema(catalog_id, conn)
     tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset)
-    return JSONResponse(content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks])
+    return JSONResponse(
+        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks],
+        headers={"Content-Language": language},
+    )
 
 
 @router.get(
@@ -1038,7 +1055,10 @@ async def list_jobs_collection(
     schema = await _resolve_catalog_schema(catalog_id, conn)
     all_tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset)
     filtered = [t for t in all_tasks if getattr(t, "collection_id", None) == collection_id]
-    return JSONResponse(content=[_localize_status_info(_task_to_status_info(t, request), language) for t in filtered])
+    return JSONResponse(
+        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in filtered],
+        headers={"Content-Language": language},
+    )
 
 
 # --- OGC Part 1: Dismiss Job (DELETE /jobs/{id}) at 3 scopes ---
@@ -1059,7 +1079,10 @@ async def dismiss_job(
         task = await execution_engine.dismiss_job(job_id, engine=engine, db_schema="public")
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return JSONResponse(content=_localize_status_info(_task_to_status_info(task, request), language))
+    return JSONResponse(
+        content=_localize_status_info(_task_to_status_info(task, request), language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.delete(
@@ -1080,7 +1103,10 @@ async def dismiss_job_catalog(
         task = await execution_engine.dismiss_job(job_id, engine=engine, db_schema=schema)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return JSONResponse(content=_localize_status_info(_task_to_status_info(task, request), language))
+    return JSONResponse(
+        content=_localize_status_info(_task_to_status_info(task, request), language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.delete(
@@ -1105,7 +1131,10 @@ async def dismiss_job_collection(
         task = await execution_engine.dismiss_job(job_id, engine=engine, db_schema=schema)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return JSONResponse(content=_localize_status_info(_task_to_status_info(task, request), language))
+    return JSONResponse(
+        content=_localize_status_info(_task_to_status_info(task, request), language),
+        headers={"Content-Language": language},
+    )
 
 
 # --- OGC Part 4: Deferred Execution (POST /jobs, PATCH, POST /results) at 3 scopes ---
@@ -1245,7 +1274,10 @@ async def update_job(
         job = await execution_engine.update_job(job_id, body.inputs, engine=engine, db_schema="public")
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return JSONResponse(content=_localize_status_info(_task_to_status_info(job, request), language))
+    return JSONResponse(
+        content=_localize_status_info(_task_to_status_info(job, request), language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.patch(
@@ -1267,7 +1299,10 @@ async def update_job_catalog(
         job = await execution_engine.update_job(job_id, body.inputs, engine=engine, db_schema=schema)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return JSONResponse(content=_localize_status_info(_task_to_status_info(job, request), language))
+    return JSONResponse(
+        content=_localize_status_info(_task_to_status_info(job, request), language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.patch(
@@ -1290,7 +1325,10 @@ async def update_job_collection(
         job = await execution_engine.update_job(job_id, body.inputs, engine=engine, db_schema=schema)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return JSONResponse(content=_localize_status_info(_task_to_status_info(job, request), language))
+    return JSONResponse(
+        content=_localize_status_info(_task_to_status_info(job, request), language),
+        headers={"Content-Language": language},
+    )
 
 
 # --- OGC Part 4: Start Job (POST /jobs/{id}/results) at 3 scopes ---

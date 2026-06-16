@@ -1971,11 +1971,14 @@ class Web(ExtensionProtocol, OGCServiceMixin):
         # (one canonical REST surface per module — no dashboard proxies).
 
         @self.router.get("/dashboard/tasks", response_class=JSONResponse)
-        async def get_dashboard_platform_tasks():
+        async def get_dashboard_platform_tasks(
+            language: str = Depends(get_language),
+        ):
             from dynastore.models.protocols.tasks import TasksProtocol
             from dynastore.models.protocols import DatabaseProtocol
             from dynastore.modules.db_config.query_executor import managed_transaction
             from dynastore.modules.tasks.tasks_module import get_task_schema
+            from dynastore.extensions.tools.response_i18n import localize_response_dict
 
             tasks_svc = get_protocol(TasksProtocol)
             if tasks_svc is None:
@@ -1988,7 +1991,17 @@ class Web(ExtensionProtocol, OGCServiceMixin):
                 schema = get_task_schema()
                 async with managed_transaction(engine) as conn:
                     tasks = await tasks_svc.list_tasks(conn, schema)
-                return [t.model_dump() if hasattr(t, "model_dump") else t for t in tasks]
+                result = []
+                for t in tasks:
+                    d = t.model_dump() if hasattr(t, "model_dump") else t
+                    if isinstance(d, dict):
+                        # Task.title is excluded from model_dump (it holds the raw
+                        # {lang: text} map); surface the stored title from the
+                        # inputs JSONB so it can be resolved to the request language.
+                        d["title"] = (d.get("inputs") or {}).get("title")
+                        localize_response_dict(d, language, text_fields=("title",), link_keys=())
+                    result.append(d)
+                return result
             except Exception:
                 return []
 
@@ -2030,10 +2043,14 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             return await _stats_summary(catalog_id, collection_id, principal_id, start_date, end_date, path_pattern, methods)
 
         @self.router.get("/dashboard/catalogs/{catalog_id}/tasks", response_class=JSONResponse)
-        async def get_dashboard_tasks(catalog_id: str):
+        async def get_dashboard_tasks(
+            catalog_id: str,
+            language: str = Depends(get_language),
+        ):
             from dynastore.models.protocols.tasks import TasksProtocol
             from dynastore.models.protocols import DatabaseProtocol
             from dynastore.modules.db_config.query_executor import managed_transaction
+            from dynastore.extensions.tools.response_i18n import localize_response_dict
 
             tasks_svc = get_protocol(TasksProtocol)
             if tasks_svc is None:
@@ -2045,7 +2062,17 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             try:
                 async with managed_transaction(engine) as conn:
                     tasks = await tasks_svc.list_tasks_for_catalog(conn, catalog_id)
-                return [t.model_dump() if hasattr(t, "model_dump") else t for t in tasks]
+                result = []
+                for t in tasks:
+                    d = t.model_dump() if hasattr(t, "model_dump") else t
+                    if isinstance(d, dict):
+                        # Task.title is excluded from model_dump (it holds the raw
+                        # {lang: text} map); surface the stored title from the
+                        # inputs JSONB so it can be resolved to the request language.
+                        d["title"] = (d.get("inputs") or {}).get("title")
+                        localize_response_dict(d, language, text_fields=("title",), link_keys=())
+                    result.append(d)
+                return result
             except Exception:
                 return []
 

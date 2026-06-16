@@ -157,12 +157,28 @@ For a deeper dive into architecture and operational best practices, see the [Dyn
 
 """
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from typing import Optional, Dict, Any, TypeVar, Generic, List
 from dynastore.models.shared_models import Link
+from dynastore.models.localization import LocalizedText
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 from enum import Enum
+
+# Default multilingual titles stored under the reserved "title" key in task inputs.
+# Process executions inject DEFAULT_PROCESS_TITLE before reaching create_task;
+# generic tasks (enqueued without a title) fall back to DEFAULT_TASK_TITLE.
+DEFAULT_TASK_TITLE = LocalizedText(
+    en="Task", fr="Tâche", es="Tarea", ru="Задача", zh="任务", ar="مهمة"
+)
+DEFAULT_PROCESS_TITLE = LocalizedText(
+    en="Process execution",
+    fr="Exécution de processus",
+    es="Ejecución de proceso",
+    ru="Выполнение процесса",
+    zh="流程执行",
+    ar="تنفيذ العملية",
+)
 
 # --- Enumerations ---
 
@@ -266,6 +282,14 @@ class TaskCreate(TaskBase):
         },
     )
 
+    title: Optional[LocalizedText] = Field(
+        default=None,
+        description=(
+            "Optional operator-supplied display title for this task, in one or more "
+            "languages. Stored under the reserved 'title' key in the inputs JSONB column. "
+            "When absent the persistence layer supplies a language-appropriate default."
+        ),
+    )
     execution_mode: str = TaskExecutionMode.ASYNCHRONOUS
     execution_scope: str = TaskExecutionScope.LOCAL_QUEUE
     scope: str = TaskScope.CATALOG
@@ -355,7 +379,18 @@ class Task(TaskBase):
 
     links: List[Link] = Field(default_factory=list)
 
+    # Surfaced from the reserved "title" key in the inputs JSONB column.
+    # Populated by the model_validator below; raw value is a {lang: text} map.
+    title: Optional[Any] = Field(default=None, exclude=True)
+
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    @model_validator(mode="after")
+    def _surface_title_from_inputs(self) -> "Task":
+        """Promote the stored title map from inputs so callers read task.title directly."""
+        if self.title is None and self.inputs:
+            self.title = self.inputs.get("title")
+        return self
 
     @property
     def task_id(self) -> UUID:

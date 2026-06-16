@@ -181,9 +181,23 @@ async def execute_process(
             catalog_id, ctx=DriverContext(db_resource=engine) if engine else None
         )
 
+    from dynastore.models.tasks import DEFAULT_PROCESS_TITLE
+    dumped = execution_request.model_dump()
+    # Ensure a clean title at the top level of the stored inputs dict. An
+    # operator-supplied title is re-dumped with exclude_none so a single-language
+    # title does not persist null sibling languages; when absent, stamp the
+    # default process-execution title so every job row carries a human-readable
+    # label regardless of which runner claims it.
+    _operator_title = execution_request.title
+    dumped["title"] = (
+        _operator_title.model_dump(exclude_none=True)
+        if _operator_title is not None
+        else DEFAULT_PROCESS_TITLE.model_dump(exclude_none=True)
+    )
+
     return await execution_engine.execute(
         task_type=process_id,
-        inputs=execution_request.model_dump(),
+        inputs=dumped,
         engine=engine,
         mode=execution_mode,
         caller_id=caller_id,

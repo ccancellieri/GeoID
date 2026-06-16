@@ -725,10 +725,19 @@ class ExecutionEngine:
 
         tasks_mgr = resolve(TasksProtocol)
 
+        from dynastore.models.tasks import DEFAULT_PROCESS_TITLE
+
+        # Deferred jobs are process executions; stamp the process-execution
+        # default title when the caller did not provide one, so the row is not
+        # mislabelled with the generic task default applied in create_task.
+        job_inputs = dict(inputs or {})
+        if not job_inputs.get("title"):
+            job_inputs["title"] = DEFAULT_PROCESS_TITLE.model_dump(exclude_none=True)
+
         task_create = TaskCreate(
             caller_id=caller_id,
             task_type=task_type,
-            inputs=inputs or {},
+            inputs=job_inputs,
             collection_id=collection_id,
         )
         job = await tasks_mgr.create_task(
