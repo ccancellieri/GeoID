@@ -313,10 +313,9 @@ COMMON_PROPERTIES: Dict[str, Any] = {
     # Platform identifier mirrored at the doc root (also under properties).
     "geoid":           {"type": "keyword"},
     # Internal write-time trackers attached by ItemsElasticsearchDriver.
-    # Required at root so the strict ``dynamic: false`` items mapping does
-    # not reject the doc when the driver writes them.
-    "_asset_id":              {"type": "keyword"},
-    "_external_id":           {"type": "keyword"},
+    # ``_external_id`` / ``_asset_id`` were dropped in #1285 identity
+    # convergence — identity lives only on the root ``external_id`` /
+    # ``asset_id`` keywords, so the driver no longer writes the ``_``-mirrors.
     "_valid_from":            {"type": "date"},
     "_valid_to":              {"type": "date"},
     "_simplification_factor": {"type": "float"},

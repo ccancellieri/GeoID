@@ -30,7 +30,10 @@ internal storage concern.
 from typing import Any, Dict, List, Optional
 
 from dynastore.modules.elasticsearch.items_projection import project_item_for_es
-from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
+from dynastore.modules.storage.computed_fields import (
+    SYSTEM_FIELD_KEYS,
+    _SYSTEM_ONLY_FIELD_NAMES,
+)
 
 _SYSTEM_KEYS: frozenset = frozenset(SYSTEM_FIELD_KEYS)
 
@@ -105,7 +108,7 @@ def build_canonical_envelope(
 
     * **flat identity** — ``identity`` keys sit at the document top level
       (``id``, ``catalog_id``, ``collection_id``, ``external_id``, ``asset_id``,
-      ``validity``, the ``_external_id`` read tracker …). ``id`` is whatever
+      ``validity`` …). ``id`` is whatever
       stable identifier the level uses (``geoid`` for items, ``collection_id``
       for collections, ``catalog_id`` for catalogs).
     * **reserved members** — protocol-structural keys surfaced verbatim by the
@@ -177,11 +180,11 @@ def build_canonical_index_doc(
         rest of the ES projection path)
       - stats: every producible computed value from resolved_sidecars NOT in
         SYSTEM_FIELD_KEYS (system wins the overlap)
-      - system: SYSTEM_FIELD_KEYS values present on the row (content hashes
-        belong here)
+      - system: the lifecycle SYSTEM_FIELD_KEYS that are NOT identity axes
+        (content hashes / validity / timestamps belong here). The identity
+        axes (geoid / external_id / asset_id) live flat at the root, never
+        duplicated into ``system`` (#1285 identity convergence).
       - access: pass-through when non-empty
-      - _external_id: transition tracker mirrored at top level (read path
-        depends on it)
 
     ``id`` is ALWAYS ``row["geoid"]``, regardless of any policy.
     Reserved STAC/GeoJSON members never leak into properties.
@@ -214,8 +217,13 @@ def build_canonical_index_doc(
 
     external_id = row.get("external_id")
     if external_id is not None:
+        # Single canonical home: the flat root ``external_id`` keyword. The
+        # legacy ``_external_id`` mirror is no longer written — queries and the
+        # read inverse address the root field directly (#1285 identity
+        # convergence). The resolved-identity transport still rides on the
+        # in-flight payload as ``_external_id`` (item_service stamps it from the
+        # write policy's path), but it is not persisted into ``_source``.
         identity["external_id"] = str(external_id)
-        identity["_external_id"] = str(external_id)   # transition tracker (read path)
 
     if row.get("asset_id") is not None:
         identity["asset_id"] = str(row["asset_id"])
@@ -228,9 +236,17 @@ def build_canonical_index_doc(
     if validity_range is not None:
         identity["validity"] = validity_range
 
-    # system: SYSTEM_FIELD_KEYS values present on the row (content hashes live
-    # here, not in stats).
-    system = {k: row[k] for k in SYSTEM_FIELD_KEYS if row.get(k) is not None}
+    # system: the lifecycle SYSTEM_FIELD_KEYS that are NOT identity axes
+    # (content hashes / validity / timestamps live here). The three identity
+    # axes (geoid / external_id / asset_id) live flat at the document root —
+    # ``classify_container`` routes them to "identity", and the strict ``system``
+    # mapping never declared them, so the old ``system.{external_id,asset_id,
+    # geoid}`` copies were unindexed ``_source`` duplicates. Building from
+    # ``_SYSTEM_ONLY_FIELD_NAMES`` keeps ``_source`` aligned with the mapping
+    # and the classifier (#1285 identity convergence). The expose_all read
+    # rebuilds the wire ``system`` section from the PG row, not from this
+    # container, so dropping the dups does not change any read response.
+    system = {k: row[k] for k in _SYSTEM_ONLY_FIELD_NAMES if row.get(k) is not None}
     # validity is typed as ES date_range — store the converted range object
     # (or drop it when the window is fully open / unusable). Overriding the raw
     # Range here is what makes the date_range mapping ingestible (#1828).

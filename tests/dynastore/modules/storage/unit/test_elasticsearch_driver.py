@@ -748,7 +748,10 @@ class TestWriteEntitiesTenantIndex:
         for doc_idx in (1, 3):
             doc = body[doc_idx]
             assert doc["collection"] == "col1"
-            assert doc["_asset_id"] == "asset-7"
+            # asset_id lives only on the canonical root field; the legacy
+            # ``_asset_id`` _source mirror was removed (#1285 identity convergence).
+            assert doc["asset_id"] == "asset-7"
+            assert "_asset_id" not in doc
             assert doc["_valid_from"] == "2026-04-27T00:00:00Z"
             # _valid_to is None in context → key skipped
             assert "_valid_to" not in doc

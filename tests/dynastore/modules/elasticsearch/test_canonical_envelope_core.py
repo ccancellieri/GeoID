@@ -207,7 +207,9 @@ def test_item_builder_output_is_canonical_and_roundtrips():
     assert doc["id"] == "019e917f-dd1d-7f5b-b133-54e8a96c4ec0"
     assert doc["catalog_id"] == "cat"
     assert doc["collection_id"] == "coll"
-    assert doc["_external_id"] == "EXT-1"
+    # external_id lives at the root only — no legacy ``_external_id`` mirror.
+    assert doc["external_id"] == "EXT-1"
+    assert "_external_id" not in doc
     # known stays flat, unknown ('note') to extras
     assert doc["properties"]["datetime"] == "2026-06-04T00:00:00Z"
     assert doc["properties"]["platform"] == "s2a"

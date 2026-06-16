@@ -532,7 +532,7 @@ def project_item_for_es(doc: Dict[str, Any], known_fields: Dict[str, Dict[str, A
     """Reshape an item doc so unknown ``properties`` keys move to ``properties.extras``.
 
     Pure function — returns a new dict; the input is not mutated. Internal
-    top-level ``_*`` fields (``_asset_id``, ``_external_id``,
+    top-level ``_*`` fields (``_valid_from``, ``_valid_to``,
     ``_simplification_factor``, …) and the STAC top-level keys
     (``geometry``, ``bbox``, ``id``, ``collection``, …) are left
     untouched. Only ``doc["properties"]`` is reshaped.

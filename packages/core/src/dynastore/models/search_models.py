@@ -59,7 +59,7 @@ class SearchBody(BaseModel):
     external_id: Optional[List[str]] = Field(
         None,
         description=(
-            "Array of external_id values. Matches items whose ``_external_id`` "
+            "Array of external_id values. Matches items whose ``external_id`` "
             "(populated from the configured ItemsWritePolicy.external_id_field) "
             "equals one of the supplied values."
         ),

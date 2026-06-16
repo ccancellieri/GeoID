@@ -118,7 +118,10 @@ def test_public_envelope_fields_are_the_default():
     clauses = _flatten(public)
     assert {"terms": {"id": ["a"]}} in clauses          # ids → id
     assert {"terms": {"id": ["g"]}} in clauses          # geoid → id (public)
-    assert {"terms": {"_external_id": ["x"]}} in clauses  # external_id → _external_id
+    # external_id targets the root keyword on BOTH index shapes now — the
+    # legacy public ``_external_id`` mirror was removed (#1285 identity convergence).
+    assert {"terms": {"external_id": ["x"]}} in clauses
+    assert {"terms": {"_external_id": ["x"]}} not in clauses
     assert {"terms": {"collection": ["c"]}} in clauses    # collection
 
 

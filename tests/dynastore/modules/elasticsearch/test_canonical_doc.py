@@ -21,11 +21,13 @@
 Tests cover:
   - id is always geoid, not external_id
   - flat identity fields (catalog_id, collection_id, external_id, asset_id,
-    validity) and _external_id transition tracker
+    validity) live at the root only — the identity axes are NOT duplicated into
+    the system container and the legacy ``_external_id`` mirror is not written
+    (#1285 identity convergence)
   - geometry and bbox pass-through
   - properties reshape: known keys stay flat, unknown keys move to extras
-  - system section: SYSTEM_FIELD_KEYS values from the row (content hashes land
-    here, not in stats)
+  - system section: the lifecycle SYSTEM_FIELD_KEYS that are NOT identity axes
+    (content hashes / validity / timestamps land here, not in stats)
   - stats section: sidecar-produced values not in SYSTEM_FIELD_KEYS
   - system wins when a sidecar produces a name that overlaps SYSTEM_FIELD_KEYS
   - access pass-through and omission when falsy
@@ -102,7 +104,7 @@ def test_id_is_always_geoid_even_with_external_id():
     assert doc["id"] == "019e6318-d99e-7da2-bdd9-1223a0d9cd35"
     assert doc["catalog_id"] == "cat" and doc["collection_id"] == "col"
     assert doc["external_id"] == "305" and doc["asset_id"] == "ALBL1_01"
-    assert doc["_external_id"] == "305"            # transition tracker preserved
+    assert "_external_id" not in doc               # no legacy _source mirror
     assert doc["properties"] == {"NAME": "Berat"}  # user-only, known key stays flat
     assert "id" not in doc["properties"] and "geoid" not in doc["properties"]
 
@@ -162,7 +164,9 @@ def test_stats_and_system_split_with_hash_in_system():
     assert doc["stats"] == {"area": 17999118217.7, "s2_res12": 1.22e18}
     assert "geometry_hash" not in doc["stats"]
     assert doc["system"]["geometry_hash"] == "abc"
-    assert doc["system"]["geoid"] == _row()["geoid"]
+    # geoid is an identity axis — it lives at the root, never in system.
+    assert doc["id"] == _row()["geoid"]
+    assert "geoid" not in doc["system"]
 
 
 def test_unknown_user_property_moves_to_extras():
@@ -220,13 +224,10 @@ def test_system_section_absent_when_row_has_no_system_keys():
     )
     # id must always be geoid; no external_id -> no _external_id
     assert doc["id"] == "abc-123"
-    # All SYSTEM_FIELD_KEYS are absent from the row except geoid itself
-    # system section should still be emitted for geoid
-    assert doc["system"]["geoid"] == "abc-123"
-    # no extra keys
-    for key in ("external_id", "asset_id", "geometry_hash", "attributes_hash",
-                "validity", "transaction_time", "deleted_at"):
-        assert key not in doc["system"]
+    # geoid is an identity axis (root only), and the row has no system-only
+    # lifecycle keys, so the system container is omitted entirely.
+    assert "system" not in doc
+    assert "_external_id" not in doc
 
 
 def test_stats_absent_when_no_sidecars():
@@ -292,10 +293,11 @@ def test_all_system_fields_present_on_row():
         row, resolved_sidecars=[], known_fields={},
         catalog_id="c", collection_id="k",
     )
+    # Identity axes live at the root only — never duplicated into system.
+    assert doc["id"] == "gid" and "geoid" not in doc["system"]
+    assert doc["external_id"] == "eid" and "external_id" not in doc["system"]
+    assert doc["asset_id"] == "aid" and "asset_id" not in doc["system"]
     sys = doc["system"]
-    assert sys["geoid"] == "gid"
-    assert sys["external_id"] == "eid"
-    assert sys["asset_id"] == "aid"
     assert sys["geometry_hash"] == "gh"
     assert sys["attributes_hash"] == "ah"
     # validity is converted to an ES date_range body: inclusive lower bound
@@ -303,6 +305,50 @@ def test_all_system_fields_present_on_row():
     assert sys["validity"] == {"gte": "2020-01-01T00:00:00+00:00"}
     assert sys["transaction_time"] == "2026-01-01T00:00:00Z"
     assert sys["deleted_at"] == "2026-06-01T00:00:00Z"
+
+
+def test_identity_convergence_no_source_duplication_and_root_is_queryable():
+    """#1285 identity convergence invariant.
+
+    The three identity axes (geoid / external_id / asset_id) are written ONCE,
+    flat at the document root. They are NOT mirrored into ``_source`` under any
+    of the legacy duplicate homes (``_external_id`` tracker, ``system.geoid`` /
+    ``system.external_id`` / ``system.asset_id``). Search is preserved because
+    the public items mapping declares the root ``external_id`` / ``asset_id`` as
+    indexed ``keyword`` fields, so a ``term`` filter on them is an exact,
+    inverted-index lookup (not an un-indexed ``_source`` scan).
+    """
+    from dynastore.modules.elasticsearch.mappings import COMMON_PROPERTIES
+    from dynastore.modules.elasticsearch.items_query import (
+        build_items_query,
+        PUBLIC_ENVELOPE_FIELDS,
+        PRIVATE_ENVELOPE_FIELDS,
+    )
+
+    doc = build_canonical_index_doc(
+        _row(), resolved_sidecars=[], known_fields={},
+        catalog_id="c", collection_id="k",
+    )
+    # Identity at the root, exactly once.
+    assert doc["id"] == _row()["geoid"]
+    assert doc["external_id"] == "305"
+    assert doc["asset_id"] == "ALBL1_01"
+    # No legacy duplicate homes anywhere in _source.
+    assert "_external_id" not in doc and "_asset_id" not in doc
+    sys = doc.get("system", {})
+    for axis in ("geoid", "external_id", "asset_id"):
+        assert axis not in sys, f"identity axis {axis!r} leaked into system"
+
+    # Root identity fields are indexed keywords → fast term lookups.
+    assert COMMON_PROPERTIES["external_id"] == {"type": "keyword"}
+    assert COMMON_PROPERTIES["asset_id"] == {"type": "keyword"}
+
+    # Both index shapes filter external_id on the root keyword (search preserved).
+    for fields in (PUBLIC_ENVELOPE_FIELDS, PRIVATE_ENVELOPE_FIELDS):
+        q = build_items_query(external_id=["305"], fields=fields)
+        clauses = q["bool"]["filter"]
+        assert {"terms": {"external_id": ["305"]}} in clauses
+        assert {"terms": {"_external_id": ["305"]}} not in clauses
 
 
 def test_access_omitted_when_none():

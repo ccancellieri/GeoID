@@ -34,7 +34,9 @@ Contracts:
      resolved sidecars and raw row.
   4. ``properties`` in ``_source`` is user-only (no SYSTEM_FIELD_KEYS).
   5. ``id`` in ``_source`` equals the geoid.
-  6. ``_external_id`` tracker is present in ``_source``.
+  6. ``external_id`` is carried only by the root identity field — the legacy
+     ``_external_id`` mirror and the ``system.external_id`` copy are gone
+     (#1285 identity convergence).
   7. Delete ops are passed through unchanged (``_id`` is still the geoid).
   8. ``write_entities`` uses ``_id=geoid``, not ``stac_doc["id"]``.
   9. ``write_entities`` produces byte-identical canonical ``_source`` to
@@ -201,13 +203,14 @@ class TestIndexBulkCanonical:
         # _source: id==geoid.
         assert doc.get("id") == _GEOID, f"doc id must be geoid; got {doc.get('id')}"
 
-        # _source: _external_id tracker.
-        assert "_external_id" in doc, f"_external_id missing from {list(doc.keys())}"
-        assert doc["_external_id"] == _EXTERNAL_ID
+        # _source: external_id at the root only (no legacy ``_external_id`` mirror).
+        assert "_external_id" not in doc
+        assert doc.get("external_id") == _EXTERNAL_ID
 
-        # _source: system section present with geoid.
+        # _source: system section present (lifecycle keys), identity at the root.
         assert "system" in doc, f"system section missing from {list(doc.keys())}"
-        assert doc["system"].get("geoid") == _GEOID
+        assert "geoid" not in doc["system"]
+        assert doc.get("id") == _GEOID
 
         # _source: stats section present with area.
         assert "stats" in doc, f"stats section missing from {list(doc.keys())}"
@@ -367,8 +370,9 @@ class TestIndexSingleCanonical:
         # system and stats sections.
         assert "system" in doc
         assert "stats" in doc
-        # _external_id tracker.
-        assert "_external_id" in doc
+        # external_id at the root; no legacy ``_external_id`` mirror.
+        assert "_external_id" not in doc
+        assert doc.get("external_id") == _EXTERNAL_ID
 
 
 # ---------------------------------------------------------------------------
@@ -574,8 +578,9 @@ class TestWriteEntitiesCanonicalSource:
                 f"SYSTEM_FIELD_KEY '{key}' leaked into properties"
             )
 
-        # _external_id tracker present.
-        assert "_external_id" in doc, f"_external_id missing from {list(doc.keys())}"
+        # external_id at the root; no legacy ``_external_id`` mirror.
+        assert "_external_id" not in doc
+        assert doc.get("external_id") == _EXTERNAL_ID
 
     @pytest.mark.asyncio
     async def test_write_entities_no_pg_row_fallback_does_not_crash(self):
@@ -731,11 +736,13 @@ class TestWriteEntitiesCanonicalSource:
         assert "system" in doc, (
             f"system missing — feature-derived fallback was taken: {list(doc.keys())}"
         )
-        # external_id from the PG row must land in the system lane (bug #2).
-        assert doc["system"].get("external_id") == ext_id, (
-            f"system.external_id must be projected from the PG row; "
-            f"got system={doc.get('system')}"
+        # external_id from the PG row must be projected onto the root identity
+        # field (bug #2). Post-#1285 it lives only at the root — never copied
+        # into the system lane.
+        assert doc.get("external_id") == ext_id, (
+            f"root external_id must be projected from the PG row; got {doc.get('external_id')}"
         )
+        assert "external_id" not in doc.get("system", {})
 
 
 # ---------------------------------------------------------------------------

@@ -920,7 +920,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
             # ``extras``).
             structural = ["id", "type", "bbox", "collection", "links",
                           "assets", "stac_version", "stac_extensions",
-                          "_external_id", "geoid", "external_id",
+                          "geoid", "external_id",
                           "collection_id"]
             if not skip_geom:
                 structural.append("geometry")
@@ -1383,11 +1383,10 @@ class ItemsElasticsearchDriver(
                 es_doc["_valid_from"] = valid_from
             if valid_to is not None:
                 es_doc["_valid_to"] = valid_to
-            if asset_id is not None and "_asset_id" not in es_doc:
-                # _asset_id tracker for the ingestion pipeline (mirrors the
-                # public driver's convention; canonical doc uses asset_id at
-                # the top-level identity field).
-                es_doc["_asset_id"] = str(asset_id)
+            # asset_id is carried only by the canonical root ``asset_id`` identity
+            # field (build_canonical_index_doc writes it from the row). The legacy
+            # ``_asset_id`` ``_source`` mirror is no longer stamped — it was an
+            # unindexed duplicate of the root field (#1285 identity convergence).
 
             # Geometry simplification (#1248/#1828) — operates on the assembled
             # _source dict so the canonical envelope is intact; metadata is
@@ -1561,8 +1560,8 @@ class ItemsElasticsearchDriver(
         layered on here so an ES-served read matches the PostgreSQL
         ``map_row_to_feature`` contract:
 
-        * ``external_id_as_feature_id`` → the indexed ``_external_id`` becomes
-          the feature ``id``;
+        * ``external_id_as_feature_id`` → the indexed root ``external_id``
+          becomes the feature ``id``;
         * ``expose_geoid`` / ``expose_created`` gate the ``geoid`` / ``created``
           properties (suppressed unless the policy opts in).
         """
@@ -1575,7 +1574,7 @@ class ItemsElasticsearchDriver(
         if read_policy is not None and isinstance(props, dict):
             ft = read_policy.feature_type
             if getattr(ft, "external_id_as_feature_id", False) and isinstance(source, dict):
-                ext = source.get("_external_id")
+                ext = source.get("external_id")
                 if ext is not None:
                     clean["id"] = str(ext)
             if not getattr(ft, "expose_geoid", False):
@@ -1624,7 +1623,7 @@ class ItemsElasticsearchDriver(
         es: Any, index_name: str, collection_id: str, external_id: str,
     ) -> bool:
         """Check whether any document in the tenant index for this
-        collection carries ``_external_id == external_id``.
+        collection carries ``external_id == external_id``.
 
         Uses ``_routing=collection_id`` so the count hits a single shard.
         """
@@ -1636,7 +1635,7 @@ class ItemsElasticsearchDriver(
                         "bool": {
                             "filter": [
                                 {"term": {"collection": collection_id}},
-                                {"term": {"_external_id": external_id}},
+                                {"term": {"external_id": external_id}},
                             ]
                         }
                     }

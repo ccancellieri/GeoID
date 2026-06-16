@@ -288,8 +288,6 @@ def test_common_properties_includes_internal_write_trackers() -> None:
     by failing — extend COMMON_PROPERTIES *and* this test together.
     """
     for required in (
-        "_asset_id",
-        "_external_id",
         "_valid_from",
         "_valid_to",
         "_simplification_factor",
@@ -302,9 +300,17 @@ def test_common_properties_includes_internal_write_trackers() -> None:
             f"{required} must be declared in COMMON_PROPERTIES so the "
             "strict items mapping accepts it"
         )
+    # ``_external_id`` / ``_asset_id`` were removed in #1285 identity
+    # convergence — identity lives only on the root ``external_id`` /
+    # ``asset_id`` keywords, so the driver no longer writes the ``_``-mirrors
+    # and they must NOT be declared.
+    for removed in ("_external_id", "_asset_id"):
+        assert removed not in COMMON_PROPERTIES
+    assert "external_id" in COMMON_PROPERTIES and "asset_id" in COMMON_PROPERTIES
     # Sanity-check the strict root accepts them.
     root_props = ITEM_MAPPING["properties"]
-    assert "_asset_id" in root_props
+    assert "_asset_id" not in root_props
+    assert root_props["external_id"] == {"type": "keyword"}
     assert "_simplification_factor" in root_props
     assert root_props["_search_text"] == {"type": "text", "analyzer": "standard"}
 

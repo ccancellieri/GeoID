@@ -44,8 +44,10 @@ def _malformed_source() -> Dict[str, Any]:
         "geometry": {},
         "collection": "glosis_demo",
         "catalog_id": "datamgr01",
-        "_external_id": "325",
-        "_asset_id": "ALBL1_01",
+        # Canonical storage shape (#1285): identity lives at the root only —
+        # no legacy ``_external_id`` / ``_asset_id`` mirrors.
+        "external_id": "325",
+        "asset_id": "ALBL1_01",
         "properties": {
             "extras": {
                 "CODE": "325",

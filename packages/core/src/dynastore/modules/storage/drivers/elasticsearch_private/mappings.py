@@ -121,8 +121,8 @@ def _tenant_root_fields() -> Dict[str, Any]:
         "geometry":              {"type": "geo_shape"},
         "bbox":                  {"type": "float"},
         # Write-time trackers (mirrors COMMON_PROPERTIES in the public mapping).
-        "_external_id":          {"type": "keyword"},
-        "_asset_id":             {"type": "keyword"},
+        # ``_external_id`` / ``_asset_id`` dropped in #1285 identity convergence
+        # — identity lives only on the root ``external_id`` / ``asset_id``.
         "_valid_from":           {"type": "date"},
         "_valid_to":             {"type": "date"},
         # ``_simplification_factor`` / ``_simplification_mode`` removed in #1828
@@ -141,12 +141,13 @@ _PRIVATE_STATS_FIELDS: Dict[str, Any] = {
     "centroid": {"type": "keyword"},  # WKB hex — not geo_point.
 }
 
-# Canonical system container — identity / lifecycle SYSTEM_FIELD_KEYS.
+# Canonical system container — lifecycle SYSTEM_FIELD_KEYS only.
 # Mirrors the ``system`` nested object in the public items mapping (#1800).
+# The identity axes (geoid / external_id / asset_id) are NOT declared here —
+# they live flat at the document root (declared in ``_tenant_root_fields``).
+# Declaring them under ``system`` only encouraged the duplicate ``_source``
+# copies that #1285 identity convergence removed.
 _PRIVATE_SYSTEM_FIELDS: Dict[str, Any] = {
-    "geoid":            {"type": "keyword"},
-    "external_id":      {"type": "keyword"},
-    "asset_id":         {"type": "keyword"},
     "geometry_hash":    {"type": "keyword"},
     "attributes_hash":  {"type": "keyword"},
     # validity is the temporal window, typed as date_range to mirror the public

@@ -198,16 +198,18 @@ def test_es_filter_combines_with_attribute_predicate():
 
 
 def test_external_id_filter_remaps_to_public_envelope_field():
-    """On the public (STAC-flavoured) index ``external_id`` is stored under the
-    prefixed name ``_external_id`` — the remap must produce a term on that name."""
+    """Since the identity convergence (#1285) the public (STAC-flavoured) index
+    carries ``external_id`` at the document root — the same canonical keyword as
+    the private index. The legacy ``_external_id`` mirror was removed, so the
+    remap must produce a term on the un-prefixed root field."""
     from dynastore.modules.elasticsearch.items_query import PUBLIC_ENVELOPE_FIELDS
 
     body = _ItemsElasticsearchBase._query_request_to_es(
         QueryRequest(filters=[FilterCondition(field="external_id", operator="=", value="ext-99")]),
         PUBLIC_ENVELOPE_FIELDS,
     )
-    assert {"term": {"_external_id": "ext-99"}} in _clauses(body)
-    assert {"term": {"external_id": "ext-99"}} not in _clauses(body)
+    assert {"term": {"external_id": "ext-99"}} in _clauses(body)
+    assert {"term": {"_external_id": "ext-99"}} not in _clauses(body)
 
 
 def test_external_id_filter_remaps_to_private_envelope_field():
@@ -224,14 +226,16 @@ def test_external_id_filter_remaps_to_private_envelope_field():
 
 
 def test_external_id_like_filter_remaps_to_public_envelope_field():
-    """``like`` operator on ``external_id`` is also remapped on the public index."""
+    """``like`` on ``external_id`` addresses the converged root keyword on the
+    public index too (#1285) — no ``_external_id`` mirror remains."""
     from dynastore.modules.elasticsearch.items_query import PUBLIC_ENVELOPE_FIELDS
 
     body = _ItemsElasticsearchBase._query_request_to_es(
         QueryRequest(filters=[FilterCondition(field="external_id", operator="like", value="ext-*")]),
         PUBLIC_ENVELOPE_FIELDS,
     )
-    assert {"wildcard": {"_external_id": "ext-*"}} in _clauses(body)
+    assert {"wildcard": {"external_id": "ext-*"}} in _clauses(body)
+    assert {"wildcard": {"_external_id": "ext-*"}} not in _clauses(body)
 
 
 def test_non_identity_field_not_remapped():

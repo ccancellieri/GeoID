@@ -42,8 +42,11 @@ class EnvelopeFields:
 
     The two ES item drivers write the same logical envelope under *different*
     field names: the public per-catalog index uses STAC-flavoured names
-    (``collection``, ``id``, ``_external_id``) while the tenant-private index
-    uses the canonical names (``collection_id``, ``geoid``, ``external_id``).
+    (``collection``, ``id``) while the tenant-private index uses the canonical
+    names (``collection_id``, ``geoid``). Both now carry ``external_id`` at the
+    document root — the legacy public ``_external_id`` mirror was removed in
+    #1285 identity convergence, so structural queries address the root field on
+    every index shape.
     A structural query must address whichever shape the resolved index carries,
     so :func:`build_items_query` takes one of these mappings instead of
     hard-coding a single shape (the D1 "reconcile public/private envelope"
@@ -58,7 +61,7 @@ class EnvelopeFields:
     collection: str = "collection"
     item_id: str = "id"
     geoid: str = "id"
-    external_id: str = "_external_id"
+    external_id: str = "external_id"
 
 
 #: Public per-catalog items index field names (STAC-flavoured) — the default.
@@ -215,9 +218,9 @@ def build_items_query(
         filter_.append({"terms": {fields.geoid: geoid}})
 
     if external_id:
-        # Public: ``_external_id`` is the internal mirror written by the items
-        # driver (ItemsElasticsearchDriver._extract_external_id_from_doc).
-        # Private: the doc carries an un-prefixed ``external_id`` root keyword.
+        # Both index shapes carry an un-prefixed ``external_id`` root keyword
+        # (the canonical identity field). The legacy public ``_external_id``
+        # mirror was removed in #1285 identity convergence.
         filter_.append({"terms": {fields.external_id: external_id}})
 
     if collections:
