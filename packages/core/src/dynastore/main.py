@@ -168,6 +168,21 @@ async def lifespan(app: FastAPI):
                     _scope,
                     os.environ.get("IDP_ISSUER_URL") or "<none>",
                 )
+            # Run all registered cold-boot contributors in descending priority
+            # order. Each contributor is fail-soft — a failure does not abort
+            # startup. Fully agnostic: no module-specific (iam/web/auth) names here.
+            try:
+                from dynastore.modules.presets.cold_boot import run_cold_boot
+                from dynastore.models.protocols import DatabaseProtocol
+                _db = get_protocol(DatabaseProtocol)
+                _engine = _db.engine if _db else None
+                await run_cold_boot(_engine)
+            except Exception:
+                logger.error(
+                    "Cold-boot orchestrator raised an unexpected error; "
+                    "some presets or IdP config may not be seeded.",
+                    exc_info=True,
+                )
             logger.info("--- [main.py] Web Extensions are active. Application is running. ---")
             yield
 

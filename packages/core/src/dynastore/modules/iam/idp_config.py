@@ -18,10 +18,10 @@
 
 """Runtime config for the identity-provider (IdP) factory.
 
-Replaces the ``IDP_*`` / ``KEYCLOAK_*`` environment-variable reads that the
-``IamModule`` lifespan used to perform. Per the project rule, system settings
-live in :class:`PluginConfig` (runtime-editable, reload-without-restart),
-never in ``os.environ``.
+Replaces the ``IDP_*`` environment-variable reads that the ``IamModule``
+lifespan used to perform. Per the project rule, system settings live in
+:class:`PluginConfig` (runtime-editable, reload-without-restart), never in
+``os.environ``.
 
 Notes on field-type choices that differ from the issue text (geoid#1500):
 

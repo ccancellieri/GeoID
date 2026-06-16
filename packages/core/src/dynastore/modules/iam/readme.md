@@ -55,9 +55,9 @@ The module is configured via environment variables and shared system properties:
 | Name | Source | Description |
 |------|--------|-------------|
 | `JWT_SECRET` | Shared Property (`iam_jwt_secret`) | Signing key for JWT tokens. Auto-generated if missing. |
-| `KEYCLOAK_ISSUER_URL` | Environment | IdP issuer URL for OIDC token validation. |
-| `KEYCLOAK_CLIENT_ID` | Environment | IdP client ID. |
-| `KEYCLOAK_PUBLIC_URL` | Environment | Browser-reachable IdP URL (may differ from internal). |
+| `IDP_ISSUER_URL` | Environment | IdP issuer URL for OIDC token validation. |
+| `IDP_CLIENT_ID` | Environment | IdP client ID. |
+| `IDP_PUBLIC_URL` | Environment | Browser-reachable IdP URL (may differ from internal). |
 
 ## Use Cases
 

@@ -16,10 +16,11 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for ``_seed_idp_config`` — cold-boot ENV bridge for IdpConfig.
+"""Unit tests for ``AuthBootstrapPreset.apply`` — cold-boot ENV bridge for IdpConfig.
 
-The seed function lives in ``dynastore.modules.iam.module``.  All DB calls
-are mocked; these tests require no real database.
+The preset logic lives in
+``dynastore.modules.iam.presets.auth_bootstrap.AuthBootstrapPreset``.  All DB
+calls are mocked; these tests require no real database.
 
 Coverage:
 - Seeds IdpConfig from IDP_ISSUER_URL + IDP_CLIENT_ID when NO row exists in
@@ -30,12 +31,15 @@ Coverage:
   (fail-closed; no anonymous IdP registration).
 - Cold-boot race: first ``list_configs`` raises, ``initialize_storage`` is
   called once, second ``list_configs`` succeeds, seed is written.
+- Encryption-failure retry: persists WITHOUT client_secret when set_config
+  raises so the OIDC provider still registers.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -48,10 +52,45 @@ os.environ.setdefault(
 from dynastore.modules.iam.idp_config import IdpConfig
 
 
-async def _seed(engine=None):
-    """Call the standalone seed function."""
-    from dynastore.modules.iam.module import _seed_idp_config
-    await _seed_idp_config(engine)
+def _make_ctx(configs: object, engine: object = None) -> object:
+    """Build a minimal PresetContext-compatible namespace for tests."""
+    return SimpleNamespace(config=configs, db=engine, engine=engine)
+
+
+async def _apply(
+    monkeypatch: object,
+    configs: object,
+    engine: object = None,
+    *,
+    issuer_url: str | None = None,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    clear_env: bool = True,
+) -> object:
+    """Call AuthBootstrapPreset.apply with a minimal context."""
+    from dynastore.modules.iam.presets.auth_bootstrap import AuthBootstrapPreset, AuthBootstrapParams
+
+    mp = monkeypatch
+    if clear_env:
+        mp.delenv("IDP_ISSUER_URL", raising=False)
+        mp.delenv("IDP_CLIENT_ID", raising=False)
+        mp.delenv("IDP_CLIENT_SECRET", raising=False)
+        mp.delenv("IDP_AUDIENCE", raising=False)
+        mp.delenv("IDP_PUBLIC_URL", raising=False)
+        mp.delenv("IDP_ROLES_CLAIM_PATH", raising=False)
+
+    params = AuthBootstrapParams(
+        issuer_url=issuer_url,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+    ctx = _make_ctx(configs, engine)
+    preset = AuthBootstrapPreset()
+    # apply() resolves PlatformConfigsProtocol via get_protocol (NOT ctx.config),
+    # because the existing-row guard needs the class-keyed list_configs() dict
+    # that only PlatformConfigsProtocol returns. Patch the lookup to the mock.
+    with patch("dynastore.tools.discovery.get_protocol", return_value=configs):
+        return await preset.apply(params, "platform", ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -60,28 +99,20 @@ async def _seed(engine=None):
 
 @pytest.mark.asyncio
 async def test_seeds_idp_config_from_env_when_no_row(monkeypatch, caplog):
-    """When list_configs returns no IdpConfig row, the seed persists a
+    """When list_configs returns no IdpConfig row, the preset persists a
     fully-configured IdpConfig built from IDP_ISSUER_URL and IDP_CLIENT_ID.
     client_secret.reveal() must return the original plaintext.
     """
     monkeypatch.setenv("IDP_ISSUER_URL", "https://keycloak.example.com/realms/test")
     monkeypatch.setenv("IDP_CLIENT_ID", "my-api-client")
     monkeypatch.setenv("IDP_CLIENT_SECRET", "supersecret")
-    # Remove any KEYCLOAK_* variants to avoid interference.
-    monkeypatch.delenv("KEYCLOAK_ISSUER_URL", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_ID", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
 
     configs = AsyncMock()
-    # No IdpConfig row in the DB.
     configs.list_configs = AsyncMock(return_value={})
     configs.set_config = AsyncMock(return_value=None)
 
-    with patch(
-        "dynastore.modules.iam.module.get_protocol",
-        return_value=configs,
-    ), caplog.at_level(logging.INFO, logger="dynastore.modules.iam.module"):
-        await _seed()
+    with caplog.at_level(logging.INFO, logger="dynastore.modules.iam.presets.auth_bootstrap"):
+        descriptor = await _apply(monkeypatch, configs, clear_env=False)
 
     configs.set_config.assert_awaited_once()
     cls_arg, cfg_arg = configs.set_config.await_args.args
@@ -92,7 +123,8 @@ async def test_seeds_idp_config_from_env_when_no_row(monkeypatch, caplog):
     assert cfg_arg.client_id == "my-api-client"
     assert cfg_arg.client_secret is not None
     assert cfg_arg.client_secret.reveal() == "supersecret"
-    assert any("Seeded IdpConfig" in rec.getMessage() for rec in caplog.records)
+    assert descriptor.payload.get("seeded") is True
+    assert any("seeded IdpConfig" in rec.getMessage() for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -113,13 +145,10 @@ async def test_skips_when_configured_row_exists(monkeypatch):
     configs.list_configs = AsyncMock(return_value={IdpConfig: existing})
     configs.set_config = AsyncMock(return_value=None)
 
-    with patch(
-        "dynastore.modules.iam.module.get_protocol",
-        return_value=configs,
-    ):
-        await _seed()
+    descriptor = await _apply(monkeypatch, configs, clear_env=False)
 
     configs.set_config.assert_not_awaited()
+    assert descriptor.payload.get("skipped") == "row_exists"
 
 
 # ---------------------------------------------------------------------------
@@ -142,13 +171,10 @@ async def test_respects_existing_unconfigured_saml2_row(monkeypatch):
     configs.list_configs = AsyncMock(return_value={IdpConfig: existing})
     configs.set_config = AsyncMock(return_value=None)
 
-    with patch(
-        "dynastore.modules.iam.module.get_protocol",
-        return_value=configs,
-    ):
-        await _seed()
+    descriptor = await _apply(monkeypatch, configs, clear_env=False)
 
     configs.set_config.assert_not_awaited()
+    assert descriptor.payload.get("skipped") == "row_exists"
 
 
 # ---------------------------------------------------------------------------
@@ -157,28 +183,19 @@ async def test_respects_existing_unconfigured_saml2_row(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fail_closed_when_no_row_and_no_env(monkeypatch, caplog):
-    """When no IdpConfig row exists and no IDP_ISSUER_URL / KEYCLOAK_ISSUER_URL
-    is in the environment, the seed must NOT write anything and must log a
-    WARNING that mentions IDP_ISSUER_URL.
+    """When no IdpConfig row exists and no IDP_ISSUER_URL is in the environment,
+    the preset must NOT write anything and must log a WARNING that mentions
+    IDP_ISSUER_URL.
     """
-    monkeypatch.delenv("IDP_ISSUER_URL", raising=False)
-    monkeypatch.delenv("KEYCLOAK_ISSUER_URL", raising=False)
-    monkeypatch.delenv("IDP_CLIENT_ID", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_ID", raising=False)
-    monkeypatch.delenv("IDP_CLIENT_SECRET", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
-
     configs = AsyncMock()
     configs.list_configs = AsyncMock(return_value={})
     configs.set_config = AsyncMock(return_value=None)
 
-    with patch(
-        "dynastore.modules.iam.module.get_protocol",
-        return_value=configs,
-    ), caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.module"):
-        await _seed()
+    with caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.presets.auth_bootstrap"):
+        descriptor = await _apply(monkeypatch, configs)
 
     configs.set_config.assert_not_awaited()
+    assert descriptor.payload.get("skipped") == "no_issuer"
     assert any(
         "IDP_ISSUER_URL" in rec.getMessage()
         for rec in caplog.records
@@ -198,9 +215,6 @@ async def test_cold_boot_initializes_storage_and_retries(monkeypatch, caplog):
     """
     monkeypatch.setenv("IDP_ISSUER_URL", "https://keycloak.example.com/realms/cold")
     monkeypatch.setenv("IDP_CLIENT_ID", "cold-boot-client")
-    monkeypatch.delenv("KEYCLOAK_ISSUER_URL", raising=False)
-    monkeypatch.delenv("IDP_CLIENT_SECRET", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
 
     engine_sentinel = object()
 
@@ -214,14 +228,13 @@ async def test_cold_boot_initializes_storage_and_retries(monkeypatch, caplog):
     configs.set_config = AsyncMock(return_value=None)
 
     with patch(
-        "dynastore.modules.iam.module.get_protocol",
-        return_value=configs,
-    ), patch(
         "dynastore.modules.db_config.platform_config_service."
         "PlatformConfigService.initialize_storage",
         new=AsyncMock(return_value=None),
-    ) as init_storage, caplog.at_level(logging.INFO, logger="dynastore.modules.iam.module"):
-        await _seed(engine=engine_sentinel)
+    ) as init_storage, caplog.at_level(
+        logging.INFO, logger="dynastore.modules.iam.presets.auth_bootstrap"
+    ):
+        descriptor = await _apply(monkeypatch, configs, engine=engine_sentinel, clear_env=False)
 
     init_storage.assert_awaited_once()
     assert configs.list_configs.await_count == 2
@@ -231,19 +244,19 @@ async def test_cold_boot_initializes_storage_and_retries(monkeypatch, caplog):
     assert isinstance(cfg_arg, IdpConfig)
     assert cfg_arg.is_configured is True
     assert cfg_arg.issuer_url == "https://keycloak.example.com/realms/cold"
+    assert descriptor.payload.get("seeded") is True
 
 
 # ---------------------------------------------------------------------------
-# Test: #2210 defense-in-depth — persist WITHOUT client_secret when secret
-# encryption is unavailable, so the OIDC provider still registers.
+# Test: persist WITHOUT client_secret when encryption is unavailable
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_persists_without_secret_when_encryption_unavailable(monkeypatch, caplog):
     """When the secret-bearing seed cannot persist (set_config raises because
-    no Fernet key is provisioned to encrypt client_secret — the exact #2210
-    dev/review failure), the seed retries WITHOUT client_secret so an OIDC
-    provider still registers and bearer-token validation works.
+    no Fernet key is provisioned to encrypt client_secret), the preset retries
+    WITHOUT client_secret so an OIDC provider still registers and bearer-token
+    validation works.
 
     Asserts: set_config is called twice; the second (succeeding) call carries
     an IdpConfig that is_configured (issuer present) but has client_secret=None;
@@ -252,14 +265,9 @@ async def test_persists_without_secret_when_encryption_unavailable(monkeypatch, 
     monkeypatch.setenv("IDP_ISSUER_URL", "https://keycloak.example.com/realms/nokeys")
     monkeypatch.setenv("IDP_CLIENT_ID", "nokeys-client")
     monkeypatch.setenv("IDP_CLIENT_SECRET", "cannot-encrypt-me")
-    monkeypatch.delenv("KEYCLOAK_ISSUER_URL", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_ID", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
 
     configs = AsyncMock()
     configs.list_configs = AsyncMock(return_value={})
-    # First persist (with secret) raises as if Fernet key is missing; the
-    # retry (without secret) succeeds.
     configs.set_config = AsyncMock(
         side_effect=[
             RuntimeError("Error calling _serialize: secret encryption unavailable"),
@@ -267,20 +275,17 @@ async def test_persists_without_secret_when_encryption_unavailable(monkeypatch, 
         ]
     )
 
-    with patch(
-        "dynastore.modules.iam.module.get_protocol",
-        return_value=configs,
-    ), caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.module"):
-        await _seed()
+    with caplog.at_level(logging.WARNING, logger="dynastore.modules.iam.presets.auth_bootstrap"):
+        descriptor = await _apply(monkeypatch, configs, clear_env=False)
 
     assert configs.set_config.await_count == 2
-    # The first attempt carried the secret; the second dropped it.
     first_cfg = configs.set_config.await_args_list[0].args[1]
     second_cfg = configs.set_config.await_args_list[1].args[1]
     assert first_cfg.client_secret is not None
     assert second_cfg.client_secret is None
     assert second_cfg.is_configured is True
     assert second_cfg.issuer_url == "https://keycloak.example.com/realms/nokeys"
+    assert descriptor.payload.get("without_secret") is True
     assert any(
         "without client_secret" in rec.getMessage().lower()
         for rec in caplog.records
@@ -296,18 +301,44 @@ async def test_no_secret_retry_when_no_client_secret(monkeypatch):
     monkeypatch.setenv("IDP_ISSUER_URL", "https://keycloak.example.com/realms/pub")
     monkeypatch.setenv("IDP_CLIENT_ID", "public-client")
     monkeypatch.delenv("IDP_CLIENT_SECRET", raising=False)
-    monkeypatch.delenv("KEYCLOAK_ISSUER_URL", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_ID", raising=False)
-    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
 
     configs = AsyncMock()
     configs.list_configs = AsyncMock(return_value={})
     configs.set_config = AsyncMock(side_effect=RuntimeError("boom"))
 
-    with patch(
-        "dynastore.modules.iam.module.get_protocol",
-        return_value=configs,
-    ):
-        await _seed()
+    # clear_env=False so the IDP_ISSUER_URL set above is preserved.
+    descriptor = await _apply(monkeypatch, configs, clear_env=False)
 
     configs.set_config.assert_awaited_once()
+    assert descriptor.payload.get("skipped") is not None
+
+
+# ---------------------------------------------------------------------------
+# Test: explicit params override ENV
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_params_override_env(monkeypatch):
+    """Explicit params take precedence over IDP_* ENV."""
+    monkeypatch.setenv("IDP_ISSUER_URL", "https://env.example.com")
+    monkeypatch.setenv("IDP_CLIENT_ID", "env-client")
+
+    configs = AsyncMock()
+    configs.list_configs = AsyncMock(return_value={})
+    configs.set_config = AsyncMock(return_value=None)
+
+    from dynastore.modules.iam.presets.auth_bootstrap import AuthBootstrapPreset, AuthBootstrapParams
+
+    params = AuthBootstrapParams(
+        issuer_url="https://params.example.com",
+        client_id="params-client",
+    )
+    ctx = _make_ctx(configs)
+    with patch("dynastore.tools.discovery.get_protocol", return_value=configs):
+        descriptor = await AuthBootstrapPreset().apply(params, "platform", ctx)
+
+    configs.set_config.assert_awaited_once()
+    _, cfg_arg = configs.set_config.await_args.args
+    assert cfg_arg.issuer_url == "https://params.example.com"
+    assert cfg_arg.client_id == "params-client"
+    assert descriptor.payload.get("seeded") is True

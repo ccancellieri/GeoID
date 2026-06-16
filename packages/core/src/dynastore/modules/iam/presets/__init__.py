@@ -23,10 +23,17 @@ registrations happen before ``GET /configs/presets`` is served.
 """
 from dynastore.modules.storage.presets.registry import register_preset
 
+from .auth_bootstrap import AuthBootstrapPreset, AuthBootstrapParams
 from .default_roles_baseline import DefaultRolesBaseline
 from .public_access_baseline import PublicAccessBaseline
 
+register_preset(AuthBootstrapPreset())
 register_preset(DefaultRolesBaseline())
 register_preset(PublicAccessBaseline())
 
-__all__ = ["DefaultRolesBaseline", "PublicAccessBaseline"]
+__all__ = [
+    "AuthBootstrapPreset",
+    "AuthBootstrapParams",
+    "DefaultRolesBaseline",
+    "PublicAccessBaseline",
+]

@@ -94,26 +94,67 @@ def _derive_fernet_key(jwt_secret: str) -> bytes:
     return base64.urlsafe_b64encode(raw)
 
 
-# Identity Provider configuration.
-# IDP_* are the canonical names; KEYCLOAK_* are accepted as aliases for
-# backward compatibility with existing deployments.
+# Identity Provider configuration — IDP_* are the canonical env-var names.
 #
 # Two-client OAuth/OIDC is the standard layout: a public SPA login client
 # (``IDP_CLIENT_ID``, e.g. ``geoid-fe``) and a separate API audience
 # (``IDP_AUDIENCE``, e.g. ``geoid-be``). Two-client deployments must set
 # ``IDP_AUDIENCE`` explicitly. In single-client setups it may be left unset;
 # ``OidcIdentityProvider`` then validates tokens against ``IDP_CLIENT_ID``.
-IDP_ISSUER_URL       = os.getenv("IDP_ISSUER_URL")    or os.getenv("KEYCLOAK_ISSUER_URL")
-IDP_CLIENT_ID        = os.getenv("IDP_CLIENT_ID")     or os.getenv("KEYCLOAK_CLIENT_ID")
-IDP_CLIENT_SECRET    = os.getenv("IDP_CLIENT_SECRET") or os.getenv("KEYCLOAK_CLIENT_SECRET")
-IDP_PUBLIC_URL       = os.getenv("IDP_PUBLIC_URL")    or os.getenv("KEYCLOAK_PUBLIC_URL")
-IDP_AUDIENCE         = os.getenv("IDP_AUDIENCE")      or os.getenv("KEYCLOAK_AUDIENCE")
+IDP_ISSUER_URL       = os.getenv("IDP_ISSUER_URL")
+IDP_CLIENT_ID        = os.getenv("IDP_CLIENT_ID")
+IDP_CLIENT_SECRET    = os.getenv("IDP_CLIENT_SECRET")
+IDP_PUBLIC_URL       = os.getenv("IDP_PUBLIC_URL")
+IDP_AUDIENCE         = os.getenv("IDP_AUDIENCE")
 # Dotted JSON path used to locate roles in the JWT. ``${IDP_AUDIENCE}`` is
 # substituted with the resolved audience. Defaults to
 # ``resource_access.${IDP_AUDIENCE}.roles``. Common operator overrides:
 # ``resource_access.account.roles`` (sysadmin role on Keycloak's built-in
 # account client) or ``realm_access.roles``.
 IDP_ROLES_CLAIM_PATH = os.getenv("IDP_ROLES_CLAIM_PATH")
+
+
+class _AuthColdBootContributor:
+    """Cold-boot contributor that applies the auth_enable public-access preset.
+
+    Runs at priority=40 — after IAM (100) and web (50). IAM-aware: skips
+    seeding when PermissionProtocol is not registered in this process (non-IAM
+    service tiers). The grant is owned and seeded by the IAM-running service.
+    """
+
+    name: str = "auth"
+    priority: int = 40
+
+    async def run(self, engine: object) -> None:
+        from dynastore.tools.discovery import get_protocol as _gp
+        from dynastore.models.protocols.policies import PermissionProtocol
+
+        if _gp(PermissionProtocol) is None:
+            logger.info(
+                "Authentication: IAM module not installed in this process — "
+                "skipping 'auth_enable' public-access seeding; this anonymous "
+                "grant is seeded by the IAM-running service."
+            )
+            return
+
+        # Login-page reachability: re-assert the anonymous ALLOW on every
+        # cold-boot — exactly like public_access_baseline does for /health —
+        # so a DB whose policy rows were wiped while the iam.applied_presets
+        # sentinel survived self-heals on restart instead of leaving the login
+        # flow 403 forever for anonymous users. The apply is idempotent
+        # (upsert policy + additive role binding); wrapped so a genuine
+        # seeding error can never abort boot.
+        try:
+            from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
+            await bootstrap_preset_if_absent(engine, preset_name="auth_enable", force=True)
+        except Exception as exc:  # noqa: BLE001 — login seeding must not abort boot
+            logger.error(
+                "Authentication: cold-boot re-assert of 'auth_enable' public-access "
+                "policy failed; anonymous users may get 403 on /auth login endpoints "
+                "until it is applied manually: %s",
+                exc,
+                exc_info=True,
+            )
 
 
 class Authentication(ExtensionProtocol):
@@ -356,52 +397,14 @@ class Authentication(ExtensionProtocol):
         self._setup_routes()
         logger.info("✓ Authentication routes configured")
 
-        # IAM is an optional module. The anonymous ALLOW for the /auth OIDC
-        # endpoints (/auth/authorize, /auth/token, /auth/refresh …) is only
-        # meaningful — and only applicable — where the IAM module is installed
-        # in-process: the PermissionProtocol it provides is what enforces and
-        # stores this policy. On a service that runs auth without IAM there is
-        # nothing to enforce here and ``ctx.policy`` is None; the grant is owned
-        # and seeded by the IAM-running service. Treat IAM like any other
-        # optional dependency — gate on its protocol and skip the seeding
-        # entirely when absent, rather than running code that dereferences a
-        # missing policy service.
-        from dynastore.tools.discovery import get_protocol
-        from dynastore.models.protocols.policies import PermissionProtocol
-
-        if get_protocol(PermissionProtocol) is None:
-            logger.info(
-                "Authentication: IAM module not installed in this process — "
-                "skipping 'auth_enable' public-access seeding; this anonymous "
-                "grant is seeded by the IAM-running service."
-            )
-        else:
-            # Login-page reachability: re-assert the anonymous ALLOW on every
-            # cold-boot — exactly like public_access_baseline does for /health —
-            # so a DB whose policy rows were wiped while the iam.applied_presets
-            # sentinel survived self-heals on restart instead of leaving the login
-            # flow 403 forever for anonymous users. The apply is idempotent
-            # (upsert policy + additive role binding); wrapped so a genuine
-            # seeding error can never abort boot.
-            try:
-                from dynastore.models.protocols import DatabaseProtocol
-                from dynastore.modules.storage.presets.lifecycle import (
-                    bootstrap_preset_if_absent,
-                )
-
-                _db = get_protocol(DatabaseProtocol)
-                await bootstrap_preset_if_absent(
-                    _db.engine if _db else None,
-                    preset_name="auth_enable",
-                    force=True,
-                )
-            except Exception as exc:  # noqa: BLE001 — login seeding must not abort boot
-                logger.error(
-                    "Authentication: cold-boot re-assert of 'auth_enable' public-access "
-                    "policy failed; anonymous users may get 403 on /auth login endpoints "
-                    "until it is applied manually: %s",
-                    exc,
-                    exc_info=True,
-                )
+        # Register the auth cold-boot contributor so run_cold_boot (called from
+        # main.py) applies auth_enable at priority=40 — after IAM (100) and
+        # web (50). The contributor is IAM-aware: it skips seeding when
+        # PermissionProtocol is absent (non-IAM service tiers).
+        from dynastore.modules.presets.cold_boot import register_cold_boot_contributor
+        try:
+            register_cold_boot_contributor(_AuthColdBootContributor())
+        except ValueError:
+            logger.debug("AuthColdBootContributor already registered; skipping duplicate.")
 
         yield

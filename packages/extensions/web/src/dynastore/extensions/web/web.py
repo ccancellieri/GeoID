@@ -449,6 +449,79 @@ class WebConfig(PluginConfig):
 
 
 
+class _WebColdBootContributor:
+    """Cold-boot contributor that applies web public-access presets at priority=50.
+
+    IAM-aware: skips seeding when PermissionProtocol is not registered in this
+    process (non-IAM service tiers); those grants are owned and seeded by the
+    IAM-running service.
+    """
+
+    name: str = "web"
+    priority: int = 50
+
+    async def run(self, engine: Any) -> None:
+        from dynastore.tools.discovery import get_protocol as _gp
+        from dynastore.models.protocols.policies import PermissionProtocol
+
+        if _gp(PermissionProtocol) is None:
+            logger.info(
+                "WebService: IAM module not installed in this process — skipping "
+                "IAM public-access seeding (web_enable, ogc_conformance_public); "
+                "these anonymous grants are seeded by the IAM-running service."
+            )
+            return
+
+        # Login-page reachability: re-assert web_enable on every cold-boot.
+        try:
+            from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent
+            await bootstrap_preset_if_absent(engine, preset_name="web_enable", force=True)
+        except Exception as exc:  # noqa: BLE001 — login seeding must not abort boot
+            logger.error(
+                "WebService: cold-boot re-assert of 'web_enable' public-access "
+                "policy failed; anonymous users may get 403 on /web (login UI) "
+                "until it is applied manually: %s",
+                exc,
+                exc_info=True,
+            )
+
+        # OGC conformance reachability: conditionally apply ogc_conformance_public.
+        try:
+            from dynastore.models.protocols import ConfigsProtocol
+            from dynastore.modules.storage.presets.lifecycle import bootstrap_preset_if_absent as _bpa
+            from dynastore.extensions.tools.conformance_config import ConformanceExposureConfig
+            import dynastore.extensions.tools.conformance_preset  # noqa: F401 — side-effect registration
+
+            _conf_cfg: ConformanceExposureConfig = ConformanceExposureConfig()
+            try:
+                _configs_svc = _gp(ConfigsProtocol)
+                if _configs_svc is not None:
+                    _conf_cfg = await _configs_svc.get_config(ConformanceExposureConfig)
+            except Exception:  # noqa: BLE001 — fall back to default (public=True)
+                pass
+
+            if _conf_cfg.public:
+                await _bpa(engine, preset_name="ogc_conformance_public", force=True)
+                logger.info(
+                    "WebService: 'ogc_conformance_public' preset applied — "
+                    "anonymous GET on /{svc}/conformance and /{svc}/ is now allowed."
+                )
+            else:
+                logger.info(
+                    "WebService: ConformanceExposureConfig.public=False — "
+                    "skipping 'ogc_conformance_public' preset; conformance endpoints "
+                    "remain gated by deny-by-default IAM."
+                )
+        except Exception as exc:  # noqa: BLE001 — conformance seeding must not abort boot
+            logger.error(
+                "WebService: cold-boot apply of 'ogc_conformance_public' preset "
+                "failed; anonymous users will not be able to read conformance "
+                "endpoints until it is applied manually: %s",
+                exc,
+                exc_info=True,
+            )
+
+
 class Web(ExtensionProtocol, OGCServiceMixin):
     always_on = True
     """
@@ -558,106 +631,16 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             await _cors_instance.initialize_from_db()
         logger.info("WebService: CORS push handler registered.")
 
-        # IAM is an optional module. Its anonymous public-access grants
-        # (the /web login UI via ``web_enable`` and OGC conformance via
-        # ``ogc_conformance_public``) are only meaningful — and only
-        # applicable — where the IAM module is installed in-process: the
-        # PermissionProtocol it provides is what enforces and stores these
-        # policies. On a service that runs without IAM (e.g. the catalog
-        # tier, where IAM runs as a separate service against the shared DB)
-        # there is nothing to enforce here and ``ctx.policy`` is None; the
-        # grants are owned and seeded by the IAM-running service. Treat IAM
-        # like any other optional dependency — gate on its protocol and skip
-        # the seeding entirely when absent (same idiom as the ConfigsProtocol
-        # check used below), rather than running code that dereferences a
-        # missing policy service.
-        from dynastore.models.protocols.policies import PermissionProtocol
-
-        if get_protocol(PermissionProtocol) is None:
-            logger.info(
-                "WebService: IAM module not installed in this process — skipping "
-                "IAM public-access seeding (web_enable, ogc_conformance_public); "
-                "these anonymous grants are seeded by the IAM-running service."
-            )
-        else:
-            # Login-page reachability: re-assert the anonymous ALLOW for the /web
-            # shell + static assets (the login UI itself) on every cold-boot —
-            # exactly like public_access_baseline does for /health — so a DB whose
-            # policy rows were wiped while the iam.applied_presets sentinel survived
-            # self-heals on restart instead of leaving /web 403 forever for
-            # anonymous users. The apply is idempotent (upsert policy + additive
-            # role binding); wrapped so a genuine seeding error can never abort boot.
-            try:
-                from dynastore.models.protocols import DatabaseProtocol
-                from dynastore.modules.storage.presets.lifecycle import (
-                    bootstrap_preset_if_absent,
-                )
-
-                _db = get_protocol(DatabaseProtocol)
-                await bootstrap_preset_if_absent(
-                    _db.engine if _db else None,
-                    preset_name="web_enable",
-                    force=True,
-                )
-            except Exception as exc:  # noqa: BLE001 — login seeding must not abort boot
-                logger.error(
-                    "WebService: cold-boot re-assert of 'web_enable' public-access "
-                    "policy failed; anonymous users may get 403 on /web (login UI) "
-                    "until it is applied manually: %s",
-                    exc,
-                    exc_info=True,
-                )
-
-            # OGC conformance reachability: conditionally apply the anonymous
-            # GET grant for /{svc}/conformance and /{svc}/ landing pages.
-            # OGC API Common Part 1 expects these to be readable without credentials
-            # so automated conformance suites (ETS/TEAM Engine) can probe them.
-            # The ConformanceExposureConfig.public flag (default True) lets a
-            # deployment opt out — set it to False and restart to gate conformance.
-            try:
-                from dynastore.models.protocols import DatabaseProtocol, ConfigsProtocol
-                from dynastore.modules.storage.presets.lifecycle import (
-                    bootstrap_preset_if_absent,
-                )
-                from dynastore.extensions.tools.conformance_config import (
-                    ConformanceExposureConfig,
-                )
-                # Ensure the preset module is imported so it self-registers.
-                import dynastore.extensions.tools.conformance_preset  # noqa: F401
-
-                _db = get_protocol(DatabaseProtocol)
-                _conf_cfg: ConformanceExposureConfig = ConformanceExposureConfig()
-                try:
-                    _configs_svc = get_protocol(ConfigsProtocol)
-                    if _configs_svc is not None:
-                        _conf_cfg = await _configs_svc.get_config(ConformanceExposureConfig)
-                except Exception:  # noqa: BLE001 — fall back to default (public=True)
-                    pass
-
-                if _conf_cfg.public:
-                    await bootstrap_preset_if_absent(
-                        _db.engine if _db else None,
-                        preset_name="ogc_conformance_public",
-                        force=True,
-                    )
-                    logger.info(
-                        "WebService: 'ogc_conformance_public' preset applied — "
-                        "anonymous GET on /{svc}/conformance and /{svc}/ is now allowed."
-                    )
-                else:
-                    logger.info(
-                        "WebService: ConformanceExposureConfig.public=False — "
-                        "skipping 'ogc_conformance_public' preset; conformance endpoints "
-                        "remain gated by deny-by-default IAM."
-                    )
-            except Exception as exc:  # noqa: BLE001 — conformance seeding must not abort boot
-                logger.error(
-                    "WebService: cold-boot apply of 'ogc_conformance_public' preset "
-                    "failed; anonymous users will not be able to read conformance "
-                    "endpoints until it is applied manually: %s",
-                    exc,
-                    exc_info=True,
-                )
+        # Register the web cold-boot contributor so run_cold_boot (called from
+        # main.py) applies the web_enable and ogc_conformance_public presets at
+        # priority=50 — after IAM (100) but before auth (40) and file presets (10).
+        # The contributor is IAM-aware: it skips seeding when PermissionProtocol
+        # is absent (non-IAM services; see WebColdBootContributor.run).
+        from dynastore.modules.presets.cold_boot import register_cold_boot_contributor
+        try:
+            register_cold_boot_contributor(_WebColdBootContributor())
+        except ValueError:
+            logger.debug("WebColdBootContributor already registered; skipping duplicate.")
 
         yield
 
