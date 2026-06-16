@@ -46,9 +46,15 @@ GDALINFO_PROCESS_DEFINITION = Process(
     ),
     version="1.0.0",
     scopes=[ProcessScope.CATALOG, ProcessScope.COLLECTION],
+    # Async-first: with no client preference, gdal offloads to a Cloud Run job
+    # (the default everywhere). Sync execution is opt-in via ``Prefer:
+    # respond-sync`` and is only honoured on a service that carries a sync
+    # runner able to handle gdal in-process (e.g. maps, which ships osgeo).
+    # Order matters: _resolve_execution_mode picks the first declared mode with
+    # a capable runner when the caller expresses no preference.
     jobControlOptions=[
-        JobControlOptions.SYNC_EXECUTE,
         JobControlOptions.ASYNC_EXECUTE,
+        JobControlOptions.SYNC_EXECUTE,
     ],
     inputs={
         "asset_id": ProcessInput(

@@ -119,3 +119,52 @@ def test_raises_when_neither_mode_has_a_capable_runner(monkeypatch):
     proc = _both_options_process()
     with pytest.raises(NotImplementedError, match="gdal"):
         processes_module._resolve_execution_mode(proc, SYNC)
+
+
+# ---------------------------------------------------------------------------
+# Default mode (no Prefer header): async-first declaration order wins
+# ---------------------------------------------------------------------------
+
+
+def _async_first_process(process_id: str = "gdal") -> models.Process:
+    """gdal-shaped process declaring async BEFORE sync (the real gdal order)."""
+    return models.Process(
+        id=process_id,
+        title="GDAL Info",
+        version="1.0.0",
+        scopes=[models.ProcessScope.CATALOG, models.ProcessScope.COLLECTION],
+        jobControlOptions=[ASYNC, SYNC],
+        inputs={},
+        outputs={},
+    )
+
+
+def test_no_preference_defaults_to_async_when_both_capable(monkeypatch):
+    """Maps ships a sync runner, but with no Prefer header gdal offloads async.
+
+    _resolve_execution_mode walks jobControlOptions in declared order; gdal
+    declares async first, so the default (cloud-run) wins even where a sync
+    runner is present. Sync stays opt-in via Prefer: respond-sync.
+    """
+    _patch_runners_for(monkeypatch, sync_capable=True, async_capable=True)
+    proc = _async_first_process()
+    result = processes_module._resolve_execution_mode(proc, None)
+    assert result == TaskExecutionMode.ASYNCHRONOUS
+
+
+def test_sync_preferred_still_resolves_sync_with_async_first_order(monkeypatch):
+    """Async-first order does not block an explicit sync request."""
+    _patch_runners_for(monkeypatch, sync_capable=True, async_capable=True)
+    proc = _async_first_process()
+    result = processes_module._resolve_execution_mode(proc, SYNC)
+    assert result == TaskExecutionMode.SYNCHRONOUS
+
+
+def test_gdal_definition_declares_async_before_sync():
+    """Regression guard: the real gdal definition must stay async-first so the
+    no-preference default offloads to Cloud Run (cloud-run-by-default intent)."""
+    from dynastore.tasks.gdal.definition import GDALINFO_PROCESS_DEFINITION
+
+    opts = GDALINFO_PROCESS_DEFINITION.jobControlOptions
+    assert opts[0] == ASYNC, f"gdal must declare async first, got {opts}"
+    assert SYNC in opts, "gdal must still offer sync as an opt-in mode"
