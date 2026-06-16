@@ -38,7 +38,7 @@ class DWHJoinRequestBase(BaseModel):
         json_schema_extra={"example": "collection1"},
         description="DynaStore collection to query.",
     )
-    with_geometry: bool = Field(default=True, description="If True, do not return geometry.")
+    with_geometry: bool = Field(default=True, description="If True, include geometry in the response.")
     dwh_join_column: str = Field(
         ...,
         json_schema_extra={"example": "geoid"},

@@ -249,7 +249,8 @@ class DwhService(ExtensionProtocol):
             )
 
         query_req = QueryRequest(
-            select=selects, limit=req.limit, offset=req.offset
+            select=selects, limit=req.limit, offset=req.offset,
+            skip_geometry=not req.with_geometry,
         )
 
         # PG row-level ABAC: the DWH join is a user-facing HTTP route, so the
