@@ -414,7 +414,7 @@ async def test_register_supervisor_jobs_includes_workclass_jobs():
 
     # Obsolete work_index_* schedule rows are pruned with the renamed names.
     assert len(prune_calls) == 1
-    assert "DELETE FROM platform.maintenance_schedule" in prune_calls[0]["sql"]
+    assert "DELETE FROM tasks.maintenance_schedule" in prune_calls[0]["sql"]
     assert prune_calls[0]["names"] == list(_OBSOLETE_SCHEDULE_JOBS)
 
 

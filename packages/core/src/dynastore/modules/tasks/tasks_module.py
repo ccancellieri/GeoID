@@ -1469,7 +1469,7 @@ async def ensure_task_storage_exists(conn: DbResource, schema: str):
 
     pg_cron is NOT used.  The three periodic jobs (reaper, partition-create,
     retention) are driven by the MaintenanceSupervisor leader-elected loop
-    via ``platform.maintenance_schedule`` — registered at CatalogModule startup
+    via ``tasks.maintenance_schedule`` — registered at CatalogModule startup
     by ``register_supervisor_jobs``.
 
     Raises ``RuntimeError`` if ``schema`` is anything other than

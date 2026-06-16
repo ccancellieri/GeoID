@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for platform.maintenance_schedule DDL + repository.
+"""Unit tests for tasks.maintenance_schedule DDL + repository.
 
 Pure-mock style (no live DB).  Mirrors the AsyncMock pattern from
 tests/dynastore/modules/db_config/unit/test_base_extensions_guard.py.
@@ -82,8 +82,8 @@ def test_ddl_uses_create_if_not_exists():
     assert "CREATE TABLE IF NOT EXISTS" in MAINTENANCE_SCHEDULE_DDL
 
 
-def test_ddl_targets_platform_schema():
-    assert "platform.maintenance_schedule" in MAINTENANCE_SCHEDULE_DDL
+def test_ddl_targets_tasks_schema():
+    assert "tasks.maintenance_schedule" in MAINTENANCE_SCHEDULE_DDL
 
 
 def test_ddl_job_name_is_primary_key():

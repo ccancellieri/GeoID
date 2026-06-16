@@ -24,52 +24,8 @@ from dynastore.modules.db_config.query_executor import (
 
 logger = logging.getLogger(__name__)
 
-UPDATE_COLLECTION_EXTENTS_SQL = """
-CREATE OR REPLACE FUNCTION platform.update_collection_extents()
-RETURNS TRIGGER AS $$
-DECLARE
-    master_table_name TEXT := TG_ARGV[0];
-    schema_name TEXT := TG_TABLE_SCHEMA;
-    collection_id_val TEXT;
-    new_spatial_extent JSONB;
-    new_temporal_extent JSONB;
-BEGIN
-    EXECUTE format(
-        'SELECT collection_id FROM %I.collection_configs '
-        'WHERE class_key = ''ItemsPostgresqlDriver'' '
-        'AND config_data->>''physical_table'' = $1 LIMIT 1',
-        schema_name
-    )
-    INTO collection_id_val
-    USING master_table_name;
-
-    IF collection_id_val IS NULL THEN
-        RETURN NULL;
-    END IF;
-
-    EXECUTE format('SELECT jsonb_build_object(''bbox'', ARRAY[ST_Extent(geom)]) FROM %I.%I', schema_name, master_table_name)
-    INTO new_spatial_extent;
-
-    EXECUTE format('SELECT jsonb_build_object(''interval'', ARRAY[ARRAY[MIN(valid_from), MAX(valid_to)]]) FROM %I.%I', schema_name, master_table_name)
-    INTO new_temporal_extent;
-
-    IF new_spatial_extent IS NOT NULL AND new_temporal_extent IS NOT NULL THEN
-        EXECUTE format(
-            'INSERT INTO %I.metadata (collection_id, extent)
-             VALUES ($1, $2)
-             ON CONFLICT (collection_id) DO UPDATE SET extent = EXCLUDED.extent',
-            schema_name
-        ) USING collection_id_val,
-                jsonb_build_object('spatial', new_spatial_extent, 'temporal', new_temporal_extent);
-    END IF;
-
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-"""
-
 ASSET_CLEANUP_SQL = """
-CREATE OR REPLACE FUNCTION platform.asset_cleanup() RETURNS TRIGGER AS $$
+CREATE OR REPLACE FUNCTION catalog.asset_cleanup() RETURNS TRIGGER AS $$
 DECLARE
     hub_physical_table TEXT := TG_ARGV[0];
     asset_id_val TEXT;
@@ -87,7 +43,7 @@ BEGIN
     IF asset_id_val IS NULL THEN
         RETURN NULL;
     END IF;
-    
+
     -- Resolve Logical Collection ID from Hub Physical Table Name
     -- The collection_configs table stores driver config with physical_table in JSONB.
     EXECUTE format(
@@ -98,7 +54,7 @@ BEGIN
     )
     INTO target_collection_id
     USING hub_physical_table;
-    
+
     -- If we can't resolve the collection, we can't safely clean up
     IF target_collection_id IS NULL THEN
         RETURN NULL;
@@ -122,11 +78,11 @@ $$ LANGUAGE plpgsql;
 """
 
 
-PLATFORM_SCHEMA_DDL = 'CREATE SCHEMA IF NOT EXISTS "platform";'
+CATALOG_SCHEMA_DDL = 'CREATE SCHEMA IF NOT EXISTS "catalog";'
 
 
 async def ensure_stored_procedures(conn: DbResource) -> None:
-    """Ensures all required stored procedures exist in the platform schema.
+    """Ensures all required stored procedures exist in the ``catalog`` schema.
 
     Always runs ``CREATE OR REPLACE FUNCTION``: the previous existence-check
     short-circuit (``check_query=check_all``) caused stale function bodies
@@ -137,17 +93,20 @@ async def ensure_stored_procedures(conn: DbResource) -> None:
     ``trg_asset_cleanup`` cascade until the function was manually dropped.
     ``CREATE OR REPLACE FUNCTION`` is cheap and idempotent, and keeps the
     function body in lockstep with the Python source on every deploy.
+
+    This is also reached from the per-tenant trigger-install path
+    (``AssetService.ensure_asset_cleanup_trigger``), so it defensively
+    ensures the ``catalog`` schema itself rather than assuming an earlier
+    module created it.
     """
-    # Ensure the platform schema exists before creating functions in it
-    await DDLQuery(PLATFORM_SCHEMA_DDL).execute(conn)
+    # Ensure the catalog schema exists before creating functions in it.
+    await DDLQuery(CATALOG_SCHEMA_DDL).execute(conn)
 
     # Use a single DDLQuery for all procedures. DDLQuery handles splitting and atomic locking.
-    await DDLQuery(
-        UPDATE_COLLECTION_EXTENTS_SQL + ASSET_CLEANUP_SQL,
-    ).execute(conn)
+    await DDLQuery(ASSET_CLEANUP_SQL).execute(conn)
 
-    # Durable maintenance-schedule table (platform.maintenance_schedule).
-    # Schema is already guaranteed above.
+    # Durable maintenance-schedule table (tasks.maintenance_schedule). It owns
+    # its own schema guard (the tasks schema is provisioned by TasksModule).
     from dynastore.modules.catalog.db_init.maintenance_schedule import (
         ensure_maintenance_schedule,
     )

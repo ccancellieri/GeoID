@@ -1376,7 +1376,7 @@ class AssetService(AssetsProtocol):
             CREATE TRIGGER trg_asset_cleanup
             AFTER DELETE OR UPDATE OF asset_id ON "{schema}"."{table}"
             FOR EACH ROW
-            EXECUTE FUNCTION platform.asset_cleanup('{hub_table}');
+            EXECUTE FUNCTION catalog.asset_cleanup('{hub_table}');
             """.strip()
 
             await DDLQuery(trigger_ddl).execute(conn)

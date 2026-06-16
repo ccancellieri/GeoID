@@ -18,7 +18,7 @@
 
 """Leader-elected maintenance supervisor.
 
-Drives deadline-insensitive periodic jobs off ``platform.maintenance_schedule``
+Drives deadline-insensitive periodic jobs off ``tasks.maintenance_schedule``
 (jobs 4–12 from the #1911 spec), replacing ALL pg_cron registrations:
 events DLQ/reaper/alert, tenant-logs prune, system-logs prune, IAM prune,
 and the three task-queue jobs (stuck-task reaper, partition-create, retention).
@@ -87,7 +87,7 @@ JOB_STORAGE_PARTITION_CREATE = "storage_partition_create"
 JOB_STORAGE_RETENTION = "storage_retention"
 
 # Obsolete supervisor job names retired by #1807 renames. An environment that
-# booted a prior build holds these rows in platform.maintenance_schedule;
+# booted a prior build holds these rows in tasks.maintenance_schedule;
 # register_supervisor_jobs now upserts the new names but never overwrites these,
 # so the loop would dispatch an unknown job_name and record a recurring error.
 # Prune them once at startup (DML on an operational table, not schema DDL).
@@ -630,7 +630,7 @@ class MaintenanceSupervisor:
     wins the lock per cadence.
 
     Jobs are registered via ``repo.upsert_job`` at startup; the supervisor
-    reads ``platform.maintenance_schedule`` on every tick (no caching — it is
+    reads ``tasks.maintenance_schedule`` on every tick (no caching — it is
     the mutable source of truth).
     """
 
@@ -823,7 +823,7 @@ class MaintenanceSupervisor:
 
 
 # ---------------------------------------------------------------------------
-# Startup: register job cadences into platform.maintenance_schedule
+# Startup: register job cadences into tasks.maintenance_schedule
 # ---------------------------------------------------------------------------
 
 
@@ -866,7 +866,7 @@ async def unschedule_superseded_cron_jobs(engine: Any) -> int:
 
 
 async def register_supervisor_jobs(engine: Any) -> None:
-    """Upsert all supervisor-owned job rows into ``platform.maintenance_schedule``.
+    """Upsert all supervisor-owned job rows into ``tasks.maintenance_schedule``.
 
     Idempotent: uses ON CONFLICT … DO UPDATE.  Designed to run once at
     CatalogModule startup before the supervisor loop is started.
@@ -891,12 +891,12 @@ async def register_supervisor_jobs(engine: Any) -> None:
         # #1807 work_index -> storage rename). Without this, get_due_jobs keeps
         # surfacing an orphaned row and _dispatch_job rejects its unknown name.
         pruned = await DQLQuery(
-            "DELETE FROM platform.maintenance_schedule WHERE job_name = ANY(:names)",
+            "DELETE FROM tasks.maintenance_schedule WHERE job_name = ANY(:names)",
             result_handler=ResultHandler.ROWCOUNT,
         ).execute(conn, names=list(_OBSOLETE_SCHEDULE_JOBS))
     logger.info(
         "maintenance_supervisor: registered %d job cadences in "
-        "platform.maintenance_schedule (pruned %d obsolete row(s)).",
+        "tasks.maintenance_schedule (pruned %d obsolete row(s)).",
         len(jobs),
         pruned or 0,
     )
