@@ -544,7 +544,13 @@ def test_es_source_filter_excludes_geometry_when_skip_geometry_true():
     from dynastore.models.query_builder import QueryRequest
 
     req = QueryRequest(skip_geometry=True)
-    body, params = _ItemsElasticsearchBase._build_read_search_body(
+    # ``_build_read_search_body`` is intentionally an instance method (#2048):
+    # it dispatches through ``self._query_request_to_es`` so the private
+    # envelope driver's row-level access-filter override is honoured rather than
+    # bypassed by a static call. The base translation needs no instance state,
+    # so a bare instance is enough to exercise the source-filter push-down.
+    driver = _ItemsElasticsearchBase.__new__(_ItemsElasticsearchBase)
+    body, params = driver._build_read_search_body(
         collection_id="col",
         request=req,
         limit=10,
@@ -571,7 +577,10 @@ def test_es_source_filter_includes_selected_properties():
     from dynastore.models.query_builder import QueryRequest, FieldSelection
 
     req = QueryRequest(select=[FieldSelection(field="title"), FieldSelection(field="country")])
-    body, _params = _ItemsElasticsearchBase._build_read_search_body(
+    # Instance call (see note above): the method routes through
+    # ``self._query_request_to_es`` by design (#2048).
+    driver = _ItemsElasticsearchBase.__new__(_ItemsElasticsearchBase)
+    body, _params = driver._build_read_search_body(
         collection_id="col",
         request=req,
         limit=10,
@@ -601,7 +610,10 @@ def test_es_source_filter_default_is_unset():
     from dynastore.models.query_builder import QueryRequest
 
     req = QueryRequest()  # defaults: select=[*], skip_geometry=False
-    body, _params = _ItemsElasticsearchBase._build_read_search_body(
+    # Instance call (see note above): the method routes through
+    # ``self._query_request_to_es`` by design (#2048).
+    driver = _ItemsElasticsearchBase.__new__(_ItemsElasticsearchBase)
+    body, _params = driver._build_read_search_body(
         collection_id="col",
         request=req,
         limit=10,

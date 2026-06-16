@@ -71,6 +71,48 @@ async def test_seed_writes_default_when_no_row_exists(caplog):
 
 
 @pytest.mark.asyncio
+async def test_seed_persists_full_config_including_role_mapping():
+    """#2210: the seeded row must be self-describing — it has to include
+    ``role_mapping`` (and the other fields), not just
+    ``{"reconcile_enabled": true}``.
+
+    ``PlatformConfigService.set_config`` serializes the config with
+    ``model_dump(exclude_unset=True)``, so the seed object must have *every*
+    field marked as set. Otherwise the stored row drops ``role_mapping`` and
+    an operator inspecting/PATCHing ``configs.platform_configs`` — or a future
+    raw-dict merge over the row — sees a misleadingly partial config.
+    """
+    configs = AsyncMock()
+    configs.list_configs = AsyncMock(return_value={})
+    configs.set_config = AsyncMock(return_value=None)
+
+    with patch(
+        "dynastore.modules.iam.module.get_protocol",
+        return_value=configs,
+    ):
+        await _seed()
+
+    configs.set_config.assert_awaited_once()
+    cls_arg, cfg_arg = configs.set_config.await_args.args
+    assert cls_arg is OidcRoleSyncConfig
+
+    # Reproduce exactly how set_config persists the row (platform_config_service
+    # line ~732): mode="json", db secret context, exclude_unset=True.
+    stored = cfg_arg.model_dump(
+        mode="json", context={"secret_mode": "db"}, exclude_unset=True
+    )
+    assert "role_mapping" in stored, (
+        "seeded row dropped role_mapping — would persist only "
+        f"{sorted(stored)}, leaving the OIDC reconciler unable to map "
+        "geoid.sysadmin from a stored-then-merged row"
+    )
+    assert stored["role_mapping"] == {"geoid.sysadmin": "sysadmin"}
+    assert stored["reconcile_enabled"] is True
+    # ttl_seconds is part of the self-describing row too.
+    assert "ttl_seconds" in stored
+
+
+@pytest.mark.asyncio
 async def test_seed_skips_when_row_already_exists():
     persisted = OidcRoleSyncConfig(reconcile_enabled=False)
     configs = AsyncMock()

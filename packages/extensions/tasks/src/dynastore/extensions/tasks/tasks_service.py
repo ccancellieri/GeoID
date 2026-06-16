@@ -32,6 +32,37 @@ from dynastore.modules.tasks.models import Task
 from dynastore.extensions.protocols import ExtensionProtocol
 
 logger = logging.getLogger(__name__)
+
+
+async def _get_task_scoped_uncached(
+    task_id: uuid.UUID, catalog_id: str, conn: AsyncConnection
+) -> Task:
+    """Resolve the catalog's tenant schema, then read the task UNCACHED and
+    verify it belongs to that schema.
+
+    Uncached on purpose. A task's terminal status is written by the
+    BackgroundRunner that owns completion, which runs on whichever instance
+    claimed the task — not necessarily the API instance serving this poll. The
+    in-process ``get_task`` cache here is never invalidated by that
+    cross-instance flip, so the cached read pins the task at its creation-time
+    status (e.g. ``ACTIVE``) for the whole cache TTL. The async hard-delete
+    advertises this route via its ``Location``/monitor link, so a cached read
+    would leave callers unable to ever observe ``COMPLETED``. ``task_id`` is a
+    globally-unique UUIDv7, so an unscoped read plus an explicit schema check is
+    safe. Mirrors the OGC Processes job-status route.
+    """
+    from dynastore.modules.tasks.tasks_module import _resolve_catalog_schema
+
+    schema = await _resolve_catalog_schema(catalog_id, conn)
+    task = await tasks_module.get_task_by_id_unscoped(conn, task_id)
+    if not task or task.schema_name != schema:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.",
+        )
+    return task
+
+
 class TasksService(ExtensionProtocol):
     priority: int = 100 # Inherit ExtensionProtocol for consistency
     
@@ -72,13 +103,14 @@ class TasksService(ExtensionProtocol):
         task_id: uuid.UUID,
         conn: AsyncConnection = Depends(get_async_connection),
     ):
-        """Fetches the complete record for a single task within a catalog."""
-        from dynastore.modules.tasks.tasks_module import _resolve_catalog_schema
-        schema = await _resolve_catalog_schema(catalog_id, conn)
-        task = await tasks_module.get_task(conn, task_id, schema=schema)
-        if not task:
-            raise HTTPException(status_code=404, detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.")
-        return task
+        """Fetches the complete record for a single task within a catalog.
+
+        Reads uncached so a terminal status written by the worker instance that
+        owned the task is reflected on the next poll (see
+        :func:`_get_task_scoped_uncached`); the cached ``get_task`` would pin the
+        status link advertised by the async hard-delete at ``ACTIVE``.
+        """
+        return await _get_task_scoped_uncached(task_id, catalog_id, conn)
 
     # Global fallback for system tasks (can be moved to a separate extension if needed)
     @router.get("", response_model=List[Task], summary="List all system tasks", include_in_schema=False)

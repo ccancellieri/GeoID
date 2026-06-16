@@ -16,16 +16,25 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Endpoint-level tests pinning the OGC API - Features ``/items`` routing-aware
-dispatch (#1047).
+"""Endpoint-level tests pinning the OGC API - Features ``/items`` listing
+contract.
 
-``get_items`` resolves the items SEARCH driver via routing and dispatches
-through its streaming ``read_entities`` + ``count_entities`` contract
-(``maybe_dispatch_items_to_search_driver``) for a
-structural-only listing; when the helper declines (CQL ``filter`` / shorthand
-attribute filter / non-4326 CRS / read-primary PG driver) it falls through to
-the PostgreSQL ``stream_items`` path. Either way the response is a streamed
-GeoJSON ``FeatureCollection``.
+OGC Features ``/items`` prefers exact, full-precision geometry, so ``get_items``
+deliberately does NOT take the Elasticsearch search fast-path. It parses the
+query parameters into a :class:`QueryRequest`, sets ``search_dispatch=None`` and
+routes through ``dispatch_or_stream_items`` with ``EXACT_READ_HINTS``. With no
+pre-built search dispatch the helper streams from the items protocol
+(``stream_items``); the ``EXACT_READ_HINTS`` hint makes the router pick the
+exact-geometry driver (today PostgreSQL) even when a simplified-geometry
+Elasticsearch driver is registered first for READ. On an ES-only catalog the
+router relaxes the hint and falls back to the available reader rather than
+returning empty.
+
+These tests therefore assert what the listing handler hands to ``stream_items``:
+the parsed ``QueryRequest`` (limit/offset direct; ``bbox`` and ``datetime``
+translated into filter conditions; CQL into ``cql_filter``), the
+``OGC_FEATURES`` consumer, and the exact-geometry hint — and that the streamed
+items are what the response carries.
 """
 
 from __future__ import annotations
@@ -35,12 +44,13 @@ from typing import List
 
 import pytest
 
-import dynastore.extensions.tools.query as _query_mod
 from dynastore.extensions.features.features_config import FeaturesPluginConfig
 from dynastore.extensions.features.features_service import OGCFeaturesService
 from dynastore.extensions.tools.formatters import OutputFormatEnum
 from dynastore.models.ogc import Feature as _OGCFeature
 from dynastore.models.query_builder import QueryResponse
+from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
+from dynastore.modules.storage.hints import EXACT_READ_HINTS
 
 
 def _make_request(
@@ -74,12 +84,14 @@ class _FakeCatalogs:
         self._stream_features = stream_features
         self._total = total
         self.stream_called = False
+        self.stream_kwargs: dict = {}
 
     async def get_collection(self, catalog_id, collection_id, lang="en"):
         return {"id": collection_id}
 
     async def stream_items(self, **kwargs):
         self.stream_called = True
+        self.stream_kwargs = kwargs
 
         async def _gen():
             for f in self._stream_features:
@@ -124,137 +136,122 @@ async def _read_body(resp) -> bytes:
     return b"".join(chunks)
 
 
+async def _call_get_items(svc, **overrides):
+    """Invoke ``get_items`` with the full default OGC argument set, allowing
+    individual parameters to be overridden per test."""
+    kwargs = dict(
+        request=_make_request(),
+        catalog_id="cat",
+        collection_id="col",
+        conn=None,
+        limit=10,
+        offset=0,
+        bbox=None,
+        datetime_param=None,
+        filter=None,
+        filter_lang="cql2-text",
+        crs=None,
+        bbox_crs=None,
+        sortby=None,
+        f=OutputFormatEnum.GEOJSON,
+        language="en",
+    )
+    kwargs.update(overrides)
+    return await svc.get_items(**kwargs)
+
+
 @pytest.mark.asyncio
-async def test_get_items_uses_search_dispatch_when_available(monkeypatch):
+async def test_get_items_streams_from_items_protocol(monkeypatch):
+    """No ES search fast-path: the listing streams from the items protocol and
+    the response carries exactly those items."""
     svc = OGCFeaturesService.__new__(OGCFeaturesService)
-    catalogs = _FakeCatalogs(stream_features=[_feature("pg-1")], total=99)
+    catalogs = _FakeCatalogs(stream_features=[_feature("pg-1"), _feature("pg-2")], total=2)
     _wire(monkeypatch, svc, catalogs)
 
-    dispatched = [_feature("es-1"), _feature("es-2")]
-
-    captured = {}
-
-    async def _fake_dispatch(**kwargs):
-        captured.update(kwargs)
-
-        async def _gen():
-            for f in dispatched:
-                yield f
-
-        return QueryResponse(
-            items=_gen(), total_count=2,
-            catalog_id=kwargs["catalog_id"], collection_id=kwargs["collection_id"],
-        )
-
-    monkeypatch.setattr(
-        _query_mod, "maybe_dispatch_items_to_search_driver", _fake_dispatch
-    )
-
-    resp = await svc.get_items(
-        request=_make_request(), catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, bbox=None, datetime_param=None,
-        filter=None, filter_lang="cql2-text", crs=None, bbox_crs=None,
-        sortby=None, f=OutputFormatEnum.GEOJSON, language="en",
-    )
+    resp = await _call_get_items(svc, limit=10, offset=0)
     body = json.loads(await _read_body(resp))
+
     assert body["type"] == "FeatureCollection"
-    assert {f["id"] for f in body["features"]} == {"es-1", "es-2"}
-    assert catalogs.stream_called is False
-    # collection threaded correctly to the dispatch helper
-    assert captured["catalog_id"] == "cat"
-    assert captured["collection_id"] == "col"
+    assert {f["id"] for f in body["features"]} == {"pg-1", "pg-2"}
+    assert catalogs.stream_called is True
+    assert catalogs.stream_kwargs["catalog_id"] == "cat"
+    assert catalogs.stream_kwargs["collection_id"] == "col"
 
 
 @pytest.mark.asyncio
-async def test_get_items_threads_bbox_and_datetime_to_dispatch(monkeypatch):
+async def test_get_items_forces_exact_geometry_and_features_consumer(monkeypatch):
+    """The listing pins the exact-geometry hint and the OGC_FEATURES consumer so
+    the router selects the full-precision (PG) reader."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[_feature("pg-1")], total=1)
+    _wire(monkeypatch, svc, catalogs)
+
+    await _call_get_items(svc)
+
+    assert EXACT_READ_HINTS.issubset(catalogs.stream_kwargs["hints"])
+    assert catalogs.stream_kwargs["consumer"] == ConsumerType.OGC_FEATURES
+
+
+@pytest.mark.asyncio
+async def test_get_items_threads_limit_and_offset_into_query_request(monkeypatch):
     svc = OGCFeaturesService.__new__(OGCFeaturesService)
     catalogs = _FakeCatalogs(stream_features=[], total=0)
     _wire(monkeypatch, svc, catalogs)
 
-    captured = {}
+    await _call_get_items(svc, limit=25, offset=50)
 
-    async def _fake_dispatch(**kwargs):
-        captured.update(kwargs)
-
-        async def _gen():
-            if False:
-                yield  # pragma: no cover
-
-        return QueryResponse(
-            items=_gen(), total_count=0,
-            catalog_id=kwargs["catalog_id"], collection_id=kwargs["collection_id"],
-        )
-
-    monkeypatch.setattr(
-        _query_mod, "maybe_dispatch_items_to_search_driver", _fake_dispatch
-    )
-
-    await svc.get_items(
-        request=_make_request(), catalog_id="cat", collection_id="col",
-        conn=None, limit=25, offset=50, bbox="1,2,3,4",
-        datetime_param="2024-01-01/2024-12-31",
-        filter=None, filter_lang="cql2-text", crs=None, bbox_crs=None,
-        sortby=None, f=OutputFormatEnum.GEOJSON, language="en",
-    )
-    assert captured["bbox"] == [1.0, 2.0, 3.0, 4.0]
-    assert captured["datetime"] == "2024-01-01/2024-12-31"
-    assert captured["limit"] == 25
-    assert captured["offset"] == 50
+    req = catalogs.stream_kwargs["request"]
+    assert req.limit == 25
+    assert req.offset == 50
 
 
 @pytest.mark.asyncio
-async def test_get_items_falls_back_to_pg_when_dispatch_declines(monkeypatch):
+async def test_get_items_translates_bbox_and_datetime_into_filter_conditions(monkeypatch):
+    """``bbox`` and a ``datetime`` interval are parsed into the QueryRequest as
+    a spatial ``geom`` filter and a ``validity`` range filter respectively."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    _wire(monkeypatch, svc, catalogs)
+
+    await _call_get_items(
+        svc, bbox="1,2,3,4", datetime_param="2024-01-01T00:00:00Z/2024-12-31T00:00:00Z"
+    )
+
+    req = catalogs.stream_kwargs["request"]
+    # bbox → a spatial geometry filter carrying the requested envelope.
+    geom_filters = [f for f in req.filters if f.field == "geom" and f.spatial_op]
+    assert geom_filters, "bbox must produce a spatial geom filter"
+    assert "POLYGON" in str(geom_filters[0].value)
+    # datetime interval → a validity range filter (operator "&&").
+    range_filters = [
+        f for f in req.filters if f.field == "validity" and f.operator == "&&"
+    ]
+    assert range_filters, "datetime interval must produce a validity range filter"
+    assert "2024-01-01" in str(range_filters[0].value)
+    assert "2024-12-31" in str(range_filters[0].value)
+
+
+@pytest.mark.asyncio
+async def test_get_items_threads_cql_filter_into_query_request(monkeypatch):
+    """An explicit CQL2 ``filter`` is carried on the QueryRequest as
+    ``cql_filter`` (the items protocol compiles it downstream)."""
     svc = OGCFeaturesService.__new__(OGCFeaturesService)
     catalogs = _FakeCatalogs(stream_features=[_feature("pg-1")], total=1)
     _wire(monkeypatch, svc, catalogs)
 
-    async def _decline(**kwargs):
-        return None
+    await _call_get_items(svc, filter="prop = 'x'", filter_lang="cql2-text")
 
-    monkeypatch.setattr(
-        _query_mod, "maybe_dispatch_items_to_search_driver", _decline
-    )
-
-    resp = await svc.get_items(
-        request=_make_request(), catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, bbox=None, datetime_param=None,
-        filter=None, filter_lang="cql2-text", crs=None, bbox_crs=None,
-        sortby=None, f=OutputFormatEnum.GEOJSON, language="en",
-    )
-    body = json.loads(await _read_body(resp))
-    assert [f["id"] for f in body["features"]] == ["pg-1"]
+    req = catalogs.stream_kwargs["request"]
+    assert req.cql_filter is not None
+    assert "prop" in req.cql_filter
     assert catalogs.stream_called is True
 
 
 @pytest.mark.asyncio
-async def test_get_items_skips_dispatch_for_cql_filter(monkeypatch):
-    svc = OGCFeaturesService.__new__(OGCFeaturesService)
-    catalogs = _FakeCatalogs(stream_features=[_feature("pg-1")], total=1)
-    _wire(monkeypatch, svc, catalogs)
-
-    called = {"dispatch": False}
-
-    async def _spy(**kwargs):
-        called["dispatch"] = True
-        return None
-
-    monkeypatch.setattr(
-        _query_mod, "maybe_dispatch_items_to_search_driver", _spy
-    )
-
-    await svc.get_items(
-        request=_make_request(), catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, bbox=None, datetime_param=None,
-        filter="prop = 'x'", filter_lang="cql2-text", crs=None, bbox_crs=None,
-        sortby=None, f=OutputFormatEnum.GEOJSON, language="en",
-    )
-    assert called["dispatch"] is False
-    assert catalogs.stream_called is True
-
-
-@pytest.mark.asyncio
-async def test_get_items_skips_dispatch_for_non_4326_crs(monkeypatch):
-    """A non-4326 output CRS reprojection is a PG-only capability → PG path."""
+async def test_get_items_serves_non_4326_crs_via_items_protocol(monkeypatch):
+    """A non-4326 output CRS reprojection is a PG-capable path; the listing
+    still streams through the items protocol (the router/driver handles the
+    reprojection), it does not error or take a separate code path."""
     svc = OGCFeaturesService.__new__(OGCFeaturesService)
     catalogs = _FakeCatalogs(stream_features=[_feature("pg-1")], total=1)
     _wire(monkeypatch, svc, catalogs)
@@ -264,22 +261,10 @@ async def test_get_items_skips_dispatch_for_non_4326_crs(monkeypatch):
 
     monkeypatch.setattr(svc, "_resolve_crs_srid", _resolve_crs, raising=False)
 
-    called = {"dispatch": False}
-
-    async def _spy(**kwargs):
-        called["dispatch"] = True
-        return None
-
-    monkeypatch.setattr(
-        _query_mod, "maybe_dispatch_items_to_search_driver", _spy
+    resp = await _call_get_items(
+        svc, crs="http://www.opengis.net/def/crs/EPSG/0/3857"
     )
+    body = json.loads(await _read_body(resp))
 
-    await svc.get_items(
-        request=_make_request(), catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, bbox=None, datetime_param=None,
-        filter=None, filter_lang="cql2-text",
-        crs="http://www.opengis.net/def/crs/EPSG/0/3857", bbox_crs=None,
-        sortby=None, f=OutputFormatEnum.GEOJSON, language="en",
-    )
-    assert called["dispatch"] is False
+    assert [f["id"] for f in body["features"]] == ["pg-1"]
     assert catalogs.stream_called is True

@@ -1517,7 +1517,13 @@ async def search_collections(
     if not target_pairs:
         return [], 0
 
-    where_clauses = ["deleted_at IS NULL"]
+    # Hide transient collections (#2194): a non-null ``lifecycle_status`` overlay
+    # (#2066) marks a collection mid-provisioning or mid-hard-delete — write-gated
+    # and not a live catalog member — so it must not surface in STAC collection
+    # search. Only ACTIVE rows (overlay NULL) are returned; a direct GET-by-id
+    # still resolves it. Folded into the per-catalog subquery WHERE so the CTE
+    # COUNT and the paged data query stay consistent.
+    where_clauses = ["deleted_at IS NULL", "c.lifecycle_status IS NULL"]
     params = {}
 
     # Common filters — catalog_id / catalog_ids filtering is handled via schema UNION above

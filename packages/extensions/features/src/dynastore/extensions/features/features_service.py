@@ -738,12 +738,13 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
 
     async def delete_collection(
         self,
+        request: Request,
         catalog_id: str,
         collection_id: str,
         force: bool = Query(False),
         conn: AsyncConnection = Depends(get_async_connection),
     ):
-        return await self._ogc_delete_collection(catalog_id, collection_id, force, conn)
+        return await self._ogc_delete_collection(catalog_id, collection_id, force, conn, request)
 
     # --- Item Endpoints ---
     async def get_items(
