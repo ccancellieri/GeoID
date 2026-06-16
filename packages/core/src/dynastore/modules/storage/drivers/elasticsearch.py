@@ -1586,15 +1586,37 @@ class ItemsElasticsearchDriver(
 
     @staticmethod
     def _extract_external_id_from_doc(doc: dict, field_path: Optional[str]) -> Optional[str]:
-        """Extract external_id using a dot-notation path from an ES document."""
+        """Extract external_id from a feature/ES doc using the configured path.
+
+        Mirrors the PG-side resolution (``_walk_external_id_path`` /
+        ``ItemsWritePolicy.resolve_external_id`` in ``driver_config``) so the ES
+        write boundary resolves the SAME value the PG primary does:
+
+          1. dotted path ``a.b.c`` → traverse nested dicts;
+          2. bare name → top-level lookup, then ``properties[name]`` fallback.
+
+        The properties fallback is the load-bearing part: a bare configured path
+        like ``"CODE"`` carries its value under ``properties`` on the wire
+        feature, so without the fallback it resolves to ``None`` on the ES side —
+        dropping ``system.external_id`` in the feature-derived path, degrading the
+        ES ``_id`` to the geoid, and defeating the REFUSE existence check.
+        """
         if field_path is None:
             return None
-        val = doc
-        for part in field_path.split("."):
-            if isinstance(val, dict):
+        if "." in field_path:
+            val = doc
+            for part in field_path.split("."):
+                if not isinstance(val, dict):
+                    return None
                 val = val.get(part)
-            else:
-                return None
+                if val is None:
+                    return None
+            return str(val)
+        val = doc.get(field_path)
+        if val is None:
+            props = doc.get("properties")
+            if isinstance(props, dict):
+                val = props.get(field_path)
         return str(val) if val is not None else None
 
     @staticmethod
@@ -2045,11 +2067,25 @@ class ItemsElasticsearchDriver(
                 # collection → never has a PG row, so fall back to a
                 # feature-derived canonical doc built from op.payload.
                 if op.payload:
+                    # Outbox payloads carry the canonical identity under the
+                    # stamped ``_external_id`` / ``_asset_id`` keys (see
+                    # ItemService._apply_index_stamp); a bare ``external_id`` /
+                    # ``asset_id`` is never present. Read the stamped keys first
+                    # (falling back to the bare names for any non-outbox caller)
+                    # so the feature-derived doc still carries
+                    # ``system.external_id`` / ``asset_id`` instead of silently
+                    # dropping them.
                     ci = canonical_input_from_feature(
                         op.payload, ctx.catalog, ctx.collection,
                         geoid=op.entity_id,
-                        external_id=op.payload.get("external_id"),
-                        asset_id=op.payload.get("asset_id"),
+                        external_id=(
+                            op.payload.get("_external_id")
+                            or op.payload.get("external_id")
+                        ),
+                        asset_id=(
+                            op.payload.get("_asset_id")
+                            or op.payload.get("asset_id")
+                        ),
                     )
                 else:
                     logger.debug(

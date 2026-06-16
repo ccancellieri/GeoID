@@ -89,3 +89,59 @@ class TestExtractValuePropertiesFallback:
     def test_no_properties_bag_returns_none(self):
         sidecar = _sidecar()
         assert sidecar._extract_value({"geometry": None}, "ADM2_PCODE") is None
+
+
+class TestExtractExternalIdFromDocPropertiesFallback:
+    """ES-side counterpart of the #488 fix.
+
+    ``ItemsElasticsearchDriver._extract_external_id_from_doc`` resolves the
+    external_id on the ES write boundary (it drives the ES ``_id`` and the
+    REFUSE existence check). It must mirror the PG-side
+    ``_walk_external_id_path``/``_extract_value`` resolution — including the
+    bare-name → ``properties`` fallback — otherwise a configured path like
+    ``"CODE"`` (whose value lives under ``properties`` on a GDAL/shapefile
+    feature) resolves to ``None`` on the ES side, dropping
+    ``system.external_id`` and degrading the ES ``_id`` to the geoid.
+    """
+
+    @staticmethod
+    def _extract(doc, path):
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+
+        return ItemsElasticsearchDriver._extract_external_id_from_doc(doc, path)
+
+    def test_none_path_returns_none(self):
+        assert self._extract({"properties": {"CODE": "1616"}}, None) is None
+
+    def test_root_level_wins(self):
+        doc = {"CODE": "ROOT", "properties": {"CODE": "PROPS"}}
+        assert self._extract(doc, "CODE") == "ROOT"
+
+    def test_falls_back_to_properties_for_bare_field(self):
+        # The regression: bare "CODE" with the value under properties.
+        doc = {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [0, 0]},
+            "properties": {"CODE": "1616"},
+        }
+        assert self._extract(doc, "CODE") == "1616"
+
+    def test_dot_path_traverses_nested_dicts(self):
+        doc = {"properties": {"CODE": "1616"}}
+        assert self._extract(doc, "properties.CODE") == "1616"
+
+    def test_dot_path_does_not_trigger_properties_fallback(self):
+        # A dotted path is explicit; no implicit properties fallback.
+        doc = {"properties": {"CODE": "1616"}}
+        assert self._extract(doc, "a.b") is None
+
+    def test_missing_field_returns_none(self):
+        assert self._extract({"properties": {"OTHER": "x"}}, "CODE") is None
+
+    def test_no_properties_bag_returns_none(self):
+        assert self._extract({"geometry": None}, "CODE") is None
+
+    def test_numeric_value_is_stringified(self):
+        assert self._extract({"properties": {"CODE": 1616}}, "CODE") == "1616"
