@@ -53,7 +53,6 @@ import pytest
 from dynastore.modules.tasks.models import (
     DEFERRED_COMPLETION,
     RunnerContext,
-    TaskStatusEnum,
     _DeferredCompletionSentinel,
 )
 from sqlalchemy.engine import Engine as _SAEngine
@@ -308,10 +307,6 @@ async def test_background_runner_claimed_exception_fails_same_row():
         patch(
             "dynastore.modules.tasks.runners.get_background_executor",
         ) as fake_exec,
-        patch(
-            "dynastore.modules.tasks.runners._emit_task_failure",
-            AsyncMock(),
-        ),
         patch("dynastore.modules.tasks.tasks_module.complete_task", fake_complete),
         patch("dynastore.modules.tasks.tasks_module.fail_task", fake_fail),
     ):
@@ -372,10 +367,6 @@ async def test_background_runner_claimed_permanent_failure_no_retry():
         patch(
             "dynastore.modules.tasks.runners.get_background_executor",
         ) as fake_exec,
-        patch(
-            "dynastore.modules.tasks.runners._emit_task_failure",
-            AsyncMock(),
-        ),
         patch("dynastore.modules.tasks.tasks_module.fail_task", fake_fail),
     ):
         fake_exec.return_value.submit = _capture_submit

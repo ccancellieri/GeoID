@@ -370,6 +370,14 @@ BEGIN
             owner_id          = NULL,
             locked_until      = NULL,
             last_heartbeat_at = NULL,
+            finished_at       = CASE
+                WHEN s.retry_count + 1 >= LEAST(
+                        COALESCE(s.max_retries, p_max_retries),
+                        p_hard_cap
+                    )
+                    THEN NOW()
+                ELSE NULL
+            END,
             error_message     = CASE
                 WHEN s.retry_count + 1 >= p_hard_cap
                     THEN 'Reaped: hard retry cap (' || p_hard_cap || ') reached'
@@ -2227,6 +2235,74 @@ async def complete_task(
     return bool(rowcount and rowcount > 0)
 
 
+async def _emit_task_failed_event(
+    task_id: uuid.UUID,
+    row: Dict[str, Any],
+    severity: str,
+) -> None:
+    """Emit a ``task.failed`` platform event for a task that reached a terminal
+    failure status (``FAILED`` or ``DEAD_LETTER``).
+
+    This is the single emission point for all terminal failure paths that go
+    through the DB write functions (``fail_task`` / ``dead_letter_task``).
+    Runners no longer emit independently — this avoids double-emission across
+    the dispatcher path, the background runner, and the sync runner.
+
+    ``row`` is the dict returned by the RETURNING clause of the terminal UPDATE;
+    it must contain ``task_type``, ``caller_id``, ``inputs`` (already decoded to
+    a dict or None), and ``error_message``.
+
+    ``severity`` is pre-computed by the caller:
+    - ``"unrecoverable"`` — permanent failure (``retry=False``) or hard-cap DLQ.
+    - ``"recoverable"``   — retry-exhausted DLQ from a transient error path.
+
+    All emission is best-effort: a logging or event-bus failure must never
+    propagate back to the DB write path that already committed the terminal
+    status.
+    """
+    task_id_str = str(task_id)
+    task_type: str = row.get("task_type") or "unknown"
+    inputs: Optional[Dict[str, Any]] = row.get("inputs")
+    if isinstance(inputs, str):
+        try:
+            inputs = json.loads(inputs)
+        except (ValueError, TypeError):
+            inputs = None
+    catalog_id: Optional[str] = (inputs or {}).get("catalog_id")
+    error_msg: str = row.get("error_message") or ""
+
+    if catalog_id:
+        try:
+            from dynastore.modules.catalog.log_manager import log_error
+            await log_error(
+                catalog_id,
+                event_type="task.failed",
+                message=(
+                    f"Task '{task_type}' ({task_id_str}) failed [{severity}]: {error_msg}"
+                ),
+                details={"task_type": task_type, "severity": severity},
+            )
+        except Exception as log_exc:
+            logger.debug(
+                "log_manager unavailable for task failure logging: %s", log_exc
+            )
+
+    try:
+        from dynastore.modules.catalog.event_service import emit_event
+        await emit_event(
+            "task.failed",
+            task_id=task_id_str,
+            task_type=task_type,
+            error_message=error_msg,
+            severity=severity,
+            inputs=inputs,
+            originating_event=None,
+            catalog_id=catalog_id,
+        )
+    except Exception as emit_exc:
+        logger.error("Failed to emit task.failed event for task %s: %s", task_id_str, emit_exc)
+
+
 async def fail_task(
     engine: DbResource,
     task_id: uuid.UUID,
@@ -2241,6 +2317,10 @@ async def fail_task(
     requeue with exponential backoff. Otherwise move to DEAD_LETTER.
 
     Returns ``True`` when a row was updated, ``False`` when none matched.
+
+    Emits a ``task.failed`` platform event when the row reaches a terminal
+    status (``FAILED`` when ``retry=False``, or ``DEAD_LETTER`` when the
+    hard-cap is crossed). The PENDING/retry branch does NOT emit.
 
     ``owner_id`` is an optional race guard: when provided, the UPDATE also
     requires ``owner_id`` to still equal the given value. The liveness
@@ -2286,7 +2366,8 @@ async def fail_task(
                     WHEN retry_count + 1 < LEAST(max_retries, :hard_cap) THEN NULL
                     ELSE owner_id
                 END
-            WHERE task_id = :task_id{owner_guard};
+            WHERE task_id = :task_id{owner_guard}
+            RETURNING status, task_type, caller_id, inputs, error_message;
         """
         params = {
             "task_id": task_id,
@@ -2302,7 +2383,8 @@ async def fail_task(
                 finished_at = :finished_at,
                 locked_until = NULL,
                 owner_id = NULL
-            WHERE task_id = :task_id{owner_guard};
+            WHERE task_id = :task_id{owner_guard}
+            RETURNING status, task_type, caller_id, inputs, error_message;
         """
         params = {
             "task_id": task_id,
@@ -2314,10 +2396,31 @@ async def fail_task(
         params["owner_id"] = owner_id
 
     async with managed_transaction(engine) as conn:
-        rowcount = await DQLQuery(
-            sql, result_handler=ResultHandler.ROWCOUNT
+        row = await DQLQuery(
+            sql, result_handler=ResultHandler.ONE_DICT
         ).execute(conn, **params)
-    return bool(rowcount and rowcount > 0)
+
+    if row is None:
+        return False
+
+    # Emit task.failed only for terminal statuses — not for PENDING (retry).
+    final_status: str = row.get("status") or ""
+    if final_status in ("FAILED", "DEAD_LETTER"):
+        # FAILED → permanent failure (retry=False); hard-cap DEAD_LETTER is
+        # also unrecoverable from the platform's perspective.
+        # A DEAD_LETTER via retry=True means retries were exhausted — still
+        # "recoverable" in the sense that the error was transient; severity
+        # mirrors the retry intent of the call site.
+        severity = "unrecoverable" if final_status == "FAILED" else "recoverable"
+        try:
+            await _emit_task_failed_event(task_id, row, severity)
+        except Exception as exc:
+            logger.error(
+                "fail_task: unexpected error in _emit_task_failed_event for %s: %s",
+                task_id, exc,
+            )
+
+    return True
 
 
 async def dead_letter_task(
@@ -2339,6 +2442,8 @@ async def dead_letter_task(
     than ``FAILED``.
 
     Returns ``True`` when a row was updated, ``False`` when none matched.
+    Emits a ``task.failed`` platform event with severity ``"recoverable"``
+    (a timeout is operationally transient — the work may be valid to replay).
     ``owner_id`` is the same optional race guard documented on
     :func:`complete_task` / :func:`fail_task`.
     """
@@ -2351,7 +2456,8 @@ async def dead_letter_task(
             finished_at = :finished_at,
             locked_until = NULL,
             owner_id = NULL
-        WHERE task_id = :task_id{owner_guard};
+        WHERE task_id = :task_id{owner_guard}
+        RETURNING task_type, caller_id, inputs, error_message;
     """
     params: Dict[str, Any] = {
         "task_id": task_id,
@@ -2361,10 +2467,25 @@ async def dead_letter_task(
     if owner_id is not None:
         params["owner_id"] = owner_id
     async with managed_transaction(engine) as conn:
-        rowcount = await DQLQuery(
-            sql, result_handler=ResultHandler.ROWCOUNT
+        row = await DQLQuery(
+            sql, result_handler=ResultHandler.ONE_DICT
         ).execute(conn, **params)
-    return bool(rowcount and rowcount > 0)
+
+    if row is None:
+        return False
+
+    # dead_letter_task is always terminal — always emit.
+    # Severity: "recoverable" because the caller chose DLQ (timed-out path)
+    # rather than permanent FAILED, meaning the work may be valid to replay.
+    try:
+        await _emit_task_failed_event(task_id, row, "recoverable")
+    except Exception as exc:
+        logger.error(
+            "dead_letter_task: unexpected error in _emit_task_failed_event for %s: %s",
+            task_id, exc,
+        )
+
+    return True
 
 
 async def heartbeat_tasks(

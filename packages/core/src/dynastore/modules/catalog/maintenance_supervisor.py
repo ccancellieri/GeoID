@@ -361,6 +361,121 @@ async def _run_task_reaper(conn: Any, hard_cap: int) -> int:
     return int(result) if result is not None else 0
 
 
+async def _report_reaped_failures(engine: Any) -> int:
+    """Emit ``task.failed`` for rows that the SQL reaper moved to DEAD_LETTER.
+
+    The reaper runs entirely in SQL and cannot emit Python events.  This
+    leader-only sweep runs right after ``_run_task_reaper`` on the same tick
+    and picks up any rows the reaper just dead-lettered.
+
+    Idempotency sentinel: after a successful event emission the row's
+    ``error_message`` is suffixed with `` [reported]``.  The SELECT filters
+    on ``error_message NOT LIKE '%[reported]%'`` so a restart cannot
+    double-emit.  The sentinel is appended in the same DB transaction as the
+    SELECT (via UPDATE ... RETURNING), which also acts as a FOR UPDATE lock
+    so two concurrent leaders cannot race on the same row.
+
+    Returns the number of rows for which an event was attempted (0 on a quiet
+    tick).  All emission is best-effort — a failing event bus never raises
+    out of this function.
+    """
+    schema = _TASKS_SCHEMA
+    # Atomically claim unreported reaped rows: mark them [reported] and
+    # return the data we need to emit the event.  FOR UPDATE SKIP LOCKED
+    # inside the CTE prevents two concurrent leader-pods from double-emitting
+    # if the advisory lock is somehow held by two winners simultaneously.
+    sql = f"""
+        WITH to_report AS (
+            SELECT timestamp, task_id
+            FROM {schema}.tasks
+            WHERE status = 'DEAD_LETTER'
+              AND error_message LIKE 'Reaped%%'
+              AND error_message NOT LIKE '%%[reported]'
+            FOR UPDATE SKIP LOCKED
+            LIMIT 200
+        )
+        UPDATE {schema}.tasks t
+        SET error_message = t.error_message || ' [reported]'
+        FROM to_report r
+        WHERE t.timestamp = r.timestamp AND t.task_id = r.task_id
+        RETURNING t.task_id, t.task_type, t.caller_id, t.inputs, t.error_message;
+    """
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(conn)
+
+    if not rows:
+        return 0
+
+    import json as _json
+    import uuid as _uuid
+
+    for row in rows:
+        try:
+            task_id_raw = row.get("task_id")
+            task_id = _uuid.UUID(str(task_id_raw)) if task_id_raw else None
+            error_msg: str = row.get("error_message") or ""
+            # Severity: hard-cap rows carry the "hard retry cap" phrase;
+            # plain heartbeat-expiry rows are recoverable (work may be replayed).
+            severity = (
+                "unrecoverable"
+                if "hard retry cap" in error_msg
+                else "recoverable"
+            )
+            inputs_raw = row.get("inputs")
+            if isinstance(inputs_raw, str):
+                try:
+                    inputs: Any = _json.loads(inputs_raw)
+                except (ValueError, TypeError):
+                    inputs = None
+            else:
+                inputs = inputs_raw
+            catalog_id: Optional[str] = (inputs or {}).get("catalog_id") if isinstance(inputs, dict) else None
+            task_type: str = row.get("task_type") or "unknown"
+            task_id_str = str(task_id) if task_id else "unknown"
+
+            if catalog_id:
+                try:
+                    from dynastore.modules.catalog.log_manager import log_error
+                    await log_error(
+                        catalog_id,
+                        event_type="task.failed",
+                        message=(
+                            f"Task '{task_type}' ({task_id_str}) failed [{severity}]: {error_msg}"
+                        ),
+                        details={"task_type": task_type, "severity": severity},
+                    )
+                except Exception as log_exc:
+                    logger.debug(
+                        "maintenance_supervisor: log_manager unavailable for reaped task %s: %s",
+                        task_id_str, log_exc,
+                    )
+
+            try:
+                from dynastore.modules.catalog.event_service import emit_event
+                await emit_event(
+                    "task.failed",
+                    task_id=task_id_str,
+                    task_type=task_type,
+                    error_message=error_msg,
+                    severity=severity,
+                    inputs=inputs,
+                    originating_event=None,
+                    catalog_id=catalog_id,
+                )
+            except Exception as emit_exc:
+                logger.error(
+                    "maintenance_supervisor: failed to emit task.failed for reaped task %s: %s",
+                    task_id_str, emit_exc,
+                )
+        except Exception as row_exc:
+            logger.error(
+                "maintenance_supervisor: unexpected error reporting reaped task %s: %s",
+                row.get("task_id"), row_exc,
+            )
+
+    return len(rows)
+
+
 async def _run_task_partition_create(conn: Any) -> int:
     """Invoke the partition-creation function for the tasks table.
 
@@ -659,6 +774,19 @@ class MaintenanceSupervisor:
             logger.info(
                 "maintenance_supervisor: job %r done — rows=%s.", job_name, rows
             )
+            # Post-reaper sweep: emit task.failed for rows the SQL reaper moved
+            # to DEAD_LETTER.  Runs in a separate transaction AFTER the reaper
+            # transaction commits above so the reaped rows are visible.
+            # Best-effort — a reporting hiccup must never brick the maintenance loop.
+            if job_name == JOB_TASK_REAPER:
+                try:
+                    await _report_reaped_failures(engine)
+                except Exception as _rep_exc:
+                    logger.error(
+                        "maintenance_supervisor: _report_reaped_failures failed: %s — "
+                        "reaped tasks will be reported on the next tick.",
+                        _rep_exc,
+                    )
         except asyncio.TimeoutError:
             status = "error"
             error = (

@@ -33,69 +33,6 @@ from dynastore.modules.tasks.dispatcher import _SERVICE_NAME
 logger = logging.getLogger(__name__)
 
 
-async def _emit_task_failure(
-    context: "RunnerContext",
-    job: Any,
-    error_message: str,
-    exc: Exception,
-) -> None:
-    """Shared helper: emits a generic platform 'task.failed' event after a task fails.
-
-    ``job`` may be either a ``Task`` (OGC Part 1 direct-invocation path) or
-    ``None`` (dispatcher-claimed path, where the task_id comes from
-    ``context.extra_context['task_id']``).
-
-    Severity is derived from the exception type:
-    - 'recoverable'   — transient errors (timeout, OSError, etc.)
-    - 'unrecoverable' — all other exceptions
-
-    The event carries the full input context so listeners can perform rollback
-    without any knowledge of the specific module that dispatched the task.
-    Also logs via tenant log_manager if catalog_id is resolvable.
-    """
-    # Determine severity from exception type
-    severity = "unrecoverable"
-    if isinstance(exc, (TimeoutError, OSError, asyncio.TimeoutError)):
-        severity = "recoverable"
-
-    # Resolve task_id from either the passed Task object or the claimed context
-    task_id_str = (
-        str(job.task_id) if job is not None and getattr(job, "task_id", None) is not None
-        else str((context.extra_context or {}).get("task_id") or "unknown")
-    )
-
-    catalog_id = (context.inputs or {}).get("catalog_id")
-    originating_event = (context.extra_context or {}).get("originating_event")
-
-    # Tenant-scoped structured log (best-effort, never blocks failure path)
-    if catalog_id:
-        try:
-            from dynastore.modules.catalog.log_manager import log_error
-            await log_error(
-                catalog_id,
-                event_type="task.failed",
-                message=f"Task '{context.task_type}' ({task_id_str}) failed [{severity}]: {error_message}",
-                details={"task_type": context.task_type, "severity": severity},
-            )
-        except Exception as log_exc:
-            logger.debug(f"log_manager unavailable for task failure logging: {log_exc}")
-
-    # Emit generic platform event — all rollback logic lives in module listeners
-    try:
-        from dynastore.modules.catalog.event_service import emit_event
-        await emit_event(
-            "task.failed",
-            task_id=task_id_str,
-            task_type=context.task_type,
-            error_message=error_message,
-            severity=severity,
-            inputs=context.inputs,
-            originating_event=originating_event,
-            catalog_id=catalog_id,
-        )
-    except Exception as emit_exc:
-        logger.error(f"Failed to emit task.failed event: {emit_exc}")
-
 @runtime_checkable
 class RunnerProtocol(Protocol):
     """Defines the contract for a class-based task runner."""
@@ -252,9 +189,17 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
         except Exception as e:
             logger.error(f"Sync task '{job.task_id}' failed: {e}", exc_info=True)
             error_message = f"Synchronous execution failed: {str(e)}"
-            update_data = TaskUpdate(status=TaskStatusEnum.FAILED, error_message=error_message)
-            await tasks_mgr.update_task(context.engine, job.task_id, update_data, schema=context.db_schema)
-            await _emit_task_failure(context, job, error_message, e)
+            from dynastore.modules.tasks.tasks_module import fail_task as _sync_fail_task
+            from datetime import datetime as _sync_dt, timezone as _sync_tz
+            try:
+                await _sync_fail_task(
+                    context.engine, job.task_id, _sync_dt.now(_sync_tz.utc),
+                    error_message, retry=False,
+                )
+            except Exception as update_error:
+                logger.error(
+                    f"SyncRunner: failed to mark task '{job.task_id}' FAILED: {update_error}"
+                )
             # Re-raise to allow the service layer to return a 500 error.
             raise
 
@@ -405,12 +350,15 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 except Exception as e:
                     logger.error(f"Async task '{job.task_id}' failed: {e}", exc_info=True)
                     error_message = f"Asynchronous execution failed: {str(e)}"
+                    from dynastore.modules.tasks.tasks_module import fail_task as _bg_fail_task
+                    from datetime import datetime as _bg_dt, timezone as _bg_tz
                     try:
-                        update_data = TaskUpdate(status=TaskStatusEnum.FAILED, error_message=error_message)
-                        await tasks_mgr.update_task(context.engine, job.task_id, update_data, schema=context.db_schema)
+                        await _bg_fail_task(
+                            context.engine, job.task_id, _bg_dt.now(_bg_tz.utc),
+                            error_message, retry=False,
+                        )
                     except Exception as update_error:
                         logger.critical(f"Failed to update task '{job.task_id}' status to FAILED: {update_error}")
-                    await _emit_task_failure(context, job, error_message, e)
 
         if background_tasks:
             background_tasks.add_task(_execute_background)
@@ -618,8 +566,8 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                             f"pg_cron reaper will catch it via expired locked_until.",
                             exc_info=True,
                         )
-                    await _emit_task_failure(context, None, error_message, e)
                     # Permanent failure is terminal (FAILED) — fire on_failure.
+                    # task.failed emitted inside _fail_task (retry=False → FAILED).
                     await _apply_terminal("failure", _terminal.on_failure)
 
                 except asyncio.TimeoutError:
@@ -662,11 +610,12 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                             f"pg_cron reaper will catch it via expired locked_until.",
                             exc_info=True,
                         )
-                    await _emit_task_failure(context, None, error_message, e)
                     # Transient failure: ROUTE fires only if this attempt was
                     # the terminal one (DEAD_LETTER at cap) — apply_terminal_action
                     # re-reads ground-truth status, so a mid-retry PENDING reset
                     # does not trigger compensation.
+                    # task.failed emitted inside _fail_task when status lands on
+                    # DEAD_LETTER (hard-cap crossed) or FAILED; PENDING does not emit.
                     await _apply_terminal("failure", _terminal.on_failure)
 
                 finally:
