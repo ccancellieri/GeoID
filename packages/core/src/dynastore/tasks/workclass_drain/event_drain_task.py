@@ -69,7 +69,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, ClassVar, Dict, List, Optional
+import time
+from typing import Any, ClassVar, Dict, List, Optional, Set
 from uuid import uuid4
 
 from dynastore.models.tasks import TaskPayload
@@ -101,6 +102,55 @@ def _backoff(retry_count: int) -> int:
     """Return the backoff in seconds for the given zero-based retry count."""
     idx = min(retry_count, len(_BACKOFF_SECONDS) - 1)
     return _BACKOFF_SECONDS[idx]
+
+
+# ---------------------------------------------------------------------------
+# Webhook fan-out (#1807)
+# ---------------------------------------------------------------------------
+
+# Short-TTL process cache of the distinct event types that have at least one
+# webhook subscription.  Lets the drain skip the per-event subscription lookup
+# for types nobody subscribes to (the common case on a webhook-free install)
+# without cross-pod cache invalidation — a new subscription takes effect within
+# the TTL.
+_SUBSCRIBED_TYPES_TTL_SECONDS: float = 60.0
+_subscribed_types_cache: Dict[str, Any] = {"value": None, "expires_at": 0.0}
+
+
+def _subscription_matches_event(
+    sub: Dict[str, Any],
+    event_catalog_id: Optional[str],
+    event_collection_id: Optional[str],
+) -> bool:
+    """Return True when *sub*'s scope selects an event with these ids.
+
+    A subscription's scope narrows which events of its type it wants:
+
+    * ``PLATFORM`` — every event of the subscribed type, any catalog/collection.
+    * ``CATALOG``  — only events whose ``catalog_id`` equals the subscription's.
+    * ``COLLECTION`` — only events matching both ``catalog_id`` and
+      ``collection_id``.
+
+    The event's ``catalog_id`` / ``collection_id`` come from the (normalized)
+    payload — ``tasks.events`` carries them in the JSONB body, not in dedicated
+    columns.
+    """
+    scope = str(sub.get("scope") or "PLATFORM").upper()
+    if scope == "PLATFORM":
+        return True
+    if scope == "CATALOG":
+        sub_catalog = sub.get("catalog_id")
+        return sub_catalog is not None and sub_catalog == event_catalog_id
+    if scope == "COLLECTION":
+        sub_catalog = sub.get("catalog_id")
+        sub_collection = sub.get("collection_id")
+        return (
+            sub_catalog is not None
+            and sub_catalog == event_catalog_id
+            and sub_collection is not None
+            and sub_collection == event_collection_id
+        )
+    return False
 
 
 class EventDrainTask(TaskProtocol):
@@ -258,6 +308,12 @@ class EventDrainTask(TaskProtocol):
                 )
                 continue
 
+            # In-process delivery succeeded — fan out to external webhook
+            # subscribers BEFORE the ack so a crash here redelivers the event
+            # (the dedup_key coalesces to exactly one delivery task per
+            # event/subscription). Best-effort: never blocks the ack.
+            await self._fan_out_webhooks(engine=engine, row=row, payload=payload)
+
             await self._mark_done(
                 engine=engine,
                 task_schema=task_schema,
@@ -340,6 +396,115 @@ class EventDrainTask(TaskProtocol):
             type(raw).__name__,
         )
         return {}
+
+    # ------------------------------------------------------------------
+    # Webhook fan-out (#1807)
+    # ------------------------------------------------------------------
+
+    async def _subscribed_event_types(self, engine: Any) -> Optional[Set[str]]:
+        """Return the cached set of subscribed event types, refreshing on TTL.
+
+        Returns ``None`` only when the set has never loaded AND a refresh just
+        failed — the caller then falls through to a per-event lookup rather than
+        dropping a webhook because of a transient cache error.
+        """
+        now = time.monotonic()
+        cached = _subscribed_types_cache.get("value")
+        if cached is not None and now < _subscribed_types_cache["expires_at"]:
+            return cached
+        try:
+            from dynastore.modules.tasks.event_driver import (
+                get_subscribed_event_types,
+            )
+
+            types = await get_subscribed_event_types(engine)
+        except Exception:  # noqa: BLE001 — optimization only; never block drain
+            logger.debug(
+                "webhook fan-out: subscribed-type refresh failed; serving %s.",
+                "stale set" if cached is not None else "no cached set",
+                exc_info=True,
+            )
+            return cached
+        _subscribed_types_cache["value"] = types
+        _subscribed_types_cache["expires_at"] = now + _SUBSCRIBED_TYPES_TTL_SECONDS
+        return types
+
+    async def _fan_out_webhooks(
+        self, *, engine: Any, row: Dict[str, Any], payload: Dict[str, Any]
+    ) -> None:
+        """Enqueue one ``webhook_delivery`` task per matching subscription.
+
+        Best-effort: every failure is swallowed so a webhook problem never
+        poisons the core event drain.  Dedup (``webhook:{event_id}:{sub_id}``)
+        gives exactly-once delivery per (event, subscription) across redelivery
+        and pods.
+        """
+        event_type = row.get("event_type") or ""
+        if not event_type:
+            return
+        try:
+            subscribed = await self._subscribed_event_types(engine)
+            if subscribed is not None and event_type not in subscribed:
+                return
+
+            from dynastore.modules.tasks.event_driver import (
+                get_subscriptions_for_event_type,
+            )
+
+            subs = await get_subscriptions_for_event_type(event_type, engine)
+            if not subs:
+                return
+
+            from dynastore.tasks.webhook_delivery.task import (
+                normalize_webhook_payload,
+            )
+
+            domain_payload = normalize_webhook_payload(payload)
+            event_catalog_id = domain_payload.get("catalog_id")
+            event_collection_id = domain_payload.get("collection_id")
+            event_id = str(row.get("event_id"))
+
+            from dynastore.models.tasks import TaskCreate, TaskScope
+            from dynastore.modules.tasks.tasks_module import create_task
+
+            for sub in subs:
+                sub_dict = sub if isinstance(sub, dict) else sub.model_dump()
+                if not _subscription_matches_event(
+                    sub_dict, event_catalog_id, event_collection_id
+                ):
+                    continue
+                subscription_id = str(sub_dict.get("subscription_id"))
+                task_data = TaskCreate(
+                    task_type="webhook_delivery",
+                    caller_id="system:webhook_fanout",
+                    scope=TaskScope.SYSTEM,
+                    inputs={
+                        "subscription_id": subscription_id,
+                        "subscriber_name": sub_dict.get("subscriber_name"),
+                        "event_type": event_type,
+                        "event_id": event_id,
+                        "payload": domain_payload,
+                    },
+                    dedup_key=f"webhook:{event_id}:{subscription_id}",
+                )
+                try:
+                    await create_task(engine, task_data, schema="system")
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "webhook fan-out: failed to enqueue delivery for "
+                        "subscription=%s event_id=%s; skipping (core event "
+                        "delivery unaffected).",
+                        subscription_id,
+                        event_id,
+                        exc_info=True,
+                    )
+        except Exception:  # noqa: BLE001 — never poison the drain
+            logger.warning(
+                "webhook fan-out: unexpected error for event_id=%s; core "
+                "event delivery unaffected.",
+                row.get("event_id"),
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Claim

@@ -119,6 +119,7 @@ stac_harvest = "dynastore.tasks.stac_harvest.task:StacHarvestTask"
 storage_drain = "dynastore.tasks.workclass_drain.storage_drain_task:StorageDrainTask"
 event_drain = "dynastore.tasks.workclass_drain.event_drain_task:EventDrainTask"
 collection_hard_delete = "dynastore.tasks.collection_hard_delete.task:CollectionHardDeleteTask"
+webhook_delivery = "dynastore.tasks.webhook_delivery.task:WebhookDeliveryTask"
 
 [build-system]
 requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]

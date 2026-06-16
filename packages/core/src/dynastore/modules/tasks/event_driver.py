@@ -34,7 +34,7 @@ discriminate rows.
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Set
 
 import orjson
 from dynastore.modules import ModuleProtocol, get_protocol
@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS {_TASKS_SCHEMA}.event_subscriptions (
 );
 """
 
-# Drain-side lookup index — used by A4 event drain to find matching webhooks.
+# Drain-side lookup index — used by the event drain to find matching webhooks.
 SUBSCRIPTIONS_INDEX_DDL = f"""
 CREATE INDEX IF NOT EXISTS idx_event_subscriptions_drain
     ON {_TASKS_SCHEMA}.event_subscriptions (event_type, scope, catalog_id, collection_id);
@@ -126,6 +126,22 @@ _upsert_subscription_query = DQLQuery(
 
 _get_subscriptions_for_event_query = DQLQuery(
     f"SELECT * FROM {_TASKS_SCHEMA}.event_subscriptions WHERE event_type = :event_type;",
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
+# Delivery-time single-subscription lookup — the webhook_delivery task re-fetches
+# its subscription by id so the auth secret stays in this table rather than being
+# copied into ``tasks.tasks.inputs``.
+_get_subscription_by_id_query = DQLQuery(
+    f"SELECT * FROM {_TASKS_SCHEMA}.event_subscriptions WHERE subscription_id = :subscription_id;",
+    result_handler=ResultHandler.ONE_OR_NONE,
+)
+
+# Distinct subscribed event types — the event drain caches this set (short TTL)
+# to short-circuit webhook fan-out for event types nobody subscribes to (the
+# common case) without a per-event subscription lookup.
+_distinct_subscribed_types_query = DQLQuery(
+    f"SELECT DISTINCT event_type FROM {_TASKS_SCHEMA}.event_subscriptions;",
     result_handler=ResultHandler.ALL_DICTS,
 )
 
@@ -607,3 +623,47 @@ async def get_subscriptions_for_event_type(
     if driver is None:
         raise RuntimeError("EventDriverProtocol not available.")
     return await driver.get_subscriptions_for_event_type(event_type, engine)
+
+
+async def get_subscription_by_id(
+    subscription_id: str, engine: Optional[DbResource] = None
+) -> Optional[EventSubscription]:
+    """Re-fetch a single webhook subscription by id (delivery-time lookup).
+
+    Used by the ``webhook_delivery`` task so the webhook URL and auth config —
+    including any secret — are read from ``tasks.event_subscriptions`` at
+    delivery time rather than snapshotted into the task row.  Returns ``None``
+    when the subscription has been removed since the task was enqueued; the
+    caller then degrades to a no-op (the operator unsubscribed).
+
+    This is a plain module helper, not an ``EventDriverProtocol`` method: adding
+    it to the Protocol would force every implementation to define it or silently
+    drop out of ``get_protocols`` (the @runtime_checkable completeness trap).
+    """
+    from dynastore.tools.protocol_helpers import get_engine  # noqa: PLC0415
+
+    db_engine = engine or get_engine()
+    async with managed_transaction(db_engine) as conn:
+        sub_dict = await _get_subscription_by_id_query.execute(
+            conn, subscription_id=str(subscription_id)
+        )
+    if not sub_dict:
+        return None
+    return EventSubscription.model_validate(sub_dict)
+
+
+async def get_subscribed_event_types(
+    engine: Optional[DbResource] = None,
+) -> Set[str]:
+    """Return the distinct set of event types that have at least one subscription.
+
+    The event drain caches this (short TTL) to skip the per-event subscription
+    lookup for event types nobody subscribes to — the common case on an install
+    with no webhooks.
+    """
+    from dynastore.tools.protocol_helpers import get_engine  # noqa: PLC0415
+
+    db_engine = engine or get_engine()
+    async with managed_transaction(db_engine) as conn:
+        rows = await _distinct_subscribed_types_query.execute(conn)
+    return {row["event_type"] for row in (rows or [])}
