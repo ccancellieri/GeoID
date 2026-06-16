@@ -21,9 +21,9 @@ tasks/maintenance.py
 
 Administrative tools for the DynaStore task queue.
 
-All queries target the global ``tasks.tasks`` table. The ``schema_name``
-parameter refers to the column value (tenant schema or 'system'), not a
-PostgreSQL schema qualifier.
+All queries target the global ``tasks.tasks`` table (task DLQ) or the global
+``tasks.events`` table (event DLQ). The ``schema_name`` parameter refers to
+the column value (tenant schema or 'system'), not a PostgreSQL schema qualifier.
 
 These tools are wired into the existing retention-policy infrastructure and
 can be called from admin endpoints or the MaintenanceSupervisor's periodic jobs.
@@ -297,6 +297,177 @@ async def requeue_dead_letter_tasks_by_type(
     )
     if count:
         await _notify_requeued(engine, "dlq_requeue_bulk")
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Event dead-letter management
+# ---------------------------------------------------------------------------
+
+
+async def list_dead_letter_events(
+    engine: AsyncEngine, schema_name: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Returns all events in DEAD_LETTER state for operator review.
+
+    Args:
+        schema_name: If provided, scopes to that tenant (the ``schema_name``
+                     column value). ``None`` returns DEAD_LETTER events across
+                     all tenants (platform/sysadmin-wide listing).
+    """
+    task_schema = get_task_schema()
+    schema_filter = ""
+    params: Dict[str, Any] = {}
+    if schema_name is not None:
+        schema_filter = "AND schema_name = :schema_name"
+        params["schema_name"] = schema_name
+
+    sql = f"""
+        SELECT day, event_id, event_type, schema_name,
+               retry_count, max_retries, error_message, created_at
+        FROM {task_schema}.events
+        WHERE status = 'DEAD_LETTER'
+          {schema_filter}
+        ORDER BY created_at ASC;
+    """
+    async with managed_transaction(engine) as conn:
+        return await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, **params
+        ) or []
+
+
+async def requeue_dead_letter_event(
+    engine: AsyncEngine,
+    event_id: str,
+    day: Any,
+    reset_retries: bool = True,
+) -> bool:
+    """Resets a single DEAD_LETTER event back to PENDING for another attempt.
+
+    The composite primary key ``(day, event_id)`` is required because
+    ``event_id`` alone is NOT unique across daily partitions.
+
+    After a successful requeue, enqueues one dedup'd ``event_drain`` task on
+    the same connection so the ``EventDrainTask`` is woken co-transactionally.
+
+    Args:
+        event_id: UUID of the event row (event_id column).
+        day: DATE value of the partition key — must match the row's ``day``
+             column exactly.
+        reset_retries: If True (default), resets ``retry_count`` to 0 for a
+                       fresh attempt budget.  If False, keeps the prior count.
+    Returns:
+        True if the event was found and requeued, False otherwise.
+    """
+    from dynastore.modules.events.events_emit import (  # noqa: PLC0415
+        _enqueue_event_drain_trigger,
+    )
+
+    task_schema = get_task_schema()
+    retry_clause = "retry_count = 0," if reset_retries else ""
+    sql = f"""
+        UPDATE {task_schema}.events
+        SET status        = 'PENDING',
+            {retry_clause}
+            locked_until  = NULL,
+            error_message = NULL,
+            owner_id      = NULL,
+            processed_at  = NULL
+        WHERE day      = :day
+          AND event_id = CAST(:event_id AS uuid)
+          AND status   = 'DEAD_LETTER'
+        RETURNING event_id;
+    """
+    async with managed_transaction(engine) as conn:
+        row = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
+            conn, event_id=event_id, day=day
+        )
+        if row:
+            await _enqueue_event_drain_trigger(conn)
+
+    if row:
+        logger.info(
+            "Maintenance: event %s (day=%s) re-queued from DEAD_LETTER.", event_id, day
+        )
+        return True
+    logger.warning(
+        "Maintenance: event %s (day=%s) not found in DEAD_LETTER state.", event_id, day
+    )
+    return False
+
+
+async def requeue_dead_letter_events_by_type(
+    engine: AsyncEngine,
+    event_type: str,
+    *,
+    since: Optional[datetime] = None,
+    limit: int = 1000,
+    reset_retries: bool = True,
+) -> int:
+    """Bulk-requeue every DEAD_LETTER event of ``event_type``.
+
+    Selects up to ``limit`` rows (newest-first) and flips them back to
+    PENDING in one CTE UPDATE.  After a non-zero requeue count, enqueues one
+    dedup'd ``event_drain`` task on the same connection to wake the drain.
+
+    Args:
+        event_type: The ``event_type`` column value to replay (e.g.
+                    ``"catalog_creation"``).
+        since: If set, only replay rows whose ``created_at >= since``.
+        limit: Maximum number of rows to requeue in one call (default 1 000).
+        reset_retries: If True (default), resets ``retry_count`` to 0 for a
+                       fresh attempt budget.  If False, keeps the prior count.
+    Returns:
+        Count of rows transitioned back to PENDING.
+    """
+    from dynastore.modules.events.events_emit import (  # noqa: PLC0415
+        _enqueue_event_drain_trigger,
+    )
+
+    task_schema = get_task_schema()
+    retry_clause = "retry_count = 0," if reset_retries else ""
+    since_filter = "AND created_at >= :since" if since is not None else ""
+
+    params: Dict[str, Any] = {"event_type": event_type, "lim": limit}
+    if since is not None:
+        params["since"] = since
+
+    sql = f"""
+        WITH victims AS (
+            SELECT day, event_id
+            FROM {task_schema}.events
+            WHERE status     = 'DEAD_LETTER'
+              AND event_type = :event_type
+              {since_filter}
+            ORDER BY created_at DESC
+            LIMIT :lim
+        )
+        UPDATE {task_schema}.events e
+        SET status        = 'PENDING',
+            {retry_clause}
+            locked_until  = NULL,
+            error_message = NULL,
+            owner_id      = NULL,
+            processed_at  = NULL
+        FROM victims v
+        WHERE e.day      = v.day
+          AND e.event_id = v.event_id
+        RETURNING e.event_id;
+    """
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(
+            sql, result_handler=ResultHandler.ALL_DICTS,
+        ).execute(conn, **params) or []
+        count = len(rows)
+        if count:
+            await _enqueue_event_drain_trigger(conn)
+
+    logger.info(
+        "Maintenance: requeued %d DEAD_LETTER event(s) of type %r%s.",
+        count,
+        event_type,
+        f" since {since.isoformat()}" if since else "",
+    )
     return count
 
 

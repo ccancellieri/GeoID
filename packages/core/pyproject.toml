@@ -114,6 +114,7 @@ index_propagation = "dynastore.tasks.index_propagation.task:IndexPropagationTask
 gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
 cascade_cleanup = "dynastore.tasks.cascade_cleanup.task:CascadeCleanupTask"
 requeue_dead_letter_tasks = "dynastore.tasks.requeue_dead_letter.task:RequeueDeadLetterTasksTask"
+requeue_dead_letter_events = "dynastore.tasks.requeue_dead_letter_events.task:RequeueDeadLetterEventsTask"
 stac_harvest = "dynastore.tasks.stac_harvest.task:StacHarvestTask"
 storage_drain = "dynastore.tasks.workclass_drain.storage_drain_task:StorageDrainTask"
 event_drain = "dynastore.tasks.workclass_drain.event_drain_task:EventDrainTask"
