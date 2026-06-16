@@ -622,7 +622,7 @@ async def test_no_listeners_marks_completed(drain_env, monkeypatch):  # noqa: AN
 
 async def _publish(engine: Any, task_schema: str, *, item: str) -> None:
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.events.events_emit import emit_event_row
+    from dynastore.modules.tasks.events.events_emit import emit_event_row
 
     async with managed_transaction(engine) as conn:
         await emit_event_row(
@@ -666,7 +666,7 @@ async def test_drain_trigger_dedup_multiple_writes_one_row(drain_env):
 async def test_drain_trigger_rolls_back_with_outer_transaction(drain_env):
     """An aborted outer transaction leaves no task row and no event row."""
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.events.events_emit import emit_event_row
+    from dynastore.modules.tasks.events.events_emit import emit_event_row
 
     task_schema, engine = drain_env
 

@@ -31,7 +31,7 @@ from typing import (
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
-from dynastore.modules.events.primitives import (
+from dynastore.modules.tasks.events.primitives import (
     EventScope,
     EventRegistry,
     define_event,

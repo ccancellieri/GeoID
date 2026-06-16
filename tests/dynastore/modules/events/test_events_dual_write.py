@@ -220,11 +220,11 @@ def _patch_events_insert_query(schema: str):
     @contextlib.asynccontextmanager
     async def _ctx():
         with mock.patch(
-            "dynastore.modules.events.events_emit._EVENTS_INSERT_QUERY_CACHE",
+            "dynastore.modules.tasks.events.events_emit._EVENTS_INSERT_QUERY_CACHE",
             {},
         ):
             with mock.patch(
-                "dynastore.modules.events.events_emit._events_insert_query",
+                "dynastore.modules.tasks.events.events_emit._events_insert_query",
                 return_value=patched,
             ):
                 yield
@@ -243,10 +243,10 @@ async def test_direct_write_to_task_events(sa_engine, emit_schema):
     import unittest.mock as mock
 
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.events.events_emit import emit_event_row
+    from dynastore.modules.tasks.events.events_emit import emit_event_row
 
     with mock.patch(
-        "dynastore.modules.events.events_emit._enqueue_event_drain_trigger",
+        "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
         new=mock.AsyncMock(),
     ):
         async with _patch_events_insert_query(emit_schema):
@@ -277,10 +277,10 @@ async def test_scope_lowercased_in_task_events(sa_engine, emit_schema):
     import unittest.mock as mock
 
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.events.events_emit import emit_event_row
+    from dynastore.modules.tasks.events.events_emit import emit_event_row
 
     with mock.patch(
-        "dynastore.modules.events.events_emit._enqueue_event_drain_trigger",
+        "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
         new=mock.AsyncMock(),
     ):
         async with _patch_events_insert_query(emit_schema):
@@ -311,10 +311,10 @@ async def test_rollback_leaves_no_rows(sa_engine, emit_schema):
     import unittest.mock as mock
 
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.events.events_emit import emit_event_row
+    from dynastore.modules.tasks.events.events_emit import emit_event_row
 
     with mock.patch(
-        "dynastore.modules.events.events_emit._enqueue_event_drain_trigger",
+        "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
         new=mock.AsyncMock(),
     ):
         async with _patch_events_insert_query(emit_schema):
@@ -360,12 +360,12 @@ async def test_drain_trigger_enqueued_co_transactionally(sa_engine, emit_schema)
     import unittest.mock as mock
 
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.events.events_emit import emit_event_row
+    from dynastore.modules.tasks.events.events_emit import emit_event_row
 
     mock_enqueue = mock.AsyncMock()
 
     with mock.patch(
-        "dynastore.modules.events.events_emit._enqueue_event_drain_trigger",
+        "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
         new=mock_enqueue,
     ):
         async with _patch_events_insert_query(emit_schema):
@@ -401,8 +401,8 @@ async def test_search_events_filters_collection_id_via_payload(sa_engine, emit_s
     import unittest.mock as mock
 
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.events.events_emit import emit_event_row
-    from dynastore.modules.events.events_module import EventsModule
+    from dynastore.modules.tasks.events.events_emit import emit_event_row
+    from dynastore.modules.tasks.event_driver import TaskEventDriver
 
     async def _seed(collection_id: str) -> None:
         async with managed_transaction(sa_engine) as conn:
@@ -422,10 +422,10 @@ async def test_search_events_filters_collection_id_via_payload(sa_engine, emit_s
                 shard=1,
             )
 
-    svc = EventsModule.__new__(EventsModule)
+    svc = TaskEventDriver.__new__(TaskEventDriver)
 
     with mock.patch(
-        "dynastore.modules.events.events_emit._enqueue_event_drain_trigger",
+        "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
         new=mock.AsyncMock(),
     ):
         async with _patch_events_insert_query(emit_schema):

@@ -16,7 +16,13 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-# dynastore/modules/events/models.py
+# dynastore/modules/tasks/events/models.py
+"""Webhook subscription and event DTOs for the tasks-backed event driver.
+
+The ``event_subscriptions`` table lives in the ``tasks`` schema.  Scope
+values (``PLATFORM``, ``CATALOG``, ``COLLECTION``) narrow which webhooks
+the drain delivers an event to.
+"""
 
 from pydantic import BaseModel, Field, HttpUrl, SecretStr, ConfigDict
 from typing import Optional, Dict, Any, List
@@ -49,7 +55,7 @@ class EventBase(BaseModel):
     """Base model for an event, containing the core data."""
     event_type: str = Field(..., description="A unique name for the event, e.g., 'collection.updated'.")
     payload: Dict[str, Any] = Field(default_factory=dict, description="The JSON data payload of the event.")
-    
+
     model_config = ConfigDict(from_attributes=True)
 
 class EventCreate(EventBase):
@@ -75,7 +81,7 @@ class EventBatch(BaseModel):
 class AuthMethod(str, Enum):
     """Defines the authentication method for the webhook."""
     NONE = "NONE"
-    API_KEY = "API_KEY" # Simple shared secret
+    API_KEY = "API_KEY"
     OIDC = "OIDC"
     OAUTH2_CLIENT_CREDENTIALS = "OAUTH2_CLIENT_CREDENTIALS"
 
@@ -104,23 +110,37 @@ class AuthConfigOAuth2(AuthConfigBase):
 # A union of all possible auth configs
 AuthConfiguration = AuthConfigNone | AuthConfigAPIKey | AuthConfigOIDC | AuthConfigOAuth2
 
+
 class EventSubscriptionBase(BaseModel):
     """Base model for an event subscription."""
     subscriber_name: str = Field(..., description="A unique name for the consuming service, e.g., 'gcp-module-worker'.")
     event_type: str = Field(..., description="The event type to subscribe to, e.g., 'catalog.hard_deletion'.")
     webhook_url: HttpUrl = Field(..., description="The HTTPS endpoint to which the event payload will be POSTed.")
     auth_config: AuthConfiguration = Field(
-        ..., 
+        ...,
         description="The authentication configuration for the webhook."
     )
-    
+    scope: str = Field(
+        default="PLATFORM",
+        description="Subscription scope: 'PLATFORM', 'CATALOG', or 'COLLECTION'.",
+    )
+    catalog_id: Optional[str] = Field(
+        None,
+        description="Catalog identifier; NULL for PLATFORM scope.",
+    )
+    collection_id: Optional[str] = Field(
+        None,
+        description="Collection identifier; NULL unless COLLECTION scope.",
+    )
+
     model_config = ConfigDict(from_attributes=True)
+
 
 class EventSubscriptionCreate(EventSubscriptionBase):
     """Model used to create a new subscription."""
     pass
 
+
 class EventSubscription(EventSubscriptionBase):
     """The full subscription model, representing a row in the database."""
     subscription_id: UUID = Field(..., description="The unique identifier for this subscription.")
-

@@ -359,7 +359,7 @@ async def requeue_dead_letter_event(
     Returns:
         True if the event was found and requeued, False otherwise.
     """
-    from dynastore.modules.events.events_emit import (  # noqa: PLC0415
+    from dynastore.modules.tasks.events.events_emit import (  # noqa: PLC0415
         _enqueue_event_drain_trigger,
     )
 
@@ -420,7 +420,7 @@ async def requeue_dead_letter_events_by_type(
     Returns:
         Count of rows transitioned back to PENDING.
     """
-    from dynastore.modules.events.events_emit import (  # noqa: PLC0415
+    from dynastore.modules.tasks.events.events_emit import (  # noqa: PLC0415
         _enqueue_event_drain_trigger,
     )
 

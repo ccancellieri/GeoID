@@ -161,7 +161,7 @@ def test_event_drain_enqueue_stamps_caller_id() -> None:
     principal is lost from the task record."""
     import inspect
 
-    from dynastore.modules.events import events_emit
+    from dynastore.modules.tasks.events import events_emit
 
     source = inspect.getsource(events_emit._enqueue_event_drain_trigger)
     assert "caller_id" in source, (

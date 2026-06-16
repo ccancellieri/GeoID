@@ -18,6 +18,7 @@
 
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config.query_executor import DbResource
+from dynastore.modules.tasks.events.models import EventSubscriptionCreate
 from contextlib import asynccontextmanager
 from typing import Optional, Any
 import logging
@@ -167,7 +168,7 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
         )
 
     # ------------------------------------------------------------------
-    # Subscription handlers — platform scope
+    # Internal helpers
     # ------------------------------------------------------------------
 
     def _get_driver(self) -> Any:
@@ -176,9 +177,16 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
             raise HTTPException(status_code=503, detail="EventDriverProtocol not active.")
         return driver
 
-    async def create_subscription(self, body: Any):
+    # ------------------------------------------------------------------
+    # Subscription handlers — platform scope
+    # ------------------------------------------------------------------
+
+    async def create_subscription(self, body: EventSubscriptionCreate):
         """Create or update a platform-scoped webhook subscription."""
         driver = self._get_driver()
+        body.scope = "PLATFORM"
+        body.catalog_id = None
+        body.collection_id = None
         return await driver.subscribe(body)
 
     async def list_subscriptions(
@@ -186,15 +194,20 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
     ):
         """List platform-scoped webhook subscriptions."""
         driver = self._get_driver()
-        if event_type:
-            return await driver.get_subscriptions_for_event_type(event_type)
-        return []
+        if not event_type:
+            return []
+        all_subs = await driver.get_subscriptions_for_event_type(event_type)
+        return [s for s in all_subs if s.scope == "PLATFORM"]
 
     async def delete_subscription(self, subscriber_name: str, event_type: str):
         """Delete a platform-scoped webhook subscription."""
         driver = self._get_driver()
         result = await driver.unsubscribe(
-            subscriber_name=subscriber_name, event_type=event_type
+            subscriber_name=subscriber_name,
+            event_type=event_type,
+            scope="PLATFORM",
+            catalog_id=None,
+            collection_id=None,
         )
         if result is None:
             raise HTTPException(status_code=404, detail="Subscription not found.")
@@ -204,9 +217,12 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
     # Subscription handlers — catalog scope
     # ------------------------------------------------------------------
 
-    async def create_catalog_subscription(self, catalog_id: str, body: Any):
+    async def create_catalog_subscription(self, catalog_id: str, body: EventSubscriptionCreate):
         """Create or update a catalog-scoped webhook subscription."""
         driver = self._get_driver()
+        body.scope = "CATALOG"
+        body.catalog_id = catalog_id
+        body.collection_id = None
         return await driver.subscribe(body)
 
     async def list_catalog_subscriptions(
@@ -216,9 +232,13 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
     ):
         """List catalog-scoped webhook subscriptions."""
         driver = self._get_driver()
-        if event_type:
-            return await driver.get_subscriptions_for_event_type(event_type)
-        return []
+        if not event_type:
+            return []
+        all_subs = await driver.get_subscriptions_for_event_type(event_type)
+        return [
+            s for s in all_subs
+            if s.scope == "CATALOG" and s.catalog_id == catalog_id
+        ]
 
     async def delete_catalog_subscription(
         self, catalog_id: str, subscriber_name: str, event_type: str
@@ -226,7 +246,11 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
         """Delete a catalog-scoped webhook subscription."""
         driver = self._get_driver()
         result = await driver.unsubscribe(
-            subscriber_name=subscriber_name, event_type=event_type
+            subscriber_name=subscriber_name,
+            event_type=event_type,
+            scope="CATALOG",
+            catalog_id=catalog_id,
+            collection_id=None,
         )
         if result is None:
             raise HTTPException(status_code=404, detail="Subscription not found.")
@@ -237,10 +261,13 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
     # ------------------------------------------------------------------
 
     async def create_collection_subscription(
-        self, catalog_id: str, collection_id: str, body: Any
+        self, catalog_id: str, collection_id: str, body: EventSubscriptionCreate
     ):
         """Create or update a collection-scoped webhook subscription."""
         driver = self._get_driver()
+        body.scope = "COLLECTION"
+        body.catalog_id = catalog_id
+        body.collection_id = collection_id
         return await driver.subscribe(body)
 
     async def list_collection_subscriptions(
@@ -251,9 +278,15 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
     ):
         """List collection-scoped webhook subscriptions."""
         driver = self._get_driver()
-        if event_type:
-            return await driver.get_subscriptions_for_event_type(event_type)
-        return []
+        if not event_type:
+            return []
+        all_subs = await driver.get_subscriptions_for_event_type(event_type)
+        return [
+            s for s in all_subs
+            if s.scope == "COLLECTION"
+            and s.catalog_id == catalog_id
+            and s.collection_id == collection_id
+        ]
 
     async def delete_collection_subscription(
         self, catalog_id: str, collection_id: str, subscriber_name: str, event_type: str
@@ -261,7 +294,11 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
         """Delete a collection-scoped webhook subscription."""
         driver = self._get_driver()
         result = await driver.unsubscribe(
-            subscriber_name=subscriber_name, event_type=event_type
+            subscriber_name=subscriber_name,
+            event_type=event_type,
+            scope="COLLECTION",
+            catalog_id=catalog_id,
+            collection_id=collection_id,
         )
         if result is None:
             raise HTTPException(status_code=404, detail="Subscription not found.")

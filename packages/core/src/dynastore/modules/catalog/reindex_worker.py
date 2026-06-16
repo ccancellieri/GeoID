@@ -46,7 +46,7 @@ Not in this file yet (follow-up M3.1b)
 
 - LISTEN on ``dynastore_events_channel`` / leader-elected consumer
   loop: that path reuses the existing ``EventBusProtocol`` infrastructure
-  (see ``modules/events/events_module.py``) and isn't reinvented here.
+  (see ``modules/tasks/event_driver.py``) and isn't reinvented here.
 - Advisory-lock sharding across worker replicas.
 - Catch-up / backfill pass that sweeps catalogs whose split-table
   ``updated_at`` ≥ some cursor.

@@ -24,7 +24,7 @@ that accommodates multiple backend types (PostgreSQL ``tasks.events``, GCP
 Pub/Sub, JMS, EventArc).
 
 Implementations:
-  - PostgreSQL (default): ``EventsModule`` in dynastore.modules.events
+  - PostgreSQL (default): ``TaskEventDriver`` in dynastore.modules.tasks.event_driver
     Capabilities: PERSISTENCE, NOTIFICATION, SUBSCRIBE, DEAD_LETTER
     DeliveryMode: AT_LEAST_ONCE
   - Other backends: implement a subset of capabilities and declare them accordingly.
@@ -50,7 +50,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from dynastore.modules.events.models import EventSubscription, EventSubscriptionCreate
+    from dynastore.modules.tasks.events.models import EventSubscription, EventSubscriptionCreate
     from dynastore.modules.db_config.query_executor import DbResource
 
 
@@ -288,8 +288,16 @@ class EventDriverProtocol(Protocol):
         subscriber_name: str,
         event_type: str,
         engine: Optional["DbResource"] = None,
+        scope: str = "PLATFORM",
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
     ) -> Optional["EventSubscription"]:
-        """Delete a webhook subscription."""
+        """Delete a webhook subscription.
+
+        ``scope``, ``catalog_id``, and ``collection_id`` narrow the deletion
+        to one specific scope variant when the same subscriber/event pair has
+        subscriptions at multiple scopes.
+        """
         ...
 
     async def get_subscriptions_for_event_type(

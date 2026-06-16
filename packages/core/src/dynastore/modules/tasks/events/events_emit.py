@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-# dynastore/modules/events/events_emit.py
+# dynastore/modules/tasks/events/events_emit.py
 """Event emit path — direct write to ``tasks.events``.
 
 ``emit_event_row`` is the single point of control for the event emit path.

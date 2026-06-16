@@ -16,14 +16,15 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""``dynastore.modules.tasks.events`` — event-type primitives co-located with the tasks plane.
+"""``dynastore.modules.tasks.events`` — event primitives and subscription models.
 
 The domain-event primitive types (``EventScope``, ``EventRegistry``,
-``define_event``, ``SystemEventType``) live here so they are co-located
-with the tasks plane that owns the ``tasks.events`` hot plane.
+``define_event``, ``SystemEventType``) live in ``primitives``.
 
-``modules.events`` re-exports everything from here via a thin shim to
-preserve all existing import paths.
+Webhook subscription DTOs (``EventSubscription``, ``EventSubscriptionCreate``,
+and auth config classes) live in ``models``.
+
+The low-level emit path (``emit_event_row``) lives in ``events_emit``.
 """
 
 from dynastore.modules.tasks.events.primitives import (
@@ -32,5 +33,30 @@ from dynastore.modules.tasks.events.primitives import (
     define_event,
     SystemEventType,
 )
+from dynastore.modules.tasks.events.models import (
+    API_KEY_NAME,
+    AuthConfiguration,
+    AuthConfigAPIKey,
+    AuthConfigNone,
+    AuthConfigOAuth2,
+    AuthConfigOIDC,
+    AuthMethod,
+    EventSubscription,
+    EventSubscriptionCreate,
+)
 
-__all__ = ["EventScope", "EventRegistry", "define_event", "SystemEventType"]
+__all__ = [
+    "EventScope",
+    "EventRegistry",
+    "define_event",
+    "SystemEventType",
+    "API_KEY_NAME",
+    "AuthConfiguration",
+    "AuthConfigAPIKey",
+    "AuthConfigNone",
+    "AuthConfigOAuth2",
+    "AuthConfigOIDC",
+    "AuthMethod",
+    "EventSubscription",
+    "EventSubscriptionCreate",
+]

@@ -48,7 +48,7 @@ from dynastore.modules.gcp.gcp_config import (
     GcsNotificationEventType,
 )
 from dynastore.modules.catalog.event_service import CatalogEventType
-from dynastore.modules.events.models import (
+from dynastore.modules.tasks.events.models import (
     API_KEY_NAME,
     AuthConfigAPIKey,
     AuthMethod,
@@ -735,7 +735,7 @@ async def register_self_as_subscriber(self_public_url):
 async def _register_self_as_subscriber_direct(
     subscriptions: list[EventSubscriptionCreate],
 ):
-    from dynastore.modules.events.events_module import subscribe
+    from dynastore.modules.tasks.event_driver import subscribe
 
     for sub in subscriptions:
         try:

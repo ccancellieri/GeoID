@@ -16,6 +16,21 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+"""TaskEventDriver — EventDriverProtocol implementation backed by ``tasks`` schema.
+
+Owns webhook subscription storage (``tasks.event_subscriptions``) and the
+durable event outbox (``tasks.events``, DDL owned by TasksModule).
+
+Priority 11: starts after DBService (10), before TasksModule (15) and
+CatalogModule (20).  The driver issues ``CREATE SCHEMA IF NOT EXISTS "tasks"``
+before its own DDL because TasksModule (priority 15) has not run yet.
+
+The subscriptions table lives in the fixed ``tasks`` schema — there is no
+environment override. All scope variants (PLATFORM, CATALOG, COLLECTION) share
+the single table; the ``scope``, ``catalog_id``, and ``collection_id`` columns
+discriminate rows.
+"""
+
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -41,7 +56,7 @@ from dynastore.models.protocols.event_driver import (
     DeliveryMode,
     EventDriverCapability,
 )
-from .models import (
+from dynastore.modules.tasks.events.models import (
     EventSubscription,
     EventSubscriptionCreate,
     API_KEY_NAME,
@@ -50,26 +65,43 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Subscription table DDL
+# Fixed schema — subscriptions always live in the tasks schema.
 # ---------------------------------------------------------------------------
 
-_EVENTS_SCHEMA = os.getenv("DYNASTORE_EVENTS_SCHEMA", "events")
+_TASKS_SCHEMA = "tasks"
 
-SUBSCRIPTIONS_SCHEMA = f"""
-CREATE SCHEMA IF NOT EXISTS "{_EVENTS_SCHEMA}";
-CREATE TABLE IF NOT EXISTS {_EVENTS_SCHEMA}.event_subscriptions (
+# ---------------------------------------------------------------------------
+# Subscription table DDL
+# ---------------------------------------------------------------------------
+#
+# Priority 11 < TasksModule priority 15, so tasks schema may not exist yet.
+# We create it here defensively.
+#
+# Uniqueness: PostgreSQL 17 is confirmed (Dockerfile.db FROM postgres:17), so
+# UNIQUE NULLS NOT DISTINCT is available (added in PG 15).  This handles the
+# NULL catalog_id/collection_id for PLATFORM-scoped rows without needing
+# COALESCE workarounds.
+
+SUBSCRIPTIONS_SCHEMA_DDL = f"""
+CREATE SCHEMA IF NOT EXISTS "{_TASKS_SCHEMA}";
+CREATE TABLE IF NOT EXISTS {_TASKS_SCHEMA}.event_subscriptions (
     subscription_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     subscriber_name VARCHAR(255) NOT NULL,
-    event_type VARCHAR(255) NOT NULL,
-    webhook_url VARCHAR(2048) NOT NULL,
-    auth_config JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (subscriber_name, event_type)
+    event_type      VARCHAR(255) NOT NULL,
+    scope           VARCHAR(32)  NOT NULL DEFAULT 'PLATFORM',
+    catalog_id      VARCHAR(255),
+    collection_id   VARCHAR(255),
+    webhook_url     VARCHAR(2048) NOT NULL,
+    auth_config     JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE NULLS NOT DISTINCT (subscriber_name, event_type, scope, catalog_id, collection_id)
 );
 """
-SUBSCRIPTIONS_SCHEMA_INDEX = f"""
-CREATE INDEX IF NOT EXISTS idx_event_subscriptions_event_type
-ON {_EVENTS_SCHEMA}.event_subscriptions (event_type);
+
+# Drain-side lookup index — used by A4 event drain to find matching webhooks.
+SUBSCRIPTIONS_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS idx_event_subscriptions_drain
+    ON {_TASKS_SCHEMA}.event_subscriptions (event_type, scope, catalog_id, collection_id);
 """
 
 PLATFORM_API_KEY = os.getenv(API_KEY_NAME)
@@ -79,25 +111,31 @@ PLATFORM_API_KEY = os.getenv(API_KEY_NAME)
 # ---------------------------------------------------------------------------
 
 _upsert_subscription_query = DQLQuery(
-    """
-    INSERT INTO platform.event_subscriptions
-        (subscriber_name, event_type, webhook_url, auth_config)
+    f"""
+    INSERT INTO {_TASKS_SCHEMA}.event_subscriptions
+        (subscriber_name, event_type, scope, catalog_id, collection_id, webhook_url, auth_config)
     VALUES
-        (:subscriber_name, :event_type, :webhook_url, :auth_config)
-    ON CONFLICT (subscriber_name, event_type) DO UPDATE SET
+        (:subscriber_name, :event_type, :scope, :catalog_id, :collection_id, :webhook_url, :auth_config)
+    ON CONFLICT (subscriber_name, event_type, scope, catalog_id, collection_id) DO UPDATE SET
         webhook_url = EXCLUDED.webhook_url,
         auth_config = EXCLUDED.auth_config
     RETURNING *;
     """,
     result_handler=ResultHandler.ONE_DICT,
 )
+
 _get_subscriptions_for_event_query = DQLQuery(
-    "SELECT * FROM platform.event_subscriptions WHERE event_type = :event_type;",
+    f"SELECT * FROM {_TASKS_SCHEMA}.event_subscriptions WHERE event_type = :event_type;",
     result_handler=ResultHandler.ALL_DICTS,
 )
+
 _delete_subscription_query = DQLQuery(
-    "DELETE FROM platform.event_subscriptions "
-    "WHERE subscriber_name = :subscriber_name AND event_type = :event_type RETURNING *;",
+    f"DELETE FROM {_TASKS_SCHEMA}.event_subscriptions "
+    "WHERE subscriber_name = :subscriber_name AND event_type = :event_type "
+    "AND scope = :scope "
+    "AND (catalog_id IS NOT DISTINCT FROM :catalog_id) "
+    "AND (collection_id IS NOT DISTINCT FROM :collection_id) "
+    "RETURNING *;",
     result_handler=ResultHandler.ONE_OR_NONE,
 )
 
@@ -113,7 +151,7 @@ MAX_RETRIES: int = _MAX_RETRIES
 
 
 # ---------------------------------------------------------------------------
-# Catalog event listeners (inlined from catalog_integration.py)
+# Catalog event listeners
 # ---------------------------------------------------------------------------
 
 async def _on_catalog_creation(catalog_id: str, *args, **kwargs):
@@ -189,7 +227,7 @@ async def _module_publish(event_type: str, payload: Dict[str, Any]) -> None:
 
 
 def register_catalog_listeners() -> None:
-    """Register EventsModule's lifecycle → outbox listeners.
+    """Register TaskEventDriver's lifecycle → outbox listeners.
 
     Other modules extend the bus via register_event_listener() in their own
     lifespan.  This function is intentionally separate so the GCP module (and
@@ -207,30 +245,31 @@ def register_catalog_listeners() -> None:
     register_event_listener(CatalogEventType.COLLECTION_CREATION, _on_collection_creation)
     register_event_listener(CatalogEventType.COLLECTION_DELETION, _on_collection_deletion)
     register_event_listener(CatalogEventType.COLLECTION_HARD_DELETION, _on_collection_hard_deletion)
-    logger.info("EventsModule: Registered catalog event listeners.")
+    logger.info("TaskEventDriver: Registered catalog event listeners.")
 
 
 # ---------------------------------------------------------------------------
-# EventsModule
+# TaskEventDriver
 # ---------------------------------------------------------------------------
 
 
-class EventsModule(ModuleProtocol):
+class TaskEventDriver(ModuleProtocol):
     """
     Owns webhook subscription storage and provides the EventDriverProtocol.
 
     Responsibilities:
-    - Manage webhook subscriptions (platform.event_subscriptions)
+    - Manage webhook subscriptions (tasks.event_subscriptions) with scope
+      discrimination (PLATFORM | CATALOG | COLLECTION).
     - Implement publish / search_events / wait_for_events; events are written
       to ``tasks.events`` (the WorkClass global hot plane) and drained by
-      the control-plane EventDrainTask — not an in-module loop
-    - Register catalog lifecycle listeners
+      the control-plane EventDrainTask — not an in-module loop.
+    - Register catalog lifecycle listeners.
 
-    The legacy ``events.events`` global outbox and its DDL, shard partitions,
-    backlog monitor, and in-process consumer have been removed.  All event
-    writes go directly to ``tasks.events`` via ``emit_event_row``.
+    The subscriptions table always lives in the fixed ``tasks`` schema.
+    There is no environment override for the schema name.
 
-    Priority 11: starts after DBService (10), before TasksModule (15) and CatalogModule (20).
+    Priority 11: starts after DBService (10), before TasksModule (15) and
+    CatalogModule (20).
     """
 
     priority: int = 11
@@ -276,16 +315,17 @@ class EventsModule(ModuleProtocol):
         try:
             self._engine = get_engine()
         except RuntimeError as e:
-            logger.critical("EventsModule cannot initialise: %s", e)
+            logger.critical("TaskEventDriver cannot initialise: %s", e)
             yield
             return
 
-        # Create webhook subscriptions table
+        # Create webhook subscriptions table (tasks schema created defensively
+        # because TasksModule priority=15 has not run yet at priority=11).
         async with managed_transaction(self._engine) as conn:
             from dynastore.modules.db_config.locking_tools import check_table_exists
-            if not await check_table_exists(conn, "event_subscriptions", _EVENTS_SCHEMA):
-                await DDLQuery(SUBSCRIPTIONS_SCHEMA).execute(conn)
-                await DDLQuery(SUBSCRIPTIONS_SCHEMA_INDEX).execute(conn)
+            if not await check_table_exists(conn, "event_subscriptions", _TASKS_SCHEMA):
+                await DDLQuery(SUBSCRIPTIONS_SCHEMA_DDL).execute(conn)
+                await DDLQuery(SUBSCRIPTIONS_INDEX_DDL).execute(conn)
 
         # Load / generate platform API key
         global PLATFORM_API_KEY
@@ -315,18 +355,18 @@ class EventsModule(ModuleProtocol):
             try:
                 register_catalog_listeners()
             except Exception:
-                logger.exception("EventsModule: Failed to register catalog listeners.")
+                logger.exception("TaskEventDriver: Failed to register catalog listeners.")
         else:
             logger.info(
-                "EventsModule: CatalogsProtocol not loaded — skipping catalog listeners."
+                "TaskEventDriver: CatalogsProtocol not loaded — skipping catalog listeners."
             )
 
-        logger.info("EventsModule: Initialisation complete. Event storage is active.")
+        logger.info("TaskEventDriver: Initialisation complete. Event storage is active.")
 
         try:
             yield
         finally:
-            logger.info("EventsModule: Shutdown complete.")
+            logger.info("TaskEventDriver: Shutdown complete.")
 
     # ------------------------------------------------------------------
     # EventDriverProtocol — DDL lifecycle
@@ -334,23 +374,19 @@ class EventsModule(ModuleProtocol):
 
     async def initialize(self, conn: Any) -> None:
         """No-op: tasks.events DDL is owned by the tasks module."""
-        pass
 
     async def init_catalog_scope(self, conn: Any, catalog_schema: str) -> None:
         """No-op. The global partitioned tasks.events outbox serves all catalogs."""
-        pass
 
     async def init_collection_scope(
         self, conn: Any, catalog_schema: str, collection_id: str
     ) -> None:
         """No-op. The global partitioned tasks.events outbox serves all collections."""
-        pass
 
     async def drop_collection_scope(
         self, conn: Any, catalog_schema: str, collection_id: str
     ) -> None:
         """No-op. The global outbox does not maintain per-collection partitions."""
-        pass
 
     # ------------------------------------------------------------------
     # EventDriverProtocol — produce
@@ -368,7 +404,7 @@ class EventsModule(ModuleProtocol):
         db_resource: Optional[DbResource] = None,
     ) -> str:
         """Insert an event into tasks.events. Returns event_id."""
-        from dynastore.modules.events.events_emit import (  # noqa: PLC0415
+        from dynastore.modules.tasks.events.events_emit import (  # noqa: PLC0415
             emit_event_row,
         )
 
@@ -418,12 +454,9 @@ class EventsModule(ModuleProtocol):
             if catalog_id and catalog_id != "_system_":
                 clauses.append("schema_name = :schema_name")
                 params["schema_name"] = catalog_id
-            # tasks.events has no dedicated collection_id / identity_id columns
-            # (#1807 P4): both live in the event payload (the collection
-            # lifecycle publishers set payload['collection_id']). Filter via the
-            # JSONB path so the collection-scoped events REST endpoint keeps
-            # returning only that collection's events — the same contract the
-            # legacy events.events column filters provided.
+            # tasks.events has no dedicated collection_id / identity_id columns.
+            # Filter via the JSONB path so the collection-scoped events REST
+            # endpoint keeps returning only that collection's events.
             if collection_id:
                 clauses.append("payload->>'collection_id' = :collection_id")
                 params["collection_id"] = collection_id
@@ -460,16 +493,16 @@ class EventsModule(ModuleProtocol):
         await signal_bus.wait_for("dynastore_events_channel", timeout=timeout)
 
     # ------------------------------------------------------------------
-    # EventsModule — create_event (top-level API)
+    # TaskEventDriver — create_event (top-level API)
     # ------------------------------------------------------------------
 
     async def create_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Publish an event to tasks.events."""
         try:
             await self.publish(event_type=event_type, payload=payload, scope="PLATFORM")
-            logger.debug("EventsModule: published event '%s'.", event_type)
+            logger.debug("TaskEventDriver: published event '%s'.", event_type)
         except Exception:
-            logger.exception("EventsModule: Failed to publish event '%s'.", event_type)
+            logger.exception("TaskEventDriver: Failed to publish event '%s'.", event_type)
 
     # ------------------------------------------------------------------
     # Webhook subscription management
@@ -485,13 +518,17 @@ class EventsModule(ModuleProtocol):
                 conn,
                 subscriber_name=subscription_data.subscriber_name,
                 event_type=subscription_data.event_type,
+                scope=subscription_data.scope,
+                catalog_id=subscription_data.catalog_id,
+                collection_id=subscription_data.collection_id,
                 webhook_url=str(subscription_data.webhook_url),
                 auth_config=subscription_data.auth_config.model_dump_json(),
             )
         logger.info(
-            "Subscription registered for '%s' on event '%s'.",
+            "Subscription registered for '%s' on event '%s' (scope=%s).",
             subscription_data.subscriber_name,
             subscription_data.event_type,
+            subscription_data.scope,
         )
         return EventSubscription.model_validate(sub_dict)
 
@@ -500,16 +537,25 @@ class EventsModule(ModuleProtocol):
         subscriber_name: str,
         event_type: str,
         engine: Optional[DbResource] = None,
+        scope: str = "PLATFORM",
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
     ) -> Optional[EventSubscription]:
         """Delete a webhook subscription."""
         db_engine = engine or self._engine
         async with managed_transaction(db_engine) as conn:
             sub_dict = await _delete_subscription_query.execute(
-                conn, subscriber_name=subscriber_name, event_type=event_type
+                conn,
+                subscriber_name=subscriber_name,
+                event_type=event_type,
+                scope=scope,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
             )
         if sub_dict:
             logger.info(
-                "Subscription removed for '%s' on event '%s'.", subscriber_name, event_type
+                "Subscription removed for '%s' on event '%s' (scope=%s).",
+                subscriber_name, event_type, scope,
             )
             return EventSubscription.model_validate(sub_dict)
         return None
@@ -517,7 +563,7 @@ class EventsModule(ModuleProtocol):
     async def get_subscriptions_for_event_type(
         self, event_type: str, engine: Optional[DbResource] = None
     ) -> List[EventSubscription]:
-        """Return all webhook subscribers for an event type."""
+        """Return all webhook subscribers for an event type (all scopes)."""
         db_engine = engine or self._engine
         async with managed_transaction(db_engine) as conn:
             sub_dicts = await _get_subscriptions_for_event_query.execute(
@@ -527,7 +573,7 @@ class EventsModule(ModuleProtocol):
 
 
 # ---------------------------------------------------------------------------
-# Module-level convenience wrappers (backward compat)
+# Module-level convenience wrappers (used by gcp_events and other callers)
 # ---------------------------------------------------------------------------
 
 async def create_event(event_type: str, payload: Dict[str, Any]) -> None:
