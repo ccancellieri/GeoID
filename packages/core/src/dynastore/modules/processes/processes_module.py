@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 from pydantic import ValidationError
 
 from dynastore.modules.db_config.query_executor import DbEngine
@@ -26,11 +26,38 @@ from dynastore.modules.tasks.models import TaskExecutionMode
 from dynastore.modules.processes import models
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
 from dynastore.models.auth_models import SYSTEM_USER_ID
+from dynastore.models.localization import LocalizedText
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.tools.discovery import get_protocols
 from dynastore.modules.tasks.execution import execution_engine
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_stored_title(
+    operator: Optional[LocalizedText],
+    process_default: Optional[LocalizedText],
+    generic: LocalizedText,
+) -> Dict[str, str]:
+    """Return a {lang: text} dict for the job title.
+
+    Precedence: operator override -> process definition's own -> generic default.
+    """
+    chosen = operator or process_default or generic
+    return chosen.model_dump(exclude_none=True)
+
+
+def resolve_stored_description(
+    operator: Optional[LocalizedText],
+    process_default: Optional[LocalizedText],
+) -> Optional[Dict[str, str]]:
+    """Return a {lang: text} dict for the job description, or None.
+
+    Precedence: operator override -> process definition's own.
+    No generic default — when neither is provided the key is omitted.
+    """
+    chosen = operator or process_default
+    return chosen.model_dump(exclude_none=True) if chosen is not None else None
 
 
 def _is_invocable_process(process_id: str) -> bool:
@@ -183,17 +210,19 @@ async def execute_process(
 
     from dynastore.models.tasks import DEFAULT_PROCESS_TITLE
     dumped = execution_request.model_dump()
-    # Ensure a clean title at the top level of the stored inputs dict. An
-    # operator-supplied title is re-dumped with exclude_none so a single-language
-    # title does not persist null sibling languages; when absent, stamp the
-    # default process-execution title so every job row carries a human-readable
-    # label regardless of which runner claims it.
-    _operator_title = execution_request.title
-    dumped["title"] = (
-        _operator_title.model_dump(exclude_none=True)
-        if _operator_title is not None
-        else DEFAULT_PROCESS_TITLE.model_dump(exclude_none=True)
+    # Stamp title with precedence: operator override -> process definition's
+    # own -> generic default. This ensures every job row carries a meaningful
+    # human-readable label regardless of which runner claims it.
+    dumped["title"] = resolve_stored_title(
+        execution_request.title, process.title, DEFAULT_PROCESS_TITLE
     )
+    # Stamp description with precedence: operator override -> process
+    # definition's own. Omit the key entirely when neither provides one.
+    _desc = resolve_stored_description(execution_request.description, process.description)
+    if _desc is not None:
+        dumped["description"] = _desc
+    else:
+        dumped.pop("description", None)
 
     return await execution_engine.execute(
         task_type=process_id,

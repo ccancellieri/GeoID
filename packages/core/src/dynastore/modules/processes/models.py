@@ -16,10 +16,10 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict
 from enum import Enum
 from typing import List, Dict, Any, Literal, Optional, TYPE_CHECKING
-from dynastore.models.localization import LocalizedText
+from dynastore.models.localization import LocalizedText, CoercibleLocalizedText
 from uuid import UUID
 from datetime import datetime
 from dynastore.models.shared_models import Link
@@ -131,8 +131,8 @@ class ProcessSummary(BaseModel):
     )
 
     id: str
-    title: str
-    description: Optional[str] = None
+    title: CoercibleLocalizedText
+    description: Optional[CoercibleLocalizedText] = None
     version: str
     scopes: List[ProcessScope] = Field(
         ...,
@@ -164,13 +164,13 @@ class ProcessSummary(BaseModel):
     )
 
 class ProcessInput(BaseModel):
-    title: str
-    description: Optional[str] = None
+    title: CoercibleLocalizedText
+    description: Optional[CoercibleLocalizedText] = None
     schema_: Dict[str, Any] = Field(..., alias="schema")
 
 class ProcessOutput(BaseModel):
-    title: str
-    description: Optional[str] = None
+    title: CoercibleLocalizedText
+    description: Optional[CoercibleLocalizedText] = None
     schema_: Dict[str, Any] = Field(..., alias="schema")
 
 class Process(ProcessSummary):
@@ -249,7 +249,14 @@ class StatusInfo(BaseModel):
     processID: Optional[str] = None
     started: Optional[datetime] = None
     finished: Optional[datetime] = None
+    # Vendor-additive: caller-supplied, submit-time display title resolved to the
+    # request language. Not in OGC statusInfo.yaml.
     title: Optional[Any] = None
+    # Vendor-additive: caller-supplied, submit-time job purpose resolved to the
+    # request language. Not in OGC statusInfo.yaml. Distinct from `message`
+    # (server-authored runtime status line); `description` is the human-readable
+    # purpose submitted by the operator at job-creation time.
+    description: Optional[Any] = None
     links: List[Link]
 
 class OutputExecutionRequest(BaseModel):
@@ -283,7 +290,7 @@ class ExecuteRequest(BaseModel):
         },
     )
 
-    title: Optional[LocalizedText] = Field(
+    title: Optional[CoercibleLocalizedText] = Field(
         default=None,
         description=(
             "Optional operator-supplied display title for this job, in one or more "
@@ -292,17 +299,18 @@ class ExecuteRequest(BaseModel):
             "process inputs dict; never validated as a process input parameter."
         ),
     )
+    description: Optional[CoercibleLocalizedText] = Field(
+        default=None,
+        description=(
+            "Optional operator-supplied job description, in one or more languages. "
+            "Stored under the reserved 'description' key in the task inputs JSONB, "
+            "a sibling of the validated process inputs (never enters input-schema "
+            "validation). Defaults to the process definition's own description when absent."
+        ),
+    )
     inputs: Dict[str, Any]
     outputs: Optional[Dict[str, OutputExecutionRequest]] = None
     response: str = Field(default="document", pattern="^(document|raw)$")
-
-    @field_validator("title", mode="before")
-    @classmethod
-    def _coerce_title_string(cls, v: Any) -> Any:
-        """Accept a plain string and wrap it as an English LocalizedText."""
-        if isinstance(v, str):
-            return LocalizedText(en=v)
-        return v
 
 # Type alias for clarity: a process execution task payload
 ProcessTaskPayload = TaskPayload[ExecuteRequest] # This remains for type hinting
@@ -373,6 +381,9 @@ def task_to_status_info(task: "Task", links: Optional[List[Link]] = None) -> Sta
     # the normal Task validation path.
     task_title = task.title if task.title is not None else (task.inputs or {}).get("title")
 
+    # Description is not surfaced as a Task attribute; read the inputs dict directly.
+    task_description = (task.inputs or {}).get("description")
+
     info = StatusInfo(
         jobID=task.jobID,
         status=api_status,
@@ -385,6 +396,7 @@ def task_to_status_info(task: "Task", links: Optional[List[Link]] = None) -> Sta
         started=task.started_at,
         finished=task.finished_at,
         title=task_title,
+        description=task_description,
         # Prefer caller-supplied HATEOAS links; fall back to any links already
         # on the task, else empty. The parentheses are load-bearing: without
         # them the conditional bound looser than ``or`` and the whole

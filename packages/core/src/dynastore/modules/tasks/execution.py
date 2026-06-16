@@ -727,12 +727,35 @@ class ExecutionEngine:
 
         from dynastore.models.tasks import DEFAULT_PROCESS_TITLE
 
-        # Deferred jobs are process executions; stamp the process-execution
-        # default title when the caller did not provide one, so the row is not
-        # mislabelled with the generic task default applied in create_task.
+        # Deferred jobs are process executions. A missing title means the job did
+        # not pass through execute_process (which already resolves title +
+        # description), so look the process up ONCE and stamp both its definition
+        # title and description. When a title is already present the upstream path
+        # has resolved everything, so we skip the registry scan entirely — this
+        # keeps high-frequency enqueue paths off the process registry.
         job_inputs = dict(inputs or {})
         if not job_inputs.get("title"):
-            job_inputs["title"] = DEFAULT_PROCESS_TITLE.model_dump(exclude_none=True)
+            # Lazy import avoids a circular dependency at module load time.
+            from dynastore.modules.processes.processes_module import (  # noqa: PLC0415
+                resolve_stored_description,
+                resolve_stored_title,
+            )
+            from dynastore.modules.processes.protocols import ProcessRegistryProtocol
+            from dynastore.tools.discovery import get_protocols as _get_protocols
+
+            _proc = None
+            for _reg in _get_protocols(ProcessRegistryProtocol):
+                _proc = await _reg.get_process(task_type)
+                if _proc:
+                    break
+
+            job_inputs["title"] = resolve_stored_title(
+                None, getattr(_proc, "title", None), DEFAULT_PROCESS_TITLE
+            )
+            if not job_inputs.get("description"):
+                _d = resolve_stored_description(None, getattr(_proc, "description", None))
+                if _d is not None:
+                    job_inputs["description"] = _d
 
         task_create = TaskCreate(
             caller_id=caller_id,

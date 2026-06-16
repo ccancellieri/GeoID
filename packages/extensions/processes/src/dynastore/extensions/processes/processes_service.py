@@ -49,7 +49,7 @@ from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse 
 from dynastore.extensions.tools.language_utils import get_language  # noqa: E402
 from dynastore.extensions.tools.ogc_common_models import Conformance
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
-from dynastore.extensions.tools.response_i18n import localize_response_dict, resolve_links  # noqa: E402
+from dynastore.extensions.tools.response_i18n import localize_response_dict, resolve_links, resolve_localized  # noqa: E402
 from dynastore.tools.json import CustomJSONEncoder  # noqa: E402
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.tools.discovery import get_protocol
@@ -392,28 +392,56 @@ async def _lookup_process_or_404_silent(process_id: str) -> Optional[models.Proc
     return None
 
 
+def _localize_process_dict(data: dict, lang: str) -> dict:
+    """Resolve title/description on a process dict AND its nested inputs/outputs maps."""
+    localize_response_dict(data, lang, text_fields=("title", "description"), link_keys=("links",))
+    for io_key in ("inputs", "outputs"):
+        io_map = data.get(io_key)
+        if isinstance(io_map, dict):
+            for io in io_map.values():
+                if isinstance(io, dict):
+                    if "title" in io:
+                        io["title"] = resolve_localized(io["title"], lang)
+                        if io["title"] is None:
+                            del io["title"]
+                    if "description" in io:
+                        io["description"] = resolve_localized(io["description"], lang)
+                        if io["description"] is None:
+                            del io["description"]
+    return data
+
+
 def _localize_process_list(pl: models.ProcessList, language: str) -> dict:
-    """Serialize a ProcessList and resolve all link titles to *language*.
+    """Serialize a ProcessList and resolve title/description/links to *language*.
 
     ``localize_response_dict`` only resolves the top-level ``links`` key.
     ``ProcessList.processes[].links`` is one level deeper, so we walk it
-    separately using :func:`~dynastore.extensions.tools.response_i18n.resolve_links`.
+    separately. ProcessSummary entries have no inputs/outputs, so only
+    title/description and links need resolution per entry.
     """
     data = pl.model_dump(by_alias=True, exclude_none=True)
     # Resolve top-level links
-    localize_response_dict(data, language, text_fields=(), link_keys=("links",))
-    # Resolve per-process links
+    localize_response_dict(data, language, text_fields=("title", "description"), link_keys=("links",))
+    # Resolve per-process title/description and links
     for process in data.get("processes", []):
+        if "title" in process:
+            process["title"] = resolve_localized(process["title"], language)
+            if process["title"] is None:
+                del process["title"]
+        if "description" in process:
+            process["description"] = resolve_localized(process["description"], language)
+            if process["description"] is None:
+                del process["description"]
         if "links" in process:
             process["links"] = resolve_links(process["links"], language)
     return data
 
 
 def _localize_status_info(si: models.StatusInfo, language: str) -> dict:
-    """Serialize a StatusInfo, resolve the job title to *language*, and resolve link titles."""
+    """Serialize a StatusInfo, resolve the job title/description to *language*, and resolve link titles."""
     data = si.model_dump(by_alias=True, exclude_none=True)
     localize_response_dict(
-        data, language, text_fields=("title", "message"), link_keys=("links",)
+        data, language, text_fields=("title", "description", "message"), link_keys=("links",)
     )
     return data
 
@@ -470,7 +498,10 @@ async def list_processes(
         runner_param=runner,
         typology=typology,
     )
-    return JSONResponse(content=_localize_process_list(pl, language))
+    return JSONResponse(
+        content=_localize_process_list(pl, language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.get(
@@ -496,7 +527,10 @@ async def list_processes_catalog(
         runner_param=runner,
         typology=typology,
     )
-    return JSONResponse(content=_localize_process_list(pl, language))
+    return JSONResponse(
+        content=_localize_process_list(pl, language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.get(
@@ -524,15 +558,21 @@ async def list_processes_collection(
         runner_param=runner,
         typology=typology,
     )
-    return JSONResponse(content=_localize_process_list(pl, language))
+    return JSONResponse(
+        content=_localize_process_list(pl, language),
+        headers={"Content-Language": language},
+    )
 
 
 @router.get(
     "/processes/{process_id}",
-    response_model=models.Process,
     name="get_process_description",
 )
-async def get_process_description(process_id: str, request: Request):
+async def get_process_description(
+    process_id: str,
+    request: Request,
+    language: str = Depends(get_language),
+) -> JSONResponse:
     """
     Describes a process with HATEOAS ``rel=execute`` links.
 
@@ -551,9 +591,16 @@ async def get_process_description(process_id: str, request: Request):
         hreflang=None,
     )
     execute_links = _build_execution_links(process, request)
-    process_dict = process.model_dump(by_alias=True)
-    process_dict["links"] = [self_link, *execute_links]
-    return models.Process.model_validate(process_dict)
+    process_dict = process.model_dump(by_alias=True, exclude_none=True)
+    process_dict["links"] = [
+        self_link.model_dump(by_alias=True, exclude_none=True),
+        *[lnk.model_dump(by_alias=True, exclude_none=True) for lnk in execute_links],
+    ]
+    process_dict = _localize_process_dict(process_dict, language)
+    return JSONResponse(
+        content=process_dict,
+        headers={"Content-Language": language},
+    )
 
 
 @router.post(

@@ -18,6 +18,7 @@
 
 from enum import Enum
 from typing import (
+    Annotated,
     Any,
     Dict,
     List,
@@ -33,7 +34,7 @@ from typing import (
     cast,
     runtime_checkable,
 )
-from pydantic import BaseModel, Field, HttpUrl, ConfigDict, model_validator
+from pydantic import BaseModel, Field, HttpUrl, ConfigDict, model_validator, BeforeValidator
 from typing_extensions import Self
 
 
@@ -243,6 +244,17 @@ class LocalizedText(LocalizedDTO[str]):
                  return {"en": value}
             return {lang: value}
         return value
+
+
+def _coerce_localized_text(value: Any) -> Any:
+    """Accept a plain string (treated as English) or a {lang: text} map / LocalizedText."""
+    if isinstance(value, str):
+        return {"en": value}
+    return value
+
+
+# Reusable field type: accepts a plain string OR a {lang: text} map.
+CoercibleLocalizedText = Annotated[LocalizedText, BeforeValidator(_coerce_localized_text)]
 
 
 class LocalizedKeywords(LocalizedDTO[List[str]]):
