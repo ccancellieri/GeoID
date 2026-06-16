@@ -18,7 +18,7 @@
 
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, ClassVar, Dict, List, Optional, TYPE_CHECKING, Tuple, Union
-from dynastore.models.mutability import Immutable, Mutable
+from dynastore.models.mutability import Computed, Immutable, Mutable
 from dynastore.models.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 import os
@@ -168,6 +168,20 @@ class GcpCatalogBucketConfig(PluginConfig):
     cors: Mutable[List[GcpCorsRule]] = Field(
         default_factory=lambda: [GcpCorsRule(origin=["*"], method=["GET", "OPTIONS", "HEAD", "POST", "PUT", "DELETE"], response_header=["*"], max_age_seconds=3600)],  # type: ignore[call-arg]
         description="CORS rules for the bucket."
+    )
+
+    # System-assigned: the GCS bucket backing this catalog. Set by the bucket
+    # provisioner when the bucket is created/linked — this is the config-backed
+    # replacement for the retired ``gcp.catalog_buckets`` link table. Marked
+    # ``Computed`` so it is stripped from caller-supplied config payloads and is
+    # only ever written by the internal provisioner (``set_config`` with
+    # ``check_immutability=False``); it is never editable through the configs API.
+    bucket_name: Computed[Optional[str]] = Field(
+        default=None,
+        description=(
+            "The GCS bucket name backing this catalog. System-assigned during "
+            "provisioning and not user-editable."
+        ),
     )
 
 

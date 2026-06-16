@@ -19,7 +19,6 @@
 from tests.dynastore.test_utils.cleanup_registry import CleanupRegistry
 from tests.dynastore.test_utils.db_cleanup import (
     CATALOG_METADATA_TABLES,
-    DELETE_ORPHAN_GCP_BUCKET_RECORDS_SQL,
     SCHEMA_DROP_BATCH_SIZE,
     TENANT_SCHEMA_DISCOVERY_SQL,
     TENANT_SCHEMA_PATTERN,
@@ -142,21 +141,6 @@ async def cleanup_catalog(engine):
                         await force_truncate_table(conn, "catalog", table)
             except Exception as e:
                 logger.debug(f"Failed to truncate catalog.{table} (ignored): {e}")
-
-        # Step 5: Clean up GCP bucket records for dropped catalogs.
-        # SQL is canonical in dynastore.tools.db_cleanup; the trailing `;` is
-        # appended here because TemplateQueryBuilder is comfortable either way.
-        try:
-            async with managed_nested_transaction(engine) as conn:
-                if await check_table_exists(conn, "catalog_buckets", "gcp"):
-                    deleted = await DQLQuery(
-                        f"{DELETE_ORPHAN_GCP_BUCKET_RECORDS_SQL};",
-                        result_handler=ResultHandler.ROWCOUNT,
-                    ).execute(conn)
-                    if deleted:
-                        logger.info(f"Removed {deleted} orphaned GCP bucket records.")
-        except Exception as e:
-            logger.debug(f"Failed to clean GCP bucket records (ignored): {e}")
 
     except Exception as e:
         logger.error(f"Error during tenant schema discovery: {e}")

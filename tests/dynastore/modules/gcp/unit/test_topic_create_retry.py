@@ -33,8 +33,7 @@ for issue #1193.
 """
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -43,8 +42,7 @@ from dynastore.modules.gcp.gcp_eventing_ops import (
     GcpEventingOpsMixin,
     _TOPIC_CREATE_MAX_ATTEMPTS,
 )
-from dynastore.modules.gcp.gcp_config import GcpEventingConfig, ManagedBucketEventing
-from dynastore.modules.gcp.models import PushSubscriptionConfig
+from dynastore.modules.gcp.gcp_config import GcpCatalogBucketConfig, GcpEventingConfig, ManagedBucketEventing
 
 
 PROJECT = "proj-x"
@@ -142,10 +140,14 @@ def mixin(monkeypatch):
 
     monkeypatch.setattr(ops_mod, "managed_transaction", _fake_managed_transaction)
 
-    # gcp_db.get_bucket_for_catalog_query.execute → returns the test bucket.
-    mock_query = MagicMock()
-    mock_query.execute = AsyncMock(return_value=BUCKET)
-    monkeypatch.setattr(ops_mod.gcp_db, "get_bucket_for_catalog_query", mock_query)
+    # The eventing ops read the bucket name via config_service.get_config(
+    # GcpCatalogBucketConfig, ...). Wire the stub's get_config_service() to
+    # return a config service mock whose get_config yields a
+    # GcpCatalogBucketConfig with the test bucket name pre-populated.
+    bucket_cfg = GcpCatalogBucketConfig(bucket_name=BUCKET)
+    mock_config_service = MagicMock()
+    mock_config_service.get_config = AsyncMock(return_value=bucket_cfg)
+    monkeypatch.setattr(m, "get_config_service", lambda: mock_config_service)
 
     # GCS bucket.list_notifications() → no pre-existing notifications.
     mock_gcs_bucket = MagicMock()

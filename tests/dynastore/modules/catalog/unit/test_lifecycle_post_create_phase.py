@@ -20,10 +20,11 @@
 
 ``sync_catalog_initializer`` hooks run *before* the ``catalog.catalogs`` row is
 inserted (for physical-schema/table setup). Work that must reference the row —
-an FK insert into ``catalog_buckets`` or an ``UPDATE`` that must match the row —
-broke when registered there: GCP's ``provision_enabled=False`` path produced a
-0-row status UPDATE (catalog stuck in ``provisioning``) and an FK violation on
-the bucket link.
+a config write that persists ``bucket_name`` onto ``GcpCatalogBucketConfig``
+or an ``UPDATE`` that must match the row — broke when registered there: GCP's
+``provision_enabled=False`` path produced a 0-row status UPDATE (catalog stuck
+in ``provisioning``) and a foreign-key violation when the config write
+referenced a catalog row that did not yet exist.
 
 The fix adds a ``sync_catalog_post_create`` phase whose hooks run in the same
 creation transaction *after* the INSERT. These tests pin both the registry

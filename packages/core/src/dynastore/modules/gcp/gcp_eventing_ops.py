@@ -44,8 +44,8 @@ else:
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.models.driver_context import DriverContext
 from dynastore.modules.db_config.query_executor import managed_transaction
-from dynastore.modules.gcp import gcp_db
 from dynastore.modules.gcp.gcp_config import (
+    GcpCatalogBucketConfig,
     GcpEventingConfig,
     ManagedBucketEventing,
     GcsNotificationEventType,
@@ -318,15 +318,22 @@ class GcpEventingOpsMixin:
 
         # 2. Create GCS notifications for each configured prefix.
         if not bucket_name:
+            config_service = self.get_config_service()
             if conn:
-                bucket_name = await gcp_db.get_bucket_for_catalog_query.execute(
-                    conn, catalog_id=catalog_id
+                cfg = await config_service.get_config(
+                    GcpCatalogBucketConfig,
+                    catalog_id=catalog_id,
+                    ctx=DriverContext(db_resource=conn),
                 )
+                bucket_name = cfg.bucket_name
             else:
                 async with managed_transaction(self.engine) as legacy_conn:
-                    bucket_name = await gcp_db.get_bucket_for_catalog_query.execute(
-                        legacy_conn, catalog_id=catalog_id
+                    cfg = await config_service.get_config(
+                        GcpCatalogBucketConfig,
+                        catalog_id=catalog_id,
+                        ctx=DriverContext(db_resource=legacy_conn),
                     )
+                    bucket_name = cfg.bucket_name
         if not bucket_name:
             raise RuntimeError(
                 f"Cannot setup GCS notification: Bucket for catalog '{catalog_id}' does not exist."

@@ -39,7 +39,6 @@ from dynastore.modules.concurrency import run_in_thread
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config.query_executor import (
     DbResource,
-    managed_transaction,
     DQLQuery,
     ResultHandler,
 )
@@ -53,8 +52,6 @@ from dynastore.models.protocols import (
     AssetUploadProtocol,
 )
 from dynastore.modules.gcp.tools.service_account import get_credentials
-from dynastore.modules.gcp import gcp_db
-from dynastore.modules.db_config import maintenance_tools
 from dynastore.modules.gcp.gcp_config import (
     GcpModuleConfig,
 )
@@ -324,21 +321,10 @@ class GCPModule(
                 region=self.get_region() or "",
             )
 
-            # Initialize database schema for the module
-            if self.engine:
-                try:
-                    async with managed_transaction(self.engine) as conn:
-                        await maintenance_tools.ensure_schema_exists(conn, "gcp")
-                        await gcp_db.DDLQuery(gcp_db.CATALOG_BUCKETS_SCHEMA).execute(
-                            conn
-                        )
-                    logger.info("GCP Module: Database schema initialized.")
-                except Exception as e:
-                    logger.error(f"GCP Module: Failed to initialize schema: {e}")
-            else:
-                logger.warning(
-                    "GCP Module: No DB engine available. Schema initialization skipped."
-                )
+            # The GCP module no longer owns any database schema: the catalog →
+            # bucket-name link lives on ``GcpCatalogBucketConfig.bucket_name``
+            # (config-backed), and the dead ``gcp.reconciliation_events`` table
+            # has been retired. There is no ``gcp`` schema to initialize.
 
             # --- Register Lifecycle Hooks ---
             from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry

@@ -103,9 +103,9 @@ def _stub_config_service(monkeypatch, *, provision_enabled: bool) -> None:
     import dynastore.tools.discovery as discovery
     monkeypatch.setattr(discovery, "get_protocol", _fake_get_protocol)
 
-    # Bucket-link + tenant-log helpers touch the DB; stub them out.
-    import dynastore.modules.gcp.gcp_db as gcp_db
-    gcp_db.link_bucket_to_catalog_query.execute = AsyncMock(return_value=None)  # type: ignore[assignment]
+    # The provision_enabled=False branch now persists the bucket name via
+    # config_mgr.set_config rather than a direct SQL link query.
+    config_mgr.set_config = AsyncMock(return_value=None)
 
     import dynastore.modules.catalog.log_manager as log_manager
     monkeypatch.setattr(log_manager, "log_info", AsyncMock(return_value=None))

@@ -26,7 +26,7 @@ handlers on the same instance. The fix splits the work into three phases:
 
   P1 (short tx)  -> bucket-exists short-circuit + effective-config resolution
   P2 (NO DB)     -> GCS create_bucket + _apply_bucket_settings + placeholders
-  P3 (short tx)  -> link_bucket_to_catalog_query
+  P3 (short tx)  -> _write_bucket_name (persists bucket name onto catalog config)
 
 These tests prove the split by tracking the interleaving of
 ``managed_transaction`` enter/exit events with GCS-side calls.
@@ -105,19 +105,20 @@ async def test_phase_split_when_conn_is_none():
     events, fake_tx = _make_event_recorder()
     bm = _make_bm(events)
 
+    # The new bucket name is computed locally; _write_bucket_name returns None.
+    expected_bucket = bm.generate_bucket_name("cat_1")
+
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value=None)
+    ), patch.object(
+        BucketService, "_write_bucket_name", new=AsyncMock(return_value=None)
     ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db, patch(
         "dynastore.modules.gcp.bucket_service.bucket_tool"
     ) as fake_tool, patch(
         "dynastore.modules.gcp.bucket_service.run_in_thread", new=AsyncMock()
     ):
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(return_value=None)
-        fake_gcp_db.link_bucket_to_catalog_query.execute = AsyncMock(
-            return_value="my-test-project-cat-1"
-        )
         fake_tool.create_bucket = AsyncMock(return_value=(MagicMock(), True))
         fake_tool.CATALOG_FOLDER = "catalog"
         fake_tool.COLLECTIONS_FOLDER = "collections"
@@ -129,7 +130,7 @@ async def test_phase_split_when_conn_is_none():
         ):
             result = await bm.ensure_storage_for_catalog("cat_1")
 
-    assert result == "my-test-project-cat-1"
+    assert result == expected_bucket
 
     # Strict event ordering: two distinct short transactions, GCS work outside both.
     assert events == [
@@ -153,13 +154,9 @@ async def test_existing_bucket_short_circuits_in_phase_one():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
-    ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db:
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(
-            return_value="my-test-project-cat-1"
-        )
-
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value="my-test-project-cat-1")
+    ):
         result = await bm.ensure_storage_for_catalog("cat_1")
 
     assert result == "my-test-project-cat-1"
@@ -177,20 +174,17 @@ async def test_link_failure_cleans_up_orphan_bucket():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value=None)
+    ), patch.object(
+        BucketService, "_write_bucket_name", new=AsyncMock(side_effect=RuntimeError("DB link failed"))
     ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db, patch(
         "dynastore.modules.gcp.bucket_service.bucket_tool"
     ) as fake_tool, patch(
         "dynastore.modules.gcp.bucket_service.run_in_thread", new=AsyncMock()
     ), patch(
         "dynastore.modules.catalog.log_manager.log_info", new=AsyncMock()
     ):
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(return_value=None)
-        # P3 raises -> cleanup path must run.
-        fake_gcp_db.link_bucket_to_catalog_query.execute = AsyncMock(
-            side_effect=RuntimeError("DB link failed")
-        )
         fake_tool.create_bucket = AsyncMock(return_value=(MagicMock(), True))
         fake_tool.delete_bucket = AsyncMock()
         fake_tool.CATALOG_FOLDER = "catalog"
@@ -213,11 +207,9 @@ async def test_auto_create_false_short_circuits_without_second_tx():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
-    ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db:
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(return_value=None)
-
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value=None)
+    ):
         result = await bm.ensure_storage_for_catalog("cat_1", auto_create=False)
 
     assert result is None
@@ -238,13 +230,9 @@ async def test_caller_provided_conn_keeps_single_tx_path():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
-    ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db:
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(
-            return_value="existing-bucket"
-        )
-
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value="existing-bucket")
+    ):
         result = await bm.ensure_storage_for_catalog("cat_1", conn=caller_conn)
 
     assert result == "existing-bucket"
@@ -269,16 +257,15 @@ async def test_raise_on_failure_propagates_gcs_create_error():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value=None)
     ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db, patch(
         "dynastore.modules.gcp.bucket_service.bucket_tool"
     ) as fake_tool, patch(
         "dynastore.modules.gcp.bucket_service.run_in_thread", new=AsyncMock()
     ), patch(
         "dynastore.modules.catalog.log_manager.log_info", new=AsyncMock()
     ):
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(return_value=None)
         fake_tool.create_bucket = AsyncMock(
             side_effect=RuntimeError("403 GCS bucket create denied")
         )
@@ -297,19 +284,17 @@ async def test_raise_on_failure_propagates_link_error():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value=None)
+    ), patch.object(
+        BucketService, "_write_bucket_name", new=AsyncMock(side_effect=RuntimeError("DB link failed"))
     ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db, patch(
         "dynastore.modules.gcp.bucket_service.bucket_tool"
     ) as fake_tool, patch(
         "dynastore.modules.gcp.bucket_service.run_in_thread", new=AsyncMock()
     ), patch(
         "dynastore.modules.catalog.log_manager.log_info", new=AsyncMock()
     ):
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(return_value=None)
-        fake_gcp_db.link_bucket_to_catalog_query.execute = AsyncMock(
-            side_effect=RuntimeError("DB link failed")
-        )
         fake_tool.create_bucket = AsyncMock(return_value=(MagicMock(), True))
         fake_tool.delete_bucket = AsyncMock()
         fake_tool.CATALOG_FOLDER = "catalog"
@@ -330,16 +315,15 @@ async def test_failure_still_returns_none_by_default():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value=None)
     ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db, patch(
         "dynastore.modules.gcp.bucket_service.bucket_tool"
     ) as fake_tool, patch(
         "dynastore.modules.gcp.bucket_service.run_in_thread", new=AsyncMock()
     ), patch(
         "dynastore.modules.catalog.log_manager.log_info", new=AsyncMock()
     ):
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(return_value=None)
         fake_tool.create_bucket = AsyncMock(
             side_effect=RuntimeError("403 GCS bucket create denied")
         )
@@ -368,20 +352,19 @@ async def test_preexisting_bucket_link_failure_does_not_delete():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value=None)
+    ), patch.object(
+        BucketService,
+        "_write_bucket_name",
+        new=AsyncMock(side_effect=RuntimeError("duplicate key value violates unique constraint")),
     ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db, patch(
         "dynastore.modules.gcp.bucket_service.bucket_tool"
     ) as fake_tool, patch(
         "dynastore.modules.gcp.bucket_service.run_in_thread", new=AsyncMock()
     ), patch(
         "dynastore.modules.catalog.log_manager.log_info", new=AsyncMock()
     ):
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(return_value=None)
-        # bucket_name UNIQUE violation: the name is already linked elsewhere.
-        fake_gcp_db.link_bucket_to_catalog_query.execute = AsyncMock(
-            side_effect=RuntimeError("duplicate key value violates unique constraint")
-        )
         # created=False → the bucket pre-existed this call.
         fake_tool.create_bucket = AsyncMock(return_value=(MagicMock(), False))
         fake_tool.delete_bucket = AsyncMock()
@@ -403,16 +386,15 @@ async def test_create_conflict_in_other_project_propagates():
 
     with patch(
         "dynastore.modules.gcp.bucket_service.managed_transaction", fake_tx
+    ), patch.object(
+        BucketService, "_read_bucket_name", new=AsyncMock(return_value=None)
     ), patch(
-        "dynastore.modules.gcp.bucket_service.gcp_db"
-    ) as fake_gcp_db, patch(
         "dynastore.modules.gcp.bucket_service.bucket_tool"
     ) as fake_tool, patch(
         "dynastore.modules.gcp.bucket_service.run_in_thread", new=AsyncMock()
     ), patch(
         "dynastore.modules.catalog.log_manager.log_info", new=AsyncMock()
     ):
-        fake_gcp_db.get_bucket_for_catalog_query.execute = AsyncMock(return_value=None)
         fake_tool.create_bucket = AsyncMock(
             side_effect=BucketConflictError("exists in another GCP project")
         )

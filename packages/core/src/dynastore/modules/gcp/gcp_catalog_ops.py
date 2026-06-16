@@ -121,10 +121,10 @@ class GcpCatalogOpsMixin:
         Runs in the catalog creation transaction AFTER the ``catalog.catalogs``
         row is inserted (registered on the ``sync_catalog_post_create`` phase).
         The ``provision_enabled=False`` branch both UPDATEs the catalog row to
-        ``ready`` and INSERTs a ``catalog_buckets`` row whose FK references
-        ``catalog.catalogs(id)`` — neither works until that row exists, which is
-        why this is a post-create hook rather than a ``sync_catalog_initializer``
-        (#1131).
+        ``ready`` and persists the deterministic bucket name onto the catalog's
+        ``GcpCatalogBucketConfig`` — neither works until the catalog row exists,
+        which is why this is a post-create hook rather than a
+        ``sync_catalog_initializer`` (#1131).
         """
         try:
             logger.info(
@@ -166,14 +166,23 @@ class GcpCatalogOpsMixin:
                             f"post-create hook ran (expected post-INSERT)."
                         )
 
-                # Link the deterministic bucket name in the DB to allow uploads
-                from dynastore.modules.gcp import gcp_db
+                # Persist the deterministic bucket name on the catalog's bucket
+                # config so uploads can resolve it — the config-backed
+                # replacement for the old ``gcp.catalog_buckets`` link.
+                # ``bucket_name`` is a ``Computed`` field, so the provisioner
+                # writes it with ``check_immutability=False``. Catalog existence
+                # is guaranteed: this post-create hook only runs after the
+                # ``catalog.catalogs`` row was inserted.
                 bucket_name = self.get_bucket_service().generate_bucket_name(catalog_id, physical_schema=physical_schema)
-                # Catalog existence check is not strictly needed here as the lifecycle hook
-                # only runs if the catalog was successfully created.
-                await gcp_db.link_bucket_to_catalog_query.execute(
-                    conn, catalog_id=catalog_id, bucket_name=bucket_name
-                )
+                if config_mgr:
+                    bucket_config.bucket_name = bucket_name
+                    await config_mgr.set_config(
+                        GcpCatalogBucketConfig,
+                        bucket_config,
+                        catalog_id=catalog_id,
+                        check_immutability=False,
+                        ctx=DriverContext(db_resource=conn),
+                    )
                 return
 
             # Log to Tenant Log

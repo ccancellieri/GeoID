@@ -38,7 +38,6 @@ from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols import ConfigsProtocol, CatalogsProtocol
 from dynastore.modules.catalog.lifecycle_manager import LifecycleContext
 from dynastore.tools.discovery import get_protocol
-from dynastore.modules.gcp import gcp_db
 from dynastore.modules.gcp.gcp_config import (
     GcpCatalogBucketConfig,
     GcpLocation,
@@ -164,9 +163,10 @@ class BucketService:
           ``.-`` adjacency and bucket names must end with letter/digit).
 
         Backwards compatibility: existing buckets are unaffected — their
-        names are persisted in ``catalogs.bucket_name`` and looked up
-        via :func:`gcp_db.get_bucket_for_catalog_query`. Only newly
-        provisioned catalogs use this scheme.
+        names are persisted on the catalog's ``GcpCatalogBucketConfig``
+        (the ``bucket_name`` field) and read back via
+        :meth:`_read_bucket_name`. Only newly provisioned catalogs use this
+        scheme.
         """
         import hashlib
         if not self.project_id:
@@ -215,14 +215,58 @@ class BucketService:
         truncated_id = identifier[:max_id].rstrip("-.") or id_hash[:1]
         return f"{truncated_prefix}-{truncated_id}-{id_hash}"
 
+    async def _read_bucket_name(
+        self, conn: DbResource, catalog_id: str
+    ) -> Optional[str]:
+        """Catalog's provisioned GCS bucket name.
+
+        Reads the ``bucket_name`` field of the catalog's
+        :class:`GcpCatalogBucketConfig` — the config-backed replacement for the
+        retired ``gcp.catalog_buckets`` link table. Resolved on the supplied
+        connection so it observes writes made earlier in the same transaction.
+        ``bucket_name`` is only ever written at catalog scope, so the config
+        waterfall yields the catalog's value (or ``None`` when unprovisioned),
+        matching the old per-catalog ``SELECT`` semantics.
+        """
+        cfg = await self.config_service.get_config(
+            GcpCatalogBucketConfig,
+            catalog_id=catalog_id,
+            ctx=DriverContext(db_resource=conn),
+        )
+        return cfg.bucket_name
+
+    async def _write_bucket_name(
+        self,
+        conn: DbResource,
+        catalog_id: str,
+        config: GcpCatalogBucketConfig,
+        bucket_name: Optional[str],
+    ) -> None:
+        """Persist the system-assigned bucket name onto the catalog's config.
+
+        ``config`` must be the catalog's *effective* bucket config (the object
+        already persisted at catalog scope, e.g. by ``_resolve_effective_config``
+        with ``persist_default=True``); we set ``bucket_name`` on it and write the
+        whole object back so no operator-set field is lost. ``check_immutability``
+        is ``False`` because ``bucket_name`` is a ``Computed`` field — it is
+        stripped from external config writes and only the internal provisioner
+        may set it.
+        """
+        config.bucket_name = bucket_name
+        await self.config_service.set_config(
+            GcpCatalogBucketConfig,
+            config,
+            catalog_id=catalog_id,
+            check_immutability=False,
+            ctx=DriverContext(db_resource=conn),
+        )
+
     async def get_storage_identifier(self, catalog_id: str) -> Optional[str]:
         """Returns the GCS path (bucket name) for a catalog's root folder."""
         if not self.engine:
             raise RuntimeError("Database engine not available.")
         async with managed_transaction(self.engine) as conn:
-            return await gcp_db.get_bucket_for_catalog_query.execute(
-                conn, catalog_id=catalog_id
-            )
+            return await self._read_bucket_name(conn, catalog_id)
 
     async def get_catalog_storage_path(self, catalog_id: str) -> Optional[str]:
         """Returns the GCS path for a catalog's root folder (e.g., gs://bucket-name/catalog/)."""
@@ -450,9 +494,7 @@ class BucketService:
         # Phase 1 (short tx, retried on a dead pooled conn): bucket-exists
         # short-circuit + effective config resolution.
         async def _phase1(p1_conn):
-            existing = await gcp_db.get_bucket_for_catalog_query.execute(
-                p1_conn, catalog_id=catalog_id
-            )
+            existing = await self._read_bucket_name(p1_conn, catalog_id)
             if existing:
                 return ("existing", existing)
             if not auto_create:
@@ -504,9 +546,10 @@ class BucketService:
         # deleting it would destroy their data.
         try:
             async def _phase3(p3_conn):
-                return await gcp_db.link_bucket_to_catalog_query.execute(
-                    p3_conn, catalog_id=catalog_id, bucket_name=new_bucket_name
+                await self._write_bucket_name(
+                    p3_conn, catalog_id, effective_config, new_bucket_name
                 )
+                return new_bucket_name
 
             result = await _phase_with_retry(self.engine, _phase3)
         except Exception as e:
@@ -519,17 +562,18 @@ class BucketService:
                 if raise_on_failure:
                     raise
                 return None
-            # Pre-existing bucket + link failure → the name is already linked
-            # to another catalog (bucket_name UNIQUE violation). Leave it
-            # intact and surface a conflict so the catalog is marked 'conflict'.
+            # Pre-existing bucket (``bucket_created is False``) + link failure →
+            # the deterministically-named bucket already exists in GCS and is not
+            # ours. Leave it intact and surface a conflict so the catalog is
+            # marked 'conflict'.
             logger.warning(
                 f"Bucket '{new_bucket_name}' pre-existed before this attempt; "
                 f"leaving it intact (not ours to delete)."
             )
             if raise_on_failure:
                 raise BucketConflictError(
-                    f"Bucket '{new_bucket_name}' is already linked to another "
-                    f"catalog; cannot link it to '{catalog_id}'."
+                    f"Bucket '{new_bucket_name}' already exists in GCS and is "
+                    f"owned by another catalog; cannot link it to '{catalog_id}'."
                 ) from e
             return None
 
@@ -561,9 +605,7 @@ class BucketService:
         raise_on_failure: bool = False,
     ) -> Optional[str]:
         """Legacy single-tx path for callers that pass an explicit `conn`."""
-        bucket_name = await gcp_db.get_bucket_for_catalog_query.execute(
-            conn, catalog_id=catalog_id
-        )
+        bucket_name = await self._read_bucket_name(conn, catalog_id)
         if bucket_name:
             return bucket_name
 
@@ -604,12 +646,14 @@ class BucketService:
                 raise
             return None
 
-        # Link bucket → catalog. Clean up ONLY a bucket we created this call;
-        # a pre-existing bucket is owned by someone else.
+        # Link bucket → catalog by persisting the name onto the catalog's bucket
+        # config. Clean up ONLY a bucket we created this call; a pre-existing
+        # bucket is owned by someone else.
         try:
-            result = await gcp_db.link_bucket_to_catalog_query.execute(
-                conn, catalog_id=catalog_id, bucket_name=new_bucket_name
+            await self._write_bucket_name(
+                conn, catalog_id, effective_config, new_bucket_name
             )
+            result = new_bucket_name
         except Exception as e:
             logger.error(
                 f"Failed to link bucket '{new_bucket_name}' to catalog '{catalog_id}': {e}",
@@ -626,8 +670,8 @@ class BucketService:
             )
             if raise_on_failure:
                 raise BucketConflictError(
-                    f"Bucket '{new_bucket_name}' is already linked to another "
-                    f"catalog; cannot link it to '{catalog_id}'."
+                    f"Bucket '{new_bucket_name}' already exists in GCS and is "
+                    f"owned by another catalog; cannot link it to '{catalog_id}'."
                 ) from e
             return None
 
@@ -877,11 +921,19 @@ class BucketService:
             return True  # No bucket provisioned; idempotent success.
 
         try:
-            # Delete DB link first (idempotent — no-op if already gone).
-            async with managed_transaction(self.engine) as conn:
-                await gcp_db.DDLQuery(
-                    "DELETE FROM gcp.catalog_buckets WHERE catalog_id = :catalog_id"
-                ).execute(conn, catalog_id=catalog_id)
+            # Clear the persisted bucket-name link first (idempotent — the
+            # config-backed equivalent of the old
+            # ``DELETE FROM gcp.catalog_buckets``). Tier-local read: rewrite only
+            # when a catalog-scoped config row actually exists and still carries a
+            # name, so a catalog whose schema is already gone is never
+            # resurrected and inherited defaults are never pinned at this tier.
+            persisted = await self.config_service.get_persisted_config(
+                GcpCatalogBucketConfig, catalog_id=catalog_id
+            )
+            if persisted and persisted.get("bucket_name"):
+                cfg = GcpCatalogBucketConfig.model_validate(persisted)
+                async with managed_transaction(self.engine) as conn:
+                    await self._write_bucket_name(conn, catalog_id, cfg, None)
 
             # Force-delete the bucket (empties objects then deletes the bucket).
             try:

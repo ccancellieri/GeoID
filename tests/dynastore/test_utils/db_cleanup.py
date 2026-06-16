@@ -121,14 +121,6 @@ SCHEMA_DROP_BATCH_SIZE: int = 20
 #: outright so the truncate is a no-op there.
 CATALOG_METADATA_TABLES: Tuple[str, ...] = ("catalogs", "collections")
 
-#: SQL deleting GCP bucket records orphaned by tenant-schema drops.
-#: Bind-friendly for both SQLAlchemy and asyncpg (no parameters).
-DELETE_ORPHAN_GCP_BUCKET_RECORDS_SQL: str = (
-    "DELETE FROM gcp.catalog_buckets "
-    "WHERE catalog_id NOT IN (SELECT id FROM catalog.catalogs)"
-)
-
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def drop_schemas_batch_sql(schema_names: Iterable[str]) -> str:
