@@ -315,9 +315,13 @@ async def _register_virtual_assets(
 ) -> int:
     """Register virtual assets for a batch of items; best-effort."""
     from dynastore.modules.catalog.asset_service import VirtualAssetCreate  # late import
+    from dynastore.models.shared_models import CoreAssetReferenceType
 
     written = 0
     for feat in batch:
+        # No id → no queryable item→asset back-reference (a sentinel would make
+        # featureless items collide on the same ref_id and cross-cascade).
+        item_id = feat.get("id")
         for va_dict in virtual_assets_for(feat):
             try:
                 va = VirtualAssetCreate(
@@ -331,10 +335,37 @@ async def _register_virtual_assets(
                     collection_id=collection_id,
                 )
                 written += 1
+                if item_id:
+                    try:
+                        await catalogs.assets.add_asset_reference(
+                            asset_id=va.asset_id,
+                            catalog_id=catalog_id,
+                            ref_type=CoreAssetReferenceType.ITEM,
+                            ref_id=item_id,
+                            cascade_delete=True,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "stac_harvest: item back-ref skip for %s: %s", va.asset_id, exc
+                        )
             except Exception as exc:
                 # 409 = already registered; treat as success silently
                 if "already" in str(exc).lower() or "exists" in str(exc).lower() or "409" in str(exc):
                     written += 1
+                    if item_id:
+                        try:
+                            await catalogs.assets.add_asset_reference(
+                                asset_id=va_dict["asset_id"],
+                                catalog_id=catalog_id,
+                                ref_type=CoreAssetReferenceType.ITEM,
+                                ref_id=item_id,
+                                cascade_delete=True,
+                            )
+                        except Exception as ref_exc:
+                            logger.debug(
+                                "stac_harvest: item back-ref skip for %s: %s",
+                                va_dict.get("asset_id"), ref_exc,
+                            )
                 else:
                     logger.debug(
                         "stac_harvest: virtual asset %s skip: %s", va_dict.get("asset_id"), exc

@@ -479,3 +479,38 @@ class AssetsProtocol(Protocol):
                     print(f"  {r.ref_type}:{r.ref_id} (registered {r.created_at})")
         """
         ...
+
+    async def list_assets_for_reference(
+        self,
+        catalog_id: str,
+        ref_type: "AssetReferenceType",
+        ref_id: str,
+    ) -> List[str]:
+        """
+        Returns asset IDs that carry a given reference (inverse lookup).
+
+        Queries ``{schema}.asset_references`` for all active rows matching
+        ``(catalog_id, ref_type, ref_id)`` and returns the corresponding
+        ``asset_id`` values.  Useful for forward-cascade operations: given a
+        logical entity that has been deleted (e.g. an item), find all virtual
+        assets that were registered against it so they can be soft-deleted.
+
+        Args:
+            catalog_id: Catalog scope.
+            ref_type: The reference type to query (e.g. ``CoreAssetReferenceType.ITEM``).
+            ref_id: The referenced entity ID (e.g. the item ID).
+
+        Returns:
+            List of ``asset_id`` strings (may be empty).
+
+        Example::
+
+            asset_ids = await assets.list_assets_for_reference(
+                catalog_id="imagery_catalog",
+                ref_type=CoreAssetReferenceType.ITEM,
+                ref_id="tile_x",
+            )
+            for asset_id in asset_ids:
+                await assets.delete_assets(catalog_id, asset_id=asset_id, hard=False)
+        """
+        ...

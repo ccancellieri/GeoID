@@ -650,6 +650,17 @@ class CoreAssetReferenceType(AssetReferenceType):
         Always registered with ``cascade_delete=True`` — this reference is
         informational and **does not block** hard-deletion of the asset.
 
+    ``ITEM = "item"``
+        An asset is owned by a specific item.  Used by the STAC-harvest
+        virtual-asset path: each virtual asset registered for a harvested
+        feature receives an ``ITEM`` back-reference keyed by the feature's
+        ``id`` field.
+
+        Always registered with ``cascade_delete=True`` — this reference is
+        informational and **does not block** hard-deletion of the asset.
+        The ``ITEM_DELETION`` forward cascade soft-deletes these virtual
+        assets so they track the item lifecycle symmetrically.
+
     Example::
 
         from dynastore.modules.catalog.models import CoreAssetReferenceType
@@ -664,6 +675,7 @@ class CoreAssetReferenceType(AssetReferenceType):
     """
 
     COLLECTION = "collection"
+    ITEM = "item"
 
 
 class ItemDataForDB(BaseModel):

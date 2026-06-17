@@ -55,7 +55,7 @@ from dynastore.models.protocols import (
     UploadTicket,
     UploadStatusResponse,
 )
-from dynastore.models.shared_models import Link
+from dynastore.models.shared_models import AssetReferenceType, Link
 from dynastore.models.protocols.asset_download import AssetDownloadProtocol
 from dynastore.tools.protocol_helpers import get_engine
 from dynastore.extensions.tools.catalog_readiness import (
@@ -2048,6 +2048,21 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found.")
         return await self.assets.list_asset_references(
             asset_id=asset_id, catalog_id=catalog_id
+        )
+
+    async def list_assets_for_reference(
+        self,
+        catalog_id: str,
+        ref_type: "AssetReferenceType",
+        ref_id: str,
+    ) -> List[str]:
+        """Inverse reference lookup: asset IDs carrying ``(ref_type, ref_id)``.
+
+        Internal protocol surface (not an HTTP route) consumed by the
+        item→asset forward cascade; delegates to the underlying asset store.
+        """
+        return await self.assets.list_assets_for_reference(
+            catalog_id=catalog_id, ref_type=ref_type, ref_id=ref_id
         )
 
     async def remove_asset_reference(

@@ -34,7 +34,7 @@ fed by the events outbox so failures are replayable.
 
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from dynastore.modules import get_protocol
 from dynastore.modules.catalog.event_service import (
@@ -282,4 +282,93 @@ def register_item_reverse_cascade_subscriber() -> None:
     logger.info(
         "ItemReverseCascadeSubscriber: registered on "
         "CatalogEventType.ASSET_HARD_DELETION"
+    )
+
+
+class ItemForwardCascadeSubscriber:
+    """Forward cascade — soft-delete virtual assets owned by a soft-deleted item.
+
+    Reads the ``asset_references`` table for ``CoreAssetReferenceType.ITEM``
+    entries keyed by the deleted item's ID and issues a soft-delete for each
+    matching virtual asset.
+
+    Unlike ``ItemReverseCascadeSubscriber`` (which gates on ``payload['propagate']``
+    to avoid dangerously cascading item deletions from an asset deletion), this
+    cascade is UNCONDITIONAL: an item's own virtual assets must always track the
+    item's lifecycle — there is no risk of unexpected data loss because virtual
+    assets are synthesised from item data and carry no independent business value.
+    """
+
+    @staticmethod
+    async def on_item_delete(
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        item_id: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> None:
+        del _kwargs
+        if not catalog_id or not item_id:
+            return
+
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.shared_models import CoreAssetReferenceType
+
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            logger.warning(
+                "ItemForwardCascade: CatalogsProtocol unavailable for %s/%s",
+                catalog_id, item_id,
+            )
+            return
+
+        try:
+            asset_ids: List[str] = await catalogs.assets.list_assets_for_reference(
+                catalog_id, CoreAssetReferenceType.ITEM, item_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "ItemForwardCascade: list_assets_for_reference failed for %s/%s: %s",
+                catalog_id, item_id, exc,
+            )
+            return
+
+        if not asset_ids:
+            return
+
+        deleted = 0
+        for asset_id in asset_ids:
+            try:
+                await catalogs.assets.delete_assets(
+                    catalog_id,
+                    asset_id=asset_id,
+                    collection_id=collection_id,
+                    hard=False,
+                )
+                deleted += 1
+            except Exception as exc:
+                logger.warning(
+                    "ItemForwardCascade: delete_assets failed for %s/%s (item %s): %s",
+                    catalog_id, asset_id, item_id, exc,
+                )
+
+        logger.info(
+            "ItemForwardCascade: soft-deleted %d/%d virtual asset(s) for item %s/%s",
+            deleted, len(asset_ids), catalog_id, item_id,
+        )
+
+
+def register_item_forward_cascade_subscriber() -> None:
+    """Register ``ItemForwardCascadeSubscriber`` on the global event bus.
+
+    Wires ``ITEM_DELETION`` only — soft delete is symmetric with the item's own
+    soft-delete.  ``ITEM_HARD_DELETION`` is defined but never emitted; do not
+    wire it here.
+    """
+    async_event_listener(CatalogEventType.ITEM_DELETION)(
+        ItemForwardCascadeSubscriber.on_item_delete
+    )
+    logger.info(
+        "ItemForwardCascadeSubscriber: registered on "
+        "CatalogEventType.ITEM_DELETION"
     )

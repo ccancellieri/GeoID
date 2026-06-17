@@ -332,6 +332,7 @@ class TestProtocolCompliance:
             "delete_asset", "delete_assets", "search_assets",
             "ensure_asset_cleanup_trigger",
             "add_asset_reference", "remove_asset_reference", "list_asset_references",
+            "list_assets_for_reference",
         ]:
             setattr(mock, method, AsyncMock())
         return mock

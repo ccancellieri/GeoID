@@ -1474,6 +1474,23 @@ class AssetService(AssetsProtocol):
         )
         return [AssetReference.model_validate(r) for r in rows]
 
+    async def list_assets_for_reference(
+        self,
+        catalog_id: str,
+        ref_type: Any,
+        ref_id: str,
+        db_resource: Optional[DbResource] = None,
+    ) -> List[str]:
+        """Returns asset IDs that carry a given reference (inverse lookup)."""
+        from dynastore.modules.catalog.drivers.pg_asset_driver import AssetPostgresqlDriver
+        pg = AssetPostgresqlDriver(engine=db_resource or self.engine)
+        return await pg.list_assets_for_reference(
+            catalog_id=catalog_id,
+            ref_type=ref_type,
+            ref_id=ref_id,
+            db_resource=db_resource,
+        )
+
     async def _list_blocking_references_bulk(
         self,
         asset_ids: List[str],

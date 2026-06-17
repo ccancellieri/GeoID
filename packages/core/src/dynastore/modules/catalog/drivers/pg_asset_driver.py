@@ -742,7 +742,8 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
                 (asset_id, catalog_id, ref_type, ref_id, cascade_delete, created_at)
             VALUES (:asset_id, :catalog_id, :ref_type, :ref_id, :cascade_delete, :created_at)
             ON CONFLICT (catalog_id, asset_id, ref_type, ref_id) DO UPDATE SET
-                cascade_delete = EXCLUDED.cascade_delete
+                cascade_delete = EXCLUDED.cascade_delete,
+                valid_until    = NULL
             RETURNING asset_id, catalog_id, ref_type, ref_id, cascade_delete, created_at
         """)
         async with managed_transaction(db_resource or self.engine) as conn:
@@ -820,6 +821,42 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
                 sql, result_handler=ResultHandler.ALL_DICTS
             ).execute(conn, catalog_id=catalog_id, asset_id=asset_id)
             return rows or []
+
+    async def list_assets_for_reference(
+        self,
+        catalog_id: str,
+        ref_type: Any,
+        ref_id: str,
+        db_resource: Optional[DbResource] = None,
+        *,
+        include_invalidated: bool = False,
+    ) -> List[str]:
+        """Return asset IDs that carry a given reference (inverse lookup).
+
+        By default returns only currently-valid rows (``valid_until IS NULL``).
+        Pass ``include_invalidated=True`` to also surface rows stamped by a
+        prior soft-delete — useful for audit / forensics views.
+        """
+        schema = await self._resolve_schema(catalog_id, db_resource)
+        if not schema:
+            return []
+
+        ref_type_val = ref_type.value if hasattr(ref_type, "value") else str(ref_type)
+        valid_clause = (
+            "" if include_invalidated else " AND valid_until IS NULL"
+        )
+        sql = f"""
+            SELECT asset_id
+            FROM "{schema}".asset_references
+            WHERE catalog_id = :catalog_id
+              AND ref_type = :ref_type
+              AND ref_id = :ref_id{valid_clause}
+        """
+        async with managed_transaction(db_resource or self.engine) as conn:
+            rows = await DQLQuery(
+                sql, result_handler=ResultHandler.ALL_DICTS
+            ).execute(conn, catalog_id=catalog_id, ref_type=ref_type_val, ref_id=ref_id)
+            return [r["asset_id"] for r in (rows or [])]
 
     # Collection-metadata CRUD has moved to the
     # CollectionStore protocol +
