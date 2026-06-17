@@ -1172,6 +1172,43 @@ class CollectionService:
         ).execute(conn, id=collection_id)
         return phys_table
 
+    async def _capture_collection_config_snapshot(
+        self, catalog_id: str, collection_id: str
+    ) -> Dict[str, Any]:
+        """Best-effort snapshot of a collection's resolved config for the
+        post-commit async external-resource destroyer.
+
+        Resolves via the cache path (no shared transaction connection) so the
+        caller can run it BEFORE opening the delete transaction — keeping that
+        transaction free of distributed-cache I/O and nested pool acquisition
+        that would otherwise hold its connection idle (see the call site in
+        ``delete_collection`` for the idle-in-transaction failure this avoids).
+
+        Never raises: a snapshot failure must not block the delete. Returns at
+        least ``{catalog_id, collection_id}`` so the destroyer can still locate
+        the scope.
+        """
+        snapshot: Dict[str, Any] = {
+            "catalog_id": catalog_id,
+            "collection_id": collection_id,
+        }
+        try:
+            configs = get_protocol(ConfigsProtocol)
+            if configs is not None:
+                coll_config = await configs.get_config(
+                    CollectionPluginConfig,
+                    catalog_id,
+                    collection_id,
+                )
+                if coll_config:
+                    snapshot["collection_config"] = coll_config.model_dump()
+        except Exception as e:  # noqa: BLE001 — best-effort; never block delete
+            logger.warning(
+                f"Failed to capture config snapshot for "
+                f"'{catalog_id}:{collection_id}': {e}"
+            )
+        return snapshot
+
     async def delete_collection(
         self,
         catalog_id: str,
@@ -1228,6 +1265,30 @@ class CollectionService:
             _invalidate_collection_lifecycle_caches(catalog_id, collection_id)
 
         config_snapshot: Dict[str, Any] = {}
+        if force:
+            # Capture the config snapshot BEFORE opening the delete transaction.
+            #
+            # This read MUST stay outside the transaction. Resolving a
+            # collection config performs distributed-cache I/O and, on a cache
+            # miss, acquires a *second* pooled connection for a fallback DB read.
+            # Done inside the open transaction (the old behaviour, reading via
+            # the shared `conn`), that I/O held the delete connection idle while
+            # it waited — and under any latency or pool contention that idle
+            # window exceeded idle_in_transaction_session_timeout. PostgreSQL
+            # then terminated the backend, so the very next statement on `conn`
+            # (the cascade describe_scope below) failed with "the underlying
+            # connection is closed", fail-closing the cascade and rolling back
+            # the whole hard-delete.
+            #
+            # The snapshot is best-effort and only consumed post-commit by the
+            # async external-resource destroyer (destroy_async_collection), so
+            # it does not need transactional consistency with the purge. The
+            # DELETING pre-mark above keeps the registry row present
+            # (deleted_at IS NULL), so the read still resolves the live config.
+            config_snapshot = await self._capture_collection_config_snapshot(
+                catalog_id, collection_id
+            )
+
         phys_table: Optional[str] = None
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_physical_schema(
@@ -1237,28 +1298,6 @@ class CollectionService:
                 return False
 
             if force:
-                # Snapshot the config BEFORE the purge removes it — the async
-                # external-resource destroy scheduled after the txn needs it.
-                try:
-                    configs = get_protocol(ConfigsProtocol)
-                    config_snapshot = {
-                        "catalog_id": catalog_id,
-                        "collection_id": collection_id,
-                    }
-                    if configs is not None:
-                        coll_config = await configs.get_config(
-                            CollectionPluginConfig,
-                            catalog_id,
-                            collection_id,
-                            ctx=DriverContext(db_resource=conn),
-                        )
-                        if coll_config:
-                            config_snapshot["collection_config"] = coll_config.model_dump()
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to capture config snapshot for '{catalog_id}:{collection_id}': {e}"
-                    )
-
                 # Snapshot CleanupRefs BEFORE any state is torn down so that
                 # describe_scope can read live rows.  Fail-closed: any exception
                 # here propagates, rolling back the managed_transaction and
