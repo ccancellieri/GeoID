@@ -128,27 +128,39 @@ def _allowed_scopes_for(
     return _PLATFORM_ALLOWED_SCOPES
 
 
+# Human-readable "valid routes" hints used in 400 scope-mismatch errors.
+# Paths include the ``/processes`` router-mount prefix so they match the
+# real mounted routes (see _SCOPE_EXECUTE_ROUTE for the machine-readable
+# counterparts).
 _SCOPE_URL_HINTS = {
     models.ProcessScope.PLATFORM:
-        "POST /processes/{process_id}/execution (platform/sysadmin scope)",
+        "POST /processes/processes/{process_id}/execution (platform/sysadmin scope)",
     models.ProcessScope.CATALOG:
-        "POST /catalogs/{catalog_id}/processes/{process_id}/execution",
+        "POST /processes/catalogs/{catalog_id}/processes/{process_id}/execution",
     models.ProcessScope.COLLECTION:
-        "POST /catalogs/{catalog_id}/collections/{collection_id}"
+        "POST /processes/catalogs/{catalog_id}/collections/{collection_id}"
         "/processes/{process_id}/execution",
 }
 
-# Templated paths advertised via HATEOAS `rel=execute` links on
-# `GET /processes/{id}` — machine-readable counterparts of _SCOPE_URL_HINTS.
-# RFC 6570 URI templates; the `templated: true` extra marks them as such.
-_SCOPE_URL_TEMPLATES = {
-    models.ProcessScope.PLATFORM:
-        "/processes/{process_id}/execution",
-    models.ProcessScope.CATALOG:
-        "/catalogs/{catalog_id}/processes/{process_id}/execution",
-    models.ProcessScope.COLLECTION:
-        "/catalogs/{catalog_id}/collections/{collection_id}"
-        "/processes/{process_id}/execution",
+# Sentinels substituted into a real (mount-aware) URL so the RFC 6570
+# templated `rel=execute` links keep the router's mount prefix. We resolve
+# the full mounted path via ``request.url_for`` (which preserves the
+# ``/processes`` prefix), then restore the {catalog_id}/{collection_id}
+# template variables. Hand-assembling base_url + a static path dropped the
+# prefix and 404'd for clients that followed the link (issue #2226).
+_CAT_SENTINEL = "__catalog_id__"
+_COL_SENTINEL = "__collection_id__"
+
+_SCOPE_EXECUTE_ROUTE = {
+    models.ProcessScope.PLATFORM: ("execute_process", {}),
+    models.ProcessScope.CATALOG: (
+        "execute_process_catalog",
+        {"catalog_id": _CAT_SENTINEL},
+    ),
+    models.ProcessScope.COLLECTION: (
+        "execute_process_collection",
+        {"catalog_id": _CAT_SENTINEL, "collection_id": _COL_SENTINEL},
+    ),
 }
 
 # OGC link relation for "execute this process"
@@ -212,14 +224,19 @@ def _build_execution_links(
         return links
 
     # Canonical description: advertise one templated URL per declared scope.
-    base = _external_url(request.base_url).rstrip("/")
+    # Build each from the real route via url_for so the router mount prefix
+    # is preserved, then restore the templated path variables (issue #2226).
     for scope in process.scopes:
-        template = _SCOPE_URL_TEMPLATES[scope].replace(
-            "{process_id}", process.id
+        route_name, extra_params = _SCOPE_EXECUTE_ROUTE[scope]
+        href = _external_url(
+            request.url_for(route_name, process_id=process.id, **extra_params)
+        )
+        href = href.replace(_CAT_SENTINEL, "{catalog_id}").replace(
+            _COL_SENTINEL, "{collection_id}"
         )
         links.append(
             _link(
-                f"{base}{template}",
+                href,
                 title=f"Execute at {scope.value} scope",
                 templated=True,
             )

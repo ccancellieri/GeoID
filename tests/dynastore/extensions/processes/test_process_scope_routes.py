@@ -29,12 +29,16 @@ surface. These tests cover the scope-allow rules and the path→inputs injection
 from __future__ import annotations
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.testclient import TestClient
 
 from dynastore.extensions.processes.processes_service import (
     _allowed_scopes_for,
+    _build_execution_links,
     _inject_path_into_inputs,
+    _OGC_REL_EXECUTE,
     _validate_process_scope_or_raise,
+    router as processes_router,
 )
 from dynastore.modules.processes import models
 
@@ -106,3 +110,64 @@ def test_inject_path_rejects_conflicting_catalog_id():
     with pytest.raises(HTTPException) as exc:
         _inject_path_into_inputs(req, catalog_id="c1", collection_id=None)
     assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Execute-link HATEOAS hrefs must keep the /processes router-mount prefix.
+# Regression guard for #2226: hand-assembled base_url + path dropped the
+# prefix, so an OGC client following the rel=execute link hit a 404.
+# ---------------------------------------------------------------------------
+
+
+def _templated_execute_links(scopes):
+    """Resolve the canonical-description rel=execute links through the real
+    router so url_for reflects the production mount prefix."""
+    proc = _process(scopes)
+    app = FastAPI()
+    app.include_router(processes_router)
+
+    @app.get("/_describe")
+    def _describe(request: Request):  # pragma: no cover - exercised via client
+        return [link.model_dump() for link in _build_execution_links(proc, request)]
+
+    with TestClient(app) as client:
+        return client.get("/_describe").json()
+
+
+def test_execute_links_preserve_processes_mount_prefix():
+    links = _templated_execute_links([PLATFORM, CATALOG, COLLECTION])
+    assert len(links) == 3
+    by_href = {link["href"] for link in links}
+
+    for link in links:
+        assert link["rel"] == _OGC_REL_EXECUTE
+        assert link["templated"] is True
+        assert link["method"] == "POST"
+        # The bug: sentinels must be restored to RFC 6570 template vars.
+        assert "__catalog_id__" not in link["href"]
+        assert "__collection_id__" not in link["href"]
+
+    # Every href carries the /processes router-mount prefix (the dropped
+    # segment in #2226) and the correct templated path variables.
+    assert any(h.endswith("/processes/processes/gdal/execution") for h in by_href)
+    assert any(
+        h.endswith("/processes/catalogs/{catalog_id}/processes/gdal/execution")
+        for h in by_href
+    )
+    assert any(
+        h.endswith(
+            "/processes/catalogs/{catalog_id}/collections/{collection_id}"
+            "/processes/gdal/execution"
+        )
+        for h in by_href
+    )
+
+
+def test_scope_mismatch_hint_includes_processes_prefix():
+    # A 400 scope-mismatch error advertises the valid routes; those hints
+    # must match the real mounted paths (incl. the /processes prefix).
+    with pytest.raises(HTTPException) as exc:
+        _validate_process_scope_or_raise(
+            _process([PLATFORM]), catalog_id="c1", collection_id=None
+        )
+    assert "/processes/processes/{process_id}/execution" in exc.value.detail
