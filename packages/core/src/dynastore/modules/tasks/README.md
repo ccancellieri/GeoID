@@ -29,7 +29,7 @@ Runners receive the `schema_name` so they can operate in the correct tenant cont
 | `queue.py` | `TaskQueue`; pg_notify LISTEN with polling fallback |
 | `execution.py` | `ExecutionEngine`; routes tasks to registered runners, resolves terminal Actions (`on_success`/`on_failure`/`on_timeout`) |
 | `runners.py` | `BaseTaskRunner` base + `BackgroundRunner` (in-process async); `CapabilityMap` claim gate |
-| `routing/` | `TaskRoutingConfig`, `RunnerTarget`, `ExecHint`; the cloud/onprem/review matrix + presets; `resolved_targets` / `select_target` |
+| `routing/` | `TaskRoutingConfig`, `RunnerTarget`, `ExecHint`; the cloud/onprem matrix + presets; `resolved_targets` / `select_target` |
 | `registry/` | Durable task-capability registry (what each deployed service can run) + `reconcile_routing_capabilities` starvation check |
 | `models.py` | `Task`, `TaskCreate`, `TaskUpdate` Pydantic models |
 | `tasks_config.py` | `TasksPluginConfig` (poll interval, dispatcher batch size, task timeout, ...) |
@@ -86,8 +86,8 @@ claimer:
 
 Apply a profile from the admin presets UI (platform scope) or the `/admin/presets`
 API — **dry-run → apply → rollback**. The presets register as
-`CloudTaskRoutingPreset` / `OnpremTaskRoutingPreset` / `ReviewTaskRoutingPreset`
-at `PresetTier.PLATFORM`.
+`CloudTaskRoutingPreset` / `OnpremTaskRoutingPreset` at `PresetTier.PLATFORM`.
+(`DYNASTORE_TASK_ROUTING_PRESET=review` is a retired alias, honoured as `cloud`.)
 
 ### Discovery & diagnostics
 

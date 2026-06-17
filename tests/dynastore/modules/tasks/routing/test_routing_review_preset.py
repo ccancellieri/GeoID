@@ -16,14 +16,19 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Tests for the review routing preset and the scope_catalog_review extra.
+"""Tests for the retired ``review`` routing preset and the scope_catalog_review extra.
+
+The ``review`` preset has been retired: its only delta from ``cloud`` (an
+in-process gdal special-case on the catalog tier) was removed once gdal sync
+moved to the maps service. ``DYNASTORE_TASK_ROUTING_PRESET=review`` is now a
+deprecated alias honoured as ``cloud``.
 
 Covers four concerns:
-(a) review preset mirrors cloud for gdal — gcp_cloud_run with consumers=["catalog","maps"].
-    The former in-process catalog special-case has been removed; gdal sync now lives on
-    the maps service (which ships osgeo + worker_task_gdal + processes).
+(a) ``build_routing_matrix(preset="review")`` still yields the cloud output
+    (alias safety) — gdal -> gcp_cloud_run with consumers=["catalog","maps"].
 (b) cloud preset remains unchanged — gdal still gcp_cloud_run with {OFFLOAD, HEAVY}.
-(c) ReviewTaskRoutingPreset is registered only when osgeo is present.
+(c) the review preset is no longer registered — only cloud + onprem are; and
+    no ``ReviewTaskRoutingPreset`` symbol survives.
 (d) Prod-bleed guard: scope_catalog and scope_geoid do NOT pull in scope_catalog_review
     or the gdal sub-extras (module_gdal / worker_task_gdal), directly or transitively.
 """
@@ -141,34 +146,34 @@ def test_cloud_gdal_no_background_hint():
 
 
 # ---------------------------------------------------------------------------
-# (c) ReviewTaskRoutingPreset always registered (gate removed)
+# (c) review preset retired — no longer registered, no symbol survives
 # ---------------------------------------------------------------------------
 
 
-def test_review_always_registered_regardless_of_osgeo(monkeypatch):
-    """ReviewTaskRoutingPreset is registered unconditionally.
-
-    The osgeo gate was removed: review mirrors cloud (gdal -> gcp_cloud_run)
-    and does not require local osgeo on the registering image.
-    """
+def test_only_cloud_and_onprem_presets_registered(monkeypatch):
+    """The retired ``review`` preset is no longer registered; only the two
+    surviving deployment profiles are."""
     from dynastore.modules.tasks.routing import presets as routing_presets
     fake = MagicMock()
     monkeypatch.setattr("dynastore.modules.storage.presets.register_preset", fake)
-    for osgeo_present in (True, False):
-        fake.reset_mock()
-        monkeypatch.setattr(routing_presets, "_osgeo_available", lambda: osgeo_present)
-        routing_presets._register()
-        registered = [c.args[0].name for c in fake.call_args_list]
-        assert "review" in registered, (
-            f"review must be registered when osgeo_available={osgeo_present}"
-        )
-        assert "cloud" in registered and "onprem" in registered
+    routing_presets._register()
+    registered = [c.args[0].name for c in fake.call_args_list]
+    assert set(registered) == {"cloud", "onprem"}
+    assert "review" not in registered
 
 
-def test_review_preset_platform_tier():
-    from dynastore.modules.storage.presets.protocol import PresetTier
-    from dynastore.modules.tasks.routing.presets import ReviewTaskRoutingPreset
-    assert ReviewTaskRoutingPreset.tier == PresetTier.PLATFORM
+def test_review_preset_symbol_removed():
+    """No ``ReviewTaskRoutingPreset`` symbol survives the retirement."""
+    from dynastore.modules.tasks.routing import presets as routing_presets
+    assert not hasattr(routing_presets, "ReviewTaskRoutingPreset")
+
+
+def test_review_env_value_aliases_to_cloud_output():
+    """A deployment still setting preset='review' gets cloud routing, not onprem."""
+    _, review_procs = build_routing_matrix([_proc("gdal")], preset="review")
+    _, cloud_procs = build_routing_matrix([_proc("gdal")], preset="cloud")
+    assert review_procs["gdal"][0].runner == cloud_procs["gdal"][0].runner == "gcp_cloud_run"
+    assert review_procs["gdal"][0].consumers == cloud_procs["gdal"][0].consumers
 
 
 # ---------------------------------------------------------------------------

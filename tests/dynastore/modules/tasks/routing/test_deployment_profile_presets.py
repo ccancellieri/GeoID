@@ -25,8 +25,7 @@ Verifies that ``build()`` for each profile yields:
 - the ``asset_upload`` entry contains an ``AssetRoutingConfig`` whose UPLOAD
   operation has exactly one entry pinned to the profile's upload driver with
   ``source="operator"`` (blocking auto-augmentation);
-- ``onprem`` pins ``local_upload_module``; ``cloud`` and ``review`` pin
-  ``gcp_module``;
+- ``onprem`` pins ``local_upload_module``; ``cloud`` pins ``gcp_module``;
 - the ``task_routing`` entry is still present and uses ``TaskRoutingConfig``.
 """
 from __future__ import annotations
@@ -55,12 +54,10 @@ def _build_preset(profile: str) -> PresetBundle:
     from dynastore.modules.tasks.routing.presets import (
         CloudTaskRoutingPreset,
         OnpremTaskRoutingPreset,
-        ReviewTaskRoutingPreset,
     )
     mapping = {
         "cloud": CloudTaskRoutingPreset,
         "onprem": OnpremTaskRoutingPreset,
-        "review": ReviewTaskRoutingPreset,
     }
     preset = mapping[profile]
     # Patch _DYNASTORE_TASKS to empty dict so build() does not need a live
@@ -81,13 +78,13 @@ def _asset_config(bundle: PresetBundle) -> AssetRoutingConfig:
 # Bundle structure
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("profile", ["cloud", "onprem", "review"])
+@pytest.mark.parametrize("profile", ["cloud", "onprem"])
 def test_bundle_has_two_entries(profile: str) -> None:
     bundle = _build_preset(profile)
     assert len(bundle.entries) == 2
 
 
-@pytest.mark.parametrize("profile", ["cloud", "onprem", "review"])
+@pytest.mark.parametrize("profile", ["cloud", "onprem"])
 def test_bundle_slots(profile: str) -> None:
     bundle = _build_preset(profile)
     slots = [e.slot for e in bundle.entries]
@@ -95,7 +92,7 @@ def test_bundle_slots(profile: str) -> None:
     assert "asset_upload" in slots
 
 
-@pytest.mark.parametrize("profile", ["cloud", "onprem", "review"])
+@pytest.mark.parametrize("profile", ["cloud", "onprem"])
 def test_task_routing_entry_uses_task_routing_config(profile: str) -> None:
     bundle = _build_preset(profile)
     task_entry = next(e for e in bundle.entries if e.slot == "task_routing")
@@ -103,7 +100,7 @@ def test_task_routing_entry_uses_task_routing_config(profile: str) -> None:
     assert isinstance(task_entry.instance, TaskRoutingConfig)
 
 
-@pytest.mark.parametrize("profile", ["cloud", "onprem", "review"])
+@pytest.mark.parametrize("profile", ["cloud", "onprem"])
 def test_asset_upload_entry_uses_asset_routing_config(profile: str) -> None:
     bundle = _build_preset(profile)
     asset_entry = next(e for e in bundle.entries if e.slot == "asset_upload")
@@ -115,14 +112,14 @@ def test_asset_upload_entry_uses_asset_routing_config(profile: str) -> None:
 # UPLOAD operation content
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("profile", ["cloud", "onprem", "review"])
+@pytest.mark.parametrize("profile", ["cloud", "onprem"])
 def test_asset_upload_has_upload_operation(profile: str) -> None:
     bundle = _build_preset(profile)
     cfg = _asset_config(bundle)
     assert Operation.UPLOAD in cfg.operations
 
 
-@pytest.mark.parametrize("profile", ["cloud", "onprem", "review"])
+@pytest.mark.parametrize("profile", ["cloud", "onprem"])
 def test_upload_operation_has_exactly_one_entry(profile: str) -> None:
     bundle = _build_preset(profile)
     cfg = _asset_config(bundle)
@@ -145,17 +142,11 @@ def test_cloud_upload_driver_is_gcp_module() -> None:
     assert entry.driver_ref == "gcp_module"
 
 
-def test_review_upload_driver_is_gcp_module() -> None:
-    bundle = _build_preset("review")
-    entry = _asset_config(bundle).operations[Operation.UPLOAD][0]
-    assert entry.driver_ref == "gcp_module"
-
-
 # ---------------------------------------------------------------------------
 # source="operator" blocks auto-augmentation
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("profile", ["cloud", "onprem", "review"])
+@pytest.mark.parametrize("profile", ["cloud", "onprem"])
 def test_upload_entry_source_is_operator(profile: str) -> None:
     """source="operator" makes the list operator-managed so _self_register_upload_into
     treats it as invariant and does not append additional upload backends."""
@@ -168,7 +159,7 @@ def test_upload_entry_source_is_operator(profile: str) -> None:
 # rollback_priority ordering
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("profile", ["cloud", "onprem", "review"])
+@pytest.mark.parametrize("profile", ["cloud", "onprem"])
 def test_asset_upload_rollback_priority_is_trailing(profile: str) -> None:
     """asset_upload rolls back after task_routing (higher rollback_priority value
     means later in the rollback queue; iter_rollback sorts lower-first)."""

@@ -78,7 +78,9 @@ def build_routing_matrix(
 
     Args:
         inventory: Iterable of ``InventoryItem`` from the task registry.
-        preset:    ``"cloud"`` (default), ``"onprem"``, or ``"review"``.
+        preset:    ``"onprem"`` for the in-process profile; any other value
+                   (including the default ``"cloud"``) selects the cloud
+                   profile, so a typo can never silently mis-route to onprem.
 
     Returns:
         A 2-tuple ``(tasks_map, processes_map)`` where each map is
@@ -111,13 +113,12 @@ def build_routing_matrix(
         none is pinned to a dedicated ``"worker"`` tier — suits a worker-less
         deployment (a single fat node plus maps) with no Cloud Run Jobs.
 
-    **Processes** (``kind == "process"``), review preset:
-        Mirrors the cloud preset exactly. The former ``gdal`` in-process
-        special-case (``background`` runner on ``["catalog"]`` with
-        ``{BACKGROUND, INTERACTIVE}`` hints) has been removed: gdal sync
-        execution now lives on the maps service, which ships osgeo +
-        ``worker_task_gdal`` and registers a ``SyncRunner`` that can handle
-        it in-process when ``Prefer: respond-sync`` is sent.
+    The former ``review`` preset has been retired: its only delta from cloud
+    (an in-process ``gdal`` special-case on the catalog tier) was removed when
+    gdal sync execution moved to the maps service (which ships osgeo +
+    ``worker_task_gdal`` and registers a ``SyncRunner`` for ``Prefer:
+    respond-sync``). A deployment still setting ``DYNASTORE_TASK_ROUTING_PRESET
+    =review`` falls through to the cloud profile below.
     """
     tasks_map: Dict[str, List[RunnerTarget]] = {}
     processes_map: Dict[str, List[RunnerTarget]] = {}
@@ -134,8 +135,8 @@ def build_routing_matrix(
             ]
         else:
             # kind == "process"
-            if preset in ("cloud", "review"):
-                # review mirrors cloud exactly; gdal sync now lives on the maps service.
+            if preset != "onprem":
+                # cloud profile — the default for any non-onprem value.
                 if item.task_key in LIGHTWEIGHT_PROCESSES:
                     processes_map[item.task_key] = [
                         RunnerTarget(

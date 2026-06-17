@@ -34,6 +34,7 @@ Key design decisions
 """
 from __future__ import annotations
 
+import logging
 from enum import StrEnum
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
@@ -42,6 +43,8 @@ from pydantic import BaseModel, Field, model_validator
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.tasks.routing.exec_hints import ExecHint
+
+logger = logging.getLogger(__name__)
 
 
 class ActionVerb(StrEnum):
@@ -219,7 +222,18 @@ class TaskRoutingConfig(PluginConfig):
                 preset = os.environ.get(
                     "DYNASTORE_TASK_ROUTING_PRESET", "cloud"
                 ).strip().lower()
-                if preset not in ("cloud", "onprem", "review"):
+                if preset == "review":
+                    # ``review`` is a retired alias for ``cloud`` — its only
+                    # delta (in-process gdal on the catalog tier) was removed
+                    # once gdal sync moved to the maps service. Honour the old
+                    # value as cloud and nudge operators to update the config.
+                    logger.warning(
+                        "DYNASTORE_TASK_ROUTING_PRESET='review' is deprecated "
+                        "and now behaves identically to 'cloud'; set it to "
+                        "'cloud' (or unset it)."
+                    )
+                    preset = "cloud"
+                if preset not in ("cloud", "onprem"):
                     preset = "cloud"
                 tasks_map, processes_map = build_routing_matrix(inventory, preset=preset)
                 object.__setattr__(self, "tasks", tasks_map)

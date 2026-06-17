@@ -63,9 +63,9 @@ def _local_backend_available() -> bool:
     """True when ``google.cloud.storage`` is NOT importable.
 
     When GCS is not installed this is a local / docker-compose deployment
-    and the local-disk upload backend is the canonical upload path.
-    Mirrors the ``_osgeo_available()`` gate in
-    ``modules/tasks/routing/presets.py``.
+    and the local-disk upload backend is the canonical upload path. Uses the
+    same ``importlib.util.find_spec`` capability-probe idiom as the other
+    deployment-profile gates.
 
     ``find_spec`` on a dotted sub-package name raises ``ModuleNotFoundError``
     when the parent namespace package (``google.cloud``) has never been
