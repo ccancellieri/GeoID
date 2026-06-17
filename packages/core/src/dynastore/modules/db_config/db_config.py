@@ -260,7 +260,23 @@ class DBConfig:
     #     never runs ROLLBACK — the exact failure mode that pinned
     #     catalog.catalogs behind an idle-in-transaction reader while an
     #     ALTER waited on it. A DDL therefore can never leave a lock open.
+    #   * statement_timeout — bounds total EXECUTION time of any single
+    #     statement (distinct from lock_timeout, which only bounds the WAIT to
+    #     acquire a lock). Disabled by default ("0") to preserve historical
+    #     behaviour: a genuinely slow query currently runs unbounded until the
+    #     asyncpg ``command_timeout`` (``pool_command_timeout``, 60s) cancels it
+    #     CLIENT-side, which leaves no server log line — the query just vanishes
+    #     and the request returns a 504 with no attributable cause. Setting this
+    #     just UNDER pool_command_timeout (e.g. ``DB_STATEMENT_TIMEOUT=55s``)
+    #     converts that silent wall into a logged server-side 57014 ("canceling
+    #     statement due to statement timeout") naming the offending query — the
+    #     difference between "we can't tell slow-query from lock-wait" and a
+    #     self-diagnosing failure. Legitimate long operations (large ingests,
+    #     DDL, maintenance jobs) already scope their own budget via SET LOCAL
+    #     statement_timeout, which overrides this session default within their
+    #     transaction, so a session-wide value is safe to enable.
     lock_timeout: str = _cfg_str("DB_LOCK_TIMEOUT", "5s")
+    statement_timeout: str = _cfg_str("DB_STATEMENT_TIMEOUT", "0")
     idle_in_transaction_session_timeout: str = _cfg_str(
         "DB_IDLE_IN_TRANSACTION_TIMEOUT", "30s"
     )

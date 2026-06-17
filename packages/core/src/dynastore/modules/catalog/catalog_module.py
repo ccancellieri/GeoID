@@ -514,18 +514,50 @@ class CatalogModule(ModuleProtocol):
                     exc,
                 )
 
+            # 10. Start the read-only DB contention monitor — periodic
+            # snapshot of lock-waits vs. slow queries on the shared Postgres
+            # instance, so an incident can be attributed to locking or to DB
+            # resource pressure instead of guessed at. Leader-elected; read-only.
+            from dynastore.modules.db.db_contention_monitor import (
+                DbContentionMonitor,
+                load_db_contention_monitor_config,
+            )
+            _contention_monitor_shutdown = asyncio.Event()
+            _contention_monitor: Optional[DbContentionMonitor] = None
+            try:
+                contention_cfg = load_db_contention_monitor_config()
+                if contention_cfg.enabled:
+                    _contention_monitor = DbContentionMonitor(contention_cfg)
+                    _contention_monitor.start(_contention_monitor_shutdown)
+                    logger.info(
+                        "CatalogModule: DB contention monitor started "
+                        "(interval=%ds, slow_query=%ds, lock_wait=%ds).",
+                        contention_cfg.interval_seconds,
+                        contention_cfg.slow_query_seconds,
+                        contention_cfg.lock_wait_seconds,
+                    )
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: DB contention monitor failed to start: %s — "
+                    "lock/slow-query contention will not be logged automatically.",
+                    exc,
+                )
+
             try:
                 yield
             finally:
                 _reaper_shutdown.set()
                 _supervisor_shutdown.set()
                 _lifecycle_reaper_shutdown.set()
+                _contention_monitor_shutdown.set()
                 if _reaper is not None:
                     await _reaper.stop()
                 if _supervisor is not None:
                     await _supervisor.stop()
                 if _lifecycle_reaper is not None:
                     await _lifecycle_reaper.stop()
+                if _contention_monitor is not None:
+                    await _contention_monitor.stop()
                 # Services cleanup handled by AsyncExitStack (stack.close() via __aexit__)
                 # Remove the services from the discovery registry so a future
                 # lifespan does not leave stale instances behind them.

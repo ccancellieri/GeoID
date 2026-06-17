@@ -246,6 +246,13 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                             "idle_in_transaction_session_timeout": (
                                 db_config.idle_in_transaction_session_timeout
                             ),
+                            # statement_timeout bounds total statement EXECUTION
+                            # (not just the lock wait). "0" = disabled (default,
+                            # historical behaviour). Set DB_STATEMENT_TIMEOUT just
+                            # under pool_command_timeout to turn a silent 60s
+                            # client-side cancel into a logged 57014 naming the
+                            # slow query. SET LOCAL in long jobs overrides it.
+                            "statement_timeout": db_config.statement_timeout,
                         },
                     },
                 )

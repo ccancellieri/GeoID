@@ -19,9 +19,10 @@
 import logging
 import asyncio
 import functools
+import time
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Optional, Callable, Awaitable, ClassVar, TypeVar, Dict, AsyncGenerator, Iterator, Set, Union, cast
+from typing import Optional, Callable, Awaitable, ClassVar, TypeVar, Dict, AsyncGenerator, Iterator, Set, Tuple, Union, cast
 from sqlalchemy import text, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from dynastore.modules.tasks.durable.locks import stable_lock_id_sha256 as _stable_lock_id_sha256
@@ -44,6 +45,27 @@ T = TypeVar("T")
 # within the same coroutine chain, we skip the lock attempt (PostgreSQL advisory
 # xact locks are re-entrant at the DB level too).
 _held_lock_keys: ContextVar[Optional[Set[str]]] = ContextVar("_held_lock_keys", default=None)
+
+
+# Process-wide registry of SESSION-level advisory locks this pod currently holds
+# (leadership tenures via ``pg_advisory_leadership``). Keyed by the 64-bit lock
+# id; the value carries the human ``name`` and the ``time.monotonic()`` acquire
+# stamp so release can log how long the lock was held. This is the observability
+# the operator asked for: a long-lived advisory lock can no longer be acquired
+# and released silently — both edges and the held-duration are logged, and the
+# live set is queryable via :func:`held_advisory_locks` (used by the DB
+# contention monitor to report "locks held by this pod").
+_held_advisory_locks: Dict[int, Tuple[str, float]] = {}
+
+
+def held_advisory_locks() -> Dict[int, Tuple[str, float]]:
+    """Return a snapshot of session advisory locks held by THIS process.
+
+    Maps ``lock_id`` -> ``(name, acquired_monotonic)``. Read-only copy; safe to
+    iterate without racing the registry. Held seconds = ``time.monotonic() -
+    acquired_monotonic``.
+    """
+    return dict(_held_advisory_locks)
 
 
 def retry_on_lock_conflict(max_retries: int = 5, base_delay: float = 0.5):
@@ -234,10 +256,26 @@ async def pg_advisory_leadership(
         if not acquired:
             yield False
             return
-        logger.info("%s: leadership lock acquired (key=%s).", name, key)
+        acquired_at = time.monotonic()
+        _held_advisory_locks[lock_id] = (name, acquired_at)
+        logger.info(
+            "%s: leadership lock acquired (key=%s, advisory_locks_held_now=%d).",
+            name,
+            key,
+            len(_held_advisory_locks),
+        )
         try:
             yield True
         finally:
+            _held_advisory_locks.pop(lock_id, None)
+            logger.info(
+                "%s: leadership lock released (key=%s, held=%.1fs, "
+                "advisory_locks_held_now=%d).",
+                name,
+                key,
+                time.monotonic() - acquired_at,
+                len(_held_advisory_locks),
+            )
             try:
                 await DQLQuery(
                     "SELECT pg_advisory_unlock(:id)",
