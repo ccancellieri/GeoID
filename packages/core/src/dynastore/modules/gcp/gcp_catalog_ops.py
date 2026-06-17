@@ -76,6 +76,7 @@ class GcpCatalogOpsMixin:
         def generate_default_subscription_id(self, *args: Any, **kw: Any) -> str: ...
         async def setup_managed_eventing_channel(self, *args: Any, **kw: Any) -> Any: ...
         async def teardown_managed_eventing_channel(self, *args: Any, **kw: Any) -> Any: ...
+        async def teardown_catalog_eventing(self, *args: Any, **kw: Any) -> Any: ...
         async def drop_storage(self, *args: Any, **kw: Any) -> Any: ...
 
         @property
@@ -284,6 +285,22 @@ class GcpCatalogOpsMixin:
                         "gcp.eventing.failure",
                         f"Eventing teardown failed: {e}",
                     )
+
+            # Belt-and-braces: a catalog whose provisioning crashed before
+            # topic_path was persisted leaves an orphan default Pub/Sub topic
+            # that the config-driven teardown above skips (it only deletes
+            # topic_path when set), or has no eventing config at all. Force-clean
+            # the deterministic default topic/subscription by name — this is
+            # NotFound-safe and idempotent, so it never double-deletes resources
+            # the managed teardown already removed, and guarantees no Pub/Sub
+            # resource survives a catalog hard-delete to collide on recreate.
+            try:
+                await self.teardown_catalog_eventing(catalog_id, config=None)
+            except Exception as e:
+                logger.warning(
+                    f"Best-effort default eventing cleanup failed for "
+                    f"'{catalog_id}' (non-fatal): {e}"
+                )
 
             # Bucket deletion logic (optional/configurable) would go here
             # For now, we force delete the bucket if it exists to satisfy the lifecycle contract.

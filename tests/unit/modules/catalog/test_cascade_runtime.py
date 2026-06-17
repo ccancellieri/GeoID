@@ -291,7 +291,12 @@ class TestPurgeCatalogStorageOrdering:
 
     @pytest.mark.asyncio
     async def test_snapshot_called_before_schema_drop(self) -> None:
-        """snapshot_and_enqueue must be awaited before _drop_schema_query.execute."""
+        """snapshot_and_enqueue must be awaited before the schema is dropped.
+
+        The drop now runs through ``safe_drop_relation`` (bounded lock_timeout +
+        retry on 55P03 under concurrent catalog deletes), so the ordering guard
+        patches that helper rather than the raw ``_drop_schema_query.execute``.
+        """
         import dynastore.modules.catalog.catalog_service as cs_mod
         from dynastore.modules.catalog.catalog_service import CatalogService
 
@@ -319,7 +324,10 @@ class TestPurgeCatalogStorageOrdering:
         service = CatalogService(cascade_orchestrator=mock_orchestrator)
 
         with (
-            patch.object(cs_mod._drop_schema_query, "execute", drop_execute_mock),
+            patch(
+                "dynastore.modules.db_config.locking_tools.safe_drop_relation",
+                drop_execute_mock,
+            ),
             patch.object(cs_mod._hard_delete_catalog_query, "execute", hard_delete_execute_mock),
             patch(
                 "dynastore.modules.catalog.catalog_service.DQLQuery",
@@ -341,7 +349,7 @@ class TestPurgeCatalogStorageOrdering:
         snapshot_pos = call_names.index("snapshot_and_enqueue")
         drop_pos = call_names.index("drop_execute")
         assert snapshot_pos < drop_pos, (
-            f"_drop_schema_query.execute (pos {drop_pos}) ran BEFORE "
+            f"safe_drop_relation (pos {drop_pos}) ran BEFORE "
             f"snapshot_and_enqueue (pos {snapshot_pos}). "
             "The cascade snapshot would capture an empty schema — "
             "revert the reordering in _purge_catalog_storage."

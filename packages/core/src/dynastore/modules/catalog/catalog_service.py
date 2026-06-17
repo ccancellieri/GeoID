@@ -1700,7 +1700,23 @@ class CatalogService(CatalogsProtocol):
         ).execute(conn, catalog_id=catalog_id)
 
         if old_physical_schema:
-            await _drop_schema_query.execute(conn, schema=old_physical_schema)
+            # DROP SCHEMA CASCADE takes AccessExclusiveLock and, under concurrent
+            # catalog deletes, contends on shared system-catalog rows (pg_depend)
+            # — a peer drop can hold a row lock past the 5s lock_timeout, raising
+            # LockNotAvailableError (55P03) and bubbling a raw 500 that leaks the
+            # catalog. safe_drop_relation runs the drop under a bounded
+            # lock_timeout inside a savepoint and retries on 55P03/40P01, so a
+            # transient lock wait self-heals instead of failing the request.
+            from dynastore.modules.db_config.locking_tools import safe_drop_relation
+
+            await safe_drop_relation(
+                conn,
+                schema=old_physical_schema,
+                relation=old_physical_schema,  # unused for kind="schema"
+                kind="schema",
+                cascade=True,
+                max_retries=5,
+            )
             try:
                 async with managed_nested_transaction(conn) as nested:
                     deleted_jobs = await _delete_tenant_cron_jobs_query.execute(
