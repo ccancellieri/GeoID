@@ -993,13 +993,24 @@ class CatalogModule(ModuleProtocol):
     async def _on_collection_hard_deletion(
         self, catalog_id: str, collection_id: str, **kwargs
     ):
-        """Purge assets for a hard-deleted collection."""
+        """Purge assets for a hard-deleted collection.
+
+        Runs INSIDE the collection delete transaction (``db_resource=conn``).
+        Only the canonical PG asset rows are removed here — atomic with the
+        items-table drop.  External (Elasticsearch) asset teardown is owned by
+        the async cascade_cleanup task (RoutingDrivenCascadeOwner ->
+        AssetElasticsearchDriver.drop_storage, collection-granular), so it must
+        NOT run inline: ES HTTP I/O on the delete connection would hold it idle
+        in-transaction past idle_in_transaction_session_timeout and the commit
+        would fail.  Hence ``external=False``.
+        """
         assets = get_protocol(AssetsProtocol)
         if assets:
             await assets.delete_assets(
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 hard=True,
+                external=False,
                 db_resource=kwargs.get("db_resource"),  # type: ignore[misc]
             )
 

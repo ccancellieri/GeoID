@@ -2551,9 +2551,31 @@ class AssetElasticsearchDriver(
 
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
-        await es.indices.delete(
-            index=index_name, params={"ignore_unavailable": "true"},
-        )
+        if collection_id:
+            # Collection-scoped teardown: delete only THIS collection's asset
+            # docs. The assets index is per-catalog (a single index hosts every
+            # collection, discriminated by the ``collection_id`` keyword), so a
+            # whole-index delete here would wipe sibling collections' assets.
+            # Scope by ``collection_id`` instead — mirrors the items driver so
+            # the async cascade can safely own collection-granular asset
+            # teardown.
+            try:
+                await es.delete_by_query(
+                    index=index_name,
+                    body={"query": {"term": {"collection_id": collection_id}}},
+                    params={"ignore_unavailable": "true", "refresh": "false"},
+                )
+            except Exception as e:
+                logger.warning(
+                    "AssetElasticsearchDriver.drop_storage: collection "
+                    "delete_by_query failed for %s/%s: %s",
+                    catalog_id, collection_id, e,
+                )
+        else:
+            # Catalog-scoped teardown: drop the whole per-catalog assets index.
+            await es.indices.delete(
+                index=index_name, params={"ignore_unavailable": "true"},
+            )
 
     async def export_entities(
         self,

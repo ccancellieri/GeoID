@@ -269,6 +269,7 @@ class AssetsProtocol(Protocol):
         collection_id: Optional[str] = None,
         hard: bool = False,
         propagate: bool = False,
+        external: bool = True,
     ) -> int:
         """
         Deletes assets matching criteria.
@@ -284,6 +285,11 @@ class AssetsProtocol(Protocol):
             collection_id: Optional collection ID to scope deletion.
             hard: If ``True``, physically removes the row.
             propagate: If ``True``, propagates deletion to linked storage/features.
+            external: If ``True`` (default), a hard delete also fans the removal
+                out to non-PG drivers (e.g. Elasticsearch).  Pass ``False`` when
+                the caller runs inside an open DB transaction and the external
+                teardown is owned by the async cascade — fanning out external
+                I/O inline would hold the transaction's connection idle.
 
         Returns:
             Number of assets deleted.

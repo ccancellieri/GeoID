@@ -1189,6 +1189,7 @@ class AssetService(AssetsProtocol):
         collection_id: Optional[str] = None,
         hard: bool = False,
         propagate: bool = False,
+        external: bool = True,
         db_resource: Optional[DbResource] = None,
     ) -> int:
         """Delete assets matching the given criteria.
@@ -1196,6 +1197,13 @@ class AssetService(AssetsProtocol):
         Uses the PG driver for candidate lookup, reference guard, and the
         canonical delete.  Hard-deletes are fanned out to non-PG write driver
         and secondary drivers.
+
+        When ``external`` is ``False`` the non-PG fan-out is skipped: only the
+        canonical PG delete runs.  This is for callers executing inside an open
+        DB transaction (e.g. the collection hard-delete) where the external
+        (Elasticsearch) teardown is owned by the async cascade — doing ES HTTP
+        I/O here would hold the transaction's connection idle in-transaction and
+        the commit would fail (idle_in_transaction_session_timeout).
         """
         from dynastore.modules.storage.router import get_asset_driver
         from dynastore.modules.catalog.drivers.pg_asset_driver import AssetPostgresqlDriver
@@ -1227,8 +1235,11 @@ class AssetService(AssetsProtocol):
         for a in asset_rows:
             self._invalidate_cache(a["asset_id"], a["catalog_id"], a["collection_id"])
 
-        # Fan-out hard-deletes to write driver (if non-PG) and secondary drivers
-        if hard:
+        # Fan-out hard-deletes to write driver (if non-PG) and secondary drivers.
+        # Skipped when ``external=False``: the caller (collection hard-delete)
+        # runs inside an open transaction and delegates external teardown to the
+        # async cascade, so no external driver I/O happens on the delete conn.
+        if hard and external:
             from dynastore.modules.storage.routing_config import FailurePolicy
 
             write_driver = await get_asset_driver("WRITE", catalog_id, collection_id)

@@ -83,11 +83,32 @@ _REGISTRY_COLLECTION = "collection"
 # Routing-driven owner must not claim these to avoid double-cleanup.
 _EXCLUDED_DRIVER_ID_FRAGMENTS = ("gcs", "bigquery", "gcp")
 
+# Driver id fragments for backends torn down INLINE inside the delete
+# transaction (PostgreSQL: the items-table DROP in _purge_collection_storage and
+# the asset-row DELETE, both atomic with the registry drop).  The async cascade
+# must NOT re-drop PG storage: a second ``DROP TABLE`` on the same physical
+# table races the inline drop for the table lock (LockNotAvailableError /
+# "lock timeout") and is pure redundancy.  External backends (Elasticsearch) and
+# other OTF stores (DuckDB / Iceberg), which are NOT dropped inline, remain
+# owned by the cascade.
+_INLINE_OWNED_DRIVER_ID_FRAGMENTS = ("postgresql",)
+
 
 def _is_excluded_driver(driver_ref: str) -> bool:
     """Return True if *driver_ref* belongs to an external-storage owner."""
     lower = driver_ref.lower()
     return any(frag in lower for frag in _EXCLUDED_DRIVER_ID_FRAGMENTS)
+
+
+def _is_inline_owned_driver(driver_ref: str) -> bool:
+    """Return True if *driver_ref*'s storage is torn down inline (PG).
+
+    Such drivers are skipped by the routing-driven cascade because the delete
+    transaction already drops their storage atomically; re-dropping it async
+    only races the inline drop for the table lock.
+    """
+    lower = driver_ref.lower()
+    return any(frag in lower for frag in _INLINE_OWNED_DRIVER_ID_FRAGMENTS)
 
 
 async def _enumerate_configured_drivers(
@@ -158,6 +179,14 @@ async def _enumerate_configured_drivers(
                     logger.debug(
                         "_enumerate_configured_drivers: skipping excluded "
                         "driver %r (GCS/BQ handled by dedicated owner).",
+                        driver_ref,
+                    )
+                    continue
+                if _is_inline_owned_driver(driver_ref):
+                    logger.debug(
+                        "_enumerate_configured_drivers: skipping inline-owned "
+                        "driver %r (PG storage dropped inside the delete "
+                        "transaction; async re-drop would race the table lock).",
                         driver_ref,
                     )
                     continue
