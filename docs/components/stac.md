@@ -4,6 +4,8 @@ The `stac` extension provides a SpatioTemporal Asset Catalog (STAC) compliant in
 
 It is not intended for data modification. It purely exists to enable powerful search and discovery workflows for STAC-aware clients.
 
+> See also: [STAC Catalog Harvest](stac-harvest.md) for bulk ingestion of items from remote STAC catalogs into the data layer this extension exposes.
+
 ## The `stac_generator`
 
 The core logic of this extension resides in the `stac_generator`. Its operations manage the translation from Agro-Informatics Platform (AIP) - Catalog Services's internal, generic models to STAC-compliant JSON objects via the `pystac` standard library.

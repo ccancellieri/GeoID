@@ -2,8 +2,9 @@
 
 This page reflects engineering work that is in progress or imminent on the
 Catalog Services platform. Items already shipped (Tiles, Maps, Styles,
-Connected Systems, Moving Features, Coverages, DGGS, Records) live in
-`docs/components/` and on the live OGC conformance matrix on the home page.
+Connected Systems, Moving Features, Coverages, DGGS, Records, EDR, Joins,
+3D GeoVolumes) live in `docs/components/` and on the live OGC conformance
+matrix on the home page.
 
 ## Reliability
 
@@ -36,10 +37,11 @@ Connected Systems, Moving Features, Coverages, DGGS, Records) live in
 
 ## OGC API surface
 
-- **OGC API – EDR (Environmental Data Retrieval)** — not yet implemented.
-  Not committed to a specific milestone.
-- **OGC API – Routes / Joins / 3D GeoVolumes** — exploratory; no immediate
-  plans to implement.
+- **OGC API – EDR (Environmental Data Retrieval)** — shipped (position,
+  area, and cube queries; CoverageJSON / GeoJSON output). Known gaps:
+  `locations` endpoints, vertical (`z`) subsetting, and output CRS
+  reprojection are not yet implemented. See `docs/components/edr.md`.
+- **OGC API – Routes** — exploratory; no immediate plans to implement.
 - **SensorThings API** — **not planned**. OGC API – Connected Systems is the
   successor standard for the IoT / observation domain and is already shipped,
   so SensorThings is a deliberate non-goal rather than pending work.

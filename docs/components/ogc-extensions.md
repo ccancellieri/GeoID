@@ -20,6 +20,7 @@ map of what's wired and how the pieces relate.
 | Moving Features | `/movingfeatures` | `extensions/moving_features/` | MF Part 1 core/mf-collection/tgsequence; partitioned PG storage; append+delete; temporal geometry filter; see [moving_features.md](moving_features.md) |
 | 3D GeoVolumes | `/volumes` | `extensions/volumes/` | Draft URIs (core, 3dtiles, tileset); `tileset.json` from `BoundsSourceProtocol` (pluggable — empty default or sidecar-backed opt-in); B3DM + GLB tile content via PostGIS sidecar; see [volumes.md](volumes.md) |
 | Joins | `/join` | `extensions/joins/` | Draft URI (core); discriminated `secondary` (NamedSecondarySpec / BigQuerySecondarySpec); both sides resolved via `resolve_drivers("READ", ..., hint="features")`; CQL2 on primary via `primary_filter`; legacy `/dwh` tiled join coexists; see [joins.md](joins.md) |
+| Connected Systems | `/consys` | `extensions/connected_systems/` | CS Part 1 core/system-features/datastreams/observations; catalog-scoped systems, datastreams, and timestamped observations (IoT/sensor domain); deployments read-only, sampling features not yet modelled; see [connected_systems.md](connected_systems.md) |
 
 The legacy `/dwh/*` extension (tile-join MVT/PBF surface) lives at
 `extensions/dwh/` and remains supported. `/join/*` is the OGC-conformant

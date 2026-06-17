@@ -323,8 +323,8 @@ _DELETED_MODULES = {
     "dynastore.extensions.admin.migration_routes": "migration admin routes removed",
 }
 
-# Allow references inside this test file (naming the deleted symbols) and
-# inside frozen historical plan artifacts under docs/superpowers/plans/.
+# Scan only the package source roots, so this test file naming the deleted
+# symbols (and any non-source documentation) is never matched.
 _SYMBOL_SCAN_ROOTS = _PACKAGE_ROOTS
 
 

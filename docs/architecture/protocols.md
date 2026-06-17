@@ -12,7 +12,15 @@ The core of this mechanism is the `get_protocol(Protocol)` utility located in `d
     *   **Modules**: Foundational services (DB, Auth, etc.)
     *   **Extensions**: Web-facing features (STAC, Tiles, etc.)
     *   **Tasks**: Background processing units.
-3.  **Caching**: The results are cached using `@lru_cache` to ensure performance remains high during frequent lookups.
+3.  **Prioritization & Fallback**:
+    *   **Priority**: Each implementation can declare a `priority` attribute (integer). Higher values have higher precedence.
+    *   **Availability**: Implementations can define an `is_available() -> bool` method. The discovery tool skips any implementation where this returns `False`.
+    *   **Selection**: `get_protocol()` returns the highest priority implementation that is currently available.
+4.  **Caching**: The results are cached using `@lru_cache` to ensure performance remains high during frequent lookups.
+
+### Discovery APIs
+- `get_protocol(protocol: Type[T]) -> Optional[T]`: Returns the single best (highest priority, available) implementation.
+- `get_protocols(protocol: Type[T]) -> List[T]`: Returns all available implementations sorted by priority.
 
 ## Example Use Case: Decentralized Policies
 Previously, extensions like `tiles` and `stac` had to import the `apikey` module directly to register their public access policies. This created a hard dependency and potential circular imports.
@@ -34,11 +42,11 @@ Previously, extensions like `tiles` and `stac` had to import the `apikey` module
 ## Benefits
 -   **No Direct Imports**: Extensions don't need to know which module provides authorization.
 -   **Pluggability**: The `ApiKeyModule` could be replaced by a `KeycloakModule` as long as it implements `AuthorizationProtocol`.
--   **Resilience**: Extensions gracefully handle cases where no authorization provider is present (e.g., in a minimal environment).
+-   **Resilience**: Extensions gracefully handle cases where no authorization provider is present (e.g., in a minimal environment) or fall back to lower-priority providers.
 
 ## Implementation Details
 -   **Tool**: `dynastore/tools/discovery.py`
--   **Protocols**: `dynastore/models/auth.py`
+-   **Protocols**: `dynastore/models/auth.py`, `dynastore/modules/protocols.py`
 -   **Refactored Example**: [tiles/presets/__init__.py](../../packages/extensions/tiles/src/dynastore/extensions/tiles/presets/__init__.py)
 
 ## Task & Event Protocols

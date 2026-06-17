@@ -31,7 +31,7 @@ Seeded roles:
 
 No hierarchy edges are seeded by default: catalog-tier ``admin`` is a
 peer of platform ``sysadmin``, and ``unauthenticated`` MUST NOT inherit
-either. Operators can add edges via ``IamProtocol.add_role_hierarchy``.
+either. Operators can add edges via ``RoleAdminProtocol.add_role_hierarchy``.
 """
 from __future__ import annotations
 

@@ -1,5 +1,7 @@
 # DynaStore Authentication -- v2.0
 
+> See also: [Authentication & Authorization architecture](components/auth.md) for the request-time policy engine, middleware, and identity resolution.
+
 ## Identity Provider: External OIDC (IdP-Agnostic)
 
 DynaStore v2.0 delegates authentication to external OIDC-compliant identity providers (Keycloak, Auth0, Azure AD, etc.). The platform is IdP-agnostic — any provider implementing `IdentityProviderProtocol` can be registered.

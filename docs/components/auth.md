@@ -2,6 +2,8 @@
 
 This document describes the security architecture of AIP Catalog Services. The system implements a zero-trust model where every request is evaluated against a policy engine.
 
+> See also: [Authentication](../authentication.md) for operator-facing OIDC / IdP configuration and cold-boot seeding.
+
 ## Architecture
 
 ```

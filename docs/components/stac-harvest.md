@@ -1,5 +1,7 @@
 # STAC Catalog Harvest (`stac_harvest`)
 
+> See also: [The STAC Extension](stac.md) for the read-only STAC API surface that exposes the items this process ingests.
+
 The `stac_harvest` OGC process walks a remote STAC catalog (collections + items
 via `rel=next` cursor pagination), maps each source collection to a local
 dynastore collection, and bulk-upserts the items. Upserts are idempotent —
