@@ -152,6 +152,64 @@ async def select_runner_for(task_key: str):
 
 
 # ----------------------------------------------------------------------
+# Offload-required guard
+#
+# A process routing tags with OFFLOAD / HEAVY (the cloud matrix marks every
+# non-lightweight process this way) must run on an *external* executor — a
+# Cloud Run Job (``gcp_cloud_run``) or the worker queue (``worker_queue``) —
+# never on an in-process runner (``background`` / ``sync``) on the serving
+# tier.  Running a heavy job in-process on the catalog is what saturated the
+# catalog's memory: a claimed ``ingestion`` row was executed by
+# ``BackgroundRunner`` (priority 100) because the queue path picks runners by
+# priority and never consults routing.
+#
+# Enforcement is deliberately conservative: in-process runners are dropped
+# from the candidate list ONLY when an offload-capable runner is actually
+# present for this task on this service.  When no offload runner can handle it
+# here (e.g. the maps tier that legitimately runs gdal in-process, or a
+# transient empty Cloud Run job map), the existing candidates are left intact
+# rather than failing the request — so the guard never introduces a new
+# failure mode, it only removes the in-process option when offload is real.
+# ----------------------------------------------------------------------
+
+_OFFLOAD_RUNNER_TYPES = frozenset({"gcp_cloud_run", "worker_queue"})
+
+
+async def offload_required(task_key: str) -> bool:
+    """True when routing tags ``task_key`` OFFLOAD/HEAVY (must not run in-process).
+
+    Fail-open: any resolver error or absent routing opinion (empty targets)
+    returns ``False`` so in-process execution remains available where it is the
+    intent — the ``onprem`` profile (every process routed to ``background``),
+    system tasks, and test fixtures with no live routing config.
+    """
+    from dynastore.modules.tasks.routing import resolver as routing_resolver
+    from dynastore.modules.tasks.routing.exec_hints import ExecHint
+
+    try:
+        targets = await routing_resolver.resolved_targets(task_key)
+    except Exception:  # noqa: BLE001 — resolver is best-effort
+        return False
+    heavy = {ExecHint.OFFLOAD, ExecHint.HEAVY}
+    return any(heavy & set(t.hints) for t in targets)
+
+
+def _restrict_to_offload_runners(runners: list) -> list:
+    """Drop in-process runners when an offload-capable runner is present.
+
+    Preserves the input order (which the caller has already biased toward the
+    routing-preferred runner).  Returns the list unchanged when no offload
+    runner is present, so a tier with no external executor keeps its current
+    behaviour rather than ending up with an empty candidate set.
+    """
+    offload = [
+        r for r in runners
+        if getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
+    ]
+    return offload if offload else runners
+
+
+# ----------------------------------------------------------------------
 # Terminal-outcome routing (on_success / on_failure / on_timeout)
 #
 # When a task reaches a terminal state the dispatcher (sync / non-deferred)
@@ -639,6 +697,18 @@ class ExecutionEngine:
         if preferred is not None and any(preferred is r for r in runners):
             runners = [preferred] + [r for r in runners if r is not preferred]
 
+        # Offload guard: a HEAVY/OFFLOAD-routed process must not fall through to
+        # an in-process runner on the serving tier when an external executor is
+        # available.  This closes the REST-path fall-through where a transient
+        # GcpJobRunner failure would otherwise hand the job to BackgroundRunner
+        # in-process.  Gated on async mode: SYNCHRONOUS execution is the
+        # designated maps-tier path (already filtered by _resolve_execution_mode
+        # via block_sync), and dropping in-process runners there would be wrong.
+        if mode == TaskExecutionMode.ASYNCHRONOUS and await offload_required(
+            task_type
+        ):
+            runners = _restrict_to_offload_runners(runners)
+
         context = RunnerContext(
             engine=engine,
             task_type=task_type,
@@ -1011,6 +1081,27 @@ class ExecutionEngine:
         if heartbeat is not None:
             _extra_context["heartbeat"] = heartbeat
 
+        # Routing-aware runner preference on the queue path.  Historically
+        # dispatch() picked runners purely by priority, so a claimed HEAVY row
+        # (e.g. ``ingestion``) was executed by the in-process BackgroundRunner
+        # (priority 100) even when routing said offload it to a Cloud Run Job —
+        # the path that saturated the catalog's memory.  Mirror execute(): let
+        # the platform-tier TaskRoutingConfig pick the runner and carry its
+        # options (so GcpJobRunner can read options.job).  Fail-open: any miss
+        # leaves the priority order intact.
+        runner_options: Optional[dict] = None
+        preferred = None
+        try:
+            preferred = await select_runner_for(task_type)
+            if preferred is not None:
+                runner_options = getattr(preferred, "_routing_options", None)
+                if hasattr(preferred, "_routing_options"):
+                    del preferred._routing_options  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — selection is best-effort
+            preferred = None
+        if runner_options:
+            _extra_context["runner_options"] = runner_options
+
         context = RunnerContext(
             engine=engine,
             task_type=task_type,
@@ -1025,6 +1116,25 @@ class ExecutionEngine:
             runners = self.get_runners_for(
                 task_type, runner_mode, has_request_context=False
             )
+            # Bias toward the routing-preferred runner, then enforce the
+            # offload guard: a HEAVY/OFFLOAD-routed task must launch its Cloud
+            # Run Job / enqueue to the worker rather than run in-process here.
+            if preferred is not None and any(preferred is r for r in runners):
+                runners = [preferred] + [r for r in runners if r is not preferred]
+            _offload_enforced = False
+            if runner_mode == TaskExecutionMode.ASYNCHRONOUS and await offload_required(
+                task_type
+            ):
+                restricted = _restrict_to_offload_runners(runners)
+                # Enforcement happened only if in-process runners were actually
+                # dropped (an offload runner was present). When no offload
+                # runner exists here, runners is unchanged and the in-process
+                # path remains the legitimate option (e.g. maps running gdal).
+                _offload_enforced = restricted is not runners and any(
+                    getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
+                    for r in restricted
+                )
+                runners = restricted
 
             result = None
             for runner in runners:
@@ -1042,8 +1152,14 @@ class ExecutionEngine:
                     )
                     break
 
-            # 2. Fallback: direct TaskProtocol singleton execution
-            if result is None:
+            # 2. Fallback: direct TaskProtocol singleton execution.
+            #    Skipped when the offload guard intentionally dropped the
+            #    in-process runners — running the singleton here would execute a
+            #    HEAVY task in-process on the serving tier, the exact memory-
+            #    saturation path the guard exists to prevent.  Leaving result
+            #    None re-raises below so the row is released for retry (the
+            #    Cloud Run Job / worker claims it once the job map warms).
+            if result is None and not _offload_enforced:
                 task_instance = get_task_instance(task_type)
                 if task_instance:
                     logger.info(

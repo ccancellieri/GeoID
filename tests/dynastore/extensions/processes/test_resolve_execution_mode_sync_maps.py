@@ -168,3 +168,45 @@ def test_gdal_definition_declares_async_before_sync():
     opts = GDALINFO_PROCESS_DEFINITION.jobControlOptions
     assert opts[0] == ASYNC, f"gdal must declare async first, got {opts}"
     assert SYNC in opts, "gdal must still offer sync as an opt-in mode"
+
+
+# ---------------------------------------------------------------------------
+# block_sync: heavy/offload-routed process on a non-maps tier must not run
+# synchronously in-request, even where a sync runner is locally capable (e.g.
+# an ``ingestion`` whose task instance is loaded on the catalog). It falls
+# through to async so the work is offloaded instead of saturating the serving
+# instance's memory.
+# ---------------------------------------------------------------------------
+
+
+def test_block_sync_sync_preferred_falls_through_to_async(monkeypatch):
+    """SYNC preferred + locally sync-capable, but block_sync forces ASYNC."""
+    _patch_runners_for(monkeypatch, sync_capable=True, async_capable=True)
+    proc = _both_options_process("ingestion")
+    result = processes_module._resolve_execution_mode(proc, SYNC, block_sync=True)
+    assert result == TaskExecutionMode.ASYNCHRONOUS
+
+
+def test_block_sync_no_preference_resolves_async(monkeypatch):
+    """Async-first process with block_sync set never lands on SYNCHRONOUS."""
+    _patch_runners_for(monkeypatch, sync_capable=True, async_capable=True)
+    proc = _async_first_process("ingestion")
+    result = processes_module._resolve_execution_mode(proc, None, block_sync=True)
+    assert result == TaskExecutionMode.ASYNCHRONOUS
+
+
+def test_block_sync_raises_when_only_sync_capable(monkeypatch):
+    """A heavy process that can only run sync here, with sync blocked, raises —
+    refusing to run it in-process is correct (it must be offloaded)."""
+    _patch_runners_for(monkeypatch, sync_capable=True, async_capable=False)
+    proc = _both_options_process("ingestion")
+    with pytest.raises(NotImplementedError, match="ingestion"):
+        processes_module._resolve_execution_mode(proc, SYNC, block_sync=True)
+
+
+def test_block_sync_false_preserves_sync(monkeypatch):
+    """Default (block_sync=False, e.g. the maps tier) keeps sync honoured."""
+    _patch_runners_for(monkeypatch, sync_capable=True, async_capable=True)
+    proc = _both_options_process("gdal")
+    result = processes_module._resolve_execution_mode(proc, SYNC, block_sync=False)
+    assert result == TaskExecutionMode.SYNCHRONOUS

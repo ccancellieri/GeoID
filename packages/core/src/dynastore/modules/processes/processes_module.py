@@ -33,6 +33,14 @@ from dynastore.modules.tasks.execution import execution_engine
 
 logger = logging.getLogger(__name__)
 
+# The single service tier permitted to run HEAVY/OFFLOAD-routed processes
+# synchronously in-process (it ships the osgeo runtime and is sized for the
+# work). Everywhere else a Prefer: respond-sync on a heavy process degrades to
+# async + offload, so a heavy job never blocks a request worker or consumes a
+# serving instance's memory in-process. Mirrors the ``maps`` service identity
+# from instance.json; consumers-based routing keeps maps as the heavy tier.
+_SYNC_TIER = "maps"
+
 
 def resolve_stored_title(
     operator: Optional[LocalizedText],
@@ -73,6 +81,7 @@ def _resolve_execution_mode(
     process: models.Process,
     preferred_mode: Optional[models.JobControlOptions],
     has_request_context: bool = False,
+    block_sync: bool = False,
 ) -> TaskExecutionMode:
     """
     Determine execution mode from caller preference + process constraints.
@@ -84,6 +93,14 @@ def _resolve_execution_mode(
     ASYNCHRONOUS where only a Cloud Run job runner can claim it. Picking a mode
     on bare existence would select an in-process runner that then can't run the
     task, surfacing as a late failure instead of correct routing.
+
+    ``block_sync`` removes SYNCHRONOUS from consideration regardless of local
+    capability. The caller sets it for a HEAVY/OFFLOAD-routed process on a tier
+    that is not the designated heavy-sync tier (maps): such a process must not
+    run synchronously in the request thread on a serving tier (e.g. an
+    ``ingestion`` whose task instance happens to be loaded on the catalog),
+    where it would block a worker and consume the instance's memory. With sync
+    blocked it falls through to ASYNCHRONOUS and is offloaded.
 
     Raises NotImplementedError if no runner can handle the process in any
     supported mode.
@@ -102,6 +119,10 @@ def _resolve_execution_mode(
         elif mode == models.JobControlOptions.SYNC_EXECUTE:
             check_mode = TaskExecutionMode.SYNCHRONOUS
         else:
+            continue
+
+        if check_mode == TaskExecutionMode.SYNCHRONOUS and block_sync:
+            # Heavy process on a non-maps tier: refuse in-request sync.
             continue
 
         if execution_engine.get_runners_for(
@@ -195,8 +216,23 @@ async def execute_process(
     # 4. Determine execution mode. ``background_tasks`` is the request-context
     # signal runners use to gate in-process execution, so thread it into the
     # capability check that picks the mode.
+    #
+    # Heavy/offload-routed processes must not run synchronously in-request on a
+    # serving tier: only the designated heavy-sync tier (maps) may honour
+    # ``Prefer: respond-sync`` for them. Elsewhere ``block_sync`` forces the
+    # request to resolve to async and offload, rather than blocking a request
+    # worker and loading the job into the instance's memory in-process.
+    from dynastore.modules.tasks.execution import offload_required as _offload_required
+    from dynastore.modules.tasks.dispatcher import _SERVICE_NAME as _this_service
+
+    block_sync = (_this_service or "") != _SYNC_TIER and await _offload_required(
+        process_id
+    )
     execution_mode = _resolve_execution_mode(
-        process, preferred_mode, has_request_context=background_tasks is not None
+        process,
+        preferred_mode,
+        has_request_context=background_tasks is not None,
+        block_sync=block_sync,
     )
 
     # 5. Resolve DB schema and delegate to ExecutionEngine.
