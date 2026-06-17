@@ -61,22 +61,23 @@ def _make_ctx(db: Any = None) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# 1. backend="es" routes through apply_preset for both stac_storage and
-#    items_es_public; does NOT call ctx.config.set_config directly.
+# 1. backend="es" routes through apply_preset for both stac_storage and the
+#    cumulative stac_routing (so collection + catalog STAC metadata is routed
+#    to Elasticsearch); does NOT call ctx.config.set_config directly.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_es_backend_routes_via_lifecycle() -> None:
-    """backend='es' must call apply_preset with 'stac_storage' and 'items_es_public',
-    NOT raw set_config, and must NOT apply stac_routing (collection-tier unsafe)."""
+    """backend='es' must call apply_preset with 'stac_storage' and 'stac_routing'
+    (full per-tier ES routing), NOT raw set_config, and NOT items_es_public."""
     from dynastore.tasks.stac_harvest import task as harvest_task
 
     apply_calls: list[tuple] = []
 
     async def fake_apply_preset(name: str, scope: str, params: Any, ctx: Any,
                                  engine: Any, audit: Any, **_kw: Any) -> dict:
-        apply_calls.append((name, scope))
+        apply_calls.append((name, scope, params))
         return {"state": "applied"}
 
     fake_engine = MagicMock()
@@ -94,13 +95,18 @@ async def test_es_backend_routes_via_lifecycle() -> None:
     ):
         await harvest_task._apply_stac_presets(ctx, "catalog:test-cat", "test-cat", "es")
 
-    preset_names = [name for name, _ in apply_calls]
+    preset_names = [name for name, _, _ in apply_calls]
     assert "stac_storage" in preset_names, f"stac_storage not applied; calls={apply_calls}"
-    assert "items_es_public" in preset_names, f"items_es_public not applied; calls={apply_calls}"
-    # Must NOT have called the cumulative stac_routing (it touches collection tier).
-    assert "stac_routing" not in preset_names, (
-        f"stac_routing must not be applied for es backend; calls={apply_calls}"
+    assert "stac_routing" in preset_names, f"stac_routing not applied; calls={apply_calls}"
+    # The items-only preset is no longer used by the harvest (it left collection
+    # + catalog on the PG-default routing, dropping the STAC slice for ES).
+    assert "items_es_public" not in preset_names, (
+        f"items_es_public must not be applied; calls={apply_calls}"
     )
+    # stac_routing for an ES harvest must carry the ES backend.
+    from dynastore.modules.stac.stac_storage_config import StacStorageBackend
+    routing_params = next(p for n, _, p in apply_calls if n == "stac_routing")
+    assert routing_params.stac_storage == StacStorageBackend.ES
     # ctx.config.set_config must NOT have been called (audited path).
     ctx.config.set_config.assert_not_called()
 
@@ -325,8 +331,8 @@ async def test_preset_conflict_error_is_swallowed_for_stac_storage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preset_conflict_error_is_swallowed_for_items_es_public() -> None:
-    """PresetConflictError on items_es_public apply must be swallowed."""
+async def test_preset_conflict_error_is_swallowed_for_stac_routing_es() -> None:
+    """PresetConflictError on the es-backend stac_routing apply must be swallowed."""
     from dynastore.tasks.stac_harvest import task as harvest_task
     from dynastore.modules.storage.presets.errors import PresetConflictError
 
@@ -335,7 +341,7 @@ async def test_preset_conflict_error_is_swallowed_for_items_es_public() -> None:
     async def fake_apply_preset(name: str, scope: str, params: Any, ctx: Any,
                                  engine: Any, audit: Any, **_kw: Any) -> dict:
         call_log.append(name)
-        if name == "items_es_public":
+        if name == "stac_routing":
             raise PresetConflictError({"message": "in_progress"})
         return {"state": "applied"}
 
@@ -352,9 +358,10 @@ async def test_preset_conflict_error_is_swallowed_for_items_es_public() -> None:
             return_value=MagicMock(),
         ),
     ):
+        # Must NOT raise.
         await harvest_task._apply_stac_presets(ctx, "catalog:test-cat", "test-cat", "es")
 
-    assert "items_es_public" in call_log
+    assert "stac_routing" in call_log
 
 
 # ---------------------------------------------------------------------------

@@ -388,12 +388,8 @@ async def _apply_stac_presets_direct(
     table.
     """
     from dynastore.modules.storage.presets.registry import find_preset
-    from dynastore.modules.storage.presets.stac import (
-        StacPresetParams,
-        _items_routing_es,
-    )
+    from dynastore.modules.storage.presets.stac import StacPresetParams
     from dynastore.modules.stac.stac_storage_config import StacLevel
-    from dynastore.modules.storage.routing_config import ItemsRoutingConfig
 
     storage_preset = find_preset("stac_storage")
     await storage_preset.apply(storage_params, scope, ctx)
@@ -402,36 +398,20 @@ async def _apply_stac_presets_direct(
         backend, catalog_id,
     )
 
-    if backend == "es":
-        configs = ctx.config
-        if configs is not None:
-            items_routing = _items_routing_es()
-            await configs.set_config(
-                ItemsRoutingConfig,
-                items_routing,
-                catalog_id=catalog_id,
-            )
-            logger.info(
-                "stac_harvest: wrote ES-only ItemsRoutingConfig for catalog=%s (direct path)",
-                catalog_id,
-            )
-        else:
-            logger.warning(
-                "stac_harvest: ctx.config is None — cannot write "
-                "ItemsRoutingConfig for catalog=%s (ES-only preset incomplete)",
-                catalog_id,
-            )
-    else:
-        routing_params = StacPresetParams(
-            stac_level=StacLevel.ITEMS,
-            stac_storage=stac_backend,
-        )
-        routing_preset = find_preset("stac_routing")
-        await routing_preset.apply(routing_params, scope, ctx)
-        logger.info(
-            "stac_harvest: applied stac_routing preset (backend=%s) on %s (direct path)",
-            backend, catalog_id,
-        )
+    # All backends apply the full per-tier ``stac_routing`` preset (see the
+    # audited path for the rationale): ``es`` now installs collection + catalog
+    # ES routing so STAC metadata (extent etc.) is routed to Elasticsearch
+    # instead of being dropped on the PG-default routing.
+    routing_params = StacPresetParams(
+        stac_level=StacLevel.ITEMS,
+        stac_storage=stac_backend,
+    )
+    routing_preset = find_preset("stac_routing")
+    await routing_preset.apply(routing_params, scope, ctx)
+    logger.info(
+        "stac_harvest: applied stac_routing preset (backend=%s) on %s (direct path)",
+        backend, catalog_id,
+    )
 
 
 async def _apply_stac_presets(
@@ -448,12 +428,12 @@ async def _apply_stac_presets(
     - Always apply the ``stac_storage`` preset (the SSOT signal) through the
       audited ``apply_preset`` lifecycle, which records the apply in
       ``iam.applied_presets`` for idempotency and stores a revoke descriptor.
-    - For ``"es"``: apply the new ``items_es_public`` preset (items-tier only)
-      through the lifecycle — avoids the cumulative ``stac_routing`` preset
-      which would also touch the collection tier where the
-      ``collection_elasticsearch_driver`` is not registered on this deployment.
-    - For ``"es_pg"`` or ``"pg"``: apply the ``stac_routing`` preset through
-      the lifecycle (these backends validate on all tiers).
+    - For every backend (``"es"`` / ``"es_pg"`` / ``"pg"``): apply the
+      cumulative ``stac_routing`` preset through the lifecycle so catalog +
+      collection + items routing are wired for the backend.  For ``"es"`` this
+      routes collection and catalog STAC metadata to Elasticsearch instead of
+      leaving those tiers on the PG-default routing (which dropped the STAC
+      slice because ``pg_stac(ES)`` is false).
 
     IAM-optional: when the engine or ``AppliedPresetsService`` is unavailable,
     the function falls back to the direct ``preset.apply(...)`` /
@@ -535,45 +515,38 @@ async def _apply_stac_presets(
                 scope, conflict_exc,
             )
 
-        # 2. Apply routing preset for the items tier.
-        if backend == "es":
-            # items_es_public: items-tier only — avoids collection-tier ES routing
-            # (collection_elasticsearch_driver not registered on ES-primary deployments).
-            from dynastore.modules.storage.presets.preset import NoParams
-            try:
-                await apply_preset(
-                    "items_es_public", scope, NoParams(), ctx, engine, audit
-                )
-                logger.info(
-                    "stac_harvest: applied items_es_public preset on %s",
-                    catalog_id,
-                )
-            except PresetConflictError as conflict_exc:
-                logger.info(
-                    "stac_harvest: items_es_public already applied at %s — leaving "
-                    "existing config: %s",
-                    scope, conflict_exc,
-                )
-        else:
-            # es_pg / pg: the cumulative stac_routing preset validates fine.
-            routing_params = StacPresetParams(
-                stac_level=StacLevel.ITEMS,
-                stac_storage=stac_backend,
+        # 2. Apply the full per-tier routing for the chosen backend.
+        #
+        # All backends (es / es_pg / pg) apply the cumulative ``stac_routing``
+        # preset so catalog + collection + items routing are wired for the
+        # backend.  For ``es`` this installs ``_collection_routing_es`` /
+        # ``_catalog_routing_es`` so collection and catalog STAC metadata
+        # (extent / providers / summaries / links / assets) is routed to
+        # Elasticsearch.  Previously the ``es`` path applied ``items_es_public``
+        # (items tier only), which left collections + catalog on the PG-default
+        # routing; combined with ``pg_stac(ES)`` being false, the PG wrapper
+        # then wrote only the core slice and silently dropped the STAC slice,
+        # so a pure-ES harvest both used PG and lost the extent.  The collection
+        # and catalog Elasticsearch drivers are registered unconditionally via
+        # entry-points, so this routing resolves on ES-primary deployments.
+        routing_params = StacPresetParams(
+            stac_level=StacLevel.ITEMS,
+            stac_storage=stac_backend,
+        )
+        try:
+            await apply_preset(
+                "stac_routing", scope, routing_params, ctx, engine, audit
             )
-            try:
-                await apply_preset(
-                    "stac_routing", scope, routing_params, ctx, engine, audit
-                )
-                logger.info(
-                    "stac_harvest: applied stac_routing preset (backend=%s) on %s",
-                    backend, catalog_id,
-                )
-            except PresetConflictError as conflict_exc:
-                logger.info(
-                    "stac_harvest: stac_routing already applied at %s — leaving "
-                    "existing config: %s",
-                    scope, conflict_exc,
-                )
+            logger.info(
+                "stac_harvest: applied stac_routing preset (backend=%s) on %s",
+                backend, catalog_id,
+            )
+        except PresetConflictError as conflict_exc:
+            logger.info(
+                "stac_harvest: stac_routing already applied at %s — leaving "
+                "existing config: %s",
+                scope, conflict_exc,
+            )
 
     except Exception as exc:
         logger.warning(

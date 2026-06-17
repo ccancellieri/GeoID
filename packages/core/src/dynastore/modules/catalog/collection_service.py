@@ -136,6 +136,23 @@ def _make_collection_exists_query(phys_schema: str) -> DQLQuery:
     )
 
 
+def _make_collection_list_ids_query(phys_schema: str) -> DQLQuery:
+    """SELECT ids of non-deleted collections in ``phys_schema``, paginated.
+
+    The thin PG ``collections`` registry is the authoritative existence
+    ledger for every collection regardless of where its metadata lives (ES,
+    DuckDB, or PG).  Listing enumerates ids from here and hydrates each via
+    the configured READ router, so a pure-ES (or DuckDB-only) catalog lists
+    its collections even when the ES SEARCH index is empty or lagged. Stable
+    ``ORDER BY id`` makes ``limit``/``offset`` pagination deterministic.
+    """
+    return DQLQuery(
+        f'SELECT id FROM "{phys_schema}".collections '
+        "WHERE deleted_at IS NULL ORDER BY id LIMIT :limit OFFSET :offset;",
+        result_handler=ResultHandler.ALL_SCALARS,
+    )
+
+
 class CollectionNotAliveError(Exception):
     """Raised by :meth:`CollectionService.ensure_alive` when the collection
     cannot accept writes.
@@ -998,39 +1015,58 @@ class CollectionService:
         q: Optional[str] = None,
     ) -> List[Collection]:
         db_resource = ctx.db_resource if ctx else None
-        # Navigation is routing-driven: the collection-metadata router picks
-        # the configured driver for this scope (ES-first, PG-first, or PG-only
-        # per the applied preset) and returns COMPLETE collections — the PG
-        # composition driver hydrates its STAC slice, so a PG-routed listing
-        # carries extent/providers/summaries/links/assets/item_assets, not just
-        # the CORE columns (see CollectionPostgresqlDriver.search_metadata).
-        #
-        # When the SEARCH slice is ES-only (e.g. the public_catalog preset) and
-        # the ES collection index has not yet been populated for this catalog,
-        # the SEARCH query returns empty; we then re-run the same query against
-        # the READ-routed driver, which is PG-backed under every preset (the
-        # system of record).  This per-scope routing resolution replaces the
-        # former hand-rolled collection_core⋈collection_stac fallback SQL.
-        from dynastore.modules.catalog.collection_router import (
-            search_collection_metadata as _route_search,
-        )
-        from dynastore.modules.storage.routing_config import Operation
 
-        for op in (Operation.SEARCH, Operation.READ):
-            try:
-                rows, _ = await _route_search(
-                    catalog_id, q=q, limit=limit, offset=offset,
-                    db_resource=db_resource, operation=op,
+        # A filtered listing (free-text ``q``) must go through the SEARCH-
+        # capable driver, so keep the routing-driven path for that case: the
+        # collection-metadata router picks the configured SEARCH driver for the
+        # scope and returns COMPLETE collections.  The READ fallback covers a
+        # deploy whose SEARCH slice has no results yet.
+        if q:
+            from dynastore.modules.catalog.collection_router import (
+                search_collection_metadata as _route_search,
+            )
+            from dynastore.modules.storage.routing_config import Operation
+
+            for op in (Operation.SEARCH, Operation.READ):
+                try:
+                    rows, _ = await _route_search(
+                        catalog_id, q=q, limit=limit, offset=offset,
+                        db_resource=db_resource, operation=op,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Collection-metadata router %s failed for %s: %s",
+                        op, catalog_id, exc,
+                    )
+                    continue
+                if rows:
+                    return [Collection.model_validate(row) for row in rows]
+            return []
+
+        # Unfiltered listing: enumerate ids from the thin PG registry — the
+        # authoritative existence ledger for every backend — and hydrate each
+        # via the configured READ router.  This makes listing backend-agnostic:
+        # a pure-ES (or DuckDB-only) catalog lists its collections from the
+        # registry and reads their metadata from ES/DuckDB, instead of
+        # depending on the ES SEARCH index being populated.  Existence lives in
+        # PG; metadata lives wherever the preset routes it.
+        async with managed_transaction(db_resource or self.engine) as conn:
+            phys_schema = await self._resolve_physical_schema(
+                catalog_id, db_resource=conn
+            )
+            if not phys_schema:
+                return []
+            ids = await _make_collection_list_ids_query(phys_schema).execute(
+                conn, limit=limit, offset=offset
+            )
+            collections: List[Collection] = []
+            for collection_id in ids:
+                model = await self._get_collection_model_logic(
+                    catalog_id, collection_id, conn
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Collection-metadata router %s failed for %s: %s",
-                    op, catalog_id, exc,
-                )
-                continue
-            if rows:
-                return [Collection.model_validate(row) for row in rows]
-        return []
+                if model is not None:
+                    collections.append(model)
+            return collections
 
     async def update_collection(
         self,
