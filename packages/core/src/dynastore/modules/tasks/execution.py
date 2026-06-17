@@ -402,8 +402,12 @@ async def apply_terminal_action(
     scope: Optional[str],
     outcome: str,
     action: "Any",
-) -> None:
+) -> Optional[Any]:
     """Apply one terminal-outcome Action for a finished task.
+
+    Returns the routed follow-on ``Task`` when a ROUTE action enqueued one
+    (so an inline-sync caller can offload-on-timeout and surface the new
+    async job to the client), otherwise ``None``.
 
     The caller has already written the base terminal status (COMPLETED for
     ``success``; FAILED / DEAD_LETTER for ``failure``; DEAD_LETTER for
@@ -448,16 +452,16 @@ async def apply_terminal_action(
     from dynastore.modules.tasks.routing.model import ActionVerb
 
     if action is None or action.action != ActionVerb.ROUTE:
-        return
+        return None
     process = action.process
     if not process:
-        return
+        return None
 
     if outcome in ("failure", "timeout"):
         status = await _read_task_status(engine, task_id)
         if status not in ("DEAD_LETTER", "FAILED"):
             # Not terminal yet (transient retry pending) — do not chain.
-            return
+            return None
 
     base_inputs: Dict[str, Any] = dict(inputs) if isinstance(inputs, dict) else {}
     depth = base_inputs.get(_ROUTE_DEPTH_KEY, 0)
@@ -471,7 +475,7 @@ async def apply_terminal_action(
             "_route_depth=%d reached _MAX_ROUTE_DEPTH=%d (cycle guard)",
             task_type, process, outcome, depth, _MAX_ROUTE_DEPTH,
         )
-        return
+        return None
 
     forwarded = {
         **base_inputs,
@@ -499,17 +503,19 @@ async def apply_terminal_action(
                 "(non-terminal twin already queued)",
                 task_type, process, outcome,
             )
-        else:
-            logger.info(
-                "terminal routing: %s of %s ROUTED -> %s (depth=%d)",
-                outcome, task_type, process, depth + 1,
-            )
+            return None
+        logger.info(
+            "terminal routing: %s of %s ROUTED -> %s (depth=%d)",
+            outcome, task_type, process, depth + 1,
+        )
+        return created
     except Exception:  # noqa: BLE001 — continuation must not brick the loop
         logger.warning(
             "terminal routing: ROUTE continuation %s -> %s failed; original "
             "row remains terminal (outcome=%s)",
             task_type, process, outcome, exc_info=True,
         )
+        return None
 
 
 def _route_target_kind(process_key: str) -> str:

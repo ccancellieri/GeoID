@@ -164,13 +164,28 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
             "asset": context.asset
         }
 
+        # Terminal routing policy for this task (fail-open to defaults). Gives
+        # the inline-sync path a deadline and an on_timeout action, mirroring
+        # the background/dispatcher path.
+        from dynastore.modules.tasks.execution import (
+            apply_terminal_action as _apply_terminal_action,
+            resolve_routing_terminal as _resolve_routing_terminal,
+        )
+        _terminal = await _resolve_routing_terminal(context.task_type)
+
         try:
             logger.info(f"Executing sync task '{job.task_id}'...")
             await tasks_mgr.update_task(context.engine, job.task_id, TaskUpdate(status=TaskStatusEnum.RUNNING), schema=context.db_schema)
 
-            # Hydrate and execute
+            # Hydrate and execute, bounded by the routing deadline when set.
             hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-            result = await task_instance.run(hydrated_payload)
+            if _terminal.timeout_seconds:
+                result = await asyncio.wait_for(
+                    task_instance.run(hydrated_payload),
+                    timeout=_terminal.timeout_seconds,
+                )
+            else:
+                result = await task_instance.run(hydrated_payload)
 
             # OGC API - Processes Part 1 requires ``GET /jobs/{id}/results`` to work
             # for both async AND sync executions when status=successful. Persist
@@ -185,6 +200,59 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
             await tasks_mgr.update_task(context.engine, job.task_id, update_data, schema=context.db_schema)
             logger.info(f"Sync task '{job.task_id}' completed successfully.")
             return result
+
+        except asyncio.TimeoutError:
+            # Inline sync execution exceeded its deadline. Per OGC API -
+            # Processes Part 1, ``respond-sync`` is a preference: a slow sync
+            # job may legitimately degrade to async. Dead-letter the audit task,
+            # then apply the configured on_timeout action — when it is ROUTE
+            # (e.g. re-dispatch gdal to its Cloud Run target) the offload is
+            # enqueued and we return the new async Task, so the service answers
+            # 201 + Location instead of blocking the request to the gateway
+            # timeout. With any other on_timeout policy the timeout surfaces as
+            # an error to the caller (#2221).
+            timeout_s = _terminal.timeout_seconds
+            logger.warning(
+                "SyncRunner: task '%s' (%s) exceeded %ss — dead-lettering and "
+                "applying on_timeout policy.",
+                job.task_id, context.task_type, timeout_s,
+            )
+            from dynastore.modules.tasks.tasks_module import dead_letter_task as _sync_dead_letter
+            from datetime import datetime as _to_dt, timezone as _to_tz
+            try:
+                await _sync_dead_letter(
+                    context.engine, job.task_id, _to_dt.now(_to_tz.utc),
+                    f"Synchronous execution timed out after {timeout_s}s",
+                )
+            except Exception as dle:
+                logger.error(
+                    f"SyncRunner: failed to dead-letter timed-out task '{job.task_id}': {dle}"
+                )
+            offloaded = await _apply_terminal_action(
+                context.engine,
+                task_id=job.task_id,
+                task_type=context.task_type,
+                inputs=context.inputs,
+                caller_id=context.caller_id,
+                collection_id=context.collection_id,
+                schema=context.db_schema,
+                scope=None,
+                outcome="timeout",
+                action=_terminal.on_timeout,
+            )
+            if offloaded is not None:
+                logger.info(
+                    "SyncRunner: task '%s' offloaded to async task '%s' on timeout.",
+                    job.task_id, getattr(offloaded, "task_id", "?"),
+                )
+                return offloaded
+            # on_timeout is not ROUTE (no offload target) — surface the timeout.
+            # ``from None``: this IS the timeout, just re-messaged; no need to
+            # chain the original asyncio.TimeoutError.
+            raise TimeoutError(
+                f"Synchronous execution of '{context.task_type}' timed out after "
+                f"{timeout_s}s and no on_timeout offload is configured."
+            ) from None
 
         except Exception as e:
             logger.error(f"Sync task '{job.task_id}' failed: {e}", exc_info=True)
