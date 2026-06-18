@@ -1682,20 +1682,43 @@ async def _validate_collection_routing_config(
 
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionItemsStore)}
     store_driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionStore)}
+    # Known CollectionIndexer driver_refs (e.g. the ES collection_elasticsearch_driver).
+    # An indexer is a write-only secondary-index sink, never a READ-capable
+    # CollectionStore. A routing config persisted before the ES-only collection
+    # routing fix could list the ES indexer as a READ/WRITE *primary*
+    # (``secondary_index`` unset) — an entry that can't serve metadata. The
+    # runtime router already relaxes READ to an available store (#2147) and
+    # skips any unregistered entry at dispatch, so skipping known indexers here
+    # (instead of hard-raising) keeps a stale catalog readable and lets it
+    # self-heal on the next apply — parity with operations[WRITE]
+    # (secondary-index skip, #2267) and the items/asset/catalog validators
+    # (``_validate_routing_entries`` warn-skips unregistered drivers).
+    indexer_refs = {_to_snake(type(d).__name__) for d in get_protocols(CollectionIndexer)}
 
     # Auto-register installed store drivers (WRITE/READ) so operators
     # reading ``/configs/...`` see every driver that will run; no implicit
     # fan-out behind the config's back.
     _self_register_store_drivers(config, store_driver_index)
 
-    # Validate operations[READ] (CollectionStore drivers)
+    # Validate operations[READ] (CollectionStore drivers). A known indexer
+    # mis-listed under READ (stale pre-fix config) is warn-skipped, not raised
+    # — it is not a CollectionStore and the runtime router relaxes READ past it.
     for entry in config.operations.get(Operation.READ, []):
-        if entry.driver_ref not in store_driver_index:
-            raise ValueError(
-                f"Collection metadata routing config: operations[READ] driver "
-                f"'{entry.driver_ref}' is not registered. "
-                f"Available: {sorted(store_driver_index)}"
+        if entry.driver_ref in store_driver_index:
+            continue
+        if entry.secondary_index or entry.driver_ref in indexer_refs:
+            logger.warning(
+                "Collection metadata routing config: operations[READ] driver "
+                "'%s' is a secondary-index sink, not a CollectionStore; skipping "
+                "(runtime router relaxes READ to an available store).",
+                entry.driver_ref,
             )
+            continue
+        raise ValueError(
+            f"Collection metadata routing config: operations[READ] driver "
+            f"'{entry.driver_ref}' is not registered. "
+            f"Available: {sorted(store_driver_index)}"
+        )
 
     # Validate the transformers registry (CollectionItemsStore drivers — they
     # contribute item-derived metadata at READ time)
@@ -1718,7 +1741,7 @@ async def _validate_collection_routing_config(
     # ``collection_elasticsearch_driver`` secondary index and rolled back an
     # ES-catalog routing preset apply, dropping the catalog to the PG+ES default.
     for entry in config.operations.get(Operation.WRITE, []):
-        if entry.secondary_index:
+        if entry.secondary_index or entry.driver_ref in indexer_refs:
             continue
         if entry.driver_ref not in store_driver_index:
             raise ValueError(

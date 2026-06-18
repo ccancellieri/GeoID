@@ -1736,3 +1736,94 @@ def test_validate_collection_routing_still_rejects_unknown_primary_store():
             asyncio.run(_validate_collection_routing_config(
                 cfg, catalog_id=None, collection_id=None, db_resource=None,
             ))
+
+
+def test_validate_collection_routing_skips_stale_indexer_in_read():
+    """A routing config persisted before the ES-only collection routing fix could
+    list the ES ``collection_elasticsearch_driver`` as a READ *primary*
+    (``secondary_index`` unset).  The ES driver is a ``CollectionIndexer``, never
+    a READ-capable ``CollectionStore`` — validating it against the store registry
+    hard-raised ``operations[READ] driver ... is not registered`` and blocked the
+    catalog.  It must now be warn-skipped (the runtime router relaxes READ to an
+    available store), so a stale catalog stays readable and self-heals on the
+    next apply.  Parity with the operations[WRITE] secondary-index skip (#2267).
+    """
+    import asyncio
+    from typing import ClassVar
+    from unittest.mock import patch
+
+    from dynastore.models.protocols.entity_store import CollectionStore
+    from dynastore.models.protocols.indexer import CollectionIndexer
+    from dynastore.modules.storage.routing_config import (
+        _validate_collection_routing_config,
+    )
+
+    class CollectionPostgresqlDriver:  # the sole registered CollectionStore
+        capabilities = frozenset({Capability.WRITE, Capability.READ})
+        supported_hints: frozenset = frozenset()
+
+    class CollectionElasticsearchDriver:  # a CollectionIndexer, NOT a store
+        is_collection_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset(
+            {Operation.SEARCH, Operation.WRITE}
+        )
+
+    pg = CollectionPostgresqlDriver()
+    es = CollectionElasticsearchDriver()
+
+    def _fake_get_protocols(proto):
+        if proto is CollectionStore:
+            return [pg]
+        if proto is CollectionIndexer:
+            return [es]
+        return []
+
+    cfg = CollectionRoutingConfig()
+    cfg.operations.clear()
+    cfg.operations[Operation.READ] = [
+        OperationDriverEntry(
+            driver_ref="collection_postgresql_driver", source="auto",
+        ),
+        # Stale ES-as-READ-primary entry (secondary_index unset).
+        OperationDriverEntry(
+            driver_ref="collection_elasticsearch_driver", source="auto",
+        ),
+    ]
+    cfg.operations[Operation.WRITE] = []
+
+    # Pre-fix this raised ValueError on the ES READ entry; post-fix it is skipped.
+    with patch("dynastore.tools.discovery.get_protocols", _fake_get_protocols):
+        asyncio.run(_validate_collection_routing_config(
+            cfg, catalog_id=None, collection_id=None, db_resource=None,
+        ))
+
+    read_refs = {e.driver_ref for e in cfg.operations[Operation.READ]}
+    assert "collection_postgresql_driver" in read_refs
+
+
+def test_validate_collection_routing_still_rejects_unknown_read_driver():
+    """A READ entry whose driver_ref is neither a registered ``CollectionStore``
+    nor a known ``CollectionIndexer`` (a genuine typo) still hard-fails — the
+    indexer skip must not weaken typo protection on the READ side.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    import pytest
+
+    from dynastore.modules.storage.routing_config import (
+        _validate_collection_routing_config,
+    )
+
+    cfg = CollectionRoutingConfig()
+    cfg.operations.clear()
+    cfg.operations[Operation.READ] = [
+        OperationDriverEntry(driver_ref="collection_postgres_typo", source="auto"),
+    ]
+    cfg.operations[Operation.WRITE] = []
+
+    with patch("dynastore.tools.discovery.get_protocols", lambda proto: []):
+        with pytest.raises(ValueError, match="operations\\[READ\\] driver"):
+            asyncio.run(_validate_collection_routing_config(
+                cfg, catalog_id=None, collection_id=None, db_resource=None,
+            ))
