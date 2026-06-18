@@ -36,12 +36,14 @@ teardown to the async cascade:
    cascade can own asset-ES teardown without wiping sibling collections).
 2. ``AssetService.delete_assets(external=False)`` skips the non-PG fan-out.
 3. ``_on_collection_hard_deletion`` calls it with ``external=False``.
-4. ``RoutingDrivenCascadeOwner`` no longer enumerates PG drivers (inline-owned),
-   so the cascade never re-drops the PG items table.
+4. ``RoutingDrivenCascadeOwner`` does not enumerate drivers whose declared
+   ``teardown_lane`` is ``INLINE_TXN`` (the PG family), so the cascade never
+   re-drops the PG items table.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -124,27 +126,43 @@ class TestAssetEsDropStorageGranularity:
 
 
 class TestCascadeExcludesInlineOwnedPgDrivers:
-    def test_is_inline_owned_driver(self):
-        from dynastore.modules.storage.drivers.routing_driven_cascade_owner import (
-            _is_inline_owned_driver,
+    def test_pg_drivers_declare_inline_txn_lane(self):
+        """PG drivers declare ``INLINE_TXN``; external / OTF drivers default to
+        ``ASYNC_CASCADE``.  The lane — not a driver-id substring — is what the
+        cascade enumerator dispatches on."""
+        from dynastore.models.protocols.teardown_lane import TeardownLane
+        from dynastore.modules.catalog.drivers.pg_asset_driver import (
+            AssetPostgresqlDriver,
         )
+        from dynastore.modules.storage.drivers.collection_postgresql import (
+            CollectionPostgresqlDriver,
+        )
+        from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            AssetElasticsearchDriver,
+            ItemsElasticsearchDriver,
+        )
+        from dynastore.modules.storage.drivers.iceberg import ItemsIcebergDriver
+        from dynastore.modules.storage.drivers.postgresql import ItemsPostgresqlDriver
 
-        assert _is_inline_owned_driver("items_postgresql_driver") is True
-        assert _is_inline_owned_driver("asset_postgresql_driver") is True
-        assert _is_inline_owned_driver("collection_postgresql_driver") is True
-        # External / OTF backends are NOT inline-owned — cascade keeps them.
-        assert _is_inline_owned_driver("items_elasticsearch_driver") is False
-        assert _is_inline_owned_driver("asset_elasticsearch_driver") is False
-        assert _is_inline_owned_driver("items_duckdb_driver") is False
-        assert _is_inline_owned_driver("items_iceberg_driver") is False
+        assert ItemsPostgresqlDriver.teardown_lane is TeardownLane.INLINE_TXN
+        assert AssetPostgresqlDriver.teardown_lane is TeardownLane.INLINE_TXN
+        assert CollectionPostgresqlDriver.teardown_lane is TeardownLane.INLINE_TXN
+        # External / OTF backends are owned by the async cascade.
+        assert ItemsElasticsearchDriver.teardown_lane is TeardownLane.ASYNC_CASCADE
+        assert AssetElasticsearchDriver.teardown_lane is TeardownLane.ASYNC_CASCADE
+        assert ItemsDuckdbDriver.teardown_lane is TeardownLane.ASYNC_CASCADE
+        assert ItemsIcebergDriver.teardown_lane is TeardownLane.ASYNC_CASCADE
 
     @pytest.mark.asyncio
     async def test_enumerate_skips_pg_keeps_es(self):
-        """PG drivers must not be enumerated by the cascade (the delete
-        transaction drops their storage inline); ES drivers must remain."""
+        """A driver whose resolved instance declares ``INLINE_TXN`` is not
+        enumerated by the cascade (the delete transaction drops its storage
+        inline); an ``ASYNC_CASCADE`` driver remains."""
+        from dynastore.models.protocols.teardown_lane import TeardownLane
         from dynastore.modules.catalog.resource_owner import ResourceScope, ScopeRef
-        from dynastore.modules.storage.drivers.routing_driven_cascade_owner import (
-            _enumerate_configured_drivers,
+        from dynastore.modules.storage.drivers import (
+            routing_driven_cascade_owner as rdco,
         )
 
         async def _mock_resolve(routing_cls, catalog_id, collection_id, op, hints):
@@ -157,6 +175,15 @@ class TestCascadeExcludesInlineOwnedPgDrivers:
                 ]
             return []
 
+        lanes = {
+            "items_postgresql_driver": TeardownLane.INLINE_TXN,
+            "items_elasticsearch_driver": TeardownLane.ASYNC_CASCADE,
+        }
+
+        def _fake_resolve(registry_kind, driver_ref):
+            lane = lanes.get(driver_ref)
+            return None if lane is None else SimpleNamespace(teardown_lane=lane)
+
         scope_ref = ScopeRef(
             scope=ResourceScope.COLLECTION,
             catalog_id="cat-a",
@@ -165,8 +192,8 @@ class TestCascadeExcludesInlineOwnedPgDrivers:
         with patch(
             "dynastore.modules.storage.router._resolve_driver_ids_cached",
             new=AsyncMock(side_effect=_mock_resolve),
-        ):
-            result = await _enumerate_configured_drivers(scope_ref)
+        ), patch.object(rdco, "_resolve_driver_by_parts", side_effect=_fake_resolve):
+            result = await rdco._enumerate_configured_drivers(scope_ref)
 
         driver_refs = [dr for _, dr in result]
         assert "items_postgresql_driver" not in driver_refs

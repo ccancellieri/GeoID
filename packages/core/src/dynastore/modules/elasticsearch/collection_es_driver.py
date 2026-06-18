@@ -39,6 +39,7 @@ from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.entity_store import EntityStoreCapability
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.storage_location import StorageLocation
 from dynastore.models.protocols.typed_driver import (
@@ -129,6 +130,8 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
     """
 
     is_collection_indexer: ClassVar[bool] = True
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     # Collection ES is the canonical async secondary index + primary SEARCH
     # backend for collection metadata routing.  It auto-defaults into WRITE

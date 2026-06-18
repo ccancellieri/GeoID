@@ -47,11 +47,12 @@ the ``AssetsProtocol`` contract is unchanged for all callers.
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional
 
 from sqlalchemy import text
 
 from dynastore.models.protocols.storage_driver import Capability
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.models.query_builder import AssetFilter
 from dynastore.modules.tools.asset_filters import build_pg_where
@@ -77,6 +78,10 @@ class AssetPostgresqlDriver(TypedDriver[AssetPostgresqlDriverConfig]):
     Registered via ``register_plugin(AssetPostgresqlDriver(engine=...))`` in
     ``CatalogModule.lifespan()``.
     """
+
+    # Asset rows are deleted inline inside the delete transaction; the async
+    # cascade must not re-drop them.
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
     capabilities: FrozenSet[str] = frozenset({
         Capability.READ,

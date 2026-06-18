@@ -48,7 +48,6 @@ from dynastore.modules.catalog.resource_owner import (
 from dynastore.modules.storage.drivers.routing_driven_cascade_owner import (
     RoutingDrivenCascadeOwner,
     _enumerate_configured_drivers,
-    _is_excluded_driver,
     _resolve_driver,
     register_owners,
     _REGISTRY_ITEMS,
@@ -84,31 +83,6 @@ def _make_ref(
 
 
 # ---------------------------------------------------------------------------
-# _is_excluded_driver
-# ---------------------------------------------------------------------------
-
-
-class TestIsExcludedDriver:
-    def test_gcs_driver_excluded(self) -> None:
-        assert _is_excluded_driver("gcs_asset_driver") is True
-
-    def test_bigquery_driver_excluded(self) -> None:
-        assert _is_excluded_driver("bigquery_items_driver") is True
-
-    def test_gcp_driver_excluded(self) -> None:
-        assert _is_excluded_driver("gcp_storage_driver") is True
-
-    def test_elasticsearch_driver_not_excluded(self) -> None:
-        assert _is_excluded_driver("items_elasticsearch_driver") is False
-
-    def test_postgresql_driver_not_excluded(self) -> None:
-        assert _is_excluded_driver("items_postgresql_driver") is False
-
-    def test_private_driver_not_excluded(self) -> None:
-        assert _is_excluded_driver("items_elasticsearch_private_driver") is False
-
-
-# ---------------------------------------------------------------------------
 # _enumerate_configured_drivers — unit with mocked _resolve_driver_ids_cached
 # ---------------------------------------------------------------------------
 
@@ -117,7 +91,11 @@ class TestEnumerateConfiguredDrivers:
     @pytest.mark.asyncio
     async def test_returns_deduped_pairs_across_operations(self) -> None:
         """Same driver_ref appearing in WRITE + READ for items → only one pair."""
-        # items WRITE returns driver A; items READ returns driver A again.
+        from dynastore.models.protocols.teardown_lane import TeardownLane
+
+        class _EsDriver:
+            teardown_lane = TeardownLane.ASYNC_CASCADE
+
         async def _mock_resolve(routing_cls, catalog_id, collection_id, op, hints):
             from dynastore.modules.storage.routing_config import ItemsRoutingConfig
             if routing_cls is ItemsRoutingConfig:
@@ -126,9 +104,15 @@ class TestEnumerateConfiguredDrivers:
 
         scope_ref = ScopeRef(scope=ResourceScope.CATALOG, catalog_id=_CATALOG_ID)
 
-        with patch(
-            "dynastore.modules.storage.router._resolve_driver_ids_cached",
-            new=AsyncMock(side_effect=_mock_resolve),
+        with (
+            patch(
+                "dynastore.modules.storage.router._resolve_driver_ids_cached",
+                new=AsyncMock(side_effect=_mock_resolve),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.routing_driven_cascade_owner._resolve_driver_by_parts",
+                return_value=_EsDriver(),
+            ),
         ):
             result = await _enumerate_configured_drivers(scope_ref)
 
@@ -137,8 +121,24 @@ class TestEnumerateConfiguredDrivers:
         assert len(items_entries) == 1
 
     @pytest.mark.asyncio
-    async def test_excludes_gcs_drivers(self) -> None:
-        """GCS driver refs must not appear in the result."""
+    async def test_excludes_dedicated_lane_drivers(self) -> None:
+        """Drivers with ASYNC_DEDICATED teardown_lane must not appear in the result.
+
+        The lane-based approach replaces the old GCS substring-match.
+        """
+        from dynastore.models.protocols.teardown_lane import TeardownLane
+
+        class _EsDriver:
+            teardown_lane = TeardownLane.ASYNC_CASCADE
+
+        class _DedicatedDriver:
+            teardown_lane = TeardownLane.ASYNC_DEDICATED
+
+        driver_map = {
+            "asset_elasticsearch_driver": _EsDriver(),
+            "gcs_asset_driver": _DedicatedDriver(),
+        }
+
         async def _mock_resolve(routing_cls, catalog_id, collection_id, op, hints):
             from dynastore.modules.storage.routing_config import AssetRoutingConfig
             if routing_cls is AssetRoutingConfig:
@@ -148,11 +148,20 @@ class TestEnumerateConfiguredDrivers:
                 ]
             return []
 
+        def _fake_by_parts(registry_kind: str, driver_ref: str) -> Any:
+            return driver_map.get(driver_ref)
+
         scope_ref = ScopeRef(scope=ResourceScope.CATALOG, catalog_id=_CATALOG_ID)
 
-        with patch(
-            "dynastore.modules.storage.router._resolve_driver_ids_cached",
-            new=AsyncMock(side_effect=_mock_resolve),
+        with (
+            patch(
+                "dynastore.modules.storage.router._resolve_driver_ids_cached",
+                new=AsyncMock(side_effect=_mock_resolve),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.routing_driven_cascade_owner._resolve_driver_by_parts",
+                side_effect=_fake_by_parts,
+            ),
         ):
             result = await _enumerate_configured_drivers(scope_ref)
 
@@ -200,6 +209,11 @@ class TestEnumerateConfiguredDrivers:
     @pytest.mark.asyncio
     async def test_includes_collection_metadata_driver(self) -> None:
         """CollectionRoutingConfig drivers (incl. collection_elasticsearch_driver) must appear."""
+        from dynastore.models.protocols.teardown_lane import TeardownLane
+
+        class _EsDriver:
+            teardown_lane = TeardownLane.ASYNC_CASCADE
+
         async def _mock_resolve(routing_cls, catalog_id, collection_id, op, hints):
             from dynastore.modules.storage.routing_config import CollectionRoutingConfig
             if routing_cls is CollectionRoutingConfig:
@@ -208,9 +222,15 @@ class TestEnumerateConfiguredDrivers:
 
         scope_ref = ScopeRef(scope=ResourceScope.CATALOG, catalog_id=_CATALOG_ID)
 
-        with patch(
-            "dynastore.modules.storage.router._resolve_driver_ids_cached",
-            new=AsyncMock(side_effect=_mock_resolve),
+        with (
+            patch(
+                "dynastore.modules.storage.router._resolve_driver_ids_cached",
+                new=AsyncMock(side_effect=_mock_resolve),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.routing_driven_cascade_owner._resolve_driver_by_parts",
+                return_value=_EsDriver(),
+            ),
         ):
             result = await _enumerate_configured_drivers(scope_ref)
 

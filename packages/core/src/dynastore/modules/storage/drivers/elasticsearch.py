@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.storage_driver import Capability
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.models.query_builder import AssetFilter, QueryRequest
 from dynastore.modules.elasticsearch.items_query import (
@@ -315,6 +316,8 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
     # ``modules/catalog/item_service.py`` (which must stay free of a hard ES
     # import) via ``getattr(driver, "is_es_items_driver", False)``.
     is_es_items_driver: ClassVar[bool] = True
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     # Both ES items drivers can serve a pre-translated CQL2 filter
     # (``QueryRequest.es_filter``) through ``_query_request_to_es`` — so the
@@ -2223,6 +2226,8 @@ class AssetElasticsearchDriver(
     """
 
     is_asset_indexer: ClassVar[bool] = True
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     # Asset ES is the canonical async secondary index + primary SEARCH
     # backend for asset metadata routing.  It auto-defaults into WRITE (as a

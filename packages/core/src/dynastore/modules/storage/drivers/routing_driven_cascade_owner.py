@@ -24,7 +24,8 @@ items, envelope) with a single owner that:
 1. Enumerates the drivers configured for the deleted catalog/collection by
    calling ``_resolve_driver_ids_cached`` for each relevant routing-config
    class and operation combination.
-2. Emits one ``CleanupRef`` per ``(registry_kind, driver_ref)`` pair found.
+2. Emits one ``CleanupRef`` per ``(registry_kind, driver_ref)`` pair found,
+   for drivers whose ``teardown_lane`` is ``ASYNC_CASCADE``.
 3. In ``cleanup_one``, looks up the driver from the appropriate
    ``DriverRegistry`` index and calls ``driver.drop_storage()``.
 
@@ -39,16 +40,24 @@ This design correctly handles:
 - Private items DENY revoke: ``ItemsElasticsearchPrivateDriver.drop_storage``
   already calls ``_revoke_deny_policy`` — parity is preserved.
 
-GCS asset drivers are EXCLUDED from this owner.  GCS binary storage cleanup
-is handled by the dedicated ``GcsCatalogPrefixOwner`` / ``GcsCollectionPrefixOwner``
-owners (task-runner based), which call ``StorageProtocol.drop_storage`` (renamed
-from ``delete_storage_for_catalog`` in the vocabulary-consolidation pass) and have
-their own lifecycle and retry semantics.  Including GCS drivers here would duplicate
-cleanup and conflict with those owners.  The check is based on the driver class name:
-drivers whose snake_case id contains ``gcs`` or ``bigquery`` are skipped.
+Driver teardown classification uses the driver-declared ``teardown_lane``
+``ClassVar`` (``TeardownLane`` enum) instead of substring-matching on the
+driver id string:
+- ``INLINE_TXN`` — PG family: storage is dropped synchronously inside the
+  delete transaction and must NOT be re-dropped here (table-lock race).
+- ``ASYNC_CASCADE`` (default) — enqueued for async ``drop_storage``.
+- ``ASYNC_DEDICATED`` — handled by a dedicated owner (reserved for a GCS
+  routing driver if one is ever registered; none exists currently).
+- ``NONE`` — no teardown needed (e.g. BigQuery read-only view driver).
 
-Per-asset event-driven binary teardown (``AssetBlobReaper``-style) remains outside
-the cascade registry — it is a per-asset eventing concern, not a bulk cascade.
+GCS binary storage cleanup is handled by the dedicated
+``GcsCatalogPrefixOwner`` / ``GcsCollectionPrefixOwner`` owners (task-runner
+based).  No GCS/GCP driver class is registered in the routing DriverRegistry,
+so no ASYNC_DEDICATED lane filtering is needed in practice today.
+
+Per-asset event-driven binary teardown (``AssetBlobReaper``-style) remains
+outside the cascade registry — it is a per-asset eventing concern, not a
+bulk cascade.
 
 Register via :func:`register_owners` from the catalog module lifespan BEFORE
 the CascadeCleanupRegistry is frozen.
@@ -59,6 +68,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Optional
 
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.modules.catalog.resource_owner import (
     BaseResourceOwner,
     CleanupMode,
@@ -78,37 +88,6 @@ logger = logging.getLogger(__name__)
 _REGISTRY_ITEMS = "items"
 _REGISTRY_ASSET = "asset"
 _REGISTRY_COLLECTION = "collection"
-
-# Driver id fragments whose owners are handled by dedicated GCS / BQ owners.
-# Routing-driven owner must not claim these to avoid double-cleanup.
-_EXCLUDED_DRIVER_ID_FRAGMENTS = ("gcs", "bigquery", "gcp")
-
-# Driver id fragments for backends torn down INLINE inside the delete
-# transaction (PostgreSQL: the items-table DROP in _purge_collection_storage and
-# the asset-row DELETE, both atomic with the registry drop).  The async cascade
-# must NOT re-drop PG storage: a second ``DROP TABLE`` on the same physical
-# table races the inline drop for the table lock (LockNotAvailableError /
-# "lock timeout") and is pure redundancy.  External backends (Elasticsearch) and
-# other OTF stores (DuckDB / Iceberg), which are NOT dropped inline, remain
-# owned by the cascade.
-_INLINE_OWNED_DRIVER_ID_FRAGMENTS = ("postgresql",)
-
-
-def _is_excluded_driver(driver_ref: str) -> bool:
-    """Return True if *driver_ref* belongs to an external-storage owner."""
-    lower = driver_ref.lower()
-    return any(frag in lower for frag in _EXCLUDED_DRIVER_ID_FRAGMENTS)
-
-
-def _is_inline_owned_driver(driver_ref: str) -> bool:
-    """Return True if *driver_ref*'s storage is torn down inline (PG).
-
-    Such drivers are skipped by the routing-driven cascade because the delete
-    transaction already drops their storage atomically; re-dropping it async
-    only races the inline drop for the table lock.
-    """
-    lower = driver_ref.lower()
-    return any(frag in lower for frag in _INLINE_OWNED_DRIVER_ID_FRAGMENTS)
 
 
 async def _enumerate_configured_drivers(
@@ -175,24 +154,51 @@ async def _enumerate_configured_drivers(
             )
 
             for driver_ref, _on_failure, _write_mode in entries:
-                if _is_excluded_driver(driver_ref):
-                    logger.debug(
-                        "_enumerate_configured_drivers: skipping excluded "
-                        "driver %r (GCS/BQ handled by dedicated owner).",
-                        driver_ref,
-                    )
-                    continue
-                if _is_inline_owned_driver(driver_ref):
-                    logger.debug(
-                        "_enumerate_configured_drivers: skipping inline-owned "
-                        "driver %r (PG storage dropped inside the delete "
-                        "transaction; async re-drop would race the table lock).",
-                        driver_ref,
-                    )
-                    continue
                 key = (registry_kind, driver_ref)
-                if key not in seen:
-                    seen.add(key)
+                # Process each (registry_kind, driver_ref) at most once, even
+                # when the same driver is configured for several operations —
+                # regardless of lane, so skipped drivers are not re-resolved or
+                # re-logged per operation.
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                # Resolve the driver to inspect its declared teardown_lane.
+                # If resolution fails (driver not installed / registry gap),
+                # default to ASYNC_CASCADE so cleanup_one still runs — it
+                # already treats a missing driver as DONE (fail-safe: never
+                # silently drop a teardown work item).
+                driver = _resolve_driver_by_parts(registry_kind, driver_ref)
+                lane = getattr(driver, "teardown_lane", TeardownLane.ASYNC_CASCADE)
+
+                if lane is TeardownLane.ASYNC_CASCADE:
+                    result.append(key)
+                elif lane is TeardownLane.INLINE_TXN:
+                    logger.debug(
+                        "_enumerate_configured_drivers: skipping INLINE_TXN "
+                        "driver %r (storage dropped inside the delete transaction; "
+                        "async re-drop would race the table lock).",
+                        driver_ref,
+                    )
+                elif lane is TeardownLane.ASYNC_DEDICATED:
+                    logger.debug(
+                        "_enumerate_configured_drivers: skipping ASYNC_DEDICATED "
+                        "driver %r (handled by a dedicated cascade owner).",
+                        driver_ref,
+                    )
+                elif lane is TeardownLane.NONE:
+                    logger.debug(
+                        "_enumerate_configured_drivers: skipping NONE-lane "
+                        "driver %r (no teardown needed).",
+                        driver_ref,
+                    )
+                else:
+                    # Unknown future lane value — default to ASYNC_CASCADE for safety.
+                    logger.warning(
+                        "_enumerate_configured_drivers: unknown teardown_lane %r "
+                        "for driver %r — defaulting to ASYNC_CASCADE.",
+                        lane, driver_ref,
+                    )
                     result.append(key)
 
     # Items drivers (WRITE fans-out to secondary indexes; READ/SEARCH for primaries)
@@ -218,6 +224,29 @@ async def _enumerate_configured_drivers(
     )
 
     return result
+
+
+def _resolve_driver_by_parts(registry_kind: str, driver_ref: str) -> Any:
+    """Look up a driver instance from ``(registry_kind, driver_ref)``.
+
+    Shared resolution path used by both ``_enumerate_configured_drivers``
+    (to read ``teardown_lane``) and ``_resolve_driver`` (called from
+    ``cleanup_one``).  Returns ``None`` when the driver is absent from the
+    registry (not installed, wrong scope, or registry not yet populated).
+    """
+    from dynastore.modules.storage.driver_registry import DriverRegistry
+
+    if registry_kind == _REGISTRY_ITEMS:
+        return DriverRegistry.collection_index().get(driver_ref)
+    if registry_kind == _REGISTRY_ASSET:
+        return DriverRegistry.asset_index().get(driver_ref)
+    if registry_kind == _REGISTRY_COLLECTION:
+        return DriverRegistry.collection_store_index().get(driver_ref)
+    logger.warning(
+        "_resolve_driver_by_parts: unknown registry_kind=%r for driver=%r.",
+        registry_kind, driver_ref,
+    )
+    return None
 
 
 class RoutingDrivenCascadeOwner(BaseResourceOwner):
@@ -375,22 +404,10 @@ class RoutingDrivenCascadeOwner(BaseResourceOwner):
 
 def _resolve_driver(ref: CleanupRef) -> Any:
     """Look up the driver instance from the appropriate DriverRegistry index."""
-    from dynastore.modules.storage.driver_registry import DriverRegistry
-
-    registry_kind = ref.metadata.get("registry")
-    driver_ref = ref.locator
-
-    if registry_kind == _REGISTRY_ITEMS:
-        return DriverRegistry.collection_index().get(driver_ref)
-    if registry_kind == _REGISTRY_ASSET:
-        return DriverRegistry.asset_index().get(driver_ref)
-    if registry_kind == _REGISTRY_COLLECTION:
-        return DriverRegistry.collection_store_index().get(driver_ref)
-    logger.warning(
-        "_resolve_driver: unknown registry_kind=%r for driver=%r.",
-        registry_kind, driver_ref,
+    return _resolve_driver_by_parts(
+        ref.metadata.get("registry", ""),
+        ref.locator,
     )
-    return None
 
 
 def register_owners(registry: "CascadeCleanupRegistry") -> None:

@@ -45,6 +45,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
+    ClassVar,
     Dict,
     FrozenSet,
     List,
@@ -56,6 +57,7 @@ from typing import (
 
 
 from dynastore.models.ogc import Feature, FeatureCollection
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.query_builder import QueryRequest
 
 if TYPE_CHECKING:
@@ -188,6 +190,8 @@ class CollectionItemsStore(Protocol):
     driver class.  It is returned by the driver discovery API
     (``GET /storage/drivers``) and must not be stored in the database.
     """
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     capabilities: FrozenSet[str]
     preferred_for: "FrozenSet[Hint]"

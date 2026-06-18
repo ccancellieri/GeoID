@@ -31,6 +31,7 @@ A driver may implement both protocols if it handles both features and assets
 from typing import (
     TYPE_CHECKING,
     Any,
+    ClassVar,
     Dict,
     FrozenSet,
     List,
@@ -39,6 +40,7 @@ from typing import (
     runtime_checkable,
 )
 
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.query_builder import AssetFilter
 
 if TYPE_CHECKING:
@@ -53,6 +55,8 @@ class AssetStore(Protocol):
     Implementations:
     - ``AssetElasticsearchDriver`` — asset metadata in per-catalog ES index
     """
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     capabilities: FrozenSet[str]
     preferred_for: "FrozenSet[Hint]"

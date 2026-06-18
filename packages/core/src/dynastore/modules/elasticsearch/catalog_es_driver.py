@@ -41,6 +41,7 @@ from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.entity_store import EntityStoreCapability
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import (
     TypedDriver,
     _PluginDriverConfig,
@@ -140,6 +141,8 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
     """
 
     is_catalog_indexer: ClassVar[bool] = True
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     # Catalog ES is the canonical async secondary index + primary SEARCH
     # backend for catalog metadata routing.  It auto-defaults into WRITE

@@ -31,6 +31,7 @@ from dynastore.models.protocols import (
     ConfigsProtocol,
 )
 from dynastore.models.protocols.field_definition import FieldDefinition
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.drivers.bigquery_models import (
@@ -66,6 +67,10 @@ class ItemsBigQueryDriver(TypedDriver[ItemsBigQueryDriverConfig]):
     do NOT raise, so this driver is safe to pin as ``on_failure=warn`` in
     a multi-driver WRITE fan-out (see role-based driver plan §Routing).
     """
+
+    # BQ operates on a customer-owned dataset and has no drop_storage;
+    # no teardown action is performed by any cascade owner.
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.NONE
 
     # Explicit-pin only.  Operators who want BQ in items routing set
     # the entry by hand (``source: "operator"``).

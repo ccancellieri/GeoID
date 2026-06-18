@@ -36,6 +36,7 @@ from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
+    ClassVar,
     Dict,
     FrozenSet,
     List,
@@ -49,6 +50,7 @@ from typing import (
 # ``ClassVar[Optional[DriverSla]]`` alongside their other protocol
 # attributes without a separate import of driver_roles.
 from dynastore.models.protocols.driver_roles import DriverSla as DriverSla  # re-export
+from dynastore.models.protocols.teardown_lane import TeardownLane
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -180,6 +182,8 @@ class CollectionStore(Protocol):
     driver class.  It is returned by the driver discovery API and must not be
     stored in the database.
     """
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     capabilities: FrozenSet[str]
     # sla: ClassVar[Optional[DriverSla]]   — mandatory when TRANSFORM is declared.
@@ -523,6 +527,8 @@ class CatalogStore(Protocol):
     ``capabilities`` — same semantics as :class:`CollectionStore`.
     ``sla``           — mandatory when ``EntityStoreCapability.TRANSFORM``.
     """
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     capabilities: FrozenSet[str]
     # sla: ClassVar[Optional[DriverSla]]  — mandatory when TRANSFORM is declared.

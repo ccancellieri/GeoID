@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.storage_driver import Capability
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.concurrency import run_in_thread
@@ -263,6 +264,8 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
 
     Satisfies ``CollectionItemsStore``.
     """
+
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     # OTF analytical/file-export driver — explicit-pin only.  Operators
     # who want Iceberg as a SEARCH or secondary-index target set the

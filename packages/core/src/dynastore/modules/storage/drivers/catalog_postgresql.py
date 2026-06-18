@@ -62,6 +62,7 @@ from dynastore.models.protocols.entity_store import (
     CatalogStore,
     EntityStoreCapability,
 )
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import (
     TypedDriver,
     _PluginDriverConfig,
@@ -232,6 +233,10 @@ class CatalogPostgresqlDriver(TypedDriver[CatalogPostgresqlDriverConfig]):
     inner drivers, each of which already filters the payload to its
     own column set via ``_PgCatalogCoreBase._upsert_catalog_row``.
     """
+
+    # Catalog metadata rows are in PG and are cleaned up inline with the
+    # delete transaction; the async cascade must not re-drop them.
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({
         EntityStoreCapability.READ,

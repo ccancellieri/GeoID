@@ -76,6 +76,7 @@ from dynastore.models.protocols.entity_store import (
     CollectionStore,
     EntityStoreCapability,
 )
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import (
     TypedDriver,
     _PluginDriverConfig,
@@ -328,6 +329,10 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
     so the routing layer recognises this single entry as covering
     everything the two raw drivers cover today.
     """
+
+    # Collection metadata rows are in PG and are cleaned up inline with the
+    # delete transaction; the async cascade must not re-drop them.
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
     # Collection metadata fallback for SEARCH (PG serves the
     # query-fallback path when ES is unavailable / not registered).

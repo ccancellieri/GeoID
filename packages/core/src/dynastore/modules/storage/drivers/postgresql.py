@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.storage_driver import Capability
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.protocols import ModuleProtocol
@@ -94,6 +95,11 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
     PG-based item services, preserving all sidecar logic, query
     optimization, and streaming.
     """
+
+    # PG storage is dropped inline inside the delete transaction (items-table
+    # DROP is atomic with the registry row drop); the async cascade must NOT
+    # re-drop it or a second DROP TABLE races the inline drop for the table lock.
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
     # PG is the truth-source for items (WRITE primary in routing
     # defaults) and the ``geometry_exact`` fallback for SEARCH.  WRITE +

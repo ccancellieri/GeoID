@@ -65,6 +65,7 @@ from dynastore.models.protocols.entity_store import (
     CollectionLifecycle,
     EntityStoreCapability,
 )
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
@@ -484,6 +485,7 @@ class CollectionCorePostgresqlDriver(
 
     _table: ClassVar[str] = "collection_core"
     _columns: ClassVar[Tuple[str, ...]] = _COLLECTION_CORE_COLUMNS
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
     # Collection metadata fallback for SEARCH (PG serves the
     # query-fallback path when ES is unavailable / not registered).
@@ -801,6 +803,7 @@ class CatalogCorePostgresqlDriver(
 
     _table: ClassVar[str] = "catalog_core"
     _columns: ClassVar[Tuple[str, ...]] = _CATALOG_CORE_COLUMNS
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,

@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import ClassVar, FrozenSet, Optional, Tuple
 
 from dynastore.models.protocols.entity_store import EntityStoreCapability
+from dynastore.models.protocols.teardown_lane import TeardownLane
 from dynastore.models.protocols.typed_driver import TypedDriver
 from dynastore.modules.storage.driver_config import DriverPluginConfig
 from dynastore.modules.storage.drivers.core_postgresql import (
@@ -85,6 +86,7 @@ class CollectionStacPostgresqlDriver(
 
     _table: ClassVar[str] = "collection_stac"
     _columns: ClassVar[Tuple[str, ...]] = _COLLECTION_STAC_COLUMNS
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,
@@ -112,6 +114,7 @@ class CatalogStacPostgresqlDriver(
 
     _table: ClassVar[str] = "catalog_stac"
     _columns: ClassVar[Tuple[str, ...]] = _CATALOG_STAC_COLUMNS
+    teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,
