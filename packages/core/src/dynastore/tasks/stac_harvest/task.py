@@ -447,7 +447,7 @@ async def _apply_harvest_presets(
     scope: str,
     catalog_id: str,
     drivers: "RoutingDrivers",
-) -> None:
+) -> Optional[str]:
     """Pin storage routing + enable STAC for the harvest, at ``scope``.
 
     Two orthogonal presets are applied at the resolved scope (catalog scope for a
@@ -470,8 +470,10 @@ async def _apply_harvest_presets(
     function falls back to the direct ``preset.apply(...)`` path so a deployment
     without IAM still gets the configs applied.  ``PresetConflictError`` (an
     idempotent re-run with the same params, or an in-progress concurrent apply)
-    is swallowed and logged at INFO.  All operations are best-effort: failures
-    are logged at WARNING and never abort the harvest.
+    is swallowed and logged at INFO.  All operations are best-effort: a failure
+    never aborts the harvest, but it IS returned as a short error string (and the
+    caller folds it into the job-result errors) so a routing that silently fell
+    back to the platform default is visible.  Returns ``None`` on success.
     """
     try:
         from dynastore.modules.storage.presets.routing import (
@@ -512,7 +514,7 @@ async def _apply_harvest_presets(
             await _apply_presets_direct(
                 ctx, scope, catalog_id, drivers, routing_params, storage_params
             )
-            return
+            return None
 
         # Audited path — routes through apply_preset lifecycle for the audit row,
         # idempotency, and stored revoke descriptor.  Routing first, then SSOT.
@@ -544,11 +546,18 @@ async def _apply_harvest_presets(
                 scope, conflict_exc,
             )
 
+        return None
+
     except Exception as exc:
+        # Surface the failure to the caller (folded into the job result errors)
+        # rather than silently masking it — an unpinned routing here means the
+        # catalog falls back to the platform default instead of the requested
+        # ``drivers``, which is otherwise invisible (the harvest still "succeeds").
         logger.warning(
             "stac_harvest: preset apply failed (non-fatal) on %s: %s(%s)",
             scope, type(exc).__name__, exc,
         )
+        return f"routing_preset_apply:{type(exc).__name__}:{str(exc)[:240]}"
 
 
 async def _harvest_collection(
@@ -645,9 +654,11 @@ async def run_harvest(
         # default — re-triggering the #2259 fan-out-rollback on an ES-only
         # deployment.  The target collection inherits both pinned templates.
         if preset_ctx is not None:
-            await _apply_harvest_presets(
+            perr = await _apply_harvest_presets(
                 preset_ctx, base_scope, target_catalog, request.drivers
             )
+            if perr:
+                stats.errors.append(perr)
         stats.collections_seen = 1
         await _harvest_collection(
             catalogs, request, source_coll,
@@ -658,9 +669,11 @@ async def run_harvest(
     # Catalog source — pin routing/STAC at catalog scope BEFORE the loop, then
     # walk /collections.
     if preset_ctx is not None:
-        await _apply_harvest_presets(
+        perr = await _apply_harvest_presets(
             preset_ctx, base_scope, target_catalog, request.drivers
         )
+        if perr:
+            stats.errors.append(perr)
 
     async for coll_raw in iter_collections(request.catalog_url):
         if request.max_collections and stats.collections_seen >= request.max_collections:

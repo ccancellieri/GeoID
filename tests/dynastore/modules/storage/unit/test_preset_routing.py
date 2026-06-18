@@ -41,6 +41,7 @@ from dynastore.modules.storage.presets.stac import StacPresetParams
 from dynastore.modules.storage.routing_config import (
     CollectionRoutingConfig,
     ItemsRoutingConfig,
+    Operation,
 )
 
 
@@ -57,6 +58,17 @@ def _refs(bundle) -> set:
 
 def _slots(bundle) -> list:
     return [e.slot for e in bundle.entries]
+
+
+def _slot_cfg(bundle, slot):
+    for e in bundle.entries:
+        if e.slot == slot:
+            return e.instance
+    return None
+
+
+def _op_refs(cfg, op) -> set:
+    return {e.driver_ref for e in cfg.operations.get(op, [])}
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +125,28 @@ def test_pg_drivers_pg_only():
     assert refs == {"collection_postgresql_driver", "items_postgresql_driver"}
 
 
-def test_es_drivers_es_only():
+def test_es_drivers_items_es_only_metadata_stays_pg():
+    """drivers=es → items ES-only; collection METADATA stays PG system-of-record.
+
+    The ES collection driver is a write-only secondary index, never a READ
+    store, so authoring it as a collection READ/WRITE primary fails routing
+    validation (the regression that left an ES catalog on the dual PG+ES
+    default).  Collection READ/WRITE must reference PG only; ES is appended as
+    the secondary index + SEARCH by self-registration at apply time.
+    """
     b = _build_routing_bundle(RoutingPresetParams(drivers=RoutingDrivers.ES), catalog_id="c1")
-    refs = _refs(b)
-    assert refs == {"collection_elasticsearch_driver", "items_elasticsearch_driver"}
+
+    # Items tier is genuinely ES-only (items ES driver is a full store).
+    items = _slot_cfg(b, "items_template")
+    assert _op_refs(items, Operation.WRITE) == {"items_elasticsearch_driver"}
+    assert _op_refs(items, Operation.READ) == {"items_elasticsearch_driver"}
+
+    # Collection metadata READ/WRITE stay PG (the crash guard).
+    coll = _slot_cfg(b, "collection_template")
+    assert _op_refs(coll, Operation.READ) == {"collection_postgresql_driver"}
+    assert _op_refs(coll, Operation.WRITE) == {"collection_postgresql_driver"}
+    # ES remains the collection SEARCH backend.
+    assert "collection_elasticsearch_driver" in _op_refs(coll, Operation.SEARCH)
 
 
 def test_pg_es_drivers_both_tiers():
