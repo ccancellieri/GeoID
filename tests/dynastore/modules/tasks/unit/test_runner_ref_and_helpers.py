@@ -189,11 +189,13 @@ def test_complete_task_accepts_owner_id_guard_and_returns_bool():
 def test_fail_task_owner_guard_is_conditional_in_sql():
     """The ``owner_id`` predicate is appended to the WHERE clause ONLY when an
     owner_id is supplied — every existing caller (no owner_id) keeps today's
-    unconditional ``WHERE task_id = :task_id`` behaviour. ``ROWCOUNT`` handler
-    backs the bool return."""
+    unconditional ``WHERE task_id = :task_id`` behaviour. The ``ONE_DICT``
+    ``RETURNING`` read backs the bool return (``row is None`` ⇒ ``False``) and
+    also feeds the terminal ``task.failed`` event emission."""
     src = inspect.getsource(_tasks_module().fail_task)
     assert 'owner_guard = " AND owner_id = :owner_id" if owner_id is not None else ""' in src
-    assert "ResultHandler.ROWCOUNT" in src
+    assert "ResultHandler.ONE_DICT" in src
+    assert "if row is None:" in src and "return False" in src
     # The hard-cap retry logic must be untouched by the guard.
     assert "LEAST(max_retries, :hard_cap)" in src
 
