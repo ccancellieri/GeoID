@@ -1707,11 +1707,19 @@ async def _validate_collection_routing_config(
                 f"Available: {sorted(driver_index)}"
             )
 
-    # Validate operations[WRITE] entries (CollectionStore drivers — primary
-    # metadata store plus any secondary-index sinks, e.g. ES). Secondary
-    # indexes are WRITE targets distinguished by driver role, not a separate
-    # operation.
+    # Validate operations[WRITE] entries (CollectionStore drivers — the primary
+    # metadata store). Secondary-index sinks (``secondary_index=True``, e.g. the
+    # ES ``CollectionIndexer``) are WRITE targets distinguished by driver role,
+    # not a separate operation — and they are NOT ``CollectionStore`` drivers, so
+    # they must be skipped here. They are self-registered from the
+    # ``CollectionIndexer`` registry just below (and re-stamped on round-trip),
+    # and the runtime router skips any unregistered entry at dispatch. Validating
+    # them against the store registry is what rejected a legitimate
+    # ``collection_elasticsearch_driver`` secondary index and rolled back an
+    # ES-catalog routing preset apply, dropping the catalog to the PG+ES default.
     for entry in config.operations.get(Operation.WRITE, []):
+        if entry.secondary_index:
+            continue
         if entry.driver_ref not in store_driver_index:
             raise ValueError(
                 f"Collection metadata routing config: operations[WRITE] driver "

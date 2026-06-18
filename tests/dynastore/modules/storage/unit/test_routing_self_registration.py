@@ -1663,3 +1663,76 @@ def test_option_a_792_reproducer_search_index_lock():
     refs = {e.driver_ref for e in target_ops[Operation.SEARCH]}
     # The exact #792 symptom — missing driver re-appearing — does not occur.
     assert refs == {"items_elasticsearch_driver"}
+
+
+def test_validate_collection_routing_skips_secondary_index_write_entry():
+    """A ``secondary_index=True`` WRITE entry whose driver_ref is not a
+    registered ``CollectionStore`` must NOT fail collection routing validation.
+
+    Regression for the ES-catalog routing preset apply: the default
+    ``CollectionRoutingConfig`` self-registers the ES ``CollectionIndexer``
+    into ``operations[WRITE]`` (``secondary_index=True``).  The ES driver is an
+    indexer, not a ``CollectionStore``, so validating it against the store
+    registry rejected it and rolled back the whole routing bundle, dropping an
+    ES catalog to the PG+ES default.  Secondary-index sinks are skipped here;
+    they are validated by their own discovery-driven self-registration and the
+    runtime router skips any unregistered entry at dispatch.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from dynastore.modules.storage.routing_config import (
+        WriteMode,
+        _validate_collection_routing_config,
+    )
+
+    cfg = CollectionRoutingConfig()
+    cfg.operations.clear()
+    cfg.operations[Operation.WRITE] = [
+        OperationDriverEntry(
+            driver_ref="collection_elasticsearch_driver",
+            secondary_index=True,
+            write_mode=WriteMode.ASYNC,
+            on_failure=FailurePolicy.OUTBOX,
+            source="auto",
+        ),
+    ]
+    cfg.operations[Operation.READ] = []
+
+    # No collection drivers registered → store registry is empty.  Pre-fix this
+    # raised ValueError on the secondary-index ES entry; post-fix it is skipped.
+    with patch("dynastore.tools.discovery.get_protocols", lambda proto: []):
+        asyncio.run(_validate_collection_routing_config(
+            cfg, catalog_id=None, collection_id=None, db_resource=None,
+        ))
+
+    write_refs = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
+    assert "collection_elasticsearch_driver" in write_refs
+
+
+def test_validate_collection_routing_still_rejects_unknown_primary_store():
+    """A non-secondary (primary) WRITE entry with an unregistered driver_ref
+    still hard-fails — the secondary-index skip must not weaken typo
+    protection for the primary metadata store.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    import pytest
+
+    from dynastore.modules.storage.routing_config import (
+        _validate_collection_routing_config,
+    )
+
+    cfg = CollectionRoutingConfig()
+    cfg.operations.clear()
+    cfg.operations[Operation.WRITE] = [
+        OperationDriverEntry(driver_ref="collection_postgres_typo", source="auto"),
+    ]
+    cfg.operations[Operation.READ] = []
+
+    with patch("dynastore.tools.discovery.get_protocols", lambda proto: []):
+        with pytest.raises(ValueError, match="operations\\[WRITE\\] driver"):
+            asyncio.run(_validate_collection_routing_config(
+                cfg, catalog_id=None, collection_id=None, db_resource=None,
+            ))
