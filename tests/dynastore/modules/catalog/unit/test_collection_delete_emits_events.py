@@ -107,10 +107,21 @@ def test_soft_delete_branch_emits_collection_deletion() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _FakeConn:
+    """Minimal stand-in for the txn connection. Supports ``execute`` so the
+    delete txn's ``SET LOCAL idle_in_transaction_session_timeout`` relaxation
+    (a direct ``conn.execute(text(...))``) is a no-op in this unit test. The
+    relaxation itself is pinned in test_hard_delete_idle_timeout_relaxed.py.
+    """
+
+    async def execute(self, *a, **k):
+        return None
+
+
 @asynccontextmanager
 async def _stub_txn(_engine):
     """Yield a sentinel "conn" without opening a real transaction."""
-    yield object()
+    yield _FakeConn()
 
 
 @pytest.fixture
@@ -129,6 +140,20 @@ def record_emit(monkeypatch):
     monkeypatch.setattr(
         collection_service_mod, "managed_transaction", _stub_txn
     )
+
+    # delete_collection's first statement inside the txn relaxes
+    # idle_in_transaction_session_timeout via `DDLQuery(...).execute(conn)`.
+    # The sentinel `object()` conn above cannot execute SQL, so stub DDLQuery
+    # to a no-op. The relaxation itself is pinned in
+    # test_hard_delete_idle_timeout_relaxed.py.
+    class _NoopQuery:
+        def __init__(self, *a, **k):
+            pass
+
+        async def execute(self, *a, **k):
+            return None
+
+    monkeypatch.setattr(collection_service_mod, "DDLQuery", _NoopQuery)
     return calls
 
 

@@ -1766,6 +1766,35 @@ class CatalogService(CatalogsProtocol):
         config_snapshot: Dict[str, Any] = {}
         physical_schema: Optional[str] = None
         async with managed_transaction(get_catalog_engine(db_resource)) as conn:
+            if db_resource is None:
+                # Relax idle_in_transaction_session_timeout for THIS delete
+                # transaction only (SET LOCAL auto-reverts on commit/rollback).
+                #
+                # _purge_catalog_storage calls snapshot_and_enqueue inside this
+                # transaction; its RoutingDrivenCascadeOwner.describe_scope reads
+                # routing config via ConfigsProtocol on a *second* pooled
+                # connection (by design — it must observe live, pre-drop config),
+                # leaving this transaction's connection idle. Under a cold config
+                # cache or pool contention that idle gap exceeds the 30s default,
+                # PostgreSQL terminates the backend, and the next statement fails
+                # with "the underlying connection is closed", leaving the catalog
+                # stuck mid-delete. Same mechanism and fix as the collection
+                # hard-delete path in CollectionService.delete_collection.
+                #
+                # Direct conn.execute (NOT DDLQuery): DDLQuery wraps the statement
+                # in a SAVEPOINT when the connection is already in a transaction,
+                # and a SET LOCAL scoped to that savepoint would not survive its
+                # release. The transaction stays bounded by lock_timeout and
+                # per-statement command_timeout and is driven by the background
+                # task runner, so disabling the idle reaper here is safe.
+                from typing import cast
+
+                from sqlalchemy import text
+                from sqlalchemy.ext.asyncio import AsyncConnection
+
+                await cast(AsyncConnection, conn).execute(
+                    text("SET LOCAL idle_in_transaction_session_timeout = '0'")
+                )
             if force:
                 # Resolve the physical schema before purge (purge will delete
                 # the row so we capture it here for the post-txn async hook).

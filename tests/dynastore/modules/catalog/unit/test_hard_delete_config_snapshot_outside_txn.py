@@ -99,11 +99,21 @@ async def test_runtime_snapshot_runs_before_txn_and_without_conn(monkeypatch):
     events: list[str] = []
     received: dict = {}
 
+    class _FakeConn:
+        """Supports ``execute`` so the delete txn's SET LOCAL
+        idle_in_transaction_session_timeout relaxation (a direct
+        ``conn.execute(text(...))``) is a no-op here. The relaxation is pinned
+        in test_hard_delete_idle_timeout_relaxed.py.
+        """
+
+        async def execute(self, *a, **k):
+            return None
+
     @asynccontextmanager
     async def _recording_txn(_engine):
         events.append("txn_enter")
         try:
-            yield object()
+            yield _FakeConn()
         finally:
             events.append("txn_exit")
 

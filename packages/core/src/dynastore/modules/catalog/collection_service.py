@@ -1327,6 +1327,52 @@ class CollectionService:
 
         phys_table: Optional[str] = None
         async with managed_transaction(db_resource or self.engine) as conn:
+            if db_resource is None:
+                # Relax idle_in_transaction_session_timeout for THIS delete
+                # transaction only (SET LOCAL auto-reverts on commit/rollback).
+                #
+                # The hard-delete path legitimately interleaves second-connection
+                # reads while this connection is open and idle: the cascade
+                # snapshot below calls describe_scope, whose
+                # RoutingDrivenCascadeOwner resolves routing config via
+                # ConfigsProtocol on its *own* pooled connection (by design — it
+                # must observe live, pre-drop config), and _route_delete_metadata
+                # does the same during the purge. While those reads run on the
+                # second connection, this transaction's connection sits idle.
+                #
+                # The #2250 fix moved the top-level config snapshot out of the
+                # transaction, but these in-txn second-connection reads remain by
+                # design and a regression test pins describe_scope to run inside
+                # the transaction. Under a cold config cache or pool contention
+                # the idle gap exceeds the 30s default, PostgreSQL terminates the
+                # backend, and the next statement fails with "the underlying
+                # connection is closed" (e.g. SAVEPOINT or PreparedStatement
+                # .fetch), leaving the row stuck in DELETING after the GCS folder
+                # was already removed by the async destroyer.
+                #
+                # Disabling the idle reaper here is safe: the transaction is
+                # still bounded by lock_timeout and per-statement command_timeout,
+                # and it is driven by the background task runner — never an
+                # abandoned client session that the reaper exists to collect.
+                #
+                # Issue the SET LOCAL directly on the outer connection — NOT via
+                # DDLQuery. DDLQuery wraps the statement in managed_transaction,
+                # which opens a SAVEPOINT when the connection is already in a
+                # transaction (query_executor.sync/async managed_transaction);
+                # a SET LOCAL scoped to that savepoint would not survive its
+                # release and would never apply to the outer delete transaction.
+                # A direct conn.execute runs in the outer transaction, exactly as
+                # the executor itself issues SET LOCAL statement_timeout/lock_timeout.
+                from typing import cast
+
+                from sqlalchemy import text
+                from sqlalchemy.ext.asyncio import AsyncConnection
+
+                # db_resource is None here, so `conn` is the AsyncConnection we
+                # acquired from managed_transaction(self.engine).
+                await cast(AsyncConnection, conn).execute(
+                    text("SET LOCAL idle_in_transaction_session_timeout = '0'")
+                )
             phys_schema = await self._resolve_physical_schema(
                 catalog_id, db_resource=conn
             )
