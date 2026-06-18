@@ -64,7 +64,8 @@ from .items_es_public import ItemsEsPublicPreset  # noqa: E402
 from .private_catalog import PrivateCatalogPreset  # noqa: E402
 from .private_collection import PrivateCollectionPreset  # noqa: E402
 from .public_catalog import PublicCatalogPreset  # noqa: E402
-from .stac import StacPreset, StacRoutingPreset, StacStoragePreset  # noqa: E402
+from .routing import RoutingPreset  # noqa: E402
+from .stac import StacPreset, StacStoragePreset  # noqa: E402
 from .pg_only_catalog import PgOnlyCatalogPreset  # noqa: E402
 
 register_preset(PublicCatalogPreset())
@@ -74,10 +75,11 @@ register_preset(PrivateCollectionPreset())
 register_preset(ItemsEsPrivatePreset())
 register_preset(ItemsEsPublicPreset())
 register_preset(DEMO_DATA_PRESET)
-# The two single-responsibility STAC children must register before the
-# ``stac`` composite — the registry validates ``compose`` references at
-# registration time, so the children must already be present.
-register_preset(StacRoutingPreset())
+# The two single-responsibility children of the ``stac`` composite —
+# ``routing`` and ``stac_storage`` — must register before it: the registry
+# validates ``compose`` references at registration time, so the children must
+# already be present.
+register_preset(RoutingPreset())
 register_preset(StacStoragePreset())
 register_preset(StacPreset())
 register_preset(PgOnlyCatalogPreset())
@@ -121,8 +123,8 @@ __all__ = [
     "PrivateCatalogPreset",
     "PrivateCollectionPreset",
     "PublicCatalogPreset",
+    "RoutingPreset",
     "StacPreset",
-    "StacRoutingPreset",
     "StacStoragePreset",
     "find_preset",
     "get_preset",

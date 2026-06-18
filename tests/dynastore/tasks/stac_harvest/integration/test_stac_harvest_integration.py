@@ -205,7 +205,7 @@ async def test_harvest_es_only_items_readable_and_searchable(
                 inputs={
                     "catalog_url": _FAKE_CATALOG_URL,
                     "target_catalog": catalog_id,
-                    "storage_backend": "es",
+                    "drivers": "es",
                     "max_collections": 0,
                     "max_items": 0,
                     "with_assets": False,
@@ -308,7 +308,7 @@ async def test_harvest_es_only_items_readable_and_searchable(
         routing = await configs.get_config(ItemsRoutingConfig, catalog_id=catalog_id)
         assert routing is not None, (
             f"ItemsRoutingConfig not persisted for catalog={catalog_id}. "
-            "Regression: _apply_stac_presets did not write the routing config."
+            "Regression: the harvest preset apply did not write the routing config."
         )
         ops = routing.operations or {}
         write_drivers = [e.driver_ref for e in ops.get("WRITE", [])]

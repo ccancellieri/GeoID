@@ -100,7 +100,7 @@ async def test_preset_apply_submits_stac_harvest_process() -> None:
     assert call["inputs"]["max_collections"] == 0
     assert call["inputs"]["max_items"] == 0
     assert call["inputs"]["with_assets"] is True
-    assert call["inputs"]["storage_backend"] == "es"
+    assert call["inputs"]["drivers"] == "es"
 
     # Descriptor should record the job id and parameters.
     assert descriptor.payload["job_id"] == "job-abc-123"
@@ -140,7 +140,7 @@ async def test_preset_apply_explicit_target_catalog_overrides_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_preset_apply_maps_all_params() -> None:
-    """Custom max_collections / max_items / with_assets / storage_backend are forwarded."""
+    """Custom max_collections / max_items / with_assets / drivers are forwarded."""
     from dynastore.extensions.stac.presets.stac_harvester import (
         STAC_HARVESTER_PRESET,
         StacHarvesterParams,
@@ -158,7 +158,7 @@ async def test_preset_apply_maps_all_params() -> None:
         max_collections=5,
         max_items=100,
         with_assets=False,
-        storage_backend="es_pg",
+        drivers="pg_es",
     )
 
     with patch(
@@ -171,7 +171,7 @@ async def test_preset_apply_maps_all_params() -> None:
     assert inp["max_collections"] == 5
     assert inp["max_items"] == 100
     assert inp["with_assets"] is False
-    assert inp["storage_backend"] == "es_pg"
+    assert inp["drivers"] == "pg_es"
 
 
 @pytest.mark.asyncio
@@ -259,32 +259,47 @@ def test_preset_dry_run_returns_trigger_task_entry() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. storage_backend field — defaults, mapping, and priority
+# 3. drivers field — defaults, and legacy storage_backend mapping
 # ---------------------------------------------------------------------------
 
 
-def test_harvest_request_default_backend_is_es() -> None:
-    """StacHarvestRequest defaults storage_backend to 'es'."""
+def test_harvest_request_default_drivers_is_es() -> None:
+    """StacHarvestRequest defaults drivers to 'es'."""
     from dynastore.tasks.stac_harvest.models import StacHarvestRequest
+    from dynastore.modules.storage.presets.routing import RoutingDrivers
 
     req = StacHarvestRequest(
         catalog_url="https://example.test/stac",
         target_catalog="my-cat",
     )
-    assert req.storage_backend == "es"
+    assert req.drivers == RoutingDrivers.ES
 
 
-def test_preset_params_default_backend_is_es() -> None:
-    """StacHarvesterParams defaults storage_backend to 'es'."""
+def test_harvest_request_legacy_storage_backend_maps_to_drivers() -> None:
+    """Legacy storage_backend on StacHarvestRequest maps onto drivers."""
+    from dynastore.tasks.stac_harvest.models import StacHarvestRequest
+    from dynastore.modules.storage.presets.routing import RoutingDrivers
+
+    req = StacHarvestRequest(
+        catalog_url="https://example.test/stac",
+        target_catalog="my-cat",
+        storage_backend="es_pg",
+    )
+    assert req.drivers == RoutingDrivers.PG_ES
+
+
+def test_preset_params_default_drivers_is_es() -> None:
+    """StacHarvesterParams defaults drivers to 'es'."""
     from dynastore.extensions.stac.presets.stac_harvester import StacHarvesterParams
+    from dynastore.modules.storage.presets.routing import RoutingDrivers
 
     p = StacHarvesterParams(url="https://example.test/stac")
-    assert p.storage_backend == "es"
+    assert p.drivers == RoutingDrivers.ES
 
 
 @pytest.mark.asyncio
-async def test_preset_apply_forwards_storage_backend() -> None:
-    """apply() forwards resolved storage_backend (not es_only) to stac_harvest inputs."""
+async def test_preset_apply_forwards_drivers() -> None:
+    """apply() forwards resolved drivers (legacy storage_backend mapped) to inputs."""
     from dynastore.extensions.stac.presets.stac_harvester import (
         STAC_HARVESTER_PRESET,
         StacHarvesterParams,
@@ -297,6 +312,7 @@ async def test_preset_apply_forwards_storage_backend() -> None:
         return MagicMock(jobID="job-be")
 
     ctx = _make_ctx()
+    # Legacy storage_backend still accepted and mapped to drivers=pg_es.
     params = StacHarvesterParams(url="https://example.test/stac", storage_backend="es_pg")
 
     with patch(
@@ -306,7 +322,8 @@ async def test_preset_apply_forwards_storage_backend() -> None:
         await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
 
     inp = captured[0]["inputs"]
-    assert inp["storage_backend"] == "es_pg"
+    assert inp["drivers"] == "pg_es"
+    assert "storage_backend" not in inp
     assert "es_only" not in inp
 
 

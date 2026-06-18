@@ -32,9 +32,9 @@ Re-applying re-syncs idempotently.
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Literal, Optional, Tuple, Type
+from typing import Any, ClassVar, Optional, Tuple, Type
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from dynastore.modules.storage.presets.preset import (
     AppliedDescriptor,
@@ -43,8 +43,16 @@ from dynastore.modules.storage.presets.preset import (
     PresetPlanEntry,
 )
 from dynastore.modules.storage.presets.protocol import PresetTier
+from dynastore.modules.storage.presets.routing import RoutingDrivers
 
 logger = logging.getLogger(__name__)
+
+# Legacy ``storage_backend`` literal → ``drivers`` combination.
+_LEGACY_BACKEND_TO_DRIVERS = {
+    "es": RoutingDrivers.ES,
+    "es_pg": RoutingDrivers.PG_ES,
+    "pg": RoutingDrivers.PG,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +78,14 @@ class StacHarvesterParams(BaseModel):
             "scope is catalog-scoped."
         ),
     )
+    target_collection: Optional[str] = Field(
+        default=None,
+        description=(
+            "Destination collection id for a single-collection harvest (when "
+            "``url`` points at one STAC Collection).  When unset, the source "
+            "collection's id is used.  Ignored for a full-catalog harvest."
+        ),
+    )
     max_collections: int = Field(
         default=0,
         ge=0,
@@ -87,14 +103,14 @@ class StacHarvesterParams(BaseModel):
             "(dynastore stores only the href, never the bytes)."
         ),
     )
-    storage_backend: Literal["es", "es_pg", "pg"] = Field(
-        default="es",
+    drivers: RoutingDrivers = Field(
+        default=RoutingDrivers.ES,
         description=(
-            "Item storage backend for this harvest.  "
-            "``es`` routes item WRITE and READ directly to Elasticsearch so "
-            "harvested items are immediately searchable without waiting for the "
-            "async ES-index drain.  ``es_pg`` writes to PG primary with async "
-            "ES secondary index.  ``pg`` uses PG only."
+            "Storage routing for this harvest.  ``es`` routes items directly to "
+            "public Elasticsearch (immediately searchable); ``pg_es`` writes PG "
+            "primary + async ES secondary; ``pg`` uses PG only; ``pg_pes`` writes "
+            "PG primary + private ES secondary.  Legacy ``storage_backend`` "
+            "(es / es_pg / pg) is still accepted and mapped to this field."
         ),
     )
 
@@ -104,6 +120,17 @@ class StacHarvesterParams(BaseModel):
         if not v.startswith("https://") and not v.startswith("http://"):
             raise ValueError("url must start with http:// or https://")
         return v.rstrip("/")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_legacy_storage_backend(cls, data):
+        """Map a legacy ``storage_backend`` input onto ``drivers`` (unless given)."""
+        if isinstance(data, dict) and "drivers" not in data:
+            legacy = data.get("storage_backend")
+            mapped = _LEGACY_BACKEND_TO_DRIVERS.get(legacy) if legacy else None
+            if mapped is not None:
+                data = {**data, "drivers": mapped}
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +203,11 @@ class _StacHarvesterPreset:
                         "inputs": {
                             "catalog_url": p.url,
                             "target_catalog": target,
+                            "target_collection": p.target_collection,
                             "max_collections": p.max_collections,
                             "max_items": p.max_items,
                             "with_assets": p.with_assets,
-                            "storage_backend": p.storage_backend,
+                            "drivers": p.drivers.value,
                         },
                     },
                 ),
@@ -215,10 +243,11 @@ class _StacHarvesterPreset:
         inputs: dict[str, Any] = {
             "catalog_url": p.url,
             "target_catalog": target_catalog,
+            "target_collection": p.target_collection,
             "max_collections": p.max_collections,
             "max_items": p.max_items,
             "with_assets": p.with_assets,
-            "storage_backend": p.storage_backend,
+            "drivers": p.drivers.value,
         }
 
         exec_request = _proc_models.ExecuteRequest(inputs=inputs)

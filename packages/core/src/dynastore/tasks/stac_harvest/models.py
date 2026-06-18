@@ -18,29 +18,53 @@
 
 """Input model for the stac_harvest OGC Process."""
 
-from typing import Literal
+from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from dynastore.modules.storage.presets.routing import RoutingDrivers
+
+# Legacy ``storage_backend`` literal → ``drivers`` combination.  Older callers
+# POST ``storage_backend`` (es / es_pg / pg); map it to the routing ``drivers``
+# enum so those requests keep working.
+_LEGACY_BACKEND_TO_DRIVERS = {
+    "es": RoutingDrivers.ES,
+    "es_pg": RoutingDrivers.PG_ES,
+    "pg": RoutingDrivers.PG,
+}
 
 
 class StacHarvestRequest(BaseModel):
     """Inputs for the ``stac_harvest`` OGC Process.
 
-    Harvests a remote STAC catalog (``catalog_url``) into a local dynastore
-    catalog (``target_catalog``).  Collections and items are upserted
-    idempotently, keyed on the STAC ``id`` field.
+    Harvests a remote STAC source into a local dynastore catalog.  The source
+    ``catalog_url`` may point at a STAC **catalog** (exposes ``/collections``)
+    or directly at a single STAC **collection** (a document whose ``type`` is
+    ``Collection``): the task auto-detects which and harvests accordingly.
+    Collections and items are upserted idempotently, keyed on the STAC ``id``.
     """
 
     catalog_url: str = Field(
         ...,
         description=(
-            "Base URL of the source STAC catalog — must expose "
-            "/collections and /collections/{id}/items."
+            "Source STAC URL.  Either a catalog base that exposes /collections "
+            "and /collections/{id}/items, or a single collection document "
+            "(type=Collection) to harvest just that collection."
         ),
     )
     target_catalog: str = Field(
         ...,
         description="ID of the local dynastore catalog to write into.",
+    )
+    target_collection: Optional[str] = Field(
+        default=None,
+        description=(
+            "Destination collection id for a single-collection harvest.  When "
+            "the source URL points at one collection and this is set, items "
+            "land in this collection and routing is pinned at collection scope; "
+            "when unset, the source collection's id is used.  Ignored when the "
+            "source is a full catalog."
+        ),
     )
     max_collections: int = Field(
         default=0,
@@ -59,14 +83,15 @@ class StacHarvestRequest(BaseModel):
             "(dynastore stores only the href, never the bytes)."
         ),
     )
-    storage_backend: Literal["es", "es_pg", "pg"] = Field(
-        default="es",
+    drivers: RoutingDrivers = Field(
+        default=RoutingDrivers.ES,
         description=(
-            "Item storage backend for this harvest.  "
-            "``es`` routes item WRITE and READ directly to Elasticsearch so "
-            "harvested items are immediately searchable without waiting for the "
-            "async ES-index drain.  ``es_pg`` writes to PG primary with an async "
-            "ES secondary index (default platform routing).  ``pg`` uses PG only."
+            "Storage routing for this harvest (applied via the ``routing`` "
+            "preset before any write).  ``es`` routes items directly to public "
+            "Elasticsearch so they are immediately searchable; ``pg_es`` writes "
+            "PG primary + async ES secondary; ``pg`` uses PG only; ``pg_pes`` "
+            "writes PG primary + private ES secondary.  Legacy ``storage_backend`` "
+            "(es / es_pg / pg) is still accepted and mapped to this field."
         ),
     )
 
@@ -76,3 +101,18 @@ class StacHarvestRequest(BaseModel):
         if not v.startswith("https://") and not v.startswith("http://"):
             raise ValueError("catalog_url must start with http:// or https://")
         return v.rstrip("/")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_legacy_storage_backend(cls, data):
+        """Map a legacy ``storage_backend`` input onto ``drivers``.
+
+        Only applied when ``drivers`` was not given explicitly, so a caller can
+        migrate at its own pace; the legacy key is otherwise ignored.
+        """
+        if isinstance(data, dict) and "drivers" not in data:
+            legacy = data.get("storage_backend")
+            mapped = _LEGACY_BACKEND_TO_DRIVERS.get(legacy) if legacy else None
+            if mapped is not None:
+                data = {**data, "drivers": mapped}
+        return data

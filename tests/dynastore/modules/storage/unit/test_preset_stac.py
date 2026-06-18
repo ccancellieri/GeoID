@@ -16,17 +16,16 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""StacPreset + StacStorageConfig no-DB unit tests.
+"""StacStoragePreset + StacPreset composite + StacStorageConfig no-DB unit tests.
 
-Verifies:
-- StacPreset is registered and retrievable by name.
-- build() matrix: for (level x storage) combos, the bundle contains the
-  right StacStorageConfig values and the expected routing driver_refs per
-  tier.  PG combos include the stac slice in wrapper driver-config sidecars.
+Routing-bundle shape is covered by ``test_preset_routing.py`` (the ``routing``
+preset owns routing now); this file verifies:
+- StacPreset is registered as the composite of ``routing`` + ``stac_storage``.
+- ``stac_storage`` writes ONLY the StacStorageConfig SSOT.
 - Sidecar resolution gate: StacItemsSidecar.get_default_config injects iff
   stac_items_pg=True in context (and collection_type != RECORDS).
 - default_catalog_sidecars / default_sidecars return CORE only by default.
-- _resolve_stac_items_pg helper: returns False when no ConfigsProtocol.
+- _resolve_stac_items_pg helper.
 """
 from __future__ import annotations
 
@@ -47,19 +46,9 @@ from dynastore.modules.storage.presets.preset import CompositePreset
 from dynastore.modules.storage.presets.stac import (
     StacPreset,
     StacPresetParams,
-    StacRoutingPreset,
     StacStoragePreset,
-    _build_stac_routing_bundle,
     _build_stac_storage_bundle,
 )
-from dynastore.modules.storage.routing_config import (
-    Operation,
-)
-
-
-def _routing(params: StacPresetParams):
-    """The routing-only bundle for ``params`` (no StacStorageConfig)."""
-    return _build_stac_routing_bundle(params, catalog_id="cat-1")
 
 
 def _storage(params: StacPresetParams):
@@ -110,214 +99,52 @@ def test_stac_backend_helpers():
 # ---------------------------------------------------------------------------
 
 
-def test_stac_preset_registered():
+def test_stac_preset_registered_as_routing_storage_composite():
     p = get_preset("stac")
     assert p.name == "stac"
     assert p.description, "preset must carry a non-empty description"
     assert isinstance(p, StacPreset)
-    # ``stac`` is now the composite of the two single-responsibility children,
-    # applied routing-first so the drivers the SSOT references exist before the
-    # signal flips.
     assert isinstance(p, CompositePreset)
-    assert p.compose == ("stac_routing", "stac_storage")
+    # ``stac`` composes the parametric ``routing`` preset (decide where data
+    # lives) then ``stac_storage`` (enable STAC), applied in that order.
+    assert p.compose == ("routing", "stac_storage")
 
 
-def test_stac_children_registered():
-    rp = get_preset("stac_routing")
+def test_stac_storage_child_registered():
     sp = get_preset("stac_storage")
-    assert isinstance(rp, StacRoutingPreset)
     assert isinstance(sp, StacStoragePreset)
-    # Both children share the same params model so the composite can forward
-    # one validated ``StacPresetParams`` to each.
-    assert rp.params_model is StacPresetParams
     assert sp.params_model is StacPresetParams
-    # Both are catalog-scopable (apply to a catalog scope, not just platform).
-    assert rp.catalog_scopable
     assert sp.catalog_scopable
 
 
+def test_routing_child_registered():
+    # The other composite child is the parametric ``routing`` preset.
+    rp = get_preset("routing")
+    assert rp.name == "routing"
+    assert rp.catalog_scopable
+
+
 # ---------------------------------------------------------------------------
-# The split invariant — routing carries NO SSOT; storage carries ONLY the SSOT
+# stac_storage carries ONLY the SSOT
 # ---------------------------------------------------------------------------
 
 
-def test_split_invariant_routing_has_no_ssot_storage_has_only_ssot():
+def test_storage_bundle_is_single_ssot_entry():
     params = StacPresetParams(stac_level=StacLevel.ITEMS, stac_storage=StacStorageBackend.ES_PG)
-    rb = _routing(params)
     sb = _storage(params)
-    # Storage bundle: exactly one entry, the StacStorageConfig SSOT.
     assert len(sb.entries) == 1
     assert sb.entries[0].config_cls is StacStorageConfig
-    # Routing bundle: zero StacStorageConfig entries (routing is orthogonal).
-    assert all(e.config_cls is not StacStorageConfig for e in rb.entries)
+    assert sb.entries[0].instance.stac_level == StacLevel.ITEMS
+    assert sb.entries[0].instance.stac_storage == StacStorageBackend.ES_PG
 
 
-# ---------------------------------------------------------------------------
-# Bundle shape — stac_level=NONE
-# ---------------------------------------------------------------------------
-
-
-def test_stac_none_storage_bundle_contains_only_ssot():
+def test_storage_bundle_none_carries_none_level():
     params = StacPresetParams(stac_level=StacLevel.NONE, stac_storage=StacStorageBackend.ES_PG)
     sb = _storage(params)
-    # Only the StacStorageConfig entry, carrying NONE (revoke removes it).
     assert len(sb.entries) == 1
     entry = sb.entries[0]
     assert entry.config_cls is StacStorageConfig
-    assert isinstance(entry.instance, StacStorageConfig)
     assert entry.instance.stac_level == StacLevel.NONE
-
-
-def test_stac_none_routing_bundle_is_empty():
-    params = StacPresetParams(stac_level=StacLevel.NONE, stac_storage=StacStorageBackend.ES_PG)
-    rb = _routing(params)
-    assert len(rb.entries) == 0
-
-
-# ---------------------------------------------------------------------------
-# Bundle shape — level=CATALOG x storage=ES
-# ---------------------------------------------------------------------------
-
-
-def _all_driver_refs(bundle) -> set:
-    refs = set()
-    for e in bundle.entries:
-        cfg = e.instance
-        if hasattr(cfg, "operations"):
-            for entries in cfg.operations.values():
-                for op_entry in entries:
-                    refs.add(op_entry.driver_ref)
-    return refs
-
-
-def test_stac_catalog_es_bundle():
-    params = StacPresetParams(stac_level=StacLevel.CATALOG, stac_storage=StacStorageBackend.ES)
-    rb = _routing(params)
-    sb = _storage(params)
-
-    # SSOT (in the storage bundle) carries the requested level + backend.
-    ssot = next(e for e in sb.entries if e.config_cls is StacStorageConfig)
-    assert ssot.instance.stac_level == StacLevel.CATALOG
-    assert ssot.instance.stac_storage == StacStorageBackend.ES
-
-    # Catalog routing entry present, no collection or items entries.
-    assert rb.catalog_routing is not None
-    assert rb.collection_template is None
-    assert rb.items_template is None
-
-    # ES driver present in catalog routing.
-    refs = _all_driver_refs(rb)
-    assert "catalog_elasticsearch_driver" in refs
-    assert "catalog_postgresql_driver" not in refs
-
-    # No PG driver-config entries (ES-only).
-    from dynastore.modules.storage.drivers.catalog_postgresql import (
-        CatalogPostgresqlDriverConfig,
-    )
-    pg_cfg_entries = [e for e in rb.entries if e.config_cls is CatalogPostgresqlDriverConfig]
-    assert len(pg_cfg_entries) == 0
-
-
-# ---------------------------------------------------------------------------
-# Bundle shape — level=COLLECTION x storage=ES_PG
-# ---------------------------------------------------------------------------
-
-
-def test_stac_collection_es_pg_bundle():
-    params = StacPresetParams(
-        stac_level=StacLevel.COLLECTION, stac_storage=StacStorageBackend.ES_PG
-    )
-    rb = _routing(params)
-    sb = _storage(params)
-
-    ssot = next(e for e in sb.entries if e.config_cls is StacStorageConfig)
-    assert ssot.instance.stac_level == StacLevel.COLLECTION
-    assert ssot.instance.stac_storage == StacStorageBackend.ES_PG
-
-    # Both catalog and collection routing present, no items.
-    assert rb.catalog_routing is not None
-    assert rb.collection_template is not None
-    assert rb.items_template is None
-
-    refs = _all_driver_refs(rb)
-    assert "catalog_postgresql_driver" in refs
-    assert "catalog_elasticsearch_driver" in refs
-    assert "collection_postgresql_driver" in refs
-    assert "collection_elasticsearch_driver" in refs
-    assert "items_postgresql_driver" not in refs
-    assert "items_elasticsearch_driver" not in refs
-
-    # The PG stac slice is NOT authored into the bundle: StacStorageConfig is
-    # the single SSOT and the catalog/collection wrappers add the stac slice at
-    # runtime by reading it. So neither bundle carries wrapper driver-config
-    # entries — only the SSOT (storage) + routing.
-    from dynastore.modules.storage.drivers.catalog_postgresql import (
-        CatalogPostgresqlDriverConfig,
-    )
-    from dynastore.modules.storage.drivers.collection_postgresql import (
-        CollectionPostgresqlDriverConfig,
-    )
-    entry_cls = {type(e.instance) for e in rb.entries} | {type(e.instance) for e in sb.entries}
-    assert CatalogPostgresqlDriverConfig not in entry_cls
-    assert CollectionPostgresqlDriverConfig not in entry_cls
-
-
-# ---------------------------------------------------------------------------
-# Bundle shape — level=ITEMS x storage=PG
-# ---------------------------------------------------------------------------
-
-
-def test_stac_items_pg_bundle():
-    params = StacPresetParams(stac_level=StacLevel.ITEMS, stac_storage=StacStorageBackend.PG)
-    rb = _routing(params)
-    sb = _storage(params)
-
-    ssot = next(e for e in sb.entries if e.config_cls is StacStorageConfig)
-    assert ssot.instance.stac_level == StacLevel.ITEMS
-    assert ssot.instance.stac_storage == StacStorageBackend.PG
-
-    # All three tiers present in routing.
-    assert rb.catalog_routing is not None
-    assert rb.collection_template is not None
-    assert rb.items_template is not None
-
-    refs = _all_driver_refs(rb)
-    assert "catalog_postgresql_driver" in refs
-    assert "collection_postgresql_driver" in refs
-    assert "items_postgresql_driver" in refs
-    # No ES when PG-only.
-    assert "catalog_elasticsearch_driver" not in refs
-    assert "collection_elasticsearch_driver" not in refs
-    assert "items_elasticsearch_driver" not in refs
-
-
-# ---------------------------------------------------------------------------
-# Bundle shape — level=ITEMS x storage=ES_PG (default params)
-# ---------------------------------------------------------------------------
-
-
-def test_stac_items_es_pg_bundle():
-    params = StacPresetParams(stac_level=StacLevel.ITEMS, stac_storage=StacStorageBackend.ES_PG)
-    rb = _routing(params)
-
-    assert rb.catalog_routing is not None
-    assert rb.collection_template is not None
-    assert rb.items_template is not None
-
-    refs = _all_driver_refs(rb)
-    assert "catalog_postgresql_driver" in refs
-    assert "catalog_elasticsearch_driver" in refs
-    assert "collection_postgresql_driver" in refs
-    assert "collection_elasticsearch_driver" in refs
-    assert "items_postgresql_driver" in refs
-    assert "items_elasticsearch_driver" in refs
-
-    # ES SEARCH entries in items routing.
-    search_refs = [
-        e.driver_ref
-        for e in rb.items_template.operations.get(Operation.SEARCH, [])
-    ]
-    assert "items_elasticsearch_driver" in search_refs
 
 
 # ---------------------------------------------------------------------------
@@ -375,11 +202,6 @@ def test_default_catalog_sidecars_core_only():
     )
 
 
-# ---------------------------------------------------------------------------
-# CollectionPgSidecarRegistry.default_sidecars — CORE only by default
-# ---------------------------------------------------------------------------
-
-
 def test_default_collection_sidecars_core_only():
     from dynastore.modules.storage.drivers.collection_postgresql import (
         CollectionPgSidecarRegistry,
@@ -395,7 +217,7 @@ def test_default_collection_sidecars_core_only():
 
 
 # ---------------------------------------------------------------------------
-# _resolve_stac_items_pg — no ConfigsProtocol => False
+# _resolve_stac_items_pg — config-driven gate
 # ---------------------------------------------------------------------------
 
 
@@ -409,29 +231,10 @@ async def test_resolve_stac_items_pg_no_protocol_returns_false():
 
 @pytest.mark.asyncio
 async def test_resolve_stac_items_pg_with_none_config_returns_false():
-    """ConfigsProtocol returns None for StacStorageConfig => no STAC."""
     from dynastore.modules.storage.drivers.postgresql import _resolve_stac_items_pg
 
     class FakeConfigs:
         async def get_config(self, cls, **kwargs):
-            return None
-
-    result = await _resolve_stac_items_pg("cat-1", "coll-1", configs=FakeConfigs())
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_resolve_stac_items_pg_with_none_level_returns_false():
-    """StacStorageConfig with stac_level=NONE => stac_items_pg=False."""
-    from dynastore.modules.storage.drivers.postgresql import _resolve_stac_items_pg
-
-    class FakeConfigs:
-        async def get_config(self, cls, **kwargs):
-            if cls is StacStorageConfig:
-                return StacStorageConfig(
-                    stac_level=StacLevel.NONE,
-                    stac_storage=StacStorageBackend.ES_PG,
-                )
             return None
 
     result = await _resolve_stac_items_pg("cat-1", "coll-1", configs=FakeConfigs())
@@ -440,7 +243,6 @@ async def test_resolve_stac_items_pg_with_none_level_returns_false():
 
 @pytest.mark.asyncio
 async def test_resolve_stac_items_pg_with_items_level_pg_returns_true():
-    """StacStorageConfig(ITEMS, ES_PG) => stac_items_pg=True."""
     from dynastore.modules.storage.drivers.postgresql import _resolve_stac_items_pg
 
     class FakeConfigs:
@@ -458,7 +260,6 @@ async def test_resolve_stac_items_pg_with_items_level_pg_returns_true():
 
 @pytest.mark.asyncio
 async def test_resolve_stac_items_pg_with_collection_level_returns_false():
-    """stac_level=COLLECTION => items not enabled => False even with PG."""
     from dynastore.modules.storage.drivers.postgresql import _resolve_stac_items_pg
 
     class FakeConfigs:
@@ -476,7 +277,6 @@ async def test_resolve_stac_items_pg_with_collection_level_returns_false():
 
 @pytest.mark.asyncio
 async def test_resolve_stac_items_pg_with_items_es_only_returns_false():
-    """stac_level=ITEMS but storage=ES => pg_stac=False => False."""
     from dynastore.modules.storage.drivers.postgresql import _resolve_stac_items_pg
 
     class FakeConfigs:

@@ -38,7 +38,7 @@ STAC_HARVEST_PROCESS_DEFINITION = create_process_definition(
     ),
     version="1.0.0",
     input_model=StacHarvestRequest,
-    scopes=[ProcessScope.CATALOG],
+    scopes=[ProcessScope.CATALOG, ProcessScope.COLLECTION],
     job_control_options=[
         JobControlOptions.ASYNC_EXECUTE,
         JobControlOptions.SYNC_EXECUTE,
