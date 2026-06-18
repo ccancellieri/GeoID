@@ -102,6 +102,10 @@ def _patch_actions(monkeypatch):
                                     ``heartbeat_task_if_active`` they return a
                                     bool (#750 owner-guarded race signal), so
                                     they default to ``True`` (acted on a row).
+    * ``select_dismissed_unconfirmed_gcp_tasks`` / ``stamp_dismiss_confirmed``
+      — the confirmed-dismiss helpers; patched here so tests that call
+      ``_reconcile_once`` (which drives both the lapsed-lease and
+      dismissed-unconfirmed scans) do not hit the real DB.
     """
     from dynastore.modules.tasks import tasks_module
 
@@ -109,15 +113,21 @@ def _patch_actions(monkeypatch):
     hb_if_active = AsyncMock(return_value=True)
     fail = AsyncMock(return_value=True)
     complete = AsyncMock(return_value=True)
+    select_dismissed = AsyncMock(return_value=[])
+    stamp = AsyncMock(return_value=True)
     monkeypatch.setattr(tasks_module, "heartbeat_tasks", hb)
     monkeypatch.setattr(tasks_module, "heartbeat_task_if_active", hb_if_active)
     monkeypatch.setattr(tasks_module, "fail_task", fail)
     monkeypatch.setattr(tasks_module, "complete_task", complete)
+    monkeypatch.setattr(tasks_module, "select_dismissed_unconfirmed_gcp_tasks", select_dismissed)
+    monkeypatch.setattr(tasks_module, "stamp_dismiss_confirmed", stamp)
     return SimpleNamespace(
         heartbeat=hb,
         heartbeat_if_active=hb_if_active,
         fail=fail,
         complete=complete,
+        select_dismissed=select_dismissed,
+        stamp=stamp,
     )
 
 

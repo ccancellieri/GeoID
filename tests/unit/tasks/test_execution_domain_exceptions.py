@@ -186,14 +186,13 @@ class TestStartJobStateConflictError:
 
 
 class TestDismissJobStateConflictError:
-    """dismiss_job must raise JobStateConflictError (HTTP 409) when job is terminal."""
+    """dismiss_job raises JobStateConflictError (HTTP 409) for non-dismissed terminals."""
 
     @pytest.mark.parametrize(
         "status",
         [
             TaskStatusEnum.COMPLETED,
             TaskStatusEnum.FAILED,
-            TaskStatusEnum.DISMISSED,
             TaskStatusEnum.DEAD_LETTER,
         ],
     )
@@ -234,6 +233,139 @@ class TestDismissJobStateConflictError:
         assert isinstance(exc, JobStateConflictError)
         assert exc.__class__.__name__ != "HTTPException"
         assert "fastapi" not in exc.__class__.__module__
+
+
+class TestDismissAlreadyDismissed:
+    """Repeat-dismiss must raise ValueError → HTTP 404 (OGC Req 37: no-such-job).
+
+    A job that is already DISMISSED is treated as "no such active job".
+    409 here was non-conformant; the only normative error code is 404.
+    """
+
+    def test_already_dismissed_raises_value_error(self) -> None:
+        from dynastore.modules.tasks.execution import ExecutionEngine
+
+        engine = ExecutionEngine()
+        job = _make_job(TaskStatusEnum.DISMISSED)
+        tasks_mgr = _make_tasks_mgr(job)
+
+        async def _run() -> None:
+            with _patch_tasks_protocol(tasks_mgr):
+                await engine.dismiss_job(_JOB_ID, engine=_ENGINE, db_schema=_DB_SCHEMA)
+
+        with pytest.raises(ValueError) as exc_info:
+            asyncio.run(_run())
+
+        assert str(_JOB_ID) in str(exc_info.value)
+        assert "already dismissed" in str(exc_info.value)
+
+    def test_already_dismissed_not_job_state_conflict(self) -> None:
+        """Confirm the raised exception is ValueError, NOT JobStateConflictError."""
+        from dynastore.modules.tasks.execution import ExecutionEngine
+
+        engine = ExecutionEngine()
+        job = _make_job(TaskStatusEnum.DISMISSED)
+        tasks_mgr = _make_tasks_mgr(job)
+
+        async def _run() -> None:
+            with _patch_tasks_protocol(tasks_mgr):
+                await engine.dismiss_job(_JOB_ID, engine=_ENGINE, db_schema=_DB_SCHEMA)
+
+        with pytest.raises(Exception) as exc_info:
+            asyncio.run(_run())
+
+        exc = exc_info.value
+        assert isinstance(exc, ValueError)
+        assert not isinstance(exc, JobStateConflictError)
+
+
+# ---------------------------------------------------------------------------
+# Tests: dismiss two-beat logic (confirmed vs. unconfirmed)
+# ---------------------------------------------------------------------------
+
+
+class TestDismissConfirmedAtStamping:
+    """dismiss_job two-beat: PENDING/CREATED stamp dismiss_confirmed_at immediately;
+    ACTIVE/RUNNING leave it NULL (async reconciler confirms later)."""
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            TaskStatusEnum.PENDING,
+            TaskStatusEnum.CREATED,
+        ],
+    )
+    def test_not_started_stamps_dismiss_confirmed_at(self, status: TaskStatusEnum) -> None:
+        """Jobs that never ran are confirmed immediately in the same UPDATE."""
+        from datetime import datetime
+        from dynastore.modules.tasks.execution import ExecutionEngine
+        from dynastore.models.tasks import TaskUpdate
+
+        engine = ExecutionEngine()
+        job = _make_job(status)
+        # get_task must return the job twice: first for the status check,
+        # second for the post-update read (return the same mock — status is
+        # what we've already checked; the test focuses on the update call).
+        tasks_mgr = _make_tasks_mgr(job)
+
+        captured: list[TaskUpdate] = []
+
+        async def _capture_update(_engine, _task_id, update: TaskUpdate, schema: str):
+            captured.append(update)
+
+        tasks_mgr.update_task = AsyncMock(side_effect=_capture_update)
+
+        async def _run() -> None:
+            with _patch_tasks_protocol(tasks_mgr):
+                try:
+                    await engine.dismiss_job(_JOB_ID, engine=_ENGINE, db_schema=_DB_SCHEMA)
+                except ValueError:
+                    pass  # disappears-after-dismiss is acceptable here
+
+        asyncio.run(_run())
+
+        assert len(captured) == 1
+        update = captured[0]
+        assert update.status == TaskStatusEnum.DISMISSED
+        assert update.dismiss_confirmed_at is not None
+        assert isinstance(update.dismiss_confirmed_at, datetime)
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            TaskStatusEnum.ACTIVE,
+            TaskStatusEnum.RUNNING,
+        ],
+    )
+    def test_in_flight_leaves_dismiss_confirmed_at_null(self, status: TaskStatusEnum) -> None:
+        """Jobs that are actively running are dismissed without confirming immediately."""
+        from dynastore.modules.tasks.execution import ExecutionEngine
+        from dynastore.models.tasks import TaskUpdate
+
+        engine = ExecutionEngine()
+        job = _make_job(status)
+        tasks_mgr = _make_tasks_mgr(job)
+
+        captured: list[TaskUpdate] = []
+
+        async def _capture_update(_engine, _task_id, update: TaskUpdate, schema: str):
+            captured.append(update)
+
+        tasks_mgr.update_task = AsyncMock(side_effect=_capture_update)
+
+        async def _run() -> None:
+            with _patch_tasks_protocol(tasks_mgr):
+                try:
+                    await engine.dismiss_job(_JOB_ID, engine=_ENGINE, db_schema=_DB_SCHEMA)
+                except ValueError:
+                    pass  # disappears-after-dismiss is acceptable here
+
+        asyncio.run(_run())
+
+        assert len(captured) == 1
+        update = captured[0]
+        assert update.status == TaskStatusEnum.DISMISSED
+        assert update.dismiss_confirmed_at is None
 
 
 # ---------------------------------------------------------------------------

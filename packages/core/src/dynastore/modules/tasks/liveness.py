@@ -110,3 +110,71 @@ def resolve_probe(owner_id: Optional[str]) -> Optional[LivenessProbeProtocol]:
         except Exception:  # noqa: BLE001 — a broken probe must not block resolution
             continue
     return None
+
+
+@runtime_checkable
+class StopSignalProtocol(Protocol):
+    """Contract for a runner that can signal its out-of-process execution to stop.
+
+    Deliberately a SEPARATE ``@runtime_checkable Protocol`` rather than new
+    methods on :class:`LivenessProbeProtocol`.  Adding methods to an existing
+    ``@runtime_checkable`` protocol drops every current implementer out of
+    structural ``isinstance`` / ``get_protocols`` discovery — which breaks
+    liveness probing entirely.  A standalone sibling lets the reconciler
+    resolve stop-signal runners independently via
+    ``get_protocols(StopSignalProtocol)`` and lets a future runner ship stop
+    support without touching its probe path.
+
+    ``signal_stop`` and ``force_stop`` MUST NOT raise — on any error they
+    return ``False`` so the reconciler degrades gracefully rather than
+    crashing its loop.
+
+    IAM perms needed by the runner service account:
+      ``run.executions.cancel``  — for ``signal_stop``
+      ``run.executions.delete``  — for ``force_stop``
+    """
+
+    runner_type: str
+
+    def owns(self, owner_id: str) -> bool:
+        """True if this runner is the one that stamped ``owner_id`` on a task row."""
+        ...
+
+    async def signal_stop(self, task: "Task") -> bool:
+        """Initiate a graceful stop of the execution backing ``task``.
+
+        Idempotent: returns ``True`` when a stop was (or already had been)
+        requested; ``False`` when no execution handle is available.  Never
+        raises — any error is logged and returns ``False``.
+        """
+        ...
+
+    async def force_stop(self, task: "Task") -> bool:
+        """Force-teardown the execution backing ``task`` (escalation path).
+
+        Returns ``True`` when the teardown request was sent; ``False`` when no
+        execution handle is available or the request failed.  Never raises.
+        """
+        ...
+
+
+def resolve_stop_signal(owner_id: Optional[str]) -> Optional[StopSignalProtocol]:
+    """Return the registered stop-signal runner that owns ``owner_id``, or ``None``.
+
+    Mirrors :func:`resolve_probe` — resolution keys on ``owner_id``, not on
+    ``can_handle(task_type)``.  ``None`` means the owner is an in-process /
+    ephemeral / unrecognized runner that has no stop-signal capability: the
+    reconciler will stamp ``dismiss_confirmed_at`` without an explicit stop
+    signal (there is nothing running to stop).
+    """
+    if not owner_id:
+        return None
+    from dynastore.tools.discovery import get_protocols
+
+    for runner in get_protocols(StopSignalProtocol):
+        try:
+            if runner.owns(owner_id):
+                return runner
+        except Exception:  # noqa: BLE001 — a broken runner must not block resolution
+            continue
+    return None

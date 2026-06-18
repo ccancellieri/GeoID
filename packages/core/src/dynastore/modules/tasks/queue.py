@@ -42,6 +42,23 @@ logger = logging.getLogger(__name__)
 NEW_TASK_QUEUED = "new_task_queued"
 TASK_STATUS_CHANGED = "task_status_changed"
 EVENTS_CHANNEL = "dynastore_events_channel"
+# Cross-pod in-process cancel requests.  Payload is the task_id string.
+# Emitted by BackgroundRunner.signal_stop when the target task lives on
+# another pod; every pod receives it via pg_notify and the owning pod
+# cancels its local asyncio.Task.
+CANCEL_REQUESTED = "cancel_requested"
+
+# Per-loop inbox populated by _notification_transform so BackgroundRunner's
+# cancel listener can drain task_ids without blocking on signal_bus wait.
+_cancel_inbox: "asyncio.Queue[str] | None" = None
+
+
+def _get_cancel_inbox() -> "asyncio.Queue[str]":
+    """Return (or lazily create) the module-level cancel inbox for the current loop."""
+    global _cancel_inbox
+    if _cancel_inbox is None:
+        _cancel_inbox = asyncio.Queue()
+    return _cancel_inbox
 
 
 def _notification_transform(
@@ -52,6 +69,9 @@ def _notification_transform(
     - ``new_task_queued``: payload is the task_type (used for capability
       filtering). Emits with ``identifier=None`` (dispatcher wakes for any
       matching task, claim_next handles specifics).
+    - ``cancel_requested``: payload is the task_id string.  Pushes to the
+      module-level cancel inbox so BackgroundRunner's listener can drain it,
+      then emits the broadcast wake signal ``(CANCEL_REQUESTED, None)``.
     - Other channels: forward payload as the identifier so consumers can
       wait for a specific event (e.g. task status change for a specific job).
 
@@ -63,6 +83,14 @@ def _notification_transform(
             if payload not in capability_map.all_types:
                 return None  # Skip: we can't handle this task type
         return (NEW_TASK_QUEUED, None)
+
+    if channel == CANCEL_REQUESTED:
+        if payload:
+            # Unbounded inbox drained continuously by every pod's cancel
+            # listener — put_nowait cannot block or raise here.
+            _get_cancel_inbox().put_nowait(payload)
+        # Broadcast wake — identifier=None so every pod's cancel listener wakes.
+        return (CANCEL_REQUESTED, None)
 
     # TASK_STATUS_CHANGED, EVENTS_CHANNEL — forward with payload as identifier
     return (channel, payload)
@@ -96,7 +124,7 @@ async def start_queue_listener(
         return
 
     bridge = PgListenBridge(
-        channels=[NEW_TASK_QUEUED, TASK_STATUS_CHANGED, EVENTS_CHANNEL],
+        channels=[NEW_TASK_QUEUED, TASK_STATUS_CHANGED, EVENTS_CHANNEL, CANCEL_REQUESTED],
         signal_bus=signal_bus,
         health_timeout=poll_timeout,
         transform=_notification_transform,

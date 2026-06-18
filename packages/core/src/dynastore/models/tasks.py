@@ -338,6 +338,7 @@ class TaskUpdate(BaseModel):
     last_heartbeat_at: Optional[datetime] = None
     owner_id: Optional[str] = None
     retry_count: Optional[int] = None
+    dismiss_confirmed_at: Optional[datetime] = None
 
 class Task(TaskBase):
     """
@@ -362,6 +363,7 @@ class Task(TaskBase):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), alias="created")
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = Field(None, alias="updated")
+    dismiss_confirmed_at: Optional[datetime] = None
 
     # Queue control — populated by dispatcher / heartbeat manager
     locked_until: Optional[datetime] = None

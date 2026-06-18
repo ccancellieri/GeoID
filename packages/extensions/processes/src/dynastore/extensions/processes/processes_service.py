@@ -1074,7 +1074,7 @@ async def list_jobs(
     language: str = Depends(get_language),
 ) -> JSONResponse:
     """Lists jobs (System context)."""
-    tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset)
+    tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset, kind="process")
     return JSONResponse(
         content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks],
         headers={"Content-Language": language},
@@ -1095,7 +1095,7 @@ async def list_jobs_catalog(
 ) -> JSONResponse:
     """Lists jobs (Catalog context)."""
     schema = await _resolve_catalog_schema(catalog_id, conn)
-    tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset)
+    tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
     return JSONResponse(
         content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks],
         headers={"Content-Language": language},
@@ -1117,7 +1117,7 @@ async def list_jobs_collection(
 ) -> JSONResponse:
     """Lists jobs (Collection context). Filters by collection_id."""
     schema = await _resolve_catalog_schema(catalog_id, conn)
-    all_tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset)
+    all_tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
     filtered = [t for t in all_tasks if getattr(t, "collection_id", None) == collection_id]
     return JSONResponse(
         content=[_localize_status_info(_task_to_status_info(t, request), language) for t in filtered],

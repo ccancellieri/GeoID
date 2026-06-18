@@ -571,3 +571,134 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 "— UNKNOWN, MaintenanceSupervisor task_reaper backstops.", runner_ref, exc,
             )
             return LivenessVerdict.UNKNOWN
+
+    # ------------------------------------------------------------------
+    # StopSignalProtocol — confirmed-dismiss
+    #
+    # When dismiss_job() sets status=DISMISSED on an ACTIVE/RUNNING row it
+    # leaves dismiss_confirmed_at NULL because the Cloud Run execution is
+    # still live. The liveness reconciler probes the execution on each
+    # cycle and calls signal_stop / force_stop here to drive the backing
+    # execution to a halt, then stamps dismiss_confirmed_at once stopped.
+    #
+    # IAM perms needed by the runner service account:
+    #   run.executions.cancel  — for signal_stop (graceful SIGTERM)
+    #   run.executions.delete  — for force_stop  (hard teardown)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_executions_client_safe() -> Optional[Any]:
+        """Resolve the Cloud Run ExecutionsAsyncClient without raising.
+
+        Reuses the GCPModule-managed client that ``probe_liveness`` already
+        acquires — same guard pattern (hasattr check + None-safe path) so the
+        stop-signal path and the liveness-probe path share one client lifecycle.
+        Returns ``None`` when the client is unavailable (GCP module not loaded,
+        early startup, tests without mocking).
+        """
+        try:
+            from dynastore.modules import get_protocol
+            from dynastore.models.protocols import JobExecutionProtocol
+
+            gcp_module = get_protocol(JobExecutionProtocol)
+            if gcp_module is None or not hasattr(gcp_module, "get_executions_client"):
+                return None
+            return gcp_module.get_executions_client()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 — never raise from a stop-signal helper
+            logger.debug(
+                "GcpJobRunner._get_executions_client_safe: client unavailable (%s).", exc
+            )
+            return None
+
+    async def signal_stop(self, task: Any) -> bool:
+        """Initiate a graceful stop (SIGTERM) of the Cloud Run execution backing ``task``.
+
+        Calls ``cancel_execution`` — a Cloud Run LRO that sends SIGTERM to the
+        job container.  The LRO is *initiated* only; ``.result()`` is NOT
+        awaited because confirmation comes from a later ``get_execution`` probe
+        (the reconciler's next cycle via ``probe_liveness``).
+
+        Returns ``True`` when the cancel request was sent (or the execution was
+        already gone / cancelled).  Returns ``False`` when no ``runner_ref`` is
+        available.  Never raises — any API error is logged at WARNING and
+        returns ``False`` so the reconciler degrades gracefully.
+
+        Idempotent: cancelling an already-cancelled execution is a no-op on
+        the Cloud Run side (returns quickly without error).
+        """
+        runner_ref = getattr(task, "runner_ref", None)
+        if not runner_ref:
+            logger.debug(
+                "GcpJobRunner.signal_stop: task %s has no runner_ref — cannot cancel.",
+                getattr(task, "task_id", "?"),
+            )
+            return False
+
+        client = self._get_executions_client_safe()
+        if client is None:
+            logger.warning(
+                "GcpJobRunner.signal_stop: no executions client available "
+                "for runner_ref '%s' — skipping cancel.", runner_ref,
+            )
+            return False
+
+        try:
+            # ``cancel_execution`` accepts ``name`` as a keyword argument;
+            # no ``run_v2.*`` request-object import is needed — same import-light
+            # approach used by ``probe_liveness`` (``client.get_execution(name=…)``).
+            await client.cancel_execution(name=runner_ref)
+            logger.info(
+                "GcpJobRunner.signal_stop: cancel_execution initiated for '%s' "
+                "(task %s).", runner_ref, getattr(task, "task_id", "?"),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — MUST NOT raise
+            logger.warning(
+                "GcpJobRunner.signal_stop: cancel_execution failed for '%s' (%s) "
+                "— returning False; force_stop will escalate if deadline passes.",
+                runner_ref, exc,
+            )
+            return False
+
+    async def force_stop(self, task: Any) -> bool:
+        """Force-teardown (hard delete) the Cloud Run execution backing ``task``.
+
+        Calls ``delete_execution`` — a Cloud Run LRO that tears down the
+        execution unconditionally.  The LRO is *initiated* only; confirmation
+        is not awaited (mirrors ``signal_stop``).
+
+        Returns ``True`` when the delete request was sent.  Returns ``False``
+        when no ``runner_ref`` is available or the request failed.  Never
+        raises.
+        """
+        runner_ref = getattr(task, "runner_ref", None)
+        if not runner_ref:
+            logger.debug(
+                "GcpJobRunner.force_stop: task %s has no runner_ref — cannot delete.",
+                getattr(task, "task_id", "?"),
+            )
+            return False
+
+        client = self._get_executions_client_safe()
+        if client is None:
+            logger.warning(
+                "GcpJobRunner.force_stop: no executions client available "
+                "for runner_ref '%s' — skipping delete.", runner_ref,
+            )
+            return False
+
+        try:
+            # ``delete_execution`` accepts ``name`` as a keyword argument;
+            # no ``run_v2.*`` request-object import is needed.
+            await client.delete_execution(name=runner_ref)
+            logger.info(
+                "GcpJobRunner.force_stop: delete_execution initiated for '%s' "
+                "(task %s).", runner_ref, getattr(task, "task_id", "?"),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — MUST NOT raise
+            logger.warning(
+                "GcpJobRunner.force_stop: delete_execution failed for '%s' (%s) "
+                "— returning False.", runner_ref, exc,
+            )
+            return False

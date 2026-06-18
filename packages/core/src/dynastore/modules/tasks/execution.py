@@ -44,7 +44,7 @@ OGC Job State Machine::
 import json
 import logging
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
 from uuid import UUID
 
@@ -961,11 +961,22 @@ class ExecutionEngine:
         engine: DbResource,
         db_schema: str = "tasks",
     ) -> Task:
-        """
-        Cancel a job (OGC dismiss).
+        """Cancel a job (OGC Processes Part 1 — DELETE /jobs/{id}).
 
-        Sets status to ``DISMISSED`` from any non-terminal state.
-        Returns 404 if not found, 409 if already terminal.
+        Two-beat logic:
+
+        * Not found → ``ValueError`` (handler returns HTTP 404).
+        * Already ``DISMISSED`` → ``ValueError`` (OGC Req 37: no-such-job, HTTP 404).
+          A repeat DELETE on an already-dismissed job is treated as "no such active
+          job" — the only normative error code is 404; 409 here was non-conformant.
+        * ``COMPLETED / FAILED / DEAD_LETTER`` → ``JobStateConflictError`` (HTTP 409).
+          Genuine state conflict: the job finished before the dismiss arrived.
+        * ``PENDING / CREATED`` (never started): set ``DISMISSED`` **and**
+          ``dismiss_confirmed_at = NOW()`` in a single UPDATE — nothing is running,
+          so the dismiss is confirmed immediately.
+        * ``ACTIVE / RUNNING`` (compute in flight): set ``DISMISSED`` only, leave
+          ``dismiss_confirmed_at`` NULL.  The async reconciler in a later PR stamps
+          it once the stop is proven.
         """
         from dynastore.tools.protocol_helpers import resolve
         from dynastore.models.protocols.tasks import TasksProtocol
@@ -975,7 +986,13 @@ class ExecutionEngine:
         if not job:
             raise ValueError(f"Job '{job_id}' not found.")
 
-        if job.status in _TERMINAL_STATUSES:
+        # Repeat-dismiss: OGC Req 37 (no-such-job) → 404, not 409.
+        if job.status == TaskStatusEnum.DISMISSED:
+            raise ValueError(f"Job '{job_id}' already dismissed.")
+
+        # Genuine state conflict: job finished before the dismiss arrived.
+        # DISMISSED is handled above; the rest of _TERMINAL_STATUSES is a 409.
+        if job.status in (_TERMINAL_STATUSES - {TaskStatusEnum.DISMISSED}):
             from dynastore.modules.tasks.exceptions import JobStateConflictError
 
             raise JobStateConflictError(
@@ -983,13 +1000,41 @@ class ExecutionEngine:
                 f"(status={job.status.value})."
             )
 
-        await tasks_mgr.update_task(
-            engine,
-            job_id,
-            TaskUpdate(status=TaskStatusEnum.DISMISSED),
-            schema=db_schema,
-        )
+        # PENDING / CREATED: nothing is running — confirmed immediately.
+        _not_started = frozenset({
+            TaskStatusEnum.PENDING,
+            TaskStatusEnum.CREATED,
+        })
+        if job.status in _not_started:
+            now = datetime.now(timezone.utc)
+            update = TaskUpdate(
+                status=TaskStatusEnum.DISMISSED,
+                dismiss_confirmed_at=now,
+            )
+        else:
+            # ACTIVE / RUNNING: compute in flight; confirmation is async.
+            update = TaskUpdate(status=TaskStatusEnum.DISMISSED)
+
+        await tasks_mgr.update_task(engine, job_id, update, schema=db_schema)
         logger.info("ExecutionEngine: dismissed job '%s'.", job_id)
+
+        # Best-effort stop: resolve the runner that owns this task and signal
+        # it to stop.  The dismiss wire-response is already committed above;
+        # a stop-signal failure must never affect the OGC 200 response.
+        if update.dismiss_confirmed_at is None:
+            # Only needed when compute is still in flight (ACTIVE/RUNNING path).
+            try:
+                dismissed_snap = await tasks_mgr.get_task(engine, job_id, schema=db_schema)
+                if dismissed_snap is not None:
+                    from dynastore.modules.tasks.liveness import resolve_stop_signal
+                    stop_impl = resolve_stop_signal(dismissed_snap.owner_id)
+                    if stop_impl is not None:
+                        await stop_impl.signal_stop(dismissed_snap)
+            except Exception as _stop_exc:  # noqa: BLE001 — best-effort; must not raise
+                logger.warning(
+                    "ExecutionEngine: best-effort stop signal failed for job '%s': %s",
+                    job_id, _stop_exc,
+                )
 
         dismissed = await tasks_mgr.get_task(engine, job_id, schema=db_schema)
         if dismissed is None:

@@ -30,6 +30,13 @@ from dynastore.tools.async_utils import LoopLocalLock, LoopLocalSemaphore
 from dynastore.modules.concurrency import get_background_executor
 from dynastore.modules.tasks.dispatcher import _SERVICE_NAME
 
+# Owner-id prefixes that belong to known remote (out-of-process) runners.
+# BackgroundRunner.owns() returns True for any owner_id that does NOT match
+# a remote prefix — i.e. the task was dispatched in-process by some pod's
+# dispatcher.  When the owning pod is different, signal_stop publishes a
+# cross-pod CANCEL_REQUESTED signal rather than cancelling directly.
+_KNOWN_REMOTE_OWNER_PREFIXES: frozenset[str] = frozenset({"gcp_cloud_run_"})
+
 logger = logging.getLogger(__name__)
 
 
@@ -281,7 +288,11 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
     Returns a StatusInfo object immediately (201 Created pattern).
     """
     def __init__(self):
-        self._running_tasks = set()
+        self._running_tasks: set = set()
+        # Maps task_id (str) → asyncio.Task for tasks running on THIS pod.
+        # Used by signal_stop to cancel a local task directly.  Done-callbacks
+        # remove entries so the dict stays bounded to live tasks only.
+        self._task_registry: dict[str, asyncio.Task] = {}
         self._max_concurrency = 100
         # BackgroundRunner is registered as a module-level singleton at import
         # (register_default_runners()), so a raw asyncio.Semaphore() here would
@@ -307,9 +318,19 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     self._semaphore = LoopLocalSemaphore(self._max_concurrency)
         except Exception as exc:  # noqa: BLE001 — keep default concurrency on any read failure
             logger.debug("BackgroundRunner: concurrency config unavailable (%s) — default %d", exc, self._max_concurrency)
+
+        cancel_listener_task = asyncio.create_task(
+            self._cancel_listener(), name="background_runner:cancel_listener"
+        )
         try:
             yield
         finally:
+            cancel_listener_task.cancel()
+            try:
+                await cancel_listener_task
+            except asyncio.CancelledError:
+                pass
+
             # Shutdown: wait for running tasks to finish or timeout
             if self._running_tasks:
                 pending_count = len(self._running_tasks)
@@ -327,6 +348,140 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
     def capabilities(self) -> Any:
         from dynastore.modules.tasks.models import RunnerCapabilities
         return RunnerCapabilities(max_concurrency=self._max_concurrency)
+
+    # ------------------------------------------------------------------
+    # StopSignalProtocol — confirmed dismiss for in-process tasks
+    # ------------------------------------------------------------------
+
+    def owns(self, owner_id: str) -> bool:
+        """True when ``owner_id`` belongs to an in-process background dispatcher.
+
+        Returns ``True`` for any owner_id that does not match a known
+        remote-runner prefix.  When the owning pod is different from this
+        one, the task won't be found in the local registry and
+        ``signal_stop`` will publish a cross-pod cancel request instead.
+        """
+        if not owner_id:
+            return False
+        return not any(
+            owner_id.startswith(prefix)
+            for prefix in _KNOWN_REMOTE_OWNER_PREFIXES
+        )
+
+    async def signal_stop(self, task: Any) -> bool:
+        """Cancel the asyncio.Task backing ``task``, or publish a cross-pod request.
+
+        If the task is registered in this pod's ``_task_registry``, its
+        asyncio.Task is cancelled directly.  Otherwise a ``pg_notify`` is
+        sent on the ``cancel_requested`` channel so the owning pod's cancel
+        listener picks it up.
+
+        Idempotent: cancelling an already-done asyncio.Task is a no-op on
+        the asyncio side.  Never raises — any error is logged and returns
+        ``False``.
+        """
+        task_id_str = str(getattr(task, "task_id", ""))
+        if not task_id_str:
+            logger.debug("BackgroundRunner.signal_stop: task has no task_id — skipping.")
+            return False
+
+        local_task = self._task_registry.get(task_id_str)
+        if local_task is not None:
+            local_task.cancel()
+            logger.info(
+                "BackgroundRunner.signal_stop: cancelled local asyncio.Task for task %s.",
+                task_id_str,
+            )
+            return True
+
+        # Task is on another pod — publish cross-pod cancel request.
+        try:
+            from dynastore.tools.protocol_helpers import get_engine
+            from dynastore.modules.db_config.query_executor import managed_transaction
+            from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+
+            engine = get_engine()
+            if engine is None:
+                logger.warning(
+                    "BackgroundRunner.signal_stop: no engine available "
+                    "for cross-pod cancel of task %s.", task_id_str,
+                )
+                return False
+
+            async with managed_transaction(engine) as conn:
+                await DQLQuery(
+                    "SELECT pg_notify('cancel_requested', :task_id)",
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, task_id=task_id_str)
+
+            logger.info(
+                "BackgroundRunner.signal_stop: published cancel_requested for task %s.",
+                task_id_str,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — MUST NOT raise
+            logger.warning(
+                "BackgroundRunner.signal_stop: cross-pod cancel publish failed "
+                "for task %s (%s).", task_id_str, exc,
+            )
+            return False
+
+    async def force_stop(self, task: Any) -> bool:
+        """Cancel and evict the asyncio.Task backing ``task``.
+
+        For in-process tasks there is no detached compute beyond the
+        asyncio.Task, so force == cancel + registry eviction.  Falls back
+        to ``signal_stop`` for cross-pod tasks (the remote pod's listener
+        will cancel it).  Never raises.
+        """
+        task_id_str = str(getattr(task, "task_id", ""))
+        if not task_id_str:
+            logger.debug("BackgroundRunner.force_stop: task has no task_id — skipping.")
+            return False
+
+        local_task = self._task_registry.pop(task_id_str, None)
+        if local_task is not None:
+            local_task.cancel()
+            logger.info(
+                "BackgroundRunner.force_stop: cancelled and evicted local asyncio.Task "
+                "for task %s.", task_id_str,
+            )
+            return True
+
+        # Not local — delegate to signal_stop for the cross-pod path.
+        return await self.signal_stop(task)
+
+    async def _cancel_listener(self) -> None:
+        """Background loop: drain the cancel inbox and cancel registered tasks.
+
+        Woken by the signal bus whenever a ``cancel_requested`` pg_notify
+        arrives (from ``_notification_transform``).  Drains the module-level
+        cancel inbox and cancels any matching local asyncio.Task.  Tasks not
+        in the local registry are silently skipped — multi-pod safe: every
+        pod subscribes; only the owner finds the task in its registry.
+        """
+        from dynastore.tools.async_utils import signal_bus
+        from dynastore.modules.tasks.queue import CANCEL_REQUESTED, _get_cancel_inbox
+
+        while True:
+            try:
+                await signal_bus.wait_for(CANCEL_REQUESTED, timeout=30.0)
+            except asyncio.CancelledError:
+                return
+
+            inbox = _get_cancel_inbox()
+            while not inbox.empty():
+                try:
+                    task_id_str = inbox.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                local_task = self._task_registry.get(task_id_str)
+                if local_task is not None:
+                    local_task.cancel()
+                    logger.info(
+                        "BackgroundRunner._cancel_listener: cancelled local asyncio.Task "
+                        "for task %s (cross-pod request).", task_id_str,
+                    )
 
     async def run(self, context: RunnerContext) -> Any:
         from dynastore.tools.protocol_helpers import resolve
@@ -409,11 +564,39 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     logger.info(f"Async task '{job.task_id}' completed successfully.")
 
                 except asyncio.CancelledError:
-                    logger.warning(f"Async task '{job.task_id}' was cancelled (SIGTERM?). Resetting to PENDING.")
+                    # Distinguish dismiss-driven cancellation from shutdown.
+                    # If the row is now DISMISSED with no confirmation stamp,
+                    # this pod cancelled it via signal_stop — stamp confirmed.
                     try:
-                        await tasks_mgr.update_task(context.engine, job.task_id, TaskUpdate(status=TaskStatusEnum.PENDING), schema=context.db_schema)
+                        refreshed = await tasks_mgr.get_task(
+                            context.engine, job.task_id, schema=context.db_schema,
+                        )
+                        if (
+                            refreshed is not None
+                            and refreshed.status == TaskStatusEnum.DISMISSED
+                            and refreshed.dismiss_confirmed_at is None
+                        ):
+                            from dynastore.modules.tasks.tasks_module import stamp_dismiss_confirmed
+                            await stamp_dismiss_confirmed(context.engine, job.task_id)
+                            logger.info(
+                                "BackgroundRunner: stamped dismiss_confirmed_at "
+                                "for dismissed task '%s'.", job.task_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Async task '%s' was cancelled (shutdown). Resetting to PENDING.",
+                                job.task_id,
+                            )
+                            await tasks_mgr.update_task(
+                                context.engine, job.task_id,
+                                TaskUpdate(status=TaskStatusEnum.PENDING),
+                                schema=context.db_schema,
+                            )
                     except Exception as e:
-                        logger.error(f"Failed to reset cancelled task '{job.task_id}': {e}")
+                        logger.error(
+                            "Failed to handle cancellation for task '%s': %s",
+                            job.task_id, e,
+                        )
                     raise
                 except Exception as e:
                     logger.error(f"Async task '{job.task_id}' failed: {e}", exc_info=True)
@@ -433,9 +616,12 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
             logger.info(f"Task '{job.task_id}' submitted to Starlette BackgroundTasks.")
         else:
             executor = get_background_executor()
-            t = executor.submit(_execute_background(), task_name=f"task:{job.task_id}")
+            _task_id_str = str(job.task_id)
+            t = executor.submit(_execute_background(), task_name=f"task:{_task_id_str}")
             self._running_tasks.add(t)
+            self._task_registry[_task_id_str] = t
             t.add_done_callback(self._running_tasks.discard)
+            t.add_done_callback(lambda _: self._task_registry.pop(_task_id_str, None))
             logger.info(f"Task '{job.task_id}' submitted via BackgroundExecutor.")
 
         from dynastore.modules.processes.models import StatusInfo
@@ -591,26 +777,47 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     await _apply_terminal("success", _terminal.on_success)
 
                 except asyncio.CancelledError:
-                    # SIGTERM / shutdown.  Reset to PENDING via fail_task
-                    # with retry=True; the pg_cron reaper would catch it
-                    # anyway via expired locked_until, but writing
-                    # explicitly here produces a cleaner audit trail
-                    # (retry_count incremented, error_message attributed).
-                    logger.warning(
-                        f"BackgroundRunner: claimed task '{claimed_task_id}' "
-                        f"cancelled (SIGTERM?) — resetting to PENDING for retry."
-                    )
+                    # Distinguish dismiss-driven cancellation from shutdown.
+                    # Re-read the row: if it is DISMISSED with no confirmation
+                    # stamp the cancellation was driven by signal_stop — stamp
+                    # confirmed and do not reset to PENDING.  Otherwise this is
+                    # a SIGTERM / pod-shutdown cancel — reset via fail_task so
+                    # the row can be retried.
                     try:
-                        await _fail_task(
-                            context.engine, claimed_task_id,
-                            _dt.now(_tz.utc),
-                            "Runner interrupted (SIGTERM / pod shutdown)",
-                            retry=True,
+                        from dynastore.tools.protocol_helpers import resolve as _resolve
+                        from dynastore.models.protocols.tasks import TasksProtocol as _TasksProtocol
+                        _tasks_mgr_inner = _resolve(_TasksProtocol)
+                        _refreshed = await _tasks_mgr_inner.get_task(
+                            context.engine, claimed_task_id, schema=context.db_schema,
                         )
+                        if (
+                            _refreshed is not None
+                            and _refreshed.status == TaskStatusEnum.DISMISSED
+                            and _refreshed.dismiss_confirmed_at is None
+                        ):
+                            from dynastore.modules.tasks.tasks_module import stamp_dismiss_confirmed as _stamp
+                            await _stamp(context.engine, claimed_task_id)
+                            logger.info(
+                                "BackgroundRunner: stamped dismiss_confirmed_at "
+                                "for dismissed claimed task '%s'.", claimed_task_id,
+                            )
+                        else:
+                            logger.warning(
+                                "BackgroundRunner: claimed task '%s' cancelled "
+                                "(shutdown) — resetting to PENDING for retry.",
+                                claimed_task_id,
+                            )
+                            await _fail_task(
+                                context.engine, claimed_task_id,
+                                _dt.now(_tz.utc),
+                                "Runner interrupted (SIGTERM / pod shutdown)",
+                                retry=True,
+                            )
                     except Exception as e:
                         logger.error(
-                            f"BackgroundRunner: failed to reset cancelled task "
-                            f"'{claimed_task_id}' to PENDING: {e} — pg_cron reaper will catch it."
+                            "BackgroundRunner: failed to handle cancellation for "
+                            "claimed task '%s': %s — pg_cron reaper will catch it.",
+                            claimed_task_id, e,
                         )
                     raise
 
@@ -701,12 +908,15 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
             )
         else:
             executor = get_background_executor()
+            _claimed_id_str = str(claimed_task_id)
             t = executor.submit(
                 _execute_background_claimed(),
-                task_name=f"task:{claimed_task_id}",
+                task_name=f"task:{_claimed_id_str}",
             )
             self._running_tasks.add(t)
+            self._task_registry[_claimed_id_str] = t
             t.add_done_callback(self._running_tasks.discard)
+            t.add_done_callback(lambda _: self._task_registry.pop(_claimed_id_str, None))
             logger.info(
                 f"BackgroundRunner: claimed task '{claimed_task_id}' submitted via BackgroundExecutor."
             )

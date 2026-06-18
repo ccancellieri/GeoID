@@ -74,12 +74,14 @@ async def test_preset_apply_submits_stac_harvest_process() -> None:
 
     async def _fake_execute(process_id: str, exec_request: Any, *, engine: Any,
                              caller_id: str, preferred_mode: Any,
+                             catalog_id: Any = None,
                              dedup_key: Any) -> MagicMock:
         result = MagicMock()
         result.jobID = "job-abc-123"
         captured.append({
             "process_id": process_id,
             "inputs": dict(exec_request.inputs),
+            "catalog_id": catalog_id,
         })
         return result
 
@@ -101,6 +103,8 @@ async def test_preset_apply_submits_stac_harvest_process() -> None:
     assert call["inputs"]["max_items"] == 0
     assert call["inputs"]["with_assets"] is True
     assert call["inputs"]["drivers"] == "es"
+    # catalog_id must be propagated so the task row lands in the catalog schema.
+    assert call["catalog_id"] == "test-cat"
 
     # Descriptor should record the job id and parameters.
     assert descriptor.payload["job_id"] == "job-abc-123"

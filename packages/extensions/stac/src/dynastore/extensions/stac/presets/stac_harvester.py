@@ -265,6 +265,7 @@ class _StacHarvesterPreset:
             engine=ctx.db,
             caller_id=caller_id,
             preferred_mode=_proc_models.JobControlOptions.ASYNC_EXECUTE,
+            catalog_id=target_catalog,
             dedup_key=None,
         )
 

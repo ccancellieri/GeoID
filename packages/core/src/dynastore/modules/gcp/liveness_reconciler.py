@@ -51,7 +51,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, NamedTuple, Optional
 
 from dynastore.modules.tasks import tasks_module
-from dynastore.modules.tasks.liveness import LivenessVerdict, resolve_probe
+from dynastore.modules.tasks.liveness import LivenessVerdict, resolve_probe, resolve_stop_signal
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,16 @@ class ReconcileOutcome(NamedTuple):
 
     verdict: LivenessVerdict
     race_lost: bool = False
+
+
+# How long (in seconds) to keep trying graceful cancel before escalating
+# to force_stop on a DISMISSED-but-still-alive execution.  The reference
+# point is ``last_heartbeat_at`` (most recent alive signal from the job
+# container) falling back to ``timestamp`` (row creation time).  A value
+# of 600s (10 minutes) covers the worst-case Cloud Run cold-start window
+# plus a generous SIGTERM drain period, without letting a dismissed
+# execution run indefinitely.
+_DISMISS_FORCE_DELETE_AFTER: timedelta = timedelta(seconds=600)
 
 
 class GcpLivenessReconciler:
@@ -172,6 +182,9 @@ class GcpLivenessReconciler:
     async def _reconcile_once(self) -> None:
         """Scan lapsed-lease Cloud Run rows and reconcile each one.
 
+        Also scans DISMISSED-but-unconfirmed GCP rows and drives them toward a
+        confirmed stop via :class:`StopSignalProtocol`.
+
         Accumulates a verdict-distribution :class:`~collections.Counter` over
         the pass plus a distinct race-loss tally, and emits one structured
         INFO summary line at the end (#741 item 3 / #745 items 1-2).
@@ -233,6 +246,139 @@ class GcpLivenessReconciler:
             "liveness_reconcile_pass service=%s scanned=%d RACE_LOST=%d%s",
             _SERVICE_NAME_FOR_METRICS, len(rows), race_lost, verdict_suffix,
         )
+
+        # Dismissed-unconfirmed scan: drive DISMISSED rows whose backing
+        # Cloud Run execution is still alive toward a confirmed stop.
+        dismissed_rows = await tasks_module.select_dismissed_unconfirmed_gcp_tasks(
+            self._engine
+        )
+        dismiss_unconfirmed_total = 0
+        for drow in dismissed_rows:
+            try:
+                confirmed = await self._reconcile_dismissed_row(drow)
+                if confirmed:
+                    dismiss_unconfirmed_total += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — one bad row must not stop the rest
+                logger.warning(
+                    "GcpLivenessReconciler: failed to reconcile dismissed task %s: %s",
+                    drow.get("task_id"), e,
+                )
+        if dismissed_rows:
+            logger.info(
+                "liveness_dismiss_pass service=%s scanned=%d dismiss_unconfirmed_total=%d",
+                _SERVICE_NAME_FOR_METRICS,
+                len(dismissed_rows),
+                dismiss_unconfirmed_total,
+            )
+
+    async def _reconcile_dismissed_row(self, row: Dict[str, Any]) -> bool:
+        """Drive a single DISMISSED-but-unconfirmed GCP row toward confirmed stop.
+
+        Three outcomes (in order):
+
+        a) Execution already stopped (probe returns terminal/DEAD/UNKNOWN-with-no-ref):
+           stamp ``dismiss_confirmed_at = NOW()`` and return ``True``.
+        b) Execution still ALIVE within the force-delete deadline:
+           call ``runner.signal_stop(task)`` (cancel / graceful SIGTERM) and
+           return ``False`` — the next reconciler cycle re-probes.
+        c) Execution still ALIVE past the deadline (``_DISMISS_FORCE_DELETE_AFTER``
+           elapsed since ``last_heartbeat_at`` or ``timestamp``):
+           call ``runner.force_stop(task)`` (hard delete), stamp
+           ``dismiss_confirmed_at``, emit ``dismiss_unconfirmed_total``,
+           return ``True``.
+
+        The deadline is derived from ``last_heartbeat_at`` (most recent alive
+        signal from the job container) falling back to ``timestamp`` (row
+        creation time) — both columns are always present without any schema
+        change.  Elapsed time is measured from the most recent alive signal
+        rather than from the dismiss request because we have no dismiss-request
+        timestamp on the row; using the most-recent-alive-signal gives a
+        conservative upper bound on execution age.
+
+        Returns ``True`` when ``dismiss_confirmed_at`` was stamped this cycle
+        (used by the caller to tally ``dismiss_unconfirmed_total``).
+        """
+        from dynastore.models.tasks import Task
+
+        task_id = row.get("task_id")
+        if task_id is None:
+            return False  # malformed row — skip
+
+        owner_id = row.get("owner_id")
+        runner = resolve_stop_signal(owner_id)
+
+        task = Task.model_validate(row)
+        now = datetime.now(timezone.utc)
+        runner_ref = row.get("runner_ref")
+
+        # Probe liveness via the existing probe path (no runner_ref → UNKNOWN).
+        probe = resolve_probe(owner_id)
+        if probe is not None:
+            verdict = await probe.probe_liveness(task)
+        else:
+            verdict = LivenessVerdict.UNKNOWN
+
+        execution_stopped = verdict in (
+            LivenessVerdict.DEAD,
+            LivenessVerdict.TERMINAL_SUCCEEDED,
+            LivenessVerdict.TERMINAL_FAILED,
+        ) or (verdict == LivenessVerdict.UNKNOWN and not runner_ref)
+
+        if execution_stopped:
+            # Execution is gone/terminal — confirm the dismiss immediately.
+            stamped = await tasks_module.stamp_dismiss_confirmed(self._engine, task_id)
+            if stamped:
+                logger.info(
+                    "GcpLivenessReconciler: dismissed task %s confirmed stopped "
+                    "(verdict=%s, execution=%s).",
+                    task_id, verdict.value, runner_ref,
+                )
+            else:
+                logger.debug(
+                    "GcpLivenessReconciler: dismissed task %s stamp_dismiss_confirmed "
+                    "matched 0 rows (concurrent reconciler or already confirmed).",
+                    task_id,
+                )
+            return stamped
+
+        # Execution is still ALIVE (or UNKNOWN with a handle).
+        # Determine elapsed time since the last alive signal to decide
+        # whether to escalate to force_stop.
+        ref_ts: Optional[datetime] = row.get("last_heartbeat_at") or row.get("timestamp")
+        elapsed = (now - ref_ts) if ref_ts is not None else None
+        past_deadline = (
+            elapsed is not None and elapsed >= _DISMISS_FORCE_DELETE_AFTER
+        )
+
+        if past_deadline:
+            # Escalate: force-teardown the execution.
+            force_sent = False
+            if runner is not None:
+                force_sent = await runner.force_stop(task)
+            stamped = await tasks_module.stamp_dismiss_confirmed(self._engine, task_id)
+            logger.warning(
+                "GcpLivenessReconciler: dismissed task %s past force-stop deadline "
+                "(elapsed=%.0fs, ref_ts=%s) — force_stop sent=%s, confirmed=%s.",
+                task_id,
+                elapsed.total_seconds() if elapsed is not None else -1,
+                ref_ts,
+                force_sent,
+                stamped,
+            )
+            return stamped
+
+        # Still within the graceful window — send a cancel signal and wait.
+        if runner is not None:
+            await runner.signal_stop(task)
+        else:
+            logger.debug(
+                "GcpLivenessReconciler: dismissed task %s has no stop-signal runner "
+                "for owner_id '%s' — will re-probe next cycle.",
+                task_id, owner_id,
+            )
+        return False
 
     async def _reconcile_row(self, row: Dict[str, Any]) -> Optional[ReconcileOutcome]:
         """Probe the owning runner for ``row`` and act on the verdict.

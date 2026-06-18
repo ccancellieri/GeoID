@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS {schema}.tasks (
     timestamp         TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     started_at        TIMESTAMPTZ,
     finished_at       TIMESTAMPTZ,
+    dismiss_confirmed_at TIMESTAMPTZ,
     collection_id     VARCHAR(255),
     locked_until      TIMESTAMPTZ,
     last_heartbeat_at TIMESTAMPTZ,
@@ -1665,14 +1666,21 @@ async def get_task_for_catalog(
 
 
 async def list_tasks_for_catalog(
-    conn: DbResource, catalog_id: str, limit: int = 20, offset: int = 0
+    conn: DbResource,
+    catalog_id: str,
+    limit: int = 20,
+    offset: int = 0,
+    kind: Optional[str] = None,
 ) -> List[Task]:
     """
     Lists tasks from a catalog's schema.
     Uses CatalogsProtocol to resolve the physical schema.
+
+    Pass ``kind`` to narrow results to a specific task type (forwarded to
+    :func:`list_tasks`).
     """
     schema = await _resolve_catalog_schema(catalog_id, conn)
-    return await list_tasks(conn, schema, limit, offset)
+    return await list_tasks(conn, schema, limit, offset, kind=kind)
 
 
 async def update_task_for_catalog(
@@ -1904,14 +1912,29 @@ async def get_task_by_id_unscoped(
 
 
 async def list_tasks(
-    conn: DbResource, schema: str, limit: int = 20, offset: int = 0
+    conn: DbResource,
+    schema: str,
+    limit: int = 20,
+    offset: int = 0,
+    kind: Optional[str] = None,
 ) -> List[Task]:
-    """Lists tasks filtered by schema_name, ordered by creation date."""
+    """Lists tasks filtered by schema_name, ordered by creation date.
+
+    Pass ``kind`` to narrow results to a specific task type (e.g. ``'process'``
+    for OGC Process jobs only).  When ``None`` all types are returned — the
+    admin Tasks API relies on this full view.
+    """
     task_schema = get_task_schema()
-    sql = f'SELECT * FROM {task_schema}.tasks WHERE schema_name = :schema_name ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
-    task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-        conn, schema_name=schema, limit=limit, offset=offset
-    )
+    if kind is not None:
+        sql = f'SELECT * FROM {task_schema}.tasks WHERE schema_name = :schema_name AND type = :kind ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
+        task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, schema_name=schema, limit=limit, offset=offset, kind=kind
+        )
+    else:
+        sql = f'SELECT * FROM {task_schema}.tasks WHERE schema_name = :schema_name ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
+        task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, schema_name=schema, limit=limit, offset=offset
+        )
     return [Task.model_validate(t) for t in task_dicts]
 
 
@@ -2665,6 +2688,65 @@ async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
             except (ValueError, TypeError):
                 row["inputs"] = None
     return rows or []
+
+
+async def select_dismissed_unconfirmed_gcp_tasks(
+    engine: DbResource,
+) -> List[Dict[str, Any]]:
+    """Return DISMISSED Cloud Run task rows whose stop is not yet confirmed.
+
+    Selects rows where ``status = 'DISMISSED'`` and ``dismiss_confirmed_at IS
+    NULL`` — i.e. an ACTIVE/RUNNING job that was dismissed while compute was
+    in flight.  ``locked_until < NOW()`` is intentionally NOT required: a
+    just-dismissed ACTIVE job still holds a live lease; the reconciler must
+    act immediately regardless.
+
+    ``FOR UPDATE SKIP LOCKED`` so concurrent reconciler pods never double-act
+    on the same row.  ``timestamp`` and ``last_heartbeat_at`` are included so
+    the caller can derive elapsed time for the force-stop deadline without a
+    second round-trip.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        SELECT task_id, schema_name, task_type, owner_id, runner_ref,
+               timestamp, started_at, last_heartbeat_at, retry_count, max_retries
+        FROM {task_schema}.tasks
+        WHERE status = 'DISMISSED'
+          AND dismiss_confirmed_at IS NULL
+          AND owner_id LIKE 'gcp_cloud_run_%'
+        FOR UPDATE SKIP LOCKED
+        LIMIT 500;
+    """
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(conn)
+    return rows or []
+
+
+async def stamp_dismiss_confirmed(
+    engine: DbResource,
+    task_id: uuid.UUID,
+) -> bool:
+    """Stamp ``dismiss_confirmed_at = NOW()`` on a DISMISSED row.
+
+    Gated on ``status = 'DISMISSED'`` so a race where the row has been
+    updated to another status between the reconciler's SELECT and this write
+    is handled safely (returns ``False`` with no write).  Returns ``True``
+    when the row was updated, ``False`` when it was not found or already had
+    ``dismiss_confirmed_at`` set.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        UPDATE {task_schema}.tasks
+        SET dismiss_confirmed_at = NOW()
+        WHERE task_id = :task_id
+          AND status = 'DISMISSED'
+          AND dismiss_confirmed_at IS NULL;
+    """
+    async with managed_transaction(engine) as conn:
+        rowcount = await DQLQuery(sql, result_handler=ResultHandler.ROWCOUNT).execute(
+            conn, task_id=task_id
+        )
+    return bool(rowcount and rowcount > 0)
 
 
 async def claim_by_id(
