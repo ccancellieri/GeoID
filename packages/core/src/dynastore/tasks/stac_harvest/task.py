@@ -575,7 +575,29 @@ async def run_harvest(
         Resolved scope string (e.g. ``"catalog:fao-gismgr"``).
     """
     stats = HarvestStats()
-    stac_presets_applied = False
+
+    # Pin the catalog's STAC routing/storage for the chosen backend BEFORE any
+    # collection is created.  The target catalog already exists at this point
+    # (the harvest job is submitted at catalog scope), so routing can — and must
+    # — be pinned up front: collections and items are written under whatever
+    # routing is in effect at write time.
+    #
+    # Applying the presets only after the first collection succeeded meant the
+    # first collection was created under the *unpinned* default routing.  With
+    # no per-collection routing pinned, ``create_collection`` fans the metadata
+    # write out to every registered CollectionStore driver inside the registry
+    # transaction; on an ES-primary deployment that includes a synchronous,
+    # fatal Elasticsearch write.  When that write raised, the shared transaction
+    # rolled back the registry row, ``_ensure_collection`` returned False, the
+    # loop ``continue``-d, and the routing preset below was never reached —
+    # leaving an empty collections table, an empty ES index, and the catalog
+    # still on the PG-default routing.  Pinning here routes the very first
+    # collection (e.g. ``_collection_routing_es`` for ``storage_backend="es"``)
+    # to the intended backend only.
+    if preset_ctx is not None:
+        await _apply_stac_presets(
+            preset_ctx, scope, request.target_catalog, request.storage_backend
+        )
 
     async for coll_raw in iter_collections(request.catalog_url):
         if request.max_collections and stats.collections_seen >= request.max_collections:
@@ -588,14 +610,6 @@ async def run_harvest(
             stats.errors.append(f"collection:{cid}")
             continue
         stats.collections_written += 1
-
-        # Pin item storage routing once the first collection is created
-        # (catalog provisioning is complete at that point).
-        if not stac_presets_applied and preset_ctx is not None:
-            await _apply_stac_presets(
-                preset_ctx, scope, request.target_catalog, request.storage_backend
-            )
-            stac_presets_applied = True
 
         batch: List[Dict[str, Any]] = []
         n_items = 0
