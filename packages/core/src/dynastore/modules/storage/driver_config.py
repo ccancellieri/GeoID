@@ -1125,20 +1125,30 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
             "index rebuild (ES does not allow tightening a live mapping)."
         ),
     )
-    # Issue #1248: exact geometry by default. When False (default) the
-    # driver indexes the geometry verbatim; an oversized geometry is
-    # rejected up-front by the ``item_service.upsert`` pre-write guard
-    # (HTTP 422) so the PG primary row is never created. Set True to
-    # restore the legacy behaviour of shrinking oversized geometries via
-    # ``simplify_to_fit`` to fit the ES 10 MB per-document limit.
+    # Issue #1248: geometry simplification is on by default. The driver
+    # simplifies oversized geometries to fit the ES 10 MB per-document
+    # limit; the PostgreSQL primary always keeps full resolution.
     simplify_geometry: Mutable[bool] = Field(
-        default=False,
+        default=True,
         description=(
-            "When True, oversized geometries are simplified to fit the "
-            "Elasticsearch 10 MB per-document limit before indexing "
-            "(lossy). When False (default), exact geometry is indexed and "
-            "items whose geometry exceeds 10 MB are rejected with HTTP 422 "
-            "before any write."
+            "When True (default), oversized geometries are simplified to fit "
+            "the Elasticsearch per-document byte budget before indexing "
+            "(lossy; the PostgreSQL primary always keeps full resolution). "
+            "Set False to index exact geometry and reject items whose geometry "
+            "exceeds the budget with HTTP 422 before any write."
+        ),
+    )
+    simplify_target_bytes: Mutable[Optional[int]] = Field(
+        default=None,
+        ge=1,
+        examples=[None, 1_000_000],
+        description=(
+            "Target byte budget for ES geometry simplification. When set, "
+            "geometry is simplified to fit under this size instead of the "
+            "10 MB Elasticsearch per-document limit — lower values keep ES "
+            "indices smaller at the cost of geometry fidelity. Values above "
+            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
+            "limit when unset. Does not affect the PostgreSQL primary."
         ),
     )
 
@@ -1201,17 +1211,30 @@ class ItemsElasticsearchPrivateDriverConfig(CollectionDriverConfig):
             "index rebuild (ES does not allow tightening a live mapping)."
         ),
     )
-    # Issue #1248: exact geometry by default — see
+    # Issue #1248: geometry simplification is on by default — see
     # ``ItemsElasticsearchDriverConfig.simplify_geometry`` for the full
-    # rationale. The private driver shares the same opt-in semantics.
+    # rationale. The private driver shares the same default-on semantics.
     simplify_geometry: Mutable[bool] = Field(
-        default=False,
+        default=True,
         description=(
-            "When True, oversized geometries are simplified to fit the "
-            "Elasticsearch 10 MB per-document limit before indexing "
-            "(lossy). When False (default), exact geometry is indexed and "
-            "items whose geometry exceeds 10 MB are rejected with HTTP 422 "
-            "before any write."
+            "When True (default), oversized geometries are simplified to fit "
+            "the Elasticsearch per-document byte budget before indexing "
+            "(lossy; the PostgreSQL primary always keeps full resolution). "
+            "Set False to index exact geometry and reject items whose geometry "
+            "exceeds the budget with HTTP 422 before any write."
+        ),
+    )
+    simplify_target_bytes: Mutable[Optional[int]] = Field(
+        default=None,
+        ge=1,
+        examples=[None, 1_000_000],
+        description=(
+            "Target byte budget for ES geometry simplification. When set, "
+            "geometry is simplified to fit under this size instead of the "
+            "10 MB Elasticsearch per-document limit — lower values keep ES "
+            "indices smaller at the cost of geometry fidelity. Values above "
+            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
+            "limit when unset. Does not affect the PostgreSQL primary."
         ),
     )
 
@@ -1234,7 +1257,7 @@ class ItemsElasticsearchEnvelopeDriverConfig(CollectionDriverConfig):
 
     :attr:`mapping` is the Tier-2 overlay (mirrors the public config) so
     operators can type extra tenant attributes. ``simplify_geometry`` shares
-    the same opt-in semantics as the other ES item drivers (#1248).
+    the same default-on semantics as the other ES item drivers (#1248).
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection", "items", "drivers")
     _freeze_at: ClassVar[Optional[str]] = "collection"
@@ -1255,17 +1278,30 @@ class ItemsElasticsearchEnvelopeDriverConfig(CollectionDriverConfig):
             "index rebuild (ES does not allow tightening a live mapping)."
         ),
     )
-    # Issue #1248: exact geometry by default — see
+    # Issue #1248: geometry simplification is on by default — see
     # ``ItemsElasticsearchDriverConfig.simplify_geometry`` for the full
-    # rationale. The envelope driver shares the same opt-in semantics.
+    # rationale. The envelope driver shares the same default-on semantics.
     simplify_geometry: Mutable[bool] = Field(
-        default=False,
+        default=True,
         description=(
-            "When True, oversized geometries are simplified to fit the "
-            "Elasticsearch 10 MB per-document limit before indexing "
-            "(lossy). When False (default), exact geometry is indexed and "
-            "items whose geometry exceeds 10 MB are rejected with HTTP 422 "
-            "before any write."
+            "When True (default), oversized geometries are simplified to fit "
+            "the Elasticsearch per-document byte budget before indexing "
+            "(lossy; the PostgreSQL primary always keeps full resolution). "
+            "Set False to index exact geometry and reject items whose geometry "
+            "exceeds the budget with HTTP 422 before any write."
+        ),
+    )
+    simplify_target_bytes: Mutable[Optional[int]] = Field(
+        default=None,
+        ge=1,
+        examples=[None, 1_000_000],
+        description=(
+            "Target byte budget for ES geometry simplification. When set, "
+            "geometry is simplified to fit under this size instead of the "
+            "10 MB Elasticsearch per-document limit — lower values keep ES "
+            "indices smaller at the cost of geometry fidelity. Values above "
+            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
+            "limit when unset. Does not affect the PostgreSQL primary."
         ),
     )
 

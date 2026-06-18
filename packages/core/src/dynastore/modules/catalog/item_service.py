@@ -755,27 +755,31 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         The private driver exposes ``_resolve_simplify_geometry``; the public
         driver resolves its ``simplify_geometry`` flag through
-        ``get_driver_config``. Defaults to False (exact-by-default, #1248) if
-        neither path yields a value.
+        ``get_driver_config``. Defaults to True (simplify-by-default, revised
+        2026-06-18) — a config-read failure must fail OPEN (simplify), never
+        reject.
         """
         resolver = getattr(driver, "_resolve_simplify_geometry", None)
         if resolver is not None:
             try:
-                return bool(await resolver(
+                result = await resolver(
                     catalog_id, collection_id, db_resource=db_resource,
-                ))
+                )
+                if result is None:
+                    return True  # not configured → fail open (accept + auto-simplify)
+                return bool(result)
             except Exception:
-                return False
+                return True
         get_config = getattr(driver, "get_driver_config", None)
         if get_config is not None:
             try:
                 cfg = await get_config(
                     catalog_id, collection_id, db_resource=db_resource,
                 )
-                return bool(getattr(cfg, "simplify_geometry", False))
+                return bool(getattr(cfg, "simplify_geometry", True))
             except Exception:
-                return False
-        return False
+                return True
+        return True
 
     async def _enforce_es_geometry_size_limit(
         self,
@@ -849,11 +853,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             return (
                 f"Item '{item_id}' geometry is {size} bytes, exceeding the "
                 f"{DEFAULT_MAX_BYTES}-byte (10 MB) Elasticsearch "
-                f"per-document limit. The collection routes an Elasticsearch "
-                f"items index with geometry simplification disabled, so the "
-                f"item is rejected before any write. Reduce the geometry "
-                f"resolution, or enable 'simplify_geometry' on the "
-                f"Elasticsearch items driver to index a simplified copy."
+                f"per-document limit. ES geometry simplification is ON by "
+                f"default, but this collection has explicitly set "
+                f"'simplify_geometry: false' on its Elasticsearch items driver, "
+                f"so the oversized item is rejected before any write. To accept "
+                f"and auto-simplify it, remove that override or set "
+                f"'simplify_geometry: true' (PostgreSQL keeps full resolution)."
             )
 
         # The per-item rejection out-list, when the caller seeded one

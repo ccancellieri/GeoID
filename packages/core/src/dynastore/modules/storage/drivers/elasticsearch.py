@@ -111,6 +111,26 @@ except ImportError:  # shapely not installed
 logger = logging.getLogger(__name__)
 
 
+def _clamp_geometry_budget(target: Optional[int]) -> int:
+    """Return a valid ES geometry byte budget from *target*.
+
+    Rules:
+    - None → ``DEFAULT_MAX_BYTES`` (10 MB ES ceiling)
+    - value > ``DEFAULT_MAX_BYTES`` → ``DEFAULT_MAX_BYTES`` (never exceed the ES hard limit)
+    - value ≤ 0 → ``DEFAULT_MAX_BYTES`` (treat non-positive as unset)
+    - 1 ≤ value ≤ ``DEFAULT_MAX_BYTES`` → value (passes through unchanged)
+
+    This is a pure function with no I/O and is easily unit-tested in isolation.
+    ``_resolve_simplify_max_bytes`` delegates to it so the clamping logic lives
+    in exactly one place.
+    """
+    from dynastore.tools.geometry_simplify import DEFAULT_MAX_BYTES
+
+    if target is None or target <= 0:
+        return DEFAULT_MAX_BYTES
+    return min(int(target), DEFAULT_MAX_BYTES)
+
+
 def _es_client_required() -> Any:
     """Return the ES async client; raise if the platform module hasn't started."""
     from dynastore.modules.elasticsearch.client import get_client
@@ -495,7 +515,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         return succeeded, failures
 
     # ------------------------------------------------------------------
-    # Shared simplification helper
+    # Shared simplification helpers
     # ------------------------------------------------------------------
 
     async def _resolve_simplify_geometry(
@@ -514,31 +534,75 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         falls back to ``get_driver_config`` (which already resolves
         ``ItemsElasticsearchDriverConfig``).
 
-        Degrade-safe: returns ``False`` (exact geometry) when the configs
-        protocol is unavailable or the config row is missing.
+        Degrade-safe: returns ``True`` (fail open to simplify) when the configs
+        protocol is unavailable or the config row is missing.  Only an explicit
+        ``simplify_geometry = False`` in the resolved config disables
+        simplification.
         """
         config_cls = self.__class__._driver_config_class
-        if config_cls is None:
-            # Public driver path: delegate to the generic get_driver_config.
-            driver_config = await self.get_driver_config(
-                catalog_id, collection_id, db_resource=db_resource,
+        try:
+            if config_cls is None:
+                # Public driver path: delegate to the generic get_driver_config.
+                driver_config = await self.get_driver_config(
+                    catalog_id, collection_id, db_resource=db_resource,
+                )
+                return bool(getattr(driver_config, "simplify_geometry", True))
+
+            from dynastore.models.protocols.configs import ConfigsProtocol
+            from dynastore.models.driver_context import DriverContext
+            from dynastore.tools.discovery import get_protocol
+
+            configs = get_protocol(ConfigsProtocol)
+            if configs is None:
+                return True
+            config = await configs.get_config(
+                config_cls,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                ctx=DriverContext(db_resource=db_resource),
             )
-            return bool(getattr(driver_config, "simplify_geometry", False))
+            return bool(getattr(config, "simplify_geometry", True))
+        except Exception:
+            return True
 
-        from dynastore.models.protocols.configs import ConfigsProtocol
-        from dynastore.models.driver_context import DriverContext
-        from dynastore.tools.discovery import get_protocol
+    async def _resolve_simplify_max_bytes(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> int:
+        """Effective ES geometry byte budget for simplification.
 
-        configs = get_protocol(ConfigsProtocol)
-        if configs is None:
-            return False
-        config = await configs.get_config(
-            config_cls,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            ctx=DriverContext(db_resource=db_resource),
-        )
-        return bool(getattr(config, "simplify_geometry", False))
+        Reads ``simplify_target_bytes`` from this driver's config and clamps it
+        to ``(1, DEFAULT_MAX_BYTES)``.  Returns ``DEFAULT_MAX_BYTES`` (the 10 MB
+        ES ceiling) when unset or when the config is unavailable.
+        """
+        from dynastore.tools.geometry_simplify import DEFAULT_MAX_BYTES
+
+        config_cls = self.__class__._driver_config_class
+        try:
+            if config_cls is None:
+                cfg = await self.get_driver_config(
+                    catalog_id, collection_id, db_resource=db_resource,
+                )
+            else:
+                from dynastore.models.protocols.configs import ConfigsProtocol
+                from dynastore.models.driver_context import DriverContext
+                from dynastore.tools.discovery import get_protocol
+
+                configs = get_protocol(ConfigsProtocol)
+                if configs is None:
+                    return DEFAULT_MAX_BYTES
+                cfg = await configs.get_config(
+                    config_cls,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    ctx=DriverContext(db_resource=db_resource),
+                )
+        except Exception:
+            return DEFAULT_MAX_BYTES
+        return _clamp_geometry_budget(getattr(cfg, "simplify_target_bytes", None))
 
     # ------------------------------------------------------------------
     # Shared concrete methods — identical across private and envelope drivers
@@ -1181,11 +1245,13 @@ class ItemsElasticsearchDriver(
             _ITEMS_INDEX_ENSURED_CATALOGS.add(catalog_id)
         known_fields = await resolve_catalog_known_fields(catalog_id)
 
-        # Issue #1248: exact geometry by default. Simplification is opt-in via
-        # the driver's ``simplify_geometry`` config flag; oversized geometries
-        # are otherwise rejected up-front by ``item_service.upsert`` (HTTP 422)
-        # rather than truncated here.
+        # Issue #1248: auto-simplify by default. Simplification can be disabled
+        # by setting ``simplify_geometry = false`` in the driver config; the
+        # byte budget is clamped to the ES 10 MB ceiling.
         simplify_geometry = await self._resolve_simplify_geometry(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
+        simplify_max_bytes = await self._resolve_simplify_max_bytes(
             catalog_id, collection_id, db_resource=db_resource,
         )
 
@@ -1395,7 +1461,7 @@ class ItemsElasticsearchDriver(
             # _source dict so the canonical envelope is intact; metadata is
             # recorded in system.geometry_simplification (nested, typed).
             es_doc, factor, mode = maybe_simplify_for_es(
-                es_doc, simplify=simplify_geometry,
+                es_doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
             )
             _apply_geometry_simplification(es_doc, factor, mode)
 
@@ -1998,7 +2064,10 @@ class ItemsElasticsearchDriver(
             stac_reserved_members=ci.stac_reserved_members,
         )
         simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
-        doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
+        simplify_max_bytes = await self._resolve_simplify_max_bytes(ctx.catalog, ctx.collection)
+        doc, factor, mode = maybe_simplify_for_es(
+            doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+        )
         _apply_geometry_simplification(doc, factor, mode)
         await es.index(
             index=index_name, id=op.entity_id, body=doc,
@@ -2035,6 +2104,7 @@ class ItemsElasticsearchDriver(
         await _ensure_in_public_alias_once(ctx.catalog, index_name)
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
         simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
+        simplify_max_bytes = await self._resolve_simplify_max_bytes(ctx.catalog, ctx.collection)
 
         # Batch-fetch canonical inputs for all upsert ops in one PG round-trip.
         upsert_geoids = [
@@ -2108,7 +2178,9 @@ class ItemsElasticsearchDriver(
                 access=ci.access,
                 stac_reserved_members=ci.stac_reserved_members,
             )
-            doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
+            doc, factor, mode = maybe_simplify_for_es(
+                doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+            )
             _apply_geometry_simplification(doc, factor, mode)
             body.append({"index": {
                 "_index": index_name, "_id": op.entity_id,

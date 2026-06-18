@@ -99,9 +99,9 @@ class PrivateIndexTask(TaskProtocol):
     collection's ``ItemsRoutingConfig`` pins
     ``items_elasticsearch_private_driver`` in any operation. The full feature
     is fetched via ``ItemCrudProtocol`` so the dispatcher only needs
-    to send identifiers. Geometry is indexed EXACTLY by default (#1248);
-    ``simplify_to_fit`` only runs when the private driver's
-    ``simplify_geometry`` config flag is enabled.
+    to send identifiers. Geometry is simplified by default (#1248);
+    exact geometry is the explicit opt-out via ``simplify_geometry: false``
+    in the private driver config.
     """
 
     task_type = "elasticsearch_private_index"
@@ -164,11 +164,15 @@ class PrivateIndexTask(TaskProtocol):
         doc = build_tenant_feature_doc(
             feature, catalog_id=inputs.catalog_id, collection_id=inputs.collection_id,
         )
-        # #1248: exact geometry by default — simplification is opt-in via the
-        # private driver's ``simplify_geometry`` config flag.
-        simplify_geometry = False
+        # #1248: simplify geometry by default — exact geometry is the explicit
+        # opt-out via ``simplify_geometry: false`` in the private driver config.
         from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            _clamp_geometry_budget,
+        )
         configs = get_protocol(ConfigsProtocol)
+        simplify_geometry = True
+        max_bytes = _clamp_geometry_budget(None)
         if configs is not None:
             private_config = await configs.get_config(
                 ItemsElasticsearchPrivateDriverConfig,
@@ -176,9 +180,14 @@ class PrivateIndexTask(TaskProtocol):
                 collection_id=inputs.collection_id,
             )
             simplify_geometry = bool(
-                getattr(private_config, "simplify_geometry", False)
+                getattr(private_config, "simplify_geometry", True)
             )
-        doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
+            max_bytes = _clamp_geometry_budget(
+                getattr(private_config, "simplify_target_bytes", None)
+            )
+        doc, factor, mode = maybe_simplify_for_es(
+            doc, simplify=simplify_geometry, max_bytes=max_bytes,
+        )
         # Write simplification provenance under the canonical system container
         # (#1828 Phase 2 — flat root keys are no longer written on new docs).
         if mode != "none":

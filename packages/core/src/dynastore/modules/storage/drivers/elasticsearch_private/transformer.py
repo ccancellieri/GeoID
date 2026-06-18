@@ -50,9 +50,9 @@ class PrivateEntityTransformer:
     """Transforms STAC items into the tenant-feature shape and back.
 
     On indexing: builds a tenant-feature doc via
-    :func:`build_tenant_feature_doc`. Geometry is indexed EXACTLY by
-    default (#1248); :func:`simplify_to_fit` only runs when the private
-    driver's ``simplify_geometry`` config flag is enabled. The resulting
+    :func:`build_tenant_feature_doc`. Geometry is SIMPLIFIED by default
+    (#1248); :func:`simplify_to_fit` runs unless the private driver's
+    ``simplify_geometry`` config flag is explicitly set to false. The resulting
     simplification metadata is persisted under ``system.geometry_simplification``
     (#1828 Phase 2) so clients can detect when geometry fidelity was reduced.
 
@@ -102,12 +102,14 @@ class PrivateEntityTransformer:
             catalog_id=catalog_id,
             collection_id=collection_id or "",
         )
-        # #1248: exact geometry by default — simplification is opt-in via the
-        # private driver's ``simplify_geometry`` config flag.
-        simplify_geometry = await self._resolve_simplify_geometry(
+        # #1248: simplify geometry by default — exact geometry is the explicit
+        # opt-out via ``simplify_geometry: false`` in the private driver config.
+        simplify_geometry, max_bytes = await self._resolve_simplify_params(
             catalog_id, collection_id, ctx,
         )
-        doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
+        doc, factor, mode = maybe_simplify_for_es(
+            doc, simplify=simplify_geometry, max_bytes=max_bytes,
+        )
         if mode != "none":
             doc.setdefault("system", {})["geometry_simplification"] = {
                 "factor": factor,
@@ -116,20 +118,23 @@ class PrivateEntityTransformer:
         return doc
 
     @staticmethod
-    async def _resolve_simplify_geometry(
+    async def _resolve_simplify_params(
         catalog_id: str, collection_id: Optional[str],
         ctx: TransformChainContext,
-    ) -> bool:
-        """Resolve the private driver's ``simplify_geometry`` flag (#1248).
+    ) -> "tuple[bool, int]":
+        """Resolve the private driver's simplification flag and byte budget (#1248).
 
-        Exact geometry is indexed by default; simplification is opt-in via
-        ``ItemsElasticsearchPrivateDriverConfig.simplify_geometry``.
+        Geometry is simplified by default; exact geometry is the explicit opt-out
+        via ``ItemsElasticsearchPrivateDriverConfig.simplify_geometry = false``.
+        The byte budget is read from ``simplify_target_bytes`` and clamped to the
+        ES 10 MB ceiling via ``_clamp_geometry_budget``.
 
         Memoized on ``ctx.cache`` so a batch of items in the same
         collection triggers a single ``ConfigsProtocol`` lookup (#1568).
+        Returns a ``(simplify_geometry, max_bytes)`` tuple.
         """
         cache_key = (
-            "PrivateEntityTransformer.simplify_geometry",
+            "PrivateEntityTransformer.simplify_params",
             catalog_id,
             collection_id,
         )
@@ -141,20 +146,30 @@ class PrivateEntityTransformer:
         from dynastore.modules.storage.driver_config import (
             ItemsElasticsearchPrivateDriverConfig,
         )
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            _clamp_geometry_budget,
+        )
         from dynastore.tools.discovery import get_protocol
 
         configs = get_protocol(ConfigsProtocol)
         if configs is None:
-            resolved = False
+            result: "tuple[bool, int]" = (True, _clamp_geometry_budget(None))
         else:
-            config = await configs.get_config(
-                ItemsElasticsearchPrivateDriverConfig,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-            )
-            resolved = bool(getattr(config, "simplify_geometry", False))
-        ctx.cache[cache_key] = resolved
-        return resolved
+            try:
+                config = await configs.get_config(
+                    ItemsElasticsearchPrivateDriverConfig,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+                resolved = bool(getattr(config, "simplify_geometry", True))
+                max_bytes = _clamp_geometry_budget(
+                    getattr(config, "simplify_target_bytes", None)
+                )
+                result = (resolved, max_bytes)
+            except Exception:
+                result = (True, _clamp_geometry_budget(None))
+        ctx.cache[cache_key] = result
+        return result
 
     async def restore_from_index(
         self,

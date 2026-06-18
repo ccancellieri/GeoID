@@ -283,6 +283,9 @@ class ItemsElasticsearchEnvelopeDriver(
         simplify_geometry = await self._resolve_simplify_geometry(
             catalog_id, collection_id, db_resource=db_resource,
         )
+        simplify_max_bytes = await self._resolve_simplify_max_bytes(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
 
         await self._ensure_index(es, index_name, ENVELOPE_FEATURE_MAPPING,
                                  get_private_items_index_settings)
@@ -300,7 +303,7 @@ class ItemsElasticsearchEnvelopeDriver(
                 context=context,
             )
             doc, factor, mode = maybe_simplify_for_es(
-                doc, simplify=simplify_geometry,
+                doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
             )
             _stamp_simplification(doc, factor, mode)
             bulk_body.append({"index": {"_index": index_name, "_id": geoid}})
@@ -584,7 +587,12 @@ class ItemsElasticsearchEnvelopeDriver(
         simplify_geometry = await self._resolve_simplify_geometry(
             ctx.catalog, ctx.collection,
         )
-        doc, factor, mode = maybe_simplify_for_es(doc, simplify=simplify_geometry)
+        simplify_max_bytes = await self._resolve_simplify_max_bytes(
+            ctx.catalog, ctx.collection,
+        )
+        doc, factor, mode = maybe_simplify_for_es(
+            doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+        )
         _stamp_simplification(doc, factor, mode)
         await es.index(index=index_name, id=op.entity_id, body=doc)
 
@@ -609,6 +617,9 @@ class ItemsElasticsearchEnvelopeDriver(
         simplify_geometry = await self._resolve_simplify_geometry(
             ctx.catalog, ctx.collection,
         )
+        simplify_max_bytes = await self._resolve_simplify_max_bytes(
+            ctx.catalog, ctx.collection,
+        )
 
         index_name = self._items_index_name(ctx.catalog)
         es = self._get_client()
@@ -629,7 +640,7 @@ class ItemsElasticsearchEnvelopeDriver(
                 src, catalog_id=ctx.catalog, collection_id=ctx.collection,
             )
             doc, factor, mode = maybe_simplify_for_es(
-                doc, simplify=simplify_geometry,
+                doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
             )
             _stamp_simplification(doc, factor, mode)
             body.append({"index": {"_index": index_name, "_id": op.entity_id}})

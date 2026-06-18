@@ -36,6 +36,7 @@ import math
 import pytest
 from shapely.geometry import Polygon, mapping
 
+from dynastore.models.driver_context import DriverContext
 from dynastore.modules.catalog.item_service import ItemService
 
 
@@ -155,14 +156,15 @@ async def test_reject_identifies_offending_item_id():
     assert "toobig" in str(exc.value)
 
 
-class _StubCtx:
-    """Minimal DriverContext stand-in: carries the ``extensions`` dict the
-    guard drains per-item rejections into (the same channel ``_ingest_items``
-    seeds as ``ctx.extensions["_rejections"]``)."""
+class _StubCtx(DriverContext):
+    """DriverContext subclass: pre-seeds the ``extensions`` dict with the
+    rejection channel the guard drains per-item errors into (the same channel
+    ``_ingest_items`` seeds as ``ctx.extensions["_rejections"]``)."""
 
     def __init__(self, seed_rejections: bool = True):
-        self.extensions = {"_rejections": []} if seed_rejections else {}
-        self.db_resource = None
+        super().__init__(
+            extensions={"_rejections": []} if seed_rejections else {},
+        )
 
 
 @pytest.mark.asyncio
@@ -257,3 +259,72 @@ async def test_works_with_feature_model_geometry():
         await svc._enforce_es_geometry_size_limit(
             "cat1", "col1", [feature], [_es_resolved(simplify_geometry=False)],
         )
+
+
+# ---------------------------------------------------------------------------
+# Fail-open tests: missing config / resolver error must NOT reject items
+# ---------------------------------------------------------------------------
+
+class _StubESDriver:
+    is_es_items_driver = True
+
+    def __init__(self, *, simplify=None, raise_on_resolve=False):
+        self._simplify = simplify
+        self._raise = raise_on_resolve
+
+    async def _resolve_simplify_geometry(self, catalog_id, collection_id, *, db_resource=None):
+        if self._raise:
+            raise RuntimeError("configs protocol unavailable")
+        return self._simplify
+
+
+class _Resolved:
+    def __init__(self, driver):
+        self.driver = driver
+
+
+@pytest.mark.asyncio
+async def test_guard_accepts_when_simplify_explicitly_enabled():
+    svc = ItemService()
+    item = {"id": "1582", "geometry": _big_geometry()}
+    kept = await svc._enforce_es_geometry_size_limit(
+        "cat", "coll", [item], [_Resolved(_StubESDriver(simplify=True))],
+        is_single=True,
+    )
+    assert kept == [item]
+
+
+@pytest.mark.asyncio
+async def test_guard_accepts_when_simplify_not_configured():
+    """Resolver returns None (not configured) → fail open: guard must accept
+    the oversized geometry rather than reject it."""
+    svc = ItemService()
+    item = {"id": "1582", "geometry": _big_geometry()}
+    kept = await svc._enforce_es_geometry_size_limit(
+        "cat", "coll", [item], [_Resolved(_StubESDriver(simplify=None))],
+        is_single=True,
+    )
+    assert kept == [item]
+
+
+@pytest.mark.asyncio
+async def test_guard_fails_open_when_resolution_errors():
+    svc = ItemService()
+    item = {"id": "1582", "geometry": _big_geometry()}
+    kept = await svc._enforce_es_geometry_size_limit(
+        "cat", "coll", [item], [_Resolved(_StubESDriver(raise_on_resolve=True))],
+        is_single=True,
+    )
+    assert kept == [item]
+
+
+@pytest.mark.asyncio
+async def test_guard_rejects_when_simplify_explicitly_disabled():
+    svc = ItemService()
+    item = {"id": "1582", "geometry": _big_geometry()}
+    with pytest.raises(ValueError) as exc:
+        await svc._enforce_es_geometry_size_limit(
+            "cat", "coll", [item], [_Resolved(_StubESDriver(simplify=False))],
+            is_single=True,
+        )
+    assert "simplify_geometry" in str(exc.value)

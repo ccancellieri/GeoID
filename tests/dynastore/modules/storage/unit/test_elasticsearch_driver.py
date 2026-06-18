@@ -868,7 +868,8 @@ class TestWriteEntitiesTenantIndex:
 
 
 class TestWriteEntitiesGeometryPolicy:
-    """#1248 — ES indexes EXACT geometry by default; simplification opt-in."""
+    """#1248 — ES simplifies oversized geometry by default; exact geometry is
+    the explicit opt-out (``simplify_geometry: false`` in the driver config)."""
 
     @staticmethod
     def _big_polygon_feature(item_id="big1"):
@@ -879,7 +880,7 @@ class TestWriteEntitiesGeometryPolicy:
         from dynastore.models.ogc import Feature
 
         # 300k vertices → GeoJSON serialization busts the 10 MB ES limit, so
-        # exact-by-default is observably different from the lossy shrink path.
+        # simplify-by-default is observably different from the exact-geometry path.
         n = 300_000
         ring = [
             [math.cos(2 * math.pi * i / n), math.sin(2 * math.pi * i / n)]
@@ -919,27 +920,63 @@ class TestWriteEntitiesGeometryPolicy:
         return es
 
     @pytest.mark.asyncio
-    async def test_exact_geometry_round_trips_by_default(self):
-        """Default config (simplify_geometry=False): the indexed doc carries
-        the FULL geometry — never an empty ``{}`` — so the geometry round-trips
-        into the ES index payload (the #1248 symptom)."""
+    async def test_oversized_geometry_simplified_by_default(self):
+        """Default config (simplify_geometry not set → True): writing a
+        300k-vertex polygon must produce a SHRUNK geometry (not 300_001
+        vertices) and stamp ``system.geometry_simplification``.
+
+        ``maybe_simplify_for_es`` is patched to return a deterministic result so
+        the test does not require shapely to be installed in this environment.
+        """
         from dynastore.modules.storage.driver_config import (
             ItemsElasticsearchDriverConfig,
         )
 
         feature = self._big_polygon_feature()
-        es = await self._run_write(ItemsElasticsearchDriverConfig(), feature)
+        simplified_geom = {"type": "Point", "coordinates": [0.0, 0.0]}  # stub shrunk
+        with patch(
+            "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+            side_effect=lambda doc, *, simplify, **kwargs: (
+                {**doc, "geometry": simplified_geom} if simplify else doc,
+                0.001 if simplify else 1.0,
+                "tolerance" if simplify else "none",
+            ),
+        ):
+            es = await self._run_write(ItemsElasticsearchDriverConfig(), feature)
 
         assert len(es.bulk_calls) == 1
         body = es.bulk_calls[0]["body"]
         doc = body[1]
         geom = doc.get("geometry")
-        assert geom, "geometry must not be empty/{} on exact-by-default write"
+        assert geom, "geometry must not be empty/{} on default write"
+        # Geometry was shrunk by the simplification stub — not the raw 300_001.
+        assert geom["type"] == "Point", "oversized geometry must be simplified by default"
+        # Simplification metadata stamped in the canonical system container (#1828).
+        gs = doc.get("system", {}).get("geometry_simplification", {})
+        assert gs.get("mode") == "tolerance"
+
+    @pytest.mark.asyncio
+    async def test_exact_geometry_round_trips_when_disabled(self):
+        """simplify_geometry=False: the indexed doc carries the FULL geometry
+        — the 300k-vertex polygon is indexed verbatim (explicit opt-out)."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsElasticsearchDriverConfig,
+        )
+
+        feature = self._big_polygon_feature()
+        es = await self._run_write(
+            ItemsElasticsearchDriverConfig(simplify_geometry=False), feature,
+        )
+
+        assert len(es.bulk_calls) == 1
+        body = es.bulk_calls[0]["body"]
+        doc = body[1]
+        geom = doc.get("geometry")
+        assert geom, "geometry must not be empty/{} when simplification is disabled"
         assert geom["type"] == "Polygon"
-        # Full vertex count preserved — geometry indexed verbatim even though
-        # it busts the 10 MB ES limit (simplify_to_fit was NOT called).
+        # Full vertex count preserved — geometry indexed verbatim.
         assert len(geom["coordinates"][0]) == 300_001
-        # No simplification metadata stamped when simplify disabled.
+        # No simplification metadata stamped when simplification is disabled.
         # Since #1828 the canonical location is system.geometry_simplification;
         # the legacy flat keys are no longer written.
         system = doc.get("system", {})
@@ -962,7 +999,7 @@ class TestWriteEntitiesGeometryPolicy:
         simplified_geom = {"type": "Point", "coordinates": [0.0, 0.0]}  # stub shrunk
         with patch(
             "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
-            side_effect=lambda doc, *, simplify: (
+            side_effect=lambda doc, *, simplify, **kwargs: (
                 {**doc, "geometry": simplified_geom} if simplify else doc,
                 0.001 if simplify else 1.0,
                 "tolerance" if simplify else "none",

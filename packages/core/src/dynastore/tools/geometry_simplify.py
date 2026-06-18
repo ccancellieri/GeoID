@@ -29,25 +29,15 @@ The caller receives a `simplification_factor` (final/original byte
 ratio) and a `simplification_mode` so the persisted document can
 record how much fidelity was lost.
 
-Geometry policy (issue #1248)
-=============================
+Geometry policy (issue #1248, revised 2026-06-18)
+=================================================
 
-Simplification is **opt-in**. Elasticsearch drivers index *exact*
-geometry by default; they only call :func:`simplify_to_fit` when their
-``simplify_geometry`` driver config flag is set (or an equivalent
-routing hint asks for the simplified read surface). Use
-:func:`maybe_simplify_for_es` so each write call site honours that flag
-with a single line.
-
-When simplification stays disabled, the platform must not silently
-truncate an oversized geometry: the pre-write guard in
-``item_service.upsert`` rejects an item whose geometry serializes above
-:data:`DEFAULT_MAX_BYTES` with HTTP 422 *before* any driver write, so
-the PG primary row is never created (ES is an async secondary; rejecting
-post-commit would leave PG and ES inconsistent). The byte measurement
-uses the GeoJSON serialization of the geometry alone (see
-:func:`geometry_geojson_size`) because the ES per-document limit is
-dominated by the geometry payload and the threshold is an ES constraint.
+Simplification is **on by default** for Elasticsearch items drivers. ES indexes
+a simplified copy of any geometry that exceeds the byte budget; the PostgreSQL
+primary always keeps full resolution. A collection may opt out by setting
+``simplify_geometry: false`` on its ES items driver config, in which case an
+oversized geometry is rejected up-front by the ``item_service.upsert`` pre-write
+guard (HTTP 422) rather than truncated.
 """
 
 from typing import Any, Tuple
@@ -59,7 +49,7 @@ from dynastore.tools.json import orjson_default
 
 
 DEFAULT_MAX_BYTES = 10_000_000
-DEFAULT_MAX_ITERATIONS = 3
+DEFAULT_MAX_ITERATIONS = 8
 
 MODE_NONE = "none"
 MODE_TOLERANCE = "tolerance"
@@ -171,17 +161,18 @@ def maybe_simplify_for_es(
 ) -> Tuple[dict, float, str]:
     """Opt-in wrapper around :func:`simplify_to_fit` for ES write paths.
 
-    Issue #1248: ES indexes EXACT geometry by default. Simplification is
-    opt-in, gated by the driver's ``simplify_geometry`` config flag (or an
-    equivalent routing hint) which the caller resolves and passes as
-    ``simplify``.
+    Issue #1248 (revised 2026-06-18): ES simplifies geometry by default.
+    Simplification is gated by the driver's ``simplify_geometry`` config flag
+    (or an equivalent routing hint) which the caller resolves and passes as
+    ``simplify``; that flag now defaults to ``True`` for the ES items drivers.
 
-    - ``simplify=False`` (default for both ES items drivers): return the
-      document untouched with ``(doc, 1.0, MODE_NONE)``. Exact geometry is
-      indexed; oversized geometries are rejected up-front by the
-      ``item_service.upsert`` pre-write guard rather than truncated here.
-    - ``simplify=True``: delegate to :func:`simplify_to_fit` so the doc is
-      shrunk to fit the ES per-document byte budget.
+    - ``simplify=True`` (default for the ES items drivers): delegate to
+      :func:`simplify_to_fit` so the doc is shrunk to fit the ES per-document
+      byte budget. The PostgreSQL primary keeps full resolution.
+    - ``simplify=False`` (explicit opt-out): return the document untouched
+      with ``(doc, 1.0, MODE_NONE)``. Exact geometry is indexed; oversized
+      geometries are rejected up-front by the ``item_service.upsert``
+      pre-write guard rather than truncated here.
 
     The input ``doc`` is returned for chaining (mutated in place only when
     simplification actually runs).

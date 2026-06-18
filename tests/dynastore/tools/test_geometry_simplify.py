@@ -22,6 +22,7 @@ from shapely.geometry import mapping, Polygon
 
 from dynastore.tools.geometry_simplify import (
     DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_ITERATIONS,
     MODE_BBOX,
     MODE_NONE,
     MODE_TOLERANCE,
@@ -122,3 +123,17 @@ def test_geometry_geojson_size_large_polygon_exceeds_limit():
     poly = Polygon(_ring(900_000))
     size = geometry_geojson_size(mapping(poly))
     assert size > DEFAULT_MAX_BYTES
+
+
+def test_default_max_iterations_is_eight():
+    assert DEFAULT_MAX_ITERATIONS == 8
+
+
+def test_custom_smaller_budget_shrinks_geometry():
+    # A dense ring that serializes well over 1 MB.
+    poly = Polygon(_ring(60_000))
+    doc = {"id": "x", "geometry": mapping(poly)}
+    out, factor, mode = simplify_to_fit(doc, max_bytes=1_000_000)
+    assert geometry_geojson_size(out["geometry"]) <= 1_000_000
+    assert mode in (MODE_TOLERANCE, MODE_BBOX)
+    assert factor < 1.0
