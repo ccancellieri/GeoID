@@ -75,13 +75,14 @@ async def test_preset_apply_submits_stac_harvest_process() -> None:
     async def _fake_execute(process_id: str, exec_request: Any, *, engine: Any,
                              caller_id: str, preferred_mode: Any,
                              catalog_id: Any = None,
-                             dedup_key: Any) -> MagicMock:
+                             dedup_key: Any = None) -> MagicMock:
         result = MagicMock()
         result.jobID = "job-abc-123"
         captured.append({
             "process_id": process_id,
             "inputs": dict(exec_request.inputs),
             "catalog_id": catalog_id,
+            "preferred_mode": preferred_mode,
         })
         return result
 
@@ -105,6 +106,10 @@ async def test_preset_apply_submits_stac_harvest_process() -> None:
     assert call["inputs"]["drivers"] == "es"
     # catalog_id must be propagated so the task row lands in the catalog schema.
     assert call["catalog_id"] == "test-cat"
+    # Harvest is always async (Cloud Run Job on GCP, async background task
+    # elsewhere) — it is a heavy/offload-routed process.
+    from dynastore.modules.processes.models import JobControlOptions
+    assert call["preferred_mode"] == JobControlOptions.ASYNC_EXECUTE
 
     # Descriptor should record the job id and parameters.
     assert descriptor.payload["job_id"] == "job-abc-123"

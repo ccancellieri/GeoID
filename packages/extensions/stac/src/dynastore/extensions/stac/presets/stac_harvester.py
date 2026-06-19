@@ -113,7 +113,6 @@ class StacHarvesterParams(BaseModel):
             "(es / es_pg / pg) is still accepted and mapped to this field."
         ),
     )
-
     @field_validator("url")
     @classmethod
     def _validate_url(cls, v: str) -> str:
@@ -259,6 +258,10 @@ class _StacHarvesterPreset:
             if pid is not None:
                 caller_id = str(pid)
 
+        # Always async: stac_harvest is a heavy/offload-routed process, so on a
+        # GCP deployment it runs as a dedicated Cloud Run Job and elsewhere as an
+        # async background task.  Either way the request returns a job id
+        # immediately and the harvest runs out-of-band.
         result = await execute_process(
             "stac_harvest",
             exec_request,

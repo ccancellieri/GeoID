@@ -22,8 +22,6 @@ Harvests a remote STAC catalog into a local dynastore catalog.  Uses INTERNAL
 service protocols — no HTTP self-calls.  Cross-module dependencies are via
 protocols only (no direct module imports).
 """
-from __future__ import annotations
-
 import asyncio
 import json
 import logging

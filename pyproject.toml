@@ -383,6 +383,26 @@ worker_task_tiles_preseed = ["dynastore[task_base,module_catalog,tiles,crs,modul
 worker_task_gdal = ["dynastore[task_base,module_catalog,gdal,module_storage_postgresql]"]
 worker_task_dimensions_materialize = ["dynastore[task_base,module_catalog,extension_dimensions,module_storage_postgresql]"]
 worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
+# stac_harvest: I/O-bound streaming harvest of a remote STAC catalog into a
+# target dynastore catalog. task_base (sync psycopg2 engine) like ingestion and
+# every other driver-heavy worker — the task reads its engine via get_engine()
+# and writes through managed_transaction, both of which use the sync engine, and
+# it applies the `routing` preset at catalog scope before the harvest loop.
+# A driver-heavy job MUST carry the sync datastore engine: db_config's
+# engine_resolver snapshots the per-driver engine refs at boot and needs a DB
+# pool already up; task_base_async ships asyncpg but no sync engine, so pairing
+# it with drivers_grp leaves the resolver with no engine during its retry window
+# and every ref then fails with KeyError (RuntimeError: No database engine).
+#   - catalog_grp     — catalog + collection + stac + assets write services.
+#   - drivers_grp     — every item/collection/catalog storage driver so any
+#                       `drivers` value (es / pg / pg_es / pg_pes) can write.
+#   - index_grp       — Elasticsearch client (default drivers=es writes items
+#                       straight to public ES).
+#   - configs,storage — ConfigsProtocol.set_config + the routing-config preset
+#                       machinery the harvest invokes to pin per-catalog routing.
+# Remote fetch is stdlib-only (urllib via asyncio.to_thread), so no httpx dep.
+# module_storage_postgresql kept explicit per the SCOPE × routing invariant.
+worker_task_stac_harvest = ["dynastore[task_base,catalog_grp,drivers_grp,index_grp,configs,storage,geospatial_core,module_storage_postgresql]"]
 # Write-reactive tile-cache invalidation (#1292) needs no dedicated SCOPE / Job
 # (#1298): it reuses the existing tiles_preseed task (operation=invalidate),
 # which already deploys as the geospatial-tiles-preseed-job
@@ -475,7 +495,7 @@ api_full = ["dynastore[api_catalog,maps_grp,geospatial_io]"]
 # geoid_service: api_catalog + geoid extension — the ONLY service with auth
 geoid_service = ["dynastore[api_catalog,extension_geoid]"]
 # worker_service: background task processor (sync-db tasks + async-db catalog reads), no auth
-worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
+worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # catalog_local: local dev catalog — api_open without google_grp/gcp_cloud_runner (no tools_grp: use the dedicated tools service)
 catalog_local = ["dynastore[core,catalog_grp,monitor_grp,index_grp,processes]"]
 # worker_local: local HTTP simulation of Cloud Run Jobs — all tasks + processes/stats UI
@@ -494,7 +514,7 @@ scope_catalog_review = ["dynastore[scope_catalog,module_gdal,worker_task_gdal]"]
 # scope_geoid: catalog + geoid UI + auth/iam — maps to geospatial-auth in cloud
 scope_geoid = ["dynastore[scope_catalog,extension_geoid,auth_grp]"]
 # scope_worker: background task processor — headless Cloud Run job runner
-scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
+scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # scope_tools: proxy + template tools service — no auth
 scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,proxy]"]
 # scope_maps: vector producer + raster renderer (local docker), no auth.
