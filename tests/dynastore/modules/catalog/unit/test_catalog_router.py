@@ -498,4 +498,7 @@ def test_catalog_routing_config_defaults_use_canonical_names():
     write_ids = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
     read_ids = {e.driver_ref for e in cfg.operations[Operation.READ]}
     assert write_ids == {"catalog_postgresql_driver"}
-    assert read_ids == {"catalog_postgresql_driver"}
+    # READ has two entries: PG (SoR, untagged) + ES (hint-routed).
+    assert "catalog_postgresql_driver" in read_ids
+    assert "catalog_elasticsearch_driver" in read_ids
+    assert len(read_ids) == 2

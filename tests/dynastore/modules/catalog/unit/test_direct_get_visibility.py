@@ -240,7 +240,7 @@ async def test_get_collection_visible_returns_model(monkeypatch):
         result = await svc.get_collection("mycat", "col1")
         mock_col_svc = mock_prop.return_value
         mock_col_svc.get_collection_model.assert_awaited_once_with(
-            "mycat", "col1", db_resource=None
+            "mycat", "col1", db_resource=None, hints=frozenset()
         )
 
     assert result is fake_col

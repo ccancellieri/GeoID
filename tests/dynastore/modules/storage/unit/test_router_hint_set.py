@@ -124,8 +124,10 @@ class TestBestOverlapMatcher:
             )
         DriverRegistry.clear()
         _resolve_driver_ids_cached.cache_clear()
-        # ES only carries GEOMETRY_SIMPLIFIED → not a superset → excluded.
-        assert [t[0] for t in out] == ["postgresql"]
+        # ES does not match (GEOMETRY_SIMPLIFIED ⊉ {FEATURES, GEOMETRY_EXACT}).
+        # READ: matched entries first (PG), then unmatched entries as fallback
+        # tail (ES) so a hint-preferred miss can still fall through to a reader.
+        assert [t[0] for t in out] == ["postgresql", "elasticsearch"]
 
     @pytest.mark.asyncio
     async def test_longest_effective_hints_wins_tiebreak(self):
@@ -209,7 +211,9 @@ class TestBestOverlapMatcher:
         # so each entry's effective surface is its driver's ``supported_hints``.
         # Only PG advertises ``Hint.JOIN`` (ES tops out at GEOMETRY_SIMPLIFIED),
         # so the DWH-join / feature-export request ``{Hint.JOIN}`` resolves to PG
-        # alone — the full-precision read path, bypassing the ES-first default.
+        # first — the full-precision read path, bypassing the ES-first default.
+        # READ appends the non-matching ES entry as a fallback tail (declared order)
+        # after PG, so a hinted read that PG misses can still try ES.
         routing = _make_routing({
             Operation.READ: [
                 ("elasticsearch", set()),
@@ -237,7 +241,8 @@ class TestBestOverlapMatcher:
             )
         DriverRegistry.clear()
         _resolve_driver_ids_cached.cache_clear()
-        assert [t[0] for t in out] == ["postgresql"]
+        # PG matches (declares JOIN); ES does not → appended as fallback tail.
+        assert [t[0] for t in out] == ["postgresql", "elasticsearch"]
 
     @pytest.mark.asyncio
     async def test_read_hint_unsatisfiable_relaxes_to_any_reader(self):
@@ -359,3 +364,155 @@ class TestResolveDriversHintSet:
                 hints=frozenset({Hint.GEOMETRY_EXACT}),
             )
             assert out is pg
+
+
+# ---------------------------------------------------------------------------
+# Task D.1 — READ fallback tail, SEARCH matched-only, WRITE strict empty
+# ---------------------------------------------------------------------------
+
+
+class TestReadFallbackTail:
+    """Pins the hinted-READ tail-append behaviour introduced alongside the
+    routing-config two-entry READ default (PG untagged + ES hinted)."""
+
+    @pytest.mark.asyncio
+    async def test_read_hinted_returns_matched_then_unmatched_tail(self):
+        """READ with hints=[PG untagged, ES geometry_simplified]: hint=geometry_simplified
+        resolves [ES, PG] — ES matched first (longest effective wins), PG appended as
+        fallback tail."""
+        routing = _make_routing({
+            Operation.READ: [
+                ("postgresql", set()),   # untagged → driver supported_hints used
+                ("elasticsearch", {Hint.GEOMETRY_SIMPLIFIED}),
+            ],
+        })
+        mock_configs = _mock_configs_protocol(routing)
+        pg = _mock_driver("postgresql", supported_hints=frozenset({Hint.GEOMETRY_EXACT, Hint.METADATA}))
+        es = _mock_driver("elasticsearch", supported_hints=frozenset({Hint.GEOMETRY_SIMPLIFIED, Hint.METADATA}))
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        with (
+            patch("dynastore.tools.discovery.get_protocol", return_value=mock_configs),
+            patch("dynastore.tools.discovery.get_protocols", return_value=[pg, es]),
+        ):
+            out = await _resolve_driver_ids_cached(
+                ItemsRoutingConfig, "cat1", "col1", Operation.READ,
+                frozenset({Hint.GEOMETRY_SIMPLIFIED}),
+            )
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        # ES matched (carries GEOMETRY_SIMPLIFIED); PG did not match the hinted set
+        # but is appended as fallback tail (declared order: PG was entry 0).
+        assert [t[0] for t in out] == ["elasticsearch", "postgresql"]
+
+    @pytest.mark.asyncio
+    async def test_read_no_hints_excludes_opt_in_tagged_entry(self):
+        """No-hint READ with an untagged default (PG) + a hint-tagged opt-in
+        entry (ES) resolves PG ONLY. The tagged ES reader is opt-in: a plain
+        read must not pull it into the default merge / first-non-None set, or a
+        merge-all metadata router would overwrite PG's exact geometry with the
+        ES simplified slice. This is the byte-identical-to-pre-hint guarantee
+        for collection/catalog READ (which gained the ES entry)."""
+        routing = _make_routing({
+            Operation.READ: [
+                ("postgresql", set()),
+                ("elasticsearch", {Hint.GEOMETRY_SIMPLIFIED}),
+            ],
+        })
+        mock_configs = _mock_configs_protocol(routing)
+        pg = _mock_driver("postgresql", supported_hints=frozenset({Hint.GEOMETRY_EXACT, Hint.METADATA}))
+        es = _mock_driver("elasticsearch", supported_hints=frozenset({Hint.GEOMETRY_SIMPLIFIED, Hint.METADATA}))
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        with (
+            patch("dynastore.tools.discovery.get_protocol", return_value=mock_configs),
+            patch("dynastore.tools.discovery.get_protocols", return_value=[pg, es]),
+        ):
+            out = await _resolve_driver_ids_cached(
+                ItemsRoutingConfig, "cat1", "col1", Operation.READ,
+                frozenset(),
+            )
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        assert [t[0] for t in out] == ["postgresql"]
+
+    @pytest.mark.asyncio
+    async def test_read_no_hints_all_tagged_keeps_full_list(self):
+        """No-hint READ where EVERY entry is tagged (the items-tier convention:
+        ES-first + PG, both tagged) keeps the full list in declared order — the
+        untagged-only filter must never strip readers to empty, so resolved[0]
+        still decides (ES is the intentional items READ default)."""
+        routing = _make_routing({
+            Operation.READ: [
+                ("elasticsearch", {Hint.GEOMETRY_SIMPLIFIED}),
+                ("postgresql", {Hint.GEOMETRY_EXACT}),
+            ],
+        })
+        mock_configs = _mock_configs_protocol(routing)
+        es = _mock_driver("elasticsearch", supported_hints=frozenset({Hint.GEOMETRY_SIMPLIFIED}))
+        pg = _mock_driver("postgresql", supported_hints=frozenset({Hint.GEOMETRY_EXACT}))
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        with (
+            patch("dynastore.tools.discovery.get_protocol", return_value=mock_configs),
+            patch("dynastore.tools.discovery.get_protocols", return_value=[pg, es]),
+        ):
+            out = await _resolve_driver_ids_cached(
+                ItemsRoutingConfig, "cat1", "col1", Operation.READ,
+                frozenset(),
+            )
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        assert [t[0] for t in out] == ["elasticsearch", "postgresql"]
+
+    @pytest.mark.asyncio
+    async def test_search_hinted_returns_matched_only_no_tail(self):
+        """SEARCH keeps matched-only (no unmatched fallback tail). A search picks
+        one backend; there is no SoR chain to fall through to."""
+        routing = _make_routing({
+            Operation.SEARCH: [
+                ("postgresql", set()),
+                ("elasticsearch", {Hint.GEOMETRY_SIMPLIFIED}),
+            ],
+        })
+        mock_configs = _mock_configs_protocol(routing)
+        pg = _mock_driver("postgresql", supported_hints=frozenset({Hint.GEOMETRY_EXACT}))
+        es = _mock_driver("elasticsearch", supported_hints=frozenset({Hint.GEOMETRY_SIMPLIFIED}))
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        with (
+            patch("dynastore.tools.discovery.get_protocol", return_value=mock_configs),
+            patch("dynastore.tools.discovery.get_protocols", return_value=[pg, es]),
+        ):
+            out = await _resolve_driver_ids_cached(
+                ItemsRoutingConfig, "cat1", "col1", Operation.SEARCH,
+                frozenset({Hint.GEOMETRY_SIMPLIFIED}),
+            )
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        # ES matched; PG did NOT match — SEARCH must NOT append PG as tail.
+        assert [t[0] for t in out] == ["elasticsearch"]
+
+    @pytest.mark.asyncio
+    async def test_write_unsatisfiable_hint_returns_empty(self):
+        """WRITE with an unsatisfiable hint yields [] — no relaxation, no tail."""
+        routing = _make_routing({
+            Operation.WRITE: [
+                ("postgresql", {Hint.GEOMETRY_EXACT}),
+            ],
+        })
+        mock_configs = _mock_configs_protocol(routing)
+        pg = _mock_driver("postgresql")
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        with (
+            patch("dynastore.tools.discovery.get_protocol", return_value=mock_configs),
+            patch("dynastore.tools.discovery.get_protocols", return_value=[pg]),
+        ):
+            out = await _resolve_driver_ids_cached(
+                ItemsRoutingConfig, "cat1", "col1", Operation.WRITE,
+                frozenset({Hint.GEOMETRY_SIMPLIFIED}),
+            )
+        DriverRegistry.clear()
+        _resolve_driver_ids_cached.cache_clear()
+        assert out == []

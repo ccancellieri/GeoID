@@ -176,7 +176,13 @@ def test_collection_routing_default_read_is_pg_primary():
     )
     cfg = CollectionRoutingConfig()
     read = cfg.operations[Operation.READ]
-    assert [e.driver_ref for e in read] == ["collection_postgresql_driver"]
+    # Two READ entries: PG (system-of-record, untagged, FATAL) then ES
+    # (hint-routed via METADATA / prefer:es, WARN). No geometry hints at
+    # the metadata level.
+    refs = [e.driver_ref for e in read]
+    assert refs[0] == "collection_postgresql_driver"
+    assert "collection_elasticsearch_driver" in refs
+    assert len(read) == 2
     assert read[0].on_failure == FailurePolicy.FATAL
 
 
@@ -229,18 +235,24 @@ def test_collection_routing_default_search_carries_geometry_hints():
 
 
 def test_catalog_routing_default_refs_are_registered():
-    """The default WRITE/READ entries must reference an actually-registered
-    driver_ref. catalog_core_postgresql_driver / catalog_stac_postgresql_driver
+    """The default WRITE/READ entries must reference actually-registered
+    driver_refs. catalog_core_postgresql_driver / catalog_stac_postgresql_driver
     were never registered as entry-points — the registered wrapper is
-    catalog_postgresql_driver."""
+    catalog_postgresql_driver. READ has two entries: PG (SoR) and ES (hint-routed)."""
     from dynastore.modules.storage.routing_config import (
-        CatalogRoutingConfig, Operation,
+        CatalogRoutingConfig, FailurePolicy, Operation,
     )
     cfg = CatalogRoutingConfig()
     write_refs = [e.driver_ref for e in cfg.operations[Operation.WRITE]]
-    read_refs = [e.driver_ref for e in cfg.operations[Operation.READ]]
+    read_entries = cfg.operations[Operation.READ]
+    read_refs = [e.driver_ref for e in read_entries]
     assert write_refs == ["catalog_postgresql_driver"]
-    assert read_refs == ["catalog_postgresql_driver"]
+    # Two READ entries: PG first (SoR, untagged, FATAL), ES second
+    # (hints=METADATA, WARN — no geometry at the metadata level).
+    assert read_refs[0] == "catalog_postgresql_driver"
+    assert "catalog_elasticsearch_driver" in read_refs
+    assert len(read_entries) == 2
+    assert read_entries[0].on_failure == FailurePolicy.FATAL
     for ref in write_refs + read_refs:
         assert ref not in (
             "catalog_core_postgresql_driver",
@@ -254,3 +266,91 @@ def test_catalog_routing_default_write_is_fatal():
     )
     cfg = CatalogRoutingConfig()
     assert cfg.operations[Operation.WRITE][0].on_failure == FailurePolicy.FATAL
+
+
+# ---------------------------------------------------------------------------
+# Task D.2 — two-entry READ defaults for CollectionRoutingConfig / CatalogRoutingConfig
+# ---------------------------------------------------------------------------
+
+
+def test_collection_routing_read_has_pg_sor_then_es_hinted():
+    """CollectionRoutingConfig.operations[READ] has exactly two entries:
+    PG (untagged, FATAL) then ES (hints={METADATA}, WARN).
+    There is no geometry at the metadata level so geometry hints are absent."""
+    from dynastore.modules.storage.hints import Hint
+    from dynastore.modules.storage.routing_config import (
+        CollectionRoutingConfig, FailurePolicy, Operation,
+    )
+    cfg = CollectionRoutingConfig()
+    read = cfg.operations[Operation.READ]
+    assert len(read) == 2
+    pg_e = next(e for e in read if e.driver_ref == "collection_postgresql_driver")
+    es_e = next(e for e in read if e.driver_ref == "collection_elasticsearch_driver")
+    # PG is first (index 0) and FATAL
+    assert read[0].driver_ref == "collection_postgresql_driver"
+    assert pg_e.on_failure == FailurePolicy.FATAL
+    # ES entry is opt-in via METADATA hint; geometry hints do not apply here
+    assert Hint.METADATA in es_e.hints
+    assert es_e.hints == {Hint.METADATA}
+    assert es_e.on_failure == FailurePolicy.WARN
+
+
+def test_catalog_routing_read_has_pg_sor_then_es_hinted():
+    """CatalogRoutingConfig.operations[READ] has exactly two entries:
+    PG (untagged, FATAL) then ES (hints={METADATA}, WARN).
+    There is no geometry at the metadata level so geometry hints are absent."""
+    from dynastore.modules.storage.hints import Hint
+    from dynastore.modules.storage.routing_config import (
+        CatalogRoutingConfig, FailurePolicy, Operation,
+    )
+    cfg = CatalogRoutingConfig()
+    read = cfg.operations[Operation.READ]
+    assert len(read) == 2
+    pg_e = next(e for e in read if e.driver_ref == "catalog_postgresql_driver")
+    es_e = next(e for e in read if e.driver_ref == "catalog_elasticsearch_driver")
+    assert read[0].driver_ref == "catalog_postgresql_driver"
+    assert pg_e.on_failure == FailurePolicy.FATAL
+    assert Hint.METADATA in es_e.hints
+    assert es_e.hints == {Hint.METADATA}
+    assert es_e.on_failure == FailurePolicy.WARN
+
+
+def test_collection_routing_es_hints_subset_of_es_driver_supported_hints():
+    """The ES entry's hints must be a subset of CollectionElasticsearchDriver.supported_hints,
+    so _validate_routing_entries accepts the entry without an error."""
+    from dynastore.modules.storage.hints import Hint
+    from dynastore.modules.storage.routing_config import (
+        CollectionRoutingConfig, Operation,
+    )
+    from dynastore.modules.elasticsearch.collection_es_driver import (
+        CollectionElasticsearchDriver,
+    )
+    cfg = CollectionRoutingConfig()
+    es_e = next(
+        e for e in cfg.operations[Operation.READ]
+        if e.driver_ref == "collection_elasticsearch_driver"
+    )
+    driver_hints = CollectionElasticsearchDriver.supported_hints
+    assert frozenset(es_e.hints).issubset(driver_hints), (
+        f"Entry hints {es_e.hints} not a subset of driver.supported_hints {driver_hints}"
+    )
+
+
+def test_catalog_routing_es_hints_subset_of_es_driver_supported_hints():
+    """The ES entry's hints must be a subset of CatalogElasticsearchDriver.supported_hints."""
+    from dynastore.modules.storage.hints import Hint
+    from dynastore.modules.storage.routing_config import (
+        CatalogRoutingConfig, Operation,
+    )
+    from dynastore.modules.elasticsearch.catalog_es_driver import (
+        CatalogElasticsearchDriver,
+    )
+    cfg = CatalogRoutingConfig()
+    es_e = next(
+        e for e in cfg.operations[Operation.READ]
+        if e.driver_ref == "catalog_elasticsearch_driver"
+    )
+    driver_hints = CatalogElasticsearchDriver.supported_hints
+    assert frozenset(es_e.hints).issubset(driver_hints), (
+        f"Entry hints {es_e.hints} not a subset of driver.supported_hints {driver_hints}"
+    )

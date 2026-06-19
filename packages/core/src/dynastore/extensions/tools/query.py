@@ -42,7 +42,11 @@ HINTS_QUERY_DESCRIPTION = (
     "Canonical tokens come from the Hint vocabulary — e.g. "
     "``geometry_exact`` requests full-precision geometry from the exact-capable "
     "driver (today PostgreSQL) instead of the simplified search-backend copy. "
-    "Unknown tokens are ignored, so passing an unsupported hint is harmless."
+    "Unknown tokens are ignored, so passing an unsupported hint is harmless. "
+    "The parametric token ``prefer:<driver>`` (e.g. ``prefer:es``, ``prefer:pg``) "
+    "pins a READ/SEARCH to a specific driver regardless of its declared hint "
+    "surface — for example ``?hints=prefer:es`` routes a collection metadata "
+    "READ to Elasticsearch first with PostgreSQL kept as the fallback."
 )
 
 

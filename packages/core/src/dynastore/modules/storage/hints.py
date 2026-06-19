@@ -112,16 +112,6 @@ class Hint(StrEnum):
     GEOMETRY_SIMPLIFIED = "geometry_simplified"
     GEOMETRY_EXACT = "geometry_exact"
 
-    # Collection/catalog metadata read from the STAC-shaped search-backend
-    # (ES) rather than the canonical PG sidecar.  The ES copy is the
-    # lightweight envelope stored at index time; PG is the system of record
-    # (full envelope with all sidecar columns).  Callers that only need the
-    # ES-shaped representation (e.g. landing-page renders that mirror the
-    # search index) pass this hint to route the metadata READ to ES first
-    # and PG as a fall-open fallback.  Combined with GEOMETRY_SIMPLIFIED
-    # on the same ES entry so operators can request both in one hint set.
-    STAC_PREFERRED = "stac_preferred"
-
     # Driver can produce MVT-shaped geometry rows that the tile renderer
     # wraps in ``ST_AsMVT``.  Today only PG advertises this; future ES /
     # DuckDB drivers opt in by adding it to ``supported_hints`` and
@@ -193,31 +183,74 @@ class Hint(StrEnum):
 # changes to any call site that uses this constant.
 EXACT_READ_HINTS: frozenset = frozenset({Hint.GEOMETRY_EXACT})
 
+# ---------------------------------------------------------------------------
+# Parametric prefer hint support
+# ---------------------------------------------------------------------------
+
+#: Prefix that identifies a parametric driver-preference token in the
+#: ``?hints=`` query parameter.  A token of the form ``prefer:<driver>``
+#: (e.g. ``prefer:es``, ``prefer:pg``) pins a READ or SEARCH to a specific
+#: driver regardless of the declared hint surface.  It is the deterministic
+#: "read metadata from ES" selector.  The token is resolved tier-relative by
+#: the router against the operation's configured entries: exact
+#: ``driver_ref`` match wins; else an alias is expanded to a substring
+#: match against ``driver_ref`` (e.g. ``es`` → ``elasticsearch`` substring).
+PREFER_PREFIX: str = "prefer:"
+
+#: Short alias → full driver_ref substring mapping for ``prefer:<driver>``
+#: tokens.  An alias entry means the router will match any ``driver_ref``
+#: that **contains** the resolved needle as a substring.  Full snake_case
+#: ``driver_ref`` values (e.g. ``prefer:items_elasticsearch_driver``) are
+#: always accepted directly (exact match) without needing an alias entry.
+DRIVER_PREFER_ALIASES: dict = {
+    "es": "elasticsearch",
+    "pg": "postgresql",
+    "postgres": "postgresql",
+    "bq": "bigquery",
+    "duckdb": "duckdb",
+    "iceberg": "iceberg",
+}
+
 
 def parse_request_hints(values) -> frozenset:
-    """Parse caller-supplied hint tokens into a ``frozenset[Hint]``.
+    """Parse caller-supplied hint tokens into a ``frozenset``.
 
     Accepts the value of the ``?hints=`` query parameter in either repeated
     form (``?hints=geometry_exact&hints=tiles``) or comma-joined form
     (``?hints=geometry_exact,tiles``); ``values`` is therefore an iterable of
     strings (FastAPI hands a ``List[str]`` for a repeated param) or ``None``.
 
-    Tokens are matched case-insensitively against the canonical :class:`Hint`
-    vocabulary; unknown tokens are silently dropped so a typo or a hint this
-    deployment doesn't recognise simply has no effect (same tolerance the
-    routing matcher already applies to unrecognised ``supported_hints``).
+    Two token classes are accepted:
+
+    * **Canonical :class:`Hint` members** — matched case-insensitively against
+      the ``Hint`` vocabulary; unknown tokens are silently dropped so a typo or
+      a hint this deployment doesn't recognise simply has no effect.
+    * **Parametric ``prefer:<driver>`` tokens** — retained verbatim as plain
+      strings (e.g. ``"prefer:es"``) in the returned frozenset.  The router
+      resolves them tier-relative against the operation's configured driver
+      entries (exact ``driver_ref`` match, then alias → substring).  They are
+      stripped from the hint set before the overlap matcher so they never
+      interfere with declared ``Hint`` membership tests.
+
     Returns an empty frozenset when nothing valid is supplied, which keeps the
-    default (simplified / search-backend) read path byte-for-byte unchanged.
+    default read path byte-for-byte unchanged.
     """
     if not values:
         return frozenset()
     by_value = {h.value: h for h in Hint}
-    parsed = set()
+    parsed: set = set()
     for raw in values:
         if raw is None:
             continue
         for token in str(raw).split(","):
-            member = by_value.get(token.strip().lower())
+            tok = token.strip().lower()
+            if not tok:
+                continue
+            if tok.startswith(PREFER_PREFIX) and len(tok) > len(PREFER_PREFIX):
+                # Parametric prefer token — retain as plain string for the router.
+                parsed.add(tok)
+                continue
+            member = by_value.get(tok)
             if member is not None:
                 parsed.add(member)
     return frozenset(parsed)

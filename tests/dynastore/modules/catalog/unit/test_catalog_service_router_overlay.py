@@ -195,7 +195,7 @@ def test_unpack_router_metadata_cannot_shadow_control_plane_fields():
 async def test_router_resolution_returns_router_payload_on_success(monkeypatch):
     svc = _make_service_instance()
 
-    async def _fake_get(catalog_id, *, context=None, db_resource=None):
+    async def _fake_get(catalog_id, *, context=None, db_resource=None, hints=frozenset()):
         return {"title": {"en": "T"}, "conforms_to": ["x"]}
 
     monkeypatch.setattr(
@@ -211,7 +211,7 @@ async def test_router_resolution_degrades_to_none_on_exception(monkeypatch, capl
     """Router raising MUST NOT 5xx the catalog read — fall back to legacy SELECT."""
     svc = _make_service_instance()
 
-    async def _boom(catalog_id, *, context=None, db_resource=None):
+    async def _boom(catalog_id, *, context=None, db_resource=None, hints=frozenset()):
         raise RuntimeError("router exploded")
 
     monkeypatch.setattr(
@@ -236,7 +236,7 @@ async def test_router_resolution_returns_none_when_router_returns_none(monkeypat
     """No router data → fall back cleanly to legacy columns (no synthesis)."""
     svc = _make_service_instance()
 
-    async def _none(catalog_id, *, context=None, db_resource=None):
+    async def _none(catalog_id, *, context=None, db_resource=None, hints=frozenset()):
         return None
 
     monkeypatch.setattr(

@@ -896,9 +896,28 @@ class CollectionRoutingConfig(_RoutingConfigBase):
                 ),
             ],
             Operation.READ: [
+                # System of record. A plain (no-hint) read is served by PG,
+                # byte-identical to before — hints opt into the ES view below.
+                # Left untagged so it matches its full driver-declared surface
+                # ({GEOMETRY_EXACT, METADATA}) and stays the catch-all reader.
                 OperationDriverEntry(
                     driver_ref="collection_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
+                    source="auto",
+                ),
+                # Opt-in ES read: tagged METADATA so it is only reached when
+                # the caller supplies an explicit hint (e.g. ?hints=prefer:es).
+                # There is no geometry at the metadata level so geometry hints
+                # do not apply here. The READ matcher keeps the unmatched PG
+                # entry as an ordered fallback tail, so an ES miss falls through
+                # to the PG system of record (WARN = best-effort, never fatal).
+                # A no-hint read never reaches ES because the no-hint READ
+                # filter drops hint-tagged entries when an untagged default
+                # exists.
+                OperationDriverEntry(
+                    driver_ref="collection_elasticsearch_driver",
+                    hints={Hint.METADATA},
+                    on_failure=FailurePolicy.WARN,
                     source="auto",
                 ),
             ],
@@ -1082,9 +1101,28 @@ class CatalogRoutingConfig(_RoutingConfigBase):
                 ),
             ],
             Operation.READ: [
+                # System of record. A plain (no-hint) read is served by PG,
+                # byte-identical to before — hints opt into the ES view below.
+                # Left untagged so it matches its full driver-declared surface
+                # ({GEOMETRY_EXACT, METADATA}) and stays the catch-all reader.
                 OperationDriverEntry(
                     driver_ref="catalog_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
+                    source="auto",
+                ),
+                # Opt-in ES read: tagged METADATA so it is only reached when
+                # the caller supplies an explicit hint (e.g. ?hints=prefer:es).
+                # There is no geometry at the metadata level so geometry hints
+                # do not apply here. The READ matcher keeps the unmatched PG
+                # entry as an ordered fallback tail, so an ES miss falls through
+                # to the PG system of record (WARN = best-effort, never fatal).
+                # A no-hint read never reaches ES because the no-hint READ
+                # filter drops hint-tagged entries when an untagged default
+                # exists.
+                OperationDriverEntry(
+                    driver_ref="catalog_elasticsearch_driver",
+                    hints={Hint.METADATA},
+                    on_failure=FailurePolicy.WARN,
                     source="auto",
                 ),
             ],

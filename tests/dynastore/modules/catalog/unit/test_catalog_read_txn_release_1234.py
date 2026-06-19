@@ -81,7 +81,7 @@ def _install_common(monkeypatch, log: List[Any], router_calls: List[Optional[Any
     monkeypatch.setattr(cs, "managed_transaction", lambda _res: _FakeTxn(log))
 
     # router fan-out: record order + the db_resource it received.
-    async def _fake_router(self, catalog_id, *, db_resource=None):  # noqa: ANN001
+    async def _fake_router(self, catalog_id, *, db_resource=None, hints=frozenset()):  # noqa: ANN001
         log.append("router_fanout")
         router_calls.append(db_resource)
         return None

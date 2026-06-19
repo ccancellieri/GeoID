@@ -497,7 +497,9 @@ async def create_collections_catalog(
     catalogs_svc = get_protocol(CatalogsProtocol)
     if not catalogs_svc:
         raise RuntimeError("CatalogsProtocol not available")
-    collections = await cast(CatalogsProtocol, catalogs_svc).list_collections(catalog_id, lang=lang, limit=1000)
+    collections = await cast(CatalogsProtocol, catalogs_svc).list_collections(
+        catalog_id, lang=lang, limit=1000, hints=hints,
+    )
 
     stac_collections = []
     for coll in collections:

@@ -25,7 +25,36 @@ list) with optional hint-based filtering.
 For **WRITE**: all matching drivers execute (fan-out), each with its own
 ``FailurePolicy``.
 
-For **READ/SEARCH**: the first matching driver is returned.
+For **READ** (hinted): matched drivers are returned first (ordered by
+longest effective hint surface, then entry order), followed by the
+unmatched entries as an ordered fallback tail.  This lets a hint-preferred
+driver (e.g. ES for ``geometry_simplified``) fall through to the
+system-of-record (PG) when it returns ``None``.  No-hint READ is
+unaffected (the ``if hints:`` block is bypassed entirely).
+
+For **SEARCH** (hinted): matched-only (no fallback tail appended).  A
+search picks the single best backend; there is no SoR chain to fall
+through to.
+
+For **READ/SEARCH** with a hint set that matches NO configured driver:
+the hint is treated as a preference and relaxed — the full unfiltered
+driver list is returned in its original order so a read still resolves
+a driver (e.g. exact geometry requested on an ES-only catalog falls
+back to the simplified-geometry driver).  WRITE is never relaxed.
+
+Parametric ``prefer:<driver>`` override
+----------------------------------------
+
+A hint token of the form ``prefer:<driver>`` (e.g. ``prefer:es``,
+``prefer:pg``) pins a READ or SEARCH to a specific driver without
+requiring that driver to declare matching ``supported_hints``.  It is
+resolved tier-relative by :func:`_resolve_driver_preferences` against the
+operation's configured entries: exact ``driver_ref`` match wins; else an
+alias from :data:`~dynastore.modules.storage.hints.DRIVER_PREFER_ALIASES`
+is expanded to a substring match against ``driver_ref``.  For READ the
+pinned driver is placed first with the remaining entries as an ordered
+fallback tail; for SEARCH only the matched entries are returned.  WRITE
+is never redirected by prefer tokens.
 
 Performance: driver index lookup uses the process-wide ``DriverRegistry``
 singleton (L0 cache, built once at startup) so there is no per-request dict
@@ -45,7 +74,7 @@ if TYPE_CHECKING:
 
 _D = TypeVar("_D")
 
-from dynastore.modules.storage.hints import Hint
+from dynastore.modules.storage.hints import DRIVER_PREFER_ALIASES, PREFER_PREFIX, Hint
 from dynastore.modules.storage.routing_config import (
     AssetRoutingConfig,
     FailurePolicy,
@@ -76,6 +105,54 @@ class ResolvedDriver(Generic[_D]):
     @property
     def driver_ref(self) -> str:
         return type(self.driver).__name__
+
+
+# ---------------------------------------------------------------------------
+# prefer:<driver> resolution helper
+# ---------------------------------------------------------------------------
+
+
+def _resolve_driver_preferences(hints, entries) -> list:
+    """Resolve ``prefer:<driver>`` request tokens to concrete driver_refs present
+    in ``entries`` (tier-relative).
+
+    For each ``prefer:<driver>`` token in ``hints``:
+
+    1. Extract the target string after the ``prefer:`` prefix.
+    2. Try an exact ``entry.driver_ref == target`` match first.
+    3. If no exact match, look up a short alias in
+       :data:`~dynastore.modules.storage.hints.DRIVER_PREFER_ALIASES` and
+       match any entry whose ``driver_ref`` contains the resolved needle as a
+       substring (e.g. ``es`` → ``elasticsearch`` matches
+       ``collection_elasticsearch_driver``).
+
+    Returns a de-duplicated, order-preserving list of ``driver_ref`` strings
+    for all entries that matched at least one ``prefer:`` token.  Returns an
+    empty list when no ``prefer:`` tokens are present or nothing resolves.
+    """
+    seen: set = set()
+    result: list = []
+    for h in hints:
+        s = str(h)
+        if not s.startswith(PREFER_PREFIX):
+            continue
+        target = s[len(PREFER_PREFIX):].strip().lower()
+        if not target:
+            continue
+        # Try exact match first.
+        for e in entries:
+            if e.driver_ref == target and e.driver_ref not in seen:
+                seen.add(e.driver_ref)
+                result.append(e.driver_ref)
+                break
+        else:
+            # Fall back to alias → substring match.
+            needle = DRIVER_PREFER_ALIASES.get(target, target)
+            for e in entries:
+                if needle in e.driver_ref and e.driver_ref not in seen:
+                    seen.add(e.driver_ref)
+                    result.append(e.driver_ref)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +217,25 @@ async def _resolve_driver_ids_cached(
             # follow-up exception from the fallback path.
             pass
 
+    # Parametric prefer:<driver> override — resolved BEFORE the overlap
+    # matcher so prefer tokens never interfere with Hint membership tests.
+    # Strip prefer tokens from hints regardless of whether they matched;
+    # the @cached key was formed from the original frozenset so prefer
+    # values still cache distinctly (no signature change needed).
+    prefer_refs = _resolve_driver_preferences(hints, entries)
+    hints = frozenset(h for h in hints if not str(h).startswith(PREFER_PREFIX))
+    if prefer_refs and operation in (Operation.READ, Operation.SEARCH):
+        preferred = [e for ref in prefer_refs for e in entries if e.driver_ref == ref]
+        if preferred:
+            if operation == Operation.READ:
+                rest = [e for e in entries if e.driver_ref not in prefer_refs]
+                entries = preferred + rest   # pinned driver first, others as fallback tail
+            else:
+                entries = preferred          # SEARCH: matched-only
+            return [(e.driver_ref, e.on_failure, e.write_mode) for e in entries]
+    # WRITE is never redirected by prefer (operation guard above ensures it;
+    # prefer tokens are already stripped from hints so WRITE fan-out is unaffected).
+
     if hints:
         # Best-overlap matcher: an entry matches iff the entry's effective
         # hint surface is a SUPERSET of the requested hints (the entry can
@@ -176,7 +272,24 @@ async def _resolve_driver_ids_cached(
         # with original-position as the deterministic final tiebreak.
         matched.sort(key=lambda triple: (-len(triple[2]), triple[0]))
         if matched:
-            entries = [e for _, e, _eff in matched]
+            matched_entries = [e for _, e, _eff in matched]
+            if operation == Operation.READ:
+                # READ keeps the unmatched entries as an ordered fallback tail
+                # (declared order) AFTER the hint-matched ones, so a hint-
+                # preferred driver that misses — e.g. ES returns None for a
+                # collection/catalog not yet indexed — falls through to the
+                # system-of-record (PG) reader rather than 404ing. Callers that
+                # take only resolved[0] (``get_driver``) are unaffected; only
+                # the metadata routers, which iterate first-non-None when hints
+                # were supplied, walk into the tail. SEARCH keeps the matched-
+                # only set (a search picks the single best backend — there is
+                # no SoR to chain to), and WRITE must never fan a write out to
+                # an unintended driver.
+                matched_idx = {i for i, _e, _eff in matched}
+                tail = [e for i, e in enumerate(entries) if i not in matched_idx]
+                entries = matched_entries + tail
+            else:
+                entries = matched_entries
         elif operation in (Operation.READ, Operation.SEARCH):
             # No configured driver satisfies the requested hints — e.g. a READ
             # asking for GEOMETRY_EXACT against a catalog whose only items
@@ -203,6 +316,22 @@ async def _resolve_driver_ids_cached(
         else:
             entries = []
 
+    elif operation == Operation.READ:
+        # No hints requested. Entries carrying an explicit hint tag are opt-in
+        # preferences (e.g. the ES simplified-geometry reader now in the
+        # collection/catalog READ defaults): a plain no-hint read must NOT pull
+        # them into the default merge / first-non-None set, or it would diverge
+        # from the untagged system-of-record (PG) — a metadata router that
+        # merge-alls the resolved list would otherwise overwrite PG's exact
+        # geometry with the ES simplified slice. Restrict to untagged default
+        # entries when any exist. If EVERY entry is tagged — items READ is
+        # intentionally ES-first with all entries tagged; asset READ is a single
+        # geometry_exact entry — keep the full list so declared order still
+        # decides and the readers are never stripped to empty.
+        untagged = [e for e in entries if not e.hints]
+        if untagged:
+            entries = untagged
+
     return [(e.driver_ref, e.on_failure, e.write_mode) for e in entries]
 
 
@@ -216,7 +345,11 @@ async def resolve_drivers(
 ) -> List[ResolvedDriver]:
     """Resolve an ordered list of drivers for the requested operation.
 
-    For **READ/SEARCH**: caller uses the first result.
+    For **READ** (hinted): returns matched drivers first, then unmatched
+    entries as a fallback tail (PG system-of-record).  Callers that want
+    the first-non-None result walk the list; callers that take only
+    ``resolved[0]`` are unaffected.
+    For **SEARCH** (hinted): returns matched-only (no tail).
     For **WRITE**: caller executes all (fan-out), respecting ``on_failure``.
 
     Resolution layers (fast → slow):

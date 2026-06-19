@@ -19,7 +19,6 @@
 """Unit tests for routing-hints Phase 1.
 
 Covers:
-- Hint.STAC_PREFERRED enum value (step 1)
 - supported_hints ClassVar on the 4 metadata drivers (step 2)
 - READ default stays PG-only (step 3) — hint routing does not mutate the
   platform default; ES serves hinted reads only where it is registered
@@ -37,21 +36,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Hint.STAC_PREFERRED
-# ---------------------------------------------------------------------------
-
-
-def test_hint_stac_preferred_value():
-    from dynastore.modules.storage.hints import Hint
-    assert Hint.STAC_PREFERRED == "stac_preferred"
-
-
-def test_hint_stac_preferred_is_str():
-    from dynastore.modules.storage.hints import Hint
-    assert isinstance(Hint.STAC_PREFERRED, str)
-
-
-# ---------------------------------------------------------------------------
 # Step 2: supported_hints on the 4 metadata drivers
 # ---------------------------------------------------------------------------
 
@@ -61,7 +45,6 @@ def test_collection_es_driver_supported_hints():
     from dynastore.modules.storage.hints import Hint
     hints = CollectionElasticsearchDriver.supported_hints
     assert Hint.GEOMETRY_SIMPLIFIED in hints
-    assert Hint.STAC_PREFERRED in hints
     assert Hint.METADATA in hints
     # ES must NOT carry GEOMETRY_EXACT
     assert Hint.GEOMETRY_EXACT not in hints
@@ -72,7 +55,6 @@ def test_catalog_es_driver_supported_hints():
     from dynastore.modules.storage.hints import Hint
     hints = CatalogElasticsearchDriver.supported_hints
     assert Hint.GEOMETRY_SIMPLIFIED in hints
-    assert Hint.STAC_PREFERRED in hints
     assert Hint.METADATA in hints
     assert Hint.GEOMETRY_EXACT not in hints
 
@@ -83,9 +65,8 @@ def test_collection_pg_driver_supported_hints():
     hints = CollectionPostgresqlDriver.supported_hints
     assert Hint.GEOMETRY_EXACT in hints
     assert Hint.METADATA in hints
-    # PG must NOT carry simplified or stac_preferred
+    # PG must NOT carry simplified geometry
     assert Hint.GEOMETRY_SIMPLIFIED not in hints
-    assert Hint.STAC_PREFERRED not in hints
 
 
 def test_catalog_pg_driver_supported_hints():
@@ -95,7 +76,6 @@ def test_catalog_pg_driver_supported_hints():
     assert Hint.GEOMETRY_EXACT in hints
     assert Hint.METADATA in hints
     assert Hint.GEOMETRY_SIMPLIFIED not in hints
-    assert Hint.STAC_PREFERRED not in hints
 
 
 def test_collection_es_auto_register_includes_read():
@@ -111,31 +91,56 @@ def test_catalog_es_auto_register_includes_read():
 
 
 # ---------------------------------------------------------------------------
-# Step 3: READ default is PG-only (unchanged from baseline).
+# Step 3: READ default is PG system-of-record FIRST + an opt-in ES entry.
 #
-# Phase 1 keeps the platform READ default exactly as before: the system of
-# record (PG) is the only hard-coded READ entry.  ES metadata drivers join
-# the READ fan-out only where they are actually registered — via the
-# pre-existing store-driver self-registration (PG+ES deployments) or an
-# explicit routing preset — NOT by mutating the platform default.  Hint
-# routing (driver-declared ``supported_hints`` + the resolver's hint filter)
-# is what makes a registered ES driver serve geometry_simplified/stac_preferred
-# reads; it does not require the default to carry an ES entry.
+# The platform READ default now carries two entries: the untagged PG system
+# of record (declared first) and a hint-tagged ES reader (hints={METADATA}).
+# The ES entry is OPT-IN:
+# - a no-hint read resolves PG ONLY (the resolver's no-hint READ filter drops
+#   hint-tagged entries when an untagged default exists), so a plain read is
+#   byte-identical to the pre-hint behaviour;
+# - a read carrying prefer:es or METADATA is matched to ES, with PG kept as
+#   the ordered fallback tail (ES miss → PG system of record).
+# There is no geometry at the metadata level so geometry hints do not apply.
 # ---------------------------------------------------------------------------
 
 
-def test_collection_routing_config_read_default_is_pg_only():
-    from dynastore.modules.storage.routing_config import CollectionRoutingConfig, Operation
+def test_collection_routing_config_read_default_pg_first_es_opt_in():
+    from dynastore.modules.storage.routing_config import (
+        CollectionRoutingConfig, Operation, FailurePolicy,
+    )
+    from dynastore.modules.storage.hints import Hint
     cfg = CollectionRoutingConfig()
-    refs = [e.driver_ref for e in cfg.operations.get(Operation.READ, [])]
-    assert refs == ["collection_postgresql_driver"]
+    read = cfg.operations.get(Operation.READ, [])
+    assert [e.driver_ref for e in read] == [
+        "collection_postgresql_driver",
+        "collection_elasticsearch_driver",
+    ]
+    pg, es = read
+    # PG is the untagged system-of-record default (matches its full driver
+    # surface); ES is the hint-tagged, non-fatal opt-in reader.
+    assert not pg.hints
+    assert pg.on_failure == FailurePolicy.FATAL
+    assert es.hints == {Hint.METADATA}
+    assert es.on_failure == FailurePolicy.WARN
 
 
-def test_catalog_routing_config_read_default_is_pg_only():
-    from dynastore.modules.storage.routing_config import CatalogRoutingConfig, Operation
+def test_catalog_routing_config_read_default_pg_first_es_opt_in():
+    from dynastore.modules.storage.routing_config import (
+        CatalogRoutingConfig, Operation, FailurePolicy,
+    )
+    from dynastore.modules.storage.hints import Hint
     cfg = CatalogRoutingConfig()
-    refs = [e.driver_ref for e in cfg.operations.get(Operation.READ, [])]
-    assert refs == ["catalog_postgresql_driver"]
+    read = cfg.operations.get(Operation.READ, [])
+    assert [e.driver_ref for e in read] == [
+        "catalog_postgresql_driver",
+        "catalog_elasticsearch_driver",
+    ]
+    pg, es = read
+    assert not pg.hints
+    assert pg.on_failure == FailurePolicy.FATAL
+    assert es.hints == {Hint.METADATA}
+    assert es.on_failure == FailurePolicy.WARN
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +220,7 @@ async def test_resolve_routed_geometry_exact_hint_selects_pg(monkeypatch):
             Operation.READ: [
                 OperationDriverEntry(
                     driver_ref="collection_elasticsearch_driver",
-                    hints={Hint.GEOMETRY_SIMPLIFIED, Hint.STAC_PREFERRED},
+                    hints={Hint.GEOMETRY_SIMPLIFIED, Hint.METADATA},
                 ),
                 OperationDriverEntry(
                     driver_ref="collection_postgresql_driver",
@@ -262,7 +267,7 @@ async def test_resolve_routed_geometry_simplified_hint_selects_es(monkeypatch):
             Operation.READ: [
                 OperationDriverEntry(
                     driver_ref="collection_elasticsearch_driver",
-                    hints={Hint.GEOMETRY_SIMPLIFIED, Hint.STAC_PREFERRED},
+                    hints={Hint.GEOMETRY_SIMPLIFIED, Hint.METADATA},
                 ),
                 OperationDriverEntry(
                     driver_ref="collection_postgresql_driver",
@@ -820,7 +825,7 @@ async def test_create_collections_catalog_threads_hints_to_create_collection(mon
 
     fake_request = MagicMock()
 
-    hints_in = frozenset({Hint.STAC_PREFERRED})
+    hints_in = frozenset({Hint.METADATA})
     await stac_generator.create_collections_catalog(fake_request, "cat_a", lang="en", hints=hints_in)
 
     assert len(captured_hints) == 1

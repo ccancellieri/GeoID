@@ -73,7 +73,7 @@ def _patch_enumeration(monkeypatch, svc, ids: List[str]):
         lambda _schema: SimpleNamespace(execute=_execute),
     )
 
-    async def _hydrate(_catalog_id, collection_id, _conn):
+    async def _hydrate(_catalog_id, collection_id, _conn, *, hints=frozenset()):
         return _model(collection_id) if collection_id in ids else None
 
     monkeypatch.setattr(svc, "_get_collection_model_logic", _hydrate)
@@ -120,7 +120,7 @@ async def test_unfiltered_listing_skips_ids_that_fail_to_hydrate(monkeypatch):
     svc = collection_service.CollectionService(engine=MagicMock())
     _patch_enumeration(monkeypatch, svc, ["coll-a", "coll-b"])
 
-    async def _hydrate(_catalog_id, collection_id, _conn):
+    async def _hydrate(_catalog_id, collection_id, _conn, *, hints=frozenset()):
         return _model(collection_id) if collection_id == "coll-a" else None
 
     monkeypatch.setattr(svc, "_get_collection_model_logic", _hydrate)
