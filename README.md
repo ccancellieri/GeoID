@@ -24,36 +24,54 @@ The catalog → schema → partition mapping is lazy: a `code` like `"agricultur
 
 ## Documentation
 
-**Foundations**
-- [Getting Started](docs/getting-started.md)
-- [Architecture Overview](docs/architecture/overview.md)
-- [The Database Layer](docs/architecture/database.md)
+Documentation is layered: this README is the entry point, [`docs/`](docs/) holds
+high-level concept and reference pages, and each module/extension keeps a
+detailed `README.md` next to its code. The full navigable map — every topic
+linked to its concept page, its code-adjacent README, and its source directory —
+lives in **[`docs/index.md`](docs/index.md)**.
+
+### Start here
+- [Getting Started](docs/getting-started.md) — run it locally and make a first request
+- [Documentation Index](docs/index.md) — the complete map of all docs
+- [Platform Manual](docs/platform_manual.md) — operator-facing tour
+
+### Foundations
+- [Architecture Overview](docs/architecture/overview.md) — the three-pillar design
+- [The Database Layer](docs/architecture/database.md) · [Migrations](docs/architecture/migrations.md)
 - [The Query Executor Pattern](docs/architecture/query_executor.md)
+- [Protocols & Discovery](docs/architecture/protocols.md) · [Configuration](docs/architecture/configuration.md) · [Caching](docs/architecture/caching.md)
 - [Distributed Tasks](docs/architecture/distributed-tasks.md)
+- [Collection Lifecycle](docs/architecture/collection-lifecycle.md) · [Collection Metadata](docs/collection-metadata-architecture.md)
 
-**Extensions**
-- [Catalog Module](docs/components/catalog.md)
-- [Asynchronous Task Ecosystem](docs/components/tasks.md)
-- [OGC API – Features](docs/components/features.md)
-- [STAC API](docs/components/stac.md)
-- [OGC API – Coverages](docs/components/coverages.md)
-- [OGC API – Tiles](docs/components/tiles.md)
-- [OGC API – Maps](docs/components/maps.md)
-- [OGC API – Records](docs/components/records.md)
-- [OGC API – EDR](docs/components/edr.md)
-- [OGC API – DGGS](docs/components/dggs.md)
-- [OGC API – Styles](docs/components/styles.md)
-- [3D GeoVolumes](docs/components/volumes.md)
-- [OGC API – Joins](docs/components/joins.md)
-- [Moving Features](docs/components/moving_features.md)
-- [Elasticsearch Integration](docs/components/elasticsearch.md)
-- [Legacy WFS](docs/components/wfs.md)
-- [GCP Extension](docs/components/gcp.md)
+### OGC API & STAC surface
+- [OGC API – Features](docs/components/features.md) · [STAC API](docs/components/stac.md) · [Records](docs/components/records.md)
+- [Coverages](docs/components/coverages.md) · [EDR](docs/components/edr.md) · [DGGS](docs/components/dggs.md)
+- [Tiles](docs/components/tiles.md) · [Maps](docs/components/maps.md) · [Styles](docs/components/styles.md)
+- [3D GeoVolumes](docs/components/volumes.md) · [Joins](docs/components/joins.md) · [Moving Features](docs/components/moving_features.md) · [Connected Systems](docs/components/connected_systems.md)
+- [Legacy WFS](docs/components/wfs.md) · [OGC extension map](docs/components/ogc-extensions.md)
 
-**Extending & contributing**
+### Data, storage & search
+- [Catalog Module](docs/components/catalog.md) · [Items Schema](docs/components/items_schema.md) · [Field Types](docs/components/field-types.md)
+- [Storage Drivers](docs/components/storage_drivers.md) · [Platform Engines](docs/components/platform_engines.md) · [Sidecar Configs](docs/components/sidecar_configs.md) · [Schema Evolution](docs/components/schema_evolution.md)
+- [Elasticsearch Integration](docs/components/elasticsearch.md) · [STAC Harvest](docs/components/stac-harvest.md)
+- [Asynchronous Task Ecosystem](docs/components/tasks.md) · [Processes](docs/components/processes.md) · [Events](docs/components/events.md)
+
+### Access, admin & web
+- [Authentication](docs/authentication.md) · [Auth & Policy Engine](docs/components/auth.md) · [Admin API](docs/components/admin.md)
+- [Configs API](docs/components/configs_api.md) · [Web UI](docs/components/web.md) · [GCP Extension](docs/components/gcp.md)
+
+### Operations
+- [Catalog Lifecycle Readiness & Recovery](docs/operations/catalog-lifecycle-readiness-and-recovery.md)
+- [Asset Upload Smoke Test](docs/operations/asset-upload-smoke.md) · [Rate Limits & Quotas](docs/operations/rate-limit-and-quotas.md)
+
+### Extending & contributing
 - [Contributing & Plugin Naming Convention](docs/contributing.md)
-- [Example Project Template](examples/my-project/)
+- [Example Project Template](examples/my-project/) · [GeoParquet → DuckDB → OpenSearch walkthrough](examples/geoparquet-duckdb-opensearch/)
 - [Roadmap](docs/roadmap.md)
 
-**Testing**
-- [Coverage Report](docs/testing/coverage-report.md)
+### Standards research (proposals)
+- [STAC Asset Transactions Extension](docs/proposals/asset-transactions-extension.md)
+- [STAC Datacube Scalable Dimensions](docs/proposals/stac-datacube-scalable-dimensions.md)
+
+### Testing
+- [Local Development](docs/testing/local-development.md) · [Coverage Report](docs/testing/coverage-report.md)

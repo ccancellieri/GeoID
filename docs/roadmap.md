@@ -11,15 +11,12 @@ matrix on the home page.
 - **Outbox-driven multi-driver indexing** — atomic per-tenant outbox table
   + drain task have shipped. Operational hardening (replay tooling, drain
   metrics, alerting) is in progress.
-- **Engine instance protocol & cache** — Cycle F.5 / F.6 of the driver-ref
-  refactor have shipped. Remaining slices (catalogue + Cycle F.4 c/d/e
-  schema-touching cutovers) are planned and require a coordinated DB
-  reset on dev / review environments.
+- **Engine instance protocol & cache** — driver-ref refactoring is in progress;
+  remaining slices covering schema-touching cutovers are planned.
 - **Identity & access** — IAM seeding race against multi-service boots is
   closed by partition-key-aware policy storage. Remaining items in the
   IAM hardening list (`role_hierarchy` self-heal canary, sibling-service
-  cache invalidation under Valkey, principal-id migration) are tracked
-  in the issue queue.
+  cache invalidation, principal-id migration) are in progress.
 
 ## Storage & multi-tenancy
 
@@ -28,12 +25,11 @@ matrix on the home page.
   resolved through a single seam. The roadmap generalises this into a
   driver-agnostic *tenant storage workspace* so a tenant could be realised by a
   PostgreSQL schema, a disseminated Iceberg tenant catalog, or an object-store
-  prefix, with plugins writing through storage drivers transparently. The design,
-  invariants (bootstrap key, transient cache, tenant isolation), and a phased,
-  non-breaking migration are in
-  [`docs/architecture/tenant-storage-workspace.md`](architecture/tenant-storage-workspace.md).
-  Later phases are gated on real demand for a second tenant-isolating backend and
-  a coordinated storage migration.
+  prefix, with plugins writing through storage drivers transparently. Key
+  design invariants are: a bootstrap key that survives config-store unavailability,
+  a transient in-process cache, and strict tenant isolation across all driver
+  implementations. Later phases are gated on real demand for a second
+  tenant-isolating backend and a coordinated storage migration.
 
 ## OGC API surface
 

@@ -8,13 +8,13 @@ sysadmins provision engines.
 
 ## Why engines are separate from drivers
 
-Pre-Cycle F, every driver class hard-coded its own connection lifecycle.
+Previously, every driver class hard-coded its own connection lifecycle.
 Two `ItemsPostgresqlDriver`s on the same physical Postgres meant two
 asyncpg pools.  Hot/cold tiering, read/write specialisation, and cross-
 class compatibility (e.g. private + public ES drivers sharing a cluster)
 either duplicated state or required bespoke wiring.
 
-Cycle F splits the contract:
+The engines layer splits the contract:
 
 | Concern | Owner | Tenant editable? |
 |---|---|---|
@@ -29,9 +29,9 @@ never touches connection pooling.
 
 ## Engine kinds
 
-Four concrete `EngineConfig` subclasses ship with Cycle F.1.  Each
-declares an `engine_class` discriminator that drivers match against
-their `required_engine_class: ClassVar[str]`.
+Four concrete `EngineConfig` subclasses are available.  Each declares
+an `engine_class` discriminator that drivers match against their
+`required_engine_class: ClassVar[str]`.
 
 | Class | `engine_class` | Driver-side fields |
 |---|---|---|
@@ -100,8 +100,8 @@ dispatch.
 
 ## Engine instance cache
 
-`EngineInstanceCache` (Cycle F.5/F.6) lazily instantiates engines on
-demand.  It's wired into `DBConfigModule.lifespan` and exposed on
+`EngineInstanceCache` lazily instantiates engines on demand.  It's
+wired into `DBConfigModule.lifespan` and exposed on
 `app_state.engine_cache`.
 
 ```
@@ -119,8 +119,8 @@ Background sweep (every 60s):
 The cache snapshots platform engine configs at boot — see
 `engine_resolver.build_engine_snapshot`.  Operator changes via PATCH
 land in the configs store but do NOT reach the cache until process
-restart (a refresh API is on the F.4c roadmap).  Treat
-`enabled=false` PATCH as advisory until live-reload ships.
+restart (a live-reload API is planned).  Treat `enabled=false` PATCH
+as advisory until live-reload ships.
 
 ## `EngineInstanceProtocol` contract
 
@@ -152,8 +152,8 @@ Each shipped engine config implements these against its native runtime:
 
 ### Provision a new engine
 
-Engines live at `configs.platform.protocols.storage.{class_key}`.  PATCH the
-class-keyed slot with the engine's connection details:
+Engines live at `configs.platform.protocols.storage.{class_key}`.
+PATCH the class-keyed slot with the engine's connection details:
 
 ```bash
 curl -X PATCH /configs/plugins/postgresql_engine_config \
@@ -167,11 +167,11 @@ curl -X PATCH /configs/plugins/postgresql_engine_config \
     }'
 ```
 
-Cycle F.1 ships single-instance-per-kind: every default deployment has
-one ref per engine kind, keyed by the snake_case class name
-(`postgresql_engine_config`, `elasticsearch_engine_config`, etc.).
-Cycle F.4c will add operator-chosen ref names (e.g. `pg_main`,
-`pg_secondary`) for multi-instance deployments.
+The default deployment has one ref per engine kind, keyed by the
+snake_case class name (`postgresql_engine_config`,
+`elasticsearch_engine_config`, etc.).  Future releases will add
+operator-chosen ref names (e.g. `pg_main`, `pg_secondary`) for
+multi-instance deployments.
 
 ### Maintenance window without destructive delete
 
@@ -197,7 +197,7 @@ Engines are platform-only.  An attempt to PATCH
 
 ## Forward roadmap
 
-Cycle F.4c (DB-reset cycle, pending) extends the engines layer with:
+Planned extensions to the engines layer include:
 
 - **Multi-instance refs** — operator-chosen `engine_ref` names
   (e.g. `pg_main`, `pg_cold`) keyed in `platform_configs` alongside
@@ -207,10 +207,6 @@ Cycle F.4c (DB-reset cycle, pending) extends the engines layer with:
 - **Driver dispatch through the cache** — per-driver-instance
   resolution of `engine_ref → EngineInstanceCache.get()` at
   request time.
-
-Until F.4c ships, drivers continue to acquire connections via their
-existing per-driver code paths; the engine cache is exercised by tests
-and admin tooling but does not gate production dispatch.
 
 ## See also
 

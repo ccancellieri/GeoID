@@ -8,8 +8,7 @@ scope.  HATEOAS links surface alternate views and edit endpoints
 inline, so operators discover the API without consulting OpenAPI.
 
 The endpoints described here are gated by the `configs_access` IAM
-policy; outside `IamMiddleware` they require sysadmin role by default
-(per Cycle F.0 IAM rules).
+policy; outside `IamMiddleware` they require sysadmin role by default.
 
 ## Endpoints
 
@@ -36,13 +35,12 @@ All three GET endpoints accept the same query params:
 | `resolved` | bool        | `true`  | `true`: return waterfall-resolved values for every visible config; `false`: return only configs explicitly stored at this scope (delta-only — safe for read-modify-write flows). |
 | `meta`     | enum        | `field` | Per-class documentation injected INLINE on each in-scope plugin leaf.  Every in-scope leaf always carries `_meta = {tier, source}` (provenance is structural — `tier` is the active scope, `source` is the tier that supplied the resolved value).  `meta` controls the OPTIONAL extras merged into `_meta`: `none` — only `{tier, source}`; `field` (default) — adds `docs = {field_name: description}`; `schema` — adds `json_schema = <full Pydantic schema>` (heavier, form-builder ready). |
 | `include`  | enum        | `scope` | `scope` (default): body lists only configs owned by the active scope; upstream-tier configs are filtered out (their provenance is recoverable from any leaf's `_meta.source`).  `upstream`: every visible class rendered with its waterfall-resolved value (verbose; `_meta.source` on each leaf identifies the tier of origin). |
-| `strict`   | bool        | `true`  | Cycle F.7d.2 — at platform scope, `true` keeps body to platform-intrinsic configs (`modules`, `engines`, `tasks`, `extensions`); catalog-/collection-tier templates are filtered out.  `false` restores the previous always-true platform-scope inclusion (catalog-tier templates appear inline in the body).  No effect at catalog or collection scope. |
-| `links`    | enum        | `minimal` | #665 slice 1 — per-plugin HATEOAS edit affordances injected INLINE on each in-scope leaf as a `_links` sibling.  `none`: no `_links` on any leaf.  `minimal` (default): `rel`/`href`/`method`.  `full`: adds a contextual `title` per link naming the class key and tier, plus `rel="schema"` and (for bound drivers) `rel="engine"`. |
+| `strict`   | bool        | `true`  | At platform scope, `true` keeps body to platform-intrinsic configs (`modules`, `engines`, `tasks`, `extensions`); catalog-/collection-tier templates are filtered out.  `false` restores full platform-scope inclusion (catalog-tier templates appear inline in the body).  No effect at catalog or collection scope. |
+| `links`    | enum        | `minimal` | Per-plugin HATEOAS edit affordances injected INLINE on each in-scope leaf as a `_links` sibling.  `none`: no `_links` on any leaf.  `minimal` (default): `rel`/`href`/`method`.  `full`: adds a contextual `title` per link naming the class key and tier, plus `rel="schema"` and (for bound drivers) `rel="engine"`. |
 
 Query parameters are advertised through OpenAPI (`/openapi.json`); the
-response no longer carries a runtime `_links` array at the root (#665
-slice 3 — query-param self-description lives in OpenAPI as the single
-source of truth).
+response carries no runtime `_links` array at the root — query-param
+self-description lives in OpenAPI as the single source of truth.
 
 ## Response shape
 
@@ -61,20 +59,20 @@ source of truth).
 }
 ```
 
-Per #665 slice 3, **provenance is structural per-leaf** — every
-rendered config carries `_meta.tier` (active scope) and `_meta.source`
-(originating tier).  The former parallel `inherited` top-level tree is
-retired; operators discover upstream provenance from any leaf's
-`_meta.source` without cross-walking a second tree.  Per #517 field
-documentation and per-plugin edit affordances live INLINE on each leaf
-(as `_meta` / `_links` siblings of the plugin's own fields).
+**Provenance is structural per-leaf** — every rendered config carries
+`_meta.tier` (active scope) and `_meta.source` (originating tier).
+The former parallel `inherited` top-level tree is retired; operators
+discover upstream provenance from any leaf's `_meta.source` without
+cross-walking a second tree.  Field documentation and per-plugin edit
+affordances live INLINE on each leaf (as `_meta` / `_links` siblings
+of the plugin's own fields).
 
 ### `configs` tree shape
 
 The tree mirrors the `_address: ClassVar[Tuple[str, ...]]` declared on
 each `PluginConfig` subclass.  Variable-length tuples land at any
-depth; the composer walks the address recursively (Cycle D.1).
-Post Cycle F.7d.1, the platform tier splits into four sibling groups:
+depth; the composer walks the address recursively.
+The platform tier splits into four sibling groups:
 
 ```
 configs.platform.{
@@ -87,7 +85,7 @@ configs.platform.{
     routing.{...}                                    # default catalog routing config
     collection.{                                     # COLLECTION-TIER TEMPLATES
       drivers.{...}
-      routing.{...}                                  # privacy = routing-pin of private driver (#733)
+      routing.{...}                                  # privacy = routing-pin of private driver
       info.{type, default_language}
       items.{
         drivers.{items_postgresql_driver: {sidecars}, items_elasticsearch_driver, ...}
@@ -131,7 +129,7 @@ regardless of the `meta` query param value:
   (`platform` / `catalog` / `collection` / `default` if no row exists
   at any tier and the class's Pydantic defaults are returned).
 
-This replaces the retired parallel `inherited` tree (#665 slice 3):
+This replaces the retired parallel `inherited` tree:
 upstream provenance is now recoverable from any leaf's `_meta.source`
 without crawling a second tree.
 
@@ -156,12 +154,11 @@ leaf's `_meta.source` identifies the tier of origin.
 
 ## HATEOAS link catalog
 
-Per #665 slice 3, the response carries **no top-level `_links` array**
-— query-parameter self-description lives in OpenAPI
-(`/openapi.json`) as the single source of truth.  Each in-scope plugin
-leaf carries its own `_links` array (when `?links != "none"`).
-Routing-entry DTOs also carry their own `_links` (Cycle F.7d.3
-driver-config affordance).
+The response carries **no top-level `_links` array** — query-parameter
+self-description lives in OpenAPI (`/openapi.json`) as the single
+source of truth.  Each in-scope plugin leaf carries its own `_links`
+array (when `?links != "none"`).  Routing-entry DTOs also carry their
+own `_links` (driver-config affordance).
 
 ### Per-leaf `_links` rels (when `?links=minimal|full`)
 
@@ -181,7 +178,7 @@ and tier phrase (e.g. `"Replace items_routing at catalog 'demo'"`).
 ### Routing-entry `_links` rels
 
 Each `OperationDriverEntry` (inside `*RoutingConfig.operations[OP]`)
-carries an `_links` array (Cycle F.7d.3):
+carries an `_links` array:
 
 | `rel`           | Method | Purpose |
 |-----------------|--------|---------|
@@ -196,9 +193,9 @@ tier default.  The same `class_key` lives at every tier with the
 waterfall resolving to the most-specific value at read time.
 
 Future link rels (placeholder; not yet emitted):
-- `engine-config` (Cycle F.4c) — when ref-keyed driver storage adds
-  multi-instance refs, each driver entry will also carry an
-  `engine-config` link pointing at its referenced engine.
+- `engine-config` — when ref-keyed driver storage adds multi-instance
+  refs, each driver entry will also carry an `engine-config` link
+  pointing at its referenced engine.
 
 ## Scope strictness rules
 
@@ -350,7 +347,7 @@ curl -X PATCH https://api/configs/catalogs/demo/collections/sample/plugins/items
   -d 'null'
 ```
 
-## Multi-instance refs (Cycle F.4c–F.4d)
+## Multi-instance refs
 
 Operators can register multiple instances of the same driver/engine class
 side-by-side at any scope.  Each instance is keyed by an operator-chosen
@@ -429,11 +426,11 @@ pointing operators at the discriminator field.
   with a different class (the row's stored `class_key` differs from the
   body discriminator) — operators must `delete` the ref first or pick a
   different name.
-* Engine-class compatibility is enforced at the driver-config validator
-  (Cycle F.4c.3): a driver's `engine_ref` resolving via the engine
-  registry to an incompatible `engine_class` is rejected with a clear
-  ValueError; refs unknown to the registry are accepted (deferred to
-  PATCH-handler / runtime existence check via `EngineInstanceCache.get`).
+* Engine-class compatibility is enforced at the driver-config validator:
+  a driver's `engine_ref` resolving via the engine registry to an
+  incompatible `engine_class` is rejected with a clear ValueError; refs
+  unknown to the registry are accepted (deferred to PATCH-handler /
+  runtime existence check via `EngineInstanceCache.get`).
 
 ## See also
 
@@ -448,10 +445,9 @@ pointing operators at the discriminator field.
   vocabulary referenced by `items_schema.fields`
 - `docs/components/sidecar_configs.md` — sidecar configurations on PG-
   backed items drivers (full default field surface)
-- `notebook_showcase/notebooks/cycle_f_use_cases/` — four worked
-  scenarios exercising this surface end-to-end (4 sidecars + dual-
-  search routing, schema enforcement + multi-version, private ES,
-  asset duplicate-refusal config round-trip)
+- `notebook_showcase/notebooks/` — worked scenarios exercising this
+  surface end-to-end (sidecars + dual-search routing, schema
+  enforcement, private ES, asset config round-trip)
 - `src/dynastore/extensions/configs/config_api_service.py` — composer
   source (variable-length address walker, scope filter, HATEOAS link
   builder)

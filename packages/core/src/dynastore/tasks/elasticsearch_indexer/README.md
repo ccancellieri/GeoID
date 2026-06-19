@@ -43,14 +43,16 @@ Triggered by `POST /search/reindex/catalogs/{id}` (admin endpoint) or by the can
 | `elasticsearch_private_index` | `geoid`, `catalog_id`, `collection_id` | Index one `{geoid, catalog_id, collection_id}` doc |
 | `elasticsearch_private_delete` | `geoid`, `catalog_id` | Delete one geoid doc (safe on NotFoundError) |
 
-Dispatched via the index dispatcher (`modules/storage/index_dispatcher.py`) for collections whose routing pins the `items_elasticsearch_private_driver` (Cycle E — per-collection privacy).
+Dispatched via the index dispatcher (`modules/storage/index_dispatcher.py`) for collections whose routing pins the `items_elasticsearch_private_driver` (per-collection privacy).
 
-## Cloud Run Job
+## One-shot job
 
-The `geospatial-elasticsearch-indexer` Cloud Run Job handles bulk reindex for large catalogs:
+Bulk reindex for large catalogs runs as a dedicated one-shot worker job rather
+than inline, so it can use a longer timeout and more memory. A deployment defines
+it with the `worker_task_elasticsearch_indexer` scope, for example:
 
 ```yaml
-geospatial-elasticsearch-indexer:
+elasticsearch-indexer:
   type: "job"
   env:
     SCOPE: "worker_task_elasticsearch_indexer"

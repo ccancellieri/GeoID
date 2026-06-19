@@ -9,13 +9,12 @@ surfaced and **reconciled read-only**; actually adding or changing a
 physical column happens only through a fresh (re)provision or an
 out-of-band migration.
 
-> An earlier version of this page described a `SchemaEvolutionEngine`
+> **Note:** An earlier version of this page described a `SchemaEvolutionEngine`
 > with `introspect_collection` / `diff` / `apply_safe_ops`, an
 > `EvolutionPlan`, and `/admin/schemas/.../evolve|migrate` endpoints.
-> **None of that exists in the codebase** and the "apply safe `ALTER
-> TABLE` directly" model it promoted contradicts the project's hard
-> no-in-place-DDL invariant. This page now documents the actual
-> mechanism (rewrite tracked by #1521).
+> **None of that exists in the codebase** — the "apply safe `ALTER TABLE`
+> directly" model it promoted contradicts the project's hard
+> no-in-place-DDL invariant. This page documents the actual mechanism.
 
 ## The model
 
@@ -37,8 +36,8 @@ out-of-band migration.
    introspected against `information_schema.columns` and any entry with
    no backing column is dropped from the resolved config (with a WARN).
    This keeps the read path from emitting `SELECT "missing_col"` and
-   500-ing (`UndefinedColumnError`), and it never mutates the table
-   (#1489). The dropped field degrades to the read-side silent-skip until
+   500-ing (`UndefinedColumnError`), and it never mutates the table.
+   The dropped field degrades to the read-side silent-skip until
    a column is genuinely added.
 5. **Adding a column for real.** Requires a fresh (re)provision of the
    collection — there is no app-issued `ALTER` path. Plan the schema

@@ -68,7 +68,7 @@ http://www.opengis.net/spec/ogcapi-joins-1/0.0/conf/core
 {
   "driver": "bigquery",
   "target": {
-    "project_id": "fao-maps-review",
+    "project_id": "<gcp-project>",
     "dataset_id": "dynastore_ingestion",
     "table_name": "adm2"
   },
@@ -231,22 +231,21 @@ the secondary `filter` to cap memory pressure when the secondary side is large.
 
 ## Cookbook
 
-The recipes below all run against the `adm2_catalog/adm2_collection` data on
-the `review` deploy. The PG primary holds 17 000+ Togo administrative regions
-(uuid `geoid` per row); the BQ secondary
-`fao-maps-review.dynastore_ingestion.adm2` is a 40-row table keyed by the
-same `geoid` UUID with `temprature` and `rain_fall` columns.
+The recipes below illustrate common patterns using a sample catalog
+(`adm2_catalog/adm2_collection`) where the PG primary holds administrative
+region features (uuid `geoid` per row) and a BigQuery secondary table is
+keyed by the same `geoid` UUID with `temprature` and `rain_fall` columns.
 
 ### 1. Minimal /join — BQ secondary, no filters
 
 ```bash
-BASE=https://data.review.fao.org/geospatial/v2/api/maps
+BASE=https://<your-deployment>/api/maps
 curl -X POST "$BASE/join/catalogs/adm2_catalog/collections/adm2_collection/join" \
   -H "Content-Type: application/json" \
   -d '{
     "secondary": {
       "driver": "bigquery",
-      "target": {"project_id":"fao-maps-review","dataset_id":"dynastore_ingestion","table_name":"adm2"}
+      "target": {"project_id":"<gcp-project>","dataset_id":"dynastore_ingestion","table_name":"adm2"}
     },
     "join": {"primary_column":"geoid","secondary_column":"geoid","enrichment":true},
     "projection": {"with_geometry":false,"attributes":["geoid","ADM2_PCODE"]},
@@ -262,7 +261,7 @@ curl -X POST "$BASE/join/catalogs/adm2_catalog/collections/adm2_collection/join"
   -d '{
     "secondary": {
       "driver": "bigquery",
-      "target": {"project_id":"fao-maps-review","dataset_id":"dynastore_ingestion","table_name":"adm2"},
+      "target": {"project_id":"<gcp-project>","dataset_id":"dynastore_ingestion","table_name":"adm2"},
       "filter": {"cql": "temprature > 25 AND rain_fall < 100", "cql_lang": "cql2-text"}
     },
     "join": {"primary_column":"geoid","secondary_column":"geoid","enrichment":true},
@@ -282,7 +281,7 @@ curl -X POST "$BASE/join/catalogs/adm2_catalog/collections/adm2_collection/join"
   -d '{
     "secondary": {
       "driver": "bigquery",
-      "target": {"project_id":"fao-maps-review","dataset_id":"dynastore_ingestion","table_name":"adm2"},
+      "target": {"project_id":"<gcp-project>","dataset_id":"dynastore_ingestion","table_name":"adm2"},
       "filter": {"cql": "temprature > 25", "cql_lang": "cql2-text"}
     },
     "join": {"primary_column":"geoid","secondary_column":"geoid","enrichment":true},
@@ -300,7 +299,7 @@ curl -X POST "$BASE/join/catalogs/adm2_catalog/collections/adm2_collection/join"
   -d '{
     "secondary": {
       "driver": "bigquery",
-      "target": {"project_id":"fao-maps-review","dataset_id":"dynastore_ingestion","table_name":"adm2"}
+      "target": {"project_id":"<gcp-project>","dataset_id":"dynastore_ingestion","table_name":"adm2"}
     },
     "join": {"primary_column":"geoid","secondary_column":"geoid","enrichment":true},
     "primary_filter": {"cql": "S_INTERSECTS(geom, BBOX(0, 5, 2, 8))", "cql_lang": "cql2-text"},
@@ -319,8 +318,8 @@ The legacy `/dwh/.../join` endpoint accepts a raw BigQuery `SELECT` in
 curl -X POST "$BASE/dwh/catalogs/adm2_catalog/join" \
   -H "Content-Type: application/json" \
   -d '{
-    "dwh_project_id": "fao-maps-review",
-    "dwh_query": "SELECT geoid, temprature, rain_fall FROM `fao-maps-review.dynastore_ingestion.adm2` WHERE temprature > 25",
+    "dwh_project_id": "<gcp-project>",
+    "dwh_query": "SELECT geoid, temprature, rain_fall FROM `<gcp-project>.dynastore_ingestion.adm2` WHERE temprature > 25",
     "collection": "adm2_collection",
     "with_geometry": false,
     "dwh_join_column": "geoid",
@@ -341,8 +340,8 @@ The same query with a multi-table BQ JOIN (impossible to express in CQL2):
 curl -X POST "$BASE/dwh/catalogs/adm2_catalog/join" \
   -H "Content-Type: application/json" \
   -d '{
-    "dwh_project_id": "fao-maps-review",
-    "dwh_query": "WITH hot AS (SELECT geoid, temprature FROM `fao-maps-review.dynastore_ingestion.adm2` WHERE temprature > 25) SELECT h.geoid, h.temprature, p.population FROM hot h LEFT JOIN `fao-maps-review.dynastore_ingestion.population` p USING (geoid)",
+    "dwh_project_id": "<gcp-project>",
+    "dwh_query": "WITH hot AS (SELECT geoid, temprature FROM `<gcp-project>.dynastore_ingestion.adm2` WHERE temprature > 25) SELECT h.geoid, h.temprature, p.population FROM hot h LEFT JOIN `<gcp-project>.dynastore_ingestion.population` p USING (geoid)",
     "collection": "adm2_collection",
     "with_geometry": false,
     "dwh_join_column": "geoid",
@@ -370,8 +369,8 @@ in BQ where the planner caches the view definition.
 | 400 | `{"detail": "Invalid CQL filter: Unknown properties: ADM2_PCODE. Available properties: area, …"}` | Primary `cql` references a column not in the field-mapping. |
 | 422 | `{"detail": "… Invalid CQL2 (cql2-text): … | Error: …"}` | Secondary `filter.cql` doesn't parse — caught by Pydantic via `_build_secondary_context`. |
 | 422 | `{"detail": [{"loc": ["body", "..."], "msg": "Field required", …}]}` | Pydantic schema violation on the request body. |
-| 404 | `{"detail": "No READ driver registered for {cat}/{col}. Configure a CollectionRoutingConfig before /join."}` | The collection has no items driver mapped under `operations[READ]`. (Should not fire on default deploys after PR #107.) |
-| 500 | `{"detail": "BigQuery service not available (GCP module not loaded)."}` | The service isn't shipping `module_gcp` in its SCOPE. (Fixed for the maps service in PR #105.) |
+| 404 | `{"detail": "No READ driver registered for {cat}/{col}. Configure a CollectionRoutingConfig before /join."}` | The collection has no items driver mapped under `operations[READ]`. This should not fire on default deploys (the platform-default routing config lists the PG driver under READ). |
+| 500 | `{"detail": "BigQuery service not available (GCP module not loaded)."}` | The service is not shipping `module_gcp` in its SCOPE. Ensure the maps/join service scope includes the GCP module. |
 
 ---
 
@@ -445,7 +444,7 @@ dwh   = ["dynastore[joins]"]
 `pip install dynastore[joins]` installs `/join` only.
 
 Both endpoints additionally need `module_gcp` for BigQuery support — the
-`maps` service includes it via `dwh_grp` (PR #105).
+`maps` service includes it via `dwh_grp`.
 
 ---
 
@@ -473,15 +472,3 @@ Both endpoints additionally need `module_gcp` for BigQuery support — the
    table that doesn't have a GEOGRAPHY column surface as a BigQuery error
    from `BigQueryService.execute_query`, not a 400 from the joins handler.
 
----
-
-## Recent changes
-
-| PR | Date | Change |
-|---|---|---|
-| #105 | 2026-04-28 | Wired `module_gcp` into `dwh_grp` so BigQuery is available on the public maps service. Also fixed missing `/tiles` and `/styles` routes. |
-| #107 | 2026-04-28 | Composable per-driver `supported_hints` + `"join"` hint on PG/BQ + router fallback to `driver.supported_hints` when `entry.hints` is empty. Zero-config /join routing. |
-| #109 | 2026-04-28 | PG/DuckDB `read_entities` accept the Protocol's `context` kwarg (unblocks /join's `id_column` plumbing). |
-| #110 | 2026-04-28 | `index_secondary` + `run_join` fall back to `feat.id` when the join column was promoted out of `properties`. |
-| #113 | 2026-04-28 | `BigQuerySecondarySpec.filter: PrimaryFilterSpec` — CQL2 filtering on the BQ secondary, symmetric with `primary_filter`. |
-| this PR | 2026-04-28 | `tools/enrichment.py` (used by /dwh) gains the same `feat.id` fallback as PR #110, so /dwh/.../join now returns features when the join column is the row identifier. Plus this docs overhaul. |

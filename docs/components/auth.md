@@ -1,8 +1,10 @@
 # Authentication & Authorization
 
-This document describes the security architecture of AIP Catalog Services. The system implements a zero-trust model where every request is evaluated against a policy engine.
+This document describes the security architecture of GeoID Catalog Services. The system implements a zero-trust model where every request is evaluated against a policy engine.
 
 > See also: [Authentication](../authentication.md) for operator-facing OIDC / IdP configuration and cold-boot seeding.
+
+> **Implementation details:** see the [identity providers README](../packages/core/src/dynastore/modules/iam/identity_providers/README.md).
 
 ## Architecture
 
@@ -169,22 +171,15 @@ All platform IAM tables live in the `iam` schema:
 Per-catalog IAM (role grants for catalog members) lives in each catalog's
 own schema under the same table names.
 
-## Files
+## Key source paths
 
-| Path | Purpose |
-|------|---------|
-| `src/dynastore/modules/iam/module.py` | `IamModule` — `AuthenticatorProtocol` + `PermissionProtocol` impl, lifespan |
-| `src/dynastore/modules/iam/iam_service.py` | `IamService` — principal CRUD, JWT issuance, OIDC reconciliation |
-| `src/dynastore/modules/iam/iam_queries.py` | SQL DDL and DML for all IAM tables |
-| `src/dynastore/modules/iam/policies.py` | Policy evaluation helpers |
-| `src/dynastore/modules/iam/conditions.py` | Condition handlers (rate_limit, max_count, time_window, catalog_admin_required, …) |
-| `src/dynastore/modules/iam/identity_providers/oidc_identity.py` | `OidcIdentityProvider` — JWKS-backed JWT validation |
-| `src/dynastore/modules/iam/presets/default_roles_baseline.py` | Default `sysadmin`, `admin`, `unauthenticated` roles |
-| `src/dynastore/modules/iam/presets/public_access_baseline.py` | Optional `public_access` policy for anonymous discovery |
-| `src/dynastore/extensions/iam/middleware.py` | `IamMiddleware` — request interception, principal resolution, policy evaluation |
-| `src/dynastore/extensions/iam/service.py` | `IamExtension` — `/iam/` REST routes, JWKS endpoint |
-| `src/dynastore/extensions/iam/presets/iam_baseline.py` | `sysadmin_full_access` policy and role bindings |
-| `src/dynastore/extensions/auth/authentication.py` | `Authentication` extension — `/auth/` OAuth2/OIDC proxy routes |
-| `src/dynastore/models/protocols/authentication.py` | `AuthenticatorProtocol` — identity-resolution contract |
-| `src/dynastore/models/protocols/policies.py` | `PermissionProtocol`, `Policy`, `Principal`, `Role` |
-| `src/dynastore/models/auth.py` | `Principal` runtime model |
+| Area | Entry point |
+|------|-------------|
+| IAM module (AuthenticatorProtocol + PermissionProtocol) | `src/dynastore/modules/iam/module.py` |
+| Request interception & policy evaluation | `src/dynastore/extensions/iam/middleware.py` |
+| Condition handlers (rate_limit, max_count, …) | `src/dynastore/modules/iam/conditions.py` |
+| OIDC identity provider | `src/dynastore/modules/iam/identity_providers/oidc_identity.py` |
+| OAuth2 / OIDC proxy routes | `src/dynastore/extensions/auth/authentication.py` |
+| Protocol contracts | `src/dynastore/models/protocols/authentication.py`, `policies.py` |
+
+For the full file inventory and implementation notes, see the [identity providers README](../packages/core/src/dynastore/modules/iam/identity_providers/README.md).

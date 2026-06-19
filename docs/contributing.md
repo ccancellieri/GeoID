@@ -307,19 +307,17 @@ docker run --rm --network "$NETWORK" \
 - `tests/dynastore/conftest.py` — session-scoped DB cleanup, model fixtures
 - Custom markers: `@pytest.mark.enable_modules(...)`, `@pytest.mark.gcp`, `@pytest.mark.local_only`
 
-### Creating a Downstream Deployment Repository
+### Building on GeoID (Downstream Projects)
 
-See the [Deployment Repository Guide](DEPLOYMENT_REPOSITORY.md) for step-by-step
-instructions on setting up a private repo that deploys GeoID-based services.
+GeoID is consumed as a library: a downstream project declares a dependency on
+`dynastore[<extras>]` and registers its own modules/extensions through Python
+entry points — no fork required. The [example project template](../examples/my-project/)
+shows the minimal layout (a `pyproject.toml` with the dependency and entry-point
+declarations, a custom module/extension, a `docker/` build, and tests).
 
-The `setup-workspace` composite action in the infrastructure repo automatically
-injects shared scripts and default IaC templates into the caller's workspace,
-so downstream projects only need to provide:
-
-- `.github/config/apps.base.yml` — service definitions
-- `.github/config/cloudbuild.yml` — Cloud Build configuration
-- `docker/Dockerfile` — container image build
-- Optionally: `.github/config/iac.yml` to override the default Cloud Run template
+Packaging and deployment of a downstream service (CI/CD, container build, and
+infrastructure templates) are environment-specific and live in each operator's
+own deployment repository, which should be kept private.
 
 ## Questions or Issues?
 

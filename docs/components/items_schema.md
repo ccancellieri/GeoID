@@ -75,7 +75,7 @@ driver mapping its native type system onto it. The author-facing fields:
 | `enum` | `List[Any]` \| null | null | Allowed value set. |
 | `pattern` | `str` \| null | null | Regex constraint (strings). |
 | `format` | `str` \| null | null | JSON-Schema *output* format hint (e.g. `date` vs `date-time`). |
-| `parse_format` | `str` \| null | null | Ingestion-time `strptime` *input* pattern for a temporal field (e.g. `%d/%m/%Y`). Disambiguates day-first vs month-first numeric dates before re-emitting canonical ISO-8601. Unset → auto-detection. Ignored for non-temporal fields (#1350). |
+| `parse_format` | `str` \| null | null | Ingestion-time `strptime` *input* pattern for a temporal field (e.g. `%d/%m/%Y`). Disambiguates day-first vs month-first numeric dates before re-emitting canonical ISO-8601. Unset → auto-detection. Ignored for non-temporal fields. |
 | `access` | `FieldAccess` enum | `auto` | Per-field query-access intent — see [Field access intent](#field-access-intent). Overrides the schema-wide `default_access`. Replaces the former PG-specific `materialize` boolean. |
 | `default` | `Any` \| null | null | Value to apply when the field is missing on write. The driver decides how (native column `DEFAULT`, inject-on-write, or ignore). The value's Python type must match `data_type` (validated at config-parse). Geometry fields reject a default. |
 | `capabilities` | `List[FieldCapability]` | `[]` | Driver-advertised capabilities for the field; consulted by `access=auto`. |
@@ -84,7 +84,7 @@ driver mapping its native type system onto it. The author-facing fields:
 > author-facing** — it carries a read-projection detail (e.g.
 > `a.asset_id`), is excluded from serialization, and is marked read-only
 > so it never enters the author config or leaks into queryables
-> responses (#1291). Do not set it.
+> responses. Do not set it.
 
 ### Field access intent
 
@@ -133,7 +133,7 @@ loud at config-save instead of at ingest or read:
    `collection_id`, `external_id`, `asset_id`, `geometry`, `bbox`,
    `simplification_factor`, `simplification_mode`, `properties`,
    `extras`). Such a name would shadow the system field or fail
-   downstream in opaque ways. Rename with a domain prefix (#1489).
+   downstream in opaque ways. Rename with a domain prefix.
 2. **`external_id` ↔ schema cross-validation** — when an
    `items_write_policy` names an `external_id` source path, its leaf
    field must be declared in the resolved `items_schema.fields` at the
@@ -141,7 +141,7 @@ loud at config-save instead of at ingest or read:
    at every scope where a schema resolves, so a policy can't name an
    undeclared field at one tier and be accepted at another.
 3. **Storage-realizability** — defense-in-depth backstop for the
-   silent-drop class (#1488 / #1491): when the PG attributes sidecar
+   silent-drop class: when the PG attributes sidecar
    resolves COLUMNAR-only (no JSONB blob on disk), every non-geometry
    field MUST become an `AttributeSchemaEntry` after the bridge runs, or
    ingest would swallow it at the SQL boundary. The bridge auto-promotes

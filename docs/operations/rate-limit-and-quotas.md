@@ -2,8 +2,8 @@
 
 GeoID enforces request limits as **policy conditions**. A policy carrying a
 `rate_limit` or `max_count` condition gates every request that matches its
-`actions`/`resources` scope. Enforcement is atomic across all Cloud Run pods
-via Valkey; PostgreSQL holds the durable counter row (table
+`actions`/`resources` scope. Enforcement is atomic across all service instances
+via a Redis-compatible cache; PostgreSQL holds the durable counter row (table
 `iam.usage_counters`).
 
 This document is the operator copy-paste reference for the two most common
@@ -16,15 +16,14 @@ Condition") or with the REST calls below.
 ## Prerequisites
 
 - A sysadmin token (`DYNASTORE_SYSADMIN_TOKEN`).
-- The deployment runs behind a proxy/LB (Cloud Run + LB is the canonical
-  topology) — `scope=client_ip` reads `X-Forwarded-For` leftmost-token and
-  falls back to `request.client.host`. Do not use `scope=client_ip` in a
-  dev environment without a fronting proxy: every caller will share the
-  same loopback IP.
+- The deployment runs behind a proxy/load balancer — `scope=client_ip` reads
+  `X-Forwarded-For` leftmost-token and falls back to `request.client.host`. Do
+  not use `scope=client_ip` in a dev environment without a fronting proxy: every
+  caller will share the same loopback IP.
 - Counter cardinality cap: keep the cross product
   `policies × principal_keys × live_windows` under ~10⁵ rows for a single
-  Valkey/PG pair. The default reaper prunes expired window rows nightly via
-  pg_cron.
+  cache/PG pair. The in-app maintenance supervisor prunes expired window rows
+  on its regular schedule.
 
 ```bash
 export BASE=https://data.example.org/geospatial/v2/api  # adjust to your deployment
@@ -121,7 +120,7 @@ curl -X POST "$BASE/admin/policies" \
 ```
 
 `max_count` has no `window_seconds` — the counter is lifetime, written
-through to PG synchronously so it survives a Valkey restart.
+through to PG synchronously so it survives a cache restart.
 
 ### 2. Create a role that bundles it
 
@@ -164,7 +163,7 @@ curl -X DELETE \
 ```
 
 The row is deleted from `iam.usage_counters` and (if the layered driver is
-active) from Valkey. The next request starts at zero. The reset event is
+active) from the cache tier. The next request starts at zero. The reset event is
 written to the IAM audit log as `event_type="usage_counter_reset"`.
 
 For `rate_limit` rows, pass the originating window width so the resolver
@@ -183,7 +182,7 @@ curl -X DELETE \
 1. `IamMiddleware` resolves the caller's role chain and the matching policies.
 2. Each `rate_limit` / `max_count` condition calls
    `UsageCounterProtocol.incr_if_below(policy_id, principal_key, limit,
-   window_seconds)`. The Valkey-backed driver runs an `EVAL` (or `EVALSHA`)
+   window_seconds)`. The cache-backed driver runs an `EVAL` (or `EVALSHA`)
    Lua script that does the cap check and the increment atomically.
 3. If any condition denies, the middleware returns 429 with `Retry-After`
    set to the window remainder (`rate_limit`) or omitted (`max_count` —
@@ -197,7 +196,7 @@ curl -X DELETE \
 ## Notes
 
 - **One counter driver is registered at a time.** `LayeredUsageCounter`
-  (Valkey hot tier + PG durable write-through) wins when a counting cache
+  (Redis-compatible hot tier + PG durable write-through) wins when a counting cache
   backend is up; `PostgresUsageCounter` is the fallback. Both implement the
   same protocol — operator behavior is identical.
 - **Lifetime caps write through to PG synchronously.** Rate-window counters

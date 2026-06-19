@@ -3,9 +3,11 @@
 Entity-level storage abstraction that routes catalog/collection/items/asset data to pluggable backends.
 Each driver is a self-contained module with its own connection lifecycle, location config, and
 capabilities. Drivers are discovered via entry points and selected at runtime through an
-**operation-based routing system** (post-PR-#261) — one routing config per tier (items / collection /
+**operation-based routing system** — one routing config per tier (items / collection /
 asset / catalog), each mapping `Operation` (WRITE / READ / SEARCH / INDEX / BACKUP / UPLOAD) to an
 ordered list of drivers.
+
+> **Implementation details:** see the [Storage module README](../../packages/core/src/dynastore/modules/storage/README.md).
 
 ## Architecture
 
@@ -38,12 +40,12 @@ Drivers (instances discovered via `dynastore.modules` entry points)
     └── ItemsDuckdbDriver                  driver_ref="items_duckdb_driver"               (analytical reads)
 ```
 
-`driver_ref` is always `_to_snake(cls.__name__)` — the snake_case class key (post-PR-1e).
+`driver_ref` is always `_to_snake(cls.__name__)` — the snake_case class key.
 
 ### Key Design Decisions
 
-- **Operation-based routing** (post-PR-#261): each tier has its own routing config; each operation
-  carries an ordered list of `OperationDriverEntry`. The dispatcher picks the first entry whose hints
+- **Operation-based routing**: each tier has its own routing config; each operation carries an
+  ordered list of `OperationDriverEntry`. The dispatcher picks the first entry whose hints
   match (or the first entry overall when no hint is supplied).
 - **Streaming-first**: read paths return `AsyncIterator[Feature]` — O(1) memory regardless of result size.
 - **Entity-level abstraction**: drivers exchange typed Pydantic models (`Feature`, `FeatureCollection`),
@@ -51,7 +53,7 @@ Drivers (instances discovered via `dynastore.modules` entry points)
 - **Capability declaration**: drivers declare what they support via `Capability` enum. The router can
   validate capability before dispatching.
 - **Lazy initialization**: connections (DuckDB pool, Iceberg catalog) are created on first use.
-- **Async fan-out via outbox** (post-PR-#261): non-fatal `INDEX` writes land in the per-tenant
+- **Async fan-out via outbox**: non-fatal `INDEX` writes land in the per-tenant
   `storage_outbox` table and the `OutboxDrainTask` consumer dispatches them asynchronously.
 
 ## Quick Start
@@ -159,7 +161,7 @@ platform > code defaults). The class key is the snake_case form (e.g. `items_rou
 }
 
 // Privacy-pinned items routing — pinning items_elasticsearch_private_driver
-// is itself the privacy switch (#733). PG remains the durable WRITE target.
+// is itself the privacy switch. PG remains the durable WRITE target.
 {
   "operations": {
     "WRITE": [
@@ -209,7 +211,7 @@ Hint.OBFUSCATED           # private/obfuscated index
 # ... see src/dynastore/modules/storage/hints.py for the full catalog.
 ```
 
-Hints are not registerable at runtime (they're a closed enum, post PR #255). To add a hint, extend
+Hints are not registerable at runtime (they're a closed enum). To add a hint, extend
 `Hint` in `hints.py` and the driver advertises it via `supported_hints: ClassVar[FrozenSet[Hint]]`.
 
 ## Router Performance
@@ -397,7 +399,7 @@ remain available for explicit ops calls.
 
 ### Elasticsearch Private Driver (items-only, per-tenant, DENY-policied)
 
-The private ES branch is **items-only** (#1047). Catalog and collection envelopes have no
+The private ES branch is **items-only**. Catalog and collection envelopes have no
 private ES driver — when private they live in PostgreSQL only and are not indexed in ES at
 all. There is also **no global private alias**: private data is tenant-scoped, so every
 private items search resolves to a single `{prefix}-{catalog_id}-private-items` index from the
@@ -409,8 +411,7 @@ URL/principal scope; cross-tenant search of private items is not a feature.
 
 **Privacy contract**:
 - `auto_register_for_routing: ClassVar[FrozenSet[Operation]] = frozenset()` — opt-in only.
-  Operators pin it in `ItemsRoutingConfig`; the pin itself is the privacy switch (#733 retired
-  the standalone `CollectionPrivacy.is_private` flag).
+  Operators pin it in `ItemsRoutingConfig`; the pin itself is the privacy switch.
 - The items-private driver applies a catalog-wide DENY policy (`private_deny_{cat}`) on
   `ensure_storage` blocking public read access at `/.../catalogs/{cat}/...`.
 - A config-write composition guard rejects a public-ES collection whose parent catalog does
@@ -436,8 +437,8 @@ On `drop_storage`, revokes it. On startup (`lifespan`), restores DENY policies.
 ## Driver Config System
 
 Each driver has its own typed config class in `driver_config.py` (subclass of `PluginConfig` via
-`TypedDriver[ConfigCls]`). The class_key is auto-derived as `_to_snake(cls.__name__)` (post-PR-1e —
-no `_plugin_id` strings). Fetch via the standard `ConfigsProtocol` waterfall:
+`TypedDriver[ConfigCls]`). The class_key is auto-derived as `_to_snake(cls.__name__)`.
+Fetch via the standard `ConfigsProtocol` waterfall:
 
 ```python
 from dynastore.modules.storage.driver_config import (
@@ -466,7 +467,7 @@ config = await configs.get_config(
 | `items_elasticsearch_driver` | `ItemsElasticsearchDriverConfig` | `items_elasticsearch_driver_config` | `index_prefix` (resolved at runtime via `get_index_prefix()`) |
 | `asset_elasticsearch_driver` | `AssetElasticsearchDriverConfig` | `asset_elasticsearch_driver_config` | `index_prefix` |
 
-### Engine Binding (Cycle F.1 / F.2)
+### Engine Binding
 
 Every driver config inherits two engine-binding attributes from
 `_PluginDriverConfig`:
@@ -479,8 +480,8 @@ Every driver config inherits two engine-binding attributes from
   drivers like BigQuery).
 - `engine_ref: Optional[str]` field — name of the platform engine this
   driver instance binds to.  Defaults to `required_engine_class` for
-  single-instance-per-kind deployments (F.1).  F.4 enables operator-
-  chosen ref names for multi-instance.
+  single-instance-per-kind deployments.  Future releases enable
+  operator-chosen ref names for multi-instance deployments.
 
 Engines themselves live at `configs.platform.protocols.storage.*` and are
 sysadmin-only via the existing `configs_access` policy — see
@@ -790,7 +791,7 @@ src/dynastore/
 │       └── elasticsearch_private/       # ItemsElasticsearchPrivateDriver (items-only, DENY-policied)
 └── docs/components/
     ├── storage_drivers.md               # This file
-    ├── platform_engines.md              # Engines layer (Cycle F): connection pools,
+    ├── platform_engines.md              # Engines layer: connection pools,
     │                                    # lifecycle policy, engine ↔ driver compatibility
     └── sidecar_configs.md               # Sidecar configurations (geometries,
                                          # attributes, item_metadata, stac_metadata)
@@ -810,11 +811,3 @@ src/dynastore/
   `meta`, `include`, `strict`), HATEOAS link catalog, scope
   strictness rules, live-shape examples at platform / catalog /
   collection scope.
-- `notebook_showcase/notebooks/cycle_f_use_cases/` — runnable
-  walkthroughs exercising drivers + sidecars + routing + write
-  policies end-to-end (UC1 dual-search with all 4 sidecars; UC2
-  schema enforcement + multi-version; UC3 private ES; UC4 asset
-  refusal round-trip).
-- `notebook_showcase/notebooks/storage_drivers/04_engines_and_multi_instance.ipynb`
-  — multi-instance driver refs (operator-chosen names sharing one
-  driver class) and engine-driven lifecycle.

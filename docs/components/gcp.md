@@ -8,13 +8,13 @@ It is designed following the "Three Pillars" rule strictly: A silent foundation 
 The `GCPModule` acts as the centralized foundation securely holding thread-safe authenticated Cloud Storage and Pub/Sub credentials via Application Default configs.
 
 ### Just-in-Time (JIT) Setups
-When an orchestration file is requested, the system automatically spins up a dedicated `GCS` bucket. It relies on internal logic to evaluate geographical locality rules reducing bandwidth operations.
+When an orchestration file is requested, the system automatically spins up a dedicated `GCS` bucket, evaluating geographical locality rules to reduce bandwidth operations.
 
 ### Automated Serverless Eventing
 1. Establishes a dedicated `Pub/Sub` topic.
-2. Identifies the `GCS` service account binding strict IAM publish rights to the topic preventing setup configuration drift gaps automatically. 
-3. Commands GCS to attach native Bucket File Change triggers binding to the Pub/Sub.
-4. Generates an encrypted `OIDC JWT` webhook pushing back strictly into Agro-Informatics Platform (AIP) - Catalog Services core APIs natively executing events entirely headless relying on GCP native internal infrastructure for stability guarantees.
+2. Identifies the `GCS` service account and binds IAM publish rights to the topic.
+3. Commands GCS to attach native Bucket File Change triggers to the Pub/Sub topic.
+4. Generates an OIDC JWT webhook that pushes events back into DynaStore's asset APIs, executing entirely headless via GCP-native eventing.
 
 ## Endpoints
 `POST /gcp/buckets/initiate-upload`

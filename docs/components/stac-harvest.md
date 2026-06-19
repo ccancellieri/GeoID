@@ -50,11 +50,9 @@ The process description is catalog-agnostic, so the inspect path is
 ### 2. Permissions
 
 Execution is **not** gated by a process-level IAM policy — the caller principal
-is recorded only for job attribution (`caller_id`). On the **dev** catalog
-service, which runs without IAM enforcement, execution is open and **no token is
-required**. Behind the platform gateway the usual tenant/auth middleware still
-applies, so send your normal bearer token (scoped to the target catalog) in
-`review` / production.
+is recorded only for job attribution (`caller_id`). Tenant/auth middleware still
+applies when the deployment enforces IAM; send your normal bearer token scoped
+to the target catalog.
 
 ### 3. Execute: async vs sync
 
@@ -97,64 +95,43 @@ ES index is created from the current `build_item_mapping`, so the canonical
 `system.*` / `stats.*` fields and the root `external_id` / `asset_id` keyword
 lanes are typed and queryable immediately.
 
-## Execution mode: Cloud Run Job vs in-process background task
+## Execution mode: remote job vs in-process background task
 
-How an async harvest *runs* is governed by the **task-routing deployment
-preset** (`cloud` / `review` / `onprem`) plus the process's "lightweight"
-classification — not by anything in the request body.
+How an async harvest *runs* depends on the deployment's task-runner
+configuration and the process's "lightweight" classification — not on anything
+in the request body.
 
-- **`async-execute`** (`Prefer: respond-async`) — dispatched to a runner per the
-  routing matrix:
-  - **`cloud` / `review` preset:** a *non-lightweight* process offloads to a
-    **Cloud Run Job** (`gcp_cloud_run` runner). Only the two lightweight
-    processes (`requeue_dead_letter_tasks`, `tiles_invalidate`) stay in-process.
-  - **`onprem` preset:** *every* process runs in-process (`background` runner) —
-    never a Cloud Run Job.
-- **`sync-execute`** (`Prefer: respond-sync`) — runs in-process **synchronously**
-  on the catalog service and blocks until done. Suitable only for small harvests.
+- **`async-execute`** (`Prefer: respond-async`) — dispatched to the
+  highest-priority runner that can handle `stac_harvest`. When a dedicated
+  remote job runner (e.g. a cloud-hosted job) is configured and a
+  `stac_harvest` job is deployed, it offloads there. When no such job is
+  available, dispatch falls through to the in-process `background` runner —
+  the harvest still runs, but inside the catalog service.
+- **`sync-execute`** (`Prefer: respond-sync`) — runs in-process
+  **synchronously** on the catalog service and blocks until done. Suitable
+  only for small harvests.
 
-`stac_harvest` is **not** lightweight, so under `cloud` / `review` the routing
-matrix *wants* it on `gcp_cloud_run`. There is one more requirement.
+`stac_harvest` is not classified as lightweight. Running it as a remote job is
+recommended for large catalogs so a long harvest does not occupy a
+request-serving pod.
 
-### Running harvest as a Cloud Run Job
+### Running harvest as a remote job
 
-The `gcp_cloud_run` runner maps a `task_type` to a job via `load_job_config()`,
-which **discovers deployed Cloud Run Jobs by their `TASK_TYPE` env** (TTL 900s).
-A Cloud Run Job with `TASK_TYPE: stac_harvest` must therefore be deployed for
-harvest to run as a job. If no such job exists, the job map has no `stac_harvest`
-entry and dispatch falls through to the lower-priority in-process `background`
-runner — i.e. the harvest still runs, but inside the catalog **service**, not as
-a Job.
+The remote job runner maps a `task_type` to a deployed job via a job-discovery
+mechanism (TTL-cached). A deployed job with `TASK_TYPE: stac_harvest` must exist
+for harvest to route there. All task jobs share a single container image; the
+runner overrides the container args per execution with
+`[<task_type>, <TaskPayload JSON>, --schema, <schema>]`. Enabling job mode is
+therefore a deployment configuration addition — no code change required.
 
-All task Jobs share a single container image; `GcpJobRunner` overrides the
-container `--args` per execution with `[<task_type>, <TaskPayload JSON>, --schema,
-<schema>]`. So enabling job-mode is purely a deploy-manifest addition — no new
-code. In the deployment repository's `apps.base.yml`, add a Job block mirroring
-an existing one (e.g. the elasticsearch indexer), changing only the identity and:
-
-```yaml
-  geospatial-stac-harvest-job:
-    # ... same image / SA / DB pool / VPC as the other *-job blocks ...
-    TASK_TYPE: "stac_harvest"
-```
-
-Add the matching `svc_geospatial_stac_harvest_job` input + deploy-matrix entry to
-`deploy.yml`, then deploy to dev:
-
-```bash
-gh workflow run deploy.yml -f environment=dev -f svc_geospatial_stac_harvest_job=true
-```
-
-Once the Job is live, `load_job_config` auto-discovers it and subsequent async
-harvests route to the Job (verify with `GET /configs/tasks/runners` — the entry
-should appear under `gcp_cloud_run.declared_tasks`).
+Once a `stac_harvest` job is deployed, it is auto-discovered and subsequent async
+harvests route to it. Verify via `GET /configs/tasks/runners` — the entry should
+appear under the job runner's `declared_tasks`.
 
 ### Running harvest as a background task
 
-This is the default today (no `stac_harvest` Job deployed): an async harvest runs
-in-process on the catalog service. It is the *only* mode under the `onprem`
-preset. It is appropriate for small/medium harvests; for large catalogs, deploy
-the Job so a long harvest does not occupy a request-serving pod.
+When no remote job is configured for `stac_harvest`, async harvests run
+in-process on the catalog service. This is appropriate for small/medium harvests.
 
 ## Worked example
 

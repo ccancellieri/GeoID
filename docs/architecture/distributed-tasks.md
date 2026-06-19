@@ -2,10 +2,12 @@
 
 This document describes the distributed architecture of the task queue and event bus, focusing on scaling, leader election, deployment modes, and operational concerns.
 
+> **Implementation details:** see the [task system README](../packages/core/src/dynastore/models/README.md) and the [Tasks module README](../packages/core/src/dynastore/modules/tasks/README.md).
+
 ## Design Goals
 
 - Scale to millions of users, millions of collections, and hundreds of thousands of catalogs
-- Support 10+ Cloud Run service configurations with 4-50 instances each
+- Support deployments with many concurrent service instances
 - Minimize idle database connections (avoid N instances x LISTEN)
 - Exactly-once task delivery without thundering herd
 - Automatic event consumption without configuration
@@ -44,11 +46,11 @@ This document describes the distributed architecture of the task queue and event
 ## Leader Election
 
 ### Problem
-500 instances each holding a persistent `LISTEN` connection = too many idle database connections.
+Many instances each holding a persistent `LISTEN` connection = too many idle database connections.
 
 ### Solution: One Leader Per Service Type
 
-Each Cloud Run service type (identified by the `NAME` env var) elects exactly one LISTEN leader via `pg_try_advisory_lock`:
+Each service type (identified by the `NAME` env var) elects exactly one LISTEN leader via `pg_try_advisory_lock`:
 
 ```python
 lock_key = hash(f"dynastore.queue_listener.{NAME}") & 0x7FFFFFFFFFFFFFFF
@@ -59,7 +61,7 @@ lock_acquired = await conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_key)
 - **Follower:** Emits a periodic signal_bus event every `poll_interval` seconds to trigger claim sweeps.
 - **Failover:** On leader death, the session-level advisory lock is released automatically. The next follower to reconnect wins the election.
 
-**Connection budget:** ~5 LISTEN connections total (one per service type), not 500.
+**Connection budget:** one LISTEN connection per service type, not one per instance.
 
 ## Runner-Aware Task Claiming
 
@@ -85,11 +87,11 @@ class CapabilityMap:
 
 | Runner | Priority | `can_handle()` | Mode |
 |---|---|---|---|
-| `GcpCloudRunRunner` | 10 | `task_type in self._job_map_cache` | ASYNC |
+| `CloudJobRunner` | 10 | `task_type in self._job_map_cache` | ASYNC |
 | `BackgroundRunner` | 100 | `get_task_instance(task_type) is not None` | ASYNC |
 | `SyncRunner` | 100 | `get_task_instance(task_type) is not None` | SYNC |
 
-On-premise environments have no `GcpCloudRunRunner` — tasks fall through to `BackgroundRunner` transparently.
+Deployments without a cloud job runner (e.g. on-premise) fall through to `BackgroundRunner` transparently.
 
 ### Claim Query
 
@@ -146,10 +148,10 @@ The UNIQUE partial index on `dedup_key` in `tasks.tasks` prevents duplicate task
 | Environment | Notification | Event Consumer | Available Runners |
 |---|---|---|---|
 | **On-premise (docker-compose)** | Leader/follower pg_notify | Automatic | SyncRunner, BackgroundRunner |
-| **GCP Cloud Run Service** | Leader/follower pg_notify | Automatic | SyncRunner, BackgroundRunner, GcpCloudRunRunner |
-| **GCP Cloud Run Job** | N/A (one-shot) | N/A | Direct execution via `main_task.py` |
+| **Cloud service (multi-instance)** | Leader/follower pg_notify | Automatic | SyncRunner, BackgroundRunner, CloudJobRunner |
+| **Cloud one-shot job** | N/A (one-shot) | N/A | Direct execution via `main_task.py` |
 
-### Cloud Run Job Entrypoint
+### One-shot job entrypoint
 
 `main_task.py` is a generic worker that boots up, initializes modules, and runs a single task:
 
@@ -191,16 +193,14 @@ stateDiagram-v2
 | DEAD_LETTER tasks | 90 days | Separate retention window |
 | PENDING/ACTIVE (stale) | visibility_timeout | Janitor requeues or dead-letters |
 | Consumed events | Immediate | DELETE after processing |
-| Dead letter events | 30 days | pg_cron cleanup |
+| Dead letter events | 30 days | Maintenance supervisor cleanup |
 
 ### Partition Lifecycle
 
-Partitions are managed by two complementary mechanisms to ensure zero-downtime operation:
+Partitions are managed by complementary mechanisms to ensure zero-downtime operation:
 
 1. **Startup** (`ensure_future_partitions`): Creates partitions 12 months ahead on every application restart.
-2. **pg_cron** (`register_partition_creation_policy`): A `partcreate_*` cron job runs monthly (1st at 2 AM) and creates 3 future partitions. This is the safety net for services running continuously without restarts.
-3. **pg_cron** (`register_retention_policy`): A `prune_*` cron job runs weekly and drops expired partitions.
-4. **Orphan cleanup** (`ensure_global_cron_cleanup`): A daily job removes `prune_*` and `partcreate_*` cron jobs for deleted tenant schemas.
+2. **Maintenance supervisor** (leader-elected, runs in-process): Creates future partitions monthly and drops expired partitions on a weekly schedule. This is the safety net for services running continuously without restarts. Orphan partition-maintenance entries for deleted tenant schemas are also reaped here.
 
 Both creation and deletion are non-blocking: `CREATE TABLE IF NOT EXISTS` is metadata-only DDL; `DROP TABLE` locks only the specific child partition being removed.
 
@@ -214,6 +214,6 @@ Both creation and deletion are non-blocking: `CREATE TABLE IF NOT EXISTS` is met
 | `src/dynastore/modules/tasks/runners.py` | `can_handle()`, CapabilityMap |
 | `src/dynastore/modules/tasks/maintenance.py` | Admin tools (stats, purge, dead-letter management) |
 | `src/dynastore/modules/catalog/event_service.py` | EventBusProtocol implementation, consumer |
-| `src/dynastore/main_task.py` | Cloud Run Job generic entrypoint |
+| `src/dynastore/main_task.py` | One-shot job generic entrypoint |
 | `src/dynastore/models/protocols/task_queue.py` | TaskQueueProtocol definition |
 | `src/dynastore/models/protocols/event_bus.py` | EventBusProtocol definition |

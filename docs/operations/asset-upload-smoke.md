@@ -1,26 +1,25 @@
-# Asset upload — review-env smoke runbook
+# Asset upload — smoke runbook
 
-This runbook validates the asset upload lifecycle end-to-end on the **review** environment after a deploy that touches any of:
+This runbook validates the asset upload lifecycle end-to-end after a deploy that touches any of:
 
 - `extensions/assets/assets_service.py` (REST surface, write-policy gate)
 - `modules/catalog/asset_distributed.py` (chain runner)
 - `modules/catalog/drivers/pg_asset_driver.py` (DDL)
-- `modules/gcp/gcp_finalize_activator.py` (Pub/Sub activator)
-- `extensions/gcp/gcp_events.py` (Pub/Sub HTTP handler)
+- `modules/gcp/gcp_finalize_activator.py` (object-store finalize activator)
+- `extensions/gcp/gcp_events.py` (cloud events HTTP handler)
 
-GCP Pub/Sub push subscriptions cannot reach `localhost`, so end-to-end finalize verification only works against a deployed environment. This runbook covers the manual smoke flow on review.
+Cloud storage push notifications cannot reach `localhost`, so end-to-end finalize verification only works against a deployed environment. This runbook covers the manual smoke flow on a deployed environment.
 
 ---
 
 ## Prerequisites
 
-- Deploy succeeded for `geospatial-catalog`, `geospatial-geoid`, and `geospatial-tools` services.
-- Review DB has been reset (`Reset database (review only)` workflow with `mode=full, dry_run=false`) — required after schema-touching deploys.
-- A sysadmin token for review (`DYNASTORE_SYSADMIN_TOKEN`).
+- The deploy succeeded across all running services.
+- A sysadmin token (`DYNASTORE_SYSADMIN_TOKEN`).
 - A small test file (`data.tif` or any binary, ~1 MB).
 
 ```bash
-export REVIEW_BASE=https://data.review.fao.org/geospatial/v2/api
+export REVIEW_BASE=https://<your-deployment-base>/v2/api
 export TOKEN="$DYNASTORE_SYSADMIN_TOKEN"
 export CAT=smoke-$(date +%s)
 export COL=images
@@ -83,7 +82,7 @@ curl -s -X POST \
   }' | tee /tmp/ticket.json | jq '.ticket_id, .upload_url[:80], .method, .backend'
 ```
 
-Expected: 200 OK with a `ticket_id`, a GCS resumable signed URL (begins with `https://storage.googleapis.com/...`), `method=PUT`, `backend=gcs`.
+Expected: 200 OK with a `ticket_id`, a signed upload URL, `method=PUT`, and a `backend` field identifying the configured object store.
 
 **Server-side invariant — verify the born-claimed PENDING row exists immediately:**
 
@@ -107,11 +106,11 @@ curl -X PUT "$UPLOAD_URL" \
   -w "HTTP %{http_code}\n"
 ```
 
-Expected: HTTP 200 from GCS.
+Expected: HTTP 200 from the object store.
 
 ### 5. Watch the activator transition the row to ACTIVE
 
-GCS fires `OBJECT_FINALIZE` → Pub/Sub push → review's `/gcp/events/pubsub-push` handler → inline activator UPDATEs the row. Poll until status transitions:
+The configured object store fires a finalization event → push notification → the deployment's event handler → inline activator UPDATEs the row. Poll until status transitions:
 
 ```bash
 for i in 1 2 3 4 5 6; do
@@ -125,8 +124,8 @@ done
 ```
 
 Expected: within ~10–30s the row reads `active|md5:<base64>|<bytes>`. If after 60s it's still `pending`:
-- Check Pub/Sub delivery: `gcloud pubsub subscriptions describe ds-${CAT}-default-sub` for ack count.
-- Check the catalog service logs in Cloud Run for `finalize` log lines.
+- Check the push subscription delivery status for ack count.
+- Check the catalog service logs for `finalize` log lines.
 - A truly orphan finalize will appear in the index_failure_log: `GET /catalogs/$CAT/index-failures?reason=orphan_finalize`.
 
 ### 6. Verify policy gate — refuse on filename collision (default REFUSE_FAIL)
@@ -197,6 +196,6 @@ curl -X DELETE "$REVIEW_BASE/catalogs/$CAT" \
 - [ ] Step 6 returns 409 with structured rejection body — **no signed URL minted**.
 - [ ] Step 7 returns 207 with structured `IngestionReport`.
 - [ ] Step 8 reports 0 drift across all three categories.
-- [ ] Step 9 leaves the bucket prefix empty (`gsutil ls -r gs://<bucket>/$CAT/`).
+- [ ] Step 9 leaves the object-store prefix empty (verify via your storage backend's CLI or console).
 
-If any step fails, capture the catalog service Cloud Run logs and the Pub/Sub subscription state, attach to the deploy PR's smoke-evidence comment, and fix forward (per `feedback_ship_fix_during_merge.md`).
+If any step fails, capture the catalog service logs and the push subscription state, attach to the deploy's smoke-evidence record, and fix forward.

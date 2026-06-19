@@ -39,9 +39,8 @@ Every sidecar inherits two universal fields from `SidecarConfig`:
 
 Sidecars register themselves with `SidecarConfigRegistry` at import
 time; the registry-resolved discriminated union on
-`ItemsPostgresqlDriverConfig.sidecars` (post-PR-#240) means a new
-sidecar lands without touching the driver-config Union — just declare
-+ register.
+`ItemsPostgresqlDriverConfig.sidecars` means a new sidecar lands
+without touching the driver-config Union — just declare + register.
 
 ## Geometries (`sidecar_type="geometries"`)
 
@@ -111,7 +110,7 @@ RECORDS (no spatial component).
 ```
 
 > User-supplied feature schema lives on `ItemsWritePolicy.schema`
-> (collection-tier), not on the sidecar. See PR #982 (#976).
+> (collection-tier), not on the sidecar.
 
 ## Feature Attributes (`sidecar_type="attributes"`)
 
@@ -217,9 +216,8 @@ curl -X PATCH /configs/catalogs/{cat}/collections/{coll}/plugins/items_postgresq
 ```
 
 `external_id_field`, `require_external_id`, and `enable_validity` are
-collection-tier policy knobs on `ItemsWritePolicy` (PRs #940, #991), not
-sidecar fields. PATCH `/configs/.../plugins/items_write_policy` to set
-them.
+collection-tier policy knobs on `ItemsWritePolicy`, not sidecar fields.
+PATCH `/configs/.../plugins/items_write_policy` to set them.
 
 GET round-trips the slim form back as the full default surface
 (every default field visible) so operators can copy-paste-modify a
@@ -253,11 +251,10 @@ ride the driver's `engine_ref` to whichever `PostgresqlEngineConfig`
 the driver references; sidecars do not declare their own engine
 binding.
 
-When F.4c lands and a single PG engine backs multiple driver instances
-(e.g. `pg_lean` + `pg_full` per UC2 in the cycle-F plan), sidecars
-attach per-driver — the same hub schema but with different sidecar
-compositions.  Today (F.1 single-instance-per-kind) every PG-backed
-collection uses the one driver instance and its declared sidecars.
+When multi-instance engine refs are supported (planned), a single PG
+engine can back multiple driver instances with different sidecar
+compositions.  Currently every PG-backed collection uses the one driver
+instance and its declared sidecars.
 
 ## See also
 

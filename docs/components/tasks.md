@@ -1,6 +1,8 @@
 # The Asynchronous Task & Event Ecosystem
 
-The asynchronous task ecosystem is a cornerstone of Agro-Informatics Platform (AIP) - Catalog Services's resilience and scalability, embodying the "Tasks" pillar of the architecture. It provides a robust framework for offloading long-running operations from the synchronous API request loop.
+The asynchronous task ecosystem is a cornerstone of DynaStore's resilience and scalability. It provides a robust framework for offloading long-running operations from the synchronous API request loop.
+
+> **Implementation details:** see the [Tasks module README](../../packages/core/src/dynastore/modules/tasks/README.md).
 
 ## The `tasks` Module: The Central Nervous System
 The `tasks` module is the heart of the asynchronous ecosystem. It acts as a centralized, transactional ledger and status tracker. It does **not** execute jobs itself.
@@ -175,9 +177,9 @@ Event handlers that create tasks include `dedup_key = f"evt:{event_id}:{task_typ
 | DEAD_LETTER tasks | 90 days | Separate retention window |
 | PENDING/ACTIVE (stale) | visibility_timeout | Janitor requeues or dead-letters |
 | Consumed events | Immediate | DELETE after processing |
-| Dead letter events | 30 days | pg_cron cleanup |
+| Dead letter events | 30 days | Maintenance supervisor cleanup |
 
-Partition management: `pg_cron` creates monthly partitions 12 months ahead and drops expired ones.
+Partition management (creating monthly partitions ahead of time and dropping expired ones) is handled by the in-app maintenance supervisor loop, which runs on a leader-elected schedule inside the service.
 
 ## The `ingestion` Extension: The Gateway
 The primary user-facing orchestration endpoint: `POST /ingestion/{catalog_id}/{collection_id}`.

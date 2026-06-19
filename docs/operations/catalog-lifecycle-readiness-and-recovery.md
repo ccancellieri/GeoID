@@ -6,17 +6,17 @@ This runbook answers three operational questions for catalog/collection lifecycl
 2. **How healthy is the create → use → destroy loop under load (failure rate)?**
 3. **How do I recover when a catalog create or delete leaves something broken behind?**
 
-It pairs with two tools in this repo:
+It pairs with two operator tools:
 
-- `scripts/catalog_lifecycle_stress.py` — the lifecycle stress harness (section 2).
-- `scripts/cleanup_orphan_items_tables.sql` — orphan items-table cleanup (section 3.3).
+- A lifecycle stress harness (section 2) — runs N independent catalog lifecycles concurrently and reports per-phase failure rates.
+- An orphan items-table cleanup script (section 3.3) — dry-run by default, identifies and optionally drops tables left behind by a partially-rolled-back collection delete.
 
 ---
 
 ## 1. Being 100% sure a catalog is ready
 
 Catalog creation is asynchronous. `POST /stac/catalogs` returns `201` immediately, but the
-GCS bucket and the managed Pub/Sub eventing channel are provisioned by a background task.
+object-store bucket and the managed eventing channel are provisioned by a background task.
 Using the catalog before that finishes produces confusing `409 "still provisioning"` errors
 on collection/asset writes.
 
@@ -29,23 +29,23 @@ of these hold:
 - the embedded `task` (the provision task) has `status == "COMPLETED"`.
 
 ```bash
-BASE=https://data.review.fao.org/geospatial/dev/api/catalog
+BASE=https://<your-deployment-base>/api/catalog
 curl -s "$BASE/catalog/catalogs/$CAT" | jq '{provisioning_status, task: .task.status}'
 # ready when: {"provisioning_status":"ready","task":"COMPLETED"}
 ```
 
 Treat `provisioning_status == "failed"` (or a provision task in `FAILED` / `DEAD_LETTER`) as a
-hard failure — see section 3.4. Typical ready time on dev is **30–60 s**; allow a generous
-timeout (the stress harness defaults to 180 s).
+hard failure — see section 3.4. Typical ready time is **30–60 s**; allow a generous timeout
+(the stress harness defaults to 180 s).
 
 ### The caveat that bites: "ready" does not prove eventing works
 
 A catalog flips to `ready` even when its **eventing** provisioning step finished `degraded`
-(for example, Pub/Sub IAM not yet granted on the project). `provisioning_status` alone
-therefore does **not** guarantee that bucket-finalize / asset events will fire.
+(for example, object-store IAM not yet propagated). `provisioning_status` alone therefore does
+**not** guarantee that object-finalize / asset events will fire.
 
 The only trustworthy proof that eventing provisioned correctly is to **exercise it**: upload a
-real file and confirm the asset is created. (Confirming the *event* via the API is currently
+real file and confirm the asset is listed. (Confirming the event via the API is currently
 unreliable — see the observability note at the end.) The stress harness automates this with
 its `upload_asset` phase.
 
@@ -62,26 +62,25 @@ its `upload_asset` phase.
 
 ## 2. Stress testing the lifecycle & reading the failure rate
 
-`scripts/catalog_lifecycle_stress.py` runs N independent catalog lifecycles concurrently and
-reports a per-phase failure rate. Each iteration: create catalog → wait ready → create
-collections → (optionally) upload a real asset + check for its event → hard-delete each
-collection → hard-delete the catalog → assert it 404s. Every iteration is **self-cleaning**:
-teardown runs even after a mid-flight failure, and any catalog it could not delete is reported
-under `leaked_catalogs`.
+The lifecycle stress harness runs N independent catalog lifecycles concurrently and reports a
+per-phase failure rate. Each iteration: create catalog → wait ready → create collections →
+(optionally) upload a real asset + check for its event → hard-delete each collection →
+hard-delete the catalog → assert it 404s. Every iteration is **self-cleaning**: teardown runs
+even after a mid-flight failure, and any catalog it could not delete is reported under
+`leaked_catalogs`.
 
 ### Run it
 
 ```bash
 python scripts/catalog_lifecycle_stress.py \
-  --base https://data.review.fao.org/geospatial/dev/api/catalog \
+  --base https://<your-deployment-base>/api/catalog \
   --iterations 20 --concurrency 4 --collections 2 --upload
 ```
 
-All knobs also read from env (for a Cloud Run job): `STRESS_BASE`, `STRESS_ITERATIONS`,
-`STRESS_CONCURRENCY`, `STRESS_COLLECTIONS`, `STRESS_UPLOAD`, `STRESS_TOKEN`,
-`STRESS_READY_TIMEOUT`, `STRESS_DELETE_TIMEOUT`, `STRESS_EVENT_TIMEOUT`, `STRESS_POLL`,
-`STRESS_RUN_TAG`. The process exits non-zero if any **hard** phase failed, so it goes red in CI
-/ a Cloud Run job.
+All knobs also read from env: `STRESS_BASE`, `STRESS_ITERATIONS`, `STRESS_CONCURRENCY`,
+`STRESS_COLLECTIONS`, `STRESS_UPLOAD`, `STRESS_TOKEN`, `STRESS_READY_TIMEOUT`,
+`STRESS_DELETE_TIMEOUT`, `STRESS_EVENT_TIMEOUT`, `STRESS_POLL`, `STRESS_RUN_TAG`. The
+process exits non-zero if any **hard** phase failed, so it integrates with CI.
 
 ### Reading the report
 
@@ -102,27 +101,20 @@ per-phase  (~ = advisory, excluded from verdict):
   delete_catalog     0/20 fail (0.0%)  ...
 ```
 
-### Baseline observed on dev (2026-06-17, before the robustness fixes)
+### Baseline
 
-A 5-iteration, concurrency-3, upload-on run found:
+Known transient failure modes and their mitigations:
 
-- **Lifecycle phases: clean** except one transient failure on `delete_catalog` —
-  `asyncpg LockNotAvailableError` (lock timeout) under concurrent catalog deletes, which left
-  one leaked catalog. A plain retry of the delete succeeded. Overall failure rate was driven
-  entirely by that one transient lock race (20% = 1/5).
-- `verify_event` advisory-failed on every iteration (asset eventing not surfaced).
+- **Concurrent deletes** — `asyncpg LockNotAvailableError` (lock timeout) under concurrent
+  catalog deletes. The catalog hard-delete drops the tenant schema through a bounded
+  `lock_timeout` with retry on lock conflict (`safe_drop_relation`), so a transient cross-delete
+  lock wait self-heals instead of returning a `500` and leaking the catalog.
+- **Orphaned eventing resources** — a hard-delete now force-cleans the deterministic default
+  topic/subscription even when the catalog config never persisted the topic path (a crashed
+  provision), so resources don't leak and collide on a later same-id create.
 
-Both are addressed:
-
-- The catalog hard-delete now drops the tenant schema through a bounded `lock_timeout` with
-  retry on lock conflict (`safe_drop_relation`), so a transient cross-delete lock wait
-  self-heals instead of returning a `500` and leaking the catalog.
-- Hard-delete now force-cleans the deterministic default Pub/Sub topic/subscription even when
-  the catalog config never persisted `topic_path` (a crashed provision), so topics don't leak
-  to collide as "already exists" on a later same-id create.
-
-After these fixes, expect lifecycle-phase failure rates at or near **0%** under this load;
-`verify_event` stays advisory until asset eventing is surfaced.
+After these mitigations, expect lifecycle-phase failure rates at or near **0%** under normal
+load; `verify_event` stays advisory until asset eventing is surfaced through the events API.
 
 ---
 
@@ -149,25 +141,20 @@ curl -s -o /dev/null -w '%{http_code}\n' "$BASE/stac/catalogs/$CAT"   # expect 4
 With the lock-retry fix deployed, the server retries internally and this `500` should no longer
 surface; the manual retry remains the recovery for any older revision.
 
-### 3.2 An orphaned Pub/Sub topic ("already exists" on create)
+### 3.2 An orphaned eventing resource ("already exists" on create)
 
-Symptom on catalog create: a log line like
-`Managed Pub/Sub topic 'projects/<proj>/topics/ds-<catalog>-events' already exists.`
+Symptom on catalog create: a log line indicating a topic/channel with a deterministic name
+already exists.
 
-This is **benign**: topic creation is idempotent (it adopts the existing topic), and topics are
-one-per-catalog with a deterministic name, so they do not accumulate per cycle. It does,
-however, indicate a topic that a prior delete failed to tear down — usually because the catalog
-config never persisted `topic_path` (a provision that crashed mid-setup).
+This is **benign**: resource creation is idempotent (it adopts the existing resource), and each
+eventing channel is one-per-catalog with a deterministic name, so they do not accumulate per
+cycle. It does, however, indicate a resource that a prior delete failed to tear down — usually
+because the catalog config never persisted the resource path (a provision that crashed mid-setup).
 
-The hard-delete force-cleanup fix removes the deterministic default topic by name on every
-delete, so this self-corrects going forward. To remove a lingering orphan topic manually:
-
-```bash
-gcloud pubsub topics delete ds-<catalog>-events       --project fao-aip-geospatial-review
-gcloud pubsub subscriptions delete ds-<catalog>-events-sub --project fao-aip-geospatial-review  # if present
-```
-
-(Deleting the topic also drops its subscriptions. `NotFound` is fine — nothing to clean.)
+The hard-delete force-cleanup removes the deterministic default topic/subscription by name on
+every delete, so this self-corrects going forward. To remove a lingering orphan resource
+manually, use your cloud provider's CLI to delete the topic and subscription by their
+deterministic names. `NotFound` on either is fine — nothing to clean.
 
 ### 3.3 Orphaned per-collection items tables (PG storage left behind)
 
@@ -176,21 +163,21 @@ _item_metadata,_stac_metadata}` tables for a collection that no longer exists, w
 Elasticsearch shows 0 documents. These are leftovers from a pre-refactor collection delete that
 rolled back after dropping the `collection_configs` pin but before dropping the tables.
 
-They are harmless (nothing reads them) but waste storage. Clean them with the operator script,
-which is **dry-run by default** — it only reports what it would drop:
+They are harmless (nothing reads them) but waste storage. The cleanup script is
+**dry-run by default** — it only reports what it would drop:
 
 ```bash
 # 1. Preview (safe, no drops):
 psql "$DSN" -f scripts/cleanup_orphan_items_tables.sql
 
 # 2. Scope to one schema and execute:
-psql "$DSN" -v target_schema=s_ql98bdk4 -v do_drop=true -f scripts/cleanup_orphan_items_tables.sql
+psql "$DSN" -v target_schema=s_<id> -v do_drop=true -f scripts/cleanup_orphan_items_tables.sql
 
 # 3. Or sweep every tenant schema:
 psql "$DSN" -v do_drop=true -f scripts/cleanup_orphan_items_tables.sql
 ```
 
-A `t_<base>` hub is dropped **only** when no row in that schema's `collection_configs` pins it
+A table group is dropped **only** when no row in that schema's `collection_configs` pins it
 as `physical_table`, so live and mid-provision collections are never touched. The script skips
 any schema lacking a `collection_configs` table. See the script header for the full safety
 model. (Hard-deleting the owning catalog also clears these, since it drops the whole schema.)
@@ -200,10 +187,10 @@ model. (Hard-deleting the owning catalog also clears these, since it drops the w
 - `provisioning` that never reaches `ready`: inspect the provision task via
   `GET /catalog/catalogs/{id}` (the `task` block) and the catalog logs
   (`GET /catalog/logs/catalogs/{id}`). A `DEAD_LETTER` provision task usually means a transient
-  GCP error (e.g. a Pub/Sub `attachSubscription 403`); requeue the dead-letter task or
-  hard-delete and recreate.
+  cloud error (e.g. an IAM propagation delay on the eventing subscription); requeue the
+  dead-letter task or hard-delete and recreate.
 - `failed`: the catalog is not usable. Hard-delete it (`DELETE …?force=true`) and recreate.
-  Because the failure may have left partial GCP/PG resources, the orphan-topic (3.2) and
+  Because the failure may have left partial cloud/DB resources, the orphan-resource (3.2) and
   orphan-table (3.3) cleanups are the belt-and-braces follow-up.
 
 ---
@@ -214,20 +201,19 @@ model. (Hard-deleting the owning catalog also clears these, since it drops the w
 outbox) are **separate stores**. When triaging lifecycle issues, know the current coverage:
 
 - **Catalog** lifecycle is well covered: `catalog_creation`, `catalog_hard_deletion`,
-  `gcp.destroy.start` / `gcp.eventing.teardown` / `gcp.destroy.success` all appear in
+  `destroy.start` / `eventing.teardown` / `destroy.success` all appear in
   `GET /logs/system` and `GET /logs/catalogs/{id}`.
 - **Collection** delete events reach `/events`, but **`collection_creation` is not emitted**
   anywhere, and collection deletes do not write a `/logs` row.
 - **Asset** create/update/delete currently produce **no durable** log or event row (the REST
   path does not carry a DB connection into the emitter, so the outbox write is skipped). This
   is why the stress harness treats `verify_event` as advisory.
-- **Pub/Sub topic** create/adopt/delete are logged at `debug`/stdlib level only and do **not**
-  reach the `/logs` store, so the benign "already exists" line is visible only in Cloud Run
-  stdout.
+- **Eventing resource** create/adopt/delete are logged at `debug`/stdlib level only and do **not**
+  reach the `/logs` store, so the benign "already exists" line is visible only in service stdout.
 - The catalog-scoped `GET /events/catalogs/{id}/events` returns `[]` for platform-scoped
   lifecycle events (they are stored with a null top-level `schema_id`); use `GET /events/system`
   and filter on the catalog id until that filter is widened.
 
-Closing these gaps (emit `collection_creation`, make asset events durable, route Pub/Sub
-lifecycle to `/logs`, fix the catalog-scoped event filter) is tracked separately; until then,
+Closing these gaps (emit `collection_creation`, make asset events durable, route eventing
+lifecycle to `/logs`, fix the catalog-scoped event filter) is planned separately; until then,
 prefer `GET /logs/system` and `GET /events/system` for end-to-end lifecycle triage.

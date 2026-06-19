@@ -2,7 +2,9 @@
 
 The `elasticsearch` module and its companion `search` extension provide full-text, spatial, and temporal search over DynaStore entities backed by Elasticsearch. Together they form a complete indexing pipeline with runtime-configurable per-catalog behaviours — including the **GeoID private mode** for privacy-sensitive catalogs.
 
-This component follows the "Three Pillars" architecture: a silent `module` (event-driven indexing), a stateless API `extension` (search + admin endpoints), and asynchronous `tasks` (durable workers and Cloud Run Jobs).
+This component follows the "Three Pillars" architecture: a silent `module` (event-driven indexing), a stateless API `extension` (search + admin endpoints), and asynchronous `tasks` (durable workers and bulk reindex jobs).
+
+> **Implementation details:** see the [Elasticsearch module README](../../packages/core/src/dynastore/modules/elasticsearch/README.md).
 
 ---
 
@@ -57,7 +59,7 @@ Dynamic templates are applied in order (first match wins) to handle multilingual
 
 ### Canonical item envelope
 
-Item `_source` is assembled by `build_canonical_index_doc` (`modules/elasticsearch/canonical_doc.py`) into a fixed set of lanes, one modular shape for every entity level (refs #1285/#1800/#1828). The lanes are the contract; what fills them is the per-level concern:
+Item `_source` is assembled by `build_canonical_index_doc` (`modules/elasticsearch/canonical_doc.py`) into a fixed set of lanes, one modular shape for every entity level. The lanes are the contract; what fills them is the per-level concern:
 
 | Lane | Content | Indexing |
 |---|---|---|
@@ -80,9 +82,9 @@ Item `_source` is assembled by `build_canonical_index_doc` (`modules/elasticsear
 | `transaction_time` | lifecycle | always (write timestamp) | `date` |
 | `deleted_at` | lifecycle | tombstones only (omitted on live items) | `date` |
 
-The full set is emitted on every normal write — not just `geoid`/`external_id`. A regression where the pg+es **secondary** write dropped `system`/`stats` (the secondary path failed to resolve the geoid from the canonical `id` and fell back to a `{geoid}`-only row) was fixed in #2199: resolving the geoid from `id` routes the secondary write back through `build_canonical_index_doc`, so the whole row — all system columns and all stats — is rebuilt.
+The full set is emitted on every normal write — not just `geoid`/`external_id`. When the secondary write path resolves the geoid from the canonical `id`, it routes back through `build_canonical_index_doc`, so the whole row — all system columns and all stats — is rebuilt.
 
-**Caveat — `_source` presence vs. typed searchability.** `build_canonical_index_doc` *always* writes the `system`/`stats` lanes into `_source` (so they are visible in the index and round-trip on read). Whether they are **typed and searchable** depends on `build_item_mapping` declaring the `system`/`stats` containers, which it does *only* when the catalog's `known_fields` carries entries tagged `container="system"`/`"stats"`. The platform baseline `TIER_1_FIELDS` seeds only properties-lane STAC/EO fields — it does **not** yet seed the bounded system/stats vocabulary — and the index root is `dynamic:false`, so on a catalog without those known fields the lanes are stored but not queryable. Baking the bounded system/stats vocabulary into the base mapping is tracked in #1285.
+**Caveat — `_source` presence vs. typed searchability.** `build_canonical_index_doc` *always* writes the `system`/`stats` lanes into `_source` (so they are visible in the index and round-trip on read). Whether they are **typed and searchable** depends on `build_item_mapping` declaring the `system`/`stats` containers, which it does *only* when the catalog's `known_fields` carries entries tagged `container="system"`/`"stats"`. The platform baseline `TIER_1_FIELDS` seeds only properties-lane STAC/EO fields — it does **not** yet seed the bounded system/stats vocabulary — and the index root is `dynamic:false`, so on a catalog without those known fields the lanes are stored but not queryable. Baking the bounded system/stats vocabulary into the base mapping is planned.
 
 ### Configuration
 
@@ -101,7 +103,7 @@ The full set is emitted on every normal write — not just `geoid`/`external_id`
 
 ## Per-Collection Privacy
 
-Privacy is expressed by **routing-pin presence** of the private items driver in a collection's routing configs (#733 retired the standalone `CollectionPrivacy.is_private` flag). The private ES branch is **items-only** — there is no catalog/collection private ES driver; catalog and collection envelopes for private catalogs stay PG-only. The private items driver is opt-in only via explicit routing pin (`auto_register_for_routing = frozenset()`):
+Privacy is expressed by **routing-pin presence** of the private items driver in a collection's routing configs. The private ES branch is **items-only** — there is no catalog/collection private ES driver; catalog and collection envelopes for private catalogs stay PG-only. The private items driver is opt-in only via explicit routing pin (`auto_register_for_routing = frozenset()`):
 
 | Driver | Tier | Per-tenant index | Provided by |
 |---|---|---|---|
@@ -145,7 +147,7 @@ There is no follow-up "set private" step. The cascade validator rejects mixed pu
 | `POST` | `/search/catalogs/{catalog_id}/reindex` | Trigger full catalog reindex (admin) |
 | `POST` | `/search/catalogs/{catalog_id}/collections/{collection_id}/reindex` | Trigger single-collection reindex (admin) |
 
-Filters: `q`, `bbox`, `intersects`, `datetime`, `ids`, `geoid`, `external_id`, `collections`, `sortby`, `limit`, `token`, `driver`. Free-text query (`q`) searches across `id`, `title.*`, `description.*`, `keywords.*`, and all `properties.*` using ES `multi_match` with `fuzziness: AUTO`. Multilingual fields are searched transparently across all language variants. The extension is **item-only** (#819) — catalog/collection keyword search was retired; collection metadata search lives behind the STAC extension's `/stac/collections-search`.
+Filters: `q`, `bbox`, `intersects`, `datetime`, `ids`, `geoid`, `external_id`, `collections`, `sortby`, `limit`, `token`, `driver`. Free-text query (`q`) searches across `id`, `title.*`, `description.*`, `keywords.*`, and all `properties.*` using ES `multi_match` with `fuzziness: AUTO`. Multilingual fields are searched transparently across all language variants. The extension is **item-only** — catalog/collection keyword search was retired; collection metadata search lives behind the STAC extension's `/stac/collections-search`.
 
 Pagination uses ES `search_after` cursors exposed via STAC `next` links.
 
@@ -153,12 +155,12 @@ Pagination uses ES `search_after` cursors exposed via STAC `next` links.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/search/catalogs/{catalog_id}/items-search` | Resolve an item by exactly one of `geoid` or `external_id` (#1210) |
+| `POST` | `/search/catalogs/{catalog_id}/items-search` | Resolve an item by exactly one of `geoid` or `external_id` |
 
 Body carries **exactly one** of `geoid` or `external_id` (supplying both, or neither, is a 400).
 A `geoid` is resolved catalog-wide (it is unique within a catalog). An `external_id` is not
 globally unique, so it **requires a `collection_id`** and is resolved within that single collection
-only — a bare `external_id` is a 400 (un-fao/GeoID#1204 R2: the public lookup is a targeted
+only — a bare `external_id` is a 400 (the public lookup is a targeted
 resolve, never a cross-collection scan). Resolution is routing-aware: a `geoid` is served from the
 catalog's private ES index when one is pinned (id fetch), otherwise — and for `external_id`, which
 is not a document id — over PostgreSQL. The route is hosted by the geoid extension's
@@ -220,19 +222,9 @@ Bulk tasks clean the complementary index before reindexing:
 - `mode="catalog"` removes stale private docs for the catalog.
 - `mode="catalog"` skips collections with `search_index=False`.
 
-### Cloud Run Job
+### Bulk reindex job
 
-The `geospatial-elasticsearch-indexer` Cloud Run Job (`apps.base.yml`) handles bulk reindex for large catalogs that would exceed the worker's timeout:
-
-```yaml
-geospatial-elasticsearch-indexer:
-  type: "job"
-  env:
-    SCOPE: "worker_task_elasticsearch_indexer"
-    TASK_TIMEOUT: 7200    # 2 hours
-    RAM: "2Gi"
-    MAX_RETRIES: 2
-```
+A dedicated bulk-reindex job handles large catalogs that would exceed the worker's timeout. It runs with a 2-hour timeout, 2 GiB RAM, and up to 2 retries.
 
 Triggered by the admin endpoint `POST /search/reindex/catalogs/{id}`.
 
