@@ -382,6 +382,18 @@ class GcpCatalogOpsMixin:
         # We track provisioned resources to ensure cleanup on ANY failure until DB commit.
         provisioned_bucket = None
         provisioned_topic = None
+        # Bound before the try so the cleanup block can reference it even when a
+        # failure occurs before the eventing config is resolved below.
+        eventing_config = None
+
+        # Distinguishes a genuine orphan (catalog row disappeared mid-provision)
+        # from any other failure such as an eventing IAM/Pub/Sub error.
+        # Only a genuine orphan allows the bucket to be deleted: the bucket is
+        # committed durable state the moment ensure_storage_for_catalog returns,
+        # and deleting it on a soft eventing failure produces "ready with no
+        # bucket" — the catalog reports ready but every upload fails with a
+        # missing bucket error.
+        catalog_vanished = False
 
         try:
             # 2a. Ensure the bucket exists (creates it if needed, returns name)
@@ -481,7 +493,9 @@ class GcpCatalogOpsMixin:
                 logger.warning(
                     f"Catalog '{catalog_id}' not found or deleted during GCP resource provisioning. Aborting DB registration and triggering teardown."
                 )
-                # This will trigger the catch-all cleanup in 'finally' below
+                # Signal that the catalog row is gone so the exception handler
+                # knows it is safe to delete the bucket (genuine orphan path).
+                catalog_vanished = True
                 raise asyncio.CancelledError(f"Catalog {catalog_id} not found during provisioning.")
 
             async with managed_transaction(self.engine) as conn:
@@ -510,23 +524,69 @@ class GcpCatalogOpsMixin:
 
             logger.error(f"GCP Provisioning failed for catalog '{catalog_id}': {e}")
 
-            # Orphaned resource cleanup
-            if provisioned_bucket:
-                logger.info(f"Cleanup: Deleting orphaned bucket {provisioned_bucket}...")
-                try:
-                    await self.drop_storage(catalog_id)
-                except Exception as cleanup_e:
-                    logger.warning(f"Failed to cleanup orphaned bucket: {cleanup_e}")
-
-            if provisioned_topic:
-                logger.info("Cleanup: Tearing down orphaned eventing topic/channel...")
-                try:
-                    # We need the config object to teardown topics/subscriptions
-                    # Ensure eventing_config is defined and has managed_eventing
-                    if eventing_config and eventing_config.managed_eventing:
-                        await self.teardown_managed_eventing_channel(catalog_id, eventing_config.managed_eventing)
-                except Exception as cleanup_e:
-                    logger.warning(f"Failed to cleanup orphaned eventing resources: {cleanup_e}")
+            # ── Bucket cleanup contract ──
+            #
+            # The bucket is HARD state: once ensure_storage_for_catalog has
+            # returned successfully the bucket exists in GCS and its name is
+            # committed (or being committed) to the catalog config. Deleting
+            # it on any failure other than a genuine catalog-vanish produces the
+            # "ready with no bucket" failure mode — the catalog reports ready
+            # but every upload fails because the backing bucket is gone, and
+            # reprovision just repeats the cycle (recreate bucket → eventing
+            # fails → bucket deleted again).
+            #
+            # Eventing (topic/subscription) is handled the SAME way as the
+            # bucket: GCP resources are only torn down on a genuine
+            # catalog-vanish (true orphan). On any other failure — including a
+            # transient DB error AFTER the topic/subscription were created
+            # successfully — they are preserved. Tearing them down here would
+            # destroy possibly-working eventing infrastructure and force a
+            # reprovision for a failure that was purely transient; reprovision is
+            # idempotent (create_topic/subscription adopt AlreadyExists), so
+            # leaving them in place lets recovery reconcile without churn. The
+            # caller (the provisioning task) classifies the propagated error:
+            # transient → retry, permanent → catalog 'failed'. It never reports
+            # the catalog 'ready' on a failure here.
+            #
+            # Therefore, for both bucket and eventing:
+            #   • catalog_vanished=True  → genuine orphan; delete the resources.
+            #   • catalog_vanished=False → eventing/IAM/DB/other failure; preserve
+            #     everything so reprovision can recover without data loss.
+            if catalog_vanished:
+                if provisioned_bucket:
+                    logger.info(
+                        f"Cleanup: catalog '{catalog_id}' vanished mid-provision; "
+                        f"deleting orphaned bucket '{provisioned_bucket}'."
+                    )
+                    try:
+                        await self.drop_storage(catalog_id)
+                    except Exception as cleanup_e:
+                        logger.warning(f"Failed to cleanup orphaned bucket: {cleanup_e}")
+                if provisioned_topic:
+                    logger.info(
+                        f"Cleanup: catalog '{catalog_id}' vanished mid-provision; "
+                        f"tearing down orphaned eventing topic/channel."
+                    )
+                    try:
+                        if eventing_config and eventing_config.managed_eventing:
+                            await self.teardown_managed_eventing_channel(
+                                catalog_id, eventing_config.managed_eventing
+                            )
+                    except Exception as cleanup_e:
+                        logger.warning(
+                            f"Failed to cleanup orphaned eventing resources: {cleanup_e}"
+                        )
+            elif provisioned_bucket or provisioned_topic:
+                logger.warning(
+                    f"Provisioning failure ({type(e).__name__}) for catalog '{catalog_id}' "
+                    f"after GCP resources were committed (bucket={provisioned_bucket}, "
+                    f"topic={'yes' if provisioned_topic else 'no'}) — resources are "
+                    f"preserved and the error is propagated to the provisioning task "
+                    f"(transient → retry, permanent → catalog 'failed'). Re-run "
+                    f"provisioning via POST /catalog/catalogs/{catalog_id}/reprovision "
+                    f"once the underlying cause (e.g. transient DB error, or a missing "
+                    f"Pub/Sub IAM grant) is resolved."
+                )
 
             # Re-raise to let the caller handle the failure
             raise

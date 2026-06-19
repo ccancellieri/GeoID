@@ -93,9 +93,9 @@ def _make_payload(catalog_id: str = "test_cat"):
 
 @pytest.mark.asyncio
 async def test_credentials_error_skips_step_and_is_permanent():
-    """RuntimeError containing 'credentials' → PermanentTaskFailure, and the
-    gcp_bucket step is marked 'skipped' so the catalog still becomes ready
-    (on-prem / unauthorized is not a provisioning failure — #1175)."""
+    """RuntimeError containing 'credentials' → PermanentTaskFailure, and BOTH
+    gcp_bucket and gcp_eventing steps are marked 'skipped' so the catalog still
+    becomes ready (on-prem / unauthorized is not a provisioning failure — #1175)."""
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
 
@@ -112,14 +112,15 @@ async def test_credentials_error_skips_step_and_is_permanent():
         with pytest.raises(PermanentTaskFailure):
             await task.run(_make_payload("c1"))
 
-    mock_catalogs.mark_provisioning_step.assert_awaited_once_with("c1", "gcp_bucket", "skipped")
+    mock_catalogs.mark_provisioning_step.assert_any_await("c1", "gcp_bucket", "skipped")
+    mock_catalogs.mark_provisioning_step.assert_any_await("c1", "gcp_eventing", "skipped")
 
 
 @pytest.mark.asyncio
 async def test_client_init_error_skips_step_and_is_permanent():
-    """'failed to create a storage client' → PermanentTaskFailure, and the
-    gcp_bucket step is marked 'skipped' (GCP not usable on this host → catalog
-    still ready, not wedged in 'failed' — #1175)."""
+    """'failed to create a storage client' → PermanentTaskFailure, and BOTH
+    gcp_bucket and gcp_eventing steps are marked 'skipped' (GCP not usable on
+    this host → catalog still ready, not wedged in 'failed' — #1175)."""
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
 
@@ -138,7 +139,8 @@ async def test_client_init_error_skips_step_and_is_permanent():
         with pytest.raises(PermanentTaskFailure):
             await task.run(_make_payload("c1"))
 
-    mock_catalogs.mark_provisioning_step.assert_awaited_once_with("c1", "gcp_bucket", "skipped")
+    mock_catalogs.mark_provisioning_step.assert_any_await("c1", "gcp_bucket", "skipped")
+    mock_catalogs.mark_provisioning_step.assert_any_await("c1", "gcp_eventing", "skipped")
 
 
 @pytest.mark.asyncio
@@ -172,12 +174,7 @@ async def test_bucket_name_none_is_retryable():
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
     mock_storage = MagicMock()
-    setup_gcp = AsyncMock(
-        side_effect=RuntimeError(
-            "Failed to provision storage for catalog 'c1': Bucket name returned as None."
-        )
-    )
-    mock_storage.setup_catalog_gcp_resources = setup_gcp
+    mock_storage.ensure_storage_for_catalog = AsyncMock(return_value=None)
 
     with (
         patch(
@@ -189,7 +186,7 @@ async def test_bucket_name_none_is_retryable():
             return_value=mock_catalogs,
         ),
     ):
-        with pytest.raises(RuntimeError, match="Bucket name returned as None"):
+        with pytest.raises(RuntimeError, match="ensure_storage_for_catalog returned None"):
             await task.run(_make_payload("c1"))
 
     mock_catalogs.update_provisioning_status.assert_not_called()
@@ -219,14 +216,12 @@ async def test_lifespan_not_ready_is_retryable():
 
 @pytest.mark.asyncio
 async def test_successful_provision_completes_step():
-    """Happy path: bucket provisioned → gcp_bucket step marked 'complete'
-    (which flips the catalog ready once it's the last outstanding step — #1175)."""
+    """Happy path: bucket provisioned and eventing complete → both steps marked,
+    result status is 'ready' (which flips the catalog ready — #1175)."""
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
     mock_storage = MagicMock()
-    mock_storage.setup_catalog_gcp_resources = AsyncMock(
-        return_value=("d88971-test-catalog-ok", {})
-    )
+    mock_storage.ensure_storage_for_catalog = AsyncMock(return_value="d88971-test-catalog-ok")
 
     with (
         patch(
@@ -237,12 +232,17 @@ async def test_successful_provision_completes_step():
             "dynastore.tasks.gcp_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ),
+        patch(
+            "dynastore.tasks.gcp_provision.task._provision_eventing",
+            new=AsyncMock(return_value="complete"),
+        ),
     ):
         result = await task.run(_make_payload("c1"))
 
     assert result["status"] == "ready"
     assert result["bucket_name"] == "d88971-test-catalog-ok"
-    mock_catalogs.mark_provisioning_step.assert_awaited_once_with("c1", "gcp_bucket", "complete")
+    mock_catalogs.mark_provisioning_step.assert_any_await("c1", "gcp_bucket", "complete")
+    mock_catalogs.mark_provisioning_step.assert_any_await("c1", "gcp_eventing", "complete")
 
 
 @pytest.mark.asyncio
@@ -259,7 +259,7 @@ async def test_bucket_conflict_marks_conflict_and_is_permanent():
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
     mock_storage = MagicMock()
-    mock_storage.setup_catalog_gcp_resources = AsyncMock(
+    mock_storage.ensure_storage_for_catalog = AsyncMock(
         side_effect=BucketConflictError(
             "Bucket 'proj-c1' is already linked to another catalog"
         )
@@ -361,16 +361,18 @@ async def test_destroy_task_invokes_typed_destruction():
 
 
 # ---------------------------------------------------------------------------
-# Eventing step must ALWAYS reach a terminal checklist state — a permission
-# (or any) error escaping the soft handler must not leave gcp_eventing
-# 'pending', which would wedge the catalog in 'provisioning' forever.
-# Regression: dev Pub/Sub 403 left gcp_eventing 'pending' (catalog never ready).
+# Eventing step — transient failure path: a generic (non-permission,
+# non-clash) eventing error must be retried by the task queue, not silently
+# degraded. gcp_eventing stays 'pending'; the catalog is NOT marked ready.
+# Regression guard: the old "soft" handler swallowed errors into 'degraded';
+# the new atomic contract retries transient eventing errors instead.
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_eventing_escape_marks_degraded_not_pending():
-    """An exception escaping _provision_eventing_soft is caught in run() and the
-    gcp_eventing step is marked terminal ('degraded') so the catalog still
-    reaches ready instead of being wedged in 'provisioning'."""
+async def test_generic_eventing_error_is_transient_retry():
+    """A generic (non-permission, non-clash) error from _provision_eventing is
+    treated as transient: run() re-raises as RuntimeError starting 'Transient
+    eventing failure', the catalog does NOT reach ready, and gcp_eventing is
+    NOT marked 'degraded' (left pending for the task queue to retry)."""
     task = ProvisioningTask()
     mock_catalogs = AsyncMock()
     mock_storage = MagicMock()
@@ -386,17 +388,20 @@ async def test_eventing_escape_marks_degraded_not_pending():
             return_value=mock_catalogs,
         ),
         patch(
-            "dynastore.tasks.gcp_provision.task._provision_eventing_soft",
-            new=AsyncMock(side_effect=RuntimeError("403 IAM_PERMISSION_DENIED")),
+            "dynastore.tasks.gcp_provision.task._provision_eventing",
+            new=AsyncMock(side_effect=Exception("boom")),
         ),
     ):
-        result = await task.run(_make_payload("c1"))
+        with pytest.raises(RuntimeError, match="Transient eventing failure"):
+            await task.run(_make_payload("c1"))
 
-    assert result["status"] == "ready"
-    assert result["eventing_status"] == "degraded"
-    mock_catalogs.mark_provisioning_step.assert_any_await("c1", "gcp_bucket", "complete")
-    mock_catalogs.mark_provisioning_step.assert_any_await(
-        "c1", "gcp_eventing", "degraded"
+    # gcp_eventing must NOT be marked 'degraded' — it stays pending for retry
+    degraded_calls = [
+        c for c in mock_catalogs.mark_provisioning_step.await_args_list
+        if len(c.args) >= 3 and c.args[1] == "gcp_eventing" and c.args[2] == "degraded"
+    ]
+    assert not degraded_calls, (
+        f"gcp_eventing must not be marked 'degraded' on transient error: {degraded_calls}"
     )
 
 
@@ -422,7 +427,7 @@ async def test_orphan_subscription_clash_marks_eventing_failed():
             return_value=mock_catalogs,
         ),
         patch(
-            "dynastore.tasks.gcp_provision.task._provision_eventing_soft",
+            "dynastore.tasks.gcp_provision.task._provision_eventing",
             new=AsyncMock(
                 side_effect=OrphanSubscriptionClash(
                     sub_path="projects/p/subscriptions/ds-c1-default-sub",

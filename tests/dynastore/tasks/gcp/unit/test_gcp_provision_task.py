@@ -16,13 +16,15 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for the fail-soft eventing path in GcpProvisionCatalogTask.
+"""Unit tests for the atomic eventing contract in GcpProvisionCatalogTask.
 
 No DB, no GCP clients — all collaborators are replaced with stubs.
 
-Scenario A: eventing PermissionDenied → catalog reaches ready, gcp_eventing
-            step is 'degraded', task does NOT mark gcp_bucket failed.
-Scenario B: bucket failure → gcp_bucket step is 'failed', catalog stays failed
+Scenario A: eventing PermissionDenied → catalog FAILS (PermanentTaskFailure),
+            gcp_eventing step is 'failed'. The catalog must NOT reach ready.
+Scenario B: generic eventing error → transient RuntimeError, task retried,
+            catalog NOT ready, gcp_eventing NOT marked degraded.
+Scenario C: bucket failure → gcp_bucket step is 'failed', catalog stays failed
             (unchanged existing behaviour).
 """
 
@@ -78,7 +80,6 @@ _GET_CATALOGS = "dynastore.tasks.gcp_provision.task._get_catalog_protocol"
 _EVENTING_PERMISSION_ERRORS = (
     "dynastore.tasks.gcp_provision.task._EVENTING_PERMISSION_ERRORS"
 )
-_LOG_WARNING = "dynastore.tasks.gcp_provision.task.log_warning"
 _LOG_ERROR = "dynastore.tasks.gcp_provision.task.log_error"
 
 # ---------------------------------------------------------------------------
@@ -128,37 +129,35 @@ async def _run_task(
         patch(_GET_CATALOGS, return_value=catalogs_stub),
         patch(_GET_PROTOCOL, side_effect=_get_proto),
         patch(_EVENTING_PERMISSION_ERRORS, permission_error_types),
-        patch(_LOG_WARNING, new=AsyncMock()),
         patch(_LOG_ERROR, new=AsyncMock()),
     ):
         return await task.run(payload)
 
 
 # ---------------------------------------------------------------------------
-# Test A — eventing PermissionDenied → catalog reaches ready, eventing degraded
+# Test A — eventing PermissionDenied → catalog FAILS (PermanentTaskFailure),
+#           gcp_eventing step is 'failed'; the catalog must NOT reach ready.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_eventing_permission_denied_catalog_reaches_ready() -> None:
+async def test_eventing_permission_denied_marks_catalog_failed() -> None:
     """When eventing raises PermissionDenied after a successful bucket, the
-    catalog must reach ready (gcp_eventing='degraded', gcp_bucket='complete').
-    The task must NOT call mark_provisioning_step with 'failed'."""
+    task raises PermanentTaskFailure and marks gcp_eventing 'failed'.
+    The catalog must NOT reach ready — the operator must grant the IAM role
+    and reprovision."""
     storage = _make_storage_stub()
     catalogs = _make_catalogs_stub()
     eventing = _make_eventing_stub(raises=_FakePermissionDenied("403 IAM_PERMISSION_DENIED"))
 
-    result = await _run_task(
-        storage_stub=storage,
-        catalogs_stub=catalogs,
-        eventing_stub=eventing,
-        permission_error_types=(_FakePermissionDenied, _FakeForbidden),
-    )
+    with pytest.raises(PermanentTaskFailure):
+        await _run_task(
+            storage_stub=storage,
+            catalogs_stub=catalogs,
+            eventing_stub=eventing,
+            permission_error_types=(_FakePermissionDenied, _FakeForbidden),
+        )
 
-    assert result["status"] == "ready"
-    assert result["eventing_status"] == "degraded"
-    assert result["catalog_id"] == "cat-test"
-
-    # gcp_bucket must be marked complete
+    # gcp_bucket must be marked complete (bucket provisioned successfully)
     bucket_calls = [
         call for call in catalogs.mark_provisioning_step.call_args_list
         if call.args[1] == "gcp_bucket"
@@ -168,43 +167,42 @@ async def test_eventing_permission_denied_catalog_reaches_ready() -> None:
         f"gcp_bucket must be 'complete', got {bucket_calls[0].args[2]!r}"
     )
 
-    # gcp_eventing must be marked degraded
+    # gcp_eventing must be marked 'failed' (permanent permission error)
     eventing_calls = [
         call for call in catalogs.mark_provisioning_step.call_args_list
         if call.args[1] == "gcp_eventing"
     ]
     assert eventing_calls, "gcp_eventing step must be marked"
-    assert eventing_calls[0].args[2] == "degraded", (
-        f"gcp_eventing must be 'degraded', got {eventing_calls[0].args[2]!r}"
-    )
-
-    # Must NOT call update_provisioning_status or mark anything 'failed'
-    catalogs.update_provisioning_status.assert_not_called()
-    failed_calls = [
-        call for call in catalogs.mark_provisioning_step.call_args_list
-        if call.args[2] == "failed"
-    ]
-    assert not failed_calls, (
-        f"No step should be marked 'failed' on eventing PermissionDenied: {failed_calls}"
+    assert eventing_calls[0].args[2] == "failed", (
+        f"gcp_eventing must be 'failed' on permission denied, got {eventing_calls[0].args[2]!r}"
     )
 
 
 @pytest.mark.asyncio
-async def test_eventing_generic_error_also_degrades() -> None:
-    """Any non-OrphanSubscriptionClash eventing error after the bucket is
-    healthy degrades eventing without failing the catalog."""
+async def test_eventing_generic_error_is_transient() -> None:
+    """A generic (non-permission, non-clash) eventing error after a healthy
+    bucket must be treated as transient: task raises RuntimeError starting
+    'Transient eventing failure' so the queue retries. The catalog does NOT
+    reach ready, and gcp_eventing is NOT marked 'degraded'."""
     storage = _make_storage_stub()
     catalogs = _make_catalogs_stub()
     eventing = _make_eventing_stub(raises=RuntimeError("pubsub unavailable"))
 
-    result = await _run_task(
-        storage_stub=storage,
-        catalogs_stub=catalogs,
-        eventing_stub=eventing,
-    )
+    with pytest.raises(RuntimeError, match="Transient eventing failure"):
+        await _run_task(
+            storage_stub=storage,
+            catalogs_stub=catalogs,
+            eventing_stub=eventing,
+        )
 
-    assert result["status"] == "ready"
-    assert result["eventing_status"] == "degraded"
+    # gcp_eventing must NOT be marked 'degraded' — it stays pending for retry
+    degraded_calls = [
+        c for c in catalogs.mark_provisioning_step.call_args_list
+        if len(c.args) >= 3 and c.args[1] == "gcp_eventing" and c.args[2] == "degraded"
+    ]
+    assert not degraded_calls, (
+        f"gcp_eventing must not be marked 'degraded' on transient error: {degraded_calls}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +229,6 @@ async def test_bucket_retryable_failure_does_not_mark_failed() -> None:
         patch(_GET_STORAGE, return_value=storage),
         patch(_GET_CATALOGS, return_value=catalogs),
         patch(_GET_PROTOCOL, side_effect=_get_proto),
-        patch(_LOG_WARNING, new=AsyncMock()),
         patch(_LOG_ERROR, new=AsyncMock()),
     ):
         with pytest.raises(RuntimeError, match="GCS 503"):
@@ -266,7 +263,6 @@ async def test_bucket_credential_failure_marks_skipped() -> None:
         patch(_GET_STORAGE, return_value=storage),
         patch(_GET_CATALOGS, return_value=catalogs),
         patch(_GET_PROTOCOL, side_effect=_get_proto),
-        patch(_LOG_WARNING, new=AsyncMock()),
         patch(_LOG_ERROR, new=AsyncMock()),
     ):
         with pytest.raises(PermanentTaskFailure):

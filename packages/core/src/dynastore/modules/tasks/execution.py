@@ -425,8 +425,16 @@ async def _drain_provisioning_checklist(
                 task_id, task_type, outcome,
             )
             return
+        # Atomic provisioning contract: a task that reached a terminal FAILED
+        # state (DEAD_LETTER / FAILED) must not leave the catalog 'ready'.
+        # Drain its still-pending steps to 'failed' so the catalog becomes
+        # 'failed' — never silently 'ready' on a provisioning that did not
+        # complete. On a 'success' outcome the task already marked its own
+        # steps; the drain is only a no-op backstop, so a leftover pending step
+        # there resolves to 'degraded' (ready) as before.
+        drain_status = "failed" if outcome in ("failure", "timeout") else "degraded"
         updated = await catalogs.drain_pending_checklist_steps(
-            catalog_id, terminal_status="degraded",
+            catalog_id, terminal_status=drain_status,
         )
         if updated:
             logger.warning(

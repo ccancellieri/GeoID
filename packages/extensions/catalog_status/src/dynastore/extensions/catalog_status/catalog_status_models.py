@@ -54,6 +54,10 @@ class CatalogStatusView(BaseModel):
     physical_schema: Optional[str] = None
     provisioning_status: str
     task: Optional[ProvisioningTaskView] = None
+    provisioning_checklist: dict[str, str] = {}
+    """Per-step provisioning state, e.g. ``{"gcp_bucket": "complete",
+    "gcp_eventing": "degraded"}``.  Empty when the catalog has no checklist
+    (pre-#1175 catalogs or catalogs where provisioning was skipped)."""
 
 
 class CollectionStatusView(BaseModel):

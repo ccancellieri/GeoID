@@ -43,7 +43,7 @@ from dynastore.models.protocols import (
 )
 from dynastore.modules.gcp.tools.bucket import BucketConflictError
 from dynastore.modules.gcp.gcp_eventing_ops import OrphanSubscriptionClash
-from dynastore.modules.catalog.log_manager import log_error, log_warning
+from dynastore.modules.catalog.log_manager import log_error
 
 logger = logging.getLogger(__name__)
 
@@ -147,64 +147,41 @@ async def _provision_bucket_hard(
         return bucket_name
 
 
-async def _provision_eventing_soft(
+async def _provision_eventing(
     storage: StorageProtocol,
     catalog_id: str,
 ) -> str:
-    """Attempt eventing setup; return a status string indicating the outcome.
+    """Set up managed eventing for a catalog.
+
+    Atomic provisioning contract (eventing is NOT best-effort): this either
+    sets eventing up or raises. It never swallows a failure into a "degraded"
+    success, because a catalog whose eventing did not provision must not be
+    reported ``ready``.
 
     Returns:
         ``"complete"`` when eventing was set up successfully.
-        ``"degraded"`` when eventing failed with a permission/permanent error.
+        ``"skipped"``  when managed eventing is disabled for this catalog
+                       (``managed_eventing.enabled is False``) — a deliberate
+                       configuration choice, so the catalog still reaches
+                       ``ready`` as a bucket-only catalog.
 
-    Raises on OrphanSubscriptionClash — that is a structural clash requiring
-    manual recovery, not a transient permission issue, so the caller re-raises
-    it as ``PermanentTaskFailure`` to keep the bucket step unaffected while
-    still flagging the clash clearly.
+    Raises the underlying exception on any failure. The caller classifies it:
+    a permission/structural error is permanent (catalog → ``failed``; operator
+    grants the IAM role and reprovisions); anything else is treated as transient
+    and retried by the task queue.
     """
-    try:
-        if isinstance(storage, GcpCatalogProvisioning):
-            await storage.setup_catalog_gcp_resources(catalog_id)
-        else:
-            eventing = get_protocol(EventingProtocol)
-            if eventing:
-                await eventing.setup_catalog_eventing(catalog_id)
+    if isinstance(storage, GcpCatalogProvisioning):
+        _, eventing_config = await storage.setup_catalog_gcp_resources(
+            catalog_id
+        )
+        managed = getattr(eventing_config, "managed_eventing", None)
+        if managed is None or not getattr(managed, "enabled", False):
+            return "skipped"
         return "complete"
-    except OrphanSubscriptionClash:
-        raise  # caller handles this as permanent failure
-    except Exception as eventing_err:
-        is_permission = (
-            _EVENTING_PERMISSION_ERRORS
-            and isinstance(eventing_err, _EVENTING_PERMISSION_ERRORS)
-        )
-        logger.warning(
-            "GcpProvisionCatalogTask: eventing setup failed for catalog '%s' "
-            "(%s: %s). Bucket is healthy; catalog will be marked ready with "
-            "eventing in 'degraded' state. Grant 'pubsub.topics.attachSubscription' "
-            "on the Pub/Sub project and call POST /catalog/catalogs/%s/reprovision "
-            "to repair.",
-            catalog_id,
-            type(eventing_err).__name__,
-            eventing_err,
-            catalog_id,
-        )
-        try:
-            await log_warning(
-                catalog_id,
-                "gcp.provision.eventing_degraded",
-                (
-                    f"Eventing setup failed ({type(eventing_err).__name__}): "
-                    f"{eventing_err}. "
-                    f"{'IAM permission denied — grant pubsub.topics.attachSubscription. ' if is_permission else ''}"
-                    f"Use POST /catalog/catalogs/{catalog_id}/reprovision after fixing."
-                ),
-            )
-        except Exception as log_err:  # pragma: no cover — diagnostic best-effort
-            logger.error(
-                "GcpProvisionCatalogTask: failed to write tenant log for "
-                "catalog '%s' eventing degraded: %s", catalog_id, log_err,
-            )
-        return "degraded"
+    eventing = get_protocol(EventingProtocol)
+    if eventing:
+        await eventing.setup_catalog_eventing(catalog_id)
+    return "complete"
 
 
 class GcpProvisionInputs(BaseModel):
@@ -217,13 +194,23 @@ class ProvisioningTask(TaskProtocol):
 
     Idempotent: checks if resources exist before creating.
     If it fails after max retries, the janitor will move it to DEAD_LETTER
-    and the catalog will remain in 'provisioning' or 'failed' state.
+    and the catalog will be marked 'failed'.
 
-    Failure contract:
-      - Bucket failure  → catalog stays failed (HARD requirement).
-      - Eventing failure → catalog reaches ready; eventing step marked
-        'degraded' (best-effort). Use POST /catalog/catalogs/{id}/reprovision
-        after fixing the IAM grant to repair the eventing layer.
+    Atomic failure contract — the catalog is 'ready' only when every step
+    actually provisioned; otherwise it is 'failed' (never silently 'ready'):
+      - Bucket failure → catalog 'failed' (HARD requirement). The committed
+        bucket is never deleted on a soft/transient failure (deleting it is the
+        "ready with no bucket" data-loss bug); only a genuine orphan (catalog
+        row vanished mid-provision) is cleaned up.
+      - Eventing disabled (managed_eventing.enabled=False) → step 'skipped' →
+        catalog 'ready' as a bucket-only catalog (deliberate config choice).
+      - Eventing permission/structural failure → permanent: catalog 'failed';
+        grant pubsub.topics.attachSubscription, then POST
+        /catalog/catalogs/{id}/reprovision (idempotent) to recover.
+      - Eventing transient failure → retried by the task queue; on exhaustion
+        the catalog is marked 'failed'.
+    Recovery is always the same: fix the cause, then reprovision — the task
+    re-ensures the bucket and re-attaches eventing and overwrites the checklist.
     """
     task_type = "gcp_provision_catalog"
 
@@ -260,54 +247,90 @@ class ProvisioningTask(TaskProtocol):
                 catalog_id,
             )
 
-            # 4. Provision eventing — SOFT (best-effort). A permission error
-            # (or any other eventing failure) after the bucket is healthy does
-            # not fail the catalog; it marks the gcp_eventing checklist step
-            # 'degraded' so the catalog still reaches 'ready' and operators can
-            # inspect the checklist outcome in the task logs.
+            # 4. Provision eventing — atomic (NOT best-effort). Eventing is part
+            # of "the catalog is provisioned": if it cannot be set up, the
+            # catalog must not be reported 'ready'. Failures are classified here:
             #
-            # CRITICAL: the gcp_eventing step MUST reach a terminal state on
-            # every path, or the catalog is wedged in 'provisioning' forever
-            # (evaluate_checklist only flips the catalog when no step is still
-            # 'pending'). _provision_eventing_soft is designed to swallow
-            # non-structural failures into 'degraded', but we wrap the call here
-            # as a hard backstop: if anything escapes it (an exception type the
-            # soft path doesn't anticipate, or an OrphanSubscriptionClash), we
-            # still mark the step terminal before returning or re-raising —
-            # 'failed' for a structural clash (manual recovery), 'degraded' for
-            # anything else (catalog stays usable; reprovision repairs later).
-            # Observed on dev: a Pub/Sub 403 left gcp_eventing 'pending' and the
-            # catalog never became ready.
+            #   • disabled (managed_eventing.enabled=False) → "skipped" → ready
+            #     (a deliberate config choice — bucket-only catalog).
+            #   • permission / structural (OrphanSubscriptionClash) → permanent:
+            #     retrying re-issues the same denied/clashing call, so fail fast,
+            #     mark gcp_eventing 'failed' (→ catalog 'failed') and tell the
+            #     operator exactly what to grant before reprovisioning.
+            #   • anything else → transient: re-raise so the task queue retries.
+            #     gcp_eventing is left 'pending' (catalog stays 'provisioning');
+            #     on retry exhaustion the terminal drain marks it 'failed'.
+            #
+            # The gcp_eventing step MUST reach a terminal state on every NON-retry
+            # path, or evaluate_checklist (which only flips the catalog when no
+            # step is still 'pending') would wedge it in 'provisioning'.
             try:
-                eventing_status = await _provision_eventing_soft(storage, catalog_id)
+                eventing_status = await _provision_eventing(storage, catalog_id)
             except OrphanSubscriptionClash:
                 await self._mark_step("failed", catalog_id, step_key="gcp_eventing")
                 raise
-            except Exception as eventing_escape:  # noqa: BLE001 — never wedge
-                logger.warning(
-                    "GcpProvisionCatalogTask: eventing step raised past the "
-                    "soft handler for catalog '%s' (%s: %s); marking "
-                    "gcp_eventing 'degraded' so the catalog still reaches ready.",
-                    catalog_id,
-                    type(eventing_escape).__name__,
-                    eventing_escape,
+            except Exception as eventing_err:  # noqa: BLE001 — classified below
+                is_permission = bool(
+                    _EVENTING_PERMISSION_ERRORS
+                    and isinstance(eventing_err, _EVENTING_PERMISSION_ERRORS)
                 )
-                eventing_status = "degraded"
+                if is_permission:
+                    # Permanent: same IAM denial on every retry. Fail fast.
+                    await self._mark_step(
+                        "failed", catalog_id, step_key="gcp_eventing"
+                    )
+                    logger.error(
+                        "GcpProvisionCatalogTask: eventing setup permission-denied "
+                        "for catalog '%s' (%s: %s); marking catalog FAILED. Grant "
+                        "'pubsub.topics.attachSubscription' on the Pub/Sub project "
+                        "and POST /catalog/catalogs/%s/reprovision to recover.",
+                        catalog_id, type(eventing_err).__name__, eventing_err,
+                        catalog_id,
+                    )
+                    try:
+                        await log_error(
+                            catalog_id,
+                            "gcp.provision.eventing_failed",
+                            (
+                                f"Eventing setup failed — permission denied "
+                                f"({type(eventing_err).__name__}): {eventing_err}. "
+                                f"Grant pubsub.topics.attachSubscription on the "
+                                f"Pub/Sub project, then POST "
+                                f"/catalog/catalogs/{catalog_id}/reprovision."
+                            ),
+                        )
+                    except Exception as log_err:  # pragma: no cover — best-effort
+                        logger.error(
+                            "GcpProvisionCatalogTask: failed to write tenant log "
+                            "for catalog '%s' eventing failure: %s",
+                            catalog_id, log_err,
+                        )
+                    raise PermanentTaskFailure(
+                        f"Eventing IAM permission denied for catalog "
+                        f"'{catalog_id}'; grant pubsub.topics.attachSubscription "
+                        f"and reprovision."
+                    ) from eventing_err
+                # Transient: re-raise as a retryable RuntimeError (no
+                # credential/storage-client indicator) so the RuntimeError
+                # handler retries WITHOUT marking the healthy bucket failed.
+                # gcp_eventing stays 'pending' across retries.
+                logger.warning(
+                    "GcpProvisionCatalogTask: transient eventing failure for "
+                    "catalog '%s' (%s: %s); leaving gcp_eventing pending for "
+                    "retry.",
+                    catalog_id, type(eventing_err).__name__, eventing_err,
+                )
+                raise RuntimeError(
+                    f"Transient eventing failure for catalog '{catalog_id}': "
+                    f"{eventing_err}"
+                ) from eventing_err
             await catalogs.mark_provisioning_step(
                 catalog_id, "gcp_eventing", eventing_status
             )
-            if eventing_status == "complete":
-                logger.info(
-                    "GcpProvisionCatalogTask: Catalog '%s' gcp_eventing step COMPLETE.",
-                    catalog_id,
-                )
-            else:
-                logger.warning(
-                    "GcpProvisionCatalogTask: Catalog '%s' gcp_eventing step DEGRADED. "
-                    "Catalog is ready for storage/STAC; eventing is disabled until "
-                    "reprovision.",
-                    catalog_id,
-                )
+            logger.info(
+                "GcpProvisionCatalogTask: Catalog '%s' gcp_eventing step %s.",
+                catalog_id, eventing_status.upper(),
+            )
 
             return {
                 "catalog_id": catalog_id,
@@ -373,11 +396,16 @@ class ProvisioningTask(TaskProtocol):
             if any(indicator in msg for indicator in _permanent_indicators):
                 # On-prem / unauthorized: GCP cannot authenticate or init a
                 # client. This is not a provisioning *failure* — the deployment
-                # simply has no usable GCP. Mark the step 'skipped' so the
+                # simply has no usable GCP. Mark BOTH steps 'skipped' so the
                 # catalog still becomes ready instead of being wedged in
-                # 'failed' (#1175). The task itself still dead-letters below so
-                # the misconfiguration is surfaced to operators.
-                await self._mark_step("skipped", catalog_id)
+                # 'failed' (#1175). Marking the eventing step too is required by
+                # the atomic contract: the terminal drain now resolves leftover
+                # pending steps to 'failed', so a still-'pending' gcp_eventing
+                # here would otherwise flip this (legitimately ready) catalog to
+                # 'failed'. The task itself still dead-letters below so the
+                # misconfiguration is surfaced to operators.
+                await self._mark_step("skipped", catalog_id, step_key="gcp_bucket")
+                await self._mark_step("skipped", catalog_id, step_key="gcp_eventing")
                 raise PermanentTaskFailure(
                     f"GCP unavailable, cannot provision '{catalog_id}': {e}"
                 ) from e

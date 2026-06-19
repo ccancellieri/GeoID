@@ -26,6 +26,12 @@ independent catalog lifecycle:
      genuinely terminal: ``provisioning_status == "ready"`` AND the most-recent
      provision task is ``COMPLETED``. ``failed`` status (or a FAILED/DEAD_LETTER
      task) aborts the iteration as a *provisioning* failure.
+  2b. GET /catalog/catalogs/{cat}                -> VERIFY the ready catalog is
+     actually HEALTHY: read ``provisioning_checklist`` and fail if any step is
+     ``degraded``/``failed``. A catalog flips to ``ready`` even when eventing is
+     degraded or the bucket was rolled back, so asserting status alone reports a
+     half-broken catalog as clean. This phase is HARD — it is the guard that
+     stops the run from going green on a ready-but-unusable catalog.
   3. POST /stac/catalogs/{cat}/collections       -> create N collections
   4. (optional) POST .../upload + PUT bytes      -> upload a REAL file so the
      asset is created through the normal eventful path, then assert the
@@ -71,6 +77,7 @@ import httpx
 PHASES = (
     "create_catalog",
     "wait_ready",
+    "verify_provisioning",
     "create_collection",
     "upload_asset",
     "verify_event",
@@ -92,6 +99,18 @@ HARD_PHASES = tuple(p for p in PHASES if p not in ADVISORY_PHASES)
 # Terminal task states (case-insensitive match).
 _TASK_OK = {"completed", "success", "succeeded"}
 _TASK_BAD = {"failed", "error", "dead_letter", "cancelled"}
+
+# Per-step provisioning-checklist values that mean the catalog is NOT actually
+# healthy. Under the atomic provisioning contract a fully-provisioned catalog
+# has every step ``complete`` (or ``skipped`` when a resource is deliberately
+# not applicable); eventing failures now mark the catalog ``failed`` rather than
+# letting it flip to ``ready`` with a ``degraded`` step. ``degraded`` is kept in
+# this set as a defensive tripwire: it must not appear under the atomic contract,
+# so if it ever does (legacy data, a regression to the old soft path) the
+# ``verify_provisioning`` phase must flag it instead of reporting green. This
+# closes the gap that let a "ready" catalog with a missing bucket and broken
+# eventing pass silently.
+_STEP_UNHEALTHY = {"degraded", "failed"}
 
 
 @dataclass
@@ -229,6 +248,56 @@ class StressRunner:
         return PhaseResult(
             False, f"ready timeout after {self.ready_timeout}s", time.monotonic() - t0
         )
+
+    async def _verify_provisioning(
+        self, client: httpx.AsyncClient, cat: str
+    ) -> PhaseResult:
+        """Assert a 'ready' catalog is actually HEALTHY, not merely terminal.
+
+        ``wait_ready`` only proves the catalog flipped to ``ready`` — but a
+        catalog reaches ``ready`` even when a provisioning step is ``degraded``
+        or ``failed`` (the checklist evaluator treats ``degraded`` as
+        terminal-good). This phase GETs the catalog status and inspects
+        ``provisioning_checklist``: any step in :data:`_STEP_UNHEALTHY` means the
+        catalog is ``ready`` but not truly usable (e.g. eventing disabled, or a
+        rolled-back bucket), so the phase fails and names the offending steps.
+        Without this, a half-provisioned catalog passes the whole run as clean.
+
+        Backward-compatible: a deployment that does not yet surface
+        ``provisioning_checklist`` only has its top-level status re-asserted, so
+        this phase never regresses against older servers.
+        """
+        t0 = time.monotonic()
+        r = await client.get(f"{self.base}/catalog/catalogs/{cat}")
+        if r.status_code != 200:
+            return PhaseResult(
+                False,
+                f"status GET HTTP {r.status_code}: {r.text[:160]}",
+                time.monotonic() - t0,
+            )
+        doc = r.json()
+        st = (_status_of(doc) or "").lower()
+        if st != "ready":
+            return PhaseResult(
+                False,
+                f"provisioning_status={st or 'unknown'} (expected ready)",
+                time.monotonic() - t0,
+            )
+        checklist = doc.get("provisioning_checklist") or {}
+        if isinstance(checklist, dict) and checklist:
+            unhealthy = {
+                k: v
+                for k, v in checklist.items()
+                if isinstance(v, str) and v.lower() in _STEP_UNHEALTHY
+            }
+            if unhealthy:
+                detail = ", ".join(f"{k}={v}" for k, v in sorted(unhealthy.items()))
+                return PhaseResult(
+                    False,
+                    f"ready but provisioning steps not healthy: {detail}",
+                    time.monotonic() - t0,
+                )
+        return PhaseResult(True, "", time.monotonic() - t0)
 
     async def _create_collection(
         self, client: httpx.AsyncClient, cat: str, col: str
@@ -442,6 +511,21 @@ class StressRunner:
         if not res.phases["wait_ready"].ok:
             # Catalog exists but never became ready: try to delete it anyway so
             # we don't leak a half-provisioned catalog, and flag if delete fails.
+            d = await _guard(self._delete_catalog(client, cat))
+            res.phases["delete_catalog"] = d
+            if not d.ok:
+                res.leaked_catalog = cat
+            return res
+
+        res.phases["verify_provisioning"] = await _guard(
+            self._verify_provisioning(client, cat)
+        )
+        if not res.phases["verify_provisioning"].ok:
+            # Catalog is 'ready' but a provisioning step is degraded/failed (e.g.
+            # eventing disabled, rolled-back bucket). Proceeding to upload would
+            # either fail confusingly or appear to pass against a half-broken
+            # catalog — the false-green this script must stop producing. Tear it
+            # down so we don't leak it, record the failure, and end the iteration.
             d = await _guard(self._delete_catalog(client, cat))
             res.phases["delete_catalog"] = d
             if not d.ok:

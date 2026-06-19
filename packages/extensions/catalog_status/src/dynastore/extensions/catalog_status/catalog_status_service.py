@@ -256,11 +256,16 @@ class CatalogStatusService(ExtensionProtocol):
                         exc_info=True,
                     )
 
+        provisioning_checklist: dict[str, str] = (
+            getattr(catalog, "provisioning_checklist", None) or {}
+        )
+
         return CatalogStatusView(
             catalog_id=catalog_id,
             physical_schema=physical_schema,
             provisioning_status=provisioning_status,
             task=task_view,
+            provisioning_checklist=provisioning_checklist,
         )
 
     # -------------------------------------------------------------------------

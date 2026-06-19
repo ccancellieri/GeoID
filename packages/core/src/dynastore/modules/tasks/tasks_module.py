@@ -1063,8 +1063,10 @@ async def sweep_wedged_provisioning_catalogs(
     AND no ``PENDING``/``ACTIVE`` ``gcp_provision_catalog`` task pointing at the
     same ``catalog_id`` in its ``inputs`` — and calls
     ``drain_pending_checklist_steps`` on each such catalog.  The drain marks
-    still-``pending`` steps ``"degraded"`` so the catalog becomes ``ready``
-    rather than staying wedged.
+    still-``pending`` steps ``"failed"``: a provisioning task that died without
+    completing and is no longer being retried is a failure, so the catalog
+    surfaces as ``failed`` (recoverable via reprovision) instead of staying
+    wedged in ``provisioning`` or being misreported as ``ready``.
 
     Returns the number of catalogs drained this pass (0 = nothing to do).
 
@@ -1123,8 +1125,14 @@ async def sweep_wedged_provisioning_catalogs(
         if not catalog_id:
             continue
         try:
+            # A catalog wedged in 'provisioning' with no live/queued task means
+            # its provisioning task died without completing (crash / SIGKILL /
+            # DB unavailable at mark time) and is not being retried. Under the
+            # atomic provisioning contract that is a failure, not a success:
+            # drain its pending steps to 'failed' so it surfaces as 'failed'
+            # (operator reprovisions to recover) instead of silently 'ready'.
             updated = await catalogs.drain_pending_checklist_steps(
-                catalog_id, terminal_status="degraded",
+                catalog_id, terminal_status="failed",
             )
             if updated:
                 drained += 1

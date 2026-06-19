@@ -208,8 +208,27 @@ class GcpStorageOpsMixin:
 
         bucket_name = await self.get_storage_identifier(catalog_id)
         if not bucket_name:
-            raise GcpInternalError(
-                f"Bucket for catalog '{catalog_id}' was not found despite 'ready' status."
+            # The catalog claims ready but has no backing bucket — the stored
+            # provisioning status is stale. Demote it (best-effort, must not mask
+            # the error below) so the operator can see the broken state and
+            # reprovision via POST /catalog/catalogs/{catalog_id}/reprovision.
+            # ``catalogs_provider`` was already resolved and guarded above.
+            try:
+                await catalogs_provider.mark_provisioning_step(
+                    catalog_id, "gcp_bucket", "failed"
+                )
+            except Exception as demote_exc:
+                logger.warning(
+                    "initiate_upload: could not demote catalog '%s' after "
+                    "missing-bucket detection: %s",
+                    catalog_id, demote_exc,
+                )
+            raise GcpFailedDependencyError(
+                f"Catalog '{catalog_id}' is marked ready but its backing GCS bucket is "
+                f"missing — the catalog has been flagged for re-provisioning. Re-run "
+                f"provisioning via POST /catalog/catalogs/{catalog_id}/reprovision "
+                f"(if eventing previously failed on a permission error, also ensure the "
+                f"Pub/Sub IAM grant pubsub.topics.attachSubscription is in place first)."
             )
 
         storage_client = self.get_storage_client()

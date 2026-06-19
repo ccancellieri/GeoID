@@ -91,7 +91,12 @@ class TestDrainProvisioningChecklist:
 
     @pytest.mark.asyncio
     async def test_dead_letter_outcome_drains(self):
-        """outcome='failure' with DEAD_LETTER ground truth → drain fires."""
+        """outcome='failure' with DEAD_LETTER ground truth → drain fires.
+
+        Atomic contract: a terminally-failed provisioning task drains its
+        pending steps to 'failed' (catalog → 'failed'), never 'degraded'
+        (which would misreport an unprovisioned catalog as 'ready').
+        """
         mock_catalogs = _make_catalogs_mock(drain_return=True)
         with (
             patch(
@@ -111,7 +116,7 @@ class TestDrainProvisioningChecklist:
                 outcome="failure",
             )
         mock_catalogs.drain_pending_checklist_steps.assert_awaited_once_with(
-            _CATALOG_ID, terminal_status="degraded",
+            _CATALOG_ID, terminal_status="failed",
         )
 
     @pytest.mark.asyncio
