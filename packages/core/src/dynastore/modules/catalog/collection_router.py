@@ -37,12 +37,13 @@ the driver.  Same pattern as the catalog-tier router.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 from dynastore.models.protocols.entity_store import (
     CollectionStore,
     EntityStoreCapability,
 )
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routed_resolver import resolve_routed
 from dynastore.modules.storage.routing_config import CollectionRoutingConfig, Operation
 
@@ -111,6 +112,7 @@ async def _routed_drivers(
     catalog_id: str,
     collection_id: Optional[str],
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     db_resource: Optional[Any] = None,
 ) -> Optional[List[CollectionStore]]:
     """Config-driven driver list for an operation.
@@ -118,10 +120,12 @@ async def _routed_drivers(
     Returns the ordered ``CollectionStore`` instances configured under
     ``CollectionRoutingConfig.operations[operation]``, or ``None`` when the
     routing config could not be consulted (early boot — caller falls back
-    to :func:`_resolve_drivers` discovery).
+    to :func:`_resolve_drivers` discovery).  When ``hints`` is non-empty
+    the list is pre-filtered by hint overlap (see ``routed_resolver``).
     """
     resolved = await resolve_routed(
         CollectionRoutingConfig, operation, catalog_id, collection_id,
+        hints=hints,
         db_resource=db_resource,
     )
     if not resolved:
@@ -206,11 +210,34 @@ async def get_collection_metadata(
     catalog_id: str,
     collection_id: str,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     context: Optional[Dict[str, Any]] = None,
     db_resource: Optional[Any] = None,
     drivers: Optional[List[CollectionStore]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Merge every registered driver's READ slice into a single envelope.
+
+    **Dispatch semantics depend on whether hints are supplied.**
+
+    *No hints (empty frozenset):* existing merge-all behaviour — every driver
+    in the resolved list contributes its domain slice; the envelopes are
+    merged with ``dict.update`` (last-driver wins on duplicate keys).  This
+    is the default path and is preserved byte-identical.
+
+    *Non-empty hints:* first-non-None semantics — the hint-filtered ordered
+    driver list is iterated sequentially; the first driver returning a
+    truthy (non-None) result wins and is returned immediately.  An ES miss
+    (None/empty) causes the iterator to advance to the next driver (PG),
+    ensuring PG always answers if ES has no indexed copy.  This is the
+    correct contract for per-request geometry-precision routing: a caller
+    asking for geometry_simplified on a collection not yet indexed in ES
+    should still get data (from PG), not a 404.
+
+    No preset configures more than one collection READ entry today, so the
+    merge-all / first-non-None distinction is only observable when a
+    deployment has two READ drivers explicitly configured.  Merge-all for
+    the no-hint default keeps that theoretical multi-driver preset working
+    without modification.
 
     **Sequential fan-out (load-bearing).**  Earlier versions used
     ``asyncio.gather`` here, but when the caller passes a shared
@@ -226,7 +253,9 @@ async def get_collection_metadata(
     """
     if drivers is None:
         routed = await _routed_drivers(
-            Operation.READ, catalog_id, collection_id, db_resource=db_resource,
+            Operation.READ, catalog_id, collection_id,
+            hints=hints,
+            db_resource=db_resource,
         )
         # READ deliberately does NOT run drivers through ``_filter_capable``.
         # A pinned ``driver_ref`` lacking READ is invoked anyway, because
@@ -254,6 +283,14 @@ async def get_collection_metadata(
 
     # Sequential to avoid asyncpg single-wire deadlock when db_resource
     # is a shared Connection (see docstring).
+    if hints:
+        # Hinted path: first-non-None wins (ES → PG fallback chain).
+        for d in drivers:
+            result = await _safe_get(d)
+            if result:
+                return result
+        return None
+
     results: List[Optional[Dict[str, Any]]] = []
     for d in drivers:
         results.append(await _safe_get(d))

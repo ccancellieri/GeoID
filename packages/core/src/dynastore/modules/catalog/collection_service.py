@@ -18,7 +18,7 @@
 
 import logging
 import json
-from typing import List, Optional, Any, Dict, Union, Set
+from typing import FrozenSet, List, Optional, Any, Dict, Union, Set
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 
@@ -553,7 +553,12 @@ class CollectionService:
             )
 
     async def _get_collection_model_logic(
-        self, catalog_id: str, collection_id: str, conn: DbResource
+        self,
+        catalog_id: str,
+        collection_id: str,
+        conn: DbResource,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Collection]:
         phys_schema = await self._resolve_physical_schema(catalog_id, db_resource=conn)
         if not phys_schema:
@@ -567,15 +572,22 @@ class CollectionService:
             return None
 
         # 2. Read metadata via the router — fan-out across every registered
-        # CollectionStore driver (PG Core + PG Stac by default;
-        # ES joins in when the elasticsearch scope is installed).  The
+        # CollectionStore driver (PG Core + PG Stac by default).  The
         # router merges the per-domain slices into one dict.
+        #
+        # Hints are threaded straight through.  An empty hint set keeps the
+        # existing merge-all behaviour (byte-identical default read).  A
+        # non-empty hint set lets a deployment whose routing config declares
+        # hinted READ drivers prefer one driver's view (first-non-None);
+        # see ``get_collection_metadata``.
         from dynastore.modules.catalog.collection_router import (
             get_collection_metadata as _route_get_metadata,
         )
 
         meta_dict = await _route_get_metadata(
-            catalog_id, collection_id, db_resource=conn,
+            catalog_id, collection_id,
+            hints=hints,
+            db_resource=conn,
         ) or {}
 
         # Deserialize JSONB columns
@@ -620,11 +632,13 @@ class CollectionService:
         collection_id: str,
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Collection]:
         """Retrieves a collection by ID, localized."""
         db_resource = ctx.db_resource if ctx else None
         collection_model = await self.get_collection_model(
-            catalog_id, collection_id, db_resource=db_resource
+            catalog_id, collection_id, db_resource=db_resource, hints=hints,
         )
         if not collection_model:
             return None
@@ -655,11 +669,33 @@ class CollectionService:
         catalog_id: str,
         collection_id: str,
         db_resource: Optional[DbResource] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Collection]:
+        """Return the collection metadata model, optionally hint-routed.
+
+        Cache behaviour (requirement B):
+        - When ``hints`` is empty the result is served from the shared
+          ``_collection_model_cache`` (keyed by catalog_id + collection_id).
+          The cache entry is populated via ``_get_collection_model_db``
+          on the no-hint merge-all path, so the cached model is the full
+          default envelope (byte-identical to the pre-hints baseline).
+        - When ``hints`` is non-empty the cache is bypassed entirely so
+          a geometry_simplified read cannot be served a cached
+          default-shaped model and vice-versa.
+        """
         if db_resource:
             async with managed_transaction(db_resource) as conn:
                 return await self._get_collection_model_logic(
-                    catalog_id, collection_id, conn
+                    catalog_id, collection_id, conn, hints=hints,
+                )
+        if hints:
+            # Bypass cache: hinted read must never serve a differently-hinted
+            # cached model (e.g. a geometry_simplified ES copy being returned
+            # when a geometry_exact PG model is in cache, or vice-versa).
+            async with managed_transaction(self.engine) as conn:
+                return await self._get_collection_model_logic(
+                    catalog_id, collection_id, conn, hints=hints,
                 )
         return await _collection_model_cache(self, catalog_id, collection_id)
 
@@ -1013,6 +1049,8 @@ class CollectionService:
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> List[Collection]:
         db_resource = ctx.db_resource if ctx else None
 
@@ -1062,7 +1100,7 @@ class CollectionService:
             collections: List[Collection] = []
             for collection_id in ids:
                 model = await self._get_collection_model_logic(
-                    catalog_id, collection_id, conn
+                    catalog_id, collection_id, conn, hints=hints,
                 )
                 if model is not None:
                     collections.append(model)

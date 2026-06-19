@@ -55,6 +55,8 @@ class CollectionsProtocol(Protocol):
         collection_id: str,
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet[Any] = frozenset(),
     ) -> Optional["Collection"]:
         """
         Retrieves a collection by ID.
@@ -119,6 +121,8 @@ class CollectionsProtocol(Protocol):
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
+        *,
+        hints: FrozenSet[Any] = frozenset(),
     ) -> List[Any]:
         """
         Lists all collections in a catalog.

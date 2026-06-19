@@ -546,10 +546,11 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         limit: int = Query(10, ge=1),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         catalogs_svc = await self._get_catalogs_service()
         collections = await catalogs_svc.list_collections(
-            catalog_id, lang=language, limit=limit, offset=offset
+            catalog_id, lang=language, limit=limit, offset=offset, hints=request_hints,
         )
         # Convert returned models to OGCCollection models and add links
         ogc_collections = [
@@ -645,10 +646,11 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         collection_id: str,
         request: Request,
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         catalogs_svc = await self._get_catalogs_service()
         collection = await catalogs_svc.get_collection(
-            catalog_id, collection_id, lang=language
+            catalog_id, collection_id, lang=language, hints=request_hints,
         )
         if not collection:
             raise HTTPException(status_code=404, detail="Collection not found")

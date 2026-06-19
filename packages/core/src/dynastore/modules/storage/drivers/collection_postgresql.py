@@ -82,6 +82,7 @@ from dynastore.models.protocols.typed_driver import (
     _PluginDriverConfig,
 )
 from dynastore.models.mutability import Immutable
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import Operation
 from dynastore.tools.cache import cached
 
@@ -337,6 +338,14 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
     # Collection metadata fallback for SEARCH (PG serves the
     # query-fallback path when ES is unavailable / not registered).
     auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH})
+
+    # Hints this driver serves on READ/SEARCH operations.
+    # GEOMETRY_EXACT: PG is the system of record with full WKB geometry.
+    # METADATA: generic participation in metadata reads.
+    supported_hints: ClassVar[FrozenSet[Hint]] = frozenset({
+        Hint.GEOMETRY_EXACT,
+        Hint.METADATA,
+    })
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({
         EntityStoreCapability.READ,

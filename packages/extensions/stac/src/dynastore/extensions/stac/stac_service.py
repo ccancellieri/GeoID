@@ -500,6 +500,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         limit: int = Query(100, ge=1, le=10000),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Lists available STAC catalogs.
 
@@ -536,16 +537,20 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     async def get_stac_catalog(
-        self, catalog_id: str, request: Request, language: str = Depends(get_language)
+        self,
+        catalog_id: str,
+        request: Request,
+        language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.get_catalog(catalog_id, lang=language):
+        if not await catalogs_svc.get_catalog(catalog_id, lang=language, hints=request_hints):
             raise HTTPException(
                 status_code=404, detail=f"Catalog '{catalog_id}' not found."
             )
         catalog_dict = await stac_generator.create_catalog(
-            request, catalog_id=catalog_id, lang=language
+            request, catalog_id=catalog_id, lang=language, hints=request_hints,
         )
         return JSONResponse(content=catalog_dict)
 
@@ -555,6 +560,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         request: Request,
         engine=Depends(get_async_engine),
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
         # STAC Collection Search extension query params (GET /collections)
         bbox: Optional[str] = Query(
             None,
@@ -594,7 +600,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         catalog_id = validate_sql_identifier(catalog_id)
         catalogs_svc = await self._get_catalogs_service()
         try:
-            catalog = await catalogs_svc.get_catalog(catalog_id, lang=language)
+            catalog = await catalogs_svc.get_catalog(catalog_id, lang=language, hints=request_hints)
         except (ValueError, Exception):
             catalog = None
         if not catalog:
@@ -608,7 +614,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             # Plain listing — no search parameters
             try:
                 collections = await stac_generator.create_collections_catalog(
-                    request, catalog_id=catalog_id, lang=language
+                    request, catalog_id=catalog_id, lang=language, hints=request_hints,
                 )
                 return JSONResponse(content=collections)
             except AttributeError as e:
@@ -692,17 +698,18 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         collection_id: str,
         request: Request,
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
         catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.get_collection(catalog_id, collection_id):
+        if not await catalogs_svc.get_collection(catalog_id, collection_id, hints=request_hints):
             raise HTTPException(
                 status_code=404,
                 detail=f"Collection '{catalog_id}:{collection_id}' not found.",
             )
         collection = await stac_generator.create_collection(
-            request, catalog_id=catalog_id, collection_id=collection_id, lang=language
+            request, catalog_id=catalog_id, collection_id=collection_id, lang=language, hints=request_hints,
         )
         if collection is None:
             raise HTTPException(

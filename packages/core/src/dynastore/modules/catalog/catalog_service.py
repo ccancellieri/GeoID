@@ -798,6 +798,8 @@ class CatalogService(CatalogsProtocol):
         catalog_id: str,
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Catalog:
         # Enforce the direct-get visibility contract (#2050): a catalog the
         # caller has no visibility grant for must be indistinguishable from a
@@ -814,7 +816,7 @@ class CatalogService(CatalogsProtocol):
         if visible_ids is not None and catalog_id not in visible_ids:
             raise ValueError(f"Catalog '{catalog_id}' not found.")
 
-        model = await self.get_catalog_model(catalog_id, ctx=ctx)
+        model = await self.get_catalog_model(catalog_id, ctx=ctx, hints=hints)
         if not model:
             raise ValueError(f"Catalog '{catalog_id}' not found.")
         return model
@@ -1198,7 +1200,11 @@ class CatalogService(CatalogsProtocol):
             return []
 
     async def _resolve_catalog_router_metadata(
-        self, catalog_id: str, *, db_resource: Optional[Any] = None,
+        self,
+        catalog_id: str,
+        *,
+        hints: FrozenSet = frozenset(),
+        db_resource: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         """Best-effort fetch of router-supplied catalog metadata.
 
@@ -1208,13 +1214,22 @@ class CatalogService(CatalogsProtocol):
         exceptions (partial-envelope semantics), so this guard is
         belt-and-braces against a total-outage scenario where the
         router's driver resolution itself raises.
+
+        Hints are threaded straight through.  An empty hint set keeps the
+        existing merge-all behaviour (byte-identical default read).  A
+        non-empty hint set lets a deployment whose routing config declares
+        hinted READ drivers prefer one driver's view (first-non-None);
+        see ``get_catalog_metadata``.
         """
         try:
             from dynastore.modules.catalog.catalog_router import (
                 get_catalog_metadata,
             )
+
             return await get_catalog_metadata(
-                catalog_id, db_resource=db_resource,
+                catalog_id,
+                hints=hints,
+                db_resource=db_resource,
             )
         except Exception as exc:  # noqa: BLE001 — degrade to legacy SELECT
             logger.warning(
@@ -1241,20 +1256,44 @@ class CatalogService(CatalogsProtocol):
         )
 
     async def get_catalog_model(
-        self, catalog_id: str, ctx: Optional["DriverContext"] = None
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Catalog]:
-        """Get catalog by ID."""
+        """Get catalog by ID, optionally hint-routed.
+
+        Cache behaviour (requirement B):
+        - When ``hints`` is empty the result is served from the shared
+          ``_catalog_model_cache`` (keyed by catalog_id).  The cache
+          entry is populated via ``_get_catalog_model_db`` on the no-hint
+          merge-all path, so the cached model is the full default envelope
+          (byte-identical to the pre-hints baseline).
+        - When ``hints`` is non-empty the cache is bypassed entirely so
+          a geometry_simplified read cannot be served a cached
+          default-shaped model and vice-versa.
+        """
         db_resource = ctx.db_resource if ctx else None
-        if db_resource:
-            async with managed_transaction(db_resource) as conn:
-                result = await _get_catalog_query.execute(conn, id=catalog_id)
-            # Keep the router fan-out (network-bound driver I/O) out of the
-            # catalog.catalogs read transaction so it can't be held
-            # idle-in-transaction across that I/O (#1234); see
-            # _get_catalog_model_db.  The fan-out reads on its own connection.
-            router_metadata = await self._resolve_catalog_router_metadata(
-                catalog_id,
-            )
+        if db_resource or hints:
+            # Bypass cache for hinted reads to avoid cross-hint contamination.
+            # The db_resource path also bypasses cache (pre-existing behaviour).
+            if db_resource:
+                async with managed_transaction(db_resource) as conn:
+                    result = await _get_catalog_query.execute(conn, id=catalog_id)
+                # Keep the router fan-out (network-bound driver I/O) out of the
+                # catalog.catalogs read transaction so it can't be held
+                # idle-in-transaction across that I/O (#1234); see
+                # _get_catalog_model_db.  The fan-out reads on its own connection.
+                router_metadata = await self._resolve_catalog_router_metadata(
+                    catalog_id, hints=hints,
+                )
+            else:
+                async with managed_transaction(self.engine) as conn:
+                    result = await _get_catalog_query.execute(conn, id=catalog_id)
+                router_metadata = await self._resolve_catalog_router_metadata(
+                    catalog_id, hints=hints,
+                )
             catalog = self._unpack_catalog_row(
                 result, router_metadata=router_metadata,
             )
@@ -1921,9 +1960,11 @@ class CatalogService(CatalogsProtocol):
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ):
         return await self._col_svc.list_collections(
-            catalog_id, limit=limit, offset=offset, lang=lang, ctx=ctx, q=q
+            catalog_id, limit=limit, offset=offset, lang=lang, ctx=ctx, q=q, hints=hints,
         )
 
     async def get_collection_model(
@@ -1931,9 +1972,11 @@ class CatalogService(CatalogsProtocol):
         catalog_id: str,
         collection_id: str,
         db_resource: Optional[DbResource] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Collection]:
         return await self._col_svc.get_collection_model(
-            catalog_id, collection_id, db_resource=db_resource
+            catalog_id, collection_id, db_resource=db_resource, hints=hints,
         )
 
     async def get_collection(
@@ -1942,6 +1985,8 @@ class CatalogService(CatalogsProtocol):
         collection_id: str,
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Collection]:
         # Enforce the direct-get visibility contract (#2050): a collection the
         # caller has no visibility grant for is indistinguishable from a
@@ -1957,7 +2002,7 @@ class CatalogService(CatalogsProtocol):
 
         db_resource = ctx.db_resource if ctx else None
         return await self._col_svc.get_collection_model(
-            catalog_id, collection_id, db_resource=db_resource
+            catalog_id, collection_id, db_resource=db_resource, hints=hints,
         )
 
     async def get_collection_column_names(

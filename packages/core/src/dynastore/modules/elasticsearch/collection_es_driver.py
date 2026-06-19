@@ -40,6 +40,7 @@ from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.models.protocols.teardown_lane import TeardownLane
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.storage_location import StorageLocation
 from dynastore.models.protocols.typed_driver import (
@@ -135,8 +136,24 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
 
     # Collection ES is the canonical async secondary index + primary SEARCH
     # backend for collection metadata routing.  It auto-defaults into WRITE
-    # (as a secondary index, identified by ``is_collection_indexer``) and SEARCH.
-    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.WRITE})
+    # (as a secondary index, identified by ``is_collection_indexer``), SEARCH,
+    # and READ (hinted — only selected when caller passes geometry_simplified
+    # or stac_preferred; default path stays on PG).
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({
+        Operation.SEARCH, Operation.WRITE, Operation.READ,
+    })
+
+    # Hints this driver serves on the READ/SEARCH operations.
+    # GEOMETRY_SIMPLIFIED: ES stores the index-time simplified geometry.
+    # STAC_PREFERRED: caller wants the lightweight STAC-shaped ES copy
+    #   rather than the full PG sidecar envelope.
+    # METADATA: generic "I want collection/catalog metadata" — declares
+    #   this driver participates in metadata reads at all.
+    supported_hints: ClassVar[FrozenSet[Hint]] = frozenset({
+        Hint.GEOMETRY_SIMPLIFIED,
+        Hint.STAC_PREFERRED,
+        Hint.METADATA,
+    })
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,

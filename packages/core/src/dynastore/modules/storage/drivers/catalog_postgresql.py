@@ -68,6 +68,7 @@ from dynastore.models.protocols.typed_driver import (
     _PluginDriverConfig,
 )
 from dynastore.models.mutability import Immutable
+from dynastore.modules.storage.hints import Hint
 from dynastore.tools.cache import cached
 
 logger = logging.getLogger(__name__)
@@ -237,6 +238,14 @@ class CatalogPostgresqlDriver(TypedDriver[CatalogPostgresqlDriverConfig]):
     # Catalog metadata rows are in PG and are cleaned up inline with the
     # delete transaction; the async cascade must not re-drop them.
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
+
+    # Hints this driver serves on READ operations.
+    # GEOMETRY_EXACT: PG is the system of record with full WKB geometry.
+    # METADATA: generic participation in metadata reads.
+    supported_hints: ClassVar[FrozenSet[Hint]] = frozenset({
+        Hint.GEOMETRY_EXACT,
+        Hint.METADATA,
+    })
 
     capabilities: ClassVar[FrozenSet[str]] = frozenset({
         EntityStoreCapability.READ,

@@ -126,13 +126,13 @@ def test_pg_drivers_pg_only():
 
 
 def test_es_drivers_items_es_only_metadata_stays_pg():
-    """drivers=es → items ES-only; collection METADATA stays PG system-of-record.
+    """drivers=es → items ES-only; collection metadata PG-authoritative.
 
-    The ES collection driver is a write-only secondary index, never a READ
-    store, so authoring it as a collection READ/WRITE primary fails routing
-    validation (the regression that left an ES catalog on the dual PG+ES
-    default).  Collection READ/WRITE must reference PG only; ES is appended as
-    the secondary index + SEARCH by self-registration at apply time.
+    The ES collection READ entry is hint-gated (geometry_simplified, on_failure=WARN):
+    it is only activated when a request explicitly requests the simplified geometry path.
+    PG remains the authoritative READ store with on_failure=FATAL as the second
+    (fallback) entry.  Collection WRITE is PG-only (system of record).  ES is
+    appended as the secondary index + SEARCH by self-registration at apply time.
     """
     b = _build_routing_bundle(RoutingPresetParams(drivers=RoutingDrivers.ES), catalog_id="c1")
 
@@ -141,10 +141,26 @@ def test_es_drivers_items_es_only_metadata_stays_pg():
     assert _op_refs(items, Operation.WRITE) == {"items_elasticsearch_driver"}
     assert _op_refs(items, Operation.READ) == {"items_elasticsearch_driver"}
 
-    # Collection metadata READ/WRITE stay PG (the crash guard).
+    # Collection WRITE stays PG-only (system of record).
     coll = _slot_cfg(b, "collection_template")
-    assert _op_refs(coll, Operation.READ) == {"collection_postgresql_driver"}
     assert _op_refs(coll, Operation.WRITE) == {"collection_postgresql_driver"}
+    # Collection READ has ES (hint-gated, WARN) + PG (authoritative, FATAL).
+    read_refs = _op_refs(coll, Operation.READ)
+    assert "collection_postgresql_driver" in read_refs, (
+        "PG must always be in collection READ (authoritative system of record)"
+    )
+    # ES is present for hint-gated geometry_simplified reads; verify failure policy.
+    from dynastore.modules.storage.routing_config import FailurePolicy
+    read_entries = {e.driver_ref: e for e in coll.operations.get(Operation.READ, [])}
+    pg_entry = read_entries.get("collection_postgresql_driver")
+    assert pg_entry is not None and pg_entry.on_failure == FailurePolicy.FATAL, (
+        "PG READ entry must be FATAL (authoritative)"
+    )
+    if "collection_elasticsearch_driver" in read_entries:
+        es_entry = read_entries["collection_elasticsearch_driver"]
+        assert es_entry.on_failure == FailurePolicy.WARN, (
+            "ES READ entry must be WARN-only (hint-gated, non-authoritative)"
+        )
     # ES remains the collection SEARCH backend.
     assert "collection_elasticsearch_driver" in _op_refs(coll, Operation.SEARCH)
 

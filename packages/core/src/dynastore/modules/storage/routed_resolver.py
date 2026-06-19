@@ -41,8 +41,9 @@ single place to watch routing behaviour for the collection/catalog tiers.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Type
 
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import OperationDriverEntry
 
 logger = logging.getLogger(__name__)
@@ -122,15 +123,78 @@ def _entries_for_operation(
         return []
 
 
+def _apply_hint_filter(
+    resolved: List[Tuple[OperationDriverEntry, Any]],
+    hints: FrozenSet[Hint],
+    operation: str,
+) -> List[Tuple[OperationDriverEntry, Any]]:
+    """Apply best-overlap hint matching to an already-resolved driver list.
+
+    Mirrors the matching semantics in ``storage/router.py``:
+
+    * Empty ``hints`` → return the list unchanged (preserve zero-config
+      default behaviour; callers that substitute GEOMETRY_EXACT for the
+      empty-hint default path rely on this short-circuit).
+    * Non-empty ``hints`` → keep entries whose *effective* hint surface
+      (``entry.hints`` when set, else driver class ``supported_hints``)
+      is a SUPERSET of the requested hints.  Tie-break: longest effective
+      surface first, then original entry order.
+    * If no entry matches (e.g. hint not declared by any configured driver)
+      and the operation is READ or SEARCH → relax: return the full list in
+      original order so the request gets data rather than nothing.
+
+    The ``operation`` string is used only for the relax-branch decision and
+    the log line; it is not re-validated here.
+    """
+    if not hints:
+        return resolved
+
+    def _effective_hints(entry: OperationDriverEntry, driver: Any) -> FrozenSet[Hint]:
+        if entry.hints:
+            return frozenset(entry.hints)
+        return frozenset(getattr(type(driver), "supported_hints", frozenset()))
+
+    def _entry_matches(entry: OperationDriverEntry, driver: Any) -> bool:
+        return hints.issubset(_effective_hints(entry, driver))
+
+    matched = [
+        (i, e, d, _effective_hints(e, d))
+        for i, (e, d) in enumerate(resolved)
+        if _entry_matches(e, d)
+    ]
+    matched.sort(key=lambda quad: (-len(quad[3]), quad[0]))
+    if matched:
+        return [(e, d) for _, e, d, _eff in matched]
+
+    from dynastore.modules.storage.routing_config import Operation
+    if operation in (Operation.READ, Operation.SEARCH):
+        logger.info(
+            "routed-resolve: no driver satisfies hints=%s for op=%s; "
+            "relaxing to full driver list",
+            sorted(hints), operation,
+        )
+        return resolved
+    return []
+
+
 async def resolve_routed(
     routing_plugin_cls: Type[Any],
     operation: str,
     catalog_id: str,
     collection_id: Optional[str] = None,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     db_resource: Optional[Any] = None,
 ) -> List[Tuple[OperationDriverEntry, Any]]:
     """Resolve an ordered list of ``(entry, driver)`` for the operation.
+
+    When ``hints`` is non-empty the list is filtered to drivers whose
+    effective hint surface (``entry.hints`` when populated, else the driver
+    class's ``supported_hints``) is a SUPERSET of the requested hints.
+    Best-overlap tie-break: longest effective surface first, then declared
+    entry order.  On no match for READ/SEARCH the full list is returned
+    (relax — preference, not hard filter).  Empty ``hints`` skips filtering
+    entirely and preserves the original declared order.
 
     Returns ``[]`` when ConfigsProtocol is unavailable — the caller should
     then degrade to discovery-based resolution. Unregistered driver_refs
@@ -175,9 +239,12 @@ async def resolve_routed(
             continue
         resolved.append((entry, driver))
 
+    resolved = _apply_hint_filter(resolved, hints, operation)
+
     logger.debug(
-        "routed-resolve %s op=%s catalog=%s collection=%s -> [%s]",
+        "routed-resolve %s op=%s catalog=%s collection=%s hints=%s -> [%s]",
         routing_plugin_cls.__name__, operation, catalog_id, collection_id,
+        sorted(hints) or "(none)",
         ", ".join(e.driver_ref for e, _ in resolved) or "(none)",
     )
     return resolved

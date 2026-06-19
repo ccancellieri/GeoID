@@ -384,14 +384,19 @@ def create_catalog_summary(
 
 
 async def create_catalog(
-    request: Request, catalog_id: str, lang: str = "en"
+    request: Request,
+    catalog_id: str,
+    lang: str = "en",
+    hints: FrozenSet = frozenset(),
 ) -> Dict[str, Any]:
     """Generates a STAC Catalog for a specific catalog ID."""
     base_url = get_url(request)
     catalogs_svc = get_protocol(CatalogsProtocol)
     if not catalogs_svc:
         raise RuntimeError("CatalogsProtocol not available")
-    catalog_metadata_model = await cast(CatalogsProtocol, catalogs_svc).get_catalog_model(catalog_id)
+    catalog_metadata_model = await cast(CatalogsProtocol, catalogs_svc).get_catalog_model(
+        catalog_id, hints=hints,
+    )
     if not catalog_metadata_model:
         return {}
 
@@ -486,7 +491,7 @@ async def create_catalog(
 
 
 async def create_collections_catalog(
-    request: Request, catalog_id: str, lang: str = "en"
+    request: Request, catalog_id: str, lang: str = "en", hints: FrozenSet = frozenset(),
 ) -> Dict[str, Any]:
     """Generates the collections list for a specific catalog."""
     catalogs_svc = get_protocol(CatalogsProtocol)
@@ -496,7 +501,7 @@ async def create_collections_catalog(
 
     stac_collections = []
     for coll in collections:
-        stac_coll = await create_collection(request, catalog_id, coll.id, lang=lang)
+        stac_coll = await create_collection(request, catalog_id, coll.id, lang=lang, hints=hints)
         if stac_coll:
             stac_collections.append(stac_coll.to_dict())
 
@@ -519,7 +524,11 @@ async def create_collections_catalog(
 
 
 async def create_collection(
-    request: Request, catalog_id: str, collection_id: str, lang: str = "en"
+    request: Request,
+    catalog_id: str,
+    collection_id: str,
+    lang: str = "en",
+    hints: FrozenSet = frozenset(),
 ) -> Optional[pystac.Collection]:
     """Generates a full STAC Collection for a specific database table."""
     catalogs_svc = get_protocol(CatalogsProtocol)
@@ -529,7 +538,7 @@ async def create_collection(
     from dynastore.modules.storage.routing_config import Operation
     driver = await get_driver(Operation.READ, catalog_id, collection_id)
     metadata_model, layer_config = await asyncio.gather(
-        catalogs_svc.get_collection_model(catalog_id, collection_id),  # type: ignore[attr-defined]
+        catalogs_svc.get_collection_model(catalog_id, collection_id, hints=hints),  # type: ignore[attr-defined]
         driver.get_driver_config(catalog_id, collection_id),
     )
     if not metadata_model:

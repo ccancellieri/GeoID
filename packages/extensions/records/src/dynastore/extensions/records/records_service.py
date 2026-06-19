@@ -295,11 +295,12 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         language: str = Depends(get_language),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> rm.RecordsCatalogCollections:
         catalogs_svc = await self._get_catalogs_service()
 
         all_collections = await catalogs_svc.list_collections(
-            catalog_id, lang=language, limit=limit, offset=offset,
+            catalog_id, lang=language, limit=limit, offset=offset, hints=request_hints,
         )
         if all_collections is None:
             raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
@@ -335,10 +336,11 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         collection_id: str,
         request: Request,
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> rm.RecordsCatalogCollection:
         catalogs_svc = await self._get_catalogs_service()
 
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id, lang=language)
+        coll = await catalogs_svc.get_collection(catalog_id, collection_id, lang=language, hints=request_hints)
         if not coll:
             raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
 

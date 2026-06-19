@@ -127,12 +127,13 @@ fuse against that regression.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from dynastore.models.protocols.entity_store import (
     CatalogStore,
     EntityStoreCapability,
 )
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routed_resolver import resolve_routed
 from dynastore.modules.storage.routing_config import CatalogRoutingConfig, Operation
 
@@ -216,6 +217,7 @@ async def _routed_catalog_drivers(
     operation: str,
     catalog_id: str,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     db_resource: Optional[Any] = None,
 ) -> Optional[List[CatalogStore]]:
     """Config-driven CatalogStore list for an operation.
@@ -223,10 +225,13 @@ async def _routed_catalog_drivers(
     Returns the ordered :class:`CatalogStore` instances configured under
     ``CatalogRoutingConfig.operations[operation]``, or ``None`` when the
     routing config could not be consulted (early boot — caller falls back
-    to :func:`_resolve_catalog_store_drivers` discovery).
+    to :func:`_resolve_catalog_store_drivers` discovery).  When ``hints``
+    is non-empty the list is pre-filtered by hint overlap (see
+    ``routed_resolver``).
     """
     resolved = await resolve_routed(
         CatalogRoutingConfig, operation, catalog_id, collection_id=None,
+        hints=hints,
         db_resource=db_resource,
     )
     if not resolved:
@@ -237,6 +242,7 @@ async def _routed_catalog_drivers(
 async def get_catalog_metadata(
     catalog_id: str,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     context: Optional[Dict[str, Any]] = None,
     db_resource: Optional[Any] = None,
     drivers: Optional[List[CatalogStore]] = None,
@@ -255,6 +261,18 @@ async def get_catalog_metadata(
     can pass a filtered subset; default resolution discovers every
     registered driver.
 
+    **Dispatch semantics depend on whether hints are supplied.**
+
+    *No hints (empty frozenset):* existing merge-all behaviour — every
+    driver in the resolved list contributes its domain slice.  This is
+    the default path and is preserved byte-identical.
+
+    *Non-empty hints:* first-non-None semantics — the hint-filtered
+    ordered driver list is iterated sequentially; the first driver
+    returning a truthy result wins.  An ES miss (None/empty) advances
+    to the next driver (PG), ensuring PG always answers if ES has no
+    indexed copy.
+
     **Sequential fan-out (load-bearing).**  Earlier versions used
     ``asyncio.gather`` here, but when the caller passes a shared
     ``db_resource`` (a live asyncpg ``Connection``), concurrent
@@ -268,7 +286,9 @@ async def get_catalog_metadata(
     """
     if drivers is None:
         routed = await _routed_catalog_drivers(
-            Operation.READ, catalog_id, db_resource=db_resource,
+            Operation.READ, catalog_id,
+            hints=hints,
+            db_resource=db_resource,
         )
         # READ deliberately does NOT run drivers through
         # ``_filter_capable``: ``_safe_get`` below is forgiving — a
@@ -295,6 +315,14 @@ async def get_catalog_metadata(
     # Sequential to avoid asyncpg single-wire deadlock when db_resource
     # is a shared Connection (see docstring).  Per-driver latency is
     # additive but dominated by the round-trip anyway (~1-2ms each).
+    if hints:
+        # Hinted path: first-non-None wins (ES → PG fallback chain).
+        for driver in drivers:
+            result = await _safe_get(driver)
+            if result:
+                return result
+        return None
+
     results: List[Optional[Dict[str, Any]]] = []
     for driver in drivers:
         results.append(await _safe_get(driver))

@@ -75,7 +75,7 @@ async def test_read_uses_config_resolved_drivers(monkeypatch):
 
     pg = _RecordingDriver("pg")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.READ:
             return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), pg)]
         return []
@@ -106,7 +106,7 @@ async def test_write_fans_out_to_config_resolved_drivers(monkeypatch):
 
     pg = _RecordingDriver("pg")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), pg)]
         return []
@@ -128,7 +128,7 @@ async def test_search_uses_first_config_resolved_driver(monkeypatch):
     es = _RecordingDriver("es")
     pg = _RecordingDriver("pg")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.SEARCH:
             return [
                 (OperationDriverEntry(driver_ref="collection_elasticsearch_driver"), es),
@@ -156,7 +156,7 @@ async def test_search_operation_kwarg_selects_read_routed_drivers(monkeypatch):
     es = _RecordingDriver("es")
     pg = _RecordingDriver("pg")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.SEARCH:
             return [(OperationDriverEntry(driver_ref="collection_elasticsearch_driver"), es)]
         if operation == Operation.READ:
@@ -181,7 +181,7 @@ async def test_upsert_dispatches_index_hop(monkeypatch):
     pg = _RecordingDriver("pg")
     dispatched: list[tuple] = []
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), pg)]
         return []
@@ -210,7 +210,7 @@ async def test_index_dispatch_failure_does_not_break_write(monkeypatch, caplog):
 
     pg = _RecordingDriver("pg")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), pg)]
         return []
@@ -240,7 +240,7 @@ async def test_delete_dispatches_index_hop(monkeypatch):
     pg = _RecordingDriver("pg")
     dispatched: list[tuple] = []
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), pg)]
         return []
@@ -274,7 +274,7 @@ async def test_delete_skips_index_hop_when_driver_failed(monkeypatch):
     boom = _BoomDriver("boom")
     dispatched: list = []
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), boom)]
         return []
@@ -308,7 +308,7 @@ async def test_write_filters_non_capable_config_resolved_driver(monkeypatch, cap
     write = _RecordingDriver("write")
     readonly = _ReadOnlyDriver("readonly")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [
                 (OperationDriverEntry(driver_ref="collection_postgresql_driver"), write),
@@ -345,7 +345,7 @@ async def test_delete_filters_non_capable_config_resolved_driver(monkeypatch, ca
     write = _RecordingDriver("write")
     readonly = _ReadOnlyDriver("readonly")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [
                 (OperationDriverEntry(driver_ref="collection_postgresql_driver"), write),

@@ -21,6 +21,7 @@ Catalog-related protocol definitions.
 """
 
 from typing import (
+    FrozenSet,
     Protocol,
     Optional,
     Any,
@@ -143,16 +144,25 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
     # façade to coerce dict rows into Feature models at the boundary.
 
     async def get_catalog(
-        self, catalog_id: str, lang: str = "en", ctx: Optional["DriverContext"] = None,
-    ) ->"Catalog":
+        self,
+        catalog_id: str,
+        lang: str = "en",
+        ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet[Any] = frozenset(),
+    ) -> "Catalog":
         """
         Retrieves the catalog metadata model for a specific language.
         """
         ...
 
     async def get_catalog_model(
-        self, catalog_id: str, ctx: Optional["DriverContext"] = None,
-    ) ->Optional["Catalog"]:
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet[Any] = frozenset(),
+    ) -> Optional["Catalog"]:
         """
         Retrieves the raw catalog model (often cached).
         """

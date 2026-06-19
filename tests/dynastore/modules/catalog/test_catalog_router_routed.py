@@ -58,7 +58,7 @@ async def test_catalog_read_uses_config_resolved_drivers(monkeypatch):
 
     pg = _RecordingCatalogDriver("pg")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.READ:
             return [(OperationDriverEntry(driver_ref="catalog_postgresql_driver"), pg)]
         return []
@@ -91,7 +91,7 @@ async def test_catalog_write_fans_out_to_config_resolved_drivers(monkeypatch):
 
     pg = _RecordingCatalogDriver("pg")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [(OperationDriverEntry(driver_ref="catalog_postgresql_driver"), pg)]
         return []
@@ -121,7 +121,7 @@ async def test_catalog_write_filters_non_capable_config_resolved_driver(monkeypa
     write = _RecordingCatalogDriver("write")
     readonly = _ReadOnlyCatalogDriver("readonly")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [
                 (OperationDriverEntry(driver_ref="catalog_postgresql_driver"), write),
@@ -157,7 +157,7 @@ async def test_catalog_delete_filters_non_capable_config_resolved_driver(monkeyp
     write = _RecordingCatalogDriver("write")
     readonly = _ReadOnlyCatalogDriver("readonly")
 
-    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, db_resource=None):
+    async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
         if operation == Operation.WRITE:
             return [
                 (OperationDriverEntry(driver_ref="catalog_postgresql_driver"), write),

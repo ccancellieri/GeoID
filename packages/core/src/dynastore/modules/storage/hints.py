@@ -112,6 +112,16 @@ class Hint(StrEnum):
     GEOMETRY_SIMPLIFIED = "geometry_simplified"
     GEOMETRY_EXACT = "geometry_exact"
 
+    # Collection/catalog metadata read from the STAC-shaped search-backend
+    # (ES) rather than the canonical PG sidecar.  The ES copy is the
+    # lightweight envelope stored at index time; PG is the system of record
+    # (full envelope with all sidecar columns).  Callers that only need the
+    # ES-shaped representation (e.g. landing-page renders that mirror the
+    # search index) pass this hint to route the metadata READ to ES first
+    # and PG as a fall-open fallback.  Combined with GEOMETRY_SIMPLIFIED
+    # on the same ES entry so operators can request both in one hint set.
+    STAC_PREFERRED = "stac_preferred"
+
     # Driver can produce MVT-shaped geometry rows that the tile renderer
     # wraps in ``ST_AsMVT``.  Today only PG advertises this; future ES /
     # DuckDB drivers opt in by adding it to ``supported_hints`` and
