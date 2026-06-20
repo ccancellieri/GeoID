@@ -306,6 +306,16 @@ class GCPModule(
                 "GCP Module: ConfigsProtocol not available. Configuration management disabled."
             )
 
+        from dynastore.tools.background_service import (
+            BackgroundSupervisor,
+            ServiceContext as _GcpServiceContext,
+        )
+        from dynastore.modules.db_config.instance import (
+            get_service_name as _gcp_get_service_name,
+        )
+        _gcp_bg_shutdown = asyncio.Event()
+        _gcp_supervisor = BackgroundSupervisor()
+
         try:
             # Async clients (_jobs_client/_run_client) are built lazily by
             # get_jobs_client/get_run_client on first use, bound to the current
@@ -412,7 +422,6 @@ class GCPModule(
             # forever and the gate silently False'd on every Cloud Run service
             # since #735 shipped. The schema-init right above already uses the
             # property; the reconciler must too.
-            self._liveness_reconciler = None
             try:
                 reconciler_engine = self.engine
             except AssertionError:
@@ -426,40 +435,40 @@ class GCPModule(
                         GcpLivenessReconciler,
                     )
                     cfg = self._module_config
-                    self._liveness_reconciler = GcpLivenessReconciler(
-                        engine=reconciler_engine,
-                        interval_seconds=getattr(
-                            cfg, "liveness_reconciler_interval_seconds", 20
-                        ),
-                        extend_visibility_seconds=getattr(
-                            cfg, "liveness_extend_visibility_seconds", 300
-                        ),
-                        unknown_grace_seconds=getattr(
-                            cfg, "liveness_unknown_grace_seconds", 180
-                        ),
+                    _gcp_supervisor.register(
+                        GcpLivenessReconciler(
+                            interval_seconds=getattr(
+                                cfg, "liveness_reconciler_interval_seconds", 20
+                            ),
+                            extend_visibility_seconds=getattr(
+                                cfg, "liveness_extend_visibility_seconds", 300
+                            ),
+                            unknown_grace_seconds=getattr(
+                                cfg, "liveness_unknown_grace_seconds", 180
+                            ),
+                        )
                     )
-                    self._liveness_reconciler.start()
-                    logger.info("GCP Module: liveness reconciler started.")
+                    logger.info("GCP Module: liveness reconciler registered.")
                 except Exception as e:
                     logger.error(
-                        "GCP Module: failed to start liveness reconciler "
+                        "GCP Module: failed to register liveness reconciler "
                         "(%s). MaintenanceSupervisor task_reaper remains the backstop.", e,
                         exc_info=True,
                     )
-                    self._liveness_reconciler = None
+            _gcp_bg_ctx = _GcpServiceContext(
+                engine=reconciler_engine,
+                shutdown=_gcp_bg_shutdown,
+                is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+                name=_gcp_get_service_name() or "unknown",
+            )
+            _gcp_supervisor.start(_gcp_bg_ctx)
 
             yield
         finally:
             logger.info("GCP Module: Exiting lifespan - closing all clients.")
-            # Stop the liveness reconciler before tearing down clients it uses.
-            if self._liveness_reconciler is not None:
-                try:
-                    await self._liveness_reconciler.stop()
-                except Exception as e:  # noqa: BLE001 — best-effort teardown
-                    logger.warning(
-                        "GCP Module: error stopping liveness reconciler: %s", e
-                    )
-                self._liveness_reconciler = None
+            # Stop the liveness reconciler supervisor before tearing down clients it uses.
+            _gcp_bg_shutdown.set()
+            await _gcp_supervisor.stop()
             # Unregister BigQuery plugins
             from dynastore.tools.discovery import unregister_plugin
 

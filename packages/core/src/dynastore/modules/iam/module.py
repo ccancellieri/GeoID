@@ -179,28 +179,57 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             # Compiled-rule cache TTL / rule-version refresher (#1343).
             # Pulls the live ``IamScaleConfig`` TTL + maxsize snapshot and
             # the platform binding-version counter on a slow timer so the
-            # sync hot path consumes them without an async hop. Registered
-            # on the exit stack so it stops cleanly on module unload.
+            # sync hot path consumes them without an async hop. Managed by
+            # BackgroundSupervisor so lifecycle is uniform with other services.
+            import asyncio as _asyncio
+            from dynastore.tools.background_service import (
+                BackgroundSupervisor as _IamBgSupervisor,
+                ServiceContext as _IamServiceContext,
+            )
+            from dynastore.modules.db_config.instance import (
+                get_service_name as _iam_get_service_name,
+            )
+            from dynastore.modules.iam.compiled_rule_cache import (
+                IamRuleCacheRefreshService,
+                refresh_config_snapshot,
+                iam_rule_version_async,
+            )
+            _iam_bg_shutdown = _asyncio.Event()
+            _iam_supervisor = _IamBgSupervisor()
+            _iam_supervisor.register(IamRuleCacheRefreshService())
+            # One initial refresh so the first cache read sees the live TTL
+            # and rule-version without waiting for the first tick.
             try:
-                from dynastore.modules.iam.compiled_rule_cache import (
-                    start_background_refresh,
-                )
-                _stop_refresh = await start_background_refresh()
-
-                @asynccontextmanager
-                async def _refresh_ctx():
-                    try:
-                        yield
-                    finally:
-                        await _stop_refresh()
-
-                await stack.enter_async_context(_refresh_ctx())
+                await refresh_config_snapshot()
+                await iam_rule_version_async("iam")
             except Exception:
                 logger.warning(
-                    "IamModule: compiled-rule cache refresher failed to start; "
+                    "IamModule: initial rule-cache snapshot failed; "
                     "TTL/version snapshots fall back to in-source defaults",
                     exc_info=True,
                 )
+            try:
+                _iam_db = get_protocol(DatabaseProtocol)
+                _iam_bg_engine = _iam_db.engine if _iam_db else None
+            except Exception:
+                _iam_bg_engine = None
+            _iam_bg_ctx = _IamServiceContext(
+                engine=_iam_bg_engine,
+                shutdown=_iam_bg_shutdown,
+                is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+                name=_iam_get_service_name() or "unknown",
+            )
+            _iam_supervisor.start(_iam_bg_ctx)
+
+            async def _stop_iam_supervisor() -> None:
+                # Registered on the exit stack (LIFO: runs before the manager /
+                # DB teardown) so the refresher loop is always drained — even if
+                # an exception is raised after start() but before/at yield, which
+                # a bare post-yield stop would skip and leak the background task.
+                _iam_bg_shutdown.set()
+                await _iam_supervisor.stop()
+
+            stack.push_async_callback(_stop_iam_supervisor)
 
             yield
 

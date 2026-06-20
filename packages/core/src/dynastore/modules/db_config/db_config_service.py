@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager, AsyncExitStack
 from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 from dynastore.modules import ModuleProtocol
+from dynastore.tools.background_service import BackgroundSupervisor, ServiceContext
 from dynastore.tools.discovery import register_plugin, unregister_plugin
 
 # Side-effect import — ensures the F.1 engine PluginConfig classes
@@ -33,7 +34,7 @@ from dynastore.tools.discovery import register_plugin, unregister_plugin
 # so this is the earliest reliable trigger.
 from . import engine_config as _engine_config  # noqa: F401
 from .db_config import DBConfig
-from .engine_instance_cache import EngineInstanceCache
+from .engine_instance_cache import EngineInstanceCache, EngineInstanceCacheSweepService
 from .engine_resolver import (
     build_engine_snapshot,
     make_resolver,
@@ -76,9 +77,9 @@ class DBConfigModule(ModuleProtocol):
         return cfg
 
     async def _build_engine_cache(
-        self, pcfg: PlatformConfigService
-    ) -> tuple[EngineInstanceCache, "Optional[asyncio.Task[bool]]"]:
-        """Snapshot platform engines + return (cache, refresh_task).
+        self, pcfg: PlatformConfigService, app_state: "DBConfigAppState"
+    ) -> tuple[EngineInstanceCache, "Optional[asyncio.Task[bool]]", BackgroundSupervisor, asyncio.Event]:
+        """Snapshot platform engines + return (cache, refresh_task, supervisor, shutdown).
 
         The initial ``build_engine_snapshot`` call runs synchronously, but at
         this point in lifespan ``DBService`` (priority 10) has not yet
@@ -96,13 +97,29 @@ class DBConfigModule(ModuleProtocol):
 
         See GeoID #818 for the regression context.
         """
+        from dynastore.modules.db_config.instance import get_service_name
+
         snapshot: Dict[str, Any] = {}
         await build_engine_snapshot(pcfg, into=snapshot)
         cache = EngineInstanceCache(
             engine_resolver=make_resolver(snapshot),
             engine_writer=make_writer(snapshot),
         )
-        cache.start_background_sweep()
+
+        sweep_shutdown = asyncio.Event()
+        supervisor = BackgroundSupervisor()
+        supervisor.register(EngineInstanceCacheSweepService(cache))
+        engine = (
+            getattr(app_state, "engine", None)
+            or getattr(app_state, "sync_engine", None)
+        )
+        sweep_ctx = ServiceContext(
+            engine=engine,
+            shutdown=sweep_shutdown,
+            is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+            name=get_service_name() or "unknown",
+        )
+        supervisor.start(sweep_ctx)
 
         refresh_task: "Optional[asyncio.Task[bool]]" = None
         if not snapshot:
@@ -110,7 +127,7 @@ class DBConfigModule(ModuleProtocol):
                 refresh_snapshot_until_ready(snapshot, pcfg),
                 name="engine_snapshot_refresh",
             )
-        return cache, refresh_task
+        return cache, refresh_task, supervisor, sweep_shutdown
 
     @staticmethod
     async def _cancel_refresh_task(task: "asyncio.Task[bool]") -> None:
@@ -132,6 +149,14 @@ class DBConfigModule(ModuleProtocol):
         """Drop the refresh-task reference from app_state on teardown."""
         if hasattr(app_state, "engine_snapshot_refresh_task"):
             app_state.engine_snapshot_refresh_task = None
+
+    @staticmethod
+    async def _teardown_sweep_supervisor(
+        supervisor: BackgroundSupervisor, shutdown: asyncio.Event
+    ) -> None:
+        """Signal and drain the engine-cache sweep supervisor."""
+        shutdown.set()
+        await supervisor.stop()
 
     @staticmethod
     async def _teardown_engine_cache(app_state: DBConfigAppState) -> None:
@@ -175,7 +200,9 @@ class DBConfigModule(ModuleProtocol):
             # engine configs at boot, exposes lazy-instantiating cache.
             # Until F.4c lands, no driver consumes this in production paths,
             # but admin tooling + tests use it via app_state.engine_cache.
-            engine_cache, refresh_task = await self._build_engine_cache(pcfg)
+            engine_cache, refresh_task, sweep_supervisor, sweep_shutdown = (
+                await self._build_engine_cache(pcfg, app_state)
+            )
             app_state.engine_cache = engine_cache
             # Publish the task handle so downstream modules (e.g. CacheModule
             # at priority 9) can await snapshot completion before consulting
@@ -187,6 +214,10 @@ class DBConfigModule(ModuleProtocol):
                     self._cancel_refresh_task, refresh_task
                 )
             stack.push_async_callback(self._clear_refresh_task_ref, app_state)
+            # Stop the sweep supervisor before releasing cached instances.
+            stack.push_async_callback(
+                self._teardown_sweep_supervisor, sweep_supervisor, sweep_shutdown
+            )
             stack.push_async_callback(self._teardown_engine_cache, app_state)
 
             yield

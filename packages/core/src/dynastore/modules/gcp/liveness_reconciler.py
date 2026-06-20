@@ -48,10 +48,16 @@ import logging
 import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, NamedTuple, Optional
+from typing import Any, Dict, NamedTuple, Optional, Union
 
 from dynastore.modules.tasks import tasks_module
 from dynastore.modules.tasks.liveness import LivenessVerdict, resolve_probe, resolve_stop_signal
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,82 +108,54 @@ class ReconcileOutcome(NamedTuple):
 _DISMISS_FORCE_DELETE_AFTER: timedelta = timedelta(seconds=600)
 
 
-class GcpLivenessReconciler:
-    """Background loop that reconciles lapsed-lease Cloud Run task rows.
+class GcpLivenessReconciler(PeriodicService):
+    """Periodic service that reconciles lapsed-lease Cloud Run task rows.
 
-    Lifecycle is explicit (``start`` / ``stop``) so the host — ``GCPModule``'s
-    lifespan — owns it cleanly. One bad row never kills the loop; one failed
-    pass never kills the loop.
+    ``BackgroundSupervisor`` owns the loop lifecycle. One bad row never kills
+    the loop; one failed pass is logged and the supervisor continues on the
+    next cadence tick.
+
+    Leadership policy: ``LEADER_ONLY`` — exactly one pod per service drives
+    the reconciler writes. Followers skip until the advisory lock is free.
+
+    Pod policy: ``SKIP_EPHEMERAL`` — Cloud Run Job containers run one task
+    and exit; they must not open reconciler connections or contend on task rows.
+    This is defense-in-depth alongside the existing
+    ``_should_register_gcp_job_runner()`` gate in ``GCPModule.lifespan``.
     """
+
+    name = "gcp_liveness_reconciler"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
 
     def __init__(
         self,
-        engine: Any,
+        engine: Any = None,
         *,
         interval_seconds: float = 20.0,
         extend_visibility_seconds: int = 300,
         unknown_grace_seconds: int = 180,
     ) -> None:
-        self._engine = engine
-        self._interval_seconds = float(interval_seconds)
-        self._extend_visibility_seconds = int(extend_visibility_seconds)
-        self._unknown_grace_seconds = int(unknown_grace_seconds)
-        self._task: Optional[asyncio.Task] = None
-        self._stopped = asyncio.Event()
+        from dynastore.modules.db_config.instance import get_service_name as _get_service_name
+        service = _get_service_name() or "unknown"
+        self.cadence_seconds: float = float(interval_seconds)
+        self.lock_key: Optional[Union[int, str]] = f"gcp-liveness-reconciler:{service}"
+        self._engine: Any = engine
+        self._extend_visibility_seconds: int = int(extend_visibility_seconds)
+        self._unknown_grace_seconds: int = int(unknown_grace_seconds)
 
-    # --- lifecycle ---------------------------------------------------------
+    # --- PeriodicService tick ----------------------------------------------
 
-    def start(self) -> None:
-        """Spawn the reconcile loop. Idempotent — a running loop is left alone."""
-        if self._task is not None and not self._task.done():
-            return
-        self._stopped.clear()
-        self._task = asyncio.create_task(self._run_loop())
-
-    async def stop(self) -> None:
-        """Signal the loop to stop, cancel it, and await its teardown.
-
-        Safe to call when the reconciler was never started.
-        """
-        self._stopped.set()
-        if self._task is None:
-            return
-        self._task.cancel()
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One reconcile pass, driven by ``BackgroundSupervisor`` on cadence."""
+        self._engine = ctx.engine
         try:
-            await self._task
-        except asyncio.CancelledError:
-            pass  # expected — we just cancelled it
-        except Exception:
-            logger.warning(
-                "GCPLivenessReconciler: loop task errored during teardown",
+            await self._reconcile_once()
+        except Exception as e:  # noqa: BLE001 — one bad pass must not kill the loop
+            logger.error(
+                "GcpLivenessReconciler: reconcile pass failed: %s", e,
                 exc_info=True,
             )
-        self._task = None
-
-    # --- loop --------------------------------------------------------------
-
-    async def _run_loop(self) -> None:
-        """Run ``_reconcile_once`` every ``interval_seconds`` until stopped.
-
-        A failed pass is logged and the loop continues — the reconciler is a
-        safety net, it must not be the thing that breaks.
-        """
-        while not self._stopped.is_set():
-            try:
-                await self._reconcile_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 — one bad pass must not kill the loop
-                logger.error(
-                    "GcpLivenessReconciler: reconcile pass failed: %s", e,
-                    exc_info=True,
-                )
-            try:
-                await asyncio.wait_for(
-                    self._stopped.wait(), timeout=self._interval_seconds
-                )
-            except asyncio.TimeoutError:
-                pass
 
     async def _reconcile_once(self) -> None:
         """Scan lapsed-lease Cloud Run rows and reconcile each one.

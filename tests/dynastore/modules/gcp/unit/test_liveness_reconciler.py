@@ -296,10 +296,19 @@ async def test_reconcile_once_one_bad_row_does_not_stop_the_rest(monkeypatch):
     assert actions.heartbeat_if_active.await_count == 2
 
 
-# --- lifecycle -------------------------------------------------------------
+# --- lifecycle (PeriodicService loop) --------------------------------------
 
 @pytest.mark.asyncio
-async def test_start_stop_lifecycle(monkeypatch):
+async def test_periodic_run_loop_ticks_then_stops_on_shutdown(monkeypatch):
+    """PeriodicService.run drives tick() repeatedly and exits on shutdown.
+
+    The hand-wired start()/stop()/_run_loop scaffolding was removed when the
+    reconciler migrated onto the BackgroundService primitive; the supervisor now
+    owns lifecycle. This verifies the inherited run() loop calls tick() at least
+    once and returns promptly once the shutdown event is set.
+    """
+    from dynastore.tools.background_service import ServiceContext
+
     rec = _make_reconciler(interval_seconds=0.01)
     ran = {"n": 0}
 
@@ -308,19 +317,19 @@ async def test_start_stop_lifecycle(monkeypatch):
 
     monkeypatch.setattr(rec, "_reconcile_once", _fake_once)
 
-    rec.start()
+    ctx = ServiceContext(
+        engine=rec._engine,
+        shutdown=asyncio.Event(),
+        is_ephemeral=False,
+        name="test-host",
+    )
+    loop_task = asyncio.create_task(rec.run(ctx))
     await asyncio.sleep(0.05)
-    await rec.stop()
+    ctx.shutdown.set()
+    await asyncio.wait_for(loop_task, timeout=1.0)
 
     assert ran["n"] >= 1
-    # After stop the background task is finished and cleared.
-    assert rec._task is None
-
-
-@pytest.mark.asyncio
-async def test_stop_is_safe_when_never_started():
-    rec = _make_reconciler()
-    await rec.stop()  # must not raise
+    assert loop_task.done()
 
 
 def test_lifespan_gates_reconciler_on_job_runner_host():

@@ -61,6 +61,12 @@ from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 from dynastore.modules.db_config.engine_config import (
     EngineConfig,
 )
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +183,6 @@ class EngineInstanceCache:
         self._clock = clock
         self._entries: Dict[str, _Entry] = {}
         self._ref_locks: Dict[str, asyncio.Lock] = {}
-        self._sweep_task: Optional[asyncio.Task] = None
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -332,61 +337,58 @@ class EngineInstanceCache:
                     evicted += 1
         return evicted
 
-    # ------------------------------------------------------------------
-    # Background sweep lifecycle
-    # ------------------------------------------------------------------
-
-    def start_background_sweep(self) -> None:
-        """Start the periodic TTL sweep task.
-
-        Idempotent — calling twice does not create a second task.
-        """
-        if self._sweep_task is not None and not self._sweep_task.done():
-            return
-        self._sweep_task = asyncio.create_task(self._sweep_loop())
-
-    async def _sweep_loop(self) -> None:
-        try:
-            while not self._closed:
-                await asyncio.sleep(self._sweep_interval)
-                if self._closed:
-                    break
-                try:
-                    await self.sweep()
-                except Exception as exc:  # noqa: BLE001 — sweep is best-effort
-                    logger.warning(
-                        "EngineInstanceCache: sweep raised %s; cache continues.",
-                        exc,
-                    )
-        except asyncio.CancelledError:
-            pass
-
     async def close(self) -> None:
-        """Cancel the sweep + release every cached instance.
+        """Release every cached instance.
 
         Idempotent.  Best-effort: ``engine_release`` failures are
-        logged but do not propagate.
+        logged but do not propagate.  The periodic sweep service is
+        stopped by ``BackgroundSupervisor`` before this is called —
+        ``close()`` only handles instance teardown.
         """
         if self._closed:
             return
         self._closed = True
-        task = self._sweep_task
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass  # expected — we just cancelled it
-            except Exception:
-                logger.warning(
-                    "Engine instance-cache sweep task errored during close",
-                    exc_info=True,
-                )
         for engine_ref in list(self._entries):
             await self.evict(engine_ref)
+
+
+class EngineInstanceCacheSweepService(PeriodicService):
+    """Periodic service that runs one TTL eviction pass on the engine cache.
+
+    Replaces the hand-wired ``asyncio.create_task(_sweep_loop())`` that
+    ``EngineInstanceCache.start_background_sweep()`` used to spawn. The
+    ``BackgroundSupervisor`` now owns the loop lifecycle.
+
+    Policy:
+      - leadership = RUN_EVERYWHERE: eviction is idempotent so every pod
+        can run it independently; no advisory-lock contention needed.
+      - pod_policy = ALL: ephemeral Cloud Run Jobs also hold engine
+        instances for their short lifetime and benefit from TTL eviction.
+      - cadence_seconds = the cache's sweep_interval_seconds at
+        construction time (default 60s, same as before).
+    """
+
+    name = "engine_instance_cache_sweep"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.ALL
+
+    def __init__(self, cache: "EngineInstanceCache") -> None:
+        self._cache = cache
+        self.cadence_seconds: float = cache._sweep_interval
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One TTL eviction pass, driven by ``BackgroundSupervisor`` on cadence."""
+        try:
+            await self._cache.sweep()
+        except Exception as exc:  # noqa: BLE001 — sweep is best-effort
+            logger.warning(
+                "EngineInstanceCacheSweepService: sweep raised %s; cache continues.",
+                exc,
+            )
 
 
 __all__ = [
     "EngineInstanceProtocol",
     "EngineInstanceCache",
+    "EngineInstanceCacheSweepService",
 ]

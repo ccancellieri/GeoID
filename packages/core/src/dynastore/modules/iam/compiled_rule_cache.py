@@ -46,7 +46,6 @@ can see at a glance whether the verdict came off a fresh or stale view.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 import time
@@ -60,6 +59,13 @@ from typing import (
     Optional,
     Tuple,
     TypeVar,
+)
+
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -297,98 +303,48 @@ async def refresh_config_snapshot() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Background refresher — owned by the IAM module lifespan so it terminates
-# cleanly on shutdown. The IAM module already holds an ``AsyncExitStack``
-# (see ``IamModule.lifespan``) which is the right place to register cleanup.
-# This helper exposes the start/stop callbacks; the module wires them in.
+# Background refresher — owned by the IAM module lifespan via BackgroundSupervisor.
+# IamRuleCacheRefreshService is registered once in IamModule.lifespan; the
+# supervisor drives its tick() on every pod (RUN_EVERYWHERE / ALL) so the sync
+# hot path always has a fresh TTL snapshot and rule-version without an async hop.
 # --------------------------------------------------------------------------- #
 
 
-_refresher_task: Optional[asyncio.Task] = None
+class IamRuleCacheRefreshService(PeriodicService):
+    """Periodic service that refreshes the compiled-rule cache TTL snapshot
+    and the IAM rule-version counter on a fixed cadence.
 
+    Leadership policy: ``RUN_EVERYWHERE`` — every pod must keep its own
+    in-process snapshots current. There is no shared mutable state to
+    serialise; each pod writes only into its own module-globals.
 
-async def _refresher_loop(interval: float) -> None:
-    while True:
+    Pod policy: ``ALL`` — job pods must also refresh so the sync hot path
+    (``get_ttl_seconds()``, ``iam_rule_version()``) is valid there too.
+    """
+
+    name = "iam_rule_cache_refresher"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.ALL
+    cadence_seconds: float = _CONFIG_REFRESH_INTERVAL
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One refresh pass: pull TTL/maxsize snapshot then update the
+        rule-version counter. A failed pass leaves the previous values in
+        place — no security or correctness consequence, just a stale knob."""
         await refresh_config_snapshot()
         try:
             await iam_rule_version_async("iam")
-        except Exception:  # pragma: no cover — defensive: never let bg task die
+        except Exception:
             logger.debug(
                 "compiled_rule_cache: rule_version refresh failed", exc_info=True
             )
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            raise
-
-
-async def start_background_refresh(
-    interval: float = _CONFIG_REFRESH_INTERVAL,
-) -> Callable[[], Awaitable[None]]:
-    """Start the background refresher. Returns an async stopper callable
-    suitable for registration with an :class:`AsyncExitStack`.
-
-    Calling twice is idempotent: the second call returns a stopper that
-    cancels the existing task. If asyncio is unavailable (we are not in a
-    running loop), the call is a no-op and the stopper is a no-op too —
-    the TTL fallback default keeps things correct.
-    """
-    global _refresher_task
-
-    # One initial refresh so the very first cache read sees the live TTL.
-    await refresh_config_snapshot()
-    await iam_rule_version_async("iam")
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        async def _noop_stop() -> None:
-            return None
-
-        return _noop_stop
-
-    if _refresher_task is not None and not _refresher_task.done():
-        # Reuse the existing task — but still return a stopper that targets it.
-        existing = _refresher_task
-
-        async def _stop_existing() -> None:
-            existing.cancel()
-            try:
-                await existing
-            except asyncio.CancelledError:
-                pass  # expected — we just cancelled it
-            except Exception:
-                logger.warning(
-                    "IAM rule-refresher task errored during shutdown", exc_info=True
-                )
-
-        return _stop_existing
-
-    _refresher_task = loop.create_task(_refresher_loop(interval))
-    task = _refresher_task
-
-    async def _stop() -> None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass  # expected — we just cancelled it
-        except Exception:
-            logger.warning(
-                "IAM rule-refresher task errored during shutdown", exc_info=True
-            )
-
-    return _stop
 
 
 def _reset_for_tests() -> None:
     """Reset module-global state. Test-only."""
-    global _TTL_SECONDS, _rule_version_snapshot, _refresher_task
+    global _TTL_SECONDS, _rule_version_snapshot
     _COMPILED_RULE_CACHE.clear()
     _COMPILED_RULE_CACHE.configure(maxsize=1024)
     with _TTL_SECONDS_LOCK:
         _TTL_SECONDS = _DEFAULT_TTL_SECONDS
     _rule_version_snapshot = 0
-    if _refresher_task is not None and not _refresher_task.done():
-        _refresher_task.cancel()
-    _refresher_task = None
