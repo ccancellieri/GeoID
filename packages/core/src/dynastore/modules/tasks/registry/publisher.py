@@ -35,37 +35,24 @@ before calling the shared ``@cached`` gate so that a Valkey outage (observed as
 per-tick storm. On a Valkey miss the ``@cached`` decorator would re-enter the
 body on every tick; the in-process memo prevents that even when the distributed
 cache is unavailable.
-
-Single-writer gating
---------------------
-``run_registry_heartbeat`` branches on engine type:
-
-* **AsyncEngine** (multi-worker async web path): the publish/heartbeat loop is
-  gated behind ``pg_advisory_leadership`` via ``run_leader_loop``.  Only one
-  worker cluster-wide per service drives the loop; all other workers sleep and
-  skip PG writes.  The advisory key is per-service so different services elect
-  independent leaders without blocking each other.
-
-* **Non-AsyncEngine** (single-process, sync-driver, or test path): the existing
-  unconditional loop runs unchanged.  There are no concurrent writers in this
-  deployment mode, so no leadership election is needed or possible.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Any, List, Optional, Set, Tuple
-
-from sqlalchemy.ext.asyncio import AsyncEngine
+from typing import Any, List, Optional, Set, Tuple, Union
 
 import dynastore.tasks as tasks_pkg
 from dynastore._version import get_git_commit, get_version
 from dynastore.modules.db_config.instance import get_service_name
-from dynastore.modules.db_config.locking_tools import pg_advisory_leadership
 from dynastore.modules.tasks.registry import repository
 from dynastore.modules.tasks.registry.model import CapabilityRow, compute_publish_digest
 from dynastore.tasks import task_kind
-from dynastore.tools.async_utils import run_leader_loop
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 from dynastore.tools.cache import CacheIgnore, cached
 
 logger = logging.getLogger(__name__)
@@ -236,62 +223,32 @@ async def publish_inventory(engine) -> None:
         logger.warning("task-registry: heartbeat failed (non-fatal)", exc_info=True)
 
 
-async def run_registry_heartbeat(
-    engine,
-    shutdown_event: asyncio.Event,
-    *,
-    refresh_seconds: float = 30.0,
-) -> None:
-    """Publish once immediately, then heartbeat on the given cadence until shutdown.
+class RegistryHeartbeatService(PeriodicService):
+    """Publishes this pod's task inventory + liveness heartbeat (issue #2271).
 
-    When ``engine`` is an :class:`~sqlalchemy.ext.asyncio.AsyncEngine` (the
-    multi-worker async web path), the loop is gated behind a per-service
-    ``pg_advisory_leadership`` lock via ``run_leader_loop``.  Only the elected
-    leader pod drives PG writes; followers sleep and skip.  This eliminates the
-    N-worker write amplification that caused 40P01 deadlock storms on
-    ``configs.task_capability_registry`` (issue #2271).
+    Leadership election and ephemeral-pod gating are declared as policy and
+    applied uniformly by ``BackgroundSupervisor``:
 
-    When ``engine`` is any other type (single-process, sync-driver, test), the
-    original unconditional loop runs unchanged: no leadership election is needed
-    or possible in that deployment mode.
+    * ``LEADER_ONLY`` — exactly one pod per service drives the registry writes;
+      the supervisor wraps ``tick()`` in ``pg_advisory_leadership`` so followers
+      skip. On a non-AsyncEngine (single-process / sync / test) deployment the
+      supervisor auto-downgrades to run-everywhere.
+    * ``SKIP_EPHEMERAL`` — ephemeral Cloud Run Job pods never start it. They run
+      one task and exit, so they must not open registry connections or contend
+      on the table at scale (the #2271 motivation; resolves #2279 for this loop).
+
+    The advisory ``lock_key`` is ``task-registry-heartbeat:{service}`` so that
+    during a rolling deploy pods electing this service use the same lock identity.
     """
-    if isinstance(engine, AsyncEngine):
+
+    name = "task_registry_heartbeat"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+
+    def __init__(self, *, refresh_seconds: float = 30.0) -> None:
+        self.cadence_seconds = refresh_seconds
         service = get_service_name() or "unknown"
-        advisory_key = f"task-registry-heartbeat:{service}"
+        self.lock_key: Optional[Union[int, str]] = f"task-registry-heartbeat:{service}"
 
-        def _acquire_leadership():
-            return pg_advisory_leadership(
-                engine,
-                advisory_key,
-                name="task_registry_heartbeat",
-            )
-
-        async def _on_leader() -> None:
-            # Hold leadership for the full heartbeat cycle: publish once, then
-            # re-publish on every tick until shutdown is signaled.  Exceptions
-            # propagate so run_leader_loop can resign and retry.
-            while not shutdown_event.is_set():
-                await publish_inventory(engine)
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=refresh_seconds)
-                    return  # shutdown signaled
-                except asyncio.TimeoutError:
-                    continue
-
-        await run_leader_loop(
-            acquire_leadership=_acquire_leadership,
-            on_leader=_on_leader,
-            name="task_registry_heartbeat",
-            cadence_seconds=refresh_seconds,
-            is_shutdown=shutdown_event.is_set,
-        )
-    else:
-        # Non-AsyncEngine path: single-process or sync-driver deployment.
-        # No concurrent writers → run unconditionally without leadership election.
-        while True:
-            await publish_inventory(engine)
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=refresh_seconds)
-                return  # shutdown signaled
-            except asyncio.TimeoutError:
-                continue
+    async def tick(self, ctx: ServiceContext) -> None:
+        await publish_inventory(ctx.engine)

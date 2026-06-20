@@ -436,41 +436,50 @@ class CatalogModule(ModuleProtocol):
             register_reindex_listener(self.event_service)
 
 
-            # 7. Start soft-delete TTL reaper background loop.
-            # Leader-elected (pg advisory lock) — only one pod runs scans.
+            # 7–10. Start leader-elected background services via BackgroundSupervisor.
+            from dynastore.modules.db_config.instance import get_service_name
+            from dynastore.tools.background_service import (
+                BackgroundSupervisor,
+                ServiceContext,
+            )
             from dynastore.modules.catalog.soft_delete_reaper import (
                 SoftDeleteReaper,
                 load_reaper_config,
             )
-            _reaper_shutdown = asyncio.Event()
-            _reaper: Optional[SoftDeleteReaper] = None
-            try:
-                reaper_cfg = await load_reaper_config()
-                _reaper = SoftDeleteReaper(reaper_cfg)
-                _reaper.start(_reaper_shutdown)
-                logger.info(
-                    "CatalogModule: soft-delete reaper started "
-                    "(grace=%ds, interval=%ds).",
-                    reaper_cfg.soft_grace_period_seconds,
-                    reaper_cfg.reaper_interval_seconds,
-                )
-            except Exception as exc:  # noqa: BLE001 — never block startup
-                logger.warning(
-                    "CatalogModule: soft-delete reaper failed to start: %s — "
-                    "soft-deleted entities will not be automatically promoted.",
-                    exc,
-                )
-
-            # 8. Register maintenance-supervisor job cadences and start the
-            # leader-elected supervisor loop (jobs 4–9: events, logs, IAM).
             from dynastore.modules.catalog.maintenance_supervisor import (
                 MaintenanceSupervisor,
                 build_supervisor_config,
                 register_supervisor_jobs,
                 unschedule_superseded_cron_jobs,
             )
-            _supervisor_shutdown = asyncio.Event()
-            _supervisor: Optional[MaintenanceSupervisor] = None
+            from dynastore.modules.catalog.lifecycle_reaper import (
+                LifecycleReaper,
+                load_lifecycle_reaper_config,
+            )
+            from dynastore.modules.db.db_contention_monitor import (
+                DbContentionMonitor,
+                load_db_contention_monitor_config,
+            )
+
+            _bg_shutdown = asyncio.Event()
+            bg_supervisor = BackgroundSupervisor()
+
+            try:
+                reaper_cfg = await load_reaper_config()
+                bg_supervisor.register(SoftDeleteReaper(reaper_cfg))
+                logger.info(
+                    "CatalogModule: soft-delete reaper registered "
+                    "(grace=%ds, interval=%ds).",
+                    reaper_cfg.soft_grace_period_seconds,
+                    reaper_cfg.reaper_interval_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: soft-delete reaper failed to configure: %s — "
+                    "soft-deleted entities will not be automatically promoted.",
+                    exc,
+                )
+
             try:
                 supervisor_cfg = build_supervisor_config()
                 # Clean-cut safety: drop any pre-existing events/logs/IAM pg_cron
@@ -478,59 +487,38 @@ class CatalogModule(ModuleProtocol):
                 # non-fresh deploy (no-op when pg_cron is absent).
                 await unschedule_superseded_cron_jobs(engine)
                 await register_supervisor_jobs(engine)
-                _supervisor = MaintenanceSupervisor(supervisor_cfg)
-                _supervisor.start(_supervisor_shutdown)
-                logger.info("CatalogModule: maintenance supervisor started.")
+                bg_supervisor.register(MaintenanceSupervisor(supervisor_cfg))
+                logger.info("CatalogModule: maintenance supervisor registered.")
             except Exception as exc:  # noqa: BLE001 — never block startup
                 logger.warning(
-                    "CatalogModule: maintenance supervisor failed to start: %s — "
+                    "CatalogModule: maintenance supervisor failed to configure: %s — "
                     "events/logs/IAM pruning will not run automatically.",
                     exc,
                 )
 
-            # 9. Start lifecycle-state reaper for stuck PROVISIONING / DELETING
-            # collections (backstop for pods that crash mid-init or mid-purge).
-            from dynastore.modules.catalog.lifecycle_reaper import (
-                LifecycleReaper,
-                load_lifecycle_reaper_config,
-            )
-            _lifecycle_reaper_shutdown = asyncio.Event()
-            _lifecycle_reaper: Optional[LifecycleReaper] = None
             try:
                 lifecycle_reaper_cfg = await load_lifecycle_reaper_config()
-                _lifecycle_reaper = LifecycleReaper(lifecycle_reaper_cfg)
-                _lifecycle_reaper.start(_lifecycle_reaper_shutdown)
+                bg_supervisor.register(LifecycleReaper(lifecycle_reaper_cfg))
                 logger.info(
-                    "CatalogModule: lifecycle reaper started "
+                    "CatalogModule: lifecycle reaper registered "
                     "(threshold=%ds, interval=%ds).",
                     lifecycle_reaper_cfg.stuck_threshold_seconds,
                     lifecycle_reaper_cfg.reaper_interval_seconds,
                 )
             except Exception as exc:  # noqa: BLE001 — never block startup
                 logger.warning(
-                    "CatalogModule: lifecycle reaper failed to start: %s — "
+                    "CatalogModule: lifecycle reaper failed to configure: %s — "
                     "stuck PROVISIONING/DELETING collections will not be "
                     "automatically reconciled.",
                     exc,
                 )
 
-            # 10. Start the read-only DB contention monitor — periodic
-            # snapshot of lock-waits vs. slow queries on the shared Postgres
-            # instance, so an incident can be attributed to locking or to DB
-            # resource pressure instead of guessed at. Leader-elected; read-only.
-            from dynastore.modules.db.db_contention_monitor import (
-                DbContentionMonitor,
-                load_db_contention_monitor_config,
-            )
-            _contention_monitor_shutdown = asyncio.Event()
-            _contention_monitor: Optional[DbContentionMonitor] = None
             try:
                 contention_cfg = load_db_contention_monitor_config()
                 if contention_cfg.enabled:
-                    _contention_monitor = DbContentionMonitor(contention_cfg)
-                    _contention_monitor.start(_contention_monitor_shutdown)
+                    bg_supervisor.register(DbContentionMonitor(contention_cfg))
                     logger.info(
-                        "CatalogModule: DB contention monitor started "
+                        "CatalogModule: DB contention monitor registered "
                         "(interval=%ds, slow_query=%ds, lock_wait=%ds).",
                         contention_cfg.interval_seconds,
                         contention_cfg.slow_query_seconds,
@@ -538,26 +526,24 @@ class CatalogModule(ModuleProtocol):
                     )
             except Exception as exc:  # noqa: BLE001 — never block startup
                 logger.warning(
-                    "CatalogModule: DB contention monitor failed to start: %s — "
+                    "CatalogModule: DB contention monitor failed to configure: %s — "
                     "lock/slow-query contention will not be logged automatically.",
                     exc,
                 )
 
+            bg_ctx = ServiceContext(
+                engine=engine,
+                shutdown=_bg_shutdown,
+                is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+                name=get_service_name() or "unknown",
+            )
+            bg_supervisor.start(bg_ctx)
+
             try:
                 yield
             finally:
-                _reaper_shutdown.set()
-                _supervisor_shutdown.set()
-                _lifecycle_reaper_shutdown.set()
-                _contention_monitor_shutdown.set()
-                if _reaper is not None:
-                    await _reaper.stop()
-                if _supervisor is not None:
-                    await _supervisor.stop()
-                if _lifecycle_reaper is not None:
-                    await _lifecycle_reaper.stop()
-                if _contention_monitor is not None:
-                    await _contention_monitor.stop()
+                _bg_shutdown.set()
+                await bg_supervisor.stop()
                 # Services cleanup handled by AsyncExitStack (stack.close() via __aexit__)
                 # Remove the services from the discovery registry so a future
                 # lifespan does not leave stale instances behind them.

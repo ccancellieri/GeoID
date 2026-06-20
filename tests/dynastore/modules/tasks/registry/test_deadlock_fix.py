@@ -24,8 +24,7 @@ Covers three properties:
 (c) heartbeat SQL locks in PK order (FOR UPDATE sub-select) and liveness refreshes on
     cache-hit ticks even when the structural UPSERT is skipped.
 (d) In-process digest memo prevents per-tick UPSERT storm when Valkey is unavailable.
-(e) Single-writer gating: AsyncEngine path routes through run_leader_loop/pg_advisory_leadership;
-    non-AsyncEngine path runs the unconditional loop unchanged.
+(g) RegistryHeartbeatService — unified BackgroundService form declares correct policy.
 """
 from __future__ import annotations
 
@@ -317,203 +316,49 @@ async def test_local_memo_does_not_suppress_new_digest(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (e) Single-writer gating: AsyncEngine → run_leader_loop; non-AsyncEngine → old loop
+# (g) RegistryHeartbeatService — unified BackgroundService form
 # ---------------------------------------------------------------------------
 
-# aiosqlite is not available in this environment, so we monkeypatch pub.AsyncEngine
-# to a sentinel base class that our fake engine subclasses.  This is the clean
-# alternative to create_async_engine("sqlite+aiosqlite:///:memory:").
+def test_registry_heartbeat_service_declares_policy(monkeypatch):
+    """The service declares LEADER_ONLY + SKIP_EPHEMERAL and a service-scoped key.
 
-
-class _FakeAsyncEngine:
-    """Passes isinstance(x, pub.AsyncEngine) after the monkeypatch below."""
-
-
-@pytest.mark.asyncio
-async def test_async_engine_routes_through_run_leader_loop(monkeypatch):
-    """When engine is an AsyncEngine, run_registry_heartbeat must delegate to
-    run_leader_loop (never calling publish_inventory directly) and must pass a
-    leadership key that contains the service name."""
-    # Monkeypatch pub.AsyncEngine so _FakeAsyncEngine passes the isinstance check.
-    monkeypatch.setattr(pub, "AsyncEngine", _FakeAsyncEngine)
-
-    leader_loop_calls: list = []
-    advisory_keys: list = []
-
-    async def _spy_run_leader_loop(
-        *,
-        acquire_leadership,
-        on_leader,
-        name,
-        cadence_seconds=5.0,
-        is_shutdown=None,
-    ):
-        # Record that run_leader_loop was called and capture the advisory key
-        # by inspecting what pg_advisory_leadership receives.
-        leader_loop_calls.append({"name": name, "cadence_seconds": cadence_seconds})
-        # Enter acquire_leadership once to capture the key, but do not yield True
-        # (we are a spy, not a real leader loop).  We need only to verify routing.
-        # Since acquire_leadership() returns an async context manager we can call
-        # it and inspect side-effects captured by the pg_advisory_leadership spy.
-
-    async def _spy_pg_advisory_leadership(engine, key, *, name="leader"):
-        advisory_keys.append(key)
-
-        @contextlib.asynccontextmanager
-        async def _cm():
-            yield False  # not a leader; the spy does not drive the inner loop
-
-        return _cm()
-
-    publish_calls: list = []
-
-    async def _spy_publish_inventory(engine):
-        publish_calls.append(engine)
-
-    monkeypatch.setattr(pub, "run_leader_loop", _spy_run_leader_loop)
-    monkeypatch.setattr(pub, "pg_advisory_leadership", _spy_pg_advisory_leadership)
-    monkeypatch.setattr(pub, "publish_inventory", _spy_publish_inventory)
-    monkeypatch.setattr(pub, "get_service_name", lambda: "svc-test")
-
-    fake_engine = _FakeAsyncEngine()
-    shutdown = asyncio.Event()
-    shutdown.set()  # immediate shutdown so the coroutine exits quickly
-
-    await pub.run_registry_heartbeat(fake_engine, shutdown, refresh_seconds=0.01)
-
-    assert len(leader_loop_calls) == 1, "run_leader_loop must be called once"
-    assert leader_loop_calls[0]["name"] == "task_registry_heartbeat"
-    assert len(publish_calls) == 0, (
-        "publish_inventory must NOT be called directly when routing through run_leader_loop"
-    )
-
-
-@pytest.mark.asyncio
-async def test_async_engine_advisory_key_contains_service_name(monkeypatch):
-    """The advisory key passed to pg_advisory_leadership must embed the service name."""
-    monkeypatch.setattr(pub, "AsyncEngine", _FakeAsyncEngine)
-
-    captured_keys: list = []
-
-    async def _capture_run_leader_loop(
-        *,
-        acquire_leadership,
-        on_leader,
-        name,
-        cadence_seconds=5.0,
-        is_shutdown=None,
-    ):
-        # Invoke acquire_leadership once to see what key it would pass.
-        async with acquire_leadership() as _:
-            pass
-
-    @contextlib.asynccontextmanager
-    async def _capture_pg_advisory_leadership(engine, key, *, name="leader"):
-        captured_keys.append(key)
-        yield False
-
-    monkeypatch.setattr(pub, "run_leader_loop", _capture_run_leader_loop)
-    monkeypatch.setattr(pub, "pg_advisory_leadership", _capture_pg_advisory_leadership)
-    monkeypatch.setattr(pub, "get_service_name", lambda: "my-service")
-
-    fake_engine = _FakeAsyncEngine()
-    shutdown = asyncio.Event()
-    shutdown.set()
-
-    await pub.run_registry_heartbeat(fake_engine, shutdown, refresh_seconds=0.01)
-
-    assert len(captured_keys) == 1
-    assert "my-service" in captured_keys[0], (
-        f"advisory key {captured_keys[0]!r} must contain the service name 'my-service'"
-    )
-
-
-@pytest.mark.asyncio
-async def test_sync_engine_runs_unconditional_loop_not_leader_loop(monkeypatch):
-    """When engine is NOT an AsyncEngine, run_registry_heartbeat runs the old
-    unconditional loop and calls publish_inventory directly, never run_leader_loop."""
-    leader_loop_called = {"n": 0}
-    publish_calls = {"n": 0}
-
-    async def _spy_run_leader_loop(**kwargs):
-        leader_loop_called["n"] += 1
-
-    async def _spy_publish_inventory(engine):
-        publish_calls["n"] += 1
-
-    monkeypatch.setattr(pub, "run_leader_loop", _spy_run_leader_loop)
-    monkeypatch.setattr(pub, "publish_inventory", _spy_publish_inventory)
-
-    engine = _SyncOnlyEngine()
-    shutdown = asyncio.Event()
-
-    async def _set_after_first_publish(original):
-        # Replace publish_inventory: set shutdown after first call so the loop exits.
-        async def _patched(eng):
-            publish_calls["n"] += 1
-            shutdown.set()
-        monkeypatch.setattr(pub, "publish_inventory", _patched)
-
-    # Re-patch publish_inventory to trigger shutdown after first call.
-    async def _publish_and_stop(eng):
-        publish_calls["n"] += 1
-        shutdown.set()
-
-    monkeypatch.setattr(pub, "publish_inventory", _publish_and_stop)
-
-    await pub.run_registry_heartbeat(engine, shutdown, refresh_seconds=0.01)
-
-    assert leader_loop_called["n"] == 0, "run_leader_loop must NOT be called for non-AsyncEngine"
-    assert publish_calls["n"] >= 1, "publish_inventory must be called directly"
-
-
-# ---------------------------------------------------------------------------
-# (f) Ephemeral-job gate: registry heartbeat skipped in job pods (#2271)
-# ---------------------------------------------------------------------------
-
-def test_should_run_registry_heartbeat_absent_flag():
-    """No ephemeral_job attribute → heartbeat should run (long-lived service default)."""
-    from types import SimpleNamespace
-    from dynastore.modules.tasks.tasks_module import _should_run_registry_heartbeat
-
-    state = SimpleNamespace()  # no ephemeral_job attribute
-    assert _should_run_registry_heartbeat(state) is True
-
-
-def test_should_run_registry_heartbeat_false():
-    """ephemeral_job=False → heartbeat should run (explicit non-ephemeral marker)."""
-    from types import SimpleNamespace
-    from dynastore.modules.tasks.tasks_module import _should_run_registry_heartbeat
-
-    state = SimpleNamespace(ephemeral_job=False)
-    assert _should_run_registry_heartbeat(state) is True
-
-
-def test_should_run_registry_heartbeat_ephemeral():
-    """ephemeral_job=True → heartbeat must NOT run (Cloud Run Job pod)."""
-    from types import SimpleNamespace
-    from dynastore.modules.tasks.tasks_module import _should_run_registry_heartbeat
-
-    state = SimpleNamespace(ephemeral_job=True)
-    assert _should_run_registry_heartbeat(state) is False
-
-
-def test_main_task_sets_ephemeral_job_flag():
-    """main_task.main() sets app_state.ephemeral_job=True before entering lifespan.
-
-    Tested by verifying the helper round-trips correctly on the same SimpleNamespace
-    shape that main() builds — no need to drive the full async lifecycle.
+    Leadership election and ephemeral gating are no longer hand-wired in the
+    function — they are policy fields the BackgroundSupervisor enforces. The
+    advisory key must still embed the service name so the lock identity matches
+    the legacy run_registry_heartbeat key across a rolling deploy.
     """
-    from types import SimpleNamespace
-    from dynastore.modules.tasks.tasks_module import _should_run_registry_heartbeat
+    from dynastore.tools.background_service import Leadership, PodPolicy
 
-    # Replicate what main_task.main() does:
-    app_state = SimpleNamespace()
-    app_state.ephemeral_job = True
+    monkeypatch.setattr(pub, "get_service_name", lambda: "my-service")
+    svc = pub.RegistryHeartbeatService(refresh_seconds=15.0)
 
-    assert getattr(app_state, "ephemeral_job", False) is True, (
-        "main_task must set app_state.ephemeral_job = True"
+    assert svc.name == "task_registry_heartbeat"
+    assert svc.leadership is Leadership.LEADER_ONLY
+    assert svc.pod_policy is PodPolicy.SKIP_EPHEMERAL
+    assert svc.cadence_seconds == 15.0
+    assert svc.lock_key == "task-registry-heartbeat:my-service", (
+        "advisory key must be preserved verbatim for rolling-deploy lock identity"
     )
-    assert _should_run_registry_heartbeat(app_state) is False, (
-        "a job pod's app_state must suppress the registry heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_registry_heartbeat_service_tick_publishes(monkeypatch):
+    """tick() delegates to publish_inventory with the context engine — the
+    cadence/leadership/skip plumbing lives in the supervisor, not here."""
+    from dynastore.tools.background_service import ServiceContext
+
+    published: list = []
+
+    async def _spy_publish(engine):
+        published.append(engine)
+
+    monkeypatch.setattr(pub, "publish_inventory", _spy_publish)
+
+    svc = pub.RegistryHeartbeatService()
+    engine = object()
+    ctx = ServiceContext(
+        engine=engine, shutdown=asyncio.Event(), is_ephemeral=False, name="svc"
     )
+    await svc.tick(ctx)
+
+    assert published == [engine]

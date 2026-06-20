@@ -39,11 +39,16 @@ reflects truth.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Union
 
 from dynastore.modules.tasks.capability_oracle import capability_key
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,42 +100,35 @@ async def _refresh_once(capabilities: Iterable[str], ttl_seconds: float) -> int:
     return written
 
 
-async def run_capability_publisher(
-    shutdown_event: asyncio.Event,
-    *,
-    ttl_seconds: float = 60.0,
-    refresh_seconds: float = 30.0,
-) -> None:
-    """Periodic loop that refreshes capability sentinel keys.
+class CapabilityPublisherService(PeriodicService):
+    """Refreshes capability sentinel keys in the shared cache on a fixed cadence.
 
-    Mirrors the shape of :func:`_warn_stuck_pending_tasks` in
-    :mod:`tasks_module` — sleeps with ``asyncio.wait_for(shutdown_event)``
-    so shutdowns are immediate, swallows all exceptions inside the loop
-    so a transient backend hiccup never crashes the publisher.
+    Runs on every pod (RUN_EVERYWHERE) so each pod refreshes its own
+    capability sentinels independently — no single writer is needed.
+    Skips ephemeral Cloud Run Job pods (SKIP_EPHEMERAL): they run one task
+    and exit, so there is nothing to advertise and no cache to maintain.
+    Resolves #2279 for this loop.
 
-    Writes one sentinel per local capability per tick. With the default
-    60s TTL + 30s refresh, every key is rewritten twice before expiry —
-    one missed tick is absorbed.
+    Each tick collects local capabilities and writes a sentinel key per
+    capability. PeriodicService supplies the loop, shutdown handling, and
+    the initial-tick-before-first-sleep guarantee — so dispatchers see
+    liveness from tick zero, not refresh_seconds later.
     """
-    if refresh_seconds <= 0:
-        logger.warning(
-            "capability_publisher: refresh_seconds=%.1f <= 0; disabling.",
-            refresh_seconds,
-        )
-        return
 
-    logger.info(
-        "capability_publisher: starting (ttl=%.1fs, refresh=%.1fs)",
-        ttl_seconds, refresh_seconds,
-    )
+    name = "capability_publisher"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = None
 
-    # First refresh runs immediately so dispatchers see liveness from
-    # tick zero, not refresh_seconds later.
-    while True:
+    def __init__(self, *, ttl_seconds: float = 60.0, refresh_seconds: float = 30.0) -> None:
+        self._ttl_seconds = ttl_seconds
+        self.cadence_seconds = refresh_seconds
+
+    async def tick(self, ctx: ServiceContext) -> None:
         try:
             caps = _collect_local_capabilities()
             if caps:
-                n = await _refresh_once(caps, ttl_seconds=ttl_seconds)
+                n = await _refresh_once(caps, ttl_seconds=self._ttl_seconds)
                 logger.debug(
                     "capability_publisher: refreshed %d/%d sentinels",
                     n, len(caps),
@@ -139,11 +137,3 @@ async def run_capability_publisher(
             logger.warning(
                 "capability_publisher: refresh raised — swallowing (%s)", exc,
             )
-
-        try:
-            await asyncio.wait_for(
-                shutdown_event.wait(), timeout=refresh_seconds,
-            )
-            return  # shutdown signalled during sleep
-        except asyncio.TimeoutError:
-            pass  # normal wakeup

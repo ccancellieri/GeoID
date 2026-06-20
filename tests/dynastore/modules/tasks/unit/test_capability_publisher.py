@@ -25,8 +25,8 @@ Contract:
   capabilities still get refreshed.
 - ``_refresh_once`` returns 0 silently when no async backend is
   registered (capability oracle will fail-open downstream).
-- The loop ``run_capability_publisher`` exits cleanly when
-  ``shutdown_event`` is set.
+- ``CapabilityPublisherService.tick()`` collects capabilities and
+  calls _refresh_once, swallowing exceptions.
 """
 from __future__ import annotations
 
@@ -37,6 +37,17 @@ import pytest
 
 from dynastore.modules.tasks import capability_publisher
 from dynastore.modules.tasks.capability_oracle import capability_key
+from dynastore.modules.tasks.capability_publisher import CapabilityPublisherService
+from dynastore.tools.background_service import ServiceContext
+
+
+def _ctx() -> ServiceContext:
+    return ServiceContext(
+        engine=object(),
+        shutdown=asyncio.Event(),
+        is_ephemeral=False,
+        name="test",
+    )
 
 
 @pytest.mark.asyncio
@@ -88,26 +99,8 @@ async def test_refresh_once_returns_zero_when_no_backend():
 
 
 @pytest.mark.asyncio
-async def test_run_publisher_exits_on_shutdown():
-    shutdown = asyncio.Event()
-    shutdown.set()
-    with patch.object(
-        capability_publisher, "_collect_local_capabilities", return_value=[],
-    ):
-        # First refresh runs (no-op, empty capabilities), then we hit the
-        # shutdown wait — which returns immediately because the event is set.
-        await asyncio.wait_for(
-            capability_publisher.run_capability_publisher(
-                shutdown, ttl_seconds=60.0, refresh_seconds=30.0,
-            ),
-            timeout=1.0,
-        )
-
-
-@pytest.mark.asyncio
-async def test_run_publisher_uses_local_capability_enumeration():
-    shutdown = asyncio.Event()
-    shutdown.set()
+async def test_tick_uses_local_capability_enumeration():
+    """tick() collects local capabilities and writes sentinel keys."""
     backend = MagicMock()
     backend.set = AsyncMock(return_value=True)
     mgr = MagicMock()
@@ -116,13 +109,28 @@ async def test_run_publisher_uses_local_capability_enumeration():
         capability_publisher, "_collect_local_capabilities",
         return_value=["catalog_elasticsearch_driver"],
     ), patch("dynastore.tools.cache.get_cache_manager", return_value=mgr):
-        await asyncio.wait_for(
-            capability_publisher.run_capability_publisher(
-                shutdown, ttl_seconds=60.0, refresh_seconds=30.0,
-            ),
-            timeout=1.0,
-        )
+        svc = CapabilityPublisherService(ttl_seconds=60.0, refresh_seconds=30.0)
+        await svc.tick(_ctx())
+
     backend.set.assert_awaited()
     assert backend.set.await_args_list[0].args[0] == capability_key(
         "catalog_elasticsearch_driver",
     )
+
+
+@pytest.mark.asyncio
+async def test_tick_swallows_exceptions():
+    """A failing _refresh_once must not propagate — tick() must be fail-soft."""
+    async def _fail_refresh(caps, *, ttl_seconds):
+        raise RuntimeError("cache down")
+
+    with patch.object(
+        capability_publisher, "_collect_local_capabilities",
+        return_value=["cap_a"],
+    ), patch.object(
+        capability_publisher, "_refresh_once",
+        side_effect=_fail_refresh,
+    ):
+        svc = CapabilityPublisherService()
+        # Must not raise
+        await svc.tick(_ctx())

@@ -18,14 +18,13 @@
 
 # dynastore/modules/tasks/tasks_module.py
 
-import asyncio
 import json
 import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from typing import List, Optional, Any, Dict, AsyncGenerator
+from typing import List, Optional, Any, Dict, AsyncGenerator, Union
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 from dynastore.modules import ModuleProtocol
@@ -45,6 +44,12 @@ from dynastore.modules.db_config.locking_tools import (
 from dynastore.modules.db_config.maintenance_tools import ensure_schema_exists
 from dynastore.models.protocols.task_queue import TaskQueueProtocol
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 
 from .models import Task, TaskCreate, TaskUpdate
 
@@ -615,8 +620,6 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
         """
         import asyncio
         from dynastore.modules.concurrency import get_background_executor
-        from dynastore.modules.tasks.queue import start_queue_listener
-        from dynastore.modules.tasks.dispatcher import run_dispatcher
         from dynastore.tasks import manage_tasks
 
         logger.info("TasksModule: Initialising task singletons …")
@@ -646,6 +649,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                     )
             logger.info("TasksModule: Task singletons active.")
 
+            supervisor = None
             if engine is not None:
                 executor = get_background_executor()
                 schema = get_task_schema()
@@ -832,7 +836,6 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 from dynastore.modules.tasks.capability_publisher import (
                     _collect_local_capabilities,
                     _refresh_once,
-                    run_capability_publisher,
                 )
                 try:
                     await _refresh_once(
@@ -844,69 +847,56 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                         exc,
                     )
 
-                executor.submit(start_queue_listener(engine, shutdown_event, poll_timeout=poll_interval), task_name="service:queue_listener")
-                executor.submit(run_dispatcher(engine, None, shutdown_event), task_name="service:dispatcher")
-                # Stuck-PENDING warner — periodic read-only scan for tasks that
-                # have been PENDING with retry_count=0 for too long. The most
-                # common cause is a routing typo or a service that should claim
-                # the task but isn't deployed. See _warn_stuck_pending_tasks.
-                executor.submit(
-                    _warn_stuck_pending_tasks(engine, schema, shutdown_event),
-                    task_name="service:stuck_pending_warner",
+                from dynastore.tools.background_service import (
+                    BackgroundSupervisor,
+                    ServiceContext as _ServiceContext,
                 )
-                # Proactive capability sweep (#524) — bulk-DLQ rows for
-                # confirmed-dead capabilities without waiting for the
-                # reactive reaper to claim+reject each row. Shares the
-                # same advisory-lock namespace as the reactive path so
-                # cross-pod dedupe holds. Reactive branch stays as a
-                # safety net until PR C deletes it.
-                executor.submit(
-                    _run_proactive_capability_sweep(
-                        engine, schema, shutdown_event,
+                from dynastore.modules.tasks.queue import QueueListenerService
+                from dynastore.modules.tasks.dispatcher import DispatcherService
+                from dynastore.modules.tasks.capability_publisher import (
+                    CapabilityPublisherService,
+                )
+                from dynastore.modules.tasks.registry.publisher import (
+                    RegistryHeartbeatService,
+                )
+                from dynastore.modules.db_config.instance import (
+                    get_service_name as _get_service_name,
+                )
+
+                bg_ctx = _ServiceContext(
+                    engine=engine,
+                    shutdown=shutdown_event,
+                    is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+                    name=_get_service_name() or "unknown",
+                )
+                supervisor = BackgroundSupervisor(executor)
+                supervisor.register(QueueListenerService(poll_timeout=poll_interval))
+                supervisor.register(DispatcherService())
+                supervisor.register(StuckPendingWarnerService(schema=schema))
+                supervisor.register(
+                    ProactiveSweepService(
+                        schema=schema,
                         interval_s=sweep_interval,
                         min_age_s=sweep_min_age,
                         capability_ttl_s=cap_ttl,
-                    ),
-                    task_name="service:proactive_capability_sweep",
+                    )
                 )
-                # Async refresh loop. Initial publish already ran
-                # synchronously above (before run_dispatcher was submitted)
-                # so dispatcher reactive-reaper checks never see an empty
-                # cache during cold start.
-                executor.submit(
-                    run_capability_publisher(
-                        shutdown_event,
+                # Async capability-sentinel refresh. Initial publish already ran
+                # synchronously above (before the supervisor starts) so
+                # dispatcher reactive-reaper checks never see an empty cache
+                # during cold start.
+                supervisor.register(
+                    CapabilityPublisherService(
                         ttl_seconds=cap_ttl,
                         refresh_seconds=cap_refresh,
-                    ),
-                    task_name="service:capability_publisher",
+                    )
                 )
                 # Durable task-capability registry: self-publish this pod's task
                 # inventory (version-gated via the shared cache, so the structural
                 # write happens ~once per deploy) and heartbeat last_seen on the
                 # same cadence as the capability publisher.
-                #
-                # The loops below (queue_listener, dispatcher, stuck_pending_warner,
-                # proactive_capability_sweep, capability_publisher) are candidates
-                # for the same ephemeral-job gate as a follow-up; scoped to the
-                # registry heartbeat here because it is the highest-contention
-                # writer at scale (#2271).
-                if _should_run_registry_heartbeat(app_state):
-                    from dynastore.modules.tasks.registry.publisher import (
-                        run_registry_heartbeat,
-                    )
-                    executor.submit(
-                        run_registry_heartbeat(
-                            engine,
-                            shutdown_event,
-                            refresh_seconds=cap_refresh,
-                        ),
-                        task_name="service:task_registry_heartbeat",
-                    )
-                else:
-                    logger.info(
-                        "TasksModule: registry heartbeat skipped in ephemeral job pod."
-                    )
+                supervisor.register(RegistryHeartbeatService(refresh_seconds=cap_refresh))
+                supervisor.start(bg_ctx)
                 logger.info(f"TasksModule: QueueListener (poll_interval={poll_interval}s) and Multi-Tenant Dispatcher launched.")
             else:
                 logger.warning(
@@ -919,17 +909,8 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
             finally:
                 shutdown_event.set()
                 logger.info("TasksModule: Shutdown event set — QueueListener/Dispatcher stopping.")
-
-
-def _should_run_registry_heartbeat(app_state: object) -> bool:
-    """Return True when this process should submit the registry heartbeat loop.
-
-    Ephemeral Cloud Run Job pods (``app_state.ephemeral_job is True``) must not
-    run the heartbeat: they execute a single task then exit, and at scale
-    hundreds run concurrently.  Long-lived web and worker services have no flag
-    set and always return True.
-    """
-    return not bool(getattr(app_state, "ephemeral_job", False))
+                if supervisor is not None:
+                    await supervisor.stop()
 
 
 # --- Internal Query Objects ---
@@ -1004,66 +985,63 @@ async def _redispatch_stuck_rows(
         logger.debug("stuck-pending redispatch: pg_notify failed: %s", exc)
 
 
-async def _warn_stuck_pending_tasks(
-    engine: DbResource,
-    schema: str,
-    shutdown_event: asyncio.Event,
-    interval_s: float = 60.0,
-    min_age_s: float = 600.0,
-    sample_limit: int = 50,
-) -> None:
-    """Periodic scan that logs WARNINGs for PENDING/retry_count=0 tasks older
-    than ``min_age_s`` seconds, then re-signals the dispatcher so claimable
-    rows are recovered without relying on pg_notify delivery or pg_cron.
+class StuckPendingWarnerService(PeriodicService):
+    """Periodic read-only scan for stuck PENDING tasks (retry_count=0).
 
-    The most common cause is a missed ``pg_notify`` at enqueue time (no
-    listener active at that instant) combined with pg_cron being absent or
-    misconfigured (as on dev). In that case the task sits PENDING forever
-    with no actor to claim it.
+    Runs on every pod (RUN_EVERYWHERE) and skips ephemeral Cloud Run Job
+    pods (SKIP_EPHEMERAL) — job pods claim one task and exit, never managing
+    stuck rows. Resolves #2279 for this loop.
 
-    Recovery: after logging, :func:`_redispatch_stuck_rows` emits the
-    in-process signal_bus (immediate same-pod wakeup) and ``pg_notify``
-    (cross-pod wakeup). ``claim_batch`` uses ``FOR UPDATE SKIP LOCKED`` so
-    only one pod claims each row — no double-execution across pods.
-
-    Rows whose required capability is confirmed dead (``cap_live is False``)
-    are skipped here — the proactive capability sweep owns their DLQ path.
-
-    The MaintenanceSupervisor-driven ``reap_stuck_tasks`` SQL function continues
-    to handle stuck *ACTIVE* tasks (heartbeat expired); this coroutine handles stuck
-    *PENDING* tasks (never claimed). Two orthogonal failure modes, two
-    independent recovery paths.
-
-    Idempotent and crash-safe: any error is logged and swallowed; the loop
-    sleeps and retries. Stops cleanly when ``shutdown_event`` is set.
+    The scan, log, and redispatch body is implemented in tick() — PeriodicService
+    supplies the loop, shutdown handling, and the initial tick. Note that
+    PeriodicService ticks IMMEDIATELY on startup then on cadence (the old
+    hand-rolled loop slept first); this is safe because the min_age guard
+    (min_age_s) filters freshly-enqueued rows.
     """
-    sql = (
-        f'SELECT task_id, task_type, schema_name, inputs, '  # nosec - schema is validated upstream
-        f'  EXTRACT(EPOCH FROM NOW() - timestamp) AS age_s '
-        f'FROM "{schema}".tasks '
-        f"WHERE status = 'PENDING' "
-        f"  AND retry_count = 0 "
-        f"  AND timestamp < NOW() - make_interval(secs => :min_age_s) "
-        f"ORDER BY timestamp ASC LIMIT :sample_limit;"
-    )
-    query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
 
-    while not shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
-            break  # shutdown signalled during sleep
-        except asyncio.TimeoutError:
-            pass  # normal — periodic wakeup
+    name = "stuck_pending_warner"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = None
 
+    def __init__(
+        self,
+        *,
+        schema: str,
+        interval_s: float = 60.0,
+        min_age_s: float = 600.0,
+        sample_limit: int = 50,
+    ) -> None:
+        self._schema = schema
+        self.cadence_seconds = interval_s
+        self._min_age_s = min_age_s
+        self._sample_limit = sample_limit
+        # Build the DQLQuery once; it is stateless and safe to share across ticks.
+        self._query = DQLQuery(
+            (
+                f'SELECT task_id, task_type, schema_name, inputs, '  # nosec
+                f'  EXTRACT(EPOCH FROM NOW() - timestamp) AS age_s '
+                f'FROM "{schema}".tasks '
+                f"WHERE status = 'PENDING' "
+                f"  AND retry_count = 0 "
+                f"  AND timestamp < NOW() - make_interval(secs => :min_age_s) "
+                f"ORDER BY timestamp ASC LIMIT :sample_limit;"
+            ),
+            result_handler=ResultHandler.ALL_DICTS,
+        )
+
+    async def tick(self, ctx: ServiceContext) -> None:
         try:
-            async with managed_transaction(engine) as conn:
-                rows = await query.execute(
-                    conn, min_age_s=min_age_s, sample_limit=sample_limit,
+            async with managed_transaction(ctx.engine) as conn:
+                rows = await self._query.execute(
+                    conn,
+                    min_age_s=self._min_age_s,
+                    sample_limit=self._sample_limit,
                 )
             rows = rows or []
             await _emit_stuck_pending_logs(rows)
             if rows:
-                await _redispatch_stuck_rows(engine, rows)
+                await _redispatch_stuck_rows(ctx.engine, rows)
         except Exception as exc:  # noqa: BLE001 — never crash on diagnostic
             logger.warning("stuck-pending warner: scan failed: %s", exc)
 
@@ -1208,57 +1186,56 @@ async def _run_mandatory_backstop_pass(
         logger.warning("proactive_sweep: mandatory backstop pass failed: %s", exc)
 
 
-async def _run_proactive_capability_sweep(
-    engine: DbResource,
-    schema: str,
-    shutdown_event: asyncio.Event,
-    *,
-    interval_s: float = 60.0,
-    min_age_s: float = 300.0,
-    max_caps_per_pass: int = 50,
-    capability_ttl_s: float = 90.0,
-) -> None:
-    """Periodically DLQ PENDING/retry=0 rows whose required capability
-    has no live worker (issue #524).
+class ProactiveSweepService(PeriodicService):
+    """Periodic DLQ sweep for PENDING rows whose required capability has no
+    live worker.
 
-    Complements the reactive reaper in ``dispatcher.py`` — same advisory
-    lock + double-check, but driven by a wall-clock timer instead of
-    waiting for a claim+reject cycle. With this loop running, the
-    worst-case latency between "last pod for a capability dies" and
-    "rows leave PENDING" is bounded by ``interval_s`` regardless of
-    incoming task volume.
+    Runs on every pod (RUN_EVERYWHERE) and skips ephemeral Cloud Run Job
+    pods (SKIP_EPHEMERAL). Resolves #2279 for this loop.
 
-    Per-pass: walks ``TASK_TYPE_CAPABILITY_INPUTS_KEY``, queries
-    distinct capability ids referenced by old PENDING rows, calls
-    ``sweep_dead_capability_rows`` per pair. Returns ``0`` when the
-    oracle says the capability is live or the advisory lock is taken
-    by another pod — so multiple pods running this loop in parallel
-    do not multiply work.
-
-    Idempotent and crash-safe: any error is logged and swallowed; the
-    loop sleeps and retries. Stops cleanly when ``shutdown_event`` is
-    set.
+    The in-body advisory lock (_run_mandatory_backstop_pass /
+    pg_try_advisory_xact_lock) is preserved — do NOT add loop-level
+    LEADER_ONLY leadership here; the per-pass locking already deduplicates
+    across pods for the backstop step. PeriodicService supplies the outer
+    loop and shutdown handling. Note that PeriodicService ticks IMMEDIATELY
+    on startup then on cadence (the old hand-rolled loop slept first); this
+    is safe because the min_age guard (min_age_s) filters freshly-enqueued rows.
     """
-    from dynastore.modules.tasks.capability_oracle import (
-        TASK_TYPE_CAPABILITY_INPUTS_KEY,
-    )
-    from dynastore.modules.tasks.dispatcher import sweep_dead_capability_rows
 
-    while not shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
-            break  # shutdown signalled during sleep
-        except asyncio.TimeoutError:
-            pass  # normal — periodic wakeup
+    name = "proactive_capability_sweep"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = None
+
+    def __init__(
+        self,
+        *,
+        schema: str,
+        interval_s: float = 60.0,
+        min_age_s: float = 300.0,
+        max_caps_per_pass: int = 50,
+        capability_ttl_s: float = 90.0,
+    ) -> None:
+        self._schema = schema
+        self.cadence_seconds = interval_s
+        self._min_age_s = min_age_s
+        self._max_caps_per_pass = max_caps_per_pass
+        self._capability_ttl_s = capability_ttl_s
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        from dynastore.modules.tasks.capability_oracle import (
+            TASK_TYPE_CAPABILITY_INPUTS_KEY,
+        )
+        from dynastore.modules.tasks.dispatcher import sweep_dead_capability_rows
 
         try:
             for task_type, inputs_key in TASK_TYPE_CAPABILITY_INPUTS_KEY.items():
-                if shutdown_event.is_set():
+                if ctx.shutdown.is_set():
                     return
                 try:
                     cap_ids = await _distinct_pending_capability_ids(
-                        engine, schema, task_type, inputs_key,
-                        min_age_s, max_caps_per_pass,
+                        ctx.engine, self._schema, task_type, inputs_key,
+                        self._min_age_s, self._max_caps_per_pass,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1267,11 +1244,11 @@ async def _run_proactive_capability_sweep(
                     )
                     continue
                 for cap_id in cap_ids:
-                    if shutdown_event.is_set():
+                    if ctx.shutdown.is_set():
                         return
                     try:
                         dlqed = await sweep_dead_capability_rows(
-                            engine, cap_id, task_type=task_type,
+                            ctx.engine, cap_id, task_type=task_type,
                         )
                         if dlqed > 0:
                             logger.info(
@@ -1285,20 +1262,14 @@ async def _run_proactive_capability_sweep(
                             "(capability=%s task_type=%s): %s",
                             cap_id, task_type, exc,
                         )
-            # Capability-less backstop + mandatory-ownership invariant. Runs on
-            # one pod per pass (advisory-locked inside the helper) so it covers
-            # task types the capability reaper skips for required_capability=None
-            # rows.
             await _run_mandatory_backstop_pass(
-                engine, schema, ttl_grace_seconds=capability_ttl_s, min_age_s=min_age_s,
+                ctx.engine, self._schema,
+                ttl_grace_seconds=self._capability_ttl_s,
+                min_age_s=self._min_age_s,
             )
-            # Wedged-provisioning reconciler: drain still-pending checklist
-            # steps for catalogs stuck in 'provisioning' with no live task.
-            # Runs on every pod independently — drain_pending_checklist_steps
-            # uses SELECT … FOR UPDATE, so concurrent pods are serialised.
             try:
                 drained = await sweep_wedged_provisioning_catalogs(
-                    engine, min_age_s=min_age_s,
+                    ctx.engine, min_age_s=self._min_age_s,
                 )
                 if drained:
                     logger.info(

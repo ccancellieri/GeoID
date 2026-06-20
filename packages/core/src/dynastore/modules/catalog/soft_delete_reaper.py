@@ -44,19 +44,23 @@ Architecture contract
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Union
 
 from pydantic import Field
 
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
-from dynastore.modules.db_config.locking_tools import pg_advisory_leadership
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
     managed_transaction,
+)
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
 )
 from dynastore.tools.discovery import get_protocol
 from dynastore.tools.protocol_helpers import get_engine
@@ -178,58 +182,27 @@ ORDER BY cat.id, col.id
 """
 
 
-class SoftDeleteReaper:
+class SoftDeleteReaper(PeriodicService):
     """Periodic reaper that promotes soft-deleted entities to hard-deleted.
 
-    Call ``start(shutdown_event)`` from a module lifespan to launch the
-    background loop.  Only one instance should run per process; leader
-    election via a pg advisory lock ensures exactly one instance runs
-    fleet-wide.
+    Implements ``PeriodicService``: ``BackgroundSupervisor`` handles leadership
+    election via ``_REAPER_ADVISORY_LOCK_KEY`` and the configured cadence.
+    Each tick calls ``run_once()`` which scans for entities past the grace
+    window and hard-deletes them via the existing force-delete path.
     """
+
+    name = "soft_delete_reaper"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
 
     def __init__(self, config: SoftDeleteReaperConfig) -> None:
         self._config = config
-        self._task: Optional[asyncio.Task[Any]] = None
+        self.cadence_seconds = config.reaper_interval_seconds
+        self.lock_key: Optional[Union[int, str]] = _REAPER_ADVISORY_LOCK_KEY
 
-    def start(self, shutdown_event: asyncio.Event) -> None:
-        """Schedule the reaper loop as an asyncio background task."""
-        self._task = asyncio.create_task(
-            self._loop(shutdown_event),
-            name="soft_delete_reaper",
-        )
-
-    async def stop(self) -> None:
-        """Cancel and await the background task."""
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self._task = None
-
-    async def _loop(self, shutdown_event: asyncio.Event) -> None:
-        """Leader-elected outer loop — exits when shutdown_event is set."""
-        from dynastore.tools.async_utils import run_leader_loop
-
-        def _acquire_leadership():
-            return pg_advisory_leadership(
-                get_engine(),
-                _REAPER_ADVISORY_LOCK_KEY,
-                name="SoftDeleteReaper",
-            )
-
-        async def _on_leader() -> None:
-            await self.run_once()
-            await asyncio.sleep(self._config.reaper_interval_seconds)
-
-        await run_leader_loop(
-            acquire_leadership=_acquire_leadership,
-            on_leader=_on_leader,
-            name="SoftDeleteReaper",
-            cadence_seconds=self._config.reaper_interval_seconds,
-            is_shutdown=shutdown_event.is_set,
-        )
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One reaper scan across catalogs and collections."""
+        await self.run_once()
 
     async def run_once(self) -> None:
         """Perform one full reaper scan across catalogs and collections.

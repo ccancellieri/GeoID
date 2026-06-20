@@ -46,19 +46,24 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from dynastore.modules.catalog.db_init.maintenance_schedule import (
     MaintenanceScheduleRepository,
 )
 from dynastore.modules.db_config.locking_tools import (
     check_extension_exists,
-    pg_advisory_leadership,
 )
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
     managed_transaction,
+)
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
 )
 from dynastore.tools.protocol_helpers import get_engine
 
@@ -621,18 +626,19 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
 # ---------------------------------------------------------------------------
 
 
-class MaintenanceSupervisor:
+class MaintenanceSupervisor(PeriodicService):
     """Leader-elected supervisor that drives periodic maintenance jobs.
 
-    Call ``start(shutdown_event)`` from CatalogModule.lifespan to schedule the
-    background loop.  The supervisor holds a session-level pg advisory lock on
-    a dedicated ``managed_transaction`` connection; exactly one pod fleet-wide
-    wins the lock per cadence.
-
-    Jobs are registered via ``repo.upsert_job`` at startup; the supervisor
-    reads ``tasks.maintenance_schedule`` on every tick (no caching — it is
-    the mutable source of truth).
+    Implements ``PeriodicService``: ``BackgroundSupervisor`` handles leadership
+    election via ``_SUPERVISOR_ADVISORY_LOCK_KEY`` and the 60 s cadence.  Each
+    tick calls ``run_once()`` which reads ``tasks.maintenance_schedule`` (no
+    caching — it is the mutable source of truth) and dispatches every due job
+    in its own bounded transaction.
     """
+
+    name = "maintenance_supervisor"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
 
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialise with resolved job config values.
@@ -642,49 +648,12 @@ class MaintenanceSupervisor:
                                  tasks_module.get_hard_retry_cap()
         """
         self._config = config
-        self._task: Optional[asyncio.Task[Any]] = None
+        self.cadence_seconds = 60.0
+        self.lock_key: Optional[Union[int, str]] = _SUPERVISOR_ADVISORY_LOCK_KEY
 
-    def start(self, shutdown_event: asyncio.Event) -> None:
-        """Schedule the supervisor loop as an asyncio background task."""
-        self._task = asyncio.create_task(
-            self._loop(shutdown_event),
-            name="maintenance_supervisor",
-        )
-
-    async def stop(self) -> None:
-        """Cancel and await the background task."""
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self._task = None
-
-    async def _loop(self, shutdown_event: asyncio.Event) -> None:
-        """Leader-elected outer loop — exits when shutdown_event is set."""
-        from dynastore.tools.async_utils import run_leader_loop
-
-        def _acquire_leadership():
-            return pg_advisory_leadership(
-                get_engine(),
-                _SUPERVISOR_ADVISORY_LOCK_KEY,
-                name="MaintenanceSupervisor",
-            )
-
-        async def _on_leader() -> None:
-            await self.run_once()
-            # Cadence sleep: re-evaluate leadership every 60 s (inner cadence).
-            # The outer run_leader_loop cadence_seconds controls the outer retry.
-            await asyncio.sleep(60.0)
-
-        await run_leader_loop(
-            acquire_leadership=_acquire_leadership,
-            on_leader=_on_leader,
-            name="MaintenanceSupervisor",
-            cadence_seconds=60.0,
-            is_shutdown=shutdown_event.is_set,
-        )
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One full supervisor tick: reclaim stale, then dispatch due jobs."""
+        await self.run_once()
 
     async def run_once(self) -> None:
         """One full supervisor tick: reclaim stale, then dispatch due jobs.

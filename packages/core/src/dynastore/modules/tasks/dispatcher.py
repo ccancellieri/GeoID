@@ -46,10 +46,15 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 
 
 from dynastore.modules.tasks.durable.locks import stable_lock_id_blake2b as _stable_lock_id_blake2b
+from dynastore.tools.background_service import (
+    Leadership,
+    PodPolicy,
+    ServiceContext,
+)
 
 
 def _stable_advisory_lock_key(*parts: str) -> int:
@@ -874,8 +879,7 @@ async def run_dispatcher(
                     )
                     # Mirror to Valkey counter (#524 Signal A). Only emit
                     # when we have a real capability id; "-" rows are
-                    # routing rejections we already surface via
-                    # _warn_stuck_pending_tasks.
+                    # routing rejections surfaced by StuckPendingWarnerService.
                     if cap_id:
                         from dynastore.modules.tasks.capability_stats import (
                             bump_claim_rejected,
@@ -1117,3 +1121,22 @@ async def run_dispatcher(
 
     await heartbeat.stop()
     logger.info("Dispatcher: Stopped.")
+
+
+class DispatcherService:
+    """BackgroundService wrapper for the task dispatcher.
+
+    Runs on every pod (RUN_EVERYWHERE) — all long-lived pods participate in
+    claiming tasks; SKIP LOCKED in claim_batch provides the necessary
+    cross-pod deduplication. Skips ephemeral Cloud Run Job pods
+    (SKIP_EPHEMERAL) — they claim tasks directly via claim_for_execution and
+    never need the dispatcher loop. Resolves #2279 for this loop.
+    """
+
+    name = "dispatcher"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = None
+
+    async def run(self, ctx: ServiceContext) -> None:
+        await run_dispatcher(ctx.engine, None, ctx.shutdown)

@@ -16,11 +16,10 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for ``tasks_module._run_proactive_capability_sweep`` (#524 PR B).
+"""Unit tests for ``ProactiveSweepService.tick()`` (#524 PR B).
 
 Covers:
-- Clean shutdown when ``shutdown_event`` is set up-front.
-- Distinct-pending query failure does not crash the loop.
+- Distinct-pending query failure does not crash the tick.
 - ``sweep_dead_capability_rows`` failure for one capability does not prevent
   subsequent capabilities from being swept.
 - Nonzero sweep result emits the structured INFO line.
@@ -39,45 +38,32 @@ from unittest.mock import ANY, AsyncMock, patch
 import pytest
 
 from dynastore.modules.tasks.tasks_module import (
+    ProactiveSweepService,
     _distinct_pending_capability_ids,
-    _run_proactive_capability_sweep,
 )
+from dynastore.tools.background_service import ServiceContext
 
 
-@pytest.mark.asyncio
-async def test_sweep_exits_immediately_on_shutdown():
-    """If shutdown_event is already set the loop returns without scanning."""
-    shutdown = asyncio.Event()
-    shutdown.set()
-    with patch(
-        "dynastore.modules.tasks.tasks_module._distinct_pending_capability_ids",
-        new=AsyncMock(),
-    ) as distinct_mock:
-        await asyncio.wait_for(
-            _run_proactive_capability_sweep(
-                engine=object(),
-                schema="tasks",
-                shutdown_event=shutdown,
-                interval_s=0.01,
-            ),
-            timeout=1.0,
-        )
-    distinct_mock.assert_not_awaited()
+def _ctx(*, shutdown_set: bool = False) -> ServiceContext:
+    ev = asyncio.Event()
+    if shutdown_set:
+        ev.set()
+    return ServiceContext(
+        engine=object(),
+        shutdown=ev,
+        is_ephemeral=False,
+        name="test",
+    )
 
 
 @pytest.mark.asyncio
 async def test_sweep_logs_dlq_count_on_nonzero_result(caplog):
-    """When sweep_dead_capability_rows returns N>0 the loop emits a
+    """When sweep_dead_capability_rows returns N>0 the tick emits a
     structured INFO line so a log-based metric can pick it up."""
-    shutdown = asyncio.Event()
     caplog.set_level(logging.INFO, logger="dynastore.modules.tasks.tasks_module")
 
     sweep = AsyncMock(return_value=4)
     distinct = AsyncMock(return_value=["dead_cap_1"])
-
-    async def stop_after_first_pass():
-        await asyncio.sleep(0.05)
-        shutdown.set()
 
     with patch(
         "dynastore.modules.tasks.tasks_module._distinct_pending_capability_ids",
@@ -85,16 +71,15 @@ async def test_sweep_logs_dlq_count_on_nonzero_result(caplog):
     ), patch(
         "dynastore.modules.tasks.dispatcher.sweep_dead_capability_rows",
         new=sweep,
+    ), patch(
+        "dynastore.modules.tasks.tasks_module._run_mandatory_backstop_pass",
+        new=AsyncMock(),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.sweep_wedged_provisioning_catalogs",
+        new=AsyncMock(return_value=0),
     ):
-        await asyncio.gather(
-            _run_proactive_capability_sweep(
-                engine=object(),
-                schema="tasks",
-                shutdown_event=shutdown,
-                interval_s=0.01,
-            ),
-            stop_after_first_pass(),
-        )
+        svc = ProactiveSweepService(schema="tasks", interval_s=0.01)
+        await svc.tick(_ctx())
 
     sweep.assert_awaited_with(ANY, "dead_cap_1", task_type="index_propagation")
     info_lines = [
@@ -109,29 +94,23 @@ async def test_sweep_logs_dlq_count_on_nonzero_result(caplog):
 @pytest.mark.asyncio
 async def test_sweep_continues_when_distinct_query_fails(caplog):
     """A failing DISTINCT query for one task_type must be logged and the
-    loop must keep going (does not crash the entire sweeper)."""
-    shutdown = asyncio.Event()
+    tick must keep going (does not crash the entire sweeper)."""
     caplog.set_level(logging.WARNING, logger="dynastore.modules.tasks.tasks_module")
 
     distinct = AsyncMock(side_effect=RuntimeError("boom"))
 
-    async def stop_after_first_pass():
-        await asyncio.sleep(0.05)
-        shutdown.set()
-
     with patch(
         "dynastore.modules.tasks.tasks_module._distinct_pending_capability_ids",
         new=distinct,
+    ), patch(
+        "dynastore.modules.tasks.tasks_module._run_mandatory_backstop_pass",
+        new=AsyncMock(),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.sweep_wedged_provisioning_catalogs",
+        new=AsyncMock(return_value=0),
     ):
-        await asyncio.gather(
-            _run_proactive_capability_sweep(
-                engine=object(),
-                schema="tasks",
-                shutdown_event=shutdown,
-                interval_s=0.01,
-            ),
-            stop_after_first_pass(),
-        )
+        svc = ProactiveSweepService(schema="tasks", interval_s=0.01)
+        await svc.tick(_ctx())
 
     warn_lines = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert any(
@@ -144,7 +123,6 @@ async def test_sweep_continues_when_distinct_query_fails(caplog):
 async def test_sweep_continues_when_one_capability_sweep_fails(caplog):
     """A sweep_dead_capability_rows raising for one (cap, task_type) pair
     must not abort the pass — subsequent cap_ids still get a chance."""
-    shutdown = asyncio.Event()
     caplog.set_level(logging.WARNING, logger="dynastore.modules.tasks.tasks_module")
 
     distinct = AsyncMock(return_value=["bad_cap", "good_cap"])
@@ -159,26 +137,21 @@ async def test_sweep_continues_when_one_capability_sweep_fails(caplog):
 
     sweep = AsyncMock(side_effect=sweep_side_effect)
 
-    async def stop_after_first_pass():
-        await asyncio.sleep(0.05)
-        shutdown.set()
-
     with patch(
         "dynastore.modules.tasks.tasks_module._distinct_pending_capability_ids",
         new=distinct,
     ), patch(
         "dynastore.modules.tasks.dispatcher.sweep_dead_capability_rows",
         new=sweep,
+    ), patch(
+        "dynastore.modules.tasks.tasks_module._run_mandatory_backstop_pass",
+        new=AsyncMock(),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.sweep_wedged_provisioning_catalogs",
+        new=AsyncMock(return_value=0),
     ):
-        await asyncio.gather(
-            _run_proactive_capability_sweep(
-                engine=object(),
-                schema="tasks",
-                shutdown_event=shutdown,
-                interval_s=0.01,
-            ),
-            stop_after_first_pass(),
-        )
+        svc = ProactiveSweepService(schema="tasks", interval_s=0.01)
+        await svc.tick(_ctx())
 
     # Both cap_ids must have been tried — bad_cap fails, good_cap succeeds.
     swept_caps = [call.args[1] for call in sweep.await_args_list]
@@ -190,6 +163,41 @@ async def test_sweep_continues_when_one_capability_sweep_fails(caplog):
         "proactive_sweep: sweep failed" in m and "bad_cap" in m
         for m in warn_lines
     ), f"missing sweep-failure warning in: {warn_lines}"
+
+
+@pytest.mark.asyncio
+async def test_sweep_tick_short_circuits_on_shutdown_during_inner_iteration():
+    """tick() checks ctx.shutdown during the inner cap_id loop and returns early."""
+    ctx = _ctx()
+
+    sweep_calls: list = []
+
+    async def _sweep_and_set(_engine, cap_id, *, task_type):
+        sweep_calls.append(cap_id)
+        # Signal shutdown after the first cap — the second should not run.
+        ctx.shutdown.set()
+        return 0
+
+    distinct = AsyncMock(return_value=["cap_one", "cap_two"])
+
+    with patch(
+        "dynastore.modules.tasks.tasks_module._distinct_pending_capability_ids",
+        new=distinct,
+    ), patch(
+        "dynastore.modules.tasks.dispatcher.sweep_dead_capability_rows",
+        new=AsyncMock(side_effect=_sweep_and_set),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module._run_mandatory_backstop_pass",
+        new=AsyncMock(),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.sweep_wedged_provisioning_catalogs",
+        new=AsyncMock(return_value=0),
+    ):
+        svc = ProactiveSweepService(schema="tasks", interval_s=0.01)
+        await svc.tick(ctx)
+
+    # Only the first cap should have been swept before shutdown.
+    assert sweep_calls == ["cap_one"]
 
 
 @pytest.mark.asyncio

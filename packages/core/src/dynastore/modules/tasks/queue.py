@@ -30,11 +30,16 @@ Janitor sweep even when no notifications arrive.
 
 import asyncio
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 
 from dynastore.tools.async_utils import signal_bus, PgListenBridge
 from dynastore.modules.db_config.query_executor import DbResource
+from dynastore.tools.background_service import (
+    Leadership,
+    PodPolicy,
+    ServiceContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,3 +150,28 @@ async def start_queue_listener(
             pass
 
     logger.info("QueueListener: Stopped.")
+
+
+class QueueListenerService:
+    """BackgroundService wrapper for the pg_notify queue listener.
+
+    Runs on every pod (RUN_EVERYWHERE) and skips ephemeral Cloud Run Job pods
+    (SKIP_EPHEMERAL) — job pods claim exactly one task and exit; they never
+    need to listen for incoming notifications. Resolves #2279 for this loop.
+
+    No leadership election: every long-lived pod opens its own LISTEN
+    connection; the dispatcher's SKIP LOCKED handles claim contention safely.
+    """
+
+    name = "queue_listener"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = None
+
+    def __init__(self, *, poll_timeout: float = 30.0) -> None:
+        self._poll_timeout = poll_timeout
+
+    async def run(self, ctx: ServiceContext) -> None:
+        await start_queue_listener(
+            ctx.engine, ctx.shutdown, poll_timeout=self._poll_timeout,
+        )

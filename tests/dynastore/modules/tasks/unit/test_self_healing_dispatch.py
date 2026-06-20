@@ -16,8 +16,8 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for the self-healing stuck-PENDING dispatch in
-``_warn_stuck_pending_tasks`` and its helper ``_redispatch_stuck_rows``.
+"""Unit tests for the self-healing stuck-PENDING dispatch via
+``StuckPendingWarnerService.tick()`` and its helper ``_redispatch_stuck_rows``.
 
 These tests are pure-Python / no-DB: all SQL is mocked. The contract:
 
@@ -44,9 +44,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from dynastore.modules.tasks.tasks_module import (
+    StuckPendingWarnerService,
     _redispatch_stuck_rows,
-    _warn_stuck_pending_tasks,
 )
+from dynastore.tools.background_service import ServiceContext
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,15 @@ def _make_rows(n: int, task_type: str = "gcp_provision_catalog") -> List[Dict[st
 @asynccontextmanager
 async def _fake_managed_transaction(_engine):
     yield MagicMock()
+
+
+def _ctx() -> ServiceContext:
+    return ServiceContext(
+        engine=object(),
+        shutdown=asyncio.Event(),
+        is_ephemeral=False,
+        name="test",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -140,16 +150,11 @@ async def test_redispatch_skips_dead_capability_rows():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_warn_loop_emits_only_once_when_two_sweepers_race():
-    """Two concurrent sweeper coroutines both wake up and call
-    _redispatch_stuck_rows for the same row.  The signal_bus.emit is
-    idempotent (WaitableSignal.set() called twice is fine).  The pg_notify
-    is emitted by both pods — but claim_batch's FOR UPDATE SKIP LOCKED means
-    only one pod claims the row.  We verify that:
-      - signal_bus.emit was called twice (once per sweeper) — idempotent.
-      - pg_notify SELECT was executed twice (once per sweeper).
-    This proves the sweep does NOT attempt to claim the row itself and that
-    there is no internal lock preventing parallel pods from emitting.
+async def test_warn_tick_emits_only_once_when_two_sweepers_race():
+    """Two concurrent _redispatch_stuck_rows calls for the same row both emit
+    — signal_bus.emit is idempotent (WaitableSignal.set() called twice is fine)
+    and pg_notify is emitted by both pods.  claim_batch's FOR UPDATE SKIP LOCKED
+    means only one pod claims the row.
     """
     rows = _make_rows(1)
 
@@ -159,7 +164,6 @@ async def test_warn_loop_emits_only_once_when_two_sweepers_race():
         bus_emit_calls.append(args)
 
     fake_query = AsyncMock()
-    fake_query.execute = AsyncMock(return_value=None)
     notify_count = {"n": 0}
 
     async def _counting_execute(*args, **kwargs):
@@ -187,19 +191,13 @@ async def test_warn_loop_emits_only_once_when_two_sweepers_race():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_warn_loop_still_emits_warning_for_stuck_rows(caplog):
-    """The warning log introduced in the original function must still fire
-    even after the self-healing redispatch is added.
+async def test_warn_tick_still_emits_warning_for_stuck_rows(caplog):
+    """The warning log must fire for stuck rows, and _redispatch_stuck_rows
+    must be called for non-empty results.
     """
-    shutdown = asyncio.Event()
     fake_rows = _make_rows(2)
-
-    async def _fake_execute(*args, **kwargs):
-        shutdown.set()
-        return fake_rows
-
     fake_query = AsyncMock()
-    fake_query.execute = _fake_execute
+    fake_query.execute = AsyncMock(return_value=fake_rows)
     fake_redispatch = AsyncMock()
 
     caplog.set_level(logging.WARNING)
@@ -211,13 +209,8 @@ async def test_warn_loop_still_emits_warning_for_stuck_rows(caplog):
              "dynastore.modules.tasks.capability_oracle.is_capability_live",
              new=AsyncMock(return_value=None),
          ):
-        await asyncio.wait_for(
-            _warn_stuck_pending_tasks(
-                engine=object(), schema="tasks", shutdown_event=shutdown,
-                interval_s=0.01, min_age_s=10.0,
-            ),
-            timeout=2.0,
-        )
+        svc = StuckPendingWarnerService(schema="tasks", interval_s=0.01, min_age_s=10.0)
+        await svc.tick(_ctx())
 
     warn_lines = [r.message for r in caplog.records if "stuck-pending: task" in r.message]
     assert len(warn_lines) == 2
@@ -230,30 +223,19 @@ async def test_warn_loop_still_emits_warning_for_stuck_rows(caplog):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_warn_loop_skips_redispatch_when_no_stuck_rows():
+async def test_warn_tick_skips_redispatch_when_no_stuck_rows():
     """When the scan returns an empty set, _redispatch_stuck_rows must not
     be called (and no signal must be emitted).
     """
-    shutdown = asyncio.Event()
-
-    async def _empty_execute(*args, **kwargs):
-        shutdown.set()
-        return []
-
     fake_query = AsyncMock()
-    fake_query.execute = _empty_execute
+    fake_query.execute = AsyncMock(return_value=[])
     fake_redispatch = AsyncMock()
 
     with patch("dynastore.modules.tasks.tasks_module.DQLQuery", return_value=fake_query), \
          patch("dynastore.modules.tasks.tasks_module.managed_transaction", _fake_managed_transaction), \
          patch("dynastore.modules.tasks.tasks_module._redispatch_stuck_rows", fake_redispatch):
-        await asyncio.wait_for(
-            _warn_stuck_pending_tasks(
-                engine=object(), schema="tasks", shutdown_event=shutdown,
-                interval_s=0.01, min_age_s=10.0,
-            ),
-            timeout=2.0,
-        )
+        svc = StuckPendingWarnerService(schema="tasks", interval_s=0.01, min_age_s=10.0)
+        await svc.tick(_ctx())
 
     fake_redispatch.assert_not_awaited()
 
