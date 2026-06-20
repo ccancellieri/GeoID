@@ -827,8 +827,19 @@ class QueryOptimizer:
                     is_spatial = filt.spatial_op or op_sql.upper().startswith("ST_")
                     is_range = op_sql in ("&&", "@>", "<@", "||", "&<", "&>")
 
-            if is_spatial:
+            if is_spatial and op_sql.upper().startswith("ST_"):
+                # ST_* function form: ST_Intersects(expr, :param)
                 where_conditions.append(f"{op_sql}({expr}, :{param_name})")
+            elif is_spatial:
+                # Infix spatial operator (e.g. BBOX → "&&"): the value is an
+                # EWKT geometry literal.  Rendering as ``&&(expr, :param)``
+                # causes PostgreSQL to parse the two-element parenthesised list
+                # as a composite/record type and then apply ``&&`` to that
+                # single record operand, producing:
+                #   operator does not exist: && record
+                # The correct form is ``expr && ST_GeomFromEWKT(:param)`` so
+                # each side of the infix operator is a typed geometry.
+                where_conditions.append(f"{expr} {op_sql} ST_GeomFromEWKT(:{param_name})")
             elif is_range or op_sql in ("&&", "@>", "<@", "||", "&<", "&>"):
                 if op_sql == "@>" and not str(filt.value).startswith(("[", "(")):
                     where_conditions.append(

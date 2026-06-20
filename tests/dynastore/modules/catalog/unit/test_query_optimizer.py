@@ -1467,3 +1467,123 @@ def test_build_optimized_query_quotes_upper_case_alias_star_path(
     assert 'as "CODE"' in sql, (
         f'Expected quoted alias as "CODE" in SQL on the wildcard path (got: {sql})'
     )
+
+
+# ---------------------------------------------------------------------------
+# Bbox spatial filter — operator does not exist: && record (#2282)
+#
+# A bbox FilterCondition with operator="&&" and spatial_op=True was rendered
+# as ``&&(sc_geometries.geom, :filter_0)`` by build_optimized_query.
+# PostgreSQL parses the parenthesised pair as a composite/record type and
+# applies ``&&`` to that single record operand, raising:
+#   operator does not exist: && record
+# The fix renders infix spatial operators as ``expr op ST_GeomFromEWKT(:param)``
+# so both sides are typed geometry values.
+# ---------------------------------------------------------------------------
+
+
+def test_build_optimized_query_bbox_filter_emits_infix_not_function_form(
+    mock_col_config, mock_registry
+):
+    """A bbox FilterCondition (operator='&&', spatial_op=True, EWKT value) must
+    produce ``sc_geometries.geom && ST_GeomFromEWKT(:filter_0)`` in the WHERE
+    clause, not the broken ``&&(sc_geometries.geom, :filter_0)`` form that
+    PostgreSQL rejects with 'operator does not exist: && record'."""
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
+            data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        "LEFT JOIN geom_table sc_geometries ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+
+    mock_registry.get_sidecar.side_effect = lambda sc, lenient=True: mock_geom
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    ewkt = "SRID=4326;POLYGON((1.0 2.0, 1.0 4.0, 3.0 4.0, 3.0 2.0, 1.0 2.0))"
+    req = QueryRequest(
+        select=[FieldSelection(field="geom", alias="geometry")],
+        filters=[
+            FilterCondition(
+                field="geom",
+                operator="&&",
+                value=ewkt,
+                spatial_op=True,
+            )
+        ],
+        raw_where=None,
+        include_total_count=False,
+    )
+
+    sql, params = optimizer.build_optimized_query(req, "myschema", "mytable")
+
+    # Correct infix form: geometry_col && ST_GeomFromEWKT(:param)
+    assert "sc_geometries.geom && ST_GeomFromEWKT(:filter_0)" in sql, (
+        f"Expected infix bbox predicate in SQL, got:\n{sql}"
+    )
+    # Broken record form must NOT appear
+    assert "&&(sc_geometries.geom," not in sql, (
+        f"Broken record-form &&(expr, :param) must not appear in SQL, got:\n{sql}"
+    )
+    assert params["filter_0"] == ewkt
+
+
+def test_build_optimized_query_st_intersects_uses_function_form(
+    mock_col_config, mock_registry
+):
+    """ST_Intersects (and other ST_* spatial operators) must still use the
+    function-call form ST_Intersects(expr, :param) — only infix operators
+    like && change to the infix form."""
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
+            data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        "LEFT JOIN geom_table sc_geometries ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+
+    mock_registry.get_sidecar.side_effect = lambda sc, lenient=True: mock_geom
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    req = QueryRequest(
+        select=[FieldSelection(field="geom", alias="geometry")],
+        filters=[
+            FilterCondition(
+                field="geom",
+                operator="ST_Intersects",
+                value="SRID=4326;POINT(1 2)",
+                spatial_op=True,
+            )
+        ],
+        raw_where=None,
+        include_total_count=False,
+    )
+
+    sql, params = optimizer.build_optimized_query(req, "myschema", "mytable")
+
+    # ST_* operators use function-call form
+    assert "ST_Intersects(sc_geometries.geom, :filter_0)" in sql, (
+        f"Expected ST_Intersects(expr, :param) in SQL, got:\n{sql}"
+    )
