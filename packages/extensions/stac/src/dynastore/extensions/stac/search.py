@@ -1536,7 +1536,11 @@ async def search_collections(
         where_clauses.append("mc.keywords @> CAST(:keywords AS jsonb)")
         params["keywords"] = str(search_request.keywords).replace("'", '"')
 
-    # STAC Collection Search `q` — free-text across id, title (all languages), description
+    # STAC Collection Search `q` — free-text across id, title (English), description (English).
+    # `title` and `description` are JSONB localized objects ({"en": "...", "fr": "..."}).
+    # Applying lower() directly to a jsonb column raises UndefinedFunctionError in Postgres
+    # because there is no lower(jsonb) overload.  Extract the English text value with the
+    # ->>'en' accessor (returns text, NULL when the key is absent) before calling lower().
     if search_request.q:
         q_conditions = []
         for idx, term in enumerate(search_request.q):
@@ -1544,8 +1548,8 @@ async def search_collections(
             params[p] = f"%{term.lower()}%"
             q_conditions.append(
                 f"(lower(c.id) LIKE :{p} "
-                f"OR lower(mc.description) LIKE :{p} "
-                f"OR lower(mc.title::text) LIKE :{p})"
+                f"OR lower(mc.description->>'en') LIKE :{p} "
+                f"OR lower(mc.title->>'en') LIKE :{p})"
             )
         if q_conditions:
             where_clauses.append("(" + " AND ".join(q_conditions) + ")")
