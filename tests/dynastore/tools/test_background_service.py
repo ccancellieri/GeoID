@@ -388,3 +388,115 @@ async def test_supervisor_stop_drains_tasks() -> None:
 
     assert all(t.done() for t in executor._tasks)
     assert exited["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_straggler_after_timeout() -> None:
+    """A service that ignores shutdown is cancelled once stop()'s timeout elapses."""
+    started = asyncio.Event()
+    cancelled = {"yes": False}
+
+    async def _run(ctx: ServiceContext) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()  # never set — ignores ctx.shutdown
+        except asyncio.CancelledError:
+            cancelled["yes"] = True
+            raise
+
+    ctx = _make_ctx()
+    executor = _TrackingExecutor()
+    supervisor = BackgroundSupervisor(executor=executor)
+    supervisor.register(_make_service(name="straggler", run_fn=_run))
+    supervisor.start(ctx)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    ctx.shutdown.set()
+    # The service will not exit on its own; stop() must cancel it after timeout.
+    await supervisor.stop(timeout=0.1)
+
+    assert executor._tasks[0].done()
+    assert cancelled["yes"] is True
+
+
+@pytest.mark.asyncio
+async def test_skip_ephemeral_evaluated_before_leadership() -> None:
+    """SKIP_EPHEMERAL + LEADER_ONLY in an ephemeral pod is skipped BEFORE any
+    leadership election is attempted (gate ordering: pod-policy then election)."""
+    ctx = _make_ctx(is_ephemeral=True, engine=MagicMock())
+    executor = _TrackingExecutor()
+    supervisor = BackgroundSupervisor(executor=executor)
+    supervisor.register(_make_service(
+        name="leader-ephemeral",
+        leadership=Leadership.LEADER_ONLY,
+        pod_policy=PodPolicy.SKIP_EPHEMERAL,
+    ))
+
+    mock_pg = MagicMock()
+    with patch("dynastore.tools.background_service.pg_advisory_leadership", mock_pg):
+        supervisor.start(ctx)
+
+    assert "service:leader-ephemeral" not in executor.submitted
+    mock_pg.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_periodic_run_survives_tick_exception() -> None:
+    """A RUN_EVERYWHERE PeriodicService whose tick raises does NOT die — the loop
+    logs and continues, so a transient failure can't silently stop it forever."""
+    calls = {"n": 0}
+
+    class _FlakyPeriodic(PeriodicService):
+        name = "flaky-periodic"
+        cadence_seconds = 0.01
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient")
+            if calls["n"] >= 3:
+                ctx.shutdown.set()
+
+    ctx = _make_ctx()
+    svc = _FlakyPeriodic()
+    await asyncio.wait_for(svc.run(ctx), timeout=1.0)
+
+    assert calls["n"] >= 3  # survived the first-tick exception and kept ticking
+
+
+@pytest.mark.asyncio
+async def test_start_continues_when_one_submit_fails() -> None:
+    """If one service's submit raises, start() logs and still starts the rest
+    (one failing service must not starve the others)."""
+
+    class _FlakyExecutor:
+        def __init__(self) -> None:
+            self.submitted: list[str] = []
+            self._tasks: list[asyncio.Task[Any]] = []
+
+        def submit(self, coro: Any, task_name: str = "bg") -> asyncio.Task[Any]:
+            if "boom" in task_name:
+                raise RuntimeError("submit failed")
+            self.submitted.append(task_name)
+            t = asyncio.create_task(coro, name=task_name)
+            self._tasks.append(t)
+            return t
+
+    ran = {"ok": False}
+
+    async def _ok(ctx: ServiceContext) -> None:
+        ran["ok"] = True
+        ctx.shutdown.set()
+
+    ctx = _make_ctx()
+    executor = _FlakyExecutor()
+    supervisor = BackgroundSupervisor(executor=executor)
+    supervisor.register(_make_service(name="boom"))            # submit() raises
+    supervisor.register(_make_service(name="good", run_fn=_ok))
+
+    supervisor.start(ctx)  # must NOT raise despite 'boom' failing
+
+    assert "service:good" in executor.submitted
+    if executor._tasks:
+        await asyncio.wait_for(executor._tasks[0], timeout=1.0)
+    assert ran["ok"] is True

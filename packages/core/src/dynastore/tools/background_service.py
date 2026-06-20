@@ -35,7 +35,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Awaitable, Optional, Union, Protocol
+from typing import Any, Awaitable, Coroutine, Optional, Union, Protocol
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -179,9 +179,27 @@ class PeriodicService(ABC):
     cadence_seconds: float = 30.0
 
     async def run(self, ctx: ServiceContext) -> None:
-        await self.tick(ctx)
+        await self._safe_tick(ctx)
         while not await ctx.sleep(self.cadence_seconds):
+            await self._safe_tick(ctx)
+
+    async def _safe_tick(self, ctx: ServiceContext) -> None:
+        """Run one tick, surviving transient failures.
+
+        A RUN_EVERYWHERE periodic loop that let an exception escape ``run()``
+        would die silently (the background executor logs and drops it) and never
+        tick again with no recovery. Catching here keeps the loop self-healing —
+        the failure is logged and the next cadence retries. LEADER_ONLY periodic
+        services do NOT use this path: the supervisor drives their tick through
+        ``run_leader_loop``, which intentionally resigns leadership and retries
+        on error so a poisoned leader hands the lock to another pod.
+        """
+        try:
             await self.tick(ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("%s: tick failed; continuing on next cadence", self.name)
 
     @abstractmethod
     async def tick(self, ctx: ServiceContext) -> None:
@@ -251,7 +269,17 @@ class BackgroundSupervisor:
             else:
                 coro = self._leader_elected_coro(service, ctx)
 
-            task = self._executor.submit(coro, task_name=f"service:{service.name}")
+            try:
+                task = self._executor.submit(coro, task_name=f"service:{service.name}")
+            except Exception:
+                # One service failing to submit must not starve the rest. Close
+                # the un-submitted coroutine so it doesn't emit a "never awaited"
+                # warning, log, and carry on with the remaining services.
+                logger.exception(
+                    "BackgroundSupervisor: failed to start %s; skipping", service.name
+                )
+                coro.close()
+                continue
             self._tasks.append(task)
             logger.info(
                 "BackgroundSupervisor: started %s (leadership=%s, pod_policy=%s)",
@@ -262,7 +290,7 @@ class BackgroundSupervisor:
 
     def _leader_elected_coro(
         self, service: BackgroundService, ctx: ServiceContext
-    ) -> Awaitable[None]:
+    ) -> Coroutine[Any, Any, None]:
         """Wrap a LEADER_ONLY service in single-leader election.
 
         ``run_leader_loop`` repeatedly tries to acquire the per-service advisory
@@ -310,8 +338,9 @@ class BackgroundSupervisor:
 
             async def on_leader_tick() -> None:
                 # One unit of work per election; the connection is released as
-                # soon as this returns. run_leader_loop sleeps the cadence below
-                # before re-electing.
+                # soon as this returns. run_leader_loop then sleeps the cadence
+                # (lock NOT held) before re-electing, so this throttles to
+                # cadence_seconds instead of hot-re-acquiring every tick.
                 await periodic.tick(ctx)
 
             return run_leader_loop(
@@ -320,6 +349,7 @@ class BackgroundSupervisor:
                 name=service.name,
                 cadence_seconds=periodic.cadence_seconds,
                 is_shutdown=ctx.shutdown.is_set,
+                shutdown_event=ctx.shutdown,
             )
 
         async def on_leader_run() -> None:
@@ -333,6 +363,7 @@ class BackgroundSupervisor:
             name=service.name,
             cadence_seconds=_REELECT_CADENCE_SECONDS,
             is_shutdown=ctx.shutdown.is_set,
+            shutdown_event=ctx.shutdown,
         )
 
     async def stop(self, *, timeout: float = 10.0) -> None:

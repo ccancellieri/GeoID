@@ -525,6 +525,7 @@ async def run_leader_loop(
     name: str,
     cadence_seconds: float = 5.0,
     is_shutdown: Optional[Callable[[], bool]] = None,
+    shutdown_event: Optional[asyncio.Event] = None,
 ) -> None:
     """Run a leader-elected loop that resigns on any exception.
 
@@ -556,14 +557,35 @@ async def run_leader_loop(
     ``RuntimeError: generator didn't stop`` and resigned every cycle).
     """
     is_shutdown = is_shutdown or (lambda: False)
+
+    async def _sleep_cadence() -> None:
+        # Sleep up to cadence_seconds, waking early when shutdown is signalled.
+        # With a shutdown_event the wait is exact; without one we fall back to a
+        # plain sleep and the outer ``while`` re-checks is_shutdown() next pass.
+        if shutdown_event is not None:
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=cadence_seconds)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(cadence_seconds)
+
     while not is_shutdown():
         try:
             async with acquire_leadership() as is_leader:
                 if not is_leader:
-                    await asyncio.sleep(cadence_seconds)
+                    # Follower: wait a cadence before re-contesting the lock.
+                    await _sleep_cadence()
                     continue
                 logger.info("%s: leadership acquired", name)
                 await on_leader()
+            # Leadership released here (the context has exited). Pace the next
+            # election by sleeping the cadence WITHOUT holding the advisory lock,
+            # so a per-tick ``on_leader`` (e.g. one PeriodicService tick) is
+            # throttled to its cadence instead of hot-re-acquiring in a tight
+            # loop. Releasing before sleeping is the point: the lock is never
+            # pinned across the idle period.
+            await _sleep_cadence()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -571,4 +593,4 @@ async def run_leader_loop(
                 "%s: leader loop error; resigning and retrying in %ss",
                 name, cadence_seconds,
             )
-            await asyncio.sleep(cadence_seconds)
+            await _sleep_cadence()

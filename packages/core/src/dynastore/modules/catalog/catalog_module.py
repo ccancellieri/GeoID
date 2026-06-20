@@ -537,9 +537,11 @@ class CatalogModule(ModuleProtocol):
                 is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
                 name=get_service_name() or "unknown",
             )
-            bg_supervisor.start(bg_ctx)
-
             try:
+                # start() is inside the try so the finally always drains the
+                # supervisor — if start() itself raises after submitting some
+                # services, those tasks are still stopped and _bg_shutdown is set.
+                bg_supervisor.start(bg_ctx)
                 yield
             finally:
                 _bg_shutdown.set()
