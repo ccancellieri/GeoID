@@ -36,12 +36,33 @@ async-only: under a job's sync engine ``engine.begin()`` returns a *sync*
 ``'... does not support the asynchronous context manager protocol'`` and dropped
 every heartbeat (stale ``last_seen`` → live owners look dead to the routing /
 mandatory-ownership check).
+
+Deadlock prevention
+-------------------
+Multiple gunicorn workers and job pods write to the same ``(service, *)`` rows
+concurrently. Two different row-ordering strategies used to coexist:
+
+* ``upsert_rows`` iterated ``rows`` in list order → lock order = list order.
+* The old ``_HEARTBEAT_SQL`` bulk UPDATE locked all rows for a service in
+  physical/heap-scan order — different from the UPSERT order → classic 40P01.
+
+Both paths now acquire row locks in the same deterministic PK order
+``(service, task_key)`` ASC:
+
+* ``upsert_rows`` sorts ``rows`` before the loop (the caller also sorts at
+  collection time, but sorting here is the hard guarantee).
+* ``heartbeat`` uses a ``FOR UPDATE`` sub-select ordered by ``(service,
+  task_key)`` so the UPDATE locks rows in the same order as the UPSERT loop.
+
+Both public functions are also wrapped in ``retry_on_lock_conflict`` so a
+deadlock victim retries instead of silently dropping liveness.
 """
 from __future__ import annotations
 
 import json
 from typing import List
 
+from dynastore.modules.db_config.locking_tools import retry_on_lock_conflict
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
@@ -75,10 +96,20 @@ ON CONFLICT (service, task_key) DO UPDATE SET
     updated_at = now()
 """
 
+# Heartbeat UPDATE locks rows via a FOR UPDATE sub-select ordered by the PK
+# (service, task_key) ASC — identical to the order the UPSERT loop uses.
+# This eliminates the divergent acquisition order that caused 40P01 when
+# multiple concurrent writers hit the same service's rows.
 _HEARTBEAT_SQL = f"""
-UPDATE {TASK_CAPABILITY_REGISTRY_TABLE}
+UPDATE {TASK_CAPABILITY_REGISTRY_TABLE} AS t
 SET last_seen = now()
-WHERE service = :service
+WHERE (t.service, t.task_key) IN (
+    SELECT service, task_key
+    FROM {TASK_CAPABILITY_REGISTRY_TABLE}
+    WHERE service = :service
+    ORDER BY service, task_key
+    FOR UPDATE
+)
 """
 
 _LIST_SQL = f"""
@@ -117,11 +148,15 @@ def _coerce_payload_schema(d: dict) -> dict:
     return d
 
 
+@retry_on_lock_conflict(max_retries=5, base_delay=0.1)
 async def upsert_rows(engine, rows: List[CapabilityRow]) -> int:
     if not rows:
         return 0
+    # Sort by PK before opening the transaction so every concurrent writer
+    # acquires row locks in the same order — prerequisite for deadlock freedom.
+    sorted_rows = sorted(rows, key=lambda r: (r.service, r.task_key))
     async with managed_transaction(engine) as conn:
-        for r in rows:
+        for r in sorted_rows:
             # JSON-encode the dict for the jsonb bind: the CAST(:payload_schema
             # AS jsonb) text bind won't auto-encode a Python dict, so serialize
             # it ourselves. One UPSERT per row keeps the path driver-agnostic
@@ -133,6 +168,7 @@ async def upsert_rows(engine, rows: List[CapabilityRow]) -> int:
     return len(rows)
 
 
+@retry_on_lock_conflict(max_retries=5, base_delay=0.1)
 async def heartbeat(engine, service: str) -> None:
     async with managed_transaction(engine) as conn:
         await DQLQuery(_HEARTBEAT_SQL, result_handler=ResultHandler.NONE).execute(

@@ -134,6 +134,16 @@ async def main(task_name: str, payload: dict, schema: str):
 
     # Create a simple app_state object. The lifespan managers will populate it.
     app_state = SimpleNamespace()
+
+    # Ephemeral Cloud Run Job pods run a single task then exit.  At production
+    # scale hundreds of these pods may run concurrently.  Long-lived
+    # dispatcher-side background loops (starting with the task-capability
+    # registry heartbeat, #2271) must NOT start inside job pods: each would
+    # open its own DB connection and hammer configs.task_capability_registry
+    # with writes and lock contention.  The flag is read by TasksModule.lifespan
+    # to gate those loops.
+    app_state.ephemeral_job = True
+
     task_id_str = payload.get("task_id")
     task_id_uuid = uuid.UUID(task_id_str) if task_id_str else None
 

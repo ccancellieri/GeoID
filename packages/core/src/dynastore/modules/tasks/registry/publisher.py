@@ -25,19 +25,47 @@ Structural PG writes happen only when the build-keyed digest changes
 cluster-wide) skips the write while a miss runs it. A single cheap last_seen
 heartbeat refreshes liveness every tick. Cadence piggybacks the
 capability-publisher refresh interval.
+
+In-process digest memo
+----------------------
+``_local_published`` is a process-wide ``{(service, digest): True}`` dict that
+records digests published by this process during the current run. It is checked
+before calling the shared ``@cached`` gate so that a Valkey outage (observed as
+``ValkeyCacheBackend.set failed``) cannot turn the once-per-deploy UPSERT into a
+per-tick storm. On a Valkey miss the ``@cached`` decorator would re-enter the
+body on every tick; the in-process memo prevents that even when the distributed
+cache is unavailable.
+
+Single-writer gating
+--------------------
+``run_registry_heartbeat`` branches on engine type:
+
+* **AsyncEngine** (multi-worker async web path): the publish/heartbeat loop is
+  gated behind ``pg_advisory_leadership`` via ``run_leader_loop``.  Only one
+  worker cluster-wide per service drives the loop; all other workers sleep and
+  skip PG writes.  The advisory key is per-service so different services elect
+  independent leaders without blocking each other.
+
+* **Non-AsyncEngine** (single-process, sync-driver, or test path): the existing
+  unconditional loop runs unchanged.  There are no concurrent writers in this
+  deployment mode, so no leadership election is needed or possible.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Set, Tuple
+
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 import dynastore.tasks as tasks_pkg
 from dynastore._version import get_git_commit, get_version
 from dynastore.modules.db_config.instance import get_service_name
+from dynastore.modules.db_config.locking_tools import pg_advisory_leadership
 from dynastore.modules.tasks.registry import repository
 from dynastore.modules.tasks.registry.model import CapabilityRow, compute_publish_digest
 from dynastore.tasks import task_kind
+from dynastore.tools.async_utils import run_leader_loop
 from dynastore.tools.cache import CacheIgnore, cached
 
 logger = logging.getLogger(__name__)
@@ -46,6 +74,15 @@ logger = logging.getLogger(__name__)
 # row that was deleted out-of-band while the build digest is unchanged). A new
 # build always changes the digest -> new key -> immediate re-publish regardless.
 _PUBLISH_DIGEST_TTL_SECONDS = 3600.0
+
+# In-process memo: set of (service, digest) pairs successfully published by
+# this process during the current run. Consulted before hitting the shared
+# @cached gate so a Valkey outage cannot convert the once-per-deploy UPSERT
+# into a per-tick storm. Reset is intentionally NOT provided — a process
+# restart clears it naturally, and a row deleted out-of-band will be
+# self-healed on the next deploy (digest changes) or when the @cached TTL
+# expires and the in-process memo alone is not enough to suppress a re-publish.
+_local_published: Set[Tuple[str, str]] = set()
 
 
 def _safe_describe(cls):
@@ -82,6 +119,12 @@ def collect_local_inventory() -> Tuple[str, str, str, List[CapabilityRow]]:
     for code-level facets), with getattr fallbacks so a task without a working
     describe() still publishes. Process tasks have no payload model on the class
     — their schema is derived from the Process definition's inputs.
+
+    Rows are returned sorted by ``(service, task_key)`` so that the UPSERT loop
+    in ``repository.upsert_rows`` always acquires row locks in PK order regardless
+    of the iteration order of ``_DYNASTORE_TASKS``. Deterministic order at the
+    collection site and at the repository site together eliminate the
+    lock-acquisition-order mismatch that caused 40P01 deadlocks.
     """
     service = get_service_name()
     commit = get_git_commit()
@@ -120,6 +163,8 @@ def collect_local_inventory() -> Tuple[str, str, str, List[CapabilityRow]]:
                 payload_schema=payload_schema,
             )
         )
+    # Sort by PK so every worker on this pod iterates in the same order.
+    rows.sort(key=lambda r: (r.service, r.task_key))
     return (service, commit, version, rows)
 
 
@@ -156,6 +201,11 @@ async def publish_inventory(engine) -> None:
     not also drop the heartbeat, because the mandatory-ownership check reads
     last_seen to find live owners. A failed UPSERT is not cached, so the next
     tick retries it.
+
+    The in-process memo (``_local_published``) is checked before the distributed
+    cache so that a Valkey outage cannot degrade into a per-tick UPSERT storm.
+    When Valkey is healthy the shared ``@cached`` gate also suppresses repeated
+    writes cluster-wide; both guards complement each other.
     """
     try:
         service, commit, version, rows = collect_local_inventory()
@@ -166,7 +216,18 @@ async def publish_inventory(engine) -> None:
         return
     digest = compute_publish_digest(commit, version, rows)
     try:
-        await _publish_if_new(service, digest, engine=engine, rows=rows)
+        local_key = (service, digest)
+        if local_key not in _local_published:
+            await _publish_if_new(service, digest, engine=engine, rows=rows)
+            _local_published.add(local_key)
+        else:
+            # In-process memo hit: UPSERT already ran in this process for this
+            # (service, digest). Skip the distributed cache round-trip too — the
+            # rows have not changed.
+            logger.debug(
+                "task-registry: in-process memo hit for service=%r (digest=%s); skipping upsert",
+                service, digest[:12],
+            )
     except Exception:
         logger.warning("task-registry: publish (upsert) failed (non-fatal)", exc_info=True)
     try:
@@ -181,11 +242,56 @@ async def run_registry_heartbeat(
     *,
     refresh_seconds: float = 30.0,
 ) -> None:
-    """Publish once immediately, then heartbeat on the given cadence until shutdown."""
-    while True:
-        await publish_inventory(engine)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=refresh_seconds)
-            return  # shutdown signaled
-        except asyncio.TimeoutError:
-            continue
+    """Publish once immediately, then heartbeat on the given cadence until shutdown.
+
+    When ``engine`` is an :class:`~sqlalchemy.ext.asyncio.AsyncEngine` (the
+    multi-worker async web path), the loop is gated behind a per-service
+    ``pg_advisory_leadership`` lock via ``run_leader_loop``.  Only the elected
+    leader pod drives PG writes; followers sleep and skip.  This eliminates the
+    N-worker write amplification that caused 40P01 deadlock storms on
+    ``configs.task_capability_registry`` (issue #2271).
+
+    When ``engine`` is any other type (single-process, sync-driver, test), the
+    original unconditional loop runs unchanged: no leadership election is needed
+    or possible in that deployment mode.
+    """
+    if isinstance(engine, AsyncEngine):
+        service = get_service_name() or "unknown"
+        advisory_key = f"task-registry-heartbeat:{service}"
+
+        def _acquire_leadership():
+            return pg_advisory_leadership(
+                engine,
+                advisory_key,
+                name="task_registry_heartbeat",
+            )
+
+        async def _on_leader() -> None:
+            # Hold leadership for the full heartbeat cycle: publish once, then
+            # re-publish on every tick until shutdown is signaled.  Exceptions
+            # propagate so run_leader_loop can resign and retry.
+            while not shutdown_event.is_set():
+                await publish_inventory(engine)
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=refresh_seconds)
+                    return  # shutdown signaled
+                except asyncio.TimeoutError:
+                    continue
+
+        await run_leader_loop(
+            acquire_leadership=_acquire_leadership,
+            on_leader=_on_leader,
+            name="task_registry_heartbeat",
+            cadence_seconds=refresh_seconds,
+            is_shutdown=shutdown_event.is_set,
+        )
+    else:
+        # Non-AsyncEngine path: single-process or sync-driver deployment.
+        # No concurrent writers → run unconditionally without leadership election.
+        while True:
+            await publish_inventory(engine)
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=refresh_seconds)
+                return  # shutdown signaled
+            except asyncio.TimeoutError:
+                continue

@@ -885,17 +885,28 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 # inventory (version-gated via the shared cache, so the structural
                 # write happens ~once per deploy) and heartbeat last_seen on the
                 # same cadence as the capability publisher.
-                from dynastore.modules.tasks.registry.publisher import (
-                    run_registry_heartbeat,
-                )
-                executor.submit(
-                    run_registry_heartbeat(
-                        engine,
-                        shutdown_event,
-                        refresh_seconds=cap_refresh,
-                    ),
-                    task_name="service:task_registry_heartbeat",
-                )
+                #
+                # The loops below (queue_listener, dispatcher, stuck_pending_warner,
+                # proactive_capability_sweep, capability_publisher) are candidates
+                # for the same ephemeral-job gate as a follow-up; scoped to the
+                # registry heartbeat here because it is the highest-contention
+                # writer at scale (#2271).
+                if _should_run_registry_heartbeat(app_state):
+                    from dynastore.modules.tasks.registry.publisher import (
+                        run_registry_heartbeat,
+                    )
+                    executor.submit(
+                        run_registry_heartbeat(
+                            engine,
+                            shutdown_event,
+                            refresh_seconds=cap_refresh,
+                        ),
+                        task_name="service:task_registry_heartbeat",
+                    )
+                else:
+                    logger.info(
+                        "TasksModule: registry heartbeat skipped in ephemeral job pod."
+                    )
                 logger.info(f"TasksModule: QueueListener (poll_interval={poll_interval}s) and Multi-Tenant Dispatcher launched.")
             else:
                 logger.warning(
@@ -908,6 +919,17 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
             finally:
                 shutdown_event.set()
                 logger.info("TasksModule: Shutdown event set — QueueListener/Dispatcher stopping.")
+
+
+def _should_run_registry_heartbeat(app_state: object) -> bool:
+    """Return True when this process should submit the registry heartbeat loop.
+
+    Ephemeral Cloud Run Job pods (``app_state.ephemeral_job is True``) must not
+    run the heartbeat: they execute a single task then exit, and at scale
+    hundreds run concurrently.  Long-lived web and worker services have no flag
+    set and always return True.
+    """
+    return not bool(getattr(app_state, "ephemeral_job", False))
 
 
 # --- Internal Query Objects ---

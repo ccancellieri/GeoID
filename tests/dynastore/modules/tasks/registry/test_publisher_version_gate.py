@@ -25,6 +25,7 @@ import pytest
 
 from dynastore.modules.tasks.registry import publisher as pub
 from dynastore.modules.tasks.registry.model import CapabilityRow
+from dynastore.tools.cache import cache_clear
 
 
 def _rows():
@@ -51,13 +52,14 @@ async def test_same_build_upserts_once_then_heartbeats(monkeypatch):
     monkeypatch.setattr(pub, "collect_local_inventory", lambda: ("worker", "c1", "1.0.0", rows))
     monkeypatch.setattr(pub.repository, "upsert_rows", _acount(calls, "upsert"))
     monkeypatch.setattr(pub.repository, "heartbeat", _acount(calls, "heartbeat"))
-    # The @cached backend is a process-wide singleton; reset it so a prior test
-    # cannot make the first publish here a spurious cache hit.
-    pub._publish_if_new.cache_clear()
+    # Both the distributed cache and the in-process memo are process-wide singletons;
+    # reset both so a prior test run cannot produce a spurious cache or memo hit.
+    cache_clear(pub._publish_if_new)
+    pub._local_published.clear()
 
     # First tick: cache miss on (service, digest) -> UPSERT + heartbeat.
     await pub.publish_inventory(engine=object())
-    # Second tick, identical build: cache hit -> NO upsert, heartbeat still runs.
+    # Second tick, identical build: in-process memo hit -> NO upsert, heartbeat still runs.
     await pub.publish_inventory(engine=object())
 
     assert calls["upsert"] == 1
@@ -69,12 +71,13 @@ async def test_new_build_digest_reupserts(monkeypatch):
     calls = {"upsert": 0, "heartbeat": 0}
     monkeypatch.setattr(pub.repository, "upsert_rows", _acount(calls, "upsert"))
     monkeypatch.setattr(pub.repository, "heartbeat", _acount(calls, "heartbeat"))
-    pub._publish_if_new.cache_clear()
+    cache_clear(pub._publish_if_new)
+    pub._local_published.clear()
 
     # Build c1.
     monkeypatch.setattr(pub, "collect_local_inventory", lambda: ("worker", "c1", "1.0.0", _rows()))
     await pub.publish_inventory(engine=object())
-    # New build c2 -> different digest -> cache miss -> UPSERT again.
+    # New build c2 -> different digest -> memo miss -> UPSERT again.
     monkeypatch.setattr(pub, "collect_local_inventory", lambda: ("worker", "c2", "1.0.0", _rows()))
     await pub.publish_inventory(engine=object())
 
@@ -89,7 +92,8 @@ async def test_no_service_identity_is_noop(monkeypatch):
     monkeypatch.setattr(pub, "collect_local_inventory", lambda: ("", "c1", "1.0.0", []))
     monkeypatch.setattr(pub.repository, "upsert_rows", _acount(calls, "upsert"))
     monkeypatch.setattr(pub.repository, "heartbeat", _acount(calls, "heartbeat"))
-    pub._publish_if_new.cache_clear()
+    cache_clear(pub._publish_if_new)
+    pub._local_published.clear()
 
     await pub.publish_inventory(engine=object())
 
