@@ -943,44 +943,68 @@ class GCPModule(
     @cached(maxsize=1, distributed=False)
     async def get_self_url(self) -> str:
         """
-        Dynamically discovers and returns the public URL of the running Cloud Run service.
-        The result is cached for subsequent calls.
-        This requires the service account to have the 'run.services.get' permission.
-        """
-        # Allow manual override via environment variable (useful for testing or non-Cloud Run envs)
-        service_url_override = os.getenv("SERVICE_URL")
-        if service_url_override:
-            return service_url_override
+        Returns the public URL of the running Cloud Run service, used as the
+        Pub/Sub push-subscription endpoint base.
 
+        Resolution order:
+        1. If K_SERVICE is set (i.e. we are inside Cloud Run), query the Cloud Run
+           Admin API for the canonical ``uri`` of this specific service revision.
+           SERVICE_URL is intentionally NOT consulted in this path — a misconfigured
+           SERVICE_URL pointing at a different environment (e.g. prod) would wire new
+           push subscriptions to the wrong service, causing GCS finalize events to be
+           lost on the service that actually owns the catalog.
+        2. If K_SERVICE is absent (local dev / test), fall back to SERVICE_URL, then
+           raise if neither is set.
+
+        The result is cached per process instance (maxsize=1, no distributed backend).
+        """
         service_name = self.get_service_name()
         if not service_name:
-            # Fallback for local development or testing via SERVICE_URL environment variable
+            # Not running inside Cloud Run — accept SERVICE_URL override for local dev/test.
             service_url = os.getenv("SERVICE_URL")
             if service_url:
+                logger.info(
+                    f"K_SERVICE not set; using SERVICE_URL override: {service_url}"
+                )
                 return service_url
             raise RuntimeError(
-                "Cannot determine self URL: K_SERVICE environment variable is not set and SERVICE_URL is missing. "
-                "This is not a Cloud Run environment."
+                "Cannot determine self URL: K_SERVICE environment variable is not set "
+                "and SERVICE_URL is missing. This is not a Cloud Run environment."
             )
+
+        # Running inside Cloud Run: discover the canonical URI via the Admin API.
+        # SERVICE_URL is explicitly skipped here — if it were accepted it could
+        # silently route push subscriptions to a different service (e.g. prod),
+        # causing GCS finalize events to be delivered there instead of this instance.
+        project_id = self.get_project_id()
+        region = self.get_region()
+        logger.info(
+            f"Discovering public URL for Cloud Run service '{service_name}' "
+            f"in project '{project_id}' region '{region}'."
+        )
+        # Resolve the client outside the try: a credentials failure raises its own
+        # RuntimeError ("run client unavailable: credentials missing"), which must
+        # propagate undecorated rather than being re-wrapped below as a
+        # run.services.get permission problem.
+        client = self.get_run_client()
         try:
-            project_id = self.get_project_id()
-            region = self.get_region()
-            logger.info(
-                f"Discovering public URL for Cloud Run service '{service_name}' in region '{region}'."
-            )
-            client = self.get_run_client()
             service_path = client.service_path(project_id or "", region or "", service_name)
             service_details = await client.get_service(name=service_path)
-            logger.info(f"Discovered and cached self URL: {service_details.uri}")
-            return service_details.uri
+            discovered_url = service_details.uri
+            logger.info(f"Discovered and cached self URL: {discovered_url}")
+            return discovered_url
         except Exception as e:
-            # Fallback for local development or testing where Cloud Run Admin API might not be accessible
-            # or permissions are missing, but we still need a URL for push subscriptions (even if it's localhost)
-            service_url = os.getenv("SERVICE_URL", "http://localhost")
-            logger.warning(
-                f"Failed to discover Cloud Run service URL: {e}. Falling back to default: {service_url}"
-            )
-            return service_url
+            # The Admin API call failed (missing run.services.get permission, network
+            # issue, etc.).  We cannot safely fall back to SERVICE_URL here — it might
+            # point at a different environment and silently misroute push subscriptions.
+            # Raise so the provisioning task retries rather than wiring a bad endpoint.
+            raise RuntimeError(
+                f"Failed to discover Cloud Run service URL for '{service_name}' "
+                f"(project={project_id}, region={region}). "
+                f"Grant the service account 'run.services.get' or set the correct "
+                f"PROJECT_ID / REGION environment variables. "
+                f"Original error: {e}"
+            ) from e
 
 
 def _should_register_gcp_job_runner() -> bool:
