@@ -96,10 +96,12 @@ async def test_collection_handler_appends_tenant_scoped_log(
     assert entry.catalog_id == "cat_x"
     assert entry.collection_id == "coll_y"
     assert entry.event_type == expected_event_type
-    # is_system=False so the row lands in the tenant schema (with collection_id),
-    # not catalog.system_logs — that's what makes the collection-scoped
-    # /logs endpoint find it.
-    assert entry.is_system is False
+    # is_system=True routes to the flat catalog.system_logs (with collection_id
+    # set), not the tenant {schema}.logs partitioned table: the listener runs
+    # in-band with the create/delete transaction that mutates that collection's
+    # log partition, so an immediate write on a separate connection cannot see
+    # it. search_logs filters the system row back by catalog_id + collection_id.
+    assert entry.is_system is True
     # immediate=True bypasses the batch aggregator: lifecycle events are sparse,
     # and the aggregator's timer flush is lost when an idle Cloud Run instance
     # is CPU-throttled and scales to zero before the buffer drains.

@@ -564,10 +564,16 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         )
 
     async def _on_collection_created(self, catalog_id: str, collection_id: str, **kwargs):
-        # Collection-scoped: is_system=False routes the row to the tenant's
-        # physical schema with collection_id set, so it surfaces under both
-        # /catalogs/{cat}/logs and /catalogs/{cat}/collections/{coll}/logs,
-        # giving /events + /logs parity with catalog_creation.
+        # is_system=True routes to the flat catalog.system_logs (with
+        # collection_id set), NOT the tenant {schema}.logs table. The tenant
+        # table is partitioned by collection_id, and this listener runs in-band
+        # during the create_collection transaction that is itself creating the
+        # new collection's log partition — an immediate write on a separate
+        # connection cannot see that uncommitted partition (and would contend
+        # on its ACCESS EXCLUSIVE lock). system_logs is flat, so the write is
+        # safe; search_logs filters it back out by catalog_id + collection_id,
+        # surfacing it under both /catalogs/{cat}/logs and the collection-scoped
+        # endpoint — mirroring how catalog_creation reaches /logs.
         db_resource = kwargs.pop("db_resource", None)
         await self.append_log(
             LogEntryCreate(
@@ -576,7 +582,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 event_type=CatalogEventType.COLLECTION_CREATION.value,
                 message="Collection created.",
                 details=kwargs,
-                is_system=False,
+                is_system=True,
             ),
             db_resource=db_resource,
             # immediate=True: see _on_catalog_created — the batch aggregator's
@@ -593,17 +599,17 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 event_type=CatalogEventType.COLLECTION_DELETION.value,
                 message="Collection soft-deleted.",
                 details=kwargs,
-                is_system=False,
+                is_system=True,
             ),
             db_resource=db_resource,
             immediate=True,
         )
 
     async def _on_collection_hard_deleted(self, catalog_id: str, collection_id: str, **kwargs):
-        # The catalog schema survives a collection hard-delete (only the
-        # collection's rows/partition are dropped), so this stays tenant-scoped.
-        # log_event falls back to a catalog-scoped row if the collection's log
-        # partition was already removed.
+        # is_system=True (catalog.system_logs): a hard-delete drops the
+        # collection's tenant log partition, so a tenant-scoped write would have
+        # nowhere durable to land. system_logs survives and search_logs filters
+        # it back by catalog_id + collection_id.
         db_resource = kwargs.pop("db_resource", None)
         await self.append_log(
             LogEntryCreate(
@@ -612,7 +618,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 event_type=CatalogEventType.COLLECTION_HARD_DELETION.value,
                 message="Collection hard-deleted.",
                 details=kwargs,
-                is_system=False,
+                is_system=True,
             ),
             db_resource=db_resource,
             immediate=True,
