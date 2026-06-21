@@ -468,8 +468,16 @@ class TaskEventDriver(ModuleProtocol):
             params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
             if catalog_id and catalog_id != "_system_":
-                clauses.append("schema_name = :schema_name")
+                # Platform-scoped lifecycle events (e.g. catalog_creation) are
+                # written with schema_name=NULL and catalog_id in the flat
+                # payload (#2256).  Surface both the tenant-schema rows AND
+                # those platform rows so the catalog-scoped /events view is
+                # complete.
+                clauses.append(
+                    "(schema_name = :schema_name OR payload->>'catalog_id' = :catalog_id)"
+                )
                 params["schema_name"] = catalog_id
+                params["catalog_id"] = catalog_id
             # tasks.events has no dedicated collection_id / identity_id columns.
             # Filter via the JSONB path so the collection-scoped events REST
             # endpoint keeps returning only that collection's events.

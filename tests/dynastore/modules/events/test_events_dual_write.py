@@ -452,3 +452,72 @@ async def test_search_events_filters_collection_id_via_payload(sa_engine, emit_s
     assert "colB" in str(only_b[0]["payload"])
     # No collection filter → both catalog events returned.
     assert len(both) == 2
+
+
+@pytest.mark.asyncio
+async def test_search_events_includes_platform_lifecycle_events(sa_engine, emit_schema):
+    """Catalog-scoped search_events surfaces platform lifecycle rows (#2256).
+
+    Platform lifecycle events (e.g. catalog_creation) are stored with
+    schema_name=NULL and catalog_id carried only in the flat payload.
+    The catalog-scoped filter must include these rows, not just
+    schema_name-keyed tenant rows.
+
+    Checks:
+    - A catalog_creation row (schema_name=NULL, payload.catalog_id="catX") is
+      returned by search_events(catalog_id="catX").
+    - A row for a *different* catalog ("catY") is NOT returned (no over-match).
+    """
+    import unittest.mock as mock
+
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.tasks.events.events_emit import emit_event_row
+    from dynastore.modules.tasks.event_driver import TaskEventDriver
+
+    async def _seed_platform(catalog_id: str) -> None:
+        """Seed a platform lifecycle row: schema_name=NULL, catalog_id in payload."""
+        async with managed_transaction(sa_engine) as conn:
+            await emit_event_row(
+                conn,
+                event_type="catalog_creation",
+                scope="PLATFORM",
+                schema_name=None,
+                catalog_id=catalog_id,
+                collection_id=None,
+                identity_id=None,
+                payload_str=f'{{"catalog_id": "{catalog_id}"}}',
+                shard=0,
+            )
+
+    svc = TaskEventDriver.__new__(TaskEventDriver)
+
+    with mock.patch(
+        "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
+        new=mock.AsyncMock(),
+    ):
+        async with _patch_events_insert_query(emit_schema):
+            with mock.patch(
+                "dynastore.modules.tasks.tasks_module.get_task_schema",
+                return_value=emit_schema,
+            ):
+                await _seed_platform("catX")
+                await _seed_platform("catY")
+
+                catX_rows = await svc.search_events(
+                    engine=sa_engine, catalog_id="catX",
+                )
+                catY_rows = await svc.search_events(
+                    engine=sa_engine, catalog_id="catY",
+                )
+
+    # catX platform lifecycle event must be visible in the catX-scoped view.
+    assert len(catX_rows) == 1, (
+        f"expected 1 platform event for catX, got {catX_rows!r}"
+    )
+    assert catX_rows[0]["payload"].get("catalog_id") == "catX"
+
+    # catY's event must NOT bleed into the catX-scoped view.
+    assert len(catY_rows) == 1, (
+        f"expected 1 platform event for catY, got {catY_rows!r}"
+    )
+    assert catY_rows[0]["payload"].get("catalog_id") == "catY"
