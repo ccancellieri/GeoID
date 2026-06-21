@@ -467,25 +467,23 @@ class TaskEventDriver(ModuleProtocol):
             clauses = []
             params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
+            # Events are stored by event_service.emit() with the call's keyword
+            # arguments nested under payload->'kwargs' (shape:
+            # {"args": [...], "kwargs": {"catalog_id": ..., "collection_id": ...}}).
+            # catalog_id/collection_id/identity_id therefore live at
+            # payload->'kwargs'->>'<key>', NOT at the top level, and schema_name
+            # holds the *physical* schema (s_xxxx), never the logical catalog_id.
+            # Filtering on the nested kwargs key surfaces both platform-scoped
+            # lifecycle events (catalog_creation, schema_name=NULL) and
+            # tenant-scoped events for the same catalog (#2256).
             if catalog_id and catalog_id != "_system_":
-                # Platform-scoped lifecycle events (e.g. catalog_creation) are
-                # written with schema_name=NULL and catalog_id in the flat
-                # payload (#2256).  Surface both the tenant-schema rows AND
-                # those platform rows so the catalog-scoped /events view is
-                # complete.
-                clauses.append(
-                    "(schema_name = :schema_name OR payload->>'catalog_id' = :catalog_id)"
-                )
-                params["schema_name"] = catalog_id
+                clauses.append("payload->'kwargs'->>'catalog_id' = :catalog_id")
                 params["catalog_id"] = catalog_id
-            # tasks.events has no dedicated collection_id / identity_id columns.
-            # Filter via the JSONB path so the collection-scoped events REST
-            # endpoint keeps returning only that collection's events.
             if collection_id:
-                clauses.append("payload->>'collection_id' = :collection_id")
+                clauses.append("payload->'kwargs'->>'collection_id' = :collection_id")
                 params["collection_id"] = collection_id
             if identity_id:
-                clauses.append("payload->>'identity_id' = :identity_id")
+                clauses.append("payload->'kwargs'->>'identity_id' = :identity_id")
                 params["identity_id"] = identity_id
             if event_type:
                 clauses.append("event_type = :event_type")

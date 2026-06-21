@@ -395,8 +395,9 @@ async def test_search_events_filters_collection_id_via_payload(sa_engine, emit_s
 
     tasks.events has no dedicated collection_id column (#1807 P4); the
     collection lifecycle publishers store collection_id in the event payload,
-    so the collection-scoped events REST endpoint must filter on
-    ``payload->>'collection_id'``. This pins that contract end-to-end.
+    which event_service.emit() nests under ``kwargs``, so the collection-scoped
+    events REST endpoint must filter on ``payload->'kwargs'->>'collection_id'``.
+    This pins that contract end-to-end.
     """
     import unittest.mock as mock
 
@@ -415,9 +416,8 @@ async def test_search_events_filters_collection_id_via_payload(sa_engine, emit_s
                 collection_id=collection_id,
                 identity_id=None,
                 payload_str=(
-                    '{"catalog_id": "cat_search", "collection_id": "'
-                    + collection_id
-                    + '"}'
+                    '{"args": [], "kwargs": {"catalog_id": "cat_search", '
+                    '"collection_id": "' + collection_id + '"}}'
                 ),
                 shard=1,
             )
@@ -459,13 +459,14 @@ async def test_search_events_includes_platform_lifecycle_events(sa_engine, emit_
     """Catalog-scoped search_events surfaces platform lifecycle rows (#2256).
 
     Platform lifecycle events (e.g. catalog_creation) are stored with
-    schema_name=NULL and catalog_id carried only in the flat payload.
-    The catalog-scoped filter must include these rows, not just
-    schema_name-keyed tenant rows.
+    schema_name=NULL and catalog_id carried in the event payload, nested under
+    ``kwargs`` by event_service.emit(). The catalog-scoped filter must include
+    these rows via ``payload->'kwargs'->>'catalog_id'`` — schema_name holds the
+    physical schema, never the logical catalog_id, so it cannot be matched on.
 
     Checks:
-    - A catalog_creation row (schema_name=NULL, payload.catalog_id="catX") is
-      returned by search_events(catalog_id="catX").
+    - A catalog_creation row (schema_name=NULL, payload.kwargs.catalog_id="catX")
+      is returned by search_events(catalog_id="catX").
     - A row for a *different* catalog ("catY") is NOT returned (no over-match).
     """
     import unittest.mock as mock
@@ -485,7 +486,11 @@ async def test_search_events_includes_platform_lifecycle_events(sa_engine, emit_
                 catalog_id=catalog_id,
                 collection_id=None,
                 identity_id=None,
-                payload_str=f'{{"catalog_id": "{catalog_id}"}}',
+                payload_str=(
+                    '{"args": [], "kwargs": {"catalog_id": "'
+                    + catalog_id
+                    + '"}}'
+                ),
                 shard=0,
             )
 
@@ -514,10 +519,10 @@ async def test_search_events_includes_platform_lifecycle_events(sa_engine, emit_
     assert len(catX_rows) == 1, (
         f"expected 1 platform event for catX, got {catX_rows!r}"
     )
-    assert catX_rows[0]["payload"].get("catalog_id") == "catX"
+    assert catX_rows[0]["payload"]["kwargs"].get("catalog_id") == "catX"
 
     # catY's event must NOT bleed into the catX-scoped view.
     assert len(catY_rows) == 1, (
         f"expected 1 platform event for catY, got {catY_rows!r}"
     )
-    assert catY_rows[0]["payload"].get("catalog_id") == "catY"
+    assert catY_rows[0]["payload"]["kwargs"].get("catalog_id") == "catY"
