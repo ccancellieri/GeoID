@@ -44,6 +44,7 @@ else:
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.models.driver_context import DriverContext
 from dynastore.modules.db_config.query_executor import managed_transaction
+from dynastore.modules.catalog.log_manager import log_info
 from dynastore.modules.gcp.gcp_config import (
     GcpCatalogBucketConfig,
     GcpEventingConfig,
@@ -246,9 +247,11 @@ class GcpEventingOpsMixin:
                 logger.info(f"Attempting to create topic with path: '{topic_path}'")
                 await run_in_thread(publisher_client.create_topic, name=topic_path)
                 logger.info(f"Created managed Pub/Sub topic: {topic_path}")
+                await log_info(catalog_id, "gcp_topic_created", f"Created managed Pub/Sub topic: {topic_path}")
                 break
             except google_exceptions.AlreadyExists:
                 logger.debug(f"Managed Pub/Sub topic '{topic_path}' already exists.")
+                await log_info(catalog_id, "gcp_topic_adopted", f"Managed Pub/Sub topic already exists, adopting: {topic_path}")
                 break
             except (
                 Aborted,
@@ -524,6 +527,11 @@ class GcpEventingOpsMixin:
                     f"bucket '{bucket_name}' with attributes "
                     f"{list(prefix_attributes.keys())}."
                 )
+                await log_info(
+                    catalog_id,
+                    "gcp_gcs_notification_created",
+                    f"Created GCS notification '{notification.notification_id}' for prefix '{prefix}' on bucket '{bucket_name}'.",
+                )
 
         managed_config.bucket_id = bucket_name
 
@@ -731,6 +739,13 @@ class GcpEventingOpsMixin:
             logger.info(
                 f"Created Pub/Sub push subscription '{subscription_path}' to endpoint '{push_endpoint}' with attributes {list(attributes.keys())}."
             )
+            _sub_catalog_id = attributes.get("catalog_id")
+            if _sub_catalog_id:
+                await log_info(
+                    _sub_catalog_id,
+                    "gcp_subscription_created",
+                    f"Created Pub/Sub push subscription '{subscription_path}'.",
+                )
         except google_exceptions.AlreadyExists as already_exists_err:
             # Pub/Sub binds subscription→topic immutably. Before refreshing
             # push_config, verify the existing subscription is bound to the
@@ -774,6 +789,13 @@ class GcpEventingOpsMixin:
                 logger.info(
                     f"Successfully updated PushConfig (attributes: {list(attributes.keys())}) for existing subscription '{subscription_path}'."
                 )
+                _sub_catalog_id = attributes.get("catalog_id")
+                if _sub_catalog_id:
+                    await log_info(
+                        _sub_catalog_id,
+                        "gcp_subscription_adopted",
+                        f"Pub/Sub subscription already exists, push config refreshed: '{subscription_path}'.",
+                    )
             except Exception as e:
                 logger.error(
                     f"Failed to update PushConfig for existing subscription '{subscription_path}': {e}"
@@ -818,6 +840,11 @@ class GcpEventingOpsMixin:
                 logger.info(
                     f"Deleted managed Pub/Sub subscription: {managed_config.subscription.subscription_path}"
                 )
+                await log_info(
+                    catalog_id,
+                    "gcp_subscription_deleted",
+                    f"Deleted managed Pub/Sub subscription: {managed_config.subscription.subscription_path}",
+                )
             except google_exceptions.NotFound:
                 logger.debug(
                     f"Managed Pub/Sub subscription '{managed_config.subscription.subscription_path}' not found. Nothing to delete."
@@ -833,6 +860,11 @@ class GcpEventingOpsMixin:
                 )
                 logger.info(
                     f"Deleted managed Pub/Sub topic: {managed_config.topic_path}"
+                )
+                await log_info(
+                    catalog_id,
+                    "gcp_topic_deleted",
+                    f"Deleted managed Pub/Sub topic: {managed_config.topic_path}",
                 )
             except google_exceptions.NotFound:
                 logger.debug(
@@ -915,6 +947,11 @@ class GcpEventingOpsMixin:
                     request={"topic": topic_path},
                 )
                 logger.info(f"Forcefully deleted default topic: {topic_path}")
+                await log_info(
+                    catalog_id,
+                    "gcp_topic_deleted",
+                    f"Forcefully deleted default Pub/Sub topic: {topic_path}",
+                )
             except google_exceptions.NotFound:
                 pass
             except Exception as e:
@@ -933,6 +970,11 @@ class GcpEventingOpsMixin:
                     request={"subscription": sub_path},
                 )
                 logger.info(f"Forcefully deleted default subscription: {sub_path}")
+                await log_info(
+                    catalog_id,
+                    "gcp_subscription_deleted",
+                    f"Forcefully deleted default Pub/Sub subscription: {sub_path}",
+                )
             except google_exceptions.NotFound:
                 pass
             except Exception as e:
