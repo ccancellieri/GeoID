@@ -678,6 +678,19 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
 
             where_clause = " AND ".join(base_clauses)
 
+            # System logs (catalog.system_logs) and tenant logs ({schema}.logs)
+            # declare their columns in a DIFFERENT physical order — notably
+            # `timestamp` is column 2 in the tenant table but the last column in
+            # system_logs. A `SELECT *` UNION ALL aligns columns positionally,
+            # so the branches collide (catalog_id VARCHAR vs timestamp TIMESTAMPTZ)
+            # and the whole query raises a type-mismatch error. Project an
+            # explicit, identically-ordered column list from each branch so the
+            # union is well-defined regardless of declaration order.
+            cols = (
+                "id, timestamp, catalog_id, collection_id, event_type, "
+                "level, message, details, stacktrace, request_context"
+            )
+
             # 2. Determine tables to query
             queries = []
 
@@ -689,7 +702,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 sys_where = where_clause.replace("catalog_id = :catalog_id", "TRUE")
 
             queries.append(
-                f"SELECT * FROM catalog.{SYSTEM_LOGS_TABLE} WHERE {sys_where}"
+                f"SELECT {cols} FROM catalog.{SYSTEM_LOGS_TABLE} WHERE {sys_where}"
             )
 
             # Tenant Logs
@@ -711,7 +724,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
 
                 if physical_schema:
                     queries.append(
-                        f'SELECT * FROM "{physical_schema}".logs WHERE {where_clause}'
+                        f'SELECT {cols} FROM "{physical_schema}".logs WHERE {where_clause}'
                     )
 
             # 3. Combine queries with UNION ALL and sort
@@ -724,7 +737,9 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 ).execute(conn, **params)
                 return [LogEntry.model_validate(r) for r in rows]
             except Exception as e:
-                logger.debug(f"Log Search failed: {e}")
+                # Don't bury read failures at debug — a swallowed error here
+                # silently returns "no logs", which masks real breakage.
+                logger.warning("Log search failed for catalog '%s': %s", catalog_id, e)
                 return []
 
 
