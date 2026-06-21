@@ -510,6 +510,11 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 is_system=True,
             ),
             db_resource=db_resource,
+            # Lifecycle events are sparse: write in-band rather than via the
+            # batch aggregator, whose timer-based flush is unreliable on a
+            # Cloud Run instance that goes idle (CPU-throttled) and scales to
+            # zero before the buffer is flushed — losing the row.
+            immediate=True,
         )
 
     async def _on_catalog_deleted(self, catalog_id: str, **kwargs):
@@ -523,6 +528,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 is_system=True,
             ),
             db_resource=db_resource,
+            immediate=True,
         )
 
     async def _on_catalog_hard_deleted(self, catalog_id: str, **kwargs):
@@ -537,6 +543,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 is_system=True,
             ),
             db_resource=db_resource,
+            immediate=True,
         )
 
     async def _on_catalog_failure(self, catalog_id: str, error: Optional[str] = None, **kwargs):
@@ -572,6 +579,9 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 is_system=False,
             ),
             db_resource=db_resource,
+            # immediate=True: see _on_catalog_created — the batch aggregator's
+            # timer flush is lost when an idle Cloud Run instance scales to zero.
+            immediate=True,
         )
 
     async def _on_collection_deleted(self, catalog_id: str, collection_id: str, **kwargs):
@@ -586,6 +596,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 is_system=False,
             ),
             db_resource=db_resource,
+            immediate=True,
         )
 
     async def _on_collection_hard_deleted(self, catalog_id: str, collection_id: str, **kwargs):
@@ -604,6 +615,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 is_system=False,
             ),
             db_resource=db_resource,
+            immediate=True,
         )
 
     async def append_log(

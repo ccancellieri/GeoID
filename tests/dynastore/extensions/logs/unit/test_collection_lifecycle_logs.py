@@ -100,3 +100,7 @@ async def test_collection_handler_appends_tenant_scoped_log(
     # not catalog.system_logs — that's what makes the collection-scoped
     # /logs endpoint find it.
     assert entry.is_system is False
+    # immediate=True bypasses the batch aggregator: lifecycle events are sparse,
+    # and the aggregator's timer flush is lost when an idle Cloud Run instance
+    # is CPU-throttled and scales to zero before the buffer drains.
+    assert ext.append_log.await_args.kwargs.get("immediate") is True
