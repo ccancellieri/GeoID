@@ -162,12 +162,12 @@ from dynastore.modules.db_config.query_executor import (
     DbConnection,
 )
 from dynastore.modules.catalog.models import AssetReferenceType, EventType
+from dynastore.modules.catalog.log_manager import log_info
 from dynastore.models.shared_models import Link
 from dynastore.models.protocols.assets import AssetsProtocol
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.query_builder import AssetFilter
 from enum import Enum
-from dynastore.models.driver_context import DriverContext
 
 logger = logging.getLogger(__name__)
 
@@ -609,6 +609,30 @@ class AssetService(AssetsProtocol):
         """Returns True if the manager is initialized and ready."""
         return self.engine is not None
 
+    async def _emit_durable(
+        self,
+        event_type: "AssetEventType",
+        doc: Any,
+        db_resource: Optional[DbResource],
+    ) -> None:
+        """Emit an asset domain event, guaranteeing the outbox write.
+
+        When the caller supplies a transaction (bulk/ingest paths) we ride it.
+        On the REST single-asset path db_resource is None and the emitter's
+        ``if db_resource:`` guard would otherwise skip the durable outbox write,
+        so we open a dedicated short transaction (#2256). The asset row is
+        already committed at this point, so a separate transaction is safe.
+        """
+        if not self._event_emitter:
+            return
+        if db_resource is not None:
+            await self._event_emitter(event_type, doc, db_resource=db_resource)
+        elif self.engine is not None:
+            async with managed_transaction(self.engine) as ev_conn:
+                await self._event_emitter(event_type, doc, db_resource=ev_conn)
+        else:
+            await self._event_emitter(event_type, doc, db_resource=None)
+
     async def _resolve_schema(
         self, catalog_id: str, db_resource: DbResource
     ) -> Optional[str]:
@@ -906,11 +930,14 @@ class AssetService(AssetsProtocol):
 
         self._invalidate_cache(created.asset_id, catalog_id, collection_id)
 
-        if self._event_emitter:
-            await self._event_emitter(
-                AssetEventType.ASSET_CREATED, created.model_dump(),
-                db_resource=db_resource,
-            )
+        await self._emit_durable(
+            AssetEventType.ASSET_CREATED, created.model_dump(), db_resource
+        )
+        await log_info(
+            catalog_id, "asset_created",
+            f"Asset '{created.asset_id}' created",
+            collection_id=collection_id,
+        )
         return created
 
     async def update_asset(
@@ -960,11 +987,14 @@ class AssetService(AssetsProtocol):
 
         self._invalidate_cache(updated.asset_id, catalog_id, collection_id)
 
-        if self._event_emitter:
-            await self._event_emitter(
-                AssetEventType.ASSET_UPDATED, updated.model_dump(),
-                db_resource=db_resource,
-            )
+        await self._emit_durable(
+            AssetEventType.ASSET_UPDATED, updated.model_dump(), db_resource
+        )
+        await log_info(
+            catalog_id, "asset_updated",
+            f"Asset '{updated.asset_id}' updated",
+            collection_id=collection_id,
+        )
         return updated
 
     async def patch_asset(
@@ -1026,11 +1056,14 @@ class AssetService(AssetsProtocol):
 
         self._invalidate_cache(updated.asset_id, catalog_id, collection_id)
 
-        if self._event_emitter:
-            await self._event_emitter(
-                AssetEventType.ASSET_UPDATED, updated.model_dump(),
-                db_resource=db_resource,
-            )
+        await self._emit_durable(
+            AssetEventType.ASSET_UPDATED, updated.model_dump(), db_resource
+        )
+        await log_info(
+            catalog_id, "asset_updated",
+            f"Asset '{updated.asset_id}' updated",
+            collection_id=collection_id,
+        )
         return updated
 
     async def finalize_pending_upload(
@@ -1141,10 +1174,14 @@ class AssetService(AssetsProtocol):
             db_resource=engine,
         )
 
-        if activated is not None and self._event_emitter:
-            await self._event_emitter(
-                AssetEventType.ASSET_UPDATED, activated.model_dump(),
-                db_resource=engine,
+        if activated is not None:
+            await self._emit_durable(
+                AssetEventType.ASSET_UPDATED, activated.model_dump(), engine
+            )
+            await log_info(
+                catalog_id, "asset_updated",
+                f"Asset '{activated.asset_id}' activated",
+                collection_id=collection_id,
             )
         return activated
 
@@ -1273,17 +1310,20 @@ class AssetService(AssetsProtocol):
         # Emit events. ``propagate`` is stamped on each payload so the
         # ``ItemReverseCascadeSubscriber`` can opt into the cascade only
         # when the caller asked for it.
-        if self._event_emitter:
-            event_type = (
-                AssetEventType.ASSET_HARD_DELETED if hard
-                else AssetEventType.ASSET_DELETED
+        event_type = (
+            AssetEventType.ASSET_HARD_DELETED if hard
+            else AssetEventType.ASSET_DELETED
+        )
+        log_event_type = "asset_deleted"
+        for a in asset_rows:
+            doc = dict(a)
+            doc["propagate"] = bool(propagate)
+            await self._emit_durable(event_type, doc, db_resource)
+            await log_info(
+                catalog_id, log_event_type,
+                f"Asset '{a.get('asset_id')}' deleted (hard={hard})",
+                collection_id=a.get("collection_id"),
             )
-            for a in asset_rows:
-                doc = dict(a)
-                doc["propagate"] = bool(propagate)
-                await self._event_emitter(
-                    event_type, doc, db_resource=db_resource,
-                )
 
         return rowcount
 
