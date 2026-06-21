@@ -979,6 +979,16 @@ class CollectionService:
             # Steps 8 & 9 (write_policy + schema persistence) moved to
             # step 5b above so ensure_storage can honour constraints.
 
+            # Emit domain event so _on_collection_creation listeners (e.g.
+            # tasks/event_driver.py) can fan out a collection_creation outbox
+            # row, giving /events + /logs parity with catalog_creation.
+            await emit_event(
+                CatalogEventType.COLLECTION_CREATION,
+                catalog_id=catalog_id,
+                collection_id=collection_model.id,
+                db_resource=conn,
+            )
+
         # Resolve physical_table for async lifecycle context (PG driver only; None for others).
         # Use db_resource when available so uncommitted catalog/collection rows are visible.
         # Fall back to None gracefully if the table hasn't been registered yet.
