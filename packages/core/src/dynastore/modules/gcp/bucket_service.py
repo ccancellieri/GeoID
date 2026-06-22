@@ -888,7 +888,11 @@ class BucketService:
         await run_in_thread(_delete_notification)
 
     async def drop_storage(
-        self, catalog_id: str, conn: Optional[DbResource] = None
+        self,
+        catalog_id: str,
+        conn: Optional[DbResource] = None,
+        physical_schema: Optional[str] = None,
+        bucket_name: Optional[str] = None,
     ) -> bool:
         """Remove the GCS bucket and its DB link for a catalog.
 
@@ -897,25 +901,54 @@ class BucketService:
         Returns True when cleanup completed successfully.
 
         Raises on unexpected GCS errors so callers can retry.
-        """
-        bucket_name = await self.get_storage_identifier(catalog_id)
 
-        # Fallback: if DB record is gone (e.g. schema already dropped), try deterministic name.
-        if not bucket_name:
+        Recreation-safe teardown path (#2298): a catalog hard-deleted and rapidly
+        recreated under a *new* schema would, on a ``catalog_id``-keyed DB lookup,
+        resolve to the *new* catalog's bucket and delete it. To target only the
+        *old* bucket, callers pass an explicit target captured at delete time:
+
+        * ``bucket_name`` — the authoritative name persisted on the old catalog's
+          config (preferred; correct even for legacy catalogs whose bucket name
+          does not embed the schema), or
+        * ``physical_schema`` — from which the name is reconstructed
+          deterministically (fallback when no persisted name was captured).
+
+        In either explicit-target mode the DB is never consulted for the name nor
+        mutated, leaving the live (recreated) catalog's bucket and config link
+        untouched. ``bucket_name`` wins when both are supplied.
+        """
+        explicit_target = physical_schema is not None or bucket_name is not None
+        if bucket_name is None and physical_schema is not None:
             try:
-                bucket_name = self.generate_bucket_name(catalog_id)
-                logger.info(
-                    "BucketService.drop_storage: DB record missing for %r; "
-                    "falling back to deterministic bucket name %r.",
-                    catalog_id, bucket_name,
+                bucket_name = self.generate_bucket_name(
+                    catalog_id, physical_schema=physical_schema
                 )
             except Exception as e:
                 logger.warning(
-                    "BucketService.drop_storage: cannot determine bucket name "
-                    "for catalog %r: %s",
-                    catalog_id, e,
+                    "BucketService.drop_storage: cannot derive schema-targeted "
+                    "bucket name for catalog %r (schema %r): %s",
+                    catalog_id, physical_schema, e,
                 )
-                return True  # Nothing to clean up.
+                return True  # Nothing safely targetable; idempotent success.
+        elif not explicit_target:
+            bucket_name = await self.get_storage_identifier(catalog_id)
+
+            # Fallback: if DB record is gone (e.g. schema already dropped), try deterministic name.
+            if not bucket_name:
+                try:
+                    bucket_name = self.generate_bucket_name(catalog_id)
+                    logger.info(
+                        "BucketService.drop_storage: DB record missing for %r; "
+                        "falling back to deterministic bucket name %r.",
+                        catalog_id, bucket_name,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "BucketService.drop_storage: cannot determine bucket name "
+                        "for catalog %r: %s",
+                        catalog_id, e,
+                    )
+                    return True  # Nothing to clean up.
 
         if not bucket_name:
             return True  # No bucket provisioned; idempotent success.
@@ -927,13 +960,17 @@ class BucketService:
             # when a catalog-scoped config row actually exists and still carries a
             # name, so a catalog whose schema is already gone is never
             # resurrected and inherited defaults are never pinned at this tier.
-            persisted = await self.config_service.get_persisted_config(
-                GcpCatalogBucketConfig, catalog_id=catalog_id
-            )
-            if persisted and persisted.get("bucket_name"):
-                cfg = GcpCatalogBucketConfig.model_validate(persisted)
-                async with managed_transaction(self.engine) as conn:
-                    await self._write_bucket_name(conn, catalog_id, cfg, None)
+            # Recreation-safe path (#2298) only deletes the old physical bucket
+            # by name; it must never clear the config link, which now belongs to
+            # the freshly recreated catalog under a different schema.
+            if not explicit_target:
+                persisted = await self.config_service.get_persisted_config(
+                    GcpCatalogBucketConfig, catalog_id=catalog_id
+                )
+                if persisted and persisted.get("bucket_name"):
+                    cfg = GcpCatalogBucketConfig.model_validate(persisted)
+                    async with managed_transaction(self.engine) as conn:
+                        await self._write_bucket_name(conn, catalog_id, cfg, None)
 
             # Force-delete the bucket (empties objects then deletes the bucket).
             try:

@@ -254,9 +254,61 @@ class GcpCatalogOpsMixin:
         )
 
         try:
+            # Recreation guard (#2298): this teardown runs un-awaited in the
+            # background, so the catalog may have been hard-deleted and rapidly
+            # recreated under a NEW physical_schema while we were queued. The
+            # default Pub/Sub topic name is deterministic per catalog_id
+            # (``ds-{catalog_id}-events``), so the new catalog adopts the exact
+            # same topic; tearing eventing down here would silently destroy the
+            # live catalog's eventing channel. Compare the schema captured at
+            # delete time against the one currently registered for this id: a
+            # mismatch means the catalog is a different, live instance.
+            recreated = False
+            try:
+                from dynastore.models.protocols import CatalogsProtocol
+
+                catalogs_svc = get_protocol(CatalogsProtocol)
+                if catalogs_svc is not None:
+                    current_schema = await catalogs_svc.resolve_physical_schema(
+                        catalog_id, allow_missing=True
+                    )
+                    recreated = (
+                        current_schema is not None
+                        and current_schema != context.physical_schema
+                    )
+            except Exception as e:
+                # Never let the recreation probe abort teardown; default to the
+                # original (non-recreated) behaviour on any lookup failure.
+                logger.warning(
+                    f"Recreation check failed for catalog '{catalog_id}' "
+                    f"(treating as not recreated): {e}"
+                )
+
+            if recreated:
+                logger.warning(
+                    f"Catalog '{catalog_id}' was recreated under a new schema "
+                    f"(deleted '{context.physical_schema}', current differs) while its "
+                    f"async teardown was in flight. Skipping eventing teardown to "
+                    f"protect the new catalog's adopted Pub/Sub topic; deleting only "
+                    f"the old, orphaned bucket."
+                )
+                try:
+                    await log_warning(
+                        catalog_id,
+                        "gcp.destroy.recreated",
+                        "Catalog recreated during teardown; eventing preserved, "
+                        "only the old bucket is removed.",
+                    )
+                except Exception as e:
+                    # The tenant schema may already be dropped; a failed log must
+                    # never abort the bucket cleanup that still has to run below.
+                    logger.warning(
+                        f"Could not record recreation notice for '{catalog_id}': {e}"
+                    )
+
             eventing_data = context.config.get(GcpEventingConfig.class_key())
 
-            if eventing_data:
+            if eventing_data and not recreated:
                 try:
                     eventing_config = GcpEventingConfig.model_validate(eventing_data)
 
@@ -294,31 +346,53 @@ class GcpCatalogOpsMixin:
             # NotFound-safe and idempotent, so it never double-deletes resources
             # the managed teardown already removed, and guarantees no Pub/Sub
             # resource survives a catalog hard-delete to collide on recreate.
-            try:
-                await self.teardown_catalog_eventing(catalog_id, config=None)
-            except Exception as e:
-                logger.warning(
-                    f"Best-effort default eventing cleanup failed for "
-                    f"'{catalog_id}' (non-fatal): {e}"
-                )
+            # Skipped on recreation (#2298): the deterministic topic is now owned
+            # by the new, live catalog.
+            if not recreated:
+                try:
+                    await self.teardown_catalog_eventing(catalog_id, config=None)
+                except Exception as e:
+                    logger.warning(
+                        f"Best-effort default eventing cleanup failed for "
+                        f"'{catalog_id}' (non-fatal): {e}"
+                    )
 
-            # Bucket deletion logic (optional/configurable) would go here
-            # For now, we force delete the bucket if it exists to satisfy the lifecycle contract.
-            # In a production system, we might want a 'retain_bucket' flag in the config.
+            # Bucket deletion: always target the OLD catalog's bucket (#2298),
+            # never a catalog_id-keyed DB lookup — after recreation that resolves
+            # to the NEW catalog's bucket and would delete live data. Prefer the
+            # authoritative name persisted on the deleted catalog's config
+            # snapshot (correct even for legacy catalogs whose name predates the
+            # schema-embedding convention); fall back to reconstructing it from
+            # the captured physical_schema. ``drop_storage`` is NotFound-safe and
+            # leaves the (recreated) catalog's DB config link untouched.
             bucket_manager = self.get_bucket_service()
-            bucket_name = await bucket_manager.get_storage_identifier(catalog_id)
-            if bucket_name:
-                logger.info(
-                    f"Deleting bucket '{bucket_name}' for catalog '{catalog_id}'..."
-                )
-                await bucket_manager.drop_storage(catalog_id)
-                await log_info(
-                    catalog_id, "gcp.bucket.deleted", f"Bucket {bucket_name} deleted."
-                )
-            else:
-                logger.warning(
-                    f"No bucket found for catalog '{catalog_id}' during teardown."
-                )
+            old_bucket_name: Optional[str] = None
+            bucket_snapshot = context.config.get(GcpCatalogBucketConfig.class_key())
+            if isinstance(bucket_snapshot, dict):
+                old_bucket_name = bucket_snapshot.get("bucket_name")
+            if not old_bucket_name:
+                try:
+                    old_bucket_name = bucket_manager.generate_bucket_name(
+                        catalog_id, physical_schema=context.physical_schema
+                    )
+                except Exception:
+                    old_bucket_name = None
+            logger.info(
+                f"Deleting old bucket '{old_bucket_name}' (schema "
+                f"'{context.physical_schema}') for catalog '{catalog_id}'..."
+            )
+            await bucket_manager.drop_storage(
+                catalog_id,
+                physical_schema=context.physical_schema,
+                bucket_name=old_bucket_name,
+            )
+            await log_info(
+                catalog_id,
+                "gcp.bucket.deleted",
+                f"Bucket {old_bucket_name} deleted."
+                if old_bucket_name
+                else "Bucket teardown attempted.",
+            )
 
             await log_info(
                 catalog_id, "gcp.destroy.success", "GCP resource teardown completed."

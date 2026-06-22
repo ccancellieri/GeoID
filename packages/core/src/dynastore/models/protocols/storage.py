@@ -41,7 +41,13 @@ class StorageProtocol(Protocol):
         """Returns the storage path (e.g., gs://...) for a catalog."""
         ...
 
-    async def drop_storage(self, catalog_id: str, conn: Optional[Any] = None) -> bool:
+    async def drop_storage(
+        self,
+        catalog_id: str,
+        conn: Optional[Any] = None,
+        physical_schema: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+    ) -> bool:
         """Remove all binary storage resources (e.g. bucket, prefix) associated with a catalog.
 
         This is the uniform teardown entry point for binary storage, parallel to the
@@ -50,6 +56,11 @@ class StorageProtocol(Protocol):
 
         Returns True when cleanup completed (idempotent — a missing bucket/resource
         is a no-op success, not a failure).
+
+        ``physical_schema`` / ``bucket_name`` select the recreation-safe teardown
+        path (#2298): an explicit old-resource target captured at delete time so a
+        catalog rapidly recreated under a new schema is never collaterally deleted.
+        Implementations that have no such race may ignore both.
         """
         ...
 
