@@ -19,9 +19,8 @@
 """State machine and CRUD tests for AppliedPresetsService using mock DB."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
 
 import pytest
 
@@ -238,3 +237,114 @@ async def test_list_with_cursor_uses_cursor_query():
         await svc.list(cursor="abc")
         mock_cursor_q.execute.assert_awaited_once()
         mock_base_q.execute.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# delete_for_catalog
+# ---------------------------------------------------------------------------
+
+# All delete_for_catalog tests supply a mock connection so _write takes the
+# ``conn is not None`` fast path and never attempts to open a real DB connection.
+
+@pytest.mark.asyncio
+async def test_delete_for_catalog_exact_scope():
+    """delete_for_catalog passes exact scope key catalog:<id>."""
+    svc, _ = _make_service()
+    captured: Dict[str, Any] = {}
+    mock_conn = MagicMock()
+
+    async def _capture(resource, **kwargs: Any):
+        captured.update(kwargs)
+        return 1
+
+    with patch(
+        "dynastore.modules.iam.applied_presets_service._q.DELETE_BY_CATALOG_SCOPE"
+    ) as mock_q:
+        mock_q.execute = _capture
+        await svc.delete_for_catalog("my-catalog", conn=mock_conn)
+
+    assert captured["scope_key"] == "catalog:my-catalog"
+
+
+@pytest.mark.asyncio
+async def test_delete_for_catalog_descendant_prefix():
+    """delete_for_catalog passes a LIKE prefix that covers collection descendants."""
+    svc, _ = _make_service()
+    captured: Dict[str, Any] = {}
+    mock_conn = MagicMock()
+
+    async def _capture(resource, **kwargs: Any):
+        captured.update(kwargs)
+        return 2
+
+    with patch(
+        "dynastore.modules.iam.applied_presets_service._q.DELETE_BY_CATALOG_SCOPE"
+    ) as mock_q:
+        mock_q.execute = _capture
+        await svc.delete_for_catalog("my-catalog", conn=mock_conn)
+
+    # The prefix must match catalog:my-catalog/<anything> but no sibling catalog.
+    assert captured["scope_prefix"] == "catalog:my-catalog/%"
+
+
+@pytest.mark.asyncio
+async def test_delete_for_catalog_escapes_underscore():
+    """Underscore in catalog_id is LIKE-escaped so it matches only itself.
+
+    Without ESCAPE, ``catalog:my_catalog/%`` would let ``_`` act as a
+    single-character wildcard and could match sibling catalogs whose id
+    differs by exactly one character in that position.
+    """
+    svc, _ = _make_service()
+    captured: Dict[str, Any] = {}
+    mock_conn = MagicMock()
+
+    async def _capture(resource, **kwargs: Any):
+        captured.update(kwargs)
+        return 1
+
+    with patch(
+        "dynastore.modules.iam.applied_presets_service._q.DELETE_BY_CATALOG_SCOPE"
+    ) as mock_q:
+        mock_q.execute = _capture
+        await svc.delete_for_catalog("my_catalog", conn=mock_conn)
+
+    # Underscore must be escaped so "my_catalog" does not act as a wildcard.
+    assert captured["scope_key"] == "catalog:my_catalog"
+    assert captured["scope_prefix"] == r"catalog:my\_catalog/%"
+
+
+@pytest.mark.asyncio
+async def test_delete_for_catalog_escapes_percent():
+    """Percent in catalog_id is LIKE-escaped so it matches only itself."""
+    svc, _ = _make_service()
+    captured: Dict[str, Any] = {}
+    mock_conn = MagicMock()
+
+    async def _capture(resource, **kwargs: Any):
+        captured.update(kwargs)
+        return 1
+
+    with patch(
+        "dynastore.modules.iam.applied_presets_service._q.DELETE_BY_CATALOG_SCOPE"
+    ) as mock_q:
+        mock_q.execute = _capture
+        await svc.delete_for_catalog("my%catalog", conn=mock_conn)
+
+    assert captured["scope_key"] == "catalog:my%catalog"
+    assert captured["scope_prefix"] == r"catalog:my\%catalog/%"
+
+
+@pytest.mark.asyncio
+async def test_delete_for_catalog_returns_rowcount():
+    """delete_for_catalog returns the integer rowcount from the query."""
+    svc, _ = _make_service()
+    mock_conn = MagicMock()
+
+    with patch(
+        "dynastore.modules.iam.applied_presets_service._q.DELETE_BY_CATALOG_SCOPE"
+    ) as mock_q:
+        mock_q.execute = AsyncMock(return_value=3)
+        result = await svc.delete_for_catalog("cat", conn=mock_conn)
+
+    assert result == 3

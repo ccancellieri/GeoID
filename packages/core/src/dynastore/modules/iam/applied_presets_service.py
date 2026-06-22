@@ -383,3 +383,29 @@ class AppliedPresetsService:
             last_error=f"child {child_name!r} failed: {child_error}",
         )
         return dict(row._mapping) if row is not None else None
+
+    async def delete_for_catalog(
+        self,
+        catalog_id: str,
+        conn: Optional[Any] = None,
+    ) -> int:
+        """Purge every applied-preset row scoped to this catalog or any descendant
+        (collection-level) scope.  Called when a catalog is hard-deleted so a
+        recreated catalog with the same id starts with a clean preset state.
+
+        Deletes both the exact ``catalog:<id>`` row and every
+        ``catalog:<id>/...`` descendant (e.g. ``catalog:<id>/collection:<col>``).
+
+        The LIKE prefix is escaped so that underscores and percent signs in the
+        catalog id are treated as literals and never match sibling catalogs.
+        ``\\`` must be escaped first to avoid double-escaping the escape char.
+        """
+        exact_key = f"catalog:{catalog_id}"
+        escaped = catalog_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        scope_prefix = f"catalog:{escaped}/%"
+        return await self._write(
+            _q.DELETE_BY_CATALOG_SCOPE,
+            conn,
+            scope_key=exact_key,
+            scope_prefix=scope_prefix,
+        )

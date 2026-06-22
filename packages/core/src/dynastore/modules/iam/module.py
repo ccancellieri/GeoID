@@ -696,3 +696,47 @@ async def initialize_iam_tenant(conn: DbResource, schema: str, catalog_id: str):
     # the IamRolesConfig catalog_roles so auth evaluations work on first
     # tenant access without requiring an explicit preset apply.
     await _seed_catalog_roles(conn, schema=schema, iam_storage=storage)
+
+
+from dynastore.modules.catalog.event_service import (  # noqa: E402
+    CatalogEventType,
+    sync_event_listener,
+)
+
+
+@sync_event_listener(CatalogEventType.AFTER_CATALOG_HARD_DELETION)
+async def _purge_applied_presets_on_catalog_hard_deletion(catalog_id: str, **kwargs: Any) -> None:
+    """Remove all iam.applied_presets rows scoped to this catalog.
+
+    Runs inside the catalog hard-delete transaction via ``db_resource=conn``
+    so the preset purge is atomic with the catalog row removal.  If the
+    connection is not passed (manual invocation) the service falls back to
+    its own managed transaction.
+
+    Covers both the exact ``catalog:<id>`` scope and every descendant scope
+    (``catalog:<id>/collection:<col>``) so a recreated catalog with the same
+    id starts with no inherited preset state.
+    """
+    from dynastore.models.protocols import DatabaseProtocol
+    from .applied_presets_service import AppliedPresetsService
+
+    conn = kwargs.get("db_resource")
+    if conn is None:
+        db = get_protocol(DatabaseProtocol)
+        conn = db.engine if db else None
+
+    try:
+        svc = AppliedPresetsService(conn)
+        deleted = await svc.delete_for_catalog(catalog_id, conn=conn)
+        logger.info(
+            "Purged %d applied_presets row(s) for hard-deleted catalog %r.",
+            deleted or 0,
+            catalog_id,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to purge applied_presets for catalog %r; "
+            "stale preset rows may remain in iam.applied_presets.",
+            catalog_id,
+            exc_info=True,
+        )

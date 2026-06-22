@@ -297,3 +297,16 @@ LIST_FOR_SCOPE_CURSOR = DQLQuery(
     """,
     result_handler=ResultHandler.ALL_DICTS,
 )
+
+# ---------------------------------------------------------------------------
+# DML — catalog hard-delete purge
+# ---------------------------------------------------------------------------
+
+DELETE_BY_CATALOG_SCOPE = DQLQuery(
+    r"""
+    DELETE FROM iam.applied_presets
+    WHERE scope_key = :scope_key
+       OR scope_key LIKE :scope_prefix ESCAPE '\'
+    """,
+    result_handler=ResultHandler.ROWCOUNT,
+)
