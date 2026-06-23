@@ -16,6 +16,6 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from .task import ProvisioningTask as GcpProvisionCatalogTask, GcpDestroyCatalogTask
+from .task import ProvisioningTask as GcpProvisionCatalogTask
 
-__all__ = ["GcpProvisionCatalogTask", "GcpDestroyCatalogTask"]
+__all__ = ["GcpProvisionCatalogTask"]

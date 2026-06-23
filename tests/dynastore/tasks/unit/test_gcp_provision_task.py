@@ -322,44 +322,6 @@ def test_storage_without_setup_method_falls_back():
     assert not isinstance(MinimalStorage(), GcpCatalogProvisioning)
 
 
-@pytest.mark.asyncio
-async def test_destroy_task_invokes_typed_destruction():
-    """GcpDestroyCatalogTask must call EventingProtocol.teardown_catalog_eventing
-    AND StorageProtocol.drop_storage directly — previously these were getattr-dispatched
-    to non-existent methods and silently no-opped.  Path A bug-fix regression guard.
-    """
-    from dynastore.tasks.gcp_provision.task import GcpDestroyCatalogTask
-
-    mock_storage = MagicMock()
-    mock_storage.drop_storage = AsyncMock(return_value=True)
-
-    mock_eventing = MagicMock()
-    mock_eventing.teardown_catalog_eventing = AsyncMock(return_value=None)
-
-    def _get_protocol_dispatch(proto):
-        from dynastore.models.protocols import EventingProtocol
-        if proto is EventingProtocol:
-            return mock_eventing
-        return None
-
-    task = GcpDestroyCatalogTask()
-    with (
-        patch(
-            "dynastore.tasks.gcp_provision.task._get_storage_protocol",
-            return_value=mock_storage,
-        ),
-        patch(
-            "dynastore.tasks.gcp_provision.task.get_protocol",
-            side_effect=_get_protocol_dispatch,
-        ),
-    ):
-        result = await task.run(_make_payload("destroy_test_cat"))
-
-    mock_eventing.teardown_catalog_eventing.assert_awaited_once_with("destroy_test_cat")
-    mock_storage.drop_storage.assert_awaited_once_with("destroy_test_cat")
-    assert result["status"] == "destroyed"
-
-
 # ---------------------------------------------------------------------------
 # Eventing step — transient failure path: a generic (non-permission,
 # non-clash) eventing error must be retried by the task queue, not silently
