@@ -875,6 +875,15 @@ class ItemQueryMixin:
         identical to calling ``get_item`` per item. Callers must gate on
         ``is_tile_cache_active`` before calling this.
 
+        The caller supplies the wire-surface ids (``feature.id``) which may be
+        UUIDs (internal geoid) OR external/producer ids (e.g. CityJSON GUIDs).
+        The query adapts: when the collection has a sidecar with a
+        ``feature_id_field_name`` (the external-id column), the WHERE clause
+        matches against that text column so any string id is accepted. When no
+        such sidecar exists, the ids must be valid UUIDs to match the ``geoid``
+        column; non-UUID ids are filtered out and, if none remain, an empty
+        list is returned immediately.
+
         Degrade-safe: any exception returns ``[]`` so the caller's write is
         never blocked. Empty ``item_ids`` short-circuits immediately.
         """
@@ -887,20 +896,67 @@ class ItemQueryMixin:
             if not phys_schema or not phys_table:
                 return []
 
+            import uuid as _uuid
+
+            from dynastore.modules.storage.drivers.pg_sidecars import driver_sidecars
+
             # Resolve bbox column name from the geometries sidecar config.
             # Default is ``bbox_geom``; fall back to that when no sidecar
             # config is found so the helper is robust to minimal environments.
             bbox_col = "bbox_geom"
-            from dynastore.modules.storage.drivers.pg_sidecars import driver_sidecars
+            # Also look for the first sidecar that carries the external feature-id
+            # column (``feature_id_field_name``). When found, the WHERE clause
+            # matches against that text column so non-UUID external/producer ids
+            # (e.g. CityJSON GUIDs like ``GUID_FFF9E566-...``) are handled
+            # correctly — the optimizer's ``CAST(:_item_ids AS uuid[])`` path is
+            # bypassed for these collections (#2045).
+            ext_id_field: Optional[str] = None
+            ext_id_sidecar_alias: Optional[str] = None
             for sc in driver_sidecars(col_config):
-                if getattr(sc, "sidecar_type", None) == "geometries":
+                sc_type = getattr(sc, "sidecar_type", None)
+                if sc_type == "geometries":
                     bbox_col = getattr(sc, "bbox_column", None) or bbox_col
-                    break
+                if ext_id_field is None:
+                    fid = getattr(sc, "feature_id_field_name", None)
+                    if fid:
+                        ext_id_field = fid
+                        ext_id_sidecar_alias = f"sc_{sc.sidecar_id}"
+
+            # Build the id-matching WHERE predicate explicitly so we never pass
+            # non-UUID strings through the optimizer's uuid[] CAST path.
+            id_raw_where: str
+            id_raw_params: Dict[str, Any]
+            if ext_id_field and ext_id_sidecar_alias:
+                # Text column match — accepts any string id (UUID or not).
+                # Mentioning the sidecar alias here causes the optimizer's
+                # raw-SQL scanner to JOIN that sidecar automatically.
+                id_raw_where = (
+                    f"{ext_id_sidecar_alias}.{ext_id_field} = ANY(:_tile_prior_ids)"
+                )
+                id_raw_params = {"_tile_prior_ids": [str(i) for i in item_ids]}
+            else:
+                # No external-id column: ids must be valid UUIDs to match
+                # the ``h.geoid`` uuid column. Filter out non-UUIDs to avoid
+                # a ``invalid UUID`` cast error from PostgreSQL.
+                uuid_ids = []
+                for i in item_ids:
+                    try:
+                        _uuid.UUID(str(i))
+                        uuid_ids.append(str(i))
+                    except (ValueError, AttributeError, TypeError):
+                        pass
+                if not uuid_ids:
+                    return []
+                id_raw_where = "h.geoid = ANY(CAST(:_tile_prior_ids AS uuid[]))"
+                id_raw_params = {"_tile_prior_ids": uuid_ids}
 
             from dynastore.models.protocols.access_filter import AccessFilter
 
             request = QueryRequest(
-                item_ids=list(item_ids),
+                # item_ids is intentionally None: the id-matching WHERE is
+                # injected via raw_where/raw_params above so the optimizer
+                # never applies its own (potentially uuid-casting) predicate.
+                item_ids=None,
                 select=[],
                 raw_selects=[
                     "h.geoid",
@@ -909,6 +965,8 @@ class ItemQueryMixin:
                     f"ST_XMax(sc_geometries.{bbox_col}) AS _xmax",
                     f"ST_YMax(sc_geometries.{bbox_col}) AS _ymax",
                 ],
+                raw_where=id_raw_where,
+                raw_params=id_raw_params,
                 limit=len(item_ids),
                 access_filter=AccessFilter.allow_everything(),
             )
