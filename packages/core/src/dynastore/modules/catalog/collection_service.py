@@ -137,7 +137,7 @@ def _make_collection_exists_query(phys_schema: str) -> DQLQuery:
 
 
 def _make_collection_list_ids_query(phys_schema: str) -> DQLQuery:
-    """SELECT ids of non-deleted collections in ``phys_schema``, paginated.
+    """SELECT ids of ACTIVE collections in ``phys_schema``, paginated.
 
     The thin PG ``collections`` registry is the authoritative existence
     ledger for every collection regardless of where its metadata lives (ES,
@@ -145,10 +145,17 @@ def _make_collection_list_ids_query(phys_schema: str) -> DQLQuery:
     the configured READ router, so a pure-ES (or DuckDB-only) catalog lists
     its collections even when the ES SEARCH index is empty or lagged. Stable
     ``ORDER BY id`` makes ``limit``/``offset`` pagination deterministic.
+
+    ``lifecycle_status IS NULL`` hides mid-provisioning and mid-hard-delete
+    rows (#2194 / #2066): the overlay is set to ``'provisioning'`` or
+    ``'deleting'`` while async init or teardown is in flight, and cleared
+    back to NULL once ACTIVE.  A direct GET-by-id still resolves it so a
+    client polling a known id can watch progress.
     """
     return DQLQuery(
         f'SELECT id FROM "{phys_schema}".collections '
-        "WHERE deleted_at IS NULL ORDER BY id LIMIT :limit OFFSET :offset;",
+        "WHERE deleted_at IS NULL AND lifecycle_status IS NULL "
+        "ORDER BY id LIMIT :limit OFFSET :offset;",
         result_handler=ResultHandler.ALL_SCALARS,
     )
 
