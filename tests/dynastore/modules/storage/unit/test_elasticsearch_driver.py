@@ -1330,3 +1330,87 @@ class TestIndexBulkResponseShapes:
             "indexed doc must carry top-level catalog_id so "
             "SearchService's term filter matches (#914 fix)"
         )
+
+
+# ---------------------------------------------------------------------------
+# get_driver_config dispatches through _driver_config_class (#2049)
+# ---------------------------------------------------------------------------
+
+
+class TestGetDriverConfigDispatchesPerSubclass:
+    """Each ES driver subclass returns its own config type from
+    ``get_driver_config``, not the hardcoded ``ItemsElasticsearchDriverConfig``
+    that the base used before #2049.
+    """
+
+    @pytest.mark.asyncio
+    async def test_public_driver_returns_items_config(self):
+        from dynastore.modules.storage.driver_config import ItemsElasticsearchDriverConfig
+
+        driver = ItemsElasticsearchDriver()
+        # No ConfigsProtocol registered → falls back to config_cls().
+        config = await driver.get_driver_config("cat1", "col1")
+        assert isinstance(config, ItemsElasticsearchDriverConfig), (
+            f"public items driver must return ItemsElasticsearchDriverConfig, "
+            f"got {type(config).__name__}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_private_driver_returns_private_config(self):
+        from dynastore.modules.storage.driver_config import ItemsElasticsearchPrivateDriverConfig
+
+        driver = ItemsElasticsearchPrivateDriver()
+        config = await driver.get_driver_config("cat1", "col1")
+        assert isinstance(config, ItemsElasticsearchPrivateDriverConfig), (
+            f"private driver must return ItemsElasticsearchPrivateDriverConfig, "
+            f"got {type(config).__name__}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_envelope_driver_returns_envelope_config(self):
+        from dynastore.modules.storage.driver_config import ItemsElasticsearchEnvelopeDriverConfig
+        from dynastore.modules.storage.drivers.elasticsearch_envelope.driver import (
+            ItemsElasticsearchEnvelopeDriver,
+        )
+
+        driver = ItemsElasticsearchEnvelopeDriver()
+        config = await driver.get_driver_config("cat1", "col1")
+        assert isinstance(config, ItemsElasticsearchEnvelopeDriverConfig), (
+            f"envelope driver must return ItemsElasticsearchEnvelopeDriverConfig, "
+            f"got {type(config).__name__}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_asset_driver_returns_asset_config(self):
+        """Before #2049, AssetElasticsearchDriver.get_driver_config fell through
+        to the _ElasticsearchBase fallback and parsed config via
+        ItemsElasticsearchDriverConfig — silently wrong type.  After the fix
+        it must return AssetElasticsearchDriverConfig."""
+        from dynastore.modules.storage.driver_config import AssetElasticsearchDriverConfig
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        driver = AssetElasticsearchDriver()
+        config = await driver.get_driver_config("cat1", "col1")
+        assert isinstance(config, AssetElasticsearchDriverConfig), (
+            f"asset driver must return AssetElasticsearchDriverConfig, "
+            f"got {type(config).__name__}"
+        )
+
+    def test_driver_config_class_attributes(self):
+        """Each driver class declares the correct _driver_config_class — pinning
+        the ClassVar so an accidental revert is caught at import time."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsElasticsearchDriverConfig,
+            ItemsElasticsearchPrivateDriverConfig,
+            ItemsElasticsearchEnvelopeDriverConfig,
+            AssetElasticsearchDriverConfig,
+        )
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+        from dynastore.modules.storage.drivers.elasticsearch_envelope.driver import (
+            ItemsElasticsearchEnvelopeDriver,
+        )
+
+        assert ItemsElasticsearchDriver._driver_config_class is ItemsElasticsearchDriverConfig
+        assert ItemsElasticsearchPrivateDriver._driver_config_class is ItemsElasticsearchPrivateDriverConfig
+        assert ItemsElasticsearchEnvelopeDriver._driver_config_class is ItemsElasticsearchEnvelopeDriverConfig
+        assert AssetElasticsearchDriver._driver_config_class is AssetElasticsearchDriverConfig

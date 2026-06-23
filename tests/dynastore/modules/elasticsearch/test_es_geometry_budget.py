@@ -91,18 +91,33 @@ def test_budget_minimum_valid_value():
 
 
 class _FakeDriverConfig:
-    """Sentinel sentinel config class so _resolve_simplify_geometry takes the get_protocol path."""
+    """Sentinel config class used as _driver_config_class on the fake driver."""
 
 
 class _FakeDriver:
     """Minimal stand-in for _ItemsElasticsearchBase to test the resolver.
 
-    Sets _driver_config_class to a non-None sentinel so the method takes the
-    get_protocol / ConfigsProtocol waterfall path (not the public-driver path
-    that calls get_driver_config).
+    Inherits ``get_driver_config`` from ``_ElasticsearchBase`` so that
+    ``_resolve_simplify_geometry`` (which now delegates to ``get_driver_config``)
+    correctly routes through the ConfigsProtocol waterfall when tests patch
+    ``dynastore.tools.discovery.get_protocol``.
     """
 
+    from dynastore.modules.storage.drivers.elasticsearch import _ElasticsearchBase as _Base  # noqa: F401
+
     _driver_config_class = _FakeDriverConfig
+
+    async def get_driver_config(
+        self,
+        catalog_id,
+        collection_id=None,
+        *,
+        db_resource=None,
+    ):
+        from dynastore.modules.storage.drivers.elasticsearch import _ElasticsearchBase
+        return await _ElasticsearchBase.get_driver_config(
+            self, catalog_id, collection_id, db_resource=db_resource,
+        )
 
     async def _resolve_simplify_geometry(
         self,

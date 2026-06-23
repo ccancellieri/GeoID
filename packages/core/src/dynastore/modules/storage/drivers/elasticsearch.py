@@ -255,6 +255,14 @@ _stamp_simplification = _apply_geometry_simplification
 class _ElasticsearchBase:
     """Shared helpers for ES storage drivers."""
 
+    # Concrete subclasses declare the PluginConfig subclass they store their
+    # per-driver config under.  ``get_driver_config`` dispatches through this
+    # so each driver retrieves its own config row without hardcoding the
+    # items config type. ``None`` here is a sentinel meaning "not declared";
+    # ``get_driver_config`` falls back to ``ItemsElasticsearchDriverConfig``
+    # in that case (preserving the pre-#2049 behaviour).
+    _driver_config_class: ClassVar[Any] = None
+
     def is_available(self) -> bool:
         """Available whenever the shared ES client is wired up.
 
@@ -284,21 +292,36 @@ class _ElasticsearchBase:
         *,
         db_resource: Optional[Any] = None,
     ) -> Any:
+        """Resolve the driver config for this subclass.
+
+        Dispatches through :attr:`_driver_config_class` so each driver
+        retrieves its own config row (``ItemsElasticsearchDriverConfig``,
+        ``AssetElasticsearchDriverConfig``, etc.) instead of always
+        parsing config through ``ItemsElasticsearchDriverConfig``.
+        Subclasses MUST declare ``_driver_config_class``; if one is
+        missing it falls back to ``ItemsElasticsearchDriverConfig`` so
+        callers keep getting a usable object at the cost of potentially
+        reading the wrong config row (the pre-#2049 behaviour).
+        """
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.tools.discovery import get_protocol
-        from dynastore.modules.storage.driver_config import ItemsElasticsearchDriverConfig
+
+        config_cls = self.__class__._driver_config_class
+        if config_cls is None:
+            from dynastore.modules.storage.driver_config import ItemsElasticsearchDriverConfig
+            config_cls = ItemsElasticsearchDriverConfig
 
         configs = get_protocol(ConfigsProtocol)
         if configs is None:
-            return ItemsElasticsearchDriverConfig()
+            return config_cls()
         config = await configs.get_config(
-            ItemsElasticsearchDriverConfig,
+            config_cls,
             catalog_id=catalog_id,
             collection_id=collection_id,
             ctx=DriverContext(db_resource=db_resource),
         )
         if config is None:
-            return ItemsElasticsearchDriverConfig()
+            return config_cls()
         return config
 
     @staticmethod
@@ -388,13 +411,14 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
     # ``items_query.EnvelopeFields``).
     _envelope_fields: ClassVar[EnvelopeFields] = PUBLIC_ENVELOPE_FIELDS
 
-    # Driver-specific config class resolved by :meth:`_resolve_simplify_geometry`.
-    # Each concrete driver overrides this to its own
-    # ``ItemsElasticsearch*DriverConfig`` subclass so the shared base can
-    # look up the per-driver config row without knowing the subclass name.
-    # The public driver uses ``ItemsElasticsearchDriverConfig`` (the default
-    # set here); private and envelope drivers override with their own types.
-    _driver_config_class: ClassVar[Any] = None  # set per-driver below
+    # Driver-specific config class resolved by :meth:`get_driver_config` and
+    # :meth:`_resolve_simplify_geometry` / :meth:`_resolve_simplify_max_bytes`.
+    # Each concrete driver sets this to its own
+    # ``ItemsElasticsearch*DriverConfig`` subclass so the shared helpers
+    # look up the per-driver config row without hardcoding a type.
+    # All three concrete items drivers declare the correct value; this
+    # ``None`` sentinel is inherited only by intermediate bases.
+    _driver_config_class: ClassVar[Any] = None
 
     # ------------------------------------------------------------------
     # Override seams
@@ -557,41 +581,21 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
     ) -> bool:
         """Return the ``simplify_geometry`` flag from this driver's config.
 
-        Resolves the per-driver ``ItemsElasticsearch*DriverConfig`` via the
-        ConfigsProtocol waterfall, using :attr:`_driver_config_class` to
-        address the right config row.  Each concrete driver sets
-        ``_driver_config_class`` to its own config type; the public driver
-        falls back to ``get_driver_config`` (which already resolves
-        ``ItemsElasticsearchDriverConfig``).
+        Delegates to :meth:`get_driver_config` which dispatches through
+        :attr:`_driver_config_class` to retrieve the per-driver config row.
+        All concrete drivers declare ``_driver_config_class``; the method
+        falls back gracefully when the protocol is unavailable.
 
         Degrade-safe: returns ``True`` (fail open to simplify) when the configs
         protocol is unavailable or the config row is missing.  Only an explicit
         ``simplify_geometry = False`` in the resolved config disables
         simplification.
         """
-        config_cls = self.__class__._driver_config_class
         try:
-            if config_cls is None:
-                # Public driver path: delegate to the generic get_driver_config.
-                driver_config = await self.get_driver_config(
-                    catalog_id, collection_id, db_resource=db_resource,
-                )
-                return bool(getattr(driver_config, "simplify_geometry", True))
-
-            from dynastore.models.protocols.configs import ConfigsProtocol
-            from dynastore.models.driver_context import DriverContext
-            from dynastore.tools.discovery import get_protocol
-
-            configs = get_protocol(ConfigsProtocol)
-            if configs is None:
-                return True
-            config = await configs.get_config(
-                config_cls,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-                ctx=DriverContext(db_resource=db_resource),
+            driver_config = await self.get_driver_config(
+                catalog_id, collection_id, db_resource=db_resource,
             )
-            return bool(getattr(config, "simplify_geometry", True))
+            return bool(getattr(driver_config, "simplify_geometry", True))
         except Exception:
             return True
 
@@ -604,32 +608,17 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
     ) -> int:
         """Effective ES geometry byte budget for simplification.
 
-        Reads ``simplify_target_bytes`` from this driver's config and clamps it
-        to ``(1, DEFAULT_MAX_BYTES)``.  Returns ``DEFAULT_MAX_BYTES`` (the 10 MB
-        ES ceiling) when unset or when the config is unavailable.
+        Delegates to :meth:`get_driver_config` which dispatches through
+        :attr:`_driver_config_class` to retrieve the per-driver config row.
+        Returns ``DEFAULT_MAX_BYTES`` (the 10 MB ES ceiling) when the config
+        is unavailable or ``simplify_target_bytes`` is unset.
         """
         from dynastore.tools.geometry_simplify import DEFAULT_MAX_BYTES
 
-        config_cls = self.__class__._driver_config_class
         try:
-            if config_cls is None:
-                cfg = await self.get_driver_config(
-                    catalog_id, collection_id, db_resource=db_resource,
-                )
-            else:
-                from dynastore.models.protocols.configs import ConfigsProtocol
-                from dynastore.models.driver_context import DriverContext
-                from dynastore.tools.discovery import get_protocol
-
-                configs = get_protocol(ConfigsProtocol)
-                if configs is None:
-                    return DEFAULT_MAX_BYTES
-                cfg = await configs.get_config(
-                    config_cls,
-                    catalog_id=catalog_id,
-                    collection_id=collection_id,
-                    ctx=DriverContext(db_resource=db_resource),
-                )
+            cfg = await self.get_driver_config(
+                catalog_id, collection_id, db_resource=db_resource,
+            )
         except Exception:
             return DEFAULT_MAX_BYTES
         return _clamp_geometry_budget(getattr(cfg, "simplify_target_bytes", None))
@@ -1158,6 +1147,10 @@ class ItemsElasticsearchDriver(
     """
 
     is_item_indexer: ClassVar[bool] = True
+
+    # Config class for the public items index — wires get_driver_config and
+    # the shared _resolve_simplify_* helpers to the correct config row.
+    _driver_config_class: ClassVar[Any] = ItemsElasticsearchDriverConfig
 
     # ES (public) is the canonical async secondary index + primary SEARCH
     # backend for items routing.  It auto-defaults into WRITE (as a secondary
@@ -2377,6 +2370,11 @@ class AssetElasticsearchDriver(
     is_asset_indexer: ClassVar[bool] = True
 
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
+
+    # Config class for the asset index — wires get_driver_config to the
+    # correct per-driver config row instead of falling through to
+    # ItemsElasticsearchDriverConfig (the _ElasticsearchBase fallback).
+    _driver_config_class: ClassVar[Any] = AssetElasticsearchDriverConfig
 
     # Asset ES is the canonical async secondary index + primary SEARCH
     # backend for asset metadata routing.  It auto-defaults into WRITE (as a
