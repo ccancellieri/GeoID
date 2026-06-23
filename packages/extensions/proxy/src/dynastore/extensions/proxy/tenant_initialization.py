@@ -40,17 +40,18 @@ async def _initialize_proxy_tenant_slice(conn: DbResource, schema: str, catalog_
 
     table_ddl = f"""
     CREATE TABLE IF NOT EXISTS \"{schema}\".collection_proxy_urls (
-        id         BIGINT       NOT NULL,
-        short_key  VARCHAR(20)  NOT NULL PRIMARY KEY,
-        long_url   TEXT         NOT NULL,
-        collection_id VARCHAR(255) NOT NULL DEFAULT '_catalog_',
-        created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        comment    TEXT
+        id                     BIGINT       NOT NULL,
+        short_key              VARCHAR(20)  NOT NULL PRIMARY KEY,
+        long_url               TEXT         NOT NULL,
+        collection_id          VARCHAR(255) NOT NULL DEFAULT '_catalog_',
+        collection_physical_id VARCHAR(255) NOT NULL DEFAULT '_catalog_',
+        created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        comment                TEXT
     );
     """
     index_ddl = (
-        f'CREATE INDEX IF NOT EXISTS idx_collection_proxy_urls_coll '
-        f'ON \"{schema}\".collection_proxy_urls (collection_id);'
+        f'CREATE INDEX IF NOT EXISTS idx_collection_proxy_urls_phys '
+        f'ON \"{schema}\".collection_proxy_urls (collection_physical_id);'
     )
 
     await DDLQuery(table_ddl).execute(conn)

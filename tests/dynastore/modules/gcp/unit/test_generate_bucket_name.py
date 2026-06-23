@@ -19,10 +19,10 @@
 """``BucketService.generate_bucket_name`` produces project-id-prefixed,
 length-safe bucket names.
 
-The previous opaque-hash scheme produced names like ``d88971-test-...``
-that were error-prone to type or recognise (e.g. the ``dd88971`` typo
-in production).  The new scheme uses the project ID directly so the
-bucket name is human-recognisable in logs / consoles / report paths.
+The method now accepts a single ``physical_id`` argument (the immutable
+physical identifier resolved via ``CatalogsProtocol.resolve_physical_id``).
+The previous two-argument form ``(catalog_id, physical_schema=None)`` has
+been removed; callers must resolve the physical_id before calling this method.
 """
 
 from __future__ import annotations
@@ -50,10 +50,12 @@ def test_basic_naming_uses_project_id_prefix():
         "my-test-project-test-catalog-19"
 
 
-def test_physical_schema_preferred_over_catalog_id():
+def test_physical_id_used_directly():
+    # generate_bucket_name now takes only the resolved physical_id.
+    # Previously the physical_schema was preferred over catalog_id — callers
+    # must now resolve the physical_id themselves before calling this method.
     bm = _make_bm("my-test-project")
-    assert bm.generate_bucket_name("any-id", physical_schema="s_2ka8fbc3") == \
-        "my-test-project-s-2ka8fbc3"
+    assert bm.generate_bucket_name("s_2ka8fbc3") == "my-test-project-s-2ka8fbc3"
 
 
 def test_underscores_normalised_to_dashes():
@@ -158,19 +160,18 @@ def test_distinct_long_identifiers_never_collide():
     assert n1 != n2
 
 
-def test_empty_identifier_raises():
+def test_empty_physical_id_raises():
     bm = _make_bm("my-test-project")
-    # Both arguments empty (catalog_id="" and physical_schema=None default) → raise
-    with pytest.raises(ValueError, match="both physical_schema and catalog_id are empty"):
+    # Empty string → raise; callers must resolve the physical_id first.
+    with pytest.raises(ValueError, match="physical_id is empty or None"):
         bm.generate_bucket_name("")
 
 
-def test_empty_physical_schema_falls_back_to_catalog_id():
-    # Legacy `(physical_schema or catalog_id)` semantic: empty physical_schema
-    # is treated as "not provided" and the catalog_id is used.
+def test_none_physical_id_raises():
+    # None → raise; callers must pass a resolved physical_id.
     bm = _make_bm("my-test-project")
-    name = bm.generate_bucket_name("test_catalog_19", physical_schema="")
-    assert name == "my-test-project-test-catalog-19"
+    with pytest.raises((ValueError, TypeError)):
+        bm.generate_bucket_name(None)  # type: ignore[arg-type]
 
 
 def test_invalid_chars_raise():

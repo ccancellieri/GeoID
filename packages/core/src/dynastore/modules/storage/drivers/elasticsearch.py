@@ -126,9 +126,12 @@ def _clamp_geometry_budget(target: Optional[int]) -> int:
     """
     from dynastore.tools.geometry_simplify import DEFAULT_MAX_BYTES
 
-    if target is None or target <= 0:
+    # Accept only a real integer budget; anything else (None, a non-numeric
+    # config value, an unconfigured attribute) degrades to the ES ceiling
+    # rather than raising — keeps the write path resilient to misconfig.
+    if not isinstance(target, int) or isinstance(target, bool) or target <= 0:
         return DEFAULT_MAX_BYTES
-    return min(int(target), DEFAULT_MAX_BYTES)
+    return min(target, DEFAULT_MAX_BYTES)
 
 
 def _es_client_required() -> Any:
@@ -144,12 +147,36 @@ def _es_client_required() -> Any:
     return es
 
 
-def _tenant_items_index(catalog_id: str) -> str:
+async def _resolve_catalog_physical_id(catalog_id: str) -> str:
+    """Resolve the immutable physical id for *catalog_id*.
+
+    Looks up ``CatalogsProtocol.resolve_physical_id`` if the protocol is
+    registered; falls back to the logical id so callers degrade gracefully
+    in contexts where the protocol is not yet wired (tests, tooling).
+    """
+    try:
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            physical = await catalogs.resolve_physical_id(
+                catalog_id, allow_missing=True,
+            )
+            if physical:
+                return physical
+    except Exception:
+        pass
+    return catalog_id
+
+
+async def _tenant_items_index(catalog_id: str) -> str:
     """Resolve the per-tenant items index name for the active deployment."""
     from dynastore.modules.elasticsearch.client import get_index_prefix
     from dynastore.modules.elasticsearch.mappings import get_tenant_items_index
 
-    return get_tenant_items_index(get_index_prefix(), catalog_id)
+    physical_id = await _resolve_catalog_physical_id(catalog_id)
+    return get_tenant_items_index(get_index_prefix(), physical_id)
 
 
 # Per-process cache: catalogs whose tenant items index has already been
@@ -373,12 +400,15 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
     # Override seams
     # ------------------------------------------------------------------
 
-    def _items_index_name(self, catalog_id: str) -> str:
+    async def _items_index_name(self, catalog_id: str) -> str:
         """Resolve the per-tenant items index this driver reads/writes.
 
         The SINGLE seam every index-naming method routes through. Public →
-        ``{prefix}-items-{catalog_id}``; private →
-        ``{prefix}-{catalog_id}-private-items``. Concrete drivers override.
+        ``{prefix}-{catalog_physical_id}-items``; private →
+        ``{prefix}-{catalog_physical_id}-private-items``. Concrete drivers
+        override. ``catalog_id`` is the logical id; each implementation
+        resolves the immutable physical id internally before building the
+        index name so a catalog rename never silently changes the index name.
         """
         raise NotImplementedError
 
@@ -411,7 +441,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
             return False
         try:
             return bool(
-                await es.indices.exists(index=self._items_index_name(catalog_id))
+                await es.indices.exists(index=await self._items_index_name(catalog_id))
             )
         except Exception:  # noqa: BLE001 — degrade to the next configured driver
             return False
@@ -698,7 +728,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
                 f"{type(self).__name__} does not support soft delete."
             )
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         es = self._get_client()
         deleted = 0
 
@@ -740,7 +770,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         from dynastore.modules.storage.storage_location import StorageLocation
 
         prefix = _get_index_prefix()
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         backend = self.__class__._location_backend or type(self).__name__
         return StorageLocation(
             backend=backend,
@@ -784,7 +814,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         multi = bool(request is not None and request.collections)
         return await es_count_items(
             es,
-            self._items_index_name(catalog_id),
+            await self._items_index_name(catalog_id),
             query=inner,
             collection=None if multi else collection_id,
             routing=None if multi else self._collection_routing(collection_id),
@@ -805,7 +835,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
             return None
         return await es_extents(
             es,
-            self._items_index_name(catalog_id),
+            await self._items_index_name(catalog_id),
             collection=collection_id,
             routing=self._collection_routing(collection_id),
         )
@@ -833,7 +863,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         )
         return await es_aggregate(
             es,
-            self._items_index_name(catalog_id),
+            await self._items_index_name(catalog_id),
             aggregation_type=aggregation_type,
             field=field,
             query=query,
@@ -854,7 +884,7 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         es = get_client()
         if es is None:
             return []
-        return await es_introspect_mapping(es, self._items_index_name(catalog_id))
+        return await es_introspect_mapping(es, await self._items_index_name(catalog_id))
 
     @staticmethod
     def _query_request_to_es(
@@ -1154,9 +1184,9 @@ class ItemsElasticsearchDriver(
         Hint.AGGREGATION, Hint.COUNT, Hint.STATISTICS,
     })
 
-    def _items_index_name(self, catalog_id: str) -> str:
-        """Public per-tenant items index ``{prefix}-items-{catalog_id}``."""
-        return _tenant_items_index(catalog_id)
+    async def _items_index_name(self, catalog_id: str) -> str:
+        """Public per-tenant items index ``{prefix}-{catalog_physical_id}-items``."""
+        return await _tenant_items_index(catalog_id)
 
     @property
     def es_client(self) -> Any:
@@ -1234,7 +1264,7 @@ class ItemsElasticsearchDriver(
         if not items:
             return []
         es = _es_client_required()
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         # ES-primary (ES-only) write: ensure the tenant items index exists with
         # the correct mapping (``collection`` as keyword) and alias enrolment
         # BEFORE writing. Otherwise ES auto-creates it with dynamic mappings on
@@ -1401,7 +1431,27 @@ class ItemsElasticsearchDriver(
                 if external_id is not None:
                     fallback_row["external_id"] = str(external_id)
                 if asset_id is not None:
-                    fallback_row["asset_id"] = str(asset_id)
+                    # ``asset_id`` from context is the mutable logical label.
+                    # Resolve it to the immutable physical_id (UUIDv7) via the
+                    # protocol so the stamped ``asset_physical_id`` in item
+                    # _source is rename-stable.  A None result (protocol
+                    # unavailable or asset not yet committed) is silently
+                    # ignored — the item is indexed without an asset link.
+                    _fallback_phys: Optional[str] = None
+                    try:
+                        from dynastore.models.protocols.assets import AssetsProtocol as _AP
+                        from dynastore.tools.discovery import get_protocol as _gp
+                        _assets_svc = _gp(_AP)
+                        if _assets_svc is not None:
+                            _fallback_phys = await _assets_svc.resolve_asset_physical_id(
+                                catalog_id, str(asset_id),
+                                collection_id=collection_id,
+                                allow_missing=True,
+                            )
+                    except Exception:
+                        pass
+                    if _fallback_phys is not None:
+                        fallback_row["physical_id"] = _fallback_phys
 
                 # Collect per-item STAC reserved members present in the
                 # serialized feature.  ``assets`` and ``stac_extensions`` are
@@ -1452,10 +1502,9 @@ class ItemsElasticsearchDriver(
                 es_doc["_valid_from"] = valid_from
             if valid_to is not None:
                 es_doc["_valid_to"] = valid_to
-            # asset_id is carried only by the canonical root ``asset_id`` identity
-            # field (build_canonical_index_doc writes it from the row). The legacy
-            # ``_asset_id`` ``_source`` mirror is no longer stamped — it was an
-            # unindexed duplicate of the root field (#1285 identity convergence).
+            # The immutable asset_physical_id UUID is carried by
+            # build_canonical_index_doc from the row; the mutable logical
+            # asset_id is never written to item _source.
 
             # Geometry simplification (#1248/#1828) — operates on the assembled
             # _source dict so the canonical envelope is intact; metadata is
@@ -1739,7 +1788,7 @@ class ItemsElasticsearchDriver(
         from dynastore.tools.typed_store.base import _to_snake
 
         es = _es_client_required()
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         # Resolve the wire-shape policy once per query so every hit is
         # reconstructed against the same read contract (id source, exposure).
         read_policy = await self._resolve_read_policy(catalog_id, collection_id)
@@ -1835,7 +1884,7 @@ class ItemsElasticsearchDriver(
                 len(entity_ids),
             )
         es = _es_client_required()
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         deleted = 0
         for eid in entity_ids:
             try:
@@ -1885,7 +1934,7 @@ class ItemsElasticsearchDriver(
         )
 
         es = _es_client_required()
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
 
         try:
             exists = await es.indices.exists(index=index_name)
@@ -1958,7 +2007,7 @@ class ItemsElasticsearchDriver(
         )
 
         es = _es_client_required()
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         if collection_id:
             try:
                 await es.delete_by_query(
@@ -2010,7 +2059,7 @@ class ItemsElasticsearchDriver(
             )
 
         es = _es_client_required()
-        index_name = self._items_index_name(ctx.catalog)
+        index_name = await self._items_index_name(ctx.catalog)
         await _ensure_in_public_alias_once(ctx.catalog, index_name)
 
         if op.op_type == "delete":
@@ -2037,11 +2086,26 @@ class ItemsElasticsearchDriver(
             # For a file-backed collection there is never a PG row, so fall
             # back to a feature-derived canonical doc built from op.payload.
             if op.payload:
+                _raw_aid = op.payload.get("asset_id")
+                _index_phys: Optional[str] = None
+                if _raw_aid is not None:
+                    try:
+                        from dynastore.models.protocols.assets import AssetsProtocol as _AP2
+                        from dynastore.tools.discovery import get_protocol as _gp2
+                        _ap2 = _gp2(_AP2)
+                        if _ap2 is not None:
+                            _index_phys = await _ap2.resolve_asset_physical_id(
+                                ctx.catalog, str(_raw_aid),
+                                collection_id=ctx.collection,
+                                allow_missing=True,
+                            )
+                    except Exception:
+                        pass
                 ci = canonical_input_from_feature(
                     op.payload, ctx.catalog, ctx.collection,
                     geoid=op.entity_id,
                     external_id=op.payload.get("external_id"),
-                    asset_id=op.payload.get("asset_id"),
+                    physical_id=_index_phys,
                 )
             else:
                 logger.debug(
@@ -2100,7 +2164,7 @@ class ItemsElasticsearchDriver(
             )
 
         es = _es_client_required()
-        index_name = self._items_index_name(ctx.catalog)
+        index_name = await self._items_index_name(ctx.catalog)
         await _ensure_in_public_alias_once(ctx.catalog, index_name)
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
         simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
@@ -2141,12 +2205,28 @@ class ItemsElasticsearchDriver(
                 if op.payload:
                     # Outbox payloads carry the canonical identity under the
                     # stamped ``_external_id`` / ``_asset_id`` keys (see
-                    # ItemService._apply_index_stamp); a bare ``external_id`` /
-                    # ``asset_id`` is never present. Read the stamped keys first
-                    # (falling back to the bare names for any non-outbox caller)
-                    # so the feature-derived doc still carries
-                    # ``system.external_id`` / ``asset_id`` instead of silently
-                    # dropping them.
+                    # ItemService._apply_index_stamp).  ``_asset_id`` is the
+                    # mutable logical label — resolve it to the immutable
+                    # physical_id (UUIDv7) before passing to the feature
+                    # builder so item _source never holds the logical name.
+                    _bulk_raw_aid = (
+                        op.payload.get("_asset_id")
+                        or op.payload.get("asset_id")
+                    )
+                    _bulk_phys: Optional[str] = None
+                    if _bulk_raw_aid is not None:
+                        try:
+                            from dynastore.models.protocols.assets import AssetsProtocol as _AP3
+                            from dynastore.tools.discovery import get_protocol as _gp3
+                            _ap3 = _gp3(_AP3)
+                            if _ap3 is not None:
+                                _bulk_phys = await _ap3.resolve_asset_physical_id(
+                                    ctx.catalog, str(_bulk_raw_aid),
+                                    collection_id=ctx.collection,
+                                    allow_missing=True,
+                                )
+                        except Exception:
+                            pass
                     ci = canonical_input_from_feature(
                         op.payload, ctx.catalog, ctx.collection,
                         geoid=op.entity_id,
@@ -2154,10 +2234,7 @@ class ItemsElasticsearchDriver(
                             op.payload.get("_external_id")
                             or op.payload.get("external_id")
                         ),
-                        asset_id=(
-                            op.payload.get("_asset_id")
-                            or op.payload.get("asset_id")
-                        ),
+                        physical_id=_bulk_phys,
                     )
                 else:
                     logger.debug(
@@ -2219,7 +2296,7 @@ class ItemsElasticsearchDriver(
         """
         from dynastore.modules.storage.storage_location import StorageLocation
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         return StorageLocation(
             backend="elasticsearch",
             canonical_uri=f"es://{index_name}?routing={collection_id}",
@@ -2329,6 +2406,23 @@ class AssetElasticsearchDriver(
         yield
 
     # ------------------------------------------------------------------
+    # Index-name seam
+    # ------------------------------------------------------------------
+
+    async def _asset_index_name(self, catalog_id: str) -> str:
+        """Resolve the per-catalog assets index name for the active deployment.
+
+        Resolves the immutable physical id for *catalog_id* once via
+        ``CatalogsProtocol.resolve_physical_id`` before building the index
+        name so a catalog rename never silently changes the index.
+        """
+        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
+        from dynastore.modules.elasticsearch.mappings import get_assets_index_name
+
+        physical_id = await _resolve_catalog_physical_id(catalog_id)
+        return get_assets_index_name(_get_index_prefix(), physical_id)
+
+    # ------------------------------------------------------------------
     # Public API — direct programmatic indexing
     # ------------------------------------------------------------------
 
@@ -2338,15 +2432,12 @@ class AssetElasticsearchDriver(
         db_resource: Optional[Any] = None,
     ) -> None:
         """Index a single asset document."""
-        from dynastore.modules.elasticsearch.mappings import (
-            get_assets_index_name, ASSET_MAPPING,
-        )
+        from dynastore.modules.elasticsearch.mappings import ASSET_MAPPING
         from dynastore.modules.elasticsearch.index_config import (
             get_assets_index_settings,
         )
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         es = self._get_client()
 
         if not await es.indices.exists(index=index_name):
@@ -2371,10 +2462,7 @@ class AssetElasticsearchDriver(
         db_resource: Optional[Any] = None,
     ) -> None:
         """Delete a single asset document from the index."""
-        from dynastore.modules.elasticsearch.mappings import get_assets_index_name
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         es = self._get_client()
         try:
             await es.delete(index=index_name, id=asset_id)
@@ -2414,6 +2502,30 @@ class AssetElasticsearchDriver(
         doc.setdefault("catalog_id", ctx.catalog)
         if ctx.collection is not None:
             doc.setdefault("collection_id", ctx.collection)
+        # Stamp the immutable physical_id (UUIDv7) alongside the mutable
+        # logical asset_id so the visibility filter can key on it after a
+        # rename without requiring a reindex (#2296).  The Asset model does
+        # not carry physical_id (internal-only, never serialized to REST/STAC),
+        # so we resolve it here via the shared cached resolver.  A None result
+        # (asset not yet landed, protocol unavailable) leaves asset_physical_id
+        # absent from the doc — the filter degrades gracefully to no-match on
+        # that doc until the next reindex re-stamps it.
+        if "asset_physical_id" not in doc:
+            try:
+                from dynastore.models.protocols.assets import AssetsProtocol
+                from dynastore.tools.discovery import get_protocol as _get_protocol
+                _assets = _get_protocol(AssetsProtocol)
+                if _assets is not None:
+                    _phys = await _assets.resolve_asset_physical_id(
+                        ctx.catalog,
+                        op.entity_id,
+                        collection_id=ctx.collection,
+                        allow_missing=True,
+                    )
+                    if _phys is not None:
+                        doc["asset_physical_id"] = _phys
+            except Exception:
+                pass
         await self.index_asset(ctx.catalog, doc)
 
     async def index_bulk(self, ctx, ops):
@@ -2456,15 +2568,12 @@ class AssetElasticsearchDriver(
         context: Optional[Dict[str, Any]] = None,
         db_resource: Optional[Any] = None,
     ) -> List[Feature]:
-        from dynastore.modules.elasticsearch.mappings import (
-            get_assets_index_name, ASSET_MAPPING,
-        )
+        from dynastore.modules.elasticsearch.mappings import ASSET_MAPPING
         from dynastore.modules.elasticsearch.index_config import (
             get_assets_index_settings,
         )
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         items = self._normalize_entities(entities)
         es = self._get_client()
 
@@ -2522,13 +2631,10 @@ class AssetElasticsearchDriver(
         # applied here by design (geoid#1643); only search_assets (the SEARCH
         # path on this driver) invokes restore_transform_chain. Declaring
         # output_transformers on a by-id READ entry will not fire.
-        from dynastore.modules.elasticsearch.mappings import get_assets_index_name
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-
         if not entity_ids:
             return
 
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         es = self._get_client()
 
         if not await es.indices.exists(index=index_name):
@@ -2564,10 +2670,7 @@ class AssetElasticsearchDriver(
             raise SoftDeleteNotSupportedError(
                 "AssetElasticsearchDriver does not support soft delete."
             )
-        from dynastore.modules.elasticsearch.mappings import get_assets_index_name
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         es = self._get_client()
         deleted = 0
         for asset_id in entity_ids:
@@ -2588,15 +2691,12 @@ class AssetElasticsearchDriver(
         collection_id: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
-        from dynastore.modules.elasticsearch.mappings import (
-            get_assets_index_name, ASSET_MAPPING,
-        )
+        from dynastore.modules.elasticsearch.mappings import ASSET_MAPPING
         from dynastore.modules.elasticsearch.index_config import (
             get_assets_index_settings,
         )
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         es = self._get_client()
         if not await es.indices.exists(index=index_name):
             try:
@@ -2623,10 +2723,7 @@ class AssetElasticsearchDriver(
             raise SoftDeleteNotSupportedError(
                 "AssetElasticsearchDriver does not support soft drop."
             )
-        from dynastore.modules.elasticsearch.mappings import get_assets_index_name
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         es = self._get_client()
         if collection_id:
             # Collection-scoped teardown: delete only THIS collection's asset
@@ -2686,14 +2783,12 @@ class AssetElasticsearchDriver(
         the HTTP layer renders 404, never 403 or 200-with-data.
         """
         from dynastore.models.protocols.visibility import resolve_asset_listing_ids
-        from dynastore.modules.elasticsearch.mappings import get_assets_index_name
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 
         visible_ids = await resolve_asset_listing_ids(catalog_id, collection_id)
         if visible_ids is not None and asset_id not in visible_ids:
             return None
 
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         es = self._get_client()
         try:
             resp = await es.get(index=index_name, id=asset_id)
@@ -2736,15 +2831,13 @@ class AssetElasticsearchDriver(
         set is empty.
         """
         from dynastore.models.protocols.visibility import resolve_asset_listing_ids
-        from dynastore.modules.elasticsearch.mappings import get_assets_index_name
-        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 
         vis_collection_id = None if all_collections else collection_id
         visible_ids = await resolve_asset_listing_ids(catalog_id, vis_collection_id)
         if visible_ids is not None and not visible_ids:
             return []
 
-        index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         es = self._get_client()
 
         base_query = build_es_query(filters or [])
@@ -2766,11 +2859,41 @@ class AssetElasticsearchDriver(
             }
 
         if visible_ids is not None:
-            # Inject the asset_id allowlist as an ES ``terms`` filter.
-            # Mirroring the collection_es_driver visible_ids pattern.
+            # Translate the logical asset-id allowlist (from IAM) to immutable
+            # physical_ids so the filter remains correct across asset renames.
+            # A rename changes the logical asset_id label but not physical_id,
+            # so keying on physical_id means the ES doc is correct from the
+            # moment of the rename — no reindex required (#2296).
+            # Resolve each visible logical id → physical_id via the shared
+            # cached resolver (no per-call DB hit when the cache is warm).
+            # Any id that cannot be resolved (asset deleted or protocol
+            # unavailable) is silently dropped — fail-closed is safe because
+            # the grant for a non-existent asset should never widen a listing.
+            from dynastore.models.protocols.assets import AssetsProtocol
+            from dynastore.tools.discovery import get_protocol as _gp
+            _assets_proto = _gp(AssetsProtocol)
+            physical_ids: list = []
+            if _assets_proto is not None:
+                for _lid in visible_ids:
+                    try:
+                        _phys = await _assets_proto.resolve_asset_physical_id(
+                            catalog_id,
+                            _lid,
+                            collection_id=collection_id,
+                            allow_missing=True,
+                        )
+                        if _phys is not None:
+                            physical_ids.append(_phys)
+                    except Exception:
+                        pass
+            else:
+                # No AssetsProtocol registered — fall back to the logical ids
+                # so the filter still narrows the listing (correct for catalogs
+                # that have never been renamed).
+                physical_ids = list(visible_ids)
             existing = base_query if "bool" in base_query else {"bool": {"must": [base_query]}}
             existing.setdefault("bool", {}).setdefault("filter", []).append(
-                {"terms": {"asset_id": sorted(visible_ids)}}
+                {"terms": {"asset_physical_id": sorted(physical_ids)}}
             )
             base_query = existing
 
@@ -2828,10 +2951,9 @@ class AssetElasticsearchDriver(
         """Return typed physical storage coordinates for this asset index."""
         from dynastore.modules.storage.storage_location import StorageLocation
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
-        from dynastore.modules.elasticsearch.mappings import get_assets_index_name
 
         prefix = _get_index_prefix()
-        index_name = get_assets_index_name(prefix, catalog_id)
+        index_name = await self._asset_index_name(catalog_id)
         return StorageLocation(
             backend="elasticsearch_assets",
             canonical_uri=f"es://{index_name}",

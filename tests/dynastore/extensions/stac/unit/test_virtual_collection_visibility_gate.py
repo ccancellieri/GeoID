@@ -242,7 +242,12 @@ async def test_get_virtual_asset_items_iam_off_reaches_service(monkeypatch):
         get_collection_config=AsyncMock(return_value=SimpleNamespace()),
     )
     monkeypatch.setattr(svc, "_get_catalogs_service", _acoro(catalogs_stub))
-    monkeypatch.setattr(stac_virtual_mod, "get_protocol", lambda _p: SimpleNamespace())
+    # Provide an AssetsProtocol stub with resolve_asset_physical_id so the
+    # physical-id resolution path does not raise AttributeError.
+    assets_stub = SimpleNamespace(
+        resolve_asset_physical_id=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(stac_virtual_mod, "get_protocol", lambda _p: assets_stub)
 
     async def _empty_aiter():
         return

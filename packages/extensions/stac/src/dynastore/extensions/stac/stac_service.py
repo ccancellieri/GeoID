@@ -61,6 +61,7 @@ from .stac_models import (
     STACCatalogUpdate,
 )
 from .stac_aggregation_models import AggregationRequest
+from dynastore.extensions.ogc_models_shared import RenameRequest, RenameResponse
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
 from dynastore.extensions.tools.url import get_url
 from dynastore.tools.discovery import get_protocol, get_protocols
@@ -366,6 +367,11 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             # Write Operations
             ("/catalogs", "create_stac_catalog", ["POST"], {"status_code": status.HTTP_201_CREATED}),
             ("/catalogs/{catalog_id}/collections", "create_stac_collection", ["POST"], {"status_code": status.HTTP_201_CREATED}),
+            # Rename endpoints — must be declared BEFORE the parametric
+            # {catalog_id} and {collection_id} routes so Starlette matches
+            # the literal `:rename` suffix first.
+            ("/catalogs/{catalog_id}:rename", "rename_stac_catalog", ["POST"], {"status_code": status.HTTP_200_OK}),
+            ("/catalogs/{catalog_id}/collections/{collection_id}:rename", "rename_stac_collection", ["POST"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}", "replace_stac_catalog", ["PUT"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}", "update_stac_catalog", ["PATCH"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}", "delete_stac_catalog", ["DELETE"], {}),
@@ -800,6 +806,76 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         input_data = definition.model_dump(exclude_unset=False)
         input_data = normalize_i18n_for_replace(input_data, language)
         return await self._ogc_replace_catalog(catalog_id, input_data, language, None)
+
+    async def rename_stac_catalog(
+        self,
+        catalog_id: str,
+        body: RenameRequest,
+    ) -> RenameResponse:
+        """Rename a catalog's logical id.
+
+        POST /stac/catalogs/{catalog_id}:rename
+
+        Only the human-readable label (``catalog.catalogs.id``) is updated.
+        Physical schema, storage backends, and configs are unchanged.  IAM
+        bindings that reference the old id must be updated manually.
+        """
+        from dynastore.models.protocols import CatalogsProtocol
+        from dynastore.modules.catalog.catalog_service import _CatalogRenameConflictError
+
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Catalog service unavailable.",
+            )
+        try:
+            return await catalogs.rename_catalog(catalog_id, body.new_id)
+        except _CatalogRenameConflictError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            ) from e
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(e),
+            ) from e
+
+    async def rename_stac_collection(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        body: RenameRequest,
+    ) -> RenameResponse:
+        """Rename a collection's logical id.
+
+        POST /stac/catalogs/{catalog_id}/collections/{collection_id}:rename
+
+        Only the human-readable label columns are updated.  The physical
+        table, partition key, and storage backends are unchanged.
+        """
+        from dynastore.models.protocols import CatalogsProtocol
+        from dynastore.modules.catalog.collection_service import CollectionRenameConflictError
+
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Catalog service unavailable.",
+            )
+        try:
+            return await catalogs.rename_collection(catalog_id, collection_id, body.new_id)
+        except CollectionRenameConflictError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            ) from e
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(e),
+            ) from e
 
     async def update_stac_catalog(
         self,

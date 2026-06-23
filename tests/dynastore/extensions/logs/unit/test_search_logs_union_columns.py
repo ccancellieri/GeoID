@@ -63,12 +63,28 @@ def _column_order(ddl: str) -> list[str]:
 def test_system_and_tenant_log_columns_diverge() -> None:
     sys_cols = _column_order(SYSTEM_LOGS_DDL)
     tenant_cols = _column_order(TENANT_LOGS_DDL)
-    # Same set of columns ...
-    assert set(sys_cols) == set(tenant_cols)
-    # ... but a DIFFERENT order — which is exactly why a positional `SELECT *`
-    # UNION ALL collides and must not be used.
-    assert sys_cols != tenant_cols, (
-        "If the column orders were unified, the SELECT * union would be safe; "
+    # The tenant table gains ``collection_physical_id`` (the partition key)
+    # which is absent from the flat system_logs table.  The UNION branch in
+    # search_logs projects an explicit, identically-ordered column list that
+    # excludes the internal partition key, so the UNION ALL remains well-typed.
+    assert "collection_physical_id" in tenant_cols, (
+        "TENANT_LOGS_DDL must declare collection_physical_id (partition key)."
+    )
+    assert "collection_physical_id" not in sys_cols, (
+        "SYSTEM_LOGS_DDL must NOT declare collection_physical_id "
+        "(it is a flat table, not partitioned by collection)."
+    )
+    # Excluding the partition key, the remaining columns diverge in ORDER —
+    # which is exactly why a positional `SELECT *` UNION ALL collides and
+    # must not be used.
+    shared_sys = sys_cols
+    shared_tenant = [c for c in tenant_cols if c != "collection_physical_id"]
+    assert set(shared_sys) == set(shared_tenant), (
+        "System and tenant logs must share the same set of user-visible columns "
+        "(excluding collection_physical_id)."
+    )
+    assert shared_sys != shared_tenant, (
+        "If the column orders were unified the SELECT * union would be safe; "
         "until then search_logs must project explicit columns."
     )
 

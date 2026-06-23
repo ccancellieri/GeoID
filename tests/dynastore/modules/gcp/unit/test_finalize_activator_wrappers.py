@@ -140,7 +140,7 @@ def _pending_row(asset_id: str = "asset_1") -> Dict[str, Any]:
 
 def _make_event(
     catalog_id: str = "cat",
-    collection_id: Optional[str] = "col",
+    collection_physical_id: Optional[str] = "c_phys",
     filename: str = "file.tif",
     md5_hash: Optional[str] = "abc==",
 ) -> FinalizeEvent:
@@ -150,7 +150,7 @@ def _make_event(
         filename=filename,
         uri=f"gs://bkt/path/{filename}",
         catalog_id=catalog_id,
-        collection_id=collection_id,
+        collection_physical_id=collection_physical_id,
         md5_hash=md5_hash,
         size_bytes=100,
     )
@@ -170,11 +170,13 @@ async def test_select_uses_dqlquery_named_params():
     # The SQL must contain the FOR UPDATE lock and reference the schema.
     assert "FOR UPDATE" in first_call["sql"]
     assert "test_schema" in first_call["sql"]
-    # Params must use named keys, never positional lists.
-    assert "catalog_id" in first_call["params"]
-    assert "collection_id" in first_call["params"]
+    # Params must use named keys, never positional lists. The matcher keys on
+    # the physical schema (via {schema}) + collection_physical_id + filename;
+    # the mutable logical catalog_id is intentionally NOT a bind (schema scopes
+    # the catalog and the column goes stale on a catalog rename).
+    assert "collection_physical_id" in first_call["params"]
     assert "filename" in first_call["params"]
-    assert first_call["params"]["catalog_id"] == "cat"
+    assert "catalog_id" not in first_call["params"]
     assert first_call["params"]["filename"] == "file.tif"
 
 

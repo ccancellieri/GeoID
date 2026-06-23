@@ -105,6 +105,11 @@ def _invalidate_collection_lifecycle_caches(catalog_id: str, collection_id: str)
     * ``_collection_config_cache`` — keyed per ``(catalog, collection,
       class_key)``; a stale entry would serve the old collection's config
       to a reclaimed id (same collection_id, new collection).
+    * ``_collection_physical_id_cache`` — maps a logical id to the immutable
+      physical id used to key tile rows and per-collection log partitions; a
+      stale entry after a rename would resolve the old logical id to a live
+      physical id (the catalog/collection 404s first, but the entry must still
+      be dropped for both the old and the new id).
 
     All caches are tiered (in-process L1 + optional shared L2); invalidation
     reaches the shared tier, so sibling pods converge within their L1 TTL cap
@@ -117,10 +122,14 @@ def _invalidate_collection_lifecycle_caches(catalog_id: str, collection_id: str)
     """
     from dynastore.modules.storage.router import invalidate_router_cache
     from dynastore.modules.catalog.config_service import invalidate_collection_config_cache
+    from dynastore.modules.catalog.catalog_service import (
+        _invalidate_collection_physical_id_cache,
+    )
 
     _invalidate_collection_model_cache(catalog_id, collection_id)
     invalidate_router_cache(catalog_id, collection_id)
     invalidate_collection_config_cache(catalog_id, collection_id)
+    _invalidate_collection_physical_id_cache(catalog_id, collection_id)
 
 
 def _make_collection_exists_query(phys_schema: str) -> DQLQuery:
@@ -158,6 +167,16 @@ def _make_collection_list_ids_query(phys_schema: str) -> DQLQuery:
         "ORDER BY id LIMIT :limit OFFSET :offset;",
         result_handler=ResultHandler.ALL_SCALARS,
     )
+
+
+class CollectionRenameConflictError(Exception):
+    """Raised when the target ``new_id`` already exists in the collections registry."""
+
+    def __init__(self, new_id: str) -> None:
+        super().__init__(
+            f"Collection id '{new_id}' already exists (including tombstoned records)."
+        )
+        self.new_id = new_id
 
 
 class CollectionNotAliveError(Exception):
@@ -346,27 +365,22 @@ class CollectionService:
         collection_id: str,
         db_resource: Optional[DbResource] = None,
     ) -> Optional[str]:
-        """Resolve physical table via the PG driver config."""
-        pg_driver = await self._get_pg_driver()
-        if not pg_driver:
-            return None
-        return await pg_driver.resolve_physical_table(  # type: ignore[attr-defined]
-            catalog_id, collection_id, db_resource=db_resource
-        )
+        """Resolve the physical table name for a collection.
 
-    async def set_physical_table(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        physical_table: str,
-        db_resource: Optional[DbResource] = None,
-    ) -> None:
-        """Store physical table in PG driver config."""
-        pg_driver = await self._get_pg_driver()
-        if not pg_driver:
-            raise RuntimeError("ItemsPostgresqlDriver not available")
-        await pg_driver.set_physical_table(  # type: ignore[attr-defined]
-            catalog_id, collection_id, physical_table, db_resource=db_resource
+        Delegates to ``CatalogsProtocol.resolve_physical_id`` — the registry
+        column ``{schema}.collections.physical_id`` is the single authoritative
+        source.  The old JSONB ``physical_table`` pin is no longer consulted.
+        """
+        from dynastore.models.protocols.catalogs import CatalogsProtocol as _CatalogsProtocol
+        from dynastore.models.driver_context import DriverContext as _DC
+        from dynastore.tools.discovery import get_protocol as _gp
+
+        catalogs = _gp(_CatalogsProtocol)
+        if catalogs is None:
+            return None
+        ctx = _DC(db_resource=db_resource) if db_resource is not None else None
+        return await catalogs.resolve_physical_id(
+            catalog_id, collection_id, ctx=ctx, allow_missing=True
         )
 
     async def is_active(
@@ -865,16 +879,25 @@ class CollectionService:
             init_kwargs.pop("physical_table", None)
             init_kwargs.pop("layer_config", None)
 
-            # 3. Insert thin registry row (id + catalog_id + lifecycle overlay).
+            # 3. Insert thin registry row (id + catalog_id + lifecycle overlay +
+            #    physical_id).
             #    #2066: when external async initializers are registered the
             #    collection is born PROVISIONING and write-gated (409) until the
             #    async init window closes; the finalizer below flips it to
             #    ACTIVE. With no async initializers the row is ACTIVE on commit
             #    (lifecycle_status NULL) — no pointless provisioning window.
+            #
+            #    physical_id (P2a): a short, stable physical token for the
+            #    collection minted once at registry create time. Format matches
+            #    the catalog-level generate_physical_name convention (the helper
+            #    appends the "_" separator itself, so the prefix is bare "c" —
+            #    yielding "c_<suffix>", not a double-underscore "c__<suffix>").
+            from dynastore.modules.catalog.catalog_service import generate_physical_name as _gen_phys_name
+            collection_physical_id = _gen_phys_name("c")
             provisioning = lifecycle_registry.has_async_collection_initializers()
             insert_sql = f"""
-                INSERT INTO "{phys_schema}".collections (id, catalog_id, lifecycle_status)
-                VALUES (:id, :catalog_id, :lifecycle_status)
+                INSERT INTO "{phys_schema}".collections (id, catalog_id, lifecycle_status, physical_id)
+                VALUES (:id, :catalog_id, :lifecycle_status, :physical_id)
                 RETURNING id;
             """
             await DQLQuery(insert_sql, result_handler=ResultHandler.SCALAR_ONE).execute(
@@ -884,6 +907,7 @@ class CollectionService:
                 lifecycle_status=(
                     CollectionLifecycle.PROVISIONING.value if provisioning else None
                 ),
+                physical_id=collection_physical_id,
             )
 
             # 4. Run infrastructure hooks (events partition, logs, proxy —
@@ -1257,10 +1281,15 @@ class CollectionService:
         )
 
         await _route_delete_metadata(catalog_id, collection_id, db_resource=conn)
-        await DQLQuery(
-            f'DELETE FROM "{phys_schema}".collection_configs WHERE collection_id = :id;',
-            result_handler=ResultHandler.NONE,
-        ).execute(conn, id=collection_id)
+        # ``phys_table`` is the collection's physical_id (from collections.physical_id,
+        # resolved above at the start of this method before the collections row was
+        # deleted).  Use it as the key into collection_configs so this DELETE succeeds
+        # even though the collections row is already gone at this point.
+        if phys_table:
+            await DQLQuery(
+                f'DELETE FROM "{phys_schema}".collection_configs WHERE physical_id = :phys_id;',
+                result_handler=ResultHandler.NONE,
+            ).execute(conn, phys_id=phys_table)
         return phys_table
 
     async def _capture_collection_config_snapshot(
@@ -1379,6 +1408,21 @@ class CollectionService:
             config_snapshot = await self._capture_collection_config_snapshot(
                 catalog_id, collection_id
             )
+
+        # Capture the immutable physical id BEFORE the delete (the row still
+        # resolves) so we can bust the reverse (physical→logical) cache
+        # post-commit on both soft and hard delete — once the row is tombstoned
+        # or gone the resolver returns None and can no longer find the key.
+        deleted_physical_id: Optional[str] = None
+        try:
+            # resolve_physical_table returns collections.physical_id (the PG
+            # table name == the physical id post-convergence) — the exact key
+            # the reverse cache is keyed on.
+            deleted_physical_id = await self.resolve_physical_table(
+                catalog_id, collection_id
+            )
+        except Exception:
+            deleted_physical_id = None
 
         phys_table: Optional[str] = None
         async with managed_transaction(db_resource or self.engine) as conn:
@@ -1536,6 +1580,12 @@ class CollectionService:
         # for the transitioned id. The hard-delete row is now gone (MISSING),
         # which also clears the DELETING overlay set in the pre-mark above.
         _invalidate_collection_lifecycle_caches(catalog_id, collection_id)
+        if deleted_physical_id:
+            from dynastore.modules.catalog.catalog_service import (
+                _invalidate_collection_logical_id_cache,
+            )
+
+            _invalidate_collection_logical_id_cache(catalog_id, deleted_physical_id)
         if force:
             _unmark_confirmed_active(catalog_id, collection_id)
 
@@ -1622,3 +1672,121 @@ class CollectionService:
             _invalidate_collection_model_cache(catalog_id, collection_id)
             return True
 
+    async def rename_collection(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        new_id: str,
+        ctx: Optional[DriverContext] = None,
+    ) -> "RenameResponse":
+        """Rename a collection's logical id (presentation label change only).
+
+        The physical table (identified by ``physical_id`` / ``physical_table``),
+        the partition key ``collection_physical_id`` on ``assets``, metadata
+        tables (``collection_core``, ``collection_stac``), and all storage
+        backends remain unchanged — they key on the immutable
+        ``collection_physical_id``, not the logical label.
+
+        Inside a single serialized transaction this updates only:
+
+        - ``{schema}.collections.id`` — the single logical→physical mapping row.
+
+        The ``assets.collection_id`` presentation column is intentionally left
+        stale after a rename; it is never used as a lookup key.
+        """
+        from dynastore.extensions.ogc_models_shared import RenameResponse
+
+        validate_sql_identifier(catalog_id)
+        validate_sql_identifier(collection_id)
+        new_id = validate_sql_identifier(new_id)
+
+        # Fast path: no-op when the normalized ids are identical.
+        if new_id == collection_id:
+            return RenameResponse(
+                old_id=collection_id,
+                new_id=new_id,
+                level="collection",
+                warnings=[],
+                reindex_required=False,
+                iam_manual_update_required=False,
+            )
+
+        db_resource = ctx.db_resource if ctx else None
+
+        async with managed_transaction(db_resource or self.engine) as conn:
+            if db_resource is None:
+                from typing import cast as _cast
+                from sqlalchemy import text as _text
+                from sqlalchemy.ext.asyncio import AsyncConnection as _AsyncConn
+                await _cast(_AsyncConn, conn).execute(
+                    _text("SET LOCAL idle_in_transaction_session_timeout = '0'")
+                )
+
+            phys_schema = await self._resolve_physical_schema(
+                catalog_id, db_resource=conn
+            )
+            if not phys_schema:
+                raise ValueError(f"Catalog '{catalog_id}' not found.")
+
+            # Serialize concurrent renames on the same collection within this schema.
+            await DQLQuery(
+                "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+                result_handler=ResultHandler.SCALAR,
+            ).execute(conn, lock_key=f"{phys_schema}:col_rename:{collection_id}")
+
+            # Existence check (404) — non-deleted rows only.  Fetch the
+            # immutable physical_id while here: it is stable across the rename
+            # and is the key for busting the reverse (physical→logical) cache,
+            # whose mapping is exactly what this rename changes.
+            existing_physical_id = await DQLQuery(
+                f'SELECT physical_id FROM "{phys_schema}".collections '
+                "WHERE id = :id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, id=collection_id)
+            if existing_physical_id is None:
+                raise ValueError(
+                    f"Collection '{collection_id}' not found in catalog '{catalog_id}'."
+                )
+
+            # Collision check — include tombstoned rows (409).
+            collision = await DQLQuery(
+                f'SELECT id FROM "{phys_schema}".collections WHERE id = :new_id;',
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, new_id=new_id)
+            if collision is not None:
+                raise CollectionRenameConflictError(new_id)
+
+            # Update the thin registry PK — the single logical→physical mapping
+            # row.  Metadata tables (collection_core, collection_stac) key on
+            # collection_physical_id and are unaffected.
+            await DDLQuery(
+                f'UPDATE "{phys_schema}".collections '
+                "SET id = :new_id, updated_at = NOW() "
+                "WHERE id = :old_id;",
+            ).execute(conn, new_id=new_id, old_id=collection_id)
+
+        from dynastore.modules.catalog.catalog_service import (
+            _invalidate_collection_logical_id_cache,
+        )
+
+        # Bust caches for both old and new id post-commit.
+        _invalidate_collection_lifecycle_caches(catalog_id, collection_id)
+        _invalidate_collection_lifecycle_caches(catalog_id, new_id)
+        # The reverse (physical→logical) cache is keyed on the immutable
+        # physical_id, so the logical-id-keyed lifecycle bust above cannot reach
+        # it.  Drop it explicitly: this rename is precisely what remaps the
+        # physical_id to a new logical id.
+        _invalidate_collection_logical_id_cache(catalog_id, existing_physical_id)
+
+        warnings = [
+            "es_reindex_required",
+            "iam_manual_update_required",
+        ]
+        return RenameResponse(
+            old_id=collection_id,
+            new_id=new_id,
+            level="collection",
+            warnings=warnings,
+            reindex_required=True,
+            iam_manual_update_required=True,
+        )

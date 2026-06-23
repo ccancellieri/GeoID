@@ -193,21 +193,21 @@ async def _get_pg_collection_tables(
     schema: str,
     db_resource: Any,
 ) -> List[Tuple[str, str]]:
-    """Return [(collection_id, physical_table), ...] for all PG-driver collections.
+    """Return [(collection_id, physical_id), ...] for all active PG collections.
 
-    Reads ``{schema}.collection_configs`` — the table the PG driver writes when
-    ``ensure_storage`` runs for a collection.  Rows where ``physical_table`` is
-    null or absent are skipped (non-PG driver configs share the same table but
-    don't carry a physical_table).
+    Reads ``{schema}.collections.physical_id`` — the single authoritative
+    source for the physical table name of each collection.  Rows where
+    ``physical_id`` is NULL (a collection that has never been provisioned)
+    are excluded.
     """
     from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
 
     sql = f"""
-        SELECT collection_id,
-               config_data->>'physical_table' AS physical_table
-        FROM   "{schema}".collection_configs
-        WHERE  class_key = 'ItemsPostgresqlDriver'
-          AND  config_data->>'physical_table' IS NOT NULL
+        SELECT id AS collection_id,
+               physical_id
+        FROM   "{schema}".collections
+        WHERE  physical_id IS NOT NULL
+          AND  deleted_at IS NULL
     """
     try:
         rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(db_resource)
@@ -216,7 +216,7 @@ async def _get_pg_collection_tables(
         return []
     if not rows:
         return []
-    return [(r["collection_id"], r["physical_table"]) for r in rows]
+    return [(r["collection_id"], r["physical_id"]) for r in rows]
 
 
 async def _hub_geoid_lookup(

@@ -125,7 +125,11 @@ class PrivateIndexTask(TaskProtocol):
         from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
         inputs = PrivateIndexInputs.model_validate(payload.inputs)
-        index_name = get_private_index_name(_get_index_prefix(), inputs.catalog_id)
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            _resolve_catalog_physical_id,
+        )
+        catalog_physical_id = await _resolve_catalog_physical_id(inputs.catalog_id)
+        index_name = get_private_index_name(_get_index_prefix(), catalog_physical_id)
 
         # Tenant-scoped manual mapping overlay (#1295 slice 3). Resolved
         # once up front and reused for both index-create and projection.
@@ -223,7 +227,11 @@ class PrivateDeleteTask(TaskProtocol):
         )
 
         inputs = PrivateDeleteInputs.model_validate(payload.inputs)
-        index_name = get_private_index_name(_get_index_prefix(), inputs.catalog_id)
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            _resolve_catalog_physical_id,
+        )
+        catalog_physical_id = await _resolve_catalog_physical_id(inputs.catalog_id)
+        index_name = get_private_index_name(_get_index_prefix(), catalog_physical_id)
 
         es = _build_es_client()
         try:

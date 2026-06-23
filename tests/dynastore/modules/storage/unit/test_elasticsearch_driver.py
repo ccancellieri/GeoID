@@ -209,12 +209,14 @@ class TestItemsIndexNameSeam:
     so a future change to either driver's index naming or routing is caught.
     """
 
-    def test_public_index_name_is_tenant_items_index(self):
+    @pytest.mark.asyncio
+    async def test_public_index_name_is_tenant_items_index(self):
         from dynastore.modules.elasticsearch.mappings import get_tenant_items_index
         from dynastore.modules.elasticsearch.client import get_index_prefix
 
         driver = ItemsElasticsearchDriver()
-        name = driver._items_index_name("cat1")
+        # No CatalogsProtocol registered: physical_id falls back to the logical id.
+        name = await driver._items_index_name("cat1")
         assert name == get_tenant_items_index(get_index_prefix(), "cat1")
         assert "private" not in name
 
@@ -223,14 +225,16 @@ class TestItemsIndexNameSeam:
         assert driver._collection_routing("col1") == "col1"
         assert driver._collection_routing(None) is None
 
-    def test_private_index_name_is_private_index(self):
+    @pytest.mark.asyncio
+    async def test_private_index_name_is_private_index(self):
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
             get_private_index_name,
         )
         from dynastore.modules.elasticsearch.client import get_index_prefix
 
         driver = ItemsElasticsearchPrivateDriver()
-        name = driver._items_index_name("cat1")
+        # No CatalogsProtocol registered: physical_id falls back to the logical id.
+        name = await driver._items_index_name("cat1")
         assert name == get_private_index_name(get_index_prefix(), "cat1")
         assert name.endswith("-private-items")
 

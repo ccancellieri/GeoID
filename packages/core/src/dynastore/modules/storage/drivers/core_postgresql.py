@@ -125,6 +125,30 @@ async def _resolve_physical_schema(
     )
 
 
+async def _resolve_collection_physical_id(
+    catalog_id: str,
+    collection_id: str,
+    *,
+    db_resource: Optional[DbResource] = None,
+) -> Optional[str]:
+    """Resolve the immutable physical id (``c_…`` token) for a collection.
+
+    Reads ``{schema}.collections.physical_id`` via CatalogsProtocol, passing
+    the in-flight connection so the lookup joins the caller's transaction.
+    Returns ``None`` when the collection is absent or when the protocol is
+    not registered.
+    """
+    from dynastore.models.protocols import CatalogsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    catalogs = get_protocol(CatalogsProtocol)
+    if not catalogs:
+        return None
+    return await catalogs.resolve_physical_id(
+        catalog_id, collection_id, ctx=DriverContext(db_resource=db_resource)
+    )
+
+
 def _to_json(value: Any) -> Optional[str]:
     """Serialise ``value`` as a JSON string for PG JSONB storage."""
     if value is None:
@@ -237,13 +261,18 @@ class _PgCollectionCoreBase:
             phys = await _resolve_physical_schema(catalog_id, db_resource=conn)
             if not phys:
                 return None
+            coll_phys = await _resolve_collection_physical_id(
+                catalog_id, collection_id, db_resource=conn
+            )
+            if not coll_phys:
+                return None
             sql = (
                 f'SELECT * FROM "{phys}".{self._table} '
-                f'WHERE collection_id = :id;'
+                f'WHERE collection_physical_id = :id;'
             )
             row = await DQLQuery(
                 sql, result_handler=ResultHandler.ONE_DICT
-            ).execute(conn, id=collection_id)
+            ).execute(conn, id=coll_phys)
             if not row:
                 return None
             return _deserialise_jsonb(dict(row), self._columns)
@@ -282,15 +311,22 @@ class _PgCollectionCoreBase:
             phys = await _resolve_physical_schema(catalog_id, db_resource=conn)
             if not phys:
                 raise RuntimeError(f"No physical schema for catalog '{catalog_id}'")
+            coll_phys = await _resolve_collection_physical_id(
+                catalog_id, collection_id, db_resource=conn
+            )
+            if not coll_phys:
+                raise RuntimeError(
+                    f"No physical id for collection '{catalog_id}/{collection_id}'"
+                )
             await self._upsert_collection_row(
-                conn, phys, collection_id, payload,
+                conn, phys, coll_phys, payload,
             )
 
     async def _upsert_collection_row(
         self,
         conn: Any,
         phys_schema: str,
-        collection_id: str,
+        coll_phys_id: str,
         payload: Dict[str, Any],
     ) -> None:
         """Issue the ``{phys_schema}.{_table}`` partial UPSERT.
@@ -299,22 +335,26 @@ class _PgCollectionCoreBase:
         domain-specific behaviour on top (e.g. a STAC driver that
         also writes a derived extent index) can override it without
         duplicating the engine / schema resolution boilerplate.
+
+        ``coll_phys_id`` is the immutable collection physical id (the
+        ``c_…`` token from ``collections.physical_id``), already resolved
+        by :meth:`upsert_metadata` before this helper is called.
         """
         supplied_cols: Tuple[str, ...] = tuple(payload.keys())
-        params: Dict[str, Any] = {"id": collection_id}
+        params: Dict[str, Any] = {"id": coll_phys_id}
         for c in supplied_cols:
             params[c] = _to_json(payload[c])
 
         if not supplied_cols:
             # Caller supplied no column values — only bump updated_at.
             # INSERT … ON CONFLICT DO UPDATE SET updated_at = NOW()
-            # writes the minimal row (collection_id + default NULLs) on
-            # fresh insert, then subsequent upserts just tick the
+            # writes the minimal row (collection_physical_id + default NULLs)
+            # on fresh insert, then subsequent upserts just tick the
             # freshness token.
             sql = (
                 f'INSERT INTO "{phys_schema}".{self._table} '
-                f'(collection_id, updated_at) VALUES (:id, NOW()) '
-                f'ON CONFLICT (collection_id) DO UPDATE SET '
+                f'(collection_physical_id, updated_at) VALUES (:id, NOW()) '
+                f'ON CONFLICT (collection_physical_id) DO UPDATE SET '
                 f'updated_at = NOW();'
             )
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
@@ -329,9 +369,9 @@ class _PgCollectionCoreBase:
         )
         sql = (
             f'INSERT INTO "{phys_schema}".{self._table} '
-            f'(collection_id, {col_list}, updated_at) '
+            f'(collection_physical_id, {col_list}, updated_at) '
             f'VALUES (:id, {val_placeholders}, NOW()) '
-            f'ON CONFLICT (collection_id) DO UPDATE SET '
+            f'ON CONFLICT (collection_physical_id) DO UPDATE SET '
             f'{update_list}, updated_at = NOW();'
         )
         await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
@@ -353,6 +393,11 @@ class _PgCollectionCoreBase:
             phys = await _resolve_physical_schema(catalog_id, db_resource=conn)
             if not phys:
                 return
+            coll_phys = await _resolve_collection_physical_id(
+                catalog_id, collection_id, db_resource=conn
+            )
+            if not coll_phys:
+                return
             if soft and "extra_metadata" in self._columns:
                 # Tombstone via extra_metadata JSON — preserves row for recovery.
                 sql = (
@@ -361,15 +406,15 @@ class _PgCollectionCoreBase:
                     f"  COALESCE(extra_metadata, '{{}}'::jsonb), "
                     f"  '{{_deleted_at}}', to_jsonb(now()::text)), "
                     f'updated_at = NOW() '
-                    f'WHERE collection_id = :id;'
+                    f'WHERE collection_physical_id = :id;'
                 )
             else:
                 sql = (
                     f'DELETE FROM "{phys}".{self._table} '
-                    f'WHERE collection_id = :id;'
+                    f'WHERE collection_physical_id = :id;'
                 )
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-                conn, id=collection_id
+                conn, id=coll_phys
             )
 
     async def search_metadata(
@@ -606,7 +651,7 @@ class CollectionCorePostgresqlDriver(
             count_sql = (
                 f'SELECT COUNT(*) FROM "{phys}".collections c '
                 f'LEFT JOIN "{phys}".collection_core m '
-                f'ON m.collection_id = c.id WHERE {where_sql};'
+                f'ON m.collection_physical_id = c.physical_id WHERE {where_sql};'
             )
             total = await DQLQuery(
                 count_sql, result_handler=ResultHandler.SCALAR,
@@ -616,7 +661,7 @@ class CollectionCorePostgresqlDriver(
                 f'SELECT c.id, {col_list} '
                 f'FROM "{phys}".collections c '
                 f'LEFT JOIN "{phys}".collection_core m '
-                f'ON m.collection_id = c.id '
+                f'ON m.collection_physical_id = c.physical_id '
                 f'WHERE {where_sql} '
                 f'ORDER BY c.created_at DESC LIMIT :limit OFFSET :offset;'
             )

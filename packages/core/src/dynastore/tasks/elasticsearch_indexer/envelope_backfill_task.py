@@ -161,7 +161,11 @@ class EnvelopeAttrsBackfillTask(TaskProtocol):
             }
 
         # --- 2. Resolve envelope index name ---
-        index_name = get_envelope_index_name(_get_index_prefix(), catalog_id)
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            _resolve_catalog_physical_id,
+        )
+        catalog_physical_id = await _resolve_catalog_physical_id(catalog_id)
+        index_name = get_envelope_index_name(_get_index_prefix(), catalog_physical_id)
 
         # --- 3. Resolve dependencies ---
         # get_protocol returns CatalogsProtocol which gains .search() at runtime

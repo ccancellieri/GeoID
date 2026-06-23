@@ -38,7 +38,7 @@ import google.cloud.storage  # noqa: F401
 from dynastore.tasks.protocols import TaskProtocol
 from dynastore.models.tasks import TaskPayload
 from dynastore.modules import get_protocol
-from dynastore.models.protocols import StorageProtocol, EventingProtocol, ConfigsProtocol
+from dynastore.models.protocols import StorageProtocol, EventingProtocol, ConfigsProtocol, CatalogsProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,20 @@ class GcpCatalogCleanupTask(TaskProtocol):
         eventing = get_protocol(EventingProtocol)
         configs = get_protocol(ConfigsProtocol)
 
+        # Resolve the immutable physical_id for the collection.  At cleanup time
+        # the collection row may already be deleted (hard-deletion task), so
+        # allow_missing=True returns None and we fall back to the logical id.
+        _catalogs_cleanup = get_protocol(CatalogsProtocol)
+        _collection_physical_id: Optional[str] = None
+        if _catalogs_cleanup:
+            try:
+                _collection_physical_id = await _catalogs_cleanup.resolve_physical_id(
+                    catalog_id, collection_id, allow_missing=True
+                )
+            except Exception:
+                pass
+        collection_physical_id = _collection_physical_id or collection_id
+
         # Check configuration flag
         if configs:
             bucket_config = await configs.get_config(
@@ -205,7 +219,7 @@ class GcpCatalogCleanupTask(TaskProtocol):
                 bucket_name = await storage.get_storage_identifier(catalog_id)
             if bucket_name:
                 folder_prefix = bucket_tool.get_blob_path_for_collection_folder(
-                    collection_id
+                    collection_physical_id
                 )
                 logger.info(
                     f"GcpCatalogCleanupTask[COLLECTION]: Deleting objects with "
@@ -249,7 +263,7 @@ class GcpCatalogCleanupTask(TaskProtocol):
                     managed = eventing_config.managed_eventing
                     if managed and managed.enabled:
                         folder_prefix = bucket_tool.get_blob_path_for_collection_folder(
-                            collection_id
+                            collection_physical_id
                         )
                         if managed.blob_name_prefix == folder_prefix:
                             logger.info(

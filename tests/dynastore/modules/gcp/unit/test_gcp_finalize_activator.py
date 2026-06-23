@@ -118,25 +118,27 @@ def _patch_is_async_resource():
 def _make_event(
     *,
     catalog_id: str = "cat_a",
-    collection_id: Optional[str] = "col_a",
+    collection_physical_id: Optional[str] = "c_phys_a",
     filename: str = "image.tif",
     md5_hash: Optional[str] = "abc==",
     size_bytes: Optional[int] = 12345,
     custom_metadata: Optional[Dict[str, Any]] = None,
 ) -> FinalizeEvent:
+    # GCS stores objects under the collection PHYSICAL id, so the object-prefix
+    # tail (and thus FinalizeEvent.collection_physical_id) is the physical id.
     return FinalizeEvent(
         bucket="bkt",
-        object_name=f"collections/{collection_id}/{filename}"
-        if collection_id
+        object_name=f"collections/{collection_physical_id}/{filename}"
+        if collection_physical_id
         else f"catalog/{filename}",
         filename=filename,
         uri=(
-            f"gs://bkt/collections/{collection_id}/{filename}"
-            if collection_id
+            f"gs://bkt/collections/{collection_physical_id}/{filename}"
+            if collection_physical_id
             else f"gs://bkt/catalog/{filename}"
         ),
         catalog_id=catalog_id,
-        collection_id=collection_id,
+        collection_physical_id=collection_physical_id,
         md5_hash=md5_hash,
         size_bytes=size_bytes,
         content_type="image/tiff",
@@ -166,6 +168,37 @@ async def test_activates_pending_row_to_active() -> None:
     assert len(conn.calls) == 2
     assert "FOR UPDATE" in conn.calls[0]["sql"]
     assert "UPDATE" in conn.calls[1]["sql"].upper()
+
+
+@pytest.mark.asyncio
+async def test_matches_pending_row_on_collection_physical_id() -> None:
+    """Regression: the finalize event carries the collection PHYSICAL id (the
+    object-prefix tail), and the activator must match the PENDING row on
+    ``collection_physical_id`` — NOT the mutable logical ``collection_id``.
+
+    Previously the matcher keyed on ``collection_id``, so the physical id from
+    the event never matched the logical id on the row → 0 rows → the asset
+    wedged in PENDING (orphan_finalize). This asserts both the SELECT and the
+    UPDATE key on ``collection_physical_id`` and bind the event's physical id.
+    """
+    rows = [{"asset_id": "asset_phys", "status": "pending", "metadata": {}}]
+    conn = _FakeConn(select_rows=rows)
+    # The event's collection identifier IS the physical id (c_…), the value
+    # stored in assets.collection_physical_id — never the logical 'gaul'.
+    event = _make_event(collection_physical_id="c_3qwwjsp")
+
+    outcome = await activate(conn, "schema_x", event)
+
+    assert outcome.action == "activated"
+    select_call, update_call = conn.calls[0], conn.calls[1]
+    # Both statements key on the physical column, not the logical one.
+    assert "collection_physical_id IS NOT DISTINCT FROM :collection_physical_id" in select_call["sql"]
+    assert "collection_physical_id IS NOT DISTINCT FROM :collection_physical_id" in update_call["sql"]
+    assert "AND collection_id " not in select_call["sql"]
+    # The bound value is the physical id from the event.
+    assert select_call["binds"]["collection_physical_id"] == "c_3qwwjsp"
+    assert update_call["binds"]["collection_physical_id"] == "c_3qwwjsp"
+    assert "collection_id" not in select_call["binds"]
 
 
 @pytest.mark.asyncio
@@ -328,14 +361,14 @@ def test_finalize_event_from_pubsub_basic_shape() -> None:
         "contentType": "image/tiff",
     }
     ev = finalize_event_from_pubsub(
-        body, catalog_id="cat_a", collection_id="col1"
+        body, catalog_id="cat_a", collection_physical_id="c_phys1"
     )
     assert ev.bucket == "bkt"
     assert ev.object_name == "collections/col1/image.tif"
     assert ev.filename == "image.tif"
     assert ev.uri == "gs://bkt/collections/col1/image.tif"
     assert ev.catalog_id == "cat_a"
-    assert ev.collection_id == "col1"
+    assert ev.collection_physical_id == "c_phys1"
     assert ev.md5_hash == "MD5=="
     assert ev.size_bytes == 987
     assert ev.generation == "42"
@@ -346,9 +379,9 @@ def test_finalize_event_from_pubsub_tolerates_missing_size() -> None:
     """Some events omit ``size`` — must not crash, size_bytes stays None."""
     body = {"bucket": "bkt", "name": "catalog/f.geojson"}
     ev = finalize_event_from_pubsub(
-        body, catalog_id="cat_b", collection_id=None
+        body, catalog_id="cat_b", collection_physical_id=None
     )
     assert ev.size_bytes is None
-    assert ev.collection_id is None
+    assert ev.collection_physical_id is None
     assert ev.filename == "f.geojson"
     assert ev.uri == "gs://bkt/catalog/f.geojson"

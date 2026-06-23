@@ -209,10 +209,9 @@ async def _collection_is_materialized(
 ) -> bool:
     """True iff the collection's physical items table has at least one row.
 
-    Resolves the physical schema via the catalog manager + the writer's
-    ``physical_table`` from ``ItemsPostgresqlDriverConfig`` (the only
-    canonical SOR — ES is an index, not a system of record).  An empty
-    or missing table → not materialized → ``Immutable`` not enforced.
+    The collection's physical items table is named after its immutable
+    ``physical_id`` (``collections.physical_id``).  An empty or missing
+    table → not materialized → ``Immutable`` not enforced.
     """
     if not catalog_id or not collection_id:
         return False
@@ -230,24 +229,13 @@ async def _collection_is_materialized(
     )
     if not phys_schema:
         return False
-    # Resolve the items physical_table from the collection's items PG
-    # driver config (the canonical writer).  Lookup is best-effort —
-    # if any layer is absent, treat as not materialized.
-    from dynastore.modules.storage.driver_config import (
-        ItemsPostgresqlDriverConfig,
+    # The physical items table is named after the collection's immutable
+    # physical_id.  An unresolved id (collection not yet provisioned) → not
+    # materialized.
+    phys_table = await catalogs.resolve_physical_id(
+        catalog_id, collection_id,
+        ctx=DriverContext(db_resource=conn), allow_missing=True,
     )
-    cfg_service = get_protocol(__configs_protocol_ref())
-    if cfg_service is None:
-        return False
-    try:
-        items_cfg = await cfg_service.get_config(
-            ItemsPostgresqlDriverConfig,
-            catalog_id=catalog_id, collection_id=collection_id,
-            ctx=DriverContext(db_resource=conn),
-        )
-    except Exception:
-        return False
-    phys_table = getattr(items_cfg, "physical_table", None) if items_cfg else None
     if not phys_table:
         return False
     if not await check_table_exists(conn, phys_table, phys_schema):

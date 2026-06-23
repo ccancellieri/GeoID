@@ -56,7 +56,11 @@ def _parse_gs_uri(uri: str) -> Optional[Tuple[str, str]]:
     return parsed.netloc, blob_path
 
 
-def _build_metadata(payload: Dict[str, Any], asset_id: str) -> Dict[str, str]:
+def _build_metadata(
+    payload: Dict[str, Any],
+    asset_id: str,
+    physical_id: Optional[str] = None,
+) -> Dict[str, str]:
     raw = payload.get("metadata") or {}
     out: Dict[str, str] = {
         str(k): str(v)
@@ -64,6 +68,8 @@ def _build_metadata(payload: Dict[str, Any], asset_id: str) -> Dict[str, str]:
         if v is not None
     }
     out["asset_id"] = asset_id
+    if physical_id:
+        out["asset_physical_id"] = physical_id
     asset_type = payload.get("asset_type")
     if asset_type is not None:
         out["asset_type"] = (
@@ -97,6 +103,30 @@ class BucketAnnotationPatcher:
         bucket_name, blob_path = parsed
         ctx = f"{catalog_id}/{collection_id or '<catalog-tier>'}/{asset_id}"
 
+        # Resolve the immutable physical_id so the blob carries a rename-stable
+        # key alongside the logical asset_id. The handler runs detached from any
+        # DB transaction (async listener), so ctx=None routes through the shared
+        # L1/L2 cache. allow_missing=True — an unresolvable id must not block
+        # the metadata patch.
+        physical_id: Optional[str] = payload.get("physical_id")
+        if not physical_id:
+            try:
+                from dynastore.models.protocols.assets import AssetsProtocol
+
+                assets = get_protocol(AssetsProtocol)
+                if assets is not None:
+                    physical_id = await assets.resolve_asset_physical_id(
+                        catalog_id,
+                        asset_id,
+                        collection_id,
+                        allow_missing=True,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "BucketAnnotationPatcher: could not resolve physical_id for %s: %s",
+                    ctx, exc,
+                )
+
         try:
             from dynastore.modules.gcp.gcp_module import GCPModule
 
@@ -119,7 +149,7 @@ class BucketAnnotationPatcher:
             )
             return
 
-        new_metadata = _build_metadata(payload, asset_id)
+        new_metadata = _build_metadata(payload, asset_id, physical_id=physical_id or None)
 
         def _patch() -> None:
             blob = client.bucket(bucket_name).blob(blob_path)

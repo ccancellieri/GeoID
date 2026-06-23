@@ -54,11 +54,11 @@ class AbstractProxyStorage(ProtocolPlugin[object]):
         yield
 
     @abc.abstractmethod
-    async def insert_short_url(self, conn: DbResource, schema: str, long_url: str, custom_key: Optional[str] = None, collection_id: Optional[str] = None, comment: Optional[str] = None) -> ShortURL:
+    async def insert_short_url(self, conn: DbResource, schema: str, long_url: str, custom_key: Optional[str] = None, collection_id: Optional[str] = None, collection_physical_id: Optional[str] = None, comment: Optional[str] = None) -> ShortURL:
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def select_urls_by_collection(self, conn: DbResource, schema: str, collection_id: str, limit: int = 100, offset: int = 0) -> List[ShortURL]:
+    async def select_urls_by_collection(self, conn: DbResource, schema: str, collection_physical_id: str, limit: int = 100, offset: int = 0) -> List[ShortURL]:
         raise NotImplementedError
 
     @abc.abstractmethod

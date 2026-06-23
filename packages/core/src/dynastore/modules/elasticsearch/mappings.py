@@ -237,7 +237,7 @@ _SYSTEM_GEOMETRY_SIMPLIFICATION: Dict[str, Any] = {
 #       ``geometry``/``bbox``)
 #   * bbox ([minx, miny, maxx, maxy]) -> float (mirrors the root ``bbox`` type)
 #
-# NOTE: the three IDENTITY axes (``geoid`` / ``external_id`` / ``asset_id``)
+# NOTE: the IDENTITY axes (``geoid`` / ``external_id`` / ``asset_physical_id``)
 # are NOT in this container — per ``classify_container`` they live FLAT at the
 # document root and are declared (and indexed as keyword) in COMMON_PROPERTIES.
 # The read-side resolvers (``resolve_es_field_path`` / ``build_es_field_mapping``
@@ -343,14 +343,18 @@ COMMON_PROPERTIES: Dict[str, Any] = {
     "collection_id":   {"type": "keyword"},
     # Identity axes that live FLAT at the document root (refs #1285). The write
     # path mirrors these from the canonical envelope's identity section, and the
-    # read-side resolvers route ``external_id`` / ``asset_id`` filters & sorts
-    # here (see ``cql_to_es._ENVELOPE_FIELD_PATHS`` and ``resolve_es_field_path``
-    # → identity branch). Without an explicit keyword mapping they fall under the
+    # read-side resolvers route ``external_id`` filters & sorts here (see
+    # ``cql_to_es._ENVELOPE_FIELD_PATHS`` and ``resolve_es_field_path`` →
+    # identity branch). Without an explicit keyword mapping they fall under the
     # strict ``dynamic: false`` root, ride in ``_source`` un-indexed, and every
     # ``term``/``terms`` filter on them silently returns nothing — which is the
     # exact bug this declaration fixes. ``geoid`` is already declared below.
-    "external_id":     {"type": "keyword"},
-    "asset_id":        {"type": "keyword"},
+    "external_id":        {"type": "keyword"},
+    # Immutable physical_id (UUIDv7) of the parent asset.  Visibility filters
+    # and the virtual-asset view key on this stable UUID so asset renames never
+    # require an ES reindex.  The mutable logical asset_id is NOT stored in
+    # item _source — internal-only, never surfaced in the REST/STAC response.
+    "asset_physical_id":  {"type": "keyword"},
     # STAC Item documents use the field name ``collection`` (not
     # ``collection_id``) — and that's the field both /search and the
     # ``items_es_ops`` term-filter target. Without an explicit keyword
@@ -368,8 +372,8 @@ COMMON_PROPERTIES: Dict[str, Any] = {
     "geoid":           {"type": "keyword"},
     # Internal write-time trackers attached by ItemsElasticsearchDriver.
     # ``_external_id`` / ``_asset_id`` were dropped in #1285 identity
-    # convergence — identity lives only on the root ``external_id`` /
-    # ``asset_id`` keywords, so the driver no longer writes the ``_``-mirrors.
+    # convergence.  The mutable logical asset_id is no longer stored in item
+    # _source — only the immutable ``asset_physical_id`` UUID survives.
     "_valid_from":            {"type": "date"},
     "_valid_to":              {"type": "date"},
     "_simplification_factor": {"type": "float"},
@@ -440,7 +444,7 @@ def _field_def_es_type(field_def: Any) -> Dict[str, Any]:
 
     * ``system.geometry_hash`` / ``system.attributes_hash`` → ``keyword``
       (``system.validity`` → ``date_range``; identity ``external_id`` /
-      ``asset_id`` are flat-root keyword fields, not system members)
+      ``asset_physical_id`` are flat-root keyword fields, not system members)
     * ``system.transaction_time`` / ``system.deleted_at`` → ``date``
     * ``stats.area`` → ``double``
     * ``stats.centroid`` → ``geo_point`` (the geometries sidecar emits a
@@ -502,8 +506,8 @@ def build_item_mapping(known_fields: Dict[str, Any]) -> Dict[str, Any]:
       ``validity``, ``transaction_time``, ``deleted_at``). ALWAYS emitted:
       seeded from the bounded :data:`CANONICAL_SYSTEM_TYPES` vocab so every
       system field is queryable and uniformly typed across the cross-catalog
-      alias. The identity axes (``geoid``/``external_id``/``asset_id``) are NOT
-      here — they are flat-at-root keyword fields in COMMON_PROPERTIES.
+      alias. The identity axes (``geoid``/``external_id``/``asset_physical_id``)
+      are NOT here — they are flat-at-root keyword fields in COMMON_PROPERTIES.
 
     The projection helper (``items_projection.project_item_for_es``)
     enforces the shape at write time; ES enforces it at the mapping
@@ -755,7 +759,12 @@ ASSET_MAPPING: Dict[str, Any] = {
     "dynamic_templates": DYNAMIC_TEMPLATES,
     "numeric_detection": False,
     "properties": {
-        "asset_id":      {"type": "keyword"},
+        "asset_id":           {"type": "keyword"},
+        # Immutable physical_id (UUIDv7) of the asset.  Rename-stable key for
+        # visibility filters: IAM visible_ids (logical) are translated →
+        # physical_ids at query time so renaming an asset does not void its
+        # visibility grant until the next reindex (#2296).
+        "asset_physical_id":  {"type": "keyword"},
         "catalog_id":    {"type": "keyword"},
         "collection_id": {"type": "keyword"},
         "item_id":       {"type": "keyword"},
@@ -800,9 +809,9 @@ def get_all_index_names(prefix: str) -> List[Dict[str, Any]]:
     ]
 
 
-def get_tenant_items_index(prefix: str, catalog_id: str) -> str:
+def get_tenant_items_index(prefix: str, catalog_physical_id: str) -> str:
     """Per-catalog public items index. Owned by ``ItemsElasticsearchDriver``."""
-    return f"{prefix}-{catalog_id}-items"
+    return f"{prefix}-{catalog_physical_id}-items"
 
 
 def get_public_items_alias(prefix: str) -> str:
@@ -810,9 +819,9 @@ def get_public_items_alias(prefix: str) -> str:
     return f"{prefix}-items"
 
 
-def get_assets_index_name(prefix: str, catalog_id: str) -> str:
+def get_assets_index_name(prefix: str, catalog_physical_id: str) -> str:
     """Return the name of the assets index for a catalog."""
-    return f"{prefix}-{catalog_id}-assets"
+    return f"{prefix}-{catalog_physical_id}-assets"
 
 
 

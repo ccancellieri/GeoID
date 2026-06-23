@@ -1073,15 +1073,15 @@ async def search_items(
             offset=None,
         )
 
-        # Physical table for this collection. Resolve from the per-collection
-        # driver config already loaded above (``collection_configs``, fetched
-        # with the live ``db_resource``). ``driver.location()`` must NOT be used
-        # here: it takes no ``db_resource`` and re-resolves the config with
-        # none, yielding a default config whose ``physical_table`` is ``None``,
-        # so ``location()`` raises and the collection is silently skipped —
-        # COLUMNAR attribute search then returns an empty page (#1641).
-        # ``phys_schema`` above is likewise resolved with the live resource.
-        phys_table = getattr(config, "physical_table", None)
+        # Physical table for this collection: it is named after the
+        # collection's immutable ``physical_id``.  Resolve with the live
+        # ``db_resource`` (``phys_schema`` above is resolved the same way).
+        # A None here would silently skip the collection and make COLUMNAR
+        # attribute search return an empty page (#1641), so resolve directly.
+        phys_table = await catalogs2.resolve_physical_id(
+            cat_id, collection_id,
+            ctx=DriverContext(db_resource=db_resource), allow_missing=True,
+        )
         if phys_table:
             from dynastore.tools.db import validate_sql_identifier
 
@@ -1596,8 +1596,8 @@ async def search_collections(
         union_queries.append(
             f'SELECT {_meta_cols} '
             f'FROM "{schema}".collections c '
-            f'LEFT JOIN "{schema}".collection_core mc ON mc.collection_id = c.id '
-            f'LEFT JOIN "{schema}".collection_stac ms ON ms.collection_id = c.id '
+            f'LEFT JOIN "{schema}".collection_core mc ON mc.collection_physical_id = c.physical_id '
+            f'LEFT JOIN "{schema}".collection_stac ms ON ms.collection_physical_id = c.physical_id '
             f'WHERE {per_where}'
         )
 

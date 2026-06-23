@@ -344,21 +344,13 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         *,
         db_resource: Optional[Any] = None,
     ) -> None:
-        """Rename PG physical table and update driver config."""
+        """Logical rename of a collection's storage identity.
 
-        schema = await self._resolve_schema(catalog_id, db_resource=db_resource)  # noqa: F841
-        old_table = await self.resolve_physical_table(
-            catalog_id, old_collection_id, db_resource=db_resource
-        )
-        if not old_table:
-            raise ValueError(
-                f"No physical table found for {catalog_id}:{old_collection_id}"
-            )
-
-        new_table = old_table  # Keep same physical table name, just update config mapping
-        await self.set_physical_table(
-            catalog_id, new_collection_id, new_table, db_resource=db_resource
-        )
+        The physical PG table name equals the collection's ``physical_id`` and
+        is immutable — a collection-id rename never touches storage.  This
+        method is a no-op placeholder; the collection registry update is owned
+        by the catalog service layer.
+        """
 
     async def _resolve_schema(self, catalog_id: str, db_resource=None) -> str:
         """Resolve the PG schema name for a catalog."""
@@ -384,49 +376,83 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         *,
         db_resource=None,
     ) -> Optional[str]:
-        """Resolve physical table name from driver config."""
-        config = await self.get_driver_config(
-            catalog_id, collection_id, db_resource=db_resource
-        )
-        table = config.physical_table
-        if table is None:
-            return None
-        # SQL-boundary guard (#1135): ``physical_table`` is interpolated into
-        # f-string SQL identifiers — validate before returning so a value that
-        # bypassed config validation (legacy row, model_copy, extra="allow")
-        # can never reach SQL.
-        from dynastore.tools.db import validate_sql_identifier
-        return validate_sql_identifier(table)
+        """Resolve physical table name — only when the hub table exists in PG.
 
-    async def set_physical_table(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        physical_table: str,
-        *,
-        db_resource=None,
-    ) -> None:
-        """Store physical table name in driver config."""
-        from dynastore.models.protocols.configs import ConfigsProtocol
+        Reads ``{schema}.collections.physical_id`` via
+        ``CatalogsProtocol.resolve_physical_id`` (minted at collection create
+        time), then verifies the hub table physically exists before returning.
+
+        Returns None when:
+        - the collection row has no physical_id, or
+        - the hub table has not yet been created by ``ensure_storage``
+          (lazy-activation pending state).
+
+        Callers that use the return value as a "storage is provisioned" signal
+        (item_query pending guard, is_active, lookup_service) therefore see the
+        same semantics as the retired JSONB ``physical_table`` pin: a non-None
+        result guarantees the table is queryable.
+
+        SQL-boundary guard: the resolved identifier is validated before
+        returning so it can never reach an f-string SQL expression unvalidated.
+        """
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.driver_context import DriverContext as _DC
         from dynastore.tools.discovery import get_protocol
 
-        from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            return None
+        ctx = _DC(db_resource=db_resource) if db_resource is not None else None
+        phys_id = await catalogs.resolve_physical_id(
+            catalog_id, collection_id, ctx=ctx, allow_missing=True
+        )
+        if phys_id is None:
+            return None
+        from dynastore.tools.db import validate_sql_identifier
+        validated = validate_sql_identifier(phys_id)
 
-        config = await self.get_driver_config(
-            catalog_id, collection_id, db_resource=db_resource
+        # Fast path: table already confirmed in this process — no extra DB hop.
+        from dynastore.modules.catalog.collection_service import (
+            _confirmed_active,
+            _mark_confirmed_active,
         )
-        updated_config = config.model_copy(update={"physical_table": physical_table})
-        configs = get_protocol(ConfigsProtocol)
-        if configs is None:
-            return
-        await configs.set_config(
-            ItemsPostgresqlDriverConfig,
-            updated_config,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            check_immutability=False,
-            ctx=DriverContext(db_resource=db_resource),
-        )
+        if (catalog_id, collection_id) in _confirmed_active:
+            return validated
+
+        # Slow path: physical_id is set at collection create time, but the hub
+        # table is only created later by ensure_storage (lazy activation).
+        # Probe with to_regclass so the pending guard in item_query fires
+        # correctly for unprovisioned collections.
+        try:
+            schema = await self._resolve_schema(catalog_id, db_resource=db_resource)
+        except Exception:
+            # Schema not resolvable — cannot confirm existence; return None so
+            # callers treat the collection as unprovisioned rather than crashing.
+            return None
+        from dynastore.modules.db_config.locking_tools import check_table_exists
+        from dynastore.modules.db_config.query_executor import managed_transaction
+        try:
+            if db_resource is not None:
+                exists = await check_table_exists(db_resource, validated, schema=schema)
+            else:
+                from dynastore.models.protocols.db import DatabaseProtocol
+                db_proto = get_protocol(DatabaseProtocol)
+                if db_proto is None:
+                    # No DB available; cannot confirm existence — treat as unprovisioned.
+                    return None
+                async with managed_transaction(db_proto.engine) as _conn:
+                    exists = await check_table_exists(_conn, validated, schema=schema)
+        except Exception as exc:
+            logger.warning(
+                "resolve_physical_table: table existence probe failed for "
+                "%s/%s.%s: %s — treating as unprovisioned",
+                catalog_id, collection_id, validated, exc,
+            )
+            return None
+        if not exists:
+            return None
+        _mark_confirmed_active(catalog_id, collection_id)
+        return validated
 
     async def ensure_storage(
         self,
@@ -436,14 +462,13 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
     ) -> None:
         """Create PG hub table + sidecar tables for a collection.
 
-        Generates a unique ``physical_table`` name, creates the hub table,
-        creates sidecar tables, and stores the mapping in the driver config.
+        Uses the collection's ``physical_id`` minted at registry-create time as
+        the physical table name.  ``physical_id`` is the single authoritative
+        identity; there is no separate ``t_`` token and no JSONB pin.
 
         If ``collection_id`` is None, this is a no-op (catalog-level call).
 
         PG-specific kwargs:
-            physical_table: Optional explicit table name. If not provided,
-                one is generated automatically.
             layer_config: Optional config overlay merged on top of the
                 resolved ``ItemsPostgresqlDriverConfig`` before creating storage.
         """
@@ -452,20 +477,18 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
 
         db_resource = kwargs.get("db_resource")
         col_config = kwargs.get("col_config")
-        physical_table = kwargs.get("physical_table")
         layer_config = kwargs.get("layer_config")
         if db_resource is None:
             raise ValueError("ensure_storage requires db_resource")
 
         from dynastore.modules.db_config.query_executor import (
-            DDLQuery, managed_transaction,
+            DDLQuery, DQLQuery, ResultHandler, managed_transaction,
         )
         from dynastore.tools.discovery import get_protocol
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.modules.storage.driver_config import (
             ItemsPostgresqlDriverConfig,
         )
-        from dynastore.modules.catalog.catalog_service import generate_physical_name
         from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
         from dynastore.models.protocols.assets import AssetsProtocol
 
@@ -495,11 +518,6 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                 return d
 
             merged = deep_update(base_dump, layer_config_dict)
-            # ``physical_table`` is machine-assigned; a layer_config overlay must
-            # never be able to point this collection at an arbitrary table
-            # (#1135).  Pin it to the trusted stored value (or None for a fresh
-            # collection) regardless of what the overlay carried.
-            merged["physical_table"] = col_config.physical_table
             try:
                 col_config = ItemsPostgresqlDriverConfig.model_validate(merged)
             except Exception as e:
@@ -508,13 +526,26 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     catalog_id, collection_id, e,
                 )
 
-        # --- Generate physical table name if not provided ---
-        # Prefer the name already stored in col_config (idempotent re-runs);
-        # only generate a new name if the collection is truly new.
-        if not physical_table and col_config and col_config.physical_table:
-            physical_table = col_config.physical_table
+        # --- Resolve physical table name from the collection registry ---
+        # ``collections.physical_id`` is the single authoritative source minted
+        # at registry-create time (generate_physical_name("c") → "c_<suffix>").
+        # There is no
+        # separate ``t_`` token generation and no JSONB fallback.  A NULL here
+        # means the collection row is absent or corrupt — fail loud so the
+        # caller can diagnose rather than silently naming a table after a random
+        # identifier.
+        async with managed_transaction(db_resource) as _reg_conn:
+            physical_table = await DQLQuery(
+                f'SELECT physical_id FROM "{schema}".collections '
+                "WHERE id = :collection_id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(_reg_conn, collection_id=collection_id)
         if not physical_table:
-            physical_table = generate_physical_name("t")
+            raise ValueError(
+                f"ensure_storage: collection '{catalog_id}/{collection_id}' has no "
+                f"physical_id in the registry.  The collection row must exist with a "
+                f"non-NULL physical_id before storage can be provisioned."
+            )
 
         # --- Resolve effective sidecars (M1b.2) ---
         # The sidecars list on `col_config` may be empty (default-fast path —
@@ -807,15 +838,18 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
 
         col_config = col_config.model_copy(update={"sidecars": reconciled_sidecars})
 
-        # --- Store physical_table in driver config ---
+        # --- Persist sidecar config (without physical_table pin) ---
+        # The physical table name is now authoritative in collections.physical_id
+        # and never stored in collection_configs JSONB.  Only the sidecar layout
+        # (which sidecars exist, their config, the partitioning shape) needs to
+        # be persisted so future reads can reconstruct the SQL projection.
         from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 
         configs = get_protocol(ConfigsProtocol)
-        updated_config = col_config.model_copy(update={"physical_table": physical_table})
         if configs is not None:
             await configs.set_config(
                 ItemsPostgresqlDriverConfig,
-                updated_config,
+                col_config,
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 check_immutability=False,
@@ -1669,11 +1703,9 @@ async def _pg_driver_init_collection(
     - Any other type → ignored with a debug log.  Other drivers
       register their own hooks.
 
-    When persisted, ``physical_table`` is deliberately **not** set here —
-    that's the responsibility of ``ensure_storage()`` (which is invoked
-    by the collection-activation path after the first write).  The
-    ``WriteOnce[Optional[str]]`` guard on ``physical_table`` admits a
-    transition from ``None`` → real value exactly once.
+    The physical table name comes from ``collections.physical_id`` and is
+    never stored on ``ItemsPostgresqlDriverConfig``.  Any ``physical_table``
+    key in a dict ``layer_config`` is silently dropped during model_validate.
     """
     layer_config = kwargs.get("layer_config")
     if layer_config is None:
@@ -1707,19 +1739,10 @@ async def _pg_driver_init_collection(
         )
         return
 
-    # ``physical_table`` is machine-assigned by ``ensure_storage()`` — never
-    # honour a caller-supplied value at collection creation (#1135).  Drop it
-    # from the explicit field set so it is neither persisted nor counted toward
-    # the default-fast guard below.  (The generic config-write strip enforces
-    # the same on the PATCH path; this is the create-path belt-and-suspenders.)
-    if pg_config.physical_table is not None:
-        logger.warning(
-            "PG init_collection: ignoring caller-supplied physical_table=%r for "
-            "%s/%s — it is machine-assigned.",
-            pg_config.physical_table, catalog_id, collection_id,
-        )
-        pg_config = pg_config.model_copy(update={"physical_table": None})
-        pg_config.__pydantic_fields_set__.discard("physical_table")
+    # The physical table name is derived from collections.physical_id and is
+    # never stored on the driver config.  Any physical_table key that arrives
+    # inside a dict layer_config is silently dropped during model_validate
+    # (the field no longer exists on ItemsPostgresqlDriverConfig).
 
     # The default-fast guard: persist only when the caller supplied at
     # least one PG-specific field explicitly.  A bare

@@ -137,12 +137,17 @@ class BucketService:
     # this regex; we keep it in the class for completeness/documentation.
     _GCS_VALID_CHAR_PATTERN = re.compile(r"^[a-z0-9._-]+$")
 
-    def generate_bucket_name(self, catalog_id: str, physical_schema: Optional[str] = None) -> str:
+    def generate_bucket_name(self, physical_id: str) -> str:
         """Generates the deterministic GCS bucket name for a catalog.
 
         Format: ``{project_id}-{identifier}`` where *identifier* is the
-        physical schema (preferred) or the catalog_id, lowercased and
-        with underscores translated to dashes.
+        ``physical_id`` (the immutable physical identifier, e.g. the PG
+        schema name), lowercased and with underscores translated to dashes.
+
+        ``physical_id`` must be the immutable physical identifier resolved
+        at the service boundary via ``CatalogsProtocol.resolve_physical_id``.
+        Passing a mutable logical catalog id is an error — the bucket name
+        must never change when a catalog is renamed.
 
         Length policy (GCS caps bucket names at 63 chars):
         - Common case: ``{project_id}-{identifier}`` fits → use as-is.
@@ -155,9 +160,9 @@ class BucketService:
           with its own 8-char hash for collision safety.
 
         Validation (fail-fast at name generation rather than at GCS provision):
-        - Empty identifier → ValueError
-        - Identifier contains chars outside ``[a-z0-9._-]`` → ValueError
-        - Identifier contains ``google`` or close misspellings → ValueError
+        - Empty or None physical_id → ValueError
+        - physical_id contains chars outside ``[a-z0-9._-]`` → ValueError
+        - physical_id contains ``google`` or close misspellings → ValueError
           (GCS reserves these and would reject the bucket creation)
         - After truncation, trailing ``-`` or ``.`` is trimmed (GCS forbids
           ``.-`` adjacency and bucket names must end with letter/digit).
@@ -171,11 +176,13 @@ class BucketService:
         import hashlib
         if not self.project_id:
             raise RuntimeError("GCP Project ID not available.")
-        raw_id = physical_schema or catalog_id
-        if not raw_id:
+        if not physical_id:
             raise ValueError(
-                "Cannot generate bucket name: both physical_schema and catalog_id are empty."
+                "Cannot generate bucket name: physical_id is empty or None. "
+                "Resolve the physical id via CatalogsProtocol.resolve_physical_id "
+                "before calling generate_bucket_name."
             )
+        raw_id = physical_id
         prefix = self.project_id.lower()
         identifier = raw_id.lower().replace("_", "-")
         if not self._GCS_VALID_CHAR_PATTERN.match(identifier):
@@ -276,12 +283,22 @@ class BucketService:
     async def get_collection_storage_path(
         self, catalog_id: str, collection_id: str
     ) -> Optional[str]:
-        """Returns the GCS path for a collection's folder (e.g., gs://bucket-name/collections/my-collection/)."""
+        """Returns the GCS path for a collection's folder.
+
+        Resolves the collection's physical_id before building the path so the
+        GCS prefix remains stable even when the logical collection id changes.
+        """
         bucket_name = await self.ensure_storage_for_catalog(catalog_id)
-        return (
-            bucket_tool.get_gcs_collection_path(bucket_name, collection_id)
-            if bucket_name
-            else None
+        if not bucket_name:
+            return None
+        collection_physical_id: Optional[str] = None
+        catalogs_svc = get_protocol(CatalogsProtocol)
+        if catalogs_svc:
+            collection_physical_id = await catalogs_svc.resolve_physical_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+        return bucket_tool.get_gcs_collection_path(
+            bucket_name, collection_physical_id or collection_id
         )
 
     async def prepare_upload_target(
@@ -523,9 +540,16 @@ class BucketService:
         if not self.project_id:
             raise RuntimeError("GCP Project ID could not be determined.")
 
-        new_bucket_name = self.generate_bucket_name(
-            catalog_id, physical_schema=context.physical_schema if context else None
-        )
+        # Resolve the immutable physical_id — prefer the lifecycle snapshot
+        # (already in-memory, no DB call needed); fall back to a live lookup.
+        _physical_id: Optional[str] = context.physical_schema if context else None
+        if not _physical_id:
+            _catalogs_svc = get_protocol(CatalogsProtocol)
+            if _catalogs_svc:
+                _physical_id = await _catalogs_svc.resolve_physical_id(
+                    catalog_id, allow_missing=True
+                )
+        new_bucket_name = self.generate_bucket_name(_physical_id or catalog_id)
 
         try:
             bucket_created = await self._gcs_create_and_configure_bucket(
@@ -627,9 +651,20 @@ class BucketService:
         if not self.project_id:
             raise RuntimeError("GCP Project ID could not be determined.")
 
-        new_bucket_name = self.generate_bucket_name(
-            catalog_id, physical_schema=context.physical_schema if context else None
-        )
+        # Resolve the immutable physical_id — prefer the lifecycle snapshot
+        # (already in-memory, no DB call needed); fall back to a live lookup.
+        # We have `conn` here so pass it via DriverContext to avoid opening
+        # an additional connection.
+        _physical_id_single: Optional[str] = context.physical_schema if context else None
+        if not _physical_id_single:
+            _catalogs_svc_single = get_protocol(CatalogsProtocol)
+            if _catalogs_svc_single:
+                _physical_id_single = await _catalogs_svc_single.resolve_physical_id(
+                    catalog_id,
+                    ctx=DriverContext(db_resource=conn),
+                    allow_missing=True,
+                )
+        new_bucket_name = self.generate_bucket_name(_physical_id_single or catalog_id)
 
         try:
             bucket_created = await self._gcs_create_and_configure_bucket(
@@ -910,8 +945,9 @@ class BucketService:
         * ``bucket_name`` — the authoritative name persisted on the old catalog's
           config (preferred; correct even for legacy catalogs whose bucket name
           does not embed the schema), or
-        * ``physical_schema`` — from which the name is reconstructed
-          deterministically (fallback when no persisted name was captured).
+        * ``physical_schema`` — the immutable physical id, from which the name is
+          reconstructed deterministically (fallback when no persisted name was
+          captured).
 
         In either explicit-target mode the DB is never consulted for the name nor
         mutated, leaving the live (recreated) catalog's bucket and config link
@@ -920,9 +956,9 @@ class BucketService:
         explicit_target = physical_schema is not None or bucket_name is not None
         if bucket_name is None and physical_schema is not None:
             try:
-                bucket_name = self.generate_bucket_name(
-                    catalog_id, physical_schema=physical_schema
-                )
+                # physical_schema IS the immutable physical id the bucket name
+                # is derived from (rename-safe, #2296).
+                bucket_name = self.generate_bucket_name(physical_schema)
             except Exception as e:
                 logger.warning(
                     "BucketService.drop_storage: cannot derive schema-targeted "
@@ -933,10 +969,19 @@ class BucketService:
         elif not explicit_target:
             bucket_name = await self.get_storage_identifier(catalog_id)
 
-            # Fallback: if DB record is gone (e.g. schema already dropped), try deterministic name.
+            # Fallback: DB record gone (schema already dropped). The bucket name
+            # derives from the immutable physical id, never the mutable catalog_id
+            # (which may have been renamed), so resolve it first and fall back to
+            # catalog_id only when it cannot be resolved.
             if not bucket_name:
                 try:
-                    bucket_name = self.generate_bucket_name(catalog_id)
+                    _physical_id: Optional[str] = None
+                    _catalogs = get_protocol(CatalogsProtocol)
+                    if _catalogs:
+                        _physical_id = await _catalogs.resolve_physical_id(
+                            catalog_id, allow_missing=True
+                        )
+                    bucket_name = self.generate_bucket_name(_physical_id or catalog_id)
                     logger.info(
                         "BucketService.drop_storage: DB record missing for %r; "
                         "falling back to deterministic bucket name %r.",

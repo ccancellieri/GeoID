@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from dynastore.models.protocols.configs import ConfigsProtocol
     from dynastore.models.protocols.localization import LocalizationProtocol
     from dynastore.models.driver_context import DriverContext  # noqa: F401
+    from dynastore.extensions.ogc_models_shared import RenameResponse
 
 
 @runtime_checkable
@@ -94,14 +95,74 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
 
     # === Global Schema/Catalog Management ===
 
+    async def resolve_physical_id(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
+        ctx: Optional["DriverContext"] = None,
+        allow_missing: bool = False,
+    ) -> Optional[str]:
+        """Return the immutable physical identifier for a catalog or collection.
+
+        For catalogs (``collection_id is None``) this is the physical schema
+        name stored in ``catalog.catalogs.physical_schema``.
+        For collections it is the physical table name stored in the collection
+        registry.
+
+        Callers resolve this value ONCE at the service boundary and pass it
+        downstream; never pass a logical (user-visible) id to storage backends.
+
+        Parameters
+        ----------
+        catalog_id:
+            Logical catalog identifier.
+        collection_id:
+            Logical collection identifier.  When ``None`` the catalog-level
+            physical id is returned.
+        ctx:
+            Optional driver context carrying an in-flight DB connection.
+        allow_missing:
+            When ``True`` return ``None`` instead of raising for an absent
+            catalog.  For the collection path ``None`` is always returned when
+            the collection is not found.
+        """
+        ...
+
     async def resolve_physical_schema(
         self,
         catalog_id: Optional[str] = None,
         ctx: Optional["DriverContext"] = None,
         allow_missing: bool = False,
     ) -> Optional[str]:
+        """Resolve the physical PG schema name for a catalog.
+
+        Back-compat shim: delegates to ``resolve_physical_id(catalog_id)``.
+        Prefer ``resolve_physical_id`` for new callers.
         """
-        Resolves the physical schema name for a given catalog ID.
+        ...
+
+    async def resolve_logical_id(
+        self,
+        catalog_id: str,
+        physical_id: str,
+        *,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Optional[str]:
+        """Return the current logical ``collection_id`` for a collection physical id.
+
+        The inverse of :meth:`resolve_physical_id` (collection path): given an
+        immutable ``collection_physical_id`` carried on a stored row, return the
+        live user-facing ``collection_id``.  Read boundaries that hold only a
+        physical id (multi-collection asset listings, drift reconcile, the
+        virtual-asset collections filter) use this to re-attach the logical
+        label instead of persisting a rename-stale copy on every row.
+
+        Resolution is centrally cached (the same ``@cached`` machinery as the
+        forward resolver).  When ``ctx`` carries a connection the lookup joins
+        that transaction directly (cache-bypassing) so uncommitted state is
+        visible.  Returns ``None`` for an unknown physical id; callers fall back
+        to the physical id itself.
         """
         ...
 
@@ -285,5 +346,40 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         ``ids`` — restrict results to these catalog ids; applied before
         pagination so that LIMIT/OFFSET are consistent with the filtered
         result set.  ``None`` means no restriction (all catalogs).
+        """
+        ...
+
+    async def rename_catalog(
+        self,
+        catalog_id: str,
+        new_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> "RenameResponse":
+        """Rename a catalog's logical id.
+
+        Returns a :class:`~dynastore.extensions.ogc_models_shared.RenameResponse`
+        with warnings about ES reindex and IAM update requirements.
+
+        Raises:
+            ValueError: Catalog not found (``catalog_id`` absent or tombstoned).
+            _CatalogRenameConflictError: ``new_id`` already exists.
+        """
+        ...
+
+    async def rename_collection(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        new_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> "RenameResponse":
+        """Rename a collection's logical id.
+
+        Returns a :class:`~dynastore.extensions.ogc_models_shared.RenameResponse`
+        with warnings about ES reindex and IAM update requirements.
+
+        Raises:
+            ValueError: Catalog or collection not found.
+            CollectionRenameConflictError: ``new_id`` already exists in this catalog.
         """
         ...

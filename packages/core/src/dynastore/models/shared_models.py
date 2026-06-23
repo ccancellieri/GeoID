@@ -396,6 +396,7 @@ class BaseMetadata(LocalizedFieldsBase):
         # Common fields that are implementation details or already top-level in STAC
         return {
             "physical_schema",
+            "physical_id",
             "connection_info",
             "type",
             "provisioning_status",

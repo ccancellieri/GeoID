@@ -84,11 +84,19 @@ class ProxyUrlOwner(BaseResourceOwner):
         if not phys_schema:
             return []
 
+        collection_physical_id = await catalogs.resolve_physical_id(
+            scope_ref.catalog_id,
+            scope_ref.collection_id,
+            ctx=DriverContext(db_resource=conn),
+            allow_missing=True,
+        )
+        lookup_id = collection_physical_id or scope_ref.collection_id
+
         short_keys = await DQLQuery(
             f"SELECT short_key FROM {phys_schema}.collection_proxy_urls"
-            " WHERE collection_id = :coll",
+            " WHERE collection_physical_id = :coll",
             result_handler=ResultHandler.ALL_SCALARS,
-        ).execute(conn, coll=scope_ref.collection_id)
+        ).execute(conn, coll=lookup_id)
 
         return [
             CleanupRef(

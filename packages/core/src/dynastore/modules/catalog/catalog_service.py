@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
     from dynastore.modules.db_config.query_executor import DDLBatch
     from dynastore.modules.storage.hints import Hint
+    from dynastore.extensions.ogc_models_shared import RenameResponse
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 
@@ -88,6 +89,37 @@ from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry, Life
 
 logger = logging.getLogger(__name__)
 
+
+class _CatalogRenameConflictError(Exception):
+    """Raised when the target ``new_id`` already exists in catalog.catalogs."""
+
+    def __init__(self, new_id: str) -> None:
+        super().__init__(
+            f"Catalog id '{new_id}' already exists (including tombstoned records)."
+        )
+        self.new_id = new_id
+
+
+class _CollectionRenameConflictError(Exception):
+    """Raised when the target ``new_id`` already exists in the collections registry."""
+
+    def __init__(self, new_id: str) -> None:
+        super().__init__(
+            f"Collection id '{new_id}' already exists (including tombstoned records)."
+        )
+        self.new_id = new_id
+
+
+class _AssetRenameConflictError(Exception):
+    """Raised when the target ``new_id`` already exists in the assets table."""
+
+    def __init__(self, new_id: str) -> None:
+        super().__init__(
+            f"Asset id '{new_id}' already exists."
+        )
+        self.new_id = new_id
+
+
 # ==============================================================================
 #  CORE DDL DEFINITIONS (Base Catalog)
 # ==============================================================================
@@ -101,6 +133,8 @@ CREATE TABLE IF NOT EXISTS {schema}.collections (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     deleted_at TIMESTAMPTZ DEFAULT NULL,
     lifecycle_status VARCHAR DEFAULT NULL,
+    physical_id VARCHAR DEFAULT NULL,
+    UNIQUE (physical_id),
     PRIMARY KEY (id)
 );
 """
@@ -533,6 +567,85 @@ def _invalidate_catalog_model_cache(catalog_id: str) -> None:
     _physical_schema_cache.cache_invalidate(None, catalog_id)
 
 
+@cached(
+    maxsize=4096,
+    ttl=300,
+    namespace="collection_physical_id",
+    ignore=["service"],
+    condition=lambda v: v is not None,
+)
+async def _collection_physical_id_cache(
+    service: "CatalogService", catalog_id: str, collection_id: str
+) -> Optional[str]:
+    """Resolve a collection's immutable physical id as a plain string.
+
+    Pure accelerator over ``{schema}.collections.physical_id`` (the single
+    source of truth).  Shared L1/L2 cache (the same ``@cached`` machinery as
+    ``_physical_schema_cache``) so every hot caller — tile storage, the log
+    writer — pays the DB round-trip at most once per TTL window instead of once
+    per write.  ``condition`` keeps misses out so a just-created collection
+    resolves immediately; ``service`` is ignored for keying so every service
+    instance shares one backend.  Only the cache-friendly (no ``db_resource``)
+    path of ``resolve_physical_id`` routes through here; in-transaction callers
+    still read straight from their connection.
+    """
+    return await service._resolve_collection_physical_id_db(catalog_id, collection_id)
+
+
+def _invalidate_collection_physical_id_cache(
+    catalog_id: str, collection_id: str
+) -> None:
+    """Drop the shared collection physical-id cache entry.
+
+    Wired into ``_invalidate_collection_lifecycle_caches`` so a rename/delete
+    busts the entry for both the old and the new logical id.  A catalog rename
+    leaves the schema (and thus every collection's physical id) unchanged, so
+    only the per-collection logical key needs busting here; stale entries under
+    a renamed-away catalog id are never queried (the catalog 404s first) and
+    expire on TTL regardless.
+    """
+    _collection_physical_id_cache.cache_invalidate(None, catalog_id, collection_id)
+
+
+@cached(
+    maxsize=4096,
+    ttl=300,
+    namespace="collection_logical_id",
+    ignore=["service"],
+    condition=lambda v: v is not None,
+)
+async def _collection_logical_id_cache(
+    service: "CatalogService", catalog_id: str, physical_id: str
+) -> Optional[str]:
+    """Resolve a collection's current logical id from its immutable physical id.
+
+    The reverse of ``_collection_physical_id_cache``: reads
+    ``{schema}.collections.id`` keyed on the immutable ``physical_id``.  Used at
+    read boundaries that hold only the physical id of a row (multi-collection
+    asset listings, drift reconcile, the virtual-asset collections filter) to
+    re-attach the user-facing logical ``collection_id`` without storing a
+    rename-stale copy on every asset row.  ``condition`` keeps misses out so a
+    just-created collection resolves immediately; ``service`` is ignored for
+    keying so every service instance shares one backend.  Only the
+    cache-friendly (no ``db_resource``) path routes through here; in-transaction
+    callers read straight from their connection.
+    """
+    return await service._resolve_collection_logical_id_db(catalog_id, physical_id)
+
+
+def _invalidate_collection_logical_id_cache(
+    catalog_id: str, physical_id: str
+) -> None:
+    """Drop the shared collection logical-id (reverse) cache entry.
+
+    Busted on rename/delete alongside the forward physical-id cache: a rename
+    changes which logical id a physical id maps to, so the reverse entry under
+    the renamed-away physical id must be dropped (the physical id itself is
+    immutable, but its logical label moved).
+    """
+    _collection_logical_id_cache.cache_invalidate(None, catalog_id, physical_id)
+
+
 from dynastore.modules.catalog.collection_service import CollectionService
 from dynastore.modules.catalog.item_service import ItemService
 
@@ -618,7 +731,65 @@ class CatalogService(CatalogsProtocol):
         from dynastore.tools.discovery import get_protocol as _gp
         return _gp(LocalizationProtocol)
 
-    # --- Schema Resolution ---
+    # --- Schema / Physical ID Resolution ---
+
+    async def _resolve_collection_physical_id_db(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        db_resource: Optional[DbResource] = None,
+    ) -> Optional[str]:
+        """Read ``physical_id`` from the per-tenant collections registry table.
+
+        ``{schema}.collections.physical_id`` is the single source of truth for a
+        collection's immutable identity.  Returns ``None`` only when the row is
+        absent, when the catalog schema cannot be resolved, or when no engine is
+        available.
+        """
+        engine = db_resource or getattr(self, "engine", None)
+        if engine is None:
+            return None
+        try:
+            phys_schema = await _physical_schema_cache(self, catalog_id)
+        except Exception:
+            return None
+        if not phys_schema:
+            return None
+        async with managed_transaction(engine) as conn:
+            return await DQLQuery(
+                f'SELECT physical_id FROM "{phys_schema}".collections '
+                "WHERE id = :collection_id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, collection_id=collection_id)
+
+    async def _resolve_collection_logical_id_db(
+        self,
+        catalog_id: str,
+        physical_id: str,
+        db_resource: Optional[DbResource] = None,
+    ) -> Optional[str]:
+        """Read the current logical ``id`` for a collection's immutable physical id.
+
+        The reverse of :meth:`_resolve_collection_physical_id_db`: keys on
+        ``{schema}.collections.physical_id`` (immutable, ``UNIQUE``) and returns
+        the live logical ``id``.  Returns ``None`` when the row is absent, when
+        the catalog schema cannot be resolved, or when no engine is available.
+        """
+        engine = db_resource or getattr(self, "engine", None)
+        if engine is None:
+            return None
+        try:
+            phys_schema = await _physical_schema_cache(self, catalog_id)
+        except Exception:
+            return None
+        if not phys_schema:
+            return None
+        async with managed_transaction(engine) as conn:
+            return await DQLQuery(
+                f'SELECT id FROM "{phys_schema}".collections '
+                "WHERE physical_id = :physical_id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, physical_id=physical_id)
 
     async def _get_physical_schema_db(self, catalog_id: str) -> Optional[str]:
         """Authoritative physical-schema lookup against ``catalog.catalogs``.
@@ -632,21 +803,46 @@ class CatalogService(CatalogsProtocol):
                 result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
             ).execute(conn, catalog_id=catalog_id)
 
-    async def resolve_physical_schema(
+    async def resolve_physical_id(
         self,
         catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
         ctx: Optional["DriverContext"] = None,
         allow_missing: bool = False,
     ) -> Optional[str]:
-        """Resolve the per-tenant physical PG schema for a catalog.
+        """Return the immutable physical identifier for a catalog or collection.
 
-        Authoritative source: the ``catalog.catalogs`` registry. When a caller
-        supplies a connection (``ctx.db_resource``) the lookup joins that
-        transaction directly; otherwise it goes through ``_physical_schema_cache``
-        — a lossless *string* cache. Resolution is never derived from the cached
-        ``Catalog`` model (which cannot carry ``physical_schema`` across the
-        distributed cache — see ``_physical_schema_cache``).
+        For catalogs (``collection_id is None``) the physical id is the
+        per-tenant PG schema stored in ``catalog.catalogs.physical_schema``.
+
+        For collections the authoritative — and only — source is
+        ``{schema}.collections.physical_id`` (minted at create time).  There is
+        no JSONB fallback: every collection row carries its own physical id.
+
+        When a caller supplies a connection via ``ctx.db_resource`` the catalog
+        lookup joins that transaction directly; otherwise the module-level
+        ``_physical_schema_cache`` (TTL 300 s) is used as a lossless string
+        accelerator.
         """
+        if collection_id is not None:
+            db_resource = ctx.db_resource if ctx else None
+            if db_resource is not None:
+                # In-transaction caller: read straight from its connection so
+                # uncommitted state is visible; never serve from the cache.
+                phys_id = await self._resolve_collection_physical_id_db(
+                    catalog_id, collection_id, db_resource=db_resource
+                )
+            else:
+                phys_id = await _collection_physical_id_cache(
+                    self, catalog_id, collection_id
+                )
+            if not phys_id and not allow_missing:
+                raise ValueError(
+                    f"Collection '{catalog_id}/{collection_id}' not found."
+                )
+            return phys_id
+
         db_resource = ctx.db_resource if ctx else None
         if db_resource:
             async with managed_transaction(db_resource) as conn:
@@ -661,6 +857,50 @@ class CatalogService(CatalogsProtocol):
         if not ps and not allow_missing:
             raise ValueError(f"Catalog '{catalog_id}' not found.")
         return ps
+
+    async def resolve_physical_schema(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+        allow_missing: bool = False,
+    ) -> Optional[str]:
+        """Resolve the per-tenant physical PG schema for a catalog.
+
+        Back-compat shim that delegates to ``resolve_physical_id``.
+        Prefer ``resolve_physical_id`` for new callers.
+        """
+        return await self.resolve_physical_id(
+            catalog_id, ctx=ctx, allow_missing=allow_missing
+        )
+
+    async def resolve_logical_id(
+        self,
+        catalog_id: str,
+        physical_id: str,
+        *,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Optional[str]:
+        """Return the current logical ``collection_id`` for a collection physical id.
+
+        The inverse of :meth:`resolve_physical_id` (collection path): given the
+        immutable ``collection_physical_id`` carried on an asset row, returns the
+        live user-facing ``collection_id``.  Boundaries that hold only a physical
+        id (multi-collection asset listings, drift reconcile, the virtual-asset
+        collections filter) use this to re-attach the logical label instead of
+        reading a rename-stale copy off the row.
+
+        When a caller supplies a connection via ``ctx.db_resource`` the lookup
+        joins that transaction directly so uncommitted state is visible;
+        otherwise the shared ``_collection_logical_id_cache`` (TTL 300 s) serves
+        as a lossless string accelerator.  Returns ``None`` for an unknown
+        physical id (callers fall back to the physical id itself).
+        """
+        db_resource = ctx.db_resource if ctx else None
+        if db_resource is not None:
+            return await self._resolve_collection_logical_id_db(
+                catalog_id, physical_id, db_resource=db_resource
+            )
+        return await _collection_logical_id_cache(self, catalog_id, physical_id)
 
     # --- Collection Resolution ---
     async def resolve_datasource(
@@ -731,9 +971,10 @@ class CatalogService(CatalogsProtocol):
         physical_table: str,
         db_resource: Optional[DbResource] = None,
     ) -> None:
-        return await self._col_svc.set_physical_table(
-            catalog_id, collection_id, physical_table, db_resource=db_resource
-        )
+        """No-op: the physical table name is the collection's ``physical_id``
+        stored in the registry and is never written to ``collection_configs``
+        JSONB.  Retained for call-site backward compatibility.
+        """
 
     # --- Catalog CRUD ---
 
@@ -1952,6 +2193,102 @@ class CatalogService(CatalogsProtocol):
 
         return True
 
+    async def rename_catalog(
+        self,
+        catalog_id: str,
+        new_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> "RenameResponse":
+        """Rename a catalog's logical id (presentation label change only).
+
+        The physical schema, all storage backends, and configs remain keyed on
+        ``physical_schema`` (the immutable ``s_…`` schema name) and are NOT
+        moved.  Tenant storage tables (``collections``, ``assets``, ``logs``)
+        are untouched because they key on the immutable physical schema, not
+        the logical catalog id.
+
+        Inside a single serialized transaction this updates only:
+
+        - ``catalog.catalogs.id`` (registry PK) — the single logical→physical
+          mapping row.  ON UPDATE CASCADE propagates to ``catalog_core.catalog_id``
+          and ``catalog_stac.catalog_id`` automatically.
+
+        Returns a :class:`RenameResponse` with warnings about required
+        follow-up actions (ES reindex, IAM policy binding updates).
+        """
+        from dynastore.extensions.ogc_models_shared import RenameResponse
+
+        validate_sql_identifier(catalog_id)
+        new_id = validate_sql_identifier(new_id)
+
+        # Fast path: no-op if the normalized ids are identical.
+        if new_id == catalog_id:
+            return RenameResponse(
+                old_id=catalog_id,
+                new_id=new_id,
+                level="catalog",
+                warnings=[],
+                reindex_required=False,
+                iam_manual_update_required=False,
+            )
+
+        db_resource = ctx.db_resource if ctx else None
+
+        async with managed_transaction(get_catalog_engine(db_resource)) as conn:
+            if db_resource is None:
+                from typing import cast as _cast
+                from sqlalchemy import text as _text
+                from sqlalchemy.ext.asyncio import AsyncConnection as _AsyncConn
+                await _cast(_AsyncConn, conn).execute(
+                    _text("SET LOCAL idle_in_transaction_session_timeout = '0'")
+                )
+
+            # Serialize concurrent renames on the same old id.
+            await DQLQuery(
+                "SELECT pg_advisory_xact_lock(hashtext('catalog_rename:'||:old))",
+                result_handler=ResultHandler.SCALAR,
+            ).execute(conn, old=catalog_id)
+
+            # Existence check (404).
+            existing = await DQLQuery(
+                "SELECT id FROM catalog.catalogs WHERE id = :id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, id=catalog_id)
+            if existing is None:
+                raise ValueError(f"Catalog '{catalog_id}' not found.")
+
+            # Collision check — include tombstoned rows (409).
+            collision = await DQLQuery(
+                "SELECT id FROM catalog.catalogs WHERE id = :new_id;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, new_id=new_id)
+            if collision is not None:
+                raise _CatalogRenameConflictError(new_id)
+
+            # Single UPDATE; ON UPDATE CASCADE propagates to catalog_core and
+            # catalog_stac (applied to the CREATE TABLE DDL at provisioning).
+            await DDLQuery(
+                "UPDATE catalog.catalogs SET id = :new_id, updated_at = NOW() "
+                "WHERE id = :old_id;",
+            ).execute(conn, new_id=new_id, old_id=catalog_id)
+
+        # Bust caches for both old and new id post-commit.
+        _invalidate_catalog_model_cache(catalog_id)
+        _invalidate_catalog_model_cache(new_id)
+
+        warnings = [
+            "es_reindex_required",
+            "iam_manual_update_required",
+        ]
+        return RenameResponse(
+            old_id=catalog_id,
+            new_id=new_id,
+            level="catalog",
+            warnings=warnings,
+            reindex_required=True,
+            iam_manual_update_required=True,
+        )
+
     async def list_collections(
         self,
         catalog_id: str,
@@ -2052,6 +2389,17 @@ class CatalogService(CatalogsProtocol):
     ) -> bool:
         return await self._col_svc.delete_collection(
             catalog_id, collection_id, force=force, ctx=ctx
+        )
+
+    async def rename_collection(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        new_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> "RenameResponse":
+        return await self._col_svc.rename_collection(
+            catalog_id, collection_id, new_id, ctx=ctx
         )
 
     async def delete_collection_language(

@@ -177,26 +177,29 @@ async def list_bucket_blobs(
 
 
 _SELECT_ASSETS_SQL = """
-SELECT asset_id, collection_id, filename, status, uri, owned_by, kind, created_at, metadata
+SELECT asset_id, collection_physical_id, filename, status, uri, owned_by, kind, created_at, metadata
 FROM "{schema}".assets
-WHERE catalog_id = :catalog_id
-  AND status <> 'deleted'
+WHERE status <> 'deleted'
   {collection_clause}
 """.strip()
 
 
 def _build_select_sql(schema: str, *, scoped_collection: bool) -> str:
-    clause = "AND collection_id = :collection_id" if scoped_collection else ""
+    clause = (
+        "AND collection_physical_id = :collection_physical_id"
+        if scoped_collection
+        else ""
+    )
     return _SELECT_ASSETS_SQL.format(schema=schema, collection_clause=clause)
 
 
 _INSERT_ORPHAN_SQL = """
 INSERT INTO "{schema}".assets
-    (asset_id, catalog_id, collection_id, asset_type, kind, status,
-     filename, uri, owned_by, created_at, updated_at, metadata)
+    (asset_id, collection_physical_id, asset_type, kind, status,
+     filename, uri, owned_by, created_at, updated_at, metadata, physical_id)
 VALUES
-    (:asset_id, :catalog_id, :collection_id, :asset_type, :kind, :status,
-     :filename, :uri, :owned_by, :created_at, :updated_at, CAST(:metadata AS jsonb))
+    (:asset_id, :collection_physical_id, :asset_type, :kind, :status,
+     :filename, :uri, :owned_by, :created_at, :updated_at, CAST(:metadata AS jsonb), :physical_id)
 """.strip()
 
 
@@ -205,8 +208,7 @@ UPDATE "{schema}".assets
 SET status = 'failed',
     updated_at = NOW(),
     metadata = COALESCE(metadata, '{{}}'::jsonb) || CAST(:patch AS jsonb)
-WHERE catalog_id = :catalog_id
-  AND collection_id IS NOT DISTINCT FROM :collection_id
+WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id
   AND asset_id = :asset_id
 """.strip()
 
@@ -216,8 +218,7 @@ UPDATE "{schema}".assets
 SET status = 'failed',
     updated_at = NOW(),
     metadata = COALESCE(metadata, '{{}}'::jsonb) || CAST(:patch AS jsonb)
-WHERE catalog_id = :catalog_id
-  AND collection_id IS NOT DISTINCT FROM :collection_id
+WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id
   AND asset_id = :asset_id
   AND status = 'pending'
 """.strip()
@@ -228,25 +229,29 @@ WHERE catalog_id = :catalog_id
 # ---------------------------------------------------------------------------
 
 
-def _resolve_listing_prefix(collection_id: Optional[str]) -> Optional[str]:
+def _resolve_listing_prefix(collection_physical_id: Optional[str]) -> Optional[str]:
     """Return the GCS object-name prefix to scan for the given scope.
 
     ``None`` means "scan the whole bucket" (catalog scope) — the catalog
     bucket holds both ``catalog/`` and ``collections/`` trees, so we
     cannot narrow further without losing catalog-tier rows.
+
+    ``collection_physical_id`` must be the immutable physical identifier of
+    the collection (resolved via ``CatalogsProtocol.resolve_physical_id``),
+    not the mutable logical collection id.
     """
-    if collection_id is None:
+    if collection_physical_id is None:
         return None
     from dynastore.modules.gcp.tools import bucket as bucket_tool
 
-    return bucket_tool.get_blob_path_for_collection_folder(collection_id)
+    return bucket_tool.get_blob_path_for_collection_folder(collection_physical_id)
 
 
-def _row_collection_id(row: Any) -> Optional[str]:
-    """Return ``collection_id`` from a SQL row dict (handles None)."""
+def _row_collection_physical_id(row: Any) -> Optional[str]:
+    """Return the immutable ``collection_physical_id`` from a SQL row dict."""
     if isinstance(row, dict):
-        return row.get("collection_id")
-    return getattr(row, "collection_id", None)
+        return row.get("collection_physical_id")
+    return getattr(row, "collection_physical_id", None)
 
 
 def _row_get(row: Any, key: str) -> Any:
@@ -279,8 +284,37 @@ async def reconcile_bucket(
     catalog_id = inputs.catalog_id
     collection_id = inputs.collection_id
 
+    # Single catalogs-protocol handle, reused for forward (logical→physical)
+    # and reverse (physical→logical) collection-id resolution below.
+    from dynastore.modules import get_protocol as _get_protocol_rec
+    from dynastore.models.protocols import CatalogsProtocol as _CatalogsProtocol_rec
+    _catalogs_rec = _get_protocol_rec(_CatalogsProtocol_rec)
+
+    async def _logical_collection(phys: Optional[str]) -> Optional[str]:
+        """Reverse-resolve a collection_physical_id to its logical id for the
+        drift report (display only); fall back to the physical token when the
+        protocol is absent or the collection is gone."""
+        if not phys or _catalogs_rec is None:
+            return phys
+        try:
+            return await _catalogs_rec.resolve_logical_id(catalog_id, phys) or phys
+        except Exception:
+            return phys
+
+    # Resolve the immutable physical_id for the collection so the GCS prefix
+    # scan targets the correct path even when the logical id has been renamed.
+    collection_physical_id: Optional[str] = None
+    if collection_id is not None and _catalogs_rec is not None:
+        try:
+            collection_physical_id = await _catalogs_rec.resolve_physical_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+        except Exception:
+            pass
+    collection_physical_id = collection_physical_id or collection_id
+
     # ---------------------------------------------------------------- bucket
-    prefix = _resolve_listing_prefix(collection_id)
+    prefix = _resolve_listing_prefix(collection_physical_id)
     blobs = await list_bucket_blobs(storage_client, bucket_name, prefix)
     # Map basename -> blob_path. Multiple blobs sharing a basename across
     # different prefixes is rare; we keep the first hit (stable for tests).
@@ -289,12 +323,14 @@ async def reconcile_bucket(
         blob_filenames.setdefault(filename, blob_path)
 
     # --------------------------------------------------------------- db rows
+    # Scope the SELECT by the immutable collection_physical_id when present.
+    # The schema already scopes to one catalog, so catalog_id is not needed.
     select_sql = _build_select_sql(
-        schema, scoped_collection=collection_id is not None
+        schema, scoped_collection=collection_physical_id is not None
     )
-    sql_params: Dict[str, Any] = {"catalog_id": catalog_id}
-    if collection_id is not None:
-        sql_params["collection_id"] = collection_id
+    sql_params: Dict[str, Any] = {}
+    if collection_physical_id is not None:
+        sql_params["collection_physical_id"] = collection_physical_id
 
     async with managed_transaction(engine) as conn:
         rows = await DQLQuery(
@@ -303,14 +339,16 @@ async def reconcile_bucket(
 
     rows = rows or []
 
-    # Index DB rows by (collection_id, filename) so the diff is O(N+M).
-    # collection_id is normalised to "" when NULL so set-membership works.
+    # Index DB rows by (collection_physical_id, filename) so the diff is O(N+M).
+    # The bucket stores objects under the immutable physical id path, so the
+    # diff key must also use the physical id. collection_physical_id is
+    # normalised to "" when NULL so set-membership works.
     db_filename_index: Set[Tuple[str, str]] = set()
     for row in rows:
         fn = _row_get(row, "filename")
         if not fn:
             continue
-        db_filename_index.add((_row_collection_id(row) or "", fn))
+        db_filename_index.add((_row_collection_physical_id(row) or "", fn))
 
     drift_details: List[DriftEntry] = []
     orphans_imported = 0
@@ -328,7 +366,9 @@ async def reconcile_bucket(
         kind = _row_get(row, "kind")
         status = _row_get(row, "status")
         filename = _row_get(row, "filename")
-        row_collection = _row_collection_id(row)
+        # assets no longer stores the logical collection_id; reverse-resolve it
+        # from the immutable collection_physical_id for the drift report.
+        row_collection = await _logical_collection(_row_collection_physical_id(row))
         asset_id = _row_get(row, "asset_id")
         uri = _row_get(row, "uri")
 
@@ -377,32 +417,37 @@ async def reconcile_bucket(
                 ghost_targets.append(row)
 
     # -------------------------------------------------------- orphan-blob pass
-    # Iterate listed blobs; any whose (collection_id, filename) is absent
-    # from the DB index is an orphan that we WOULD import.
+    # Iterate listed blobs; any whose (collection_physical_id, filename) is
+    # absent from the DB index is an orphan that we WOULD import.
+    # blob_collection_physical_id is derived from the immutable path segment
+    # ``collections/{collection_physical_id}/...``, which always equals the
+    # physical id regardless of any logical rename.
     orphan_blobs: List[Tuple[str, Optional[str], str]] = []
     for blob_path, filename in blobs:
-        # Resolve the scope this blob belongs to from the prefix shape:
-        # ``collections/{cid}/...``  → collection_id=cid
-        # ``catalog/...``            → catalog-tier (collection_id=None)
-        # other prefixes             → catalog-tier (defensive default)
-        blob_collection_id: Optional[str] = collection_id
-        if blob_collection_id is None:
-            # bucket-wide scan: derive from the path itself
+        # Resolve the physical collection scope from the prefix shape:
+        # ``collections/{physical_id}/...``  → collection_physical_id=physical_id
+        # ``catalog/...``                    → catalog-tier (None)
+        # other prefixes                     → catalog-tier (defensive default)
+        if collection_physical_id is not None:
+            # scoped mode: physical id is already known
+            blob_collection_physical_id: Optional[str] = collection_physical_id
+        else:
+            # bucket-wide scan: extract physical id directly from the path
             parts = blob_path.split("/", 2)
             if len(parts) >= 3 and parts[0] == "collections":
-                blob_collection_id = parts[1]
+                blob_collection_physical_id = parts[1]
             else:
-                blob_collection_id = None
-        key = (blob_collection_id or "", filename)
+                blob_collection_physical_id = None
+        key = (blob_collection_physical_id or "", filename)
         if key in db_filename_index:
             continue
         orphans_imported += 1
-        orphan_blobs.append((blob_path, blob_collection_id, filename))
+        orphan_blobs.append((blob_path, blob_collection_physical_id, filename))
         drift_details.append(
             DriftEntry(
                 kind=DriftKind.ORPHAN_BLOB,
                 catalog_id=catalog_id,
-                collection_id=blob_collection_id,
+                collection_id=await _logical_collection(blob_collection_physical_id),
                 asset_id=None,
                 filename=filename,
                 uri=f"gs://{bucket_name}/{blob_path}",
@@ -458,7 +503,11 @@ async def _apply_fixes(
 
     async with managed_transaction(engine) as conn:
         # Orphan blob → INSERT new ACTIVE row.
-        for blob_path, blob_collection_id, filename in orphan_blobs:
+        # blob_collection_physical_id comes from the immutable path segment;
+        # collection_physical_id is the partition key and must be set.
+        from dynastore.tools.identifiers import generate_geoid
+
+        for blob_path, blob_collection_physical_id, filename in orphan_blobs:
             asset_id = f"reconcile-{uuid.uuid4().hex[:12]}"
             metadata = {
                 "_reconcile": {
@@ -472,8 +521,7 @@ async def _apply_fixes(
             ).execute(
                 conn,
                 asset_id=asset_id,
-                catalog_id=catalog_id,
-                collection_id=blob_collection_id,
+                collection_physical_id=blob_collection_physical_id,
                 asset_type="ASSET",
                 kind="physical",
                 status="active",
@@ -483,9 +531,11 @@ async def _apply_fixes(
                 created_at=now,
                 updated_at=now,
                 metadata=json.dumps(metadata),
+                physical_id=generate_geoid(),
             )
 
         # Ghost row → UPDATE status=failed with reason=missing_blob.
+        # Match on the immutable collection_physical_id + asset_id.
         for row in ghost_targets:
             patch = {
                 "_reconcile": {
@@ -497,13 +547,13 @@ async def _apply_fixes(
                 ghost_sql, result_handler=ResultHandler.ROWCOUNT
             ).execute(
                 conn,
-                catalog_id=catalog_id,
-                collection_id=_row_collection_id(row),
+                collection_physical_id=_row_collection_physical_id(row),
                 asset_id=_row_get(row, "asset_id"),
                 patch=json.dumps(patch),
             )
 
         # Stuck PENDING → UPDATE status=failed with reason=upload_abandoned.
+        # Match on the immutable collection_physical_id + asset_id.
         for row in stuck_targets:
             patch = {
                 "_reconcile": {
@@ -515,8 +565,7 @@ async def _apply_fixes(
                 stuck_sql, result_handler=ResultHandler.ROWCOUNT
             ).execute(
                 conn,
-                catalog_id=catalog_id,
-                collection_id=_row_collection_id(row),
+                collection_physical_id=_row_collection_physical_id(row),
                 asset_id=_row_get(row, "asset_id"),
                 patch=json.dumps(patch),
             )

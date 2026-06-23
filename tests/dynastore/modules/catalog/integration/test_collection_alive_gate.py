@@ -222,8 +222,13 @@ async def _snapshot_tables(engine, schema: str) -> set:
         return {row[0] for row in res}
 
 
-async def _count_collection_config_rows(engine, schema: str, collection_id: str) -> int:
-    """Rows pinned at collection scope (e.g. ItemsRoutingConfig) for the collection."""
+async def _count_collection_config_rows(engine, schema: str, physical_id: str) -> int:
+    """Rows pinned at collection scope (e.g. ItemsRoutingConfig) for the collection.
+
+    ``physical_id`` is the collection's immutable c_... token from
+    ``{schema}.collections.physical_id``.  Must be resolved before calling
+    this helper if the collection row may have already been deleted.
+    """
     from sqlalchemy import text
 
     from dynastore.modules.db_config.query_executor import managed_transaction
@@ -232,9 +237,9 @@ async def _count_collection_config_rows(engine, schema: str, collection_id: str)
         res = await conn.execute(
             text(
                 f'SELECT COUNT(*) FROM "{schema}".collection_configs '
-                "WHERE collection_id = :c"
+                "WHERE physical_id = :pid"
             ),
-            {"c": collection_id},
+            {"pid": physical_id},
         )
         return int(res.scalar_one())
 
@@ -278,14 +283,24 @@ async def test_upsert_after_hard_delete_is_rejected_and_does_not_reprovision(
         # First write provisions storage (lazy activation).
         await catalogs.upsert(catalog_id, collection_id, item)
 
+        schema = await catalogs.resolve_physical_schema(catalog_id)
+        assert schema is not None
+
+        # Capture physical_id before the delete — the collections row is gone
+        # after delete_collection and cannot be resolved from the registry.
+        coll_physical_id = await catalogs.resolve_physical_id(
+            catalog_id, collection_id, allow_missing=True
+        )
+        assert coll_physical_id is not None, (
+            "Expected a physical_id for the provisioned collection before delete"
+        )
+
         # Hard delete: registry row gone, storage torn down.
         await catalogs.delete_collection(catalog_id, collection_id, force=True)
 
-        schema = await catalogs.resolve_physical_schema(catalog_id)
-        assert schema is not None
         tables_before = await _snapshot_tables(engine, schema)
         pins_before = await _count_collection_config_rows(
-            engine, schema, collection_id
+            engine, schema, coll_physical_id
         )
 
         # The race: a late writer retries its upsert after the delete.
@@ -299,7 +314,7 @@ async def test_upsert_after_hard_delete_is_rejected_and_does_not_reprovision(
             f"Rejected write re-created tables: {tables_after - tables_before}"
         )
         pins_after = await _count_collection_config_rows(
-            engine, schema, collection_id
+            engine, schema, coll_physical_id
         )
         assert pins_after == pins_before == 0, (
             "Rejected write must not pin collection-scope config"

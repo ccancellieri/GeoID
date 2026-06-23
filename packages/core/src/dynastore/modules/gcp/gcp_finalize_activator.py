@@ -80,7 +80,13 @@ class FinalizeEvent:
     filename: str
     uri: str
     catalog_id: str
-    collection_id: Optional[str] = None
+    # The collection's IMMUTABLE physical id, not the mutable logical id.
+    # GCS stores objects under ``collections/<collection_physical_id>/`` and
+    # the Pub/Sub notification stamps that same tail, so the value parsed from
+    # the object path / message attributes is the physical id. The ``assets``
+    # row is matched on ``collection_physical_id`` (the partition key), which
+    # is also what survives a collection rename — see :func:`activate`.
+    collection_physical_id: Optional[str] = None
     md5_hash: Optional[str] = None
     size_bytes: Optional[int] = None
     content_type: Optional[str] = None
@@ -121,7 +127,7 @@ class OrphanFinalizeEvent(Exception):
         self.event = event
         super().__init__(
             f"orphan_finalize: no PENDING asset for {event.catalog_id}:"
-            f"{event.collection_id or '_'} filename='{event.filename}' "
+            f"{event.collection_physical_id or '_'} filename='{event.filename}' "
             f"uri='{event.uri}'"
         )
 
@@ -130,7 +136,7 @@ def finalize_event_from_pubsub(
     gcs_event_payload: Dict[str, Any],
     *,
     catalog_id: str,
-    collection_id: Optional[str],
+    collection_physical_id: Optional[str],
 ) -> FinalizeEvent:
     """Build a :class:`FinalizeEvent` from a parsed Pub/Sub push body.
 
@@ -139,6 +145,10 @@ def finalize_event_from_pubsub(
     HTTP route is responsible for the b64 decode + JSON parse +
     catalog/collection resolution; this helper is the minimal shape
     reduction.
+
+    ``collection_physical_id`` is the collection's IMMUTABLE physical id
+    (the ``collections/<id>/`` object-prefix tail), never the mutable
+    logical id — the activator matches the ``assets`` row on it.
     """
     bucket = str(gcs_event_payload.get("bucket") or "")
     object_name = str(gcs_event_payload.get("name") or "")
@@ -164,7 +174,7 @@ def finalize_event_from_pubsub(
         filename=filename,
         uri=uri,
         catalog_id=catalog_id,
-        collection_id=collection_id,
+        collection_physical_id=collection_physical_id,
         md5_hash=gcs_event_payload.get("md5Hash"),
         size_bytes=size_bytes,
         content_type=gcs_event_payload.get("contentType"),
@@ -175,11 +185,17 @@ def finalize_event_from_pubsub(
 
 # SQL is module-level so unit tests can assert on its shape (e.g. that
 # ``FOR UPDATE`` is present without poking at private internals).
+# NOTE: no ``catalog_id`` predicate. ``{schema}`` is the catalog's IMMUTABLE
+# physical schema (resolved via resolve_physical_schema), so it already scopes
+# every row to exactly one catalog. The ``assets.catalog_id`` column is the
+# MUTABLE logical id (no ON UPDATE CASCADE on tenant tables), so matching on it
+# would go stale the moment the catalog is renamed between initiate_upload and
+# finalize. Keying on (collection_physical_id, filename) within the physical
+# schema is both sufficient and rename-robust — mirrors get_asset/search_assets.
 _SELECT_PENDING_SQL = """
 SELECT asset_id, status, metadata
 FROM "{schema}".assets
-WHERE catalog_id = :catalog_id
-  AND collection_id IS NOT DISTINCT FROM :collection_id
+WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id
   AND filename = :filename
   AND kind = 'physical'
   AND status IN ('pending', 'active', 'deleted')
@@ -197,8 +213,7 @@ SET status = 'active',
     owned_by = 'gcs',
     metadata = metadata - '_upload',
     updated_at = NOW()
-WHERE catalog_id = :catalog_id
-  AND collection_id IS NOT DISTINCT FROM :collection_id
+WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id
   AND asset_id = :asset_id
 """.strip()
 
@@ -279,8 +294,7 @@ async def activate(
         result_handler=ResultHandler.ALL,
     ).execute(
         conn,
-        catalog_id=event.catalog_id,
-        collection_id=event.collection_id,
+        collection_physical_id=event.collection_physical_id,
         filename=event.filename,
     )
     rows = rows or []
@@ -332,8 +346,7 @@ async def activate(
         uri=event.uri,
         content_hash=tagged_hash,
         size_bytes=event.size_bytes,
-        catalog_id=event.catalog_id,
-        collection_id=event.collection_id,
+        collection_physical_id=event.collection_physical_id,
         asset_id=chosen_asset_id,
     )
 
@@ -363,10 +376,15 @@ async def _log_orphan(event: FinalizeEvent) -> None:
                 f"PENDING asset row — bucket retains the blob; reconciliation "
                 f"will surface or sweep it."
             ),
-            collection_id=event.collection_id,
+            # The event only carries the immutable physical id; surface it as
+            # the orphan's collection locator (no logical id is available at
+            # the finalize boundary, and the physical id is what the blob path
+            # and reconciliation key on).
+            collection_id=event.collection_physical_id,
             details={
                 "bucket": event.bucket,
                 "object_name": event.object_name,
+                "collection_physical_id": event.collection_physical_id,
                 "filename": event.filename,
                 "generation": event.generation,
                 "size_bytes": event.size_bytes,

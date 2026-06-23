@@ -147,16 +147,22 @@ class ItemsElasticsearchEnvelopeDriver(
     # Backend label for StorageLocation (used by inherited location() method).
     _location_backend: ClassVar[str] = "elasticsearch_envelope"
 
-    def _items_index_name(self, catalog_id: str) -> str:
-        """Per-tenant envelope index ``{prefix}-{catalog_id}-envelope-items``.
+    async def _items_index_name(self, catalog_id: str) -> str:
+        """Per-tenant envelope index ``{prefix}-{catalog_physical_id}-envelope-items``.
 
         The single index-name seam every CRUD + data-side op routes through.
+        Resolves the immutable physical id for *catalog_id* before building
+        the index name so a catalog rename never changes the index.
         """
         from dynastore.modules.elasticsearch.client import get_index_prefix
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            _resolve_catalog_physical_id,
+        )
         from dynastore.modules.storage.drivers.elasticsearch_envelope.mappings import (
             get_envelope_index_name,
         )
-        return get_envelope_index_name(get_index_prefix(), catalog_id)
+        physical_id = await _resolve_catalog_physical_id(catalog_id)
+        return get_envelope_index_name(get_index_prefix(), physical_id)
 
     def _collection_routing(self, collection_id: Optional[str]) -> Optional[str]:
         """The envelope index is not sharded by collection — no ``_routing``."""
@@ -276,7 +282,7 @@ class ItemsElasticsearchEnvelopeDriver(
         )
         from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         items = self._normalize_entities(entities)
         es = self._get_client()
 
@@ -353,7 +359,7 @@ class ItemsElasticsearchEnvelopeDriver(
         )
         from dynastore.tools.typed_store.base import _to_snake
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         es = self._get_client()
 
         if not await es.indices.exists(index=index_name):
@@ -512,7 +518,7 @@ class ItemsElasticsearchEnvelopeDriver(
             get_private_items_index_settings,
         )
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         es = self._get_client()
         await self._ensure_index(es, index_name, ENVELOPE_FEATURE_MAPPING,
                                  get_private_items_index_settings)
@@ -529,7 +535,7 @@ class ItemsElasticsearchEnvelopeDriver(
                 "ItemsElasticsearchEnvelopeDriver does not support soft drop."
             )
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         es = self._get_client()
         await es.indices.delete(
             index=index_name, params={"ignore_unavailable": "true"},
@@ -563,7 +569,7 @@ class ItemsElasticsearchEnvelopeDriver(
             get_private_items_index_settings,
         )
 
-        index_name = self._items_index_name(ctx.catalog)
+        index_name = await self._items_index_name(ctx.catalog)
         es = self._get_client()
 
         if op.op_type == "delete":
@@ -621,7 +627,7 @@ class ItemsElasticsearchEnvelopeDriver(
             ctx.catalog, ctx.collection,
         )
 
-        index_name = self._items_index_name(ctx.catalog)
+        index_name = await self._items_index_name(ctx.catalog)
         es = self._get_client()
 
         await self._ensure_index(es, index_name, ENVELOPE_FEATURE_MAPPING,

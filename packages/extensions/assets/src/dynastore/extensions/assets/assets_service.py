@@ -43,6 +43,8 @@ from dynastore.extensions.ogc_models_shared import (
     BulkCreationResponse,
     IngestionReport,
     SidecarRejection,
+    RenameRequest,
+    RenameResponse,
 )
 from dynastore.extensions.assets.conformance import ASSETS_CONFORMANCE_URIS
 from dynastore.extensions.tools.fast_api import AppJSONResponse
@@ -340,6 +342,24 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             response_model=Asset,
             status_code=status.HTTP_201_CREATED,
             summary="Create Collection Asset",
+        )
+        # Rename endpoints — registered BEFORE the plain {asset_id} routes so
+        # the literal `:rename` suffix is matched first by Starlette.
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/assets/{asset_id}:rename",
+            self.rename_catalog_asset,
+            methods=["POST"],
+            response_model=RenameResponse,
+            status_code=status.HTTP_200_OK,
+            summary="Rename Catalog Asset",
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}:rename",
+            self.rename_collection_asset,
+            methods=["POST"],
+            response_model=RenameResponse,
+            status_code=status.HTTP_200_OK,
+            summary="Rename Collection Asset",
         )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/assets/{asset_id}",
@@ -992,6 +1012,37 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             raise HTTPException(status_code=404, detail=str(e)) from e
 
 
+    async def rename_catalog_asset(
+        self,
+        body: RenameRequest,
+        catalog_id: str = Path(..., description="The catalog ID"),
+        asset_id: str = Path(..., description="The asset ID to rename"),
+    ) -> RenameResponse:
+        """Rename a catalog-scoped asset's logical id.
+
+        POST /assets/catalogs/{catalog_id}/assets/{asset_id}:rename
+
+        Only ``asset_id`` (the presentation label) changes.  The physical file
+        location, partition key, and all storage backends are untouched.
+        An ES reindex is required to reflect the new id in secondary indexes.
+        """
+        from dynastore.modules.catalog.asset_service import AssetRenameConflictError
+
+        await require_catalog_ready(catalog_id)
+        try:
+            return await self.assets.rename_asset(
+                catalog_id=catalog_id,
+                asset_id=asset_id,
+                new_id=body.new_id,
+            )
+        except AssetRenameConflictError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            ) from e
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
     async def delete_catalog_asset_by_id(
         self,
         catalog_id: str = Path(..., description="The catalog ID"),
@@ -1177,6 +1228,40 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             raise HTTPException(status_code=404, detail=str(e)) from e
 
 
+    async def rename_collection_asset(
+        self,
+        body: RenameRequest,
+        catalog_id: str = Path(..., description="The catalog ID"),
+        collection_id: str = Path(..., description="The collection ID"),
+        asset_id: str = Path(..., description="The asset ID to rename"),
+    ) -> RenameResponse:
+        """Rename a collection-scoped asset's logical id.
+
+        POST /assets/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}:rename
+
+        Only ``asset_id`` (the presentation label) changes.  The physical file
+        location, partition key ``collection_physical_id``, and all storage
+        backends are untouched.  An ES reindex is required to reflect the new
+        id in secondary indexes.
+        """
+        from dynastore.modules.catalog.asset_service import AssetRenameConflictError
+
+        await require_collection_ready(catalog_id, collection_id)
+        try:
+            return await self.assets.rename_asset(
+                catalog_id=catalog_id,
+                asset_id=asset_id,
+                new_id=body.new_id,
+                collection_id=collection_id,
+            )
+        except AssetRenameConflictError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            ) from e
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
     async def delete_collection_asset_by_id(
         self,
         catalog_id: str = Path(..., description="The catalog ID"),
@@ -1311,6 +1396,18 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                 detail=f"No physical schema for catalog '{catalog_id}'.",
             )
 
+        # Resolve the collection's immutable physical id once so all per-row
+        # upserts in the batch share the same resolved value.
+        collection_physical_id: Optional[str] = None
+        if collection_id is not None:
+            from dynastore.models.driver_context import DriverContext
+            collection_physical_id = await catalogs_svc.resolve_physical_id(
+                catalog_id,
+                collection_id,
+                ctx=DriverContext(db_resource=None),
+                allow_missing=True,
+            )
+
         configs_svc = cast(
             Optional[ConfigsProtocol], get_protocol(ConfigsProtocol)
         )
@@ -1326,7 +1423,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             collection_id=collection_id,
         )
         scope = Scope(
-            schema=schema, catalog_id=catalog_id, collection_id=collection_id
+            schema=schema,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            collection_physical_id=collection_physical_id,
         )
         policy_source = (
             f"/configs/catalogs/{catalog_id}"
@@ -1789,6 +1889,18 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                 detail=f"No physical schema for catalog '{catalog_id}'.",
             )
 
+        # Resolve the collection's immutable physical id so the Scope carries
+        # it for all write / probe operations inside this upload session.
+        from dynastore.models.driver_context import DriverContext
+        collection_physical_id: Optional[str] = None
+        if collection_id is not None:
+            collection_physical_id = await catalogs_svc.resolve_physical_id(
+                catalog_id,
+                collection_id,
+                ctx=DriverContext(db_resource=None),
+                allow_missing=True,
+            )
+
         configs_svc = cast(
             Optional[ConfigsProtocol], get_protocol(ConfigsProtocol)
         )
@@ -1830,7 +1942,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         )
 
         scope = Scope(
-            schema=schema, catalog_id=catalog_id, collection_id=collection_id
+            schema=schema,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            collection_physical_id=collection_physical_id,
         )
 
         # 5. Atomic policy + born-claimed PENDING INSERT.
@@ -1946,15 +2061,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             f'UPDATE "{scope.schema}".assets '
             "SET metadata = metadata || CAST(:upload_meta AS jsonb), "
             "    updated_at = NOW() "
-            "WHERE catalog_id = :catalog_id "
-            "AND collection_id IS NOT DISTINCT FROM :collection_id "
+            "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
             "AND asset_id = :asset_id"
         )
         async with managed_transaction(engine) as conn:
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
                 conn,
-                catalog_id=scope.catalog_id,
-                collection_id=scope.collection_id,
+                collection_physical_id=scope.collection_physical_id,
                 asset_id=asset_id,
                 upload_meta=json.dumps(upload_blob),
             )
@@ -1973,8 +2086,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         sql = (
             f'UPDATE "{scope.schema}".assets '
             "SET status = 'deleted', updated_at = NOW() "
-            "WHERE catalog_id = :catalog_id "
-            "AND collection_id IS NOT DISTINCT FROM :collection_id "
+            "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
             "AND asset_id = :asset_id "
             "AND status = 'pending'"
         )
@@ -1982,8 +2094,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             async with managed_transaction(engine) as conn:
                 await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
                     conn,
-                    catalog_id=scope.catalog_id,
-                    collection_id=scope.collection_id,
+                    collection_physical_id=scope.collection_physical_id,
                     asset_id=asset_id,
                 )
         except Exception as cleanup_exc:

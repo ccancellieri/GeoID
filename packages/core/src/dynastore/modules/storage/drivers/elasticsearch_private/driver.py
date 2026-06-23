@@ -154,16 +154,22 @@ class ItemsElasticsearchPrivateDriver(
     # Backend label for StorageLocation (used by inherited location() method).
     _location_backend: ClassVar[str] = "elasticsearch_private"
 
-    def _items_index_name(self, catalog_id: str) -> str:
-        """Private per-tenant index ``{prefix}-{catalog_id}-private-items``.
+    async def _items_index_name(self, catalog_id: str) -> str:
+        """Private per-tenant index ``{prefix}-{catalog_physical_id}-private-items``.
 
         The single index-name seam every CRUD + data-side op routes through.
+        Resolves the immutable physical id for *catalog_id* before building
+        the index name so a catalog rename never changes the index.
         """
         from dynastore.modules.elasticsearch.client import get_index_prefix
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            _resolve_catalog_physical_id,
+        )
         from dynastore.modules.storage.drivers.elasticsearch_private.mappings import (
             get_private_index_name,
         )
-        return get_private_index_name(get_index_prefix(), catalog_id)
+        physical_id = await _resolve_catalog_physical_id(catalog_id)
+        return get_private_index_name(get_index_prefix(), physical_id)
 
     def _collection_routing(self, collection_id: Optional[str]) -> Optional[str]:
         """The private index is not sharded by collection — no ``_routing``."""
@@ -205,7 +211,7 @@ class ItemsElasticsearchPrivateDriver(
         )
         from dynastore.tools.geometry_simplify import maybe_simplify_for_es
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         items = self._normalize_entities(entities)
         es = self._get_client()
 
@@ -222,11 +228,25 @@ class ItemsElasticsearchPrivateDriver(
         # overlay → legacy fully-dynamic ``properties`` sub-tree.
         known_fields = await resolve_catalog_private_known_fields(catalog_id)
 
-        # Ingestion-context asset identity (mirrors the public driver's
-        # ``_asset_id`` tracking field) — projected onto the private doc as
-        # a top-level ``asset_id`` keyword for the WRITE path.
+        # Ingestion-context asset identity: resolve the mutable logical
+        # asset_id to its immutable physical_id (UUIDv7) so item _source
+        # carries the rename-stable UUID, not the label.
         ctx = context or {}
-        asset_id = ctx.get("asset_id")
+        _logical_aid = ctx.get("asset_id")
+        _write_physical_id: Optional[str] = None
+        if _logical_aid is not None:
+            try:
+                from dynastore.models.protocols.assets import AssetsProtocol as _AP4
+                from dynastore.tools.discovery import get_protocol as _gp4
+                _ap4 = _gp4(_AP4)
+                if _ap4 is not None:
+                    _write_physical_id = await _ap4.resolve_asset_physical_id(
+                        catalog_id, str(_logical_aid),
+                        collection_id=collection_id,
+                        allow_missing=True,
+                    )
+            except Exception:
+                pass
 
         await self._ensure_index(
             es, index_name,
@@ -244,7 +264,7 @@ class ItemsElasticsearchPrivateDriver(
                 continue
             doc = build_tenant_feature_doc(
                 item, catalog_id=catalog_id, collection_id=collection_id,
-                asset_id=asset_id,
+                physical_id=_write_physical_id,
             )
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
@@ -286,7 +306,7 @@ class ItemsElasticsearchPrivateDriver(
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         es = self._get_client()
 
         if not await es.indices.exists(index=index_name):
@@ -402,7 +422,7 @@ class ItemsElasticsearchPrivateDriver(
             get_private_items_index_settings,
         )
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         es = self._get_client()
 
         # Snapshot the tenant-scoped operator overlay at index-create time.
@@ -431,7 +451,7 @@ class ItemsElasticsearchPrivateDriver(
                 "ItemsElasticsearchPrivateDriver does not support soft drop."
             )
 
-        index_name = self._items_index_name(catalog_id)
+        index_name = await self._items_index_name(catalog_id)
         es = self._get_client()
         await es.indices.delete(
             index=index_name, params={"ignore_unavailable": "true"},
@@ -465,7 +485,7 @@ class ItemsElasticsearchPrivateDriver(
             get_private_items_index_settings,
         )
 
-        index_name = self._items_index_name(ctx.catalog)
+        index_name = await self._items_index_name(ctx.catalog)
         es = self._get_client()
 
         if op.op_type == "delete":
@@ -548,7 +568,7 @@ class ItemsElasticsearchPrivateDriver(
         # Tenant-scoped manual mapping overlay (#1295 slice 3).
         known_fields = await resolve_catalog_private_known_fields(ctx.catalog)
 
-        index_name = self._items_index_name(ctx.catalog)
+        index_name = await self._items_index_name(ctx.catalog)
         es = self._get_client()
 
         await self._ensure_index(
@@ -556,6 +576,17 @@ class ItemsElasticsearchPrivateDriver(
             build_private_item_mapping(known_fields),
             get_private_items_index_settings,
         )
+
+        # Resolve the assets protocol once; used per-op to stamp the immutable
+        # physical_id into item _source (rename-stable, never re-serialised to
+        # REST/STAC).  Missing protocol → graceful degradation (no stamp).
+        _bulk_ap = None
+        try:
+            from dynastore.models.protocols.assets import AssetsProtocol as _BulkAP
+            from dynastore.tools.discovery import get_protocol as _bulk_gp
+            _bulk_ap = _bulk_gp(_BulkAP)
+        except Exception:
+            pass
 
         body: List[dict] = []
         for op in ops:
@@ -566,8 +597,28 @@ class ItemsElasticsearchPrivateDriver(
                 continue
             src = op.payload or {"id": op.entity_id}
             src.setdefault("id", op.entity_id)
+
+            # Resolve the mutable logical asset_id to the immutable physical_id
+            # (UUIDv7) so item _source carries the rename-stable UUID.
+            _raw_aid = (
+                op.payload.get("_asset_id") if op.payload else None
+            ) or (
+                op.payload.get("asset_id") if op.payload else None
+            )
+            _bulk_phys: Optional[str] = None
+            if _raw_aid is not None and _bulk_ap is not None:
+                try:
+                    _bulk_phys = await _bulk_ap.resolve_asset_physical_id(
+                        ctx.catalog, str(_raw_aid),
+                        collection_id=ctx.collection,
+                        allow_missing=True,
+                    )
+                except Exception:
+                    pass
+
             doc = build_tenant_feature_doc(
                 src, catalog_id=ctx.catalog, collection_id=ctx.collection,
+                physical_id=_bulk_phys,
             )
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,

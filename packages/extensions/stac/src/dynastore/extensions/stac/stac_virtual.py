@@ -297,24 +297,33 @@ class StacVirtualMixin(_Host):
             if visible_collections is not None and not visible_collections:
                 collection_ids: list = []
             else:
+                # Join the collections registry on the IMMUTABLE
+                # collection_physical_id so the returned collection id is the
+                # CURRENT logical id (c.id), never the stale label snapshot in
+                # assets.collection_id (which is not updated on a collection
+                # rename). The visible-ids filter therefore also applies to the
+                # current logical id. No catalog_id predicate: ``{phys_schema}``
+                # already scopes every row to this catalog, and the column is a
+                # mutable label that goes stale on a catalog rename.
                 vis_clause = (
-                    "  AND collection_id = ANY(:visible_ids) "
+                    "  AND c.id = ANY(:visible_ids) "
                     if visible_collections is not None
                     else ""
                 )
                 sql = (
-                    f'SELECT DISTINCT collection_id '
-                    f'FROM "{phys_schema}".assets '
-                    f'WHERE catalog_id = :catalog_id '
-                    f'  AND asset_id = :asset_id '
-                    f'  AND deleted_at IS NULL '
-                    f'  AND collection_id IS NOT NULL '
+                    f'SELECT DISTINCT c.id '
+                    f'FROM "{phys_schema}".assets a '
+                    f'JOIN "{phys_schema}".collections c '
+                    f'  ON c.physical_id = a.collection_physical_id '
+                    f'WHERE a.asset_id = :asset_id '
+                    f"  AND a.status <> 'deleted' "
+                    f'  AND a.collection_physical_id IS NOT NULL '
+                    f'  AND c.deleted_at IS NULL '
                     f'{vis_clause}'
-                    f'ORDER BY collection_id '
+                    f'ORDER BY c.id '
                     f'LIMIT :limit OFFSET :offset'
                 )
                 query_params = {
-                    "catalog_id": catalog_id,
                     "asset_id": asset_id,
                     "limit": limit,
                     "offset": offset,
@@ -422,11 +431,45 @@ class StacVirtualMixin(_Host):
             # Optimized query with QueryRequest
             from dynastore.models.query_builder import QueryRequest, FilterCondition
 
-            # Build request for asset items
-            # We assume 'asset_id' is a queryable field in the sidecars (attributes or stac_metadata)
-            asset_filter = FilterCondition(field="asset_id", operator="=", value=asset_id)
+            # The PG attributes sidecar stores the immutable physical_id (UUIDv7)
+            # rather than the mutable logical asset_id (#2296).  Resolve the
+            # incoming logical asset_id → physical_id so the sidecar filter
+            # matches what the write path stamped.  Fall back to the logical id
+            # when the resolver returns None (asset not yet landed or protocol
+            # unavailable) so the query degrades gracefully instead of returning
+            # an empty result set for a valid asset.
+            _assets_svc = get_protocol(AssetsProtocol)
+            _physical_id: Optional[str] = None
+            if _assets_svc is not None:
+                _physical_id = await _assets_svc.resolve_asset_physical_id(
+                    catalog_id,
+                    asset_id,
+                    collection_id=collection_id,
+                    ctx=DriverContext(db_resource=conn) if conn is not None else None,
+                    allow_missing=True,
+                )
+            # PG sidecar filter keyed on physical_id; falls back to logical id.
+            _sidecar_filter_value: str = _physical_id if _physical_id is not None else asset_id
+
+            # The ES items index stores the asset's immutable physical_id in
+            # ``asset_physical_id`` (#2296).  Filter on that field using the
+            # resolved physical_id so the query stays correct across asset
+            # renames without requiring a reindex.  Fall back to filtering on
+            # the mutable ``asset_id`` field with the logical id when the
+            # physical_id could not be resolved (asset not yet landed or
+            # protocol unavailable) so the query degrades gracefully.
+            if _physical_id is not None:
+                asset_filter = FilterCondition(
+                    field="asset_physical_id", operator="=", value=_physical_id
+                )
+            else:
+                asset_filter = FilterCondition(
+                    field="asset_id", operator="=", value=asset_id
+                )
+            # PG-path request uses the physical_id-keyed sidecar filter.
+            pg_asset_filter = FilterCondition(field="asset_id", operator="=", value=_sidecar_filter_value)
             query_req = QueryRequest(
-                filters=[asset_filter],
+                filters=[pg_asset_filter],
                 limit=limit,
                 offset=offset,
                 include_total_count=True,

@@ -263,6 +263,7 @@ class CatalogStatusService(ExtensionProtocol):
         return CatalogStatusView(
             catalog_id=catalog_id,
             physical_schema=physical_schema,
+            physical_id=physical_schema,
             provisioning_status=provisioning_status,
             task=task_view,
             provisioning_checklist=provisioning_checklist,
@@ -334,10 +335,24 @@ class CatalogStatusService(ExtensionProtocol):
                 exc_info=True,
             )
 
+        physical_id: Optional[str] = None
+        try:
+            physical_id = await catalogs.resolve_physical_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+        except Exception as exc:
+            logger.warning(
+                "catalog_status: failed to resolve physical id for collection %s/%s: %s",
+                catalog_id, collection_id, exc,
+                exc_info=True,
+            )
+
         return CollectionStatusView(
             catalog_id=catalog_id,
             collection_id=collection_id,
             physical_schema=physical_schema,
+            catalog_physical_id=physical_schema,
+            physical_id=physical_id,
             catalog_provisioning_status=provisioning_status,
         )
 

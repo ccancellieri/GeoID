@@ -401,12 +401,28 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
         catalog_id: str,
         collection_id: Optional[str],
     ) -> Optional[ItemsDuckdbDriverConfig]:
-        """Bind the driver to a catalog asset (#377).
+        """Bind the driver to a catalog asset, rename-safe via physical_id (#377, #2296).
 
-        When the config carries ``asset_id`` the asset's storage URI is resolved
-        via :class:`AssetsProtocol` and used as the read ``path`` (asset wins over
-        a hand-written ``path``, per the config contract). If the asset or the
-        assets protocol is unavailable, the existing ``path`` is kept as fallback.
+        Dispatch strategy
+        -----------------
+        ``asset_physical_id`` set (persisted config, post-first-resolve)
+            Resolve the current logical ``asset_id`` from the immutable
+            ``physical_id`` via ``AssetsProtocol.resolve_asset_logical_id``,
+            then look up the asset by that live logical id.  An asset rename
+            changes only the logical label; because the physical_id is stable,
+            this lookup always finds the asset regardless of how many times the
+            logical id has been changed since the config was written.
+
+        ``asset_physical_id`` not set (first resolve, or legacy config)
+            Fall back to ``config.asset_id`` (the logical label stored at
+            config-write time).  After a successful lookup, resolve the
+            physical_id via ``AssetsProtocol.resolve_asset_physical_id`` and
+            stamp it into the returned config copy so subsequent dispatches take
+            the rename-safe path above.
+
+        In both cases: ``asset`` wins over any hand-written ``path`` field per
+        the config contract.  If the assets protocol is unavailable, or the
+        asset is not found, the existing ``path`` is kept as fallback.
         """
         if config is None or not getattr(config, "asset_id", None):
             return config
@@ -417,20 +433,81 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
             assets = get_protocol(AssetsProtocol)
             if not assets:
                 return config
-            asset = await assets.get_asset(str(config.asset_id), catalog_id, collection_id)
+
+            # Determine which logical asset_id to use for the get_asset call.
+            # When the persisted config already carries the immutable physical_id
+            # we resolve the current logical label from it (rename-safe path).
+            # On the first resolve (or when processing a legacy config written
+            # before physical_id tracking was added) we fall back to the stored
+            # logical asset_id and then stamp the physical_id onto the result.
+            physical_id: Optional[str] = getattr(config, "asset_physical_id", None)
+            if physical_id:
+                live_asset_id = await assets.resolve_asset_logical_id(
+                    catalog_id, physical_id
+                )
+                if live_asset_id is None:
+                    logger.warning(
+                        "ItemsDuckdbDriver: physical_id=%s has no live asset_id "
+                        "for %s/%s — falling back to configured path",
+                        physical_id, catalog_id, collection_id,
+                    )
+                    return config
+            else:
+                live_asset_id = str(config.asset_id)
+
+            asset = await assets.get_asset(live_asset_id, catalog_id, collection_id)
             if asset is None:
                 logger.warning(
                     "ItemsDuckdbDriver: asset_id=%s not found for %s/%s — "
                     "falling back to configured path",
-                    config.asset_id, catalog_id, collection_id,
+                    live_asset_id, catalog_id, collection_id,
                 )
                 return config
+
             path = self._asset_uri_to_path(
                 getattr(asset, "uri", None) or getattr(asset, "href", None)
             )
             if not path:
                 return config
-            return config.model_copy(update={"path": path})
+
+            updates: dict = {"path": path}
+
+            # Stamp the immutable physical_id when it is not yet persisted so
+            # future dispatches take the rename-safe branch unconditionally.
+            if not physical_id:
+                resolved_phys = await assets.resolve_asset_physical_id(
+                    catalog_id, live_asset_id, collection_id
+                )
+                if resolved_phys:
+                    updates["asset_physical_id"] = resolved_phys
+
+            stamped = config.model_copy(update=updates)
+
+            # Persist the stamped config so subsequent dispatches skip this
+            # resolution step entirely (rename-safe branch is always taken).
+            # Only written on the first-resolve path (physical_id was absent).
+            # Best-effort: a write failure must never prevent the current
+            # dispatch from succeeding.
+            if not physical_id and updates.get("asset_physical_id"):
+                try:
+                    from dynastore.models.protocols.configs import ConfigsProtocol
+                    configs = get_protocol(ConfigsProtocol)
+                    if configs is not None:
+                        await configs.set_config(
+                            ItemsDuckdbDriverConfig,
+                            stamped,
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                            check_immutability=False,
+                        )
+                except Exception:
+                    logger.debug(
+                        "ItemsDuckdbDriver: could not persist asset_physical_id "
+                        "stamp for %s/%s — next dispatch will re-resolve",
+                        catalog_id, collection_id,
+                    )
+
+            return stamped
         except Exception:
             logger.warning(
                 "ItemsDuckdbDriver: asset_id resolution failed for %s/%s",

@@ -248,6 +248,22 @@ async def on_collection_hard_deletion(engine: DbResource, payload: Dict[str, Any
         )
         return
 
+    # Resolve the immutable physical_id for the collection.  The collection
+    # row may already be deleted (hard-deletion handler), so allow_missing=True
+    # returns None and we fall back to the logical id for the path lookup.
+    # After this change all new collections will have their objects stored under
+    # the physical_id prefix; pre-existing ones still use the logical id prefix.
+    _catalogs_evt = get_protocol(CatalogsProtocol)
+    _collection_physical_id: Optional[str] = None
+    if _catalogs_evt:
+        try:
+            _collection_physical_id = await _catalogs_evt.resolve_physical_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+        except Exception:
+            pass
+    collection_physical_id = _collection_physical_id or collection_id
+
     # 1. Delete objects
     bucket_name = await storage.get_storage_identifier(catalog_id)
     if bucket_name:
@@ -262,7 +278,7 @@ async def on_collection_hard_deletion(engine: DbResource, payload: Dict[str, Any
             else None
         )
         bucket = storage_client.bucket(bucket_name) if storage_client else None
-        folder_prefix = bucket_tool.get_blob_path_for_collection_folder(collection_id)
+        folder_prefix = bucket_tool.get_blob_path_for_collection_folder(collection_physical_id)
 
         logger.info(
             f"Deleting all objects in bucket '{bucket_name}' with prefix '{folder_prefix}'."
@@ -302,7 +318,7 @@ async def on_collection_hard_deletion(engine: DbResource, payload: Dict[str, Any
             and eventing_config.managed_eventing.enabled
         ):
             folder_prefix = bucket_tool.get_blob_path_for_collection_folder(
-                collection_id
+                collection_physical_id
             )
             if eventing_config.managed_eventing.blob_name_prefix == folder_prefix:
                 logger.info(
@@ -353,7 +369,11 @@ async def handle_gcs_notification(payload: Dict[str, Any]):
             return
 
         path_parts = object_name.split("/")
-        # Expected path for collection assets: collections/<collection_id>/<filename>
+        # Expected path for collection assets:
+        #   collections/<collection_physical_id>/<filename>
+        # The folder segment is the collection's IMMUTABLE physical id (the
+        # blob path is built from it so it survives a logical rename), NOT the
+        # logical collection id. Downstream finalize matching keys on it.
         if len(path_parts) >= 2 and path_parts[0] == bucket_tool.COLLECTIONS_FOLDER:
             collection_id = path_parts[1]
         # Expected path for catalog assets: catalog/<filename>
@@ -642,10 +662,14 @@ async def handle_asset_events(
         )
         raise CatalogSchemaUnavailable(catalog_id, collection_id)
 
+    # ``collection_id`` here is the object-prefix tail
+    # (``collections/<collection_physical_id>/...``), i.e. the collection's
+    # IMMUTABLE physical id — never the mutable logical id. The activator
+    # matches the PENDING ``assets`` row on ``collection_physical_id``.
     finalize_event = finalize_event_from_pubsub(
         event_payload,
         catalog_id=catalog_id,
-        collection_id=collection_id,
+        collection_physical_id=collection_id,
     )
 
     async with managed_transaction(db.engine) as conn:

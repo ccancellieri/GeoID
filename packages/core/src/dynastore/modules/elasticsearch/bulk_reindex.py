@@ -295,7 +295,11 @@ async def reindex_collection_into_index(
     # after the reindex completes.  Best-effort: a failure here is non-fatal
     # since the alias can be repaired independently.
     try:
-        index_name = get_tenant_items_index(get_index_prefix(), catalog_id)
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            _resolve_catalog_physical_id,
+        )
+        catalog_physical_id = await _resolve_catalog_physical_id(catalog_id)
+        index_name = get_tenant_items_index(get_index_prefix(), catalog_physical_id)
         await add_index_to_public_alias(index_name)
     except Exception as exc:  # noqa: BLE001
         logger.warning(

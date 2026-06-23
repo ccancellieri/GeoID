@@ -415,8 +415,11 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             config = await driver.get_driver_config(
                 catalog_id, collection_id, db_resource=db_resource
             )
-            # If the driver config has physical_table support (PG), use it.
-            if hasattr(config, "physical_table"):
+            # Return the PG items driver config (the canonical writer).
+            from dynastore.modules.storage.driver_config import (
+                ItemsPostgresqlDriverConfig,
+            )
+            if isinstance(config, ItemsPostgresqlDriverConfig):
                 return config
             # Non-PG config (e.g. DuckDB) — try next driver.
         return config  # Return whatever we got last (may be None)

@@ -51,28 +51,43 @@ logger = logging.getLogger(__name__)
 
 #
 #  Tables:
-#   - logs:              partitioned by collection_id (LIST) for efficient pruning.
-#   - logs_default:      DEFAULT partition for catalog-scoped logs (no collection).
+#   - logs:              partitioned by collection_physical_id (LIST).
+#   - logs_default:      DEFAULT partition (FOR VALUES IN ('')) for catalog-tier
+#                        logs (no collection) — empty-string semantics preserved.
+#
+#  Partition key
+#  ~~~~~~~~~~~~~
+#  The ``logs`` table is partitioned by ``collection_physical_id`` — the
+#  immutable physical id (``c_…`` token) stored in the collection registry.
+#  This is distinct from ``collection_id``, the mutable logical identifier
+#  exposed in the API, which is kept as a plain data column.
+#
+#  A collection rename updates only the logical ``collection_id``; it touches
+#  zero rows in ``logs`` because no key or partition references the logical id.
+#
+#  Catalog-tier log rows (no collection) use ``collection_physical_id = ''``
+#  and land in the default partition exactly as before.
 #
 #  Maintenance (MaintenanceSupervisor JOB_TENANT_LOGS_PRUNE / JOB_SYSTEM_LOGS_PRUNE):
 #   - Monthly: Prune logs older than 1 year.
 # ==============================================================================
 
-# ----- Tenant logs (flat parent, partitioned by collection_id LIST) -----
+# ----- Tenant logs (flat parent, partitioned by collection_physical_id LIST) -----
 TENANT_LOGS_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.logs (
-    id              BIGSERIAL       NOT NULL,
-    timestamp       TIMESTAMPTZ     DEFAULT NOW(),
-    catalog_id      VARCHAR         NOT NULL,
-    collection_id   VARCHAR         NOT NULL DEFAULT '',
-    event_type      VARCHAR,
-    level           VARCHAR(20),
-    message         TEXT,
-    details         JSONB,
-    stacktrace      TEXT,
-    request_context JSONB,
-    PRIMARY KEY (collection_id, id)
-) PARTITION BY LIST (collection_id);
+    id                      BIGSERIAL       NOT NULL,
+    timestamp               TIMESTAMPTZ     DEFAULT NOW(),
+    catalog_id              VARCHAR         NOT NULL,
+    collection_id           VARCHAR         NOT NULL DEFAULT '',
+    collection_physical_id  VARCHAR         NOT NULL DEFAULT '',
+    event_type              VARCHAR,
+    level                   VARCHAR(20),
+    message                 TEXT,
+    details                 JSONB,
+    stacktrace              TEXT,
+    request_context         JSONB,
+    PRIMARY KEY (collection_physical_id, id)
+) PARTITION BY LIST (collection_physical_id);
 """
 
 TENANT_LOGS_DEFAULT_PARTITION_DDL = """
@@ -153,9 +168,28 @@ from dynastore.models.driver_context import DriverContext
 async def _create_logs_partition(
     conn: DbResource, schema: str, catalog_id: str, collection_id: str, **kwargs
 ) -> None:
-    """Creates a per-collection LIST partition in logs."""
-    safe_suffix = collection_id.replace("-", "_").replace(".", "_")
-    partition_table = f"logs_{safe_suffix}"
+    """Creates a per-collection LIST partition in logs keyed on collection_physical_id."""
+    catalogs = get_protocol(CatalogsProtocol)
+    collection_physical_id: Optional[str] = None
+    if catalogs:
+        collection_physical_id = await catalogs.resolve_physical_id(
+            catalog_id,
+            collection_id,
+            ctx=DriverContext(db_resource=conn),
+            allow_missing=True,
+        )
+    if not collection_physical_id:
+        logger.warning(
+            "Could not resolve physical id for collection '%s' in catalog '%s'; "
+            "skipping logs partition creation.",
+            collection_id,
+            catalog_id,
+        )
+        return
+
+    # Partition table name is based on the physical id (stable across renames).
+    safe_suffix = collection_physical_id.replace("-", "_").replace(".", "_")
+    partition_table = f"logs_p_{safe_suffix}"
 
     async def partition_exists(active_conn=None, params=None):
         return await check_table_exists(active_conn or conn, partition_table, schema)
@@ -163,33 +197,63 @@ async def _create_logs_partition(
     create_ddl = (
         f'CREATE TABLE IF NOT EXISTS "{schema}"."{partition_table}" '
         f'PARTITION OF "{schema}".logs '
-        f"FOR VALUES IN ('{collection_id}');"
+        f"FOR VALUES IN ('{collection_physical_id}');"
     )
 
     await DDLQuery(
         create_ddl,
         check_query=partition_exists,
     ).execute(conn)
-    logger.info("Created logs partition '%s.%s'.", schema, partition_table)
+    logger.info(
+        "Created logs partition '%s.%s' for physical id '%s'.",
+        schema,
+        partition_table,
+        collection_physical_id,
+    )
 
 
 @sync_collection_hard_destroyer()
 async def _drop_logs_partition(
     conn: DbResource, schema: str, catalog_id: str, collection_id: str
 ) -> None:
-    """Drops the per-collection log partition on hard delete (no archival needed — logs are ephemeral)."""
-    safe_suffix = collection_id.replace("-", "_").replace(".", "_")
-    partition_table = f"logs_{safe_suffix}"
+    """Drops the per-collection log partition on hard delete (logs are ephemeral)."""
+    catalogs = get_protocol(CatalogsProtocol)
+    collection_physical_id: Optional[str] = None
+    if catalogs:
+        collection_physical_id = await catalogs.resolve_physical_id(
+            catalog_id,
+            collection_id,
+            ctx=DriverContext(db_resource=conn),
+            allow_missing=True,
+        )
+    if not collection_physical_id:
+        logger.debug(
+            "No physical id found for collection '%s'; no logs partition to drop.",
+            collection_id,
+        )
+        return
+
+    safe_suffix = collection_physical_id.replace("-", "_").replace(".", "_")
+    partition_table = f"logs_p_{safe_suffix}"
 
     exists = await check_table_exists(conn, partition_table, schema)
     if not exists:
-        logger.debug("No logs partition to drop for collection '%s'.", collection_id)
+        logger.debug(
+            "No logs partition '%s' to drop for collection '%s'.",
+            partition_table,
+            collection_id,
+        )
         return
 
     # Bound AccessExclusiveLock wait — concurrent log appenders on other pods
     # may still be writing to this partition when hard-delete races them.
     await safe_drop_relation(conn, schema, partition_table, kind="table")
-    logger.info("Dropped logs partition '%s.%s'.", schema, partition_table)
+    logger.info(
+        "Dropped logs partition '%s.%s' for collection '%s'.",
+        schema,
+        partition_table,
+        collection_id,
+    )
 
 
 # --- Log Entry Model (Local Definition) ---
@@ -352,32 +416,56 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
             await self._aggregator._trigger_flush(wait=True)
 
     async def _write_log_entry(
-        self, conn: DbResource, entry: LogEntryCreate
+        self,
+        conn: DbResource,
+        entry: LogEntryCreate,
     ) -> Optional[int]:
-        """Writes a single log entry, ensuring partition exists. Returns log ID."""
-        # Determine target schema and table
+        """Writes a single log entry, ensuring partition exists. Returns log ID.
+
+        The catalog→schema and collection→physical-id lookups resolve through
+        ``resolve_physical_schema`` / ``resolve_physical_id`` *without* a
+        ``db_resource``, so they serve from the shared L1/L2 caches
+        (``_physical_schema_cache`` / ``_collection_physical_id_cache``) and a
+        batch of N entries for one catalog pays the DB round-trip at most once
+        per TTL window rather than once per entry.  The flush runs on its own
+        connection after the originating write has committed, so the cached
+        (committed) view is the correct one.
+        """
+        # Determine target schema and table.
         catalogs = get_protocol(CatalogsProtocol)
         if entry.is_system or entry.catalog_id == SYSTEM_CATALOG_ID or not catalogs:
             phys_schema = "catalog"
             table_name = SYSTEM_LOGS_TABLE
         else:
             try:
-                phys_schema = await catalogs.resolve_physical_schema(
-                    entry.catalog_id, ctx=DriverContext(db_resource=conn)
-                )
+                phys_schema = await catalogs.resolve_physical_schema(entry.catalog_id)
                 table_name = "logs"
             except ValueError:
-                # Catalog might have been deleted or doesn't exist
+                # Catalog might have been deleted or doesn't exist.
                 phys_schema = None
 
         if not phys_schema:
             logger.warning(
-                f"LogService: Physical schema not found for catalog '{entry.catalog_id}'. Falling back to system_logs."
+                "LogService: Physical schema not found for catalog '%s'. "
+                "Falling back to system_logs.",
+                entry.catalog_id,
             )
             phys_schema = "catalog"
             table_name = SYSTEM_LOGS_TABLE
 
-        # Prepare details with stacktrace and request_context if provided
+        # Resolve the collection's immutable physical id once for the whole entry.
+        # Catalog-tier rows (collection_id is None/empty) use empty-string, which
+        # lands in the logs_default partition (FOR VALUES IN ('')).
+        collection_physical_id: str = ""
+        if table_name == "logs" and entry.collection_id and catalogs:
+            resolved = await catalogs.resolve_physical_id(
+                entry.catalog_id,
+                entry.collection_id,
+                allow_missing=True,
+            )
+            collection_physical_id = resolved or ""
+
+        # Prepare details with stacktrace and request_context if provided.
         details_dict = entry.details or {}
         stacktrace = (
             details_dict.pop("stacktrace", None)
@@ -392,47 +480,45 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
 
         catalog_id_val = entry.catalog_id
 
+        # The tenant logs table carries collection_physical_id (partition key);
+        # system_logs is flat and does not have that column.
+        is_tenant_logs = table_name == "logs"
+
         from dynastore.modules.db_config.query_executor import managed_transaction
         async with managed_transaction(conn) as tx_conn:
             try:
-                # Insert log entry and return ID
-                log_id = await DQLQuery(
-                    """
-                    INSERT INTO {schema}.{table} (timestamp, catalog_id, collection_id, event_type, level, message, details, stacktrace, request_context)
-                    VALUES (:timestamp, :catalog_id, :collection_id, :event_type, :level, :message, :details, :stacktrace, :request_context)
-                    RETURNING id;
-                    """,
-                    result_handler=ResultHandler.SCALAR_ONE,
-                ).execute(
-                    tx_conn,
-                    schema=phys_schema,
-                    table=table_name,
-                    timestamp=datetime.now(timezone.utc),
-                    catalog_id=catalog_id_val,
-                    collection_id=entry.collection_id or "",
-                    event_type=entry.event_type,
-                    level=entry.level,
-                    message=entry.message,
-                    details=json.dumps(details_dict, cls=CustomJSONEncoder)
-                    if details_dict
-                    else None,
-                    stacktrace=stacktrace,
-                    request_context=json.dumps(request_context, cls=CustomJSONEncoder)
-                    if request_context
-                    else None,
-                )
-                return log_id
-            except Exception as e:
-                if entry.collection_id and "no partition" in str(e).lower():
-                    # Fallback to default partition (catalog-scoped) if partition is missing
-                    logger.warning(
-                        f"Log partition missing for collection '{entry.collection_id}'. Falling back to catalog-scoped log."
+                if is_tenant_logs:
+                    # Tenant logs: include collection_physical_id so the row
+                    # lands in the correct partition and can be pruned efficiently.
+                    # collection_id is kept as a plain data column only.
+                    log_id = await DQLQuery(
+                        """
+                        INSERT INTO {schema}.{table} (timestamp, catalog_id, collection_id, collection_physical_id, event_type, level, message, details, stacktrace, request_context)
+                        VALUES (:timestamp, :catalog_id, :collection_id, :collection_physical_id, :event_type, :level, :message, :details, :stacktrace, :request_context)
+                        RETURNING id;
+                        """,
+                        result_handler=ResultHandler.SCALAR_ONE,
+                    ).execute(
+                        tx_conn,
+                        schema=phys_schema,
+                        table=table_name,
+                        timestamp=datetime.now(timezone.utc),
+                        catalog_id=catalog_id_val,
+                        collection_id=entry.collection_id or "",
+                        collection_physical_id=collection_physical_id,
+                        event_type=entry.event_type,
+                        level=entry.level,
+                        message=entry.message,
+                        details=json.dumps(details_dict, cls=CustomJSONEncoder)
+                        if details_dict
+                        else None,
+                        stacktrace=stacktrace,
+                        request_context=json.dumps(request_context, cls=CustomJSONEncoder)
+                        if request_context
+                        else None,
                     )
-                    # Ensure the original collection_id is recorded in details
-                    if not details_dict:
-                        details_dict = {}
-                    details_dict["original_collection_id"] = entry.collection_id
-
+                else:
+                    # System logs: flat table, no partition key column.
                     log_id = await DQLQuery(
                         """
                         INSERT INTO {schema}.{table} (timestamp, catalog_id, collection_id, event_type, level, message, details, stacktrace, request_context)
@@ -446,7 +532,48 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
                         table=table_name,
                         timestamp=datetime.now(timezone.utc),
                         catalog_id=catalog_id_val,
+                        collection_id=entry.collection_id or "",
+                        event_type=entry.event_type,
+                        level=entry.level,
+                        message=entry.message,
+                        details=json.dumps(details_dict, cls=CustomJSONEncoder)
+                        if details_dict
+                        else None,
+                        stacktrace=stacktrace,
+                        request_context=json.dumps(request_context, cls=CustomJSONEncoder)
+                        if request_context
+                        else None,
+                    )
+                return log_id
+            except Exception as e:
+                if is_tenant_logs and entry.collection_id and "no partition" in str(e).lower():
+                    # Fallback: partition missing (e.g. race at collection create).
+                    # Land in the default partition (collection_physical_id='').
+                    logger.warning(
+                        "Log partition missing for collection '%s' (physical '%s'). "
+                        "Falling back to catalog-scoped log.",
+                        entry.collection_id,
+                        collection_physical_id,
+                    )
+                    if not details_dict:
+                        details_dict = {}
+                    details_dict["original_collection_id"] = entry.collection_id
+
+                    log_id = await DQLQuery(
+                        """
+                        INSERT INTO {schema}.{table} (timestamp, catalog_id, collection_id, collection_physical_id, event_type, level, message, details, stacktrace, request_context)
+                        VALUES (:timestamp, :catalog_id, :collection_id, :collection_physical_id, :event_type, :level, :message, :details, :stacktrace, :request_context)
+                        RETURNING id;
+                        """,
+                        result_handler=ResultHandler.SCALAR_ONE,
+                    ).execute(
+                        tx_conn,
+                        schema=phys_schema,
+                        table=table_name,
+                        timestamp=datetime.now(timezone.utc),
+                        catalog_id=catalog_id_val,
                         collection_id="",
+                        collection_physical_id="",
                         event_type=entry.event_type,
                         level=entry.level,
                         message=entry.message,
@@ -680,11 +807,43 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
         if not phys_schema:
             return []
 
-        # Build WHERE clause
-        where_clauses = ["catalog_id = :catalog_id"]
-        params = {"catalog_id": catalog_id, "limit": limit, "offset": offset}
+        # Build WHERE clause.
+        # For tenant logs ({schema}.logs) the schema already scopes to one catalog,
+        # so catalog_id is a mutable label that becomes stale after a rename.
+        # For the flat system_logs table the catalog_id column is the only scope key.
+        if table_name == "logs":
+            where_clauses: list = []
+            params = {"catalog_id": catalog_id, "limit": limit, "offset": offset}
+        else:
+            where_clauses = ["catalog_id = :catalog_id"]
+            params = {"catalog_id": catalog_id, "limit": limit, "offset": offset}
 
-        if collection_id:
+        if collection_id and table_name == "logs":
+            # Resolve the immutable physical id for partition pruning.
+            # When resolution fails (collection not found), omit the collection
+            # filter rather than matching the stale logical id.
+            coll_phys_id: Optional[str] = None
+            if catalogs:
+                _ctx_conn = db_resource
+                if _ctx_conn is None:
+                    # conn is not available here yet; use engine for resolution.
+                    _ctx_conn = self._engine
+                if _ctx_conn:
+                    coll_phys_id = await catalogs.resolve_physical_id(
+                        catalog_id,
+                        collection_id,
+                        ctx=DriverContext(db_resource=_ctx_conn),
+                        allow_missing=True,
+                    )
+            if coll_phys_id:
+                where_clauses.append(
+                    "collection_physical_id = :collection_physical_id"
+                )
+                params["collection_physical_id"] = coll_phys_id
+            # else: physical id unresolved — return catalog-scoped rows without
+            # a collection filter rather than matching the stale logical id.
+        elif collection_id:
+            # system_logs branch: flat table, filter by logical collection_id.
             where_clauses.append("collection_id = :collection_id")
             params["collection_id"] = collection_id
 
@@ -696,7 +855,7 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
             where_clauses.append("event_type = :event_type")
             params["event_type"] = event_type
 
-        where_clause = " AND ".join(where_clauses)
+        where_clause = " AND ".join(where_clauses) if where_clauses else "TRUE"
 
         # Query logs
         async def _query(conn):
