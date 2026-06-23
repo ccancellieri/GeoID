@@ -34,8 +34,8 @@ import pyproj
 import shapely.geometry
 import shapely.ops
 from pydantic import BaseModel
-from shapely.validation import make_valid
 
+from dynastore.tools.geometry_repair import coerce_to_polygonal
 from dynastore.models.protocols.field_definition import (
     FieldCapability,
     FieldDefinition,
@@ -372,62 +372,12 @@ def _coerce_to_multipolygon(
 ) -> shapely.geometry.MultiPolygon:
     """Return a valid MultiPolygon from any shapely geometry.
 
-    If ``geom`` is invalid, ``make_valid`` is applied first. Then all
-    polygonal components are extracted:
-
-    * ``Polygon`` → wrapped in a one-element ``MultiPolygon``.
-    * ``MultiPolygon`` → returned as-is (already coerced).
-    * ``GeometryCollection`` (the result ``make_valid`` can produce for
-      self-intersecting inputs — e.g. a bow-tie polygon splits into two
-      triangles plus a shared-edge ``LineString``) → only the
-      ``Polygon`` / ``MultiPolygon`` sub-geometries are kept; ``LineString``,
-      ``Point``, and ``LinearRing`` components are dropped. This coercion
-      is mandatory before ES geo_shape indexing: ES rejects both
-      ``GeometryCollection`` and ``LineString`` shapes while accepting
-      ``Polygon`` and ``MultiPolygon``.
-
+    Delegates to :func:`dynastore.tools.geometry_repair.coerce_to_polygonal`,
+    which is the single source of truth for make_valid + polygonal coercion.
     Returns an empty ``MultiPolygon`` when no polygonal area survives —
     callers must check ``is_empty`` and handle accordingly.
     """
-    if not geom.is_valid:
-        geom = make_valid(geom)
-
-    if isinstance(geom, shapely.geometry.Polygon):
-        return shapely.geometry.MultiPolygon([geom]) if not geom.is_empty else shapely.geometry.MultiPolygon()
-
-    if isinstance(geom, shapely.geometry.MultiPolygon):
-        return geom
-
-    # GeometryCollection or other mixed type: extract polygon-area components.
-    polys: list[shapely.geometry.Polygon] = []
-    stack = list(getattr(geom, "geoms", [geom]))
-    while stack:
-        component = stack.pop()
-        if isinstance(component, shapely.geometry.Polygon):
-            if not component.is_empty:
-                polys.append(component)
-        elif isinstance(component, shapely.geometry.MultiPolygon):
-            for p in component.geoms:
-                if not p.is_empty:
-                    polys.append(p)
-        elif hasattr(component, "geoms"):
-            stack.extend(component.geoms)
-        # LineString, Point, LinearRing etc. are intentionally dropped.
-
-    if not polys:
-        return shapely.geometry.MultiPolygon()
-    if len(polys) == 1:
-        return shapely.geometry.MultiPolygon(polys)
-    # Avoid creating a MultiPolygon with overlapping rings (which would be
-    # invalid). Use unary_union to merge any overlapping polygons first.
-    merged = shapely.ops.unary_union(polys)
-    if isinstance(merged, shapely.geometry.Polygon):
-        return shapely.geometry.MultiPolygon([merged])
-    if isinstance(merged, shapely.geometry.MultiPolygon):
-        return merged
-    # unary_union of valid polygons should never produce a non-polygonal
-    # result, but guard defensively.
-    return shapely.geometry.MultiPolygon(polys)
+    return coerce_to_polygonal(geom)  # type: ignore[return-value]
 
 
 def _build_footprint_geojson(
