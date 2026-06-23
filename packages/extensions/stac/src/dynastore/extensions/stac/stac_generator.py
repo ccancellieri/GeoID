@@ -1317,6 +1317,19 @@ async def create_item_from_feature(
     )
     await asset_factory.add_dynamic_assets_and_links(item, asset_context)
 
+    # Re-run StacContributor pass now that dynamic assets are attached.
+    # The early call at item construction time carries no item_assets (assets
+    # are populated by add_dynamic_assets_and_links above), so any contributor
+    # that gates its extension URI on item_assets — e.g. WmtsWebMapLinksContributor
+    # — cannot fire then.  This second pass uses a ref built from the fully-
+    # populated item, which includes the just-attached assets.  apply_stac_contributions
+    # is idempotent (it deduplicates URIs and merges fields), so contributors
+    # that already fired (e.g. LanguageStacContributor) produce no duplicates.
+    asset_factory.apply_stac_contributions(
+        item,
+        asset_factory._to_resource_ref(item, asset_context),
+    )
+
     # Hierarchy and source links apply to all feature items.
     apply_hierarchy_links(
         item=item,
