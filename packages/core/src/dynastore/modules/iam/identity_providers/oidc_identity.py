@@ -455,3 +455,28 @@ class OidcIdentityProvider(IdentityProviderProtocol):
             )
             response.raise_for_status()
             return response.json()
+
+    async def get_end_session_url(
+        self,
+        post_logout_redirect_uri: str,
+        id_token_hint: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the OIDC RP-Initiated Logout URL (end_session_endpoint).
+
+        Keycloak requires either ``id_token_hint`` or ``client_id`` to identify
+        the session. Returns None if the provider does not advertise the endpoint.
+        """
+        from urllib.parse import urlencode
+
+        meta = await self._ensure_meta()
+        endpoint = meta.get("end_session_endpoint")
+        if not endpoint:
+            return None
+        endpoint = self._public_endpoint(endpoint)
+        params: Dict[str, str] = {
+            "client_id": self.client_id,
+            "post_logout_redirect_uri": post_logout_redirect_uri,
+        }
+        if id_token_hint:
+            params["id_token_hint"] = id_token_hint
+        return f"{endpoint}?{urlencode(params)}"

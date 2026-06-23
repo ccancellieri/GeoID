@@ -332,15 +332,28 @@ class Authentication(ExtensionProtocol):
 
         @self.router.get("/logout")
         async def logout(request: Request, redirect_uri: Optional[str] = None):
-            """Logout endpoint - clears session."""
+            """Logout endpoint - clears session and terminates the OIDC SSO session."""
             root_path = request.scope.get("root_path", "").rstrip("/")
             if not redirect_uri:
-                redirect_uri = f"{root_path}/auth/login"
+                redirect_uri = f"{root_path}/web/"
             elif redirect_uri.startswith("/"):
-                # If absolute path on same domain, prepend root_path
                 redirect_uri = f"{root_path}{redirect_uri}"
-
             request.session.clear()
+
+            # Redirect through Keycloak's end_session_endpoint so the SSO session
+            # cookie is invalidated server-side. Without this, a page refresh
+            # silently re-authenticates via the still-active Keycloak session.
+            if self.identity_provider:
+                try:
+                    absolute_redirect = resolve_redirect_uri(request, redirect_uri)
+                    end_session_url = await self.identity_provider.get_end_session_url(
+                        post_logout_redirect_uri=absolute_redirect
+                    )
+                    if end_session_url:
+                        return RedirectResponse(url=end_session_url)
+                except Exception as e:
+                    logger.warning("OIDC end_session redirect failed, falling back: %s", e)
+
             return RedirectResponse(url=redirect_uri)
 
         @self.router.get("/debug")

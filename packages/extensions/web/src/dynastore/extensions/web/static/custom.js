@@ -1066,7 +1066,10 @@ function handleLogout() {
     localStorage.removeItem(REFRESH_KEY);
     authToken = null;
     currentUser = null;
-    window.location.reload();
+    // Navigate to the backend logout endpoint which terminates the Keycloak SSO
+    // session. A bare reload only cleared localStorage — Keycloak's session cookie
+    // survived, so a subsequent Sign-In silently re-authenticated without a prompt.
+    window.location.href = `${apiRoot()}/auth/logout?redirect_uri=${encodeURIComponent('/web/')}`;
 }
 
 // --- Profile Modal Logic ---

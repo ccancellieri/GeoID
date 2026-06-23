@@ -98,7 +98,7 @@ class ConfigsService(ExtensionProtocol):
         "configs",
         owner="configs",
         description="Static assets for the Configuration Hub and Presets pages.",
-        public=False,
+        public=True,
     )
     def _provide_configs_static(self) -> List[str]:
         """Expose the configs extension static directory under the 'configs' prefix."""
