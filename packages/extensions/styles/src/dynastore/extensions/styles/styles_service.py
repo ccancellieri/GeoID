@@ -507,8 +507,11 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
                 }
             )
 
-        links = list(style.links or [])
-        links.extend(stylesheet_links)
+        serialized_links = [
+            lnk.model_dump(by_alias=True, exclude_none=True)
+            for lnk in (style.links or [])
+        ]
+        serialized_links.extend(stylesheet_links)
         return JSONResponse(
             content={
                 "id": style.style_id,
@@ -516,7 +519,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
                 "description": style.description,
                 "keywords": style.keywords,
                 "scope": "style",
-                "links": links,
+                "links": serialized_links,
             }
         )
 
