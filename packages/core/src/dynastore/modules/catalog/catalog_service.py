@@ -82,7 +82,7 @@ from dynastore.tools.discovery import get_protocol
 from dynastore.models.query_builder import QueryRequest, QueryResponse
 from dynastore.modules.catalog.event_service import CatalogEventType, emit_event
 from dynastore.modules.db_config.maintenance_tools import ensure_schema_exists
-from dynastore.modules.db_config.typed_store.ddl import PLATFORM_SCHEMAS_DDL, tenant_configs_ddl
+from dynastore.modules.db_config.typed_store.ddl import tenant_configs_ddl
 from dynastore.tools.async_utils import signal_bus
 from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry, LifecycleContext
 
@@ -1121,9 +1121,13 @@ class CatalogService(CatalogsProtocol):
             # By creating schema + core tables here (outer tx), all lifecycle hooks
             # are guaranteed to find them ready.
 
-            # 1. Schema (+ global configs schema/tables for FK references)
-            await ensure_schema_exists(conn, "configs")
-            await DDLQuery(PLATFORM_SCHEMAS_DDL).execute(conn)
+            # 1. Tenant schema only. The shared ``configs`` schema and its
+            # tables (the FK target for catalog_configs/collection_configs) are
+            # bootstrapped once at application startup by
+            # PlatformConfigService.initialize_storage. Re-asserting that shared
+            # DDL on every create took schema-level locks and silently
+            # serialized concurrent creates under load. Bootstrap once at boot,
+            # never per request.
             await ensure_schema_exists(conn, physical_schema)
 
             # 2. Core Tables (collections, catalog_configs, collection_configs)
