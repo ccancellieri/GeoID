@@ -803,33 +803,52 @@ class CatalogService(CatalogsProtocol):
         ``Catalog`` model (which cannot carry ``physical_schema`` across the
         distributed cache — see ``_physical_schema_cache``).
 
-        Phase 2: accepts both external and internal catalog ids.  First tries to
-        resolve ``catalog_id`` as an external_id (via the cached external→internal
-        resolver); if that returns None (the id is already internal, or the catalog
-        does not exist) the lookup falls through to the direct-internal path using
-        the original value.  This makes all callers — whether they hold an external
-        path-param id or an already-resolved internal id — correct without requiring
-        every call site to pre-resolve.
+        Phase 2: accepts both external and internal catalog ids.  Resolution is
+        **internal-id-first**: ``id`` is the immutable, unambiguous PK (and IS the
+        schema name), so a direct id hit is authoritative and taken as-is.  Only
+        when ``catalog_id`` is not a known internal id does the lookup fall back to
+        resolving it as a public ``external_id``.  The reverse order is unsafe: an
+        already-internal id passed to the external resolver can collide with a
+        *different* catalog whose ``external_id`` happens to equal that id, silently
+        routing to the wrong schema (observed on dev where legacy rows carry
+        ``c_…``-shaped external_ids).  Internal-first makes all callers — external
+        path-param id or already-resolved internal id — correct.
         """
-        # Try to resolve as external_id first (fast path for public callers).
-        _internal = await _catalog_external_id_cache(self, catalog_id)
-        if _internal is not None:
-            catalog_id = _internal
-
         db_resource = ctx.db_resource if ctx else None
         if db_resource:
             async with managed_transaction(db_resource) as conn:
+                # Internal-first: a direct id hit is authoritative.
                 res = await DQLQuery(
                     "SELECT id FROM catalog.catalogs WHERE id = :catalog_id AND deleted_at IS NULL;",
                     result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
                 ).execute(conn, catalog_id=catalog_id)
-                if not res and not allow_missing:
+                if res:
+                    return res
+                # Not a known internal id — interpret as a public external_id.
+                _internal = await _catalog_external_id_cache(self, catalog_id)
+                if _internal is not None:
+                    res = await DQLQuery(
+                        "SELECT id FROM catalog.catalogs WHERE id = :catalog_id AND deleted_at IS NULL;",
+                        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+                    ).execute(conn, catalog_id=_internal)
+                    if res:
+                        return res
+                if not allow_missing:
                     raise ValueError(f"Catalog '{catalog_id}' not found.")
-                return res
+                return None
+        # No caller-supplied connection: use the string caches, internal-first.
         ps = await _physical_schema_cache(self, catalog_id)
-        if not ps and not allow_missing:
+        if ps:
+            return ps
+        # Not a known internal id — interpret as a public external_id.
+        _internal = await _catalog_external_id_cache(self, catalog_id)
+        if _internal is not None:
+            ps = await _physical_schema_cache(self, _internal)
+            if ps:
+                return ps
+        if not allow_missing:
             raise ValueError(f"Catalog '{catalog_id}' not found.")
-        return ps
+        return None
 
     # --- Collection Resolution ---
     async def resolve_datasource(

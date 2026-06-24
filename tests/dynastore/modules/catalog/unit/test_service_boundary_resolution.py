@@ -442,3 +442,54 @@ async def test_resolve_physical_schema_passthrough_internal_id(monkeypatch):
     assert schema_calls == ["c_alreadyinternal"], (
         "An already-internal id must be passed straight through to the schema lookup"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_physical_schema_internal_first_beats_external_collision():
+    """An already-internal catalog id must resolve to ITS OWN schema even when a
+    DIFFERENT catalog's ``external_id`` collides with that id.
+
+    Regression: the old external-first order resolved ``catalog_id`` as an
+    external_id BEFORE checking it as an internal id.  When a legacy catalog
+    carries a ``c_…``-shaped external_id equal to another catalog's internal id
+    (observed on dev), an already-resolved internal id passed to create_collection
+    got hijacked to the colliding catalog's schema, scattering registry rows into
+    the wrong schema (write-gate then reports the collection ``missing``).
+    Internal-first must take the authoritative PK hit and never consult the
+    external resolver.
+    """
+    svc = CatalogService.__new__(CatalogService)
+
+    external_lookups: list[str] = []
+
+    async def _db_external(ext_id: str):
+        external_lookups.append(ext_id)
+        # Pollution: a different catalog carries external_id == 'c_victim'.
+        if ext_id == "c_victim":
+            return "c_collider"
+        return None
+
+    svc._get_catalog_id_by_external_id_db = _db_external  # type: ignore[assignment]
+
+    async def _db_schema(int_id: str):
+        # id IS the schema; both catalogs exist as schemas.
+        if int_id in ("c_victim", "c_collider"):
+            return int_id
+        return None
+
+    svc._get_physical_schema_db = _db_schema  # type: ignore[assignment]
+
+    _catalog_external_id_cache.cache_clear()
+    from dynastore.modules.catalog.catalog_service import _physical_schema_cache
+
+    _physical_schema_cache.cache_clear()
+
+    result = await svc.resolve_physical_schema("c_victim", allow_missing=True)
+    assert result == "c_victim", (
+        "internal id must resolve to its own schema, not the colliding "
+        f"external_id owner; got {result!r}"
+    )
+    assert external_lookups == [], (
+        "a direct internal-id hit must short-circuit before the external resolver "
+        f"(external lookups: {external_lookups})"
+    )
