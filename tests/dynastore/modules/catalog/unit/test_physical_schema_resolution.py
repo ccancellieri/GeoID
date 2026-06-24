@@ -78,6 +78,9 @@ async def test_resolve_uses_registry_not_stripped_model(monkeypatch):
     """RED→GREEN: even when the cached model lost ``physical_schema`` (as it does
     across L2), resolution returns the correct schema from the registry."""
     _physical_schema_cache.cache_clear()
+    from dynastore.modules.catalog.catalog_service import _catalog_external_id_cache
+
+    _catalog_external_id_cache.cache_clear()
     svc = CatalogService.__new__(CatalogService)
 
     async def _stripped_model(cid):
@@ -87,8 +90,13 @@ async def test_resolve_uses_registry_not_stripped_model(monkeypatch):
     async def _registry(cid):
         return "s_correct"
 
+    async def _no_external_id(cid):
+        # No external_id mapping in this unit test — passthrough (already-internal id).
+        return None
+
     monkeypatch.setattr(svc, "_get_catalog_model_db", _stripped_model)
     monkeypatch.setattr(svc, "_get_physical_schema_db", _registry)
+    monkeypatch.setattr(svc, "_get_catalog_id_by_external_id_db", _no_external_id)
 
     # No ctx → goes through the string cache → registry fallback.
     assert await svc.resolve_physical_schema("cat_redgreen_1") == "s_correct"
@@ -97,12 +105,16 @@ async def test_resolve_uses_registry_not_stripped_model(monkeypatch):
 @pytest.mark.asyncio
 async def test_resolve_missing_catalog_raises_unless_allow_missing(monkeypatch):
     _physical_schema_cache.cache_clear()
+    from dynastore.modules.catalog.catalog_service import _catalog_external_id_cache
+
+    _catalog_external_id_cache.cache_clear()
     svc = CatalogService.__new__(CatalogService)
 
     async def _absent(cid):
         return None
 
     monkeypatch.setattr(svc, "_get_physical_schema_db", _absent)
+    monkeypatch.setattr(svc, "_get_catalog_id_by_external_id_db", _absent)
 
     with pytest.raises(ValueError, match="not found"):
         await svc.resolve_physical_schema("cat_absent_1")

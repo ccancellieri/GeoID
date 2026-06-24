@@ -127,6 +127,28 @@ class UniqueViolationError(DatabaseError):
     pass
 
 
+class CatalogRenameConflictError(DatabaseError):
+    """Raised when a catalog rename target external_id is already taken by a live catalog."""
+
+    def __init__(self, new_external_id: str) -> None:
+        super().__init__(
+            f"Cannot rename: catalog external_id '{new_external_id}' is already in use"
+        )
+        self.new_external_id = new_external_id
+
+
+class CollectionRenameConflictError(DatabaseError):
+    """Raised when a collection rename target external_id is already taken within the same catalog."""
+
+    def __init__(self, catalog_id: str, new_external_id: str) -> None:
+        super().__init__(
+            f"Cannot rename: collection external_id '{new_external_id}' "
+            f"is already in use in catalog '{catalog_id}'"
+        )
+        self.catalog_id = catalog_id
+        self.new_external_id = new_external_id
+
+
 class ForeignKeyViolationError(DatabaseError):
     """Raised on violation of a foreign key constraint (pgcode: 23503)."""
     pass

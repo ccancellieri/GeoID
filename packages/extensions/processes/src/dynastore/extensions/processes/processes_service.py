@@ -21,7 +21,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Union, Any, Optional, cast
+from typing import FrozenSet, List, Union, Any, Optional
 
 import jsonschema as _jsonschema_scope_gate  # noqa: F401  # SCOPE gate: extension_processes requires jsonschema
 _ = _jsonschema_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
@@ -51,14 +51,12 @@ from dynastore.extensions.tools.ogc_common_models import Conformance
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.response_i18n import localize_response_dict, resolve_links, resolve_localized  # noqa: E402
 from dynastore.tools.json import CustomJSONEncoder  # noqa: E402
-from dynastore.models.protocols import CatalogsProtocol
-from dynastore.tools.discovery import get_protocol
-
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
 from dynastore.tools.discovery import get_protocols
 
 import dynastore.modules.processes.processes_module as processes_module
 from dynastore.modules.tasks import tasks_module
+from dynastore.modules.tasks.tasks_module import _resolve_catalog_schema
 from dynastore.modules.tasks.models import (
     Task,
     TaskStatusEnum,
@@ -71,7 +69,6 @@ from dynastore.modules.processes.inventory import (
     parse_scope_filter,
 )
 from dynastore.models.auth_models import SYSTEM_USER_ID
-from dynastore.models.driver_context import DriverContext
 from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 from dynastore.extensions.tools.url import enforce_https  # noqa: E402
 
@@ -889,17 +886,6 @@ def _handle_execution_result(
             )
 
 
-async def _resolve_catalog_schema(catalog_id: str, conn: AsyncConnection) -> str:
-    """Resolve the physical PG schema for a catalog."""
-    catalogs = get_protocol(CatalogsProtocol)
-    if not catalogs:
-        raise HTTPException(status_code=500, detail="CatalogsProtocol not available.")
-    catalogs = cast(CatalogsProtocol, catalogs)
-    schema = await catalogs.resolve_physical_schema(catalog_id, ctx=DriverContext(db_resource=conn))
-    if not schema:
-        raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
-    return schema
-
 
 async def _get_job_internal(job_id: uuid.UUID, catalog_id: str, conn: AsyncConnection):
     schema = await _resolve_catalog_schema(catalog_id, conn)
@@ -914,7 +900,7 @@ async def _get_job_internal(job_id: uuid.UUID, catalog_id: str, conn: AsyncConne
     # existence + scoping, then read uncached and verify the task belongs to
     # this catalog's schema (task_id is a globally-unique UUIDv7).
     task = await tasks_module.get_task_by_id_unscoped(conn, job_id)
-    if not task or task.schema_name != schema:
+    if not task or task.catalog_id != schema:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found in schema '{schema}'.",

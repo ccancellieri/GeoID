@@ -46,9 +46,6 @@ class _FakeCatalogs:
 
     ``schema=None`` models an absent (already-deleted) catalog: strict
     resolution raises, ``allow_missing=True`` returns ``None``.
-
-    ``resolve_physical_id`` returns a deterministic ``c_{collection_id}``
-    token so tests can assert the derived partition name without a live DB.
     """
 
     def __init__(self, schema: Optional[str]):
@@ -67,18 +64,6 @@ class _FakeCatalogs:
                 raise ValueError(f"Catalog '{catalog_id}' not found.")
             return None
         return self._schema
-
-    async def resolve_physical_id(
-        self,
-        catalog_id: str,
-        collection_id: Optional[str],
-        ctx: Any = None,
-        allow_missing: bool = False,
-    ) -> Optional[str]:
-        """Return a deterministic physical id token for the given collection."""
-        if collection_id is None:
-            return None
-        return f"c_{collection_id}"
 
 
 class _FakeTxCM:
@@ -177,11 +162,8 @@ async def test_resolve_schema_default_is_strict(monkeypatch):
 async def test_drop_storage_present_catalog_drops_partition(monkeypatch, patched):
     drv, _ = _driver_with_catalogs(monkeypatch, schema="s_live")
     await drv.drop_storage("live-cat", "col-1")
-    # Partition is named after the collection's physical id (c_… token), not
-    # the logical collection_id. _FakeCatalogs.resolve_physical_id returns
-    # "c_{collection_id}" so the expected partition name is "assets_p_c_col-1".
     assert patched["drops"] == [
-        {"schema": "s_live", "name": "assets_p_c_col-1", "kind": "table"}
+        {"schema": "s_live", "name": "assets_live-cat_col-1", "kind": "table"}
     ]
 
 
@@ -191,6 +173,4 @@ async def test_drop_storage_present_catalog_catalog_scope_deletes_refs(monkeypat
     await drv.drop_storage("live-cat", None)
     assert len(patched["deletes"]) == 1
     assert "asset_references" in patched["deletes"][0]["sql"]
-    # Schema scopes the catalog; catalog_id is not a WHERE predicate here —
-    # the schema already isolates the tenant's rows.
-    assert "catalog_id" not in patched["deletes"][0]["params"]
+    assert patched["deletes"][0]["params"].get("catalog_id") == "live-cat"

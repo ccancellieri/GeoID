@@ -69,8 +69,8 @@ class DefaultCatalogListProvider:
             for c in rows or []:
                 title = resolve_localized_field(
                     getattr(c, "title", None), language
-                ) or c.id
-                out.append(CatalogOption(id=c.id, title=title))
+                ) or getattr(c, "external_id", None) or c.id
+                out.append(CatalogOption(id=getattr(c, "external_id", None) or c.id, title=title))
             if not rows or len(rows) < _PAGE:
                 break
         return out

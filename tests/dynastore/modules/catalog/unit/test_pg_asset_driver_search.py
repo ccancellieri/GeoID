@@ -80,18 +80,7 @@ def _make_driver(monkeypatch):
     async def fake_resolve(catalog_id: str, db_resource=None) -> str:
         return f"s_{catalog_id}"
 
-    async def fake_resolve_collection_phys_id(
-        catalog_id: str,
-        collection_id,
-        db_resource=None,
-    ):
-        # Return a stable test value: None for None, else c_<collection_id>.
-        if collection_id is None:
-            return None
-        return f"c_{collection_id}"
-
     drv._resolve_schema = fake_resolve  # type: ignore[method-assign]
-    drv._resolve_collection_physical_id = fake_resolve_collection_phys_id  # type: ignore[method-assign]
     return drv
 
 
@@ -361,8 +350,8 @@ async def test_default_scopes_to_catalog_tier(captured):
     await drv.search_assets("cat-a")
     sql = captured["calls"][0]["sql"]
     params = captured["calls"][0]["params"]
-    assert "collection_physical_id IS NOT DISTINCT FROM :collection_physical_id" in sql
-    assert params["collection_physical_id"] is None
+    assert "collection_id IS NOT DISTINCT FROM :collection_id" in sql
+    assert params["collection_id"] is None
 
 
 @pytest.mark.asyncio
@@ -371,8 +360,8 @@ async def test_single_collection_binds_predicate(captured):
     await drv.search_assets("cat-a", collection_id="coll-1")
     sql = captured["calls"][0]["sql"]
     params = captured["calls"][0]["params"]
-    assert "collection_physical_id IS NOT DISTINCT FROM :collection_physical_id" in sql
-    assert params["collection_physical_id"] == "c_coll-1"
+    assert "collection_id IS NOT DISTINCT FROM :collection_id" in sql
+    assert params["collection_id"] == "coll-1"
 
 
 @pytest.mark.asyncio
@@ -381,11 +370,7 @@ async def test_all_collections_drops_collection_predicate(captured):
     await drv.search_assets("cat-a", collection_id="ignored", all_collections=True)
     sql = captured["calls"][0]["sql"]
     params = captured["calls"][0]["params"]
-    assert "collection_physical_id IS NOT DISTINCT FROM" not in sql
-    assert "collection_physical_id" not in params
-    # Catalog scope is the resolved physical schema, not a row predicate:
-    # the mutable catalog_id must NOT appear in the WHERE (it goes stale on
-    # a catalog rename). Only the soft-delete guard remains.
-    assert "catalog_id = :catalog_id" not in sql
-    assert "catalog_id" not in params
+    assert "collection_id IS NOT DISTINCT FROM" not in sql
+    assert "collection_id" not in params
+    assert "catalog_id = :catalog_id" in sql
     assert "status <> 'deleted'" in sql

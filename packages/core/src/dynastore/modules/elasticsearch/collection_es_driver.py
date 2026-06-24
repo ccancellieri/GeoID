@@ -21,19 +21,9 @@ Elasticsearch collection driver — implements CollectionStore.
 
 Stores the **full collection object** (not just metadata) in the
 platform-wide singleton index ``{prefix}-collections``. Per-catalog
-isolation is achieved via ``_routing=<catalog_physical_id>`` (shard
-locality) and a composite document id
-``"{catalog_physical_id}:{collection_physical_id}"`` (name collision
-across catalogs is impossible, and docs survive catalog/collection renames).
-
-Physical ids are the immutable ``physical_schema`` / ``physical_id``
-values stored in the PG catalog registry (``catalog.catalogs`` and
-``{schema}.collections``).  Every async ES op resolves them via
-``CatalogsProtocol.resolve_physical_id`` (300 s TTL cache) before
-building the doc id and routing param.  If resolution returns ``None``
-(e.g. catalog not yet provisioned), the logical id is used as a fallback
-so writes during bootstrap do not crash — this matches the fail-open
-pattern used by other drivers.
+isolation is achieved via ``_routing=catalog_id`` (shard locality) and a
+composite document id ``"{catalog_id}:{collection_id}"`` (name collision
+across catalogs is impossible).
 
 Provides fulltext search (multi_match on title/description/keywords),
 CQL2-JSON filter support, spatial filtering on extent bbox (geo_shape),
@@ -41,13 +31,6 @@ and aggregations. The mapping comes from
 :data:`dynastore.modules.elasticsearch.mappings.COLLECTION_MAPPING` — a
 single source of truth shared with the lifespan bootstrap and the search
 service.
-
-Clean-break scheme
-------------------
-Existing collection-metadata docs indexed under logical ids become
-unreachable under this physical-id scheme.  The operator must wipe the
-ES ``{prefix}-collections`` index and reindex on deploy.  There is no
-in-place migration — this is intentional.
 """
 
 import copy
@@ -118,100 +101,13 @@ async def _on_apply_collection_es_driver_config(
 CollectionElasticsearchDriverConfig.register_apply_handler(_on_apply_collection_es_driver_config)
 
 
-def _doc_id(catalog_physical: str, collection_physical: str) -> str:
-    """Composite ES document id using IMMUTABLE physical ids.
+def _doc_id(catalog_id: str, collection_id: str) -> str:
+    """Composite document id used in the singleton ``{prefix}-collections``.
 
-    Both arguments must be the physical (``s_…`` / ``t_…``) identifiers
-    from the PG catalog registry, not the user-visible logical ids.
-    Using physical ids means the doc stays addressable across a catalog
-    or collection rename.  The ``_source`` body still carries the logical
-    ``catalog_id`` / ``collection_id`` for presentation.
+    Same-named collections in different catalogs co-exist as distinct
+    documents because the catalog scope is encoded in the id itself.
     """
-    return f"{catalog_physical}:{collection_physical}"
-
-
-async def _resolve_physical_ids(
-    catalog_id: str,
-    collection_id: Optional[str] = None,
-    *,
-    db_resource: Optional[Any] = None,
-) -> tuple[str, Optional[str]]:
-    """Resolve (catalog_physical, collection_physical) from the PG registry.
-
-    Returns the immutable physical identifiers for the given logical ids.
-    Fail-open: if ``CatalogsProtocol`` is not registered or a lookup
-    returns ``None`` (entity not yet provisioned), the corresponding
-    logical id is returned instead so in-flight writes during bootstrap
-    do not crash.
-
-    Parameters
-    ----------
-    catalog_id:
-        Logical catalog identifier.
-    collection_id:
-        Logical collection identifier.  When ``None`` only the catalog
-        physical id is resolved.
-    db_resource:
-        Optional in-flight DB connection forwarded to the resolver.
-    """
-    from dynastore.models.protocols.catalogs import CatalogsProtocol
-    from dynastore.tools.discovery import get_protocol
-
-    catalogs = get_protocol(CatalogsProtocol)
-    if catalogs is None:
-        # CatalogsProtocol not loaded (unit tests, early bootstrap) —
-        # fall back to logical ids so the caller can still proceed.
-        return catalog_id, collection_id
-
-    ctx = DriverContext(db_resource=db_resource) if db_resource else None
-
-    catalog_physical: str = catalog_id
-    try:
-        resolved_catalog = await catalogs.resolve_physical_id(
-            catalog_id, ctx=ctx, allow_missing=True
-        )
-        if resolved_catalog:
-            catalog_physical = resolved_catalog
-        else:
-            logger.debug(
-                "_resolve_physical_ids: catalog=%r not yet provisioned — "
-                "using logical id as routing/doc-id fallback",
-                catalog_id,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "_resolve_physical_ids: catalog physical id lookup failed "
-            "for catalog=%r: %s — using logical id fallback",
-            catalog_id, exc,
-        )
-
-    if collection_id is None:
-        return catalog_physical, None
-
-    collection_physical: str = collection_id
-    try:
-        resolved_col = await catalogs.resolve_physical_id(
-            catalog_id,
-            collection_id,
-            ctx=ctx,
-            allow_missing=True,
-        )
-        if resolved_col:
-            collection_physical = resolved_col
-        else:
-            logger.debug(
-                "_resolve_physical_ids: collection=%r/%r not yet provisioned — "
-                "using logical id as doc-id fallback",
-                catalog_id, collection_id,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "_resolve_physical_ids: collection physical id lookup failed "
-            "for %r/%r: %s — using logical id fallback",
-            catalog_id, collection_id, exc,
-        )
-
-    return catalog_physical, collection_physical
+    return f"{catalog_id}:{collection_id}"
 
 
 def _bbox_to_envelope(bbox: List[float]) -> Optional[Dict[str, Any]]:
@@ -268,16 +164,9 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
     })
 
     def location(self, catalog_id: str, collection_id: Optional[str] = None) -> StorageLocation:
-        # NOTE: location() is SYNC and cannot resolve physical ids.
-        # The ``routing`` value here is the LOGICAL catalog_id — for
-        # display/introspection purposes only (canonical_uri, UI labels).
-        # Authoritative ES routing uses the physical catalog id resolved
-        # asynchronously at the time of each ES op via
-        # ``_resolve_physical_ids``.  Do NOT use this location's routing
-        # value to drive actual ES calls.
         prefix = self._get_prefix()
         index = self._index_name()
-        routing = catalog_id  # logical — display only
+        routing = catalog_id
         return StorageLocation(
             backend="elasticsearch",
             canonical_uri=f"es://{index}?routing={routing}",
@@ -355,32 +244,29 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             return
 
         # Catalog-scope: remove all collection docs owned by catalog_id.
-        # routing=catalog_physical keeps the operation on the correct shard;
-        # the term filter uses the LOGICAL catalog_id because that is what
-        # is stored in _source.catalog_id (the presentation field) and is
-        # what the field mapping indexes.  The physical id is only used
-        # for the ES routing param so the delete targets the right shard.
-        catalog_physical, _ = await _resolve_physical_ids(catalog_id)
+        # routing=catalog_id keeps the operation on the correct shard;
+        # the term filter is the correctness guard — it prevents the
+        # delete from touching documents of other catalogs on the same shard.
         try:
             await client.delete_by_query(
                 index=index_name,
                 body={"query": {"term": {"catalog_id": catalog_id}}},
                 params={
-                    "routing": catalog_physical,
+                    "routing": catalog_id,
                     "conflicts": "proceed",
                     "ignore_unavailable": "true",
                 },
             )
             logger.info(
                 "CollectionElasticsearchDriver.drop_storage: removed all "
-                "collection docs for catalog_id=%r (physical=%r) from %r.",
-                catalog_id, catalog_physical, index_name,
+                "collection docs for catalog_id=%r from %r.",
+                catalog_id, index_name,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "CollectionElasticsearchDriver.drop_storage: delete_by_query "
-                "failed for catalog_id=%r (physical=%r) index=%r: %s",
-                catalog_id, catalog_physical, index_name, exc,
+                "failed for catalog_id=%r index=%r: %s",
+                catalog_id, index_name, exc,
             )
 
     @staticmethod
@@ -492,15 +378,12 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         if not client:
             return None
 
-        catalog_physical, collection_physical = await _resolve_physical_ids(
-            catalog_id, collection_id, db_resource=db_resource
-        )
         index_name = self._index_name()
         try:
             resp = await client.get(
                 index=index_name,
-                id=_doc_id(catalog_physical, collection_physical or collection_id),
-                params={"routing": catalog_physical},
+                id=_doc_id(catalog_id, collection_id),
+                params={"routing": catalog_id},
             )
             from dynastore.modules.elasticsearch.collection_canonical import (
                 unproject_collection_from_es,
@@ -551,17 +434,11 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         if not client:
             raise RuntimeError("Elasticsearch client not available")
 
-        catalog_physical, collection_physical = await _resolve_physical_ids(
-            catalog_id, collection_id, db_resource=db_resource
-        )
         index_name = self._index_name()
         # Canonical collection envelope (#1285/#1800): identity + system +
         # access containers, attributes under properties (unknown→extras lane).
         # ``extent`` is enriched first (bbox→geo_shape, temporal→date_range) and
         # carried opaquely as a reserved structural member.
-        # The logical catalog_id/collection_id are passed to
-        # build_canonical_collection_doc so _source carries presentation ids;
-        # only the ES _id and routing param use the physical ids.
         from dynastore.modules.elasticsearch.collection_canonical import (
             build_canonical_collection_doc,
         )
@@ -578,9 +455,9 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         try:
             await client.index(
                 index=index_name,
-                id=_doc_id(catalog_physical, collection_physical or collection_id),
+                id=_doc_id(catalog_id, collection_id),
                 body=doc,
-                params={"routing": catalog_physical, "refresh": "wait_for"},
+                params={"routing": catalog_id, "refresh": "wait_for"},
             )
         except Exception as exc:
             from dynastore.modules.elasticsearch._mapping_errors import (
@@ -714,31 +591,24 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         if not client:
             return
 
-        catalog_physical, collection_physical = await _resolve_physical_ids(
-            catalog_id, collection_id, db_resource=db_resource
-        )
         index_name = self._index_name()
-        doc_id = _doc_id(catalog_physical, collection_physical or collection_id)
+        doc_id = _doc_id(catalog_id, collection_id)
         try:
             if soft:
                 await client.update(
                     index=index_name,
                     id=doc_id,
                     body={"doc": {"_deleted": True}},
-                    params={"routing": catalog_physical, "refresh": "wait_for"},
+                    params={"routing": catalog_id, "refresh": "wait_for"},
                 )
             else:
                 await client.delete(
                     index=index_name,
                     id=doc_id,
-                    params={"routing": catalog_physical, "refresh": "wait_for"},
+                    params={"routing": catalog_id, "refresh": "wait_for"},
                 )
         except Exception as e:
-            logger.debug(
-                "delete_metadata ES error for %s/%s (physical=%s/%s): %s",
-                catalog_id, collection_id,
-                catalog_physical, collection_physical, e,
-            )
+            logger.debug("delete_metadata ES error for %s/%s: %s", catalog_id, collection_id, e)
 
     async def search_metadata(
         self,
@@ -770,13 +640,6 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         client = self._get_client()
         if not client:
             return [], 0
-
-        # Resolve the catalog physical id for shard routing.  The filter
-        # term uses the logical catalog_id (what _source.catalog_id stores)
-        # so results are correctly scoped to this tenant.
-        catalog_physical, _ = await _resolve_physical_ids(
-            catalog_id, db_resource=db_resource
-        )
 
         index_name = self._index_name()
 
@@ -857,7 +720,7 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             resp = await client.search(
                 index=index_name,
                 body=body,
-                params={"routing": catalog_physical},
+                params={"routing": catalog_id},
             )
             hits = resp.get("hits", {})
             total = hits.get("total", {})

@@ -23,7 +23,7 @@ Durable task dispatcher and Janitor for the DynaStore task system.
 
 Uses a single global ``tasks.tasks`` table. No per-schema discovery is
 needed: the ``claim_next()`` query filters by runner-aware capability map
-types and returns the ``schema_name`` column so runners know which tenant
+types and returns the ``catalog_id`` column so runners know which tenant
 context to operate in.
 
 The Dispatcher:
@@ -906,7 +906,7 @@ async def run_dispatcher(
                 inputs=row.get("inputs"),
                 caller_id=row.get("caller_id"),
                 collection_id=row.get("collection_id"),
-                schema=row.get("schema_name", "tasks"),
+                schema=row.get("catalog_id", "tasks"),
                 scope=row.get("scope"),
             )
 
@@ -1068,7 +1068,7 @@ async def run_dispatcher(
                 for row in rows:
                     logger.info(
                         f"Dispatcher: Claimed task {row['task_id']} ({row['task_type']}) "
-                        f"schema={row.get('schema_name')!r} "
+                        f"schema={row.get('catalog_id')!r} "
                         f"mode={row.get('execution_mode', 'ASYNC')}."
                     )
 

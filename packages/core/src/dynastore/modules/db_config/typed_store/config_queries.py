@@ -233,32 +233,28 @@ def list_catalog_configs_paginated(phys_schema: str) -> DQLQuery:
 # --- collection_configs -------------------------------------------------------
 
 def select_collection_config(phys_schema: str) -> DQLQuery:
-    """SELECT config_data for a single (physical_id, ref_key) pair (no lock).
-
-    ``physical_id`` is the collection's immutable ``c_…`` token; callers must
-    resolve it from ``{schema}.collections.physical_id`` before calling this.
-    """
+    """SELECT config_data for a single (collection_id, ref_key) pair (no lock)."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE physical_id = :physical_id AND ref_key = :ref_key;',
+        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND ref_key = :ref_key;',
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
     )
 
 
 def select_collection_config_by_ref(phys_schema: str) -> DQLQuery:
-    """F.4c.2 ref-keyed read: returns class_key + config_data for (physical_id, ref_key)."""
+    """F.4c.2 ref-keyed read: returns class_key + config_data for (collection_id, ref_key)."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT class_key, config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE physical_id = :physical_id AND ref_key = :ref_key;',
+        f'SELECT class_key, config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND ref_key = :ref_key;',
         result_handler=ResultHandler.ONE_DICT,
     )
 
 
 def list_collection_refs(phys_schema: str) -> DQLQuery:
-    """F.4c.2 enumerate {ref_key: class_key} for a given physical_id."""
+    """F.4c.2 enumerate {ref_key: class_key} for a given collection_id."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT ref_key, class_key FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE physical_id = :physical_id ORDER BY ref_key;',
+        f'SELECT ref_key, class_key FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id ORDER BY ref_key;',
         result_handler=ResultHandler.ALL_DICTS,
     )
 
@@ -267,7 +263,7 @@ def select_collection_config_for_update(phys_schema: str) -> DQLQuery:
     """SELECT config_data FOR UPDATE — used during immutability check before write."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE physical_id = :physical_id AND ref_key = :ref_key FOR UPDATE;',
+        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND ref_key = :ref_key FOR UPDATE;',
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
     )
 
@@ -277,9 +273,9 @@ def upsert_collection_config(phys_schema: str) -> DQLQuery:
     validate_sql_identifier(phys_schema)
     return DQLQuery(
         f"""
-        INSERT INTO "{phys_schema}".{COLLECTION_CONFIGS_TABLE} (physical_id, ref_key, class_key, schema_id, config_data, updated_at)
-        VALUES (:physical_id, :ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-        ON CONFLICT (physical_id, ref_key) DO UPDATE SET
+        INSERT INTO "{phys_schema}".{COLLECTION_CONFIGS_TABLE} (collection_id, ref_key, class_key, schema_id, config_data, updated_at)
+        VALUES (:collection_id, :ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
+        ON CONFLICT (collection_id, ref_key) DO UPDATE SET
             class_key   = EXCLUDED.class_key,
             schema_id   = EXCLUDED.schema_id,
             config_data = EXCLUDED.config_data,
@@ -293,19 +289,19 @@ def delete_collection_config(phys_schema: str) -> DQLQuery:
     """DELETE a single collection-level config row."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f'DELETE FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE physical_id = :physical_id AND ref_key = :ref_key;',
+        f'DELETE FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND ref_key = :ref_key;',
         result_handler=ResultHandler.ROWCOUNT,
     )
 
 
 def list_collection_configs_paginated(phys_schema: str) -> DQLQuery:
-    """SELECT with window COUNT + ORDER BY ref_key for a given physical_id."""
+    """SELECT with window COUNT + ORDER BY ref_key for a given collection_id."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
         f"""
         SELECT COUNT(*) OVER() AS total_count, ref_key, class_key, config_data
         FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE}
-        WHERE physical_id = :physical_id
+        WHERE collection_id = :collection_id
         ORDER BY ref_key
         LIMIT :limit OFFSET :offset;
         """,

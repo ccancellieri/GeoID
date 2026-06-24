@@ -476,7 +476,7 @@ def canonical_input_from_feature(
     *,
     geoid: str,
     external_id: Optional[Any] = None,
-    physical_id: Optional[Any] = None,
+    asset_id: Optional[Any] = None,
     sidecars: Optional[List[Any]] = None,
 ) -> CanonicalIndexInput:
     """Build a :class:`CanonicalIndexInput` from a serialized feature, no PG read.
@@ -498,12 +498,7 @@ def canonical_input_from_feature(
         geoid:         The geoid to stamp as ``row["geoid"]`` and, downstream, the
                        canonical document ``id`` (``_id`` in ES).
         external_id:   Optional external id to thread into the row.
-        physical_id:   Optional immutable asset physical_id (UUIDv7) to thread
-                       into the row.  Callers must resolve the logical asset_id to
-                       physical_id via ``AssetsProtocol.resolve_asset_physical_id``
-                       before passing it here.  Only the physical_id is stored in
-                       item ``_source``; the mutable logical asset_id is never
-                       written to the ES document.
+        asset_id:      Optional source asset id to thread into the row.
         sidecars:      Optional resolved sidecars; defaults to ``[]`` (file path).
 
     Returns:
@@ -535,11 +530,8 @@ def canonical_input_from_feature(
     row: Dict[str, Any] = {"geoid": geoid}
     if external_id is not None:
         row["external_id"] = str(external_id)
-    # Thread the immutable asset_physical_id under the ``asset_physical_id``
-    # key so ``build_canonical_index_doc`` stamps it directly as
-    # ``asset_physical_id`` without touching ``asset_id`` (the mutable label).
-    if physical_id is not None:
-        row["asset_physical_id"] = str(physical_id)
+    if asset_id is not None:
+        row["asset_id"] = str(asset_id)
 
     return CanonicalIndexInput(
         row=row,

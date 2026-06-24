@@ -549,7 +549,7 @@ class EventDrainTask(TaskProtocol):
             f"     claim_version = w.claim_version + 1"
             f" FROM claimed"
             f" WHERE w.day = claimed.day AND w.event_id = claimed.event_id"
-            f" RETURNING w.day, w.event_id, w.event_type, w.scope, w.schema_name,"
+            f" RETURNING w.day, w.event_id, w.event_type, w.scope, w.catalog_id,"
             f"           w.payload, w.retry_count, w.max_retries, w.claim_version,"
             f"           w.owner_id"
         )

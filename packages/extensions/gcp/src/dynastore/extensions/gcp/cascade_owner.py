@@ -149,26 +149,7 @@ class GcsCollectionPrefixOwner(BaseResourceOwner):
 
         bucket_name = await _resolve_bucket_name(scope_ref.catalog_id)
         from dynastore.modules.gcp.tools import bucket as bucket_tool
-        from dynastore.models.protocols import CatalogsProtocol
-        from dynastore.modules import get_protocol
-        from dynastore.models.driver_context import DriverContext
-
-        # Resolve the immutable physical_id for the collection while the row
-        # still exists (describe_scope runs before the schema is dropped).
-        _collection_physical_id: Optional[str] = None
-        _catalogs_cascade = get_protocol(CatalogsProtocol)
-        if _catalogs_cascade:
-            try:
-                _collection_physical_id = await _catalogs_cascade.resolve_physical_id(
-                    scope_ref.catalog_id,
-                    scope_ref.collection_id,
-                    ctx=DriverContext(db_resource=conn),
-                    allow_missing=True,
-                )
-            except Exception:
-                pass
-        collection_physical_id = _collection_physical_id or scope_ref.collection_id
-        folder_prefix = bucket_tool.get_blob_path_for_collection_folder(collection_physical_id)
+        folder_prefix = bucket_tool.get_blob_path_for_collection_folder(scope_ref.collection_id)
 
         return [
             CleanupRef(

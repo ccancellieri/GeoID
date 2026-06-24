@@ -91,7 +91,7 @@ def test_select_catalog_config_by_ref_query_shape():
 def test_select_collection_config_by_ref_query_shape():
     sql = _cq.select_collection_config_by_ref("demo_schema").template.lower()
     assert "select class_key, config_data" in sql
-    assert "where physical_id = :physical_id and ref_key = :ref_key" in sql
+    assert "where collection_id = :collection_id and ref_key = :ref_key" in sql
     assert '"demo_schema".collection_configs' in sql
 
 
@@ -103,10 +103,10 @@ def test_list_catalog_refs_query_shape():
 
 
 def test_list_collection_refs_query_shape():
-    """Collection refs are scoped per ``physical_id`` — the collection's immutable token."""
+    """Collection refs are scoped per ``collection_id`` — pin that filter."""
     sql = _cq.list_collection_refs("demo_schema").template.lower()
     assert "select ref_key, class_key" in sql
-    assert "where physical_id = :physical_id" in sql
+    assert "where collection_id = :collection_id" in sql
     assert '"demo_schema".collection_configs' in sql
 
 

@@ -84,7 +84,7 @@ def build_tenant_feature_doc(
     catalog_id: str,
     collection_id: str,
     external_id: Any = None,
-    physical_id: Any = None,
+    asset_id: Any = None,
     known_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a canonical-envelope doc from a Feature/dict or
@@ -115,10 +115,9 @@ def build_tenant_feature_doc(
     property keys route to ``properties.extras`` when a strict overlay is
     active. Pass ``{}`` or omit for legacy fully-dynamic mode.
 
-    ``physical_id`` is the immutable physical_id (UUIDv7) of the parent asset.
-    Callers must resolve the logical asset_id to physical_id before passing it;
-    only the physical_id is stamped into item ``_source`` as
-    ``asset_physical_id``.  The mutable logical label is never written.
+    ``asset_id`` is the ingestion-context asset identity (mirrors the
+    public driver's ``_asset_id`` tracking field). It is projected into the
+    canonical ``asset_id`` identity field.
     """
     from dynastore.modules.elasticsearch.canonical_doc import build_canonical_index_doc
 
@@ -182,6 +181,9 @@ def build_tenant_feature_doc(
         else (src.get("_external_id") or raw_props.get("external_id"))
     )
 
+    # Resolve asset_id: explicit arg wins; fall back to source's _asset_id.
+    aid = asset_id if asset_id is not None else src.get("_asset_id")
+
     # Build a minimal raw row that carries the identity fields the canonical
     # builder needs for the ``system`` section.  Sidecar-columnar stats values
     # are also passed when they appear at the top level (e.g. after a
@@ -189,10 +191,8 @@ def build_tenant_feature_doc(
     row: Dict[str, Any] = {"geoid": geoid}
     if ext is not None:
         row["external_id"] = str(ext)
-    # Only the immutable asset_physical_id is stamped as ``asset_physical_id``
-    # in item ``_source``; the mutable logical asset_id is never written.
-    if physical_id is not None:
-        row["asset_physical_id"] = str(physical_id)
+    if aid is not None:
+        row["asset_id"] = str(aid)
     # Carry any SYSTEM_FIELD_KEY columns that surfaced on the raw src dict
     # (e.g. bulk-reindex reads that keep geometry_hash / validity flat).
     for sk in _sys_keys:

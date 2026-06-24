@@ -31,8 +31,9 @@ Covers (no DB required):
 - Extension pattern: custom AssetReferenceType subclass
 """
 
+import pytest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from dynastore.models.shared_models import AssetReferenceType, CoreAssetReferenceType
 from dynastore.modules.catalog.asset_service import (
@@ -243,7 +244,6 @@ class TestAssetUploadDefinition:
     def test_with_metadata(self):
         d = AssetUploadDefinition(
             asset_id="scene_001",
-            asset_type=AssetTypeEnum.ASSET,
             metadata={"sensor": "OLI-2", "cloud_cover": 5.2},
         )
         assert d.metadata["sensor"] == "OLI-2"
@@ -333,9 +333,6 @@ class TestProtocolCompliance:
             "ensure_asset_cleanup_trigger",
             "add_asset_reference", "remove_asset_reference", "list_asset_references",
             "list_assets_for_reference",
-            "rename_asset",
-            "resolve_asset_physical_id",
-            "resolve_asset_logical_id",
         ]:
             setattr(mock, method, AsyncMock())
         return mock
@@ -382,7 +379,7 @@ class TestRefTypeCoercion:
 
     def test_plain_string_no_value_attr(self):
         rt = "duckdb:table"
-        coerced = getattr(rt, "value", str(rt))
+        coerced = rt.value if hasattr(rt, "value") else str(rt)
         assert coerced == "duckdb:table"
 
     def test_custom_subclass_enum_coerced(self):

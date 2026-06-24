@@ -297,10 +297,10 @@ class TaskTableOutboxWriter:
             ctx.pg_conn,
             sql=f"""
                 INSERT INTO {task_schema}.tasks (
-                    task_id, schema_name, scope, caller_id, task_type, type,
+                    task_id, catalog_id, scope, caller_id, task_type, type,
                     execution_mode, inputs, collection_id, dedup_key, status
                 ) VALUES (
-                    :task_id, :schema_name, 'CATALOG', :caller_id, :task_type,
+                    :task_id, :catalog_id, 'CATALOG', :caller_id, :task_type,
                     'task', 'ASYNCHRONOUS', CAST(:inputs AS jsonb),
                     :collection_id, :dedup_key, 'PENDING'
                 )
@@ -308,7 +308,7 @@ class TaskTableOutboxWriter:
             """,
             params=dict(
                 task_id=task_id,
-                schema_name=schema_name,
+                catalog_id=schema_name,
                 caller_id=f"index_dispatcher:{indexer_id}",
                 task_type=self.TASK_TYPE,
                 inputs=json.dumps(inputs, cls=CustomJSONEncoder),

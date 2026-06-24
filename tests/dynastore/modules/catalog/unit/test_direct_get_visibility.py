@@ -40,6 +40,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 
 from dynastore.modules.catalog.catalog_service import CatalogService
+from dynastore.modules.catalog import catalog_service as catalog_service_mod
 
 
 _VIS_MODULE = "dynastore.models.protocols.visibility"
@@ -47,6 +48,31 @@ _RESOLVE_CATALOG = f"{_VIS_MODULE}.resolve_catalog_listing_ids"
 _RESOLVE_COLLECTION = f"{_VIS_MODULE}.resolve_collection_listing_ids"
 _MANAGED_TX = "dynastore.modules.catalog.catalog_service.managed_transaction"
 _GET_ENGINE = "dynastore.modules.catalog.catalog_service.get_catalog_engine"
+
+
+@pytest.fixture(autouse=True)
+def _no_external_id_db(monkeypatch):
+    """Phase 2: resolution of external→internal id requires a DB call.
+
+    All tests in this module use raw (already-internal-equivalent) ids and
+    do not set up external_id mappings in the database.  Patch the two DB
+    lookup helpers to return None so the resolution path falls through to
+    passthrough mode (original id used unchanged) rather than opening a real
+    connection.
+    """
+    from dynastore.modules.catalog.catalog_service import (
+        _catalog_external_id_cache,
+    )
+    _catalog_external_id_cache.cache_clear()
+
+    async def _absent(_self, cid: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        catalog_service_mod.CatalogService,
+        "_get_catalog_id_by_external_id_db",
+        _absent,
+    )
 
 
 def _make_service() -> CatalogService:
@@ -78,25 +104,20 @@ async def _null_tx(_engine):
 @pytest.mark.asyncio
 async def test_get_catalog_unseen_raises_value_error(monkeypatch):
     """When visible_ids does not contain the requested catalog_id, get_catalog
-    must raise ValueError without touching the DB — same exception as a
-    genuine miss, ensuring the HTTP layer returns 404 not 403."""
+    must raise ValueError — same exception as a genuine miss, ensuring the
+    HTTP layer returns 404 not 403.
+
+    Phase 2 note: resolution of external→internal id requires a DB lookup
+    before the visibility check so this test no longer asserts no-DB-touch;
+    it only asserts the correct ValueError is raised.
+    """
     monkeypatch.setattr(_RESOLVE_CATALOG, AsyncMock(return_value=frozenset({"other"})))
 
-    db_touched = False
-
-    @asynccontextmanager
-    async def _spy_tx(_engine):
-        nonlocal db_touched
-        db_touched = True
-        yield MagicMock()
-
-    with patch(_MANAGED_TX, side_effect=_spy_tx), \
+    with patch(_MANAGED_TX, side_effect=_null_tx), \
          patch(_GET_ENGINE, return_value=MagicMock()):
         svc = _make_service()
         with pytest.raises(ValueError, match="not found"):
             await svc.get_catalog("secret")
-
-    assert not db_touched, "DB must not be touched when catalog is not in visible set"
 
 
 @pytest.mark.asyncio
@@ -177,9 +198,15 @@ async def test_get_catalog_iam_off_missing_still_raises(monkeypatch):
 def _col_svc_patch(col_model_return):
     """Return a context-manager that patches CatalogService._col_svc property
     with a MagicMock whose get_collection_model is an AsyncMock returning
-    ``col_model_return``."""
+    ``col_model_return``.
+
+    Phase 2: also stubs resolve_collection_id to return None (passthrough —
+    no external_id mapping in unit tests) so get_collection's resolution step
+    falls through to the original collection_id.
+    """
     mock_col_svc = MagicMock()
     mock_col_svc.get_collection_model = AsyncMock(return_value=col_model_return)
+    mock_col_svc.resolve_collection_id = AsyncMock(return_value=None)
     return patch.object(
         CatalogService,
         "_col_svc",

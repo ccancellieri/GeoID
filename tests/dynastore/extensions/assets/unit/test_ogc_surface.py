@@ -127,6 +127,9 @@ def patched_bulk_env(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
     monkeypatch.setattr(
         svc_module, "require_catalog_ready", AsyncMock(return_value=None)
     )
+    monkeypatch.setattr(
+        svc_module, "require_collection_ready", AsyncMock(return_value=None)
+    )
     fake_engine = MagicMock(name="fake_engine")
     monkeypatch.setattr(svc_module, "get_engine", lambda: fake_engine)
     monkeypatch.setattr(
@@ -135,6 +138,11 @@ def patched_bulk_env(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
 
     catalogs_proto = AsyncMock()
     catalogs_proto.resolve_physical_schema = AsyncMock(return_value="ds_test")
+    # resolve_catalog_id / resolve_collection_id return None so the resolution
+    # block treats the incoming ids as already internal and leaves them unchanged.
+    catalogs_proto.resolve_catalog_id = AsyncMock(return_value=None)
+    catalogs_proto.collections = AsyncMock()
+    catalogs_proto.collections.resolve_collection_id = AsyncMock(return_value=None)
     configs_proto = AsyncMock()
     configs_proto.get_config = AsyncMock(return_value=AssetsWritePolicy())
 

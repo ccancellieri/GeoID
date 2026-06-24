@@ -91,7 +91,7 @@ async def _persist_updated_refs(
         async with managed_transaction(engine) as conn:
             await DQLQuery(
                 f"UPDATE {task_schema}.tasks SET inputs = :inputs"
-                " WHERE task_id = :task_id AND schema_name = :schema_name;",
+                " WHERE task_id = :task_id AND catalog_id = :schema_name;",
                 result_handler=ResultHandler.NONE,
             ).execute(
                 conn,
@@ -132,7 +132,10 @@ class CascadeCleanupTask(TaskProtocol):
         )
 
         task_id = getattr(payload, "task_id", None)
-        schema: str = getattr(payload, "schema_name", None) or "system"
+        # cascade_cleanup rows are system-scoped (catalog_id='system'); the
+        # TaskPayload carries no tenant field, so this resolves to 'system',
+        # which is exactly the row this task's retry-count UPDATE must match.
+        schema: str = getattr(payload, "catalog_id", None) or "system"
 
         dead_refs: list[str] = []
         retry_refs: list[str] = []

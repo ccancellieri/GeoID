@@ -55,8 +55,8 @@ class TaskQueueProtocol(TasksProtocol, Protocol):
     - Orphan cleanup for deleted catalogs
 
     The `schema` parameter in inherited TasksProtocol methods now refers to the
-    `schema_name` column value in the global `tasks.tasks` table, not a
-    PostgreSQL schema qualifier.
+    `catalog_id` column value in the global `tasks.tasks` table (the catalog
+    internal id), not a PostgreSQL schema qualifier.
     """
 
     async def enqueue(
@@ -89,7 +89,7 @@ class TaskQueueProtocol(TasksProtocol, Protocol):
         and execution modes.
 
         Uses FOR UPDATE SKIP LOCKED to prevent contention across instances.
-        Returns a dict with task fields including schema_name, or None if
+        Returns a dict with task fields including catalog_id, or None if
         no matching task is available.
         """
         ...

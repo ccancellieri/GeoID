@@ -24,9 +24,7 @@ Three scope-specific tables + one content-addressed schema registry:
 * ``configs.platform_configs`` — global, keyed by ``ref_key`` (Cycle F.4c.1).
 * ``"<tenant_schema>".catalog_configs`` — per-tenant, keyed by ``ref_key``.
 * ``"<tenant_schema>".collection_configs`` — per-tenant, keyed by
-  ``(physical_id, ref_key)``.  ``physical_id`` is the collection's immutable
-  ``c_…`` token stored in ``{schema}.collections.physical_id``; it never
-  changes on a collection rename, so all config rows survive a rename intact.
+  ``(collection_id, ref_key)``.
 
 Cycle F.4c.1 introduces ``ref_key`` as the operator-chosen instance name and
 makes it part of the primary key.  ``class_key`` remains a NOT NULL
@@ -133,13 +131,13 @@ def tenant_configs_ddl(tenant_schema: str) -> str:
         ON "{tenant_schema}".catalog_configs (class_key);
 
     CREATE TABLE IF NOT EXISTS "{tenant_schema}".collection_configs (
-        physical_id   TEXT        NOT NULL,
+        collection_id TEXT        NOT NULL,
         ref_key       TEXT        NOT NULL,
         class_key     TEXT        NOT NULL,
         schema_id     TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
         config_data   JSONB       NOT NULL,
         updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (physical_id, ref_key)
+        PRIMARY KEY (collection_id, ref_key)
     );
 
     CREATE INDEX IF NOT EXISTS ix_collection_configs_class_key

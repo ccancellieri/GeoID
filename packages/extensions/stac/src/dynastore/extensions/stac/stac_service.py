@@ -61,7 +61,6 @@ from .stac_models import (
     STACCatalogUpdate,
 )
 from .stac_aggregation_models import AggregationRequest
-from dynastore.extensions.ogc_models_shared import RenameRequest, RenameResponse
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
 from dynastore.extensions.tools.url import get_url
 from dynastore.tools.discovery import get_protocol, get_protocols
@@ -367,11 +366,6 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             # Write Operations
             ("/catalogs", "create_stac_catalog", ["POST"], {"status_code": status.HTTP_201_CREATED}),
             ("/catalogs/{catalog_id}/collections", "create_stac_collection", ["POST"], {"status_code": status.HTTP_201_CREATED}),
-            # Rename endpoints — must be declared BEFORE the parametric
-            # {catalog_id} and {collection_id} routes so Starlette matches
-            # the literal `:rename` suffix first.
-            ("/catalogs/{catalog_id}:rename", "rename_stac_catalog", ["POST"], {"status_code": status.HTTP_200_OK}),
-            ("/catalogs/{catalog_id}/collections/{collection_id}:rename", "rename_stac_collection", ["POST"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}", "replace_stac_catalog", ["PUT"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}", "update_stac_catalog", ["PATCH"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}", "delete_stac_catalog", ["DELETE"], {}),
@@ -789,106 +783,39 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         self,
         catalog_id: str,
         definition: STACCatalogRequest,
+        request: Request,
         language: str = Depends(get_language),
     ):
-        # OGC API Features Part 4 / STAC Transaction Extension: PUT replaces
-        # the whole resource with the request body. Required-field validation
-        # is enforced by ``STACCatalogRequest`` (the same model used on POST),
-        # so a partial body is rejected at the framework boundary.
-        if definition.id != catalog_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Body 'id' ({definition.id!r}) must match path catalog_id "
-                    f"({catalog_id!r})."
-                ),
-            )
+        # PUT replaces the whole resource.  A body ``id`` matching the path id
+        # is a normal replace.  A different body ``id`` is allowed ONLY with
+        # ``Prefer: handling=move`` (RFC 7240) — without that header STAC
+        # Transaction mandates 400 (on_id_mismatch="reject").
         input_data = definition.model_dump(exclude_unset=False)
         input_data = normalize_i18n_for_replace(input_data, language)
-        return await self._ogc_replace_catalog(catalog_id, input_data, language, None)
-
-    async def rename_stac_catalog(
-        self,
-        catalog_id: str,
-        body: RenameRequest,
-    ) -> RenameResponse:
-        """Rename a catalog's logical id.
-
-        POST /stac/catalogs/{catalog_id}:rename
-
-        Only the human-readable label (``catalog.catalogs.id``) is updated.
-        Physical schema, storage backends, and configs are unchanged.  IAM
-        bindings that reference the old id must be updated manually.
-        """
-        from dynastore.models.protocols import CatalogsProtocol
-        from dynastore.modules.catalog.catalog_service import _CatalogRenameConflictError
-
-        catalogs = get_protocol(CatalogsProtocol)
-        if catalogs is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Catalog service unavailable.",
-            )
-        try:
-            return await catalogs.rename_catalog(catalog_id, body.new_id)
-        except _CatalogRenameConflictError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            ) from e
-        except ValueError as e:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=str(e),
-            ) from e
-
-    async def rename_stac_collection(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        body: RenameRequest,
-    ) -> RenameResponse:
-        """Rename a collection's logical id.
-
-        POST /stac/catalogs/{catalog_id}/collections/{collection_id}:rename
-
-        Only the human-readable label columns are updated.  The physical
-        table, partition key, and storage backends are unchanged.
-        """
-        from dynastore.models.protocols import CatalogsProtocol
-        from dynastore.modules.catalog.collection_service import CollectionRenameConflictError
-
-        catalogs = get_protocol(CatalogsProtocol)
-        if catalogs is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Catalog service unavailable.",
-            )
-        try:
-            return await catalogs.rename_collection(catalog_id, collection_id, body.new_id)
-        except CollectionRenameConflictError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            ) from e
-        except ValueError as e:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=str(e),
-            ) from e
+        body_id = definition.id
+        return await self._ogc_replace_catalog(
+            catalog_id, input_data, language, None,
+            request=request, body_id=body_id, on_id_mismatch="reject",
+        )
 
     async def update_stac_catalog(
         self,
         catalog_id: str,
         definition: STACCatalogUpdate,
+        request: Request,
         language: str = Depends(get_language),
     ):
         input_data = definition.model_dump(exclude_unset=True)
-        return await self._ogc_update_catalog(catalog_id, input_data, language, None)
+        body_id: Optional[str] = input_data.get("id")
+        return await self._ogc_update_catalog(
+            catalog_id, input_data, language, None,
+            body_id=body_id, request=request, on_id_mismatch="reject",
+        )
 
     async def delete_stac_catalog(
         self,
         catalog_id: str,
+        request: Request,
         force: bool = Query(
             False,
             description=(
@@ -904,27 +831,21 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         catalog_id: str,
         collection_id: str,
         request_body: STACCollectionRequest,
+        request: Request,
         language: str = Depends(get_language),
     ):
-        # OGC API Features Part 4 / STAC Transaction Extension: PUT replaces
-        # the whole collection. ``STACCollectionRequest`` enforces required
-        # STAC fields (id/type/license/extent/...) so partial bodies fail
-        # before reaching the manager.
-        if request_body.id != collection_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Body 'id' ({request_body.id!r}) must match path collection_id "
-                    f"({collection_id!r})."
-                ),
-            )
+        # PUT replaces the whole collection.  A body ``id`` different from the
+        # path id is allowed ONLY with ``Prefer: handling=move`` — without that
+        # header STAC Transaction mandates 400 (on_id_mismatch="reject").
+        body_id = request_body.id
         input_data = request_body.model_dump(exclude_unset=False)
         if await self._should_validate_on_write(catalog_id, collection_id):
             validate_stac_collection(input_data)
         input_data = _pack_stac_extras(input_data, language)
         input_data = normalize_i18n_for_replace(input_data, language)
         return await self._ogc_replace_collection(
-            catalog_id, collection_id, input_data, language
+            catalog_id, collection_id, input_data, language,
+            request=request, body_id=body_id, on_id_mismatch="reject",
         )
 
     async def update_stac_collection(
@@ -937,11 +858,13 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         # Sidecars are handled transparently by ItemsProtocol / LifecycleRegistry.
         input_data = request_body.model_dump(exclude_unset=True)
+        body_id: Optional[str] = input_data.get("id")
         # Fold any STAC extension extras in the PATCH payload (cube:dimensions,
         # themes, …) and providers/summaries into extra_metadata for round-trip.
         input_data = _pack_stac_extras(input_data, language)
         return await self._ogc_update_collection(
-            catalog_id, collection_id, input_data, language, request
+            catalog_id, collection_id, input_data, language, request,
+            body_id=body_id, on_id_mismatch="reject",
         )
 
     async def delete_stac_collection(

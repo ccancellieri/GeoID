@@ -216,7 +216,6 @@ class EventDriverProtocol(Protocol):
         event_type: str,
         payload: Dict[str, Any],
         scope: str = "PLATFORM",
-        schema_name: Optional[str] = None,
         catalog_id: Optional[str] = None,
         collection_id: Optional[str] = None,
         identity_id: Optional[str] = None,

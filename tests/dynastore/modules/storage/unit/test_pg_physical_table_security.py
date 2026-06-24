@@ -18,20 +18,17 @@
 
 """Security regression tests for the PG items driver physical-table handling.
 
-Layered defenses after the physical_id unification (retired physical_table JSONB
-pin):
+Covers the layered defenses against caller-controlled ``physical_table``
+reaching SQL identifiers unvalidated, and against the vestigial
+``physical_schema`` override:
 
-- L1: ``resolve_physical_table`` reads from ``CatalogsProtocol.resolve_physical_id``
-  and validates the returned identifier before it reaches any SQL expression.
-  An unsafe value from the registry (corrupted row) is rejected at this boundary.
-- L1a: ``_resolve_schema`` rejects unsafe schema identifiers (unchanged).
-- L2: ``ItemsPostgresqlDriverConfig`` no longer carries a ``physical_table``
-  field — the physical name is not stored in JSONB.  Callers that previously
-  read ``config.physical_table`` must use
-  ``CatalogsProtocol.resolve_physical_id``.
+- L1: ``resolve_physical_table`` / ``_resolve_schema`` reject unsafe
+  identifiers before any value reaches an f-string SQL identifier.
+- L2: ``ItemsPostgresqlDriverConfig`` rejects an unsafe ``physical_table``
+  charset at validation time.
 - L3a: the collection-init hook never persists a caller-supplied
-  ``physical_table`` — the field does not exist on the persisted config.
-- L4: the vestigial ``physical_schema`` field remains absent.
+  ``physical_table`` (system-assigned only).
+- L4: the vestigial ``physical_schema`` field is gone.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -43,121 +40,88 @@ from dynastore.modules.storage.drivers.postgresql import ItemsPostgresqlDriver
 from dynastore.tools.db import InvalidIdentifierError
 
 
-# A value that breaks out of `"{schema}"."{table}"` — the double-quote
-# terminates the quoted identifier and opens an injection.
-INJECTION = 'c__" ; DROP TABLE secret; --'
-# A valid c_-prefixed physical_id produced by generate_physical_name("c_").
-VALID = "c__abc12345"
+# A value that breaks out of `"{schema}"."{physical_table}"` — the double
+# quote terminates the quoted identifier and opens an injection.
+INJECTION = 't" ; DROP TABLE secret; --'
+# A syntactically valid identifier (would pass charset) used to prove the
+# config field accepts well-formed names.
+VALID = "t_abc12345"
 
 
 # --------------------------------------------------------------------------
-# L2 — physical_table field removed from ItemsPostgresqlDriverConfig
+# L2 — config-level charset validation
 # --------------------------------------------------------------------------
 
 
-class TestPhysicalTableFieldRemoved:
-    def test_physical_table_not_in_model_fields(self):
-        """physical_table must not appear in ItemsPostgresqlDriverConfig.model_fields.
+class TestConfigPhysicalTableValidation:
+    def test_rejects_injection_charset(self):
+        with pytest.raises(ValueError):
+            ItemsPostgresqlDriverConfig.model_validate({"physical_table": INJECTION})
 
-        The physical name is now authoritative in collections.physical_id and
-        resolved via CatalogsProtocol.resolve_physical_id — never stored in
-        collection_configs JSONB.
-        """
-        assert "physical_table" not in ItemsPostgresqlDriverConfig.model_fields, (
-            "physical_table must not be a declared field on ItemsPostgresqlDriverConfig"
-        )
+    def test_rejects_embedded_quote(self):
+        with pytest.raises(ValueError):
+            ItemsPostgresqlDriverConfig.model_validate({"physical_table": 'a"b'})
 
-    def test_physical_schema_not_in_model_fields(self):
+    def test_accepts_valid_identifier(self):
+        cfg = ItemsPostgresqlDriverConfig.model_validate({"physical_table": VALID})
+        assert cfg.physical_table == VALID
+
+    def test_none_is_allowed(self):
+        cfg = ItemsPostgresqlDriverConfig.model_validate({})
+        assert cfg.physical_table is None
+
+
+# --------------------------------------------------------------------------
+# L4 — vestigial physical_schema removed
+# --------------------------------------------------------------------------
+
+
+class TestPhysicalSchemaRemoved:
+    def test_field_absent(self):
         assert "physical_schema" not in ItemsPostgresqlDriverConfig.model_fields
 
+    def test_physical_table_is_computed(self):
+        from dynastore.models.mutability import computed_fields, is_computed_field
+
+        fi = ItemsPostgresqlDriverConfig.model_fields["physical_table"]
+        assert is_computed_field(fi)
+        assert "physical_table" in computed_fields(ItemsPostgresqlDriverConfig)
+
+    def test_physical_table_is_readonly_in_schema(self):
+        # Generated/machine-controlled fields must advertise read-only on the wire.
+        schema = ItemsPostgresqlDriverConfig.model_json_schema()
+        assert schema["properties"]["physical_table"].get("readOnly") is True
+
 
 # --------------------------------------------------------------------------
-# L1 — SQL-boundary validation in resolve_physical_table
+# L1 — SQL-boundary validation in the resolvers
 # --------------------------------------------------------------------------
 
 
 class TestResolvePhysicalTableValidation:
     @pytest.mark.asyncio
-    async def test_rejects_unsafe_physical_id_from_registry(self):
-        """Even a corrupted registry value must be rejected before it reaches SQL.
-
-        resolve_physical_table delegates to CatalogsProtocol.resolve_physical_id
-        and validates the returned string via validate_sql_identifier before
-        returning it to any SQL-composing caller.
-        """
+    async def test_rejects_unsafe_stored_table(self):
+        """Even a value that bypassed config validation (legacy row, model_copy)
+        must be rejected before it reaches SQL."""
         driver = ItemsPostgresqlDriver()
-        catalogs = MagicMock()
-        catalogs.resolve_physical_id = AsyncMock(return_value=INJECTION)
-        with patch("dynastore.tools.discovery.get_protocol", return_value=catalogs):
+        bad = ItemsPostgresqlDriverConfig.model_construct(physical_table=INJECTION)
+        with patch.object(driver, "get_driver_config", AsyncMock(return_value=bad)):
             with pytest.raises(InvalidIdentifierError):
                 await driver.resolve_physical_table("cat1", "col1")
 
     @pytest.mark.asyncio
-    async def test_passes_valid_physical_id(self):
-        """A valid physical_id that corresponds to an existing hub table is returned.
-
-        resolve_physical_table now verifies hub-table existence after resolving
-        the identifier.  The test short-circuits the slow path via the
-        process-local _confirmed_active cache.
-        """
+    async def test_passes_valid_table(self):
         driver = ItemsPostgresqlDriver()
-        catalogs = MagicMock()
-        catalogs.resolve_physical_id = AsyncMock(return_value=VALID)
-        from dynastore.modules.catalog.collection_service import (
-            _confirmed_active,
-            _mark_confirmed_active,
-            _unmark_confirmed_active,
-        )
-        _mark_confirmed_active("cat1", "col1")
-        try:
-            with patch("dynastore.tools.discovery.get_protocol", return_value=catalogs):
-                assert await driver.resolve_physical_table("cat1", "col1") == VALID
-        finally:
-            _unmark_confirmed_active("cat1", "col1")
+        good = ItemsPostgresqlDriverConfig.model_construct(physical_table=VALID)
+        with patch.object(driver, "get_driver_config", AsyncMock(return_value=good)):
+            assert await driver.resolve_physical_table("cat1", "col1") == VALID
 
     @pytest.mark.asyncio
-    async def test_none_when_protocol_absent(self):
-        """No CatalogsProtocol registered → None (collection not provisioned)."""
+    async def test_none_passthrough(self):
         driver = ItemsPostgresqlDriver()
-        with patch("dynastore.tools.discovery.get_protocol", return_value=None):
+        empty = ItemsPostgresqlDriverConfig.model_construct(physical_table=None)
+        with patch.object(driver, "get_driver_config", AsyncMock(return_value=empty)):
             assert await driver.resolve_physical_table("cat1", "col1") is None
-
-    @pytest.mark.asyncio
-    async def test_none_when_physical_id_absent(self):
-        """Registry row exists but physical_id is NULL → None."""
-        driver = ItemsPostgresqlDriver()
-        catalogs = MagicMock()
-        catalogs.resolve_physical_id = AsyncMock(return_value=None)
-        with patch("dynastore.tools.discovery.get_protocol", return_value=catalogs):
-            assert await driver.resolve_physical_table("cat1", "col1") is None
-
-    @pytest.mark.asyncio
-    async def test_none_when_hub_table_absent(self):
-        """physical_id set in registry but hub table not yet created → None.
-
-        ensure_storage has not run yet (lazy-activation pending state).
-        resolve_physical_table must return None so item_query's pending guard
-        fires rather than attempting to SELECT from a non-existent relation.
-        """
-        driver = ItemsPostgresqlDriver()
-        catalogs = MagicMock()
-        catalogs.resolve_physical_id = AsyncMock(return_value=VALID)
-        catalogs.resolve_physical_schema = AsyncMock(return_value="s_abc12345")
-        from dynastore.modules.catalog.collection_service import _unmark_confirmed_active
-        _unmark_confirmed_active("cat_pending", "col_pending")
-        with (
-            patch("dynastore.tools.discovery.get_protocol", return_value=catalogs),
-            patch(
-                "dynastore.modules.db_config.locking_tools.check_table_exists",
-                new=AsyncMock(return_value=False),
-            ),
-        ):
-            assert await driver.resolve_physical_table("cat_pending", "col_pending") is None
-
-
-# --------------------------------------------------------------------------
-# L1a — SQL-boundary validation for the schema resolver (unchanged)
-# --------------------------------------------------------------------------
 
 
 class TestResolveSchemaValidation:
@@ -180,26 +144,39 @@ class TestResolveSchemaValidation:
 
 
 # --------------------------------------------------------------------------
-# L3a — collection-init hook: no physical_table field on persisted config
+# L3a — collection-init hook strips caller-supplied physical_table
 # --------------------------------------------------------------------------
 
 
-class TestInitCollectionHookNoPhysicalTablePin:
+class TestInitCollectionHookStrip:
     @pytest.mark.asyncio
-    async def test_physical_table_in_layer_config_is_extra_only(self):
-        """A layer_config dict with only physical_table has no meaningful PG
-        fields to persist — the key is absorbed as an extra field (model config
-        extra='allow') but is NOT a declared field.  Verify the model behaviour
-        so call-sites that strip by declared-fields don't inadvertently persist it.
-        """
-        from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+    async def test_caller_physical_table_not_persisted(self):
+        from dynastore.modules.storage.drivers import postgresql as pg
 
-        cfg = ItemsPostgresqlDriverConfig.model_validate({"physical_table": VALID})
-        # physical_table must NOT appear in declared model_fields
-        assert "physical_table" not in ItemsPostgresqlDriverConfig.model_fields, (
-            "physical_table must not be a declared field"
-        )
+        captured = {}
 
-    def test_physical_table_field_absent_from_model(self):
-        """ItemsPostgresqlDriverConfig.model_fields must not contain physical_table."""
-        assert "physical_table" not in ItemsPostgresqlDriverConfig.model_fields
+        configs = MagicMock()
+
+        async def _set_config(cls, cfg, **kwargs):
+            captured["cfg"] = cfg
+            return cfg
+
+        configs.set_config = AsyncMock(side_effect=_set_config)
+
+        def _get_protocol(proto):
+            return configs
+
+        with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+            await pg._pg_driver_init_collection(
+                conn=MagicMock(),
+                schema="s_abc12345",
+                catalog_id="cat1",
+                collection_id="col1",
+                layer_config={"physical_table": VALID},
+            )
+
+        # Either nothing was persisted (physical_table was the only field and it
+        # was stripped) or, if persisted, physical_table must not carry the
+        # caller value.
+        if "cfg" in captured:
+            assert getattr(captured["cfg"], "physical_table", None) != VALID

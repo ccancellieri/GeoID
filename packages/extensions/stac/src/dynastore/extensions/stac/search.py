@@ -461,6 +461,7 @@ def _inject_search_hints(
     features: list,
     cat_id: str,
     cids: list,
+    coll_ext_id_map: Optional[Dict[str, str]] = None,
 ) -> list:
     """Inject the catalog/collection hints the STAC search serializer reads.
 
@@ -472,7 +473,17 @@ def _inject_search_hints(
     reads — the same hints the PostgreSQL path injects. The collection hint
     prefers the item's own ``collection`` and falls back to the sole requested
     collection when only one is in scope.
+
+    ``coll_ext_id_map`` maps internal collection ids to their public external
+    labels; when provided, both the per-feature ``collection`` attribute and
+    the ``cids`` fallback are translated before being stored as the hint so the
+    STAC item serializer emits the public id on every search result.
     """
+    def _ext(internal: str) -> str:
+        if coll_ext_id_map:
+            return coll_ext_id_map.get(internal, internal)
+        return internal
+
     for feat in features:
         if feat.properties is None:
             feat.properties = {}
@@ -480,7 +491,7 @@ def _inject_search_hints(
         coll_id = getattr(feat, "collection", None)
         if not coll_id and len(cids) == 1:
             coll_id = cids[0]
-        feat.properties.setdefault("_collection_id", coll_id or "")
+        feat.properties.setdefault("_collection_id", _ext(coll_id or ""))
     return features
 
 
@@ -490,6 +501,7 @@ async def _maybe_dispatch_to_es_search(
     *,
     principals: Optional[List[str]] = None,
     principal: Optional[Any] = None,
+    coll_ext_id_map: Optional[Dict[str, str]] = None,
 ) -> Optional[Tuple[list, int, Optional[Dict[str, Any]]]]:
     """Dispatch a structural search to the catalog's routing-pinned items
     SEARCH driver, when one is configured and search-capable.
@@ -633,7 +645,7 @@ async def _maybe_dispatch_to_es_search(
 
     # read_entities already rebuilt the read contract; only inject the
     # serializer's catalog/collection hints — see :func:`_inject_search_hints`.
-    _inject_search_hints(features, cat_id, cids)
+    _inject_search_hints(features, cat_id, cids, coll_ext_id_map=coll_ext_id_map)
     return features, total, None
 
 
@@ -642,7 +654,7 @@ async def _expand_collections_for_search(
     cat_id: str,
     search_request: ItemSearchRequest,
     db_resource: DbResource,
-) -> ItemSearchRequest:
+) -> Tuple[ItemSearchRequest, Dict[str, str]]:
     """Scope an unscoped search to ALL collections of the catalog.
 
     The search-driver dispatch requires explicit collection scoping to
@@ -653,22 +665,33 @@ async def _expand_collections_for_search(
     ``ids``-only lookups) answered ``numberMatched: 0`` while the same query
     scoped with ``collections=`` matched.
 
+    Returns a tuple of (request, coll_ext_id_map) where ``coll_ext_id_map``
+    maps each internal collection id to its public external label. The map is
+    built from the ``list_collections`` round-trip so the STAC item serializer
+    can emit the correct public id on every search result without extra DB hits.
+
     Returns the request unchanged when it is already scoped or the catalog
     has no collections; otherwise returns a copy scoped to every collection
     id (one ``list_collections`` round-trip — the PG fallback reuses the
     explicit scope instead of enumerating again).
     """
     if search_request.collections:
-        return search_request
-    all_cids = [
-        c.id
-        for c in await catalogs.list_collections(
-            cat_id, limit=1000, ctx=DriverContext(db_resource=db_resource)
-        )
-    ]
+        # Already scoped to explicit collection ids — the hydration paths emit
+        # the public id directly (the PG path reuses the user-supplied external
+        # ids; the ES path reads the external id off the document), so no map is
+        # needed and we skip the list_collections round-trip on this hot path.
+        return search_request, {}
+    all_collections = await catalogs.list_collections(
+        cat_id, limit=1000, ctx=DriverContext(db_resource=db_resource)
+    )
+    coll_ext_id_map: Dict[str, str] = {
+        c.id: (getattr(c, "external_id", None) or c.id)
+        for c in (all_collections or [])
+    }
+    all_cids = list(coll_ext_id_map.keys())
     if not all_cids:
-        return search_request
-    return search_request.model_copy(update={"collections": all_cids})
+        return search_request, coll_ext_id_map
+    return search_request.model_copy(update={"collections": all_cids}), coll_ext_id_map
 
 
 async def search_items(
@@ -691,7 +714,9 @@ async def search_items(
     # An unscoped request is rewritten to explicitly scope all collections of
     # the catalog so the routing-aware dispatch below can serve it; see
     # :func:`_expand_collections_for_search`.
-    search_request = await _expand_collections_for_search(
+    # The function also returns an internal→external collection id map used
+    # throughout the search response to emit public ids, not internal tokens.
+    search_request, _coll_ext_id_map = await _expand_collections_for_search(
         catalogs, cat_id, search_request, db_resource
     )
 
@@ -704,6 +729,7 @@ async def search_items(
     # QueryOptimizer SQL path below. See :func:`_maybe_dispatch_to_es_search`.
     search_dispatch_result = await _maybe_dispatch_to_es_search(
         cat_id, search_request, principals=principals, principal=principal,
+        coll_ext_id_map=_coll_ext_id_map,
     )
     if search_dispatch_result is not None:
         return search_dispatch_result
@@ -1073,15 +1099,15 @@ async def search_items(
             offset=None,
         )
 
-        # Physical table for this collection: it is named after the
-        # collection's immutable ``physical_id``.  Resolve with the live
-        # ``db_resource`` (``phys_schema`` above is resolved the same way).
-        # A None here would silently skip the collection and make COLUMNAR
-        # attribute search return an empty page (#1641), so resolve directly.
-        phys_table = await catalogs2.resolve_physical_id(
-            cat_id, collection_id,
-            ctx=DriverContext(db_resource=db_resource), allow_missing=True,
-        )
+        # Physical table for this collection. Resolve from the per-collection
+        # driver config already loaded above (``collection_configs``, fetched
+        # with the live ``db_resource``). ``driver.location()`` must NOT be used
+        # here: it takes no ``db_resource`` and re-resolves the config with
+        # none, yielding a default config whose ``physical_table`` is ``None``,
+        # so ``location()`` raises and the collection is silently skipped —
+        # COLUMNAR attribute search then returns an empty page (#1641).
+        # ``phys_schema`` above is likewise resolved with the live resource.
+        phys_table = getattr(config, "physical_table", None)
         if phys_table:
             from dynastore.tools.db import validate_sql_identifier
 
@@ -1408,7 +1434,10 @@ async def search_items(
                     for _hk in _HYDRATION_INTERNAL_FIELDS:
                         feature.properties.pop(_hk, None)
                     feature.properties["_catalog_id"] = item_data["catalog_id"]
-                    feature.properties["_collection_id"] = item_data["collection_id"]
+                    _internal_coll_id = item_data["collection_id"]
+                    feature.properties["_collection_id"] = (
+                        _coll_ext_id_map.get(_internal_coll_id, _internal_coll_id)
+                    )
                     rows.append(feature)
             else:
                 rows.append(item_data)
@@ -1497,7 +1526,7 @@ async def search_collections(
         # Search all catalogs the caller may see.
         # We query the catalog registry directly to find all active physical schemas
         catalog_query = (
-            "SELECT id, physical_schema FROM catalog.catalogs WHERE deleted_at IS NULL"
+            "SELECT id FROM catalog.catalogs WHERE deleted_at IS NULL"
         )
         try:
             rows = await DQLQuery(
@@ -1507,7 +1536,7 @@ async def search_collections(
             logger.warning(f"Failed to retrieve catalog schemas for global search: {e}")
             return [], 0
         for row in rows or []:
-            cid, schema = row.get("id"), row.get("physical_schema")
+            cid, schema = row.get("id"), row.get("id")
             if not cid or not schema:
                 continue
             if visible_catalogs is not None and cid not in visible_catalogs:
@@ -1596,8 +1625,8 @@ async def search_collections(
         union_queries.append(
             f'SELECT {_meta_cols} '
             f'FROM "{schema}".collections c '
-            f'LEFT JOIN "{schema}".collection_core mc ON mc.collection_physical_id = c.physical_id '
-            f'LEFT JOIN "{schema}".collection_stac ms ON ms.collection_physical_id = c.physical_id '
+            f'LEFT JOIN "{schema}".collection_core mc ON mc.collection_id = c.id '
+            f'LEFT JOIN "{schema}".collection_stac ms ON ms.collection_id = c.id '
             f'WHERE {per_where}'
         )
 

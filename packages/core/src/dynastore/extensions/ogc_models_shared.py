@@ -22,47 +22,9 @@ Used by Features, Records, and STAC extensions.  Not tied to any single
 protocol — any OGC service that supports bulk creation can import from here.
 """
 
-from typing import List, Optional, Literal
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
-
-
-class RenameRequest(BaseModel):
-    """Request body for rename endpoints."""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    new_id: str = Field(..., description="The desired new logical identifier.")
-
-
-class RenameResponse(BaseModel):
-    """Response for rename endpoints (catalog, collection, or asset)."""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    old_id: str = Field(..., description="The previous logical identifier.")
-    new_id: str = Field(..., description="The new logical identifier (after normalization).")
-    level: Literal["catalog", "collection", "asset"] = Field(
-        ..., description="The entity level being renamed."
-    )
-    warnings: List[str] = Field(
-        default_factory=list,
-        description="Warning codes emitted by the rename operation.",
-    )
-    reindex_required: bool = Field(
-        False,
-        description=(
-            "True when the secondary ES index contains the old logical id in "
-            "document fields; a reindex is needed to reflect the new id there."
-        ),
-    )
-    iam_manual_update_required: bool = Field(
-        False,
-        description=(
-            "True for catalog and collection renames: IAM policy bindings that "
-            "reference the old logical id must be updated manually."
-        ),
-    )
 
 
 class BulkCreationResponse(BaseModel):

@@ -119,8 +119,8 @@ class RunnerContext(BaseModel):
     inputs: Dict[str, Any]
     asset: Optional[Any] = None
     db_schema: str = "tasks"
-    """Catalog physical schema (e.g. ``s_2ka8fbc3``) used as the
-    ``schema_name`` column on the task row. ``"public"`` for PLATFORM-scoped
+    """Catalog internal id (e.g. ``s_2ka8fbc3``) used as the
+    ``catalog_id`` column on the task row. ``"platform"`` for PLATFORM-scoped
     work, ``"system"`` for cross-tenant platform tasks. NOT the host PG
     schema of the tasks table — that lives globally in ``get_task_schema()``."""
     collection_id: Optional[str] = Field(
@@ -133,7 +133,7 @@ class RunnerContext(BaseModel):
     extra_context: Dict[str, Any]
     dedup_key: Optional[str] = None
     """Idempotency token. When set, runners pass this to ``TaskCreate`` so the
-    DB partial unique index on ``(schema_name, dedup_key)`` for non-terminal
+    DB partial unique index on ``(catalog_id, dedup_key)`` for non-terminal
     tasks collapses redelivered events into a single task. ``create_task``
     returns ``None`` on a dedup hit; the runner then returns ``None`` and
     ``ExecutionEngine.execute`` short-circuits without trying other runners."""

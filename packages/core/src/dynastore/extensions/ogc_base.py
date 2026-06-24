@@ -34,7 +34,7 @@ Usage::
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, cast
 
 from fastapi import Depends, HTTPException, Request, Response, status
 
@@ -657,6 +657,10 @@ class OGCServiceMixin:
         catalog_dict: Dict[str, Any],
         language: str,
         db_resource: Any,
+        *,
+        request: Optional[Request] = None,
+        body_id: Optional[str] = None,
+        on_id_mismatch: Literal["ignore", "reject"] = "ignore",
     ) -> Response:
         """Shared replace-catalog (PUT) body used by Features and STAC.
 
@@ -664,12 +668,68 @@ class OGCServiceMixin:
         ``normalize_i18n_for_replace``; this method performs no additional
         normalization.  *db_resource* follows the same convention as
         ``_ogc_create_catalog``.
+
+        When *body_id* differs from *catalog_id* (the path parameter) three
+        cases apply:
+
+        1. ``Prefer: handling=move`` present: perform a MOVE (rename the
+           catalog to *body_id*); respond with 200 + ``Content-Location``,
+           ``Link: rel=canonical``, and ``Preference-Applied: handling=move``.
+        2. Move NOT requested, *on_id_mismatch* == ``"reject"`` (STAC): raise
+           400 — STAC Transaction mandates that a body ``id`` not matching the
+           path ``id`` is an error.
+        3. Move NOT requested, *on_id_mismatch* == ``"ignore"`` (OGC Features
+           Part 4 Req 11): drop the body id and replace using the path id.
+
+        When *body_id* is absent or equals *catalog_id* the normal replace
+        path runs regardless of the header or the mismatch policy.
         """
         catalogs_svc = await self._get_catalogs_service()
         await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
 
+        # Mismatch branch: body id differs from path id.
+        if body_id is not None and body_id != catalog_id:
+            # MOVE gate: only rename when the client explicitly opts in.
+            if request is not None and self._wants_move(request):
+                internal_id, new_external_id, content_location = (
+                    await self._ogc_perform_catalog_rename(catalog_id, body_id, request=request)
+                )
+                ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
+                update_kwargs: Dict[str, Any] = {}
+                if ctx is not None:
+                    update_kwargs["ctx"] = ctx
+                catalog_dict = {**catalog_dict, "id": new_external_id}
+                updated = await catalogs_svc.update_catalog(
+                    internal_id, catalog_dict, lang="*", **update_kwargs
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Catalog not found after rename.",
+                    )
+                localized_data, _ = self._localize_resource(updated, language)
+                response = JSONResponse(content=localized_data)
+                if content_location is not None:
+                    response.headers["Content-Location"] = content_location
+                    response.headers["Link"] = f'<{content_location}>; rel="canonical"'
+                response.headers["Preference-Applied"] = "handling=move"
+                return response
+
+            # No MOVE requested: apply per-surface id-mismatch policy.
+            if on_id_mismatch == "reject":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Body id '{body_id}' does not match path id '{catalog_id}'."
+                        " Send 'Prefer: handling=move' to rename."
+                    ),
+                )
+            # on_id_mismatch == "ignore": drop body id, replace using path id.
+            catalog_dict = {k: v for k, v in catalog_dict.items() if k != "id"}
+
+        # Normal replace branch: body id == path id (or body id dropped/absent).
         ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
-        update_kwargs: Dict[str, Any] = {}
+        update_kwargs = {}
         if ctx is not None:
             update_kwargs["ctx"] = ctx
 
@@ -690,21 +750,79 @@ class OGCServiceMixin:
         catalog_dict: Dict[str, Any],
         language: str,
         db_resource: Any,
+        *,
+        body_id: Optional[str] = None,
+        request: Optional[Request] = None,
+        on_id_mismatch: Literal["ignore", "reject"] = "ignore",
     ) -> Response:
         """Shared update-catalog (PATCH) body used by Features and STAC.
 
         *catalog_dict* must already be the result of
         ``model_dump(exclude_unset=True)``; this method performs no additional
         normalization.
+
+        When *body_id* differs from *catalog_id* (the path parameter) three
+        cases apply:
+
+        1. ``Prefer: handling=move`` present: MOVE (rename) then patch remaining
+           fields; respond with 200 + ``Content-Location``,
+           ``Link: rel=canonical``, and ``Preference-Applied: handling=move``.
+        2. Move NOT requested, *on_id_mismatch* == ``"reject"`` (STAC): raise 400.
+        3. Move NOT requested, *on_id_mismatch* == ``"ignore"`` (OGC Features
+           Part 4): drop the body ``"id"`` field and patch normally.
+
+        When *body_id* is absent or equals *catalog_id* the normal partial-update
+        path runs regardless.
         """
         from dynastore.extensions.tools.localization_utils import detect_use_lang
 
-        use_lang = detect_use_lang(catalog_dict, language)
         catalogs_svc = await self._get_catalogs_service()
         await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
 
+        # Mismatch branch: PATCH body carries a different "id".
+        if body_id is not None and body_id != catalog_id:
+            if request is not None and self._wants_move(request):
+                internal_id, new_external_id, content_location = (
+                    await self._ogc_perform_catalog_rename(catalog_id, body_id, request=request)
+                )
+                # Strip "id" — rename already updated it.
+                patch_fields = {k: v for k, v in catalog_dict.items() if k != "id"}
+                use_lang = detect_use_lang(patch_fields, language)
+                ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
+                update_kwargs: Dict[str, Any] = {}
+                if ctx is not None:
+                    update_kwargs["ctx"] = ctx
+                updated = await catalogs_svc.update_catalog(
+                    internal_id, patch_fields, lang=use_lang, **update_kwargs
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Catalog not found after rename.",
+                    )
+                localized_data, _ = self._localize_resource(updated, language)
+                response = JSONResponse(content=localized_data)
+                if content_location is not None:
+                    response.headers["Content-Location"] = content_location
+                    response.headers["Link"] = f'<{content_location}>; rel="canonical"'
+                response.headers["Preference-Applied"] = "handling=move"
+                return response
+
+            if on_id_mismatch == "reject":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Body id '{body_id}' does not match path id '{catalog_id}'."
+                        " Send 'Prefer: handling=move' to rename."
+                    ),
+                )
+            # on_id_mismatch == "ignore": drop body id, patch with path id.
+            catalog_dict = {k: v for k, v in catalog_dict.items() if k != "id"}
+
+        # Normal update branch: body id == path id (or body id dropped/absent).
+        use_lang = detect_use_lang(catalog_dict, language)
         ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
-        update_kwargs: Dict[str, Any] = {}
+        update_kwargs = {}
         if ctx is not None:
             update_kwargs["ctx"] = ctx
 
@@ -740,6 +858,135 @@ class OGCServiceMixin:
                 detail=f"Catalog '{catalog_id}' not found.",
             )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    # ------------------------------------------------------------------
+    # Shared rename-if-changed helpers (used by both PUT and PATCH paths)
+    # ------------------------------------------------------------------
+
+    async def _ogc_perform_catalog_rename(
+        self,
+        catalog_id: str,
+        body_id: str,
+        *,
+        request: Optional[Request] = None,
+    ) -> Tuple[str, str, Optional[str]]:
+        """Resolve, rename, and return URL for a catalog MOVE.
+
+        Called when a PUT or PATCH body carries an ``"id"`` that differs from
+        the URL path parameter.  Handles 404/409 mapping so the calling handler
+        does not need to repeat the error logic.
+
+        Returns a 3-tuple ``(internal_id, new_external_id, content_location_url)``
+        where ``content_location_url`` is ``None`` when no ``request`` is
+        provided (i.e. the caller cannot build an absolute URL).
+
+        Raises:
+            HTTPException(404): catalog not found.
+            HTTPException(409): another live catalog already holds ``body_id``.
+        """
+        from dynastore.modules.db_config.exceptions import CatalogRenameConflictError
+
+        catalogs_svc = await self._get_catalogs_service()
+        internal_id = await catalogs_svc.resolve_catalog_id(
+            catalog_id, allow_missing=True
+        )
+        if internal_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Catalog '{catalog_id}' not found.",
+            )
+        try:
+            _old, new_external_id = await catalogs_svc.rename_catalog(
+                internal_id, body_id
+            )
+        except CatalogRenameConflictError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        content_location: Optional[str] = None
+        if request is not None:
+            content_location = self._build_catalog_url(request, new_external_id)
+        return internal_id, new_external_id, content_location
+
+    async def _ogc_perform_collection_rename(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        body_id: str,
+        *,
+        request: Optional[Request] = None,
+    ) -> Tuple[str, str, str, Optional[str]]:
+        """Resolve, rename, and return URL for a collection MOVE.
+
+        Called when a PUT or PATCH body carries an ``"id"`` that differs from
+        the URL path parameter.
+
+        Returns a 4-tuple
+        ``(catalog_internal_id, collection_internal_id, new_external_id,
+        content_location_url)`` where ``content_location_url`` is ``None``
+        when no ``request`` is provided.
+
+        Raises:
+            HTTPException(404): catalog or collection not found.
+            HTTPException(409): another live collection already holds ``body_id``.
+        """
+        from dynastore.modules.db_config.exceptions import CollectionRenameConflictError
+
+        catalogs_svc = await self._get_catalogs_service()
+        catalog_internal_id = await catalogs_svc.resolve_catalog_id(
+            catalog_id, allow_missing=True
+        )
+        if catalog_internal_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Catalog '{catalog_id}' not found.",
+            )
+        collection_internal_id = await catalogs_svc.collections.resolve_collection_id(
+            catalog_internal_id, collection_id, allow_missing=True
+        )
+        if collection_internal_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Collection '{catalog_id}:{collection_id}' not found.",
+            )
+        try:
+            _old, new_external_id = await catalogs_svc.rename_collection(
+                catalog_internal_id, collection_internal_id, body_id
+            )
+        except CollectionRenameConflictError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        content_location: Optional[str] = None
+        if request is not None:
+            cat_model = await catalogs_svc.get_catalog_model(catalog_internal_id)
+            cat_external_id = (
+                getattr(cat_model, "external_id", None) or catalog_id
+            ) if cat_model else catalog_id
+            content_location = self._build_collection_url(
+                request, cat_external_id, new_external_id
+            )
+        return catalog_internal_id, collection_internal_id, new_external_id, content_location
+
+    # ------------------------------------------------------------------
+    # RFC 7240 Prefer header helpers
+    # ------------------------------------------------------------------
+
+    def _wants_move(self, request: Request) -> bool:
+        """Return True iff the client sent ``Prefer: handling=move`` (RFC 7240).
+
+        Parses the ``Prefer`` header as a comma-separated list of
+        preference-tokens and checks for a ``handling=move`` token.
+        The comparison is case-insensitive; surrounding whitespace is
+        stripped; other tokens in the header are ignored.
+        """
+        prefer_header = request.headers.get("prefer", "")
+        for token in prefer_header.split(","):
+            if token.strip().lower() == "handling=move":
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Shared collection CRUD bodies (M-3)
@@ -778,12 +1025,33 @@ class OGCServiceMixin:
         localized_data, _ = self._localize_resource(created, language)
         return JSONResponse(content=localized_data, status_code=status.HTTP_201_CREATED)
 
+    def _build_catalog_url(self, request: Request, catalog_external_id: str) -> str:
+        """Build the absolute URL for a catalog's canonical PUT/GET endpoint.
+
+        Uses the incoming request's base URL and the service's path prefix.
+        """
+        root = get_root_url(request)
+        prefix = getattr(self, "prefix", "")
+        return f"{root}{prefix}/catalogs/{catalog_external_id}"
+
+    def _build_collection_url(
+        self, request: Request, catalog_external_id: str, collection_external_id: str
+    ) -> str:
+        """Build the absolute URL for a collection's canonical PUT/GET endpoint."""
+        root = get_root_url(request)
+        prefix = getattr(self, "prefix", "")
+        return f"{root}{prefix}/catalogs/{catalog_external_id}/collections/{collection_external_id}"
+
     async def _ogc_replace_collection(
         self,
         catalog_id: str,
         collection_id: str,
         updates_dict: Dict[str, Any],
         language: str,
+        *,
+        request: Optional[Request] = None,
+        body_id: Optional[str] = None,
+        on_id_mismatch: Literal["ignore", "reject"] = "ignore",
     ) -> Response:
         """Shared replace-collection (PUT) body used by Features and STAC.
 
@@ -791,10 +1059,64 @@ class OGCServiceMixin:
         ``normalize_i18n_for_replace``; this method performs no additional
         normalization.  No ``db_resource`` / transactional context is passed
         on this path (neither Features nor STAC injects one for replace).
+
+        When *body_id* differs from *collection_id* (the path parameter) three
+        cases apply:
+
+        1. ``Prefer: handling=move`` present: MOVE (rename) then replace;
+           respond with 200 + ``Content-Location``, ``Link: rel=canonical``,
+           and ``Preference-Applied: handling=move``.
+        2. Move NOT requested, *on_id_mismatch* == ``"reject"`` (STAC): raise 400.
+        3. Move NOT requested, *on_id_mismatch* == ``"ignore"`` (OGC Features
+           Part 4 Req 11): drop the body id and replace the path-addressed resource.
         """
         catalogs_svc = await self._get_catalogs_service()
         await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
 
+        # Mismatch branch: body id differs from path id.
+        if body_id is not None and body_id != collection_id:
+            if request is not None and self._wants_move(request):
+                _cat_internal, _col_internal, new_external_id, content_location = (
+                    await self._ogc_perform_collection_rename(
+                        catalog_id, collection_id, body_id, request=request
+                    )
+                )
+                updates_dict = {**updates_dict, "id": new_external_id}
+                # Logical-id contract: service queries take the LOGICAL (external)
+                # ids and resolve external->internal themselves. After the rename
+                # the collection's new logical id is ``new_external_id`` and the
+                # catalog path id is unchanged. Passing the internal surrogate here
+                # bypasses the external->internal resolver (which is external-only),
+                # so the post-rename re-read cannot find the row and raises a
+                # spurious 404 even though the rename committed.
+                updated = await catalogs_svc.update_collection(
+                    catalog_id, new_external_id, updates_dict, lang="*"
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Collection not found after rename.",
+                    )
+                localized_data, _ = self._localize_resource(updated, language)
+                response = JSONResponse(content=localized_data)
+                if content_location is not None:
+                    response.headers["Content-Location"] = content_location
+                    response.headers["Link"] = f'<{content_location}>; rel="canonical"'
+                response.headers["Preference-Applied"] = "handling=move"
+                return response
+
+            if on_id_mismatch == "reject":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Body id '{body_id}' does not match path id '{collection_id}'."
+                        " Send 'Prefer: handling=move' to rename."
+                    ),
+                )
+            # on_id_mismatch == "ignore": drop body id, replace path-addressed resource.
+            updates_dict = {k: v for k, v in updates_dict.items() if k != "id"}
+
+        # Normal replace branch: body id == path id (or body id dropped/absent).
         updated = await catalogs_svc.update_collection(
             catalog_id, collection_id, updates_dict, lang="*"
         )
@@ -813,6 +1135,9 @@ class OGCServiceMixin:
         updates_dict: Dict[str, Any],
         language: str,
         request: Optional[Request] = None,
+        *,
+        body_id: Optional[str] = None,
+        on_id_mismatch: Literal["ignore", "reject"] = "ignore",
     ) -> Response:
         """Shared update-collection (PATCH) body used by Features and STAC.
 
@@ -820,15 +1145,75 @@ class OGCServiceMixin:
         ``model_dump(exclude_unset=True)``.  ``request`` is forwarded to
         ``_pre_update_collection_validate`` for services (STAC) that need
         to fetch the current state before merging and validating.
+
+        When *body_id* differs from *collection_id* (the path parameter) three
+        cases apply:
+
+        1. ``Prefer: handling=move`` present: MOVE (rename) then patch remaining
+           fields; respond with 200 + ``Content-Location``,
+           ``Link: rel=canonical``, and ``Preference-Applied: handling=move``.
+        2. Move NOT requested, *on_id_mismatch* == ``"reject"`` (STAC): raise 400.
+        3. Move NOT requested, *on_id_mismatch* == ``"ignore"`` (OGC Features
+           Part 4): drop the body ``"id"`` field and patch normally.
+
+        When *body_id* is absent or equals *collection_id* the normal partial-update
+        path runs regardless.
         """
         from dynastore.extensions.tools.localization_utils import detect_use_lang
 
+        catalogs_svc = await self._get_catalogs_service()
+        await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
+
+        # Mismatch branch: PATCH body carries a different "id".
+        if body_id is not None and body_id != collection_id:
+            if request is not None and self._wants_move(request):
+                _cat_internal, _col_internal, new_external_id, content_location = (
+                    await self._ogc_perform_collection_rename(
+                        catalog_id, collection_id, body_id, request=request
+                    )
+                )
+                # Strip "id" — rename already updated it.
+                patch_fields = {k: v for k, v in updates_dict.items() if k != "id"}
+                # Logical-id contract: pass the new LOGICAL ids (catalog path id
+                # unchanged; collection now addressed by ``new_external_id``) so the
+                # service resolves external->internal itself. Passing the internal
+                # surrogate bypasses that resolver and the post-rename re-read 404s.
+                await self._pre_update_collection_validate(
+                    catalog_id, new_external_id, patch_fields, request
+                )
+                use_lang = detect_use_lang(patch_fields, language)
+                updated = await catalogs_svc.update_collection(
+                    catalog_id, new_external_id, patch_fields, lang=use_lang
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Collection not found after rename.",
+                    )
+                localized_data, _ = self._localize_resource(updated, language)
+                response = JSONResponse(content=localized_data)
+                if content_location is not None:
+                    response.headers["Content-Location"] = content_location
+                    response.headers["Link"] = f'<{content_location}>; rel="canonical"'
+                response.headers["Preference-Applied"] = "handling=move"
+                return response
+
+            if on_id_mismatch == "reject":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Body id '{body_id}' does not match path id '{collection_id}'."
+                        " Send 'Prefer: handling=move' to rename."
+                    ),
+                )
+            # on_id_mismatch == "ignore": drop body id, patch with path id.
+            updates_dict = {k: v for k, v in updates_dict.items() if k != "id"}
+
+        # Normal update branch: body id == path id (or body id dropped/absent).
         await self._pre_update_collection_validate(
             catalog_id, collection_id, updates_dict, request
         )
         use_lang = detect_use_lang(updates_dict, language)
-        catalogs_svc = await self._get_catalogs_service()
-        await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
 
         updated = await catalogs_svc.update_collection(
             catalog_id, collection_id, updates_dict, lang=use_lang
@@ -927,7 +1312,7 @@ class OGCServiceMixin:
             async with managed_transaction(engine) as _conn2:
                 existing_dict = await DQLQuery(
                     f"SELECT * FROM {task_schema}.tasks"
-                    " WHERE dedup_key = :dk AND schema_name = :sn"
+                    " WHERE dedup_key = :dk AND catalog_id = :sn"
                     " AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')"
                     " ORDER BY timestamp DESC LIMIT 1;",
                     result_handler=ResultHandler.ONE_DICT,

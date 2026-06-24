@@ -103,17 +103,13 @@ class BulkCatalogReindexTask(TaskProtocol):
         from dynastore.models.protocols import CatalogsProtocol
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
         from dynastore.modules.elasticsearch.mappings import get_tenant_items_index
-        from dynastore.modules.storage.drivers.elasticsearch import (
-            _resolve_catalog_physical_id,
-        )
         from dynastore.tools.discovery import get_protocol
 
         inputs = BulkCatalogReindexInputs.model_validate(payload.inputs)
         catalog_id = inputs.catalog_id
         driver_hint = inputs.driver  # optional explicit WRITE target
 
-        catalog_physical_id = await _resolve_catalog_physical_id(catalog_id)
-        index_name = get_tenant_items_index(_get_index_prefix(), catalog_physical_id)
+        index_name = get_tenant_items_index(_get_index_prefix(), catalog_id)
 
         catalogs_proto = get_protocol(CatalogsProtocol)
         if not catalogs_proto:
@@ -190,17 +186,13 @@ class BulkCollectionReindexTask(TaskProtocol):
     async def run(self, payload: TaskPayload) -> Dict[str, Any]:
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
         from dynastore.modules.elasticsearch.mappings import get_tenant_items_index
-        from dynastore.modules.storage.drivers.elasticsearch import (
-            _resolve_catalog_physical_id,
-        )
 
         inputs = BulkCollectionReindexInputs.model_validate(payload.inputs)
         catalog_id = inputs.catalog_id
         collection_id = inputs.collection_id
         driver_hint = inputs.driver  # optional explicit WRITE target
 
-        catalog_physical_id = await _resolve_catalog_physical_id(catalog_id)
-        index_name = get_tenant_items_index(_get_index_prefix(), catalog_physical_id)
+        index_name = get_tenant_items_index(_get_index_prefix(), catalog_id)
 
         es = _build_es_client()
 

@@ -77,8 +77,8 @@ INSERT_SHORT_URL_WITH_GENERATED_KEY = DQLQuery(
             proxy.base62(proxy.obfuscate_id(currval('proxy.short_url_id_seq'))) AS s_key
     )
     INSERT INTO {schema}.collection_proxy_urls
-        (id, short_key, long_url, collection_id, collection_physical_id, comment)
-    SELECT id, s_key, :long_url, :collection_id, :collection_physical_id, :comment FROM new_vals
+        (id, short_key, long_url, collection_id, comment)
+    SELECT id, s_key, :long_url, :collection_id, :comment FROM new_vals
     RETURNING id, short_key, long_url, collection_id, created_at, comment;
     """,
     result_handler=ResultHandler.ONE_DICT,
@@ -88,10 +88,10 @@ INSERT_SHORT_URL_WITH_GENERATED_KEY = DQLQuery(
 INSERT_SHORT_URL_WITH_CUSTOM_KEY = DQLQuery(
     sql_template="""
     INSERT INTO {schema}.collection_proxy_urls
-        (id, short_key, long_url, collection_id, collection_physical_id, comment)
+        (id, short_key, long_url, collection_id, comment)
     VALUES (
         nextval('proxy.short_url_id_seq'),
-        :custom_key, :long_url, :collection_id, :collection_physical_id, :comment
+        :custom_key, :long_url, :collection_id, :comment
     )
     RETURNING id, short_key, long_url, collection_id, created_at, comment;
     """,
@@ -119,7 +119,7 @@ GET_URLS_BY_COLLECTION = DQLQuery(
     sql_template="""
     SELECT id, short_key, long_url, collection_id, created_at, comment
     FROM {schema}.collection_proxy_urls
-    WHERE collection_physical_id = :collection_physical_id
+    WHERE collection_id = :collection_id
     ORDER BY created_at DESC
     LIMIT :limit OFFSET :offset;
     """,

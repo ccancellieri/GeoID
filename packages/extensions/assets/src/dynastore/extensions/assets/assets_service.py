@@ -43,8 +43,6 @@ from dynastore.extensions.ogc_models_shared import (
     BulkCreationResponse,
     IngestionReport,
     SidecarRejection,
-    RenameRequest,
-    RenameResponse,
 )
 from dynastore.extensions.assets.conformance import ASSETS_CONFORMANCE_URIS
 from dynastore.extensions.tools.fast_api import AppJSONResponse
@@ -342,24 +340,6 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             response_model=Asset,
             status_code=status.HTTP_201_CREATED,
             summary="Create Collection Asset",
-        )
-        # Rename endpoints — registered BEFORE the plain {asset_id} routes so
-        # the literal `:rename` suffix is matched first by Starlette.
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}:rename",
-            self.rename_catalog_asset,
-            methods=["POST"],
-            response_model=RenameResponse,
-            status_code=status.HTTP_200_OK,
-            summary="Rename Catalog Asset",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}:rename",
-            self.rename_collection_asset,
-            methods=["POST"],
-            response_model=RenameResponse,
-            status_code=status.HTTP_200_OK,
-            summary="Rename Collection Asset",
         )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/assets/{asset_id}",
@@ -888,6 +868,79 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         from dynastore.modules.storage.router import get_asset_upload_driver
         return await get_asset_upload_driver(catalog_id, collection_id)
 
+    @staticmethod
+    def _stamp_external_ids(
+        asset: "Asset",
+        catalog_external_id: str,
+        collection_external_id: Optional[str],
+    ) -> "Asset":
+        """Overwrite stored internal catalog_id/collection_id with the public
+        external labels so the REST response never leaks internal tokens.
+
+        Asset rows are keyed on immutable internal ids; path params carry the
+        logical (external) ids the caller used.  Stamping the path values back
+        onto the returned model is both cheaper and more correct than a DB
+        round-trip: the caller already holds the right labels.
+        """
+        asset.catalog_id = catalog_external_id
+        asset.collection_id = collection_external_id
+        return asset
+
+    @staticmethod
+    def _stamp_external_ids_list(
+        assets: List["Asset"],
+        catalog_external_id: str,
+        collection_external_id: Optional[str],
+    ) -> List["Asset"]:
+        """Bulk variant of :meth:`_stamp_external_ids` for list responses."""
+        for asset in assets:
+            asset.catalog_id = catalog_external_id
+            asset.collection_id = collection_external_id
+        return assets
+
+    @staticmethod
+    async def _stamp_external_ids_list_resolve_collections(
+        assets: List["Asset"],
+        catalog_external_id: str,
+    ) -> List["Asset"]:
+        """Stamp catalog_external_id and resolve each asset's internal
+        collection_id to its public external label.
+
+        Used when the response may contain assets from multiple collections
+        (all_collections=True or global search) so a single fixed collection_id
+        cannot be echoed from the path.
+
+        When no CatalogsProtocol is registered the catalog module is absent, so
+        no rename can have occurred and the stored collection_id IS the public
+        label — it is kept as-is.  When the protocol IS present but a stored id
+        fails to resolve (a deleted/orphaned collection), the label is nulled
+        rather than emitting the internal token — the response must never leak
+        an internal id.
+        """
+        catalogs_svc = cast(
+            Optional[CatalogsProtocol], get_protocol(CatalogsProtocol)
+        )
+        for asset in assets:
+            asset.catalog_id = catalog_external_id
+            if asset.collection_id is not None and catalogs_svc is not None:
+                # resolve_collection_external_id is cached (300 s TTL, 4096 entries)
+                # so repeated calls for the same internal id cost one DB round-trip.
+                external_col = await catalogs_svc.collections.resolve_collection_external_id(
+                    catalog_external_id, asset.collection_id, allow_missing=True
+                )
+                if external_col is not None:
+                    asset.collection_id = external_col
+                else:
+                    logger.warning(
+                        "asset %s references collection %r that did not resolve to "
+                        "an external id; nulling collection_id to avoid leaking an "
+                        "internal token",
+                        getattr(asset, "asset_id", "<unknown>"),
+                        asset.collection_id,
+                    )
+                    asset.collection_id = None
+        return assets
+
     # =============================================================================
     #  CATALOG LEVEL OPERATIONS
     # =============================================================================
@@ -903,9 +956,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Returns a list of assets associated directly with the catalog (no collection)."""
         # Accepted for uniform cross-protocol routing-hints support; this route
         # reads asset metadata rows and performs no vector-geometry read.
-        return await self.assets.list_assets(
+        assets = await self.assets.list_assets(
             catalog_id=catalog_id, collection_id=None, limit=limit, offset=offset
         )
+        return self._stamp_external_ids_list(assets, catalog_id, None)
 
 
     async def create_catalog_asset(
@@ -915,9 +969,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Creates a new physical asset at the catalog level."""
         await require_catalog_ready(catalog_id)
         try:
-            return await self.assets.create_asset(
+            asset = await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=None
             )
+            return self._stamp_external_ids(asset, catalog_id, None)
         except Exception as e:
             raise handle_exception(
                 e,
@@ -933,9 +988,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Registers a virtual (external-href) asset at the catalog level."""
         await require_catalog_ready(catalog_id)
         try:
-            return await self.assets.create_asset(
+            asset = await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=None
             )
+            return self._stamp_external_ids(asset, catalog_id, None)
         except Exception as e:
             raise handle_exception(
                 e,
@@ -977,6 +1033,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         )
         if not asset:
             raise HTTPException(status_code=404, detail="Asset not found")
+        self._stamp_external_ids(asset, catalog_id, None)
         asset.links = self._asset_links_for(asset, request)
         return asset
 
@@ -990,9 +1047,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Updates the metadata of an existing catalog asset. All other fields are immutable."""
         await require_catalog_ready(catalog_id)
         try:
-            return await self.assets.update_asset(
+            asset = await self.assets.update_asset(
                 catalog_id=catalog_id, asset_id=asset_id, update=asset_in
             )
+            return self._stamp_external_ids(asset, catalog_id, None)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -1005,43 +1063,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """RFC 7396 JSON Merge Patch over an asset's ``metadata``."""
         await require_catalog_ready(catalog_id)
         try:
-            return await self.assets.patch_asset(
+            asset = await self.assets.patch_asset(
                 catalog_id=catalog_id, asset_id=asset_id, patch=patch,
             )
+            return self._stamp_external_ids(asset, catalog_id, None)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
-
-    async def rename_catalog_asset(
-        self,
-        body: RenameRequest,
-        catalog_id: str = Path(..., description="The catalog ID"),
-        asset_id: str = Path(..., description="The asset ID to rename"),
-    ) -> RenameResponse:
-        """Rename a catalog-scoped asset's logical id.
-
-        POST /assets/catalogs/{catalog_id}/assets/{asset_id}:rename
-
-        Only ``asset_id`` (the presentation label) changes.  The physical file
-        location, partition key, and all storage backends are untouched.
-        An ES reindex is required to reflect the new id in secondary indexes.
-        """
-        from dynastore.modules.catalog.asset_service import AssetRenameConflictError
-
-        await require_catalog_ready(catalog_id)
-        try:
-            return await self.assets.rename_asset(
-                catalog_id=catalog_id,
-                asset_id=asset_id,
-                new_id=body.new_id,
-            )
-        except AssetRenameConflictError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            ) from e
-        except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
     async def delete_catalog_asset_by_id(
         self,
@@ -1089,12 +1117,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Returns a list of assets associated with a specific collection."""
         # Accepted for uniform cross-protocol routing-hints support; this route
         # reads asset metadata rows and performs no vector-geometry read.
-        return await self.assets.list_assets(
+        assets = await self.assets.list_assets(
             catalog_id=catalog_id,
             collection_id=collection_id,
             limit=limit,
             offset=offset,
         )
+        return self._stamp_external_ids_list(assets, catalog_id, collection_id)
 
 
     async def create_collection_asset(
@@ -1110,9 +1139,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         # scope comes from the path. AssetCreate has no collection_id field
         # so there is no conflict to reconcile.
         try:
-            return await self.assets.create_asset(
+            asset = await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=collection_id
             )
+            return self._stamp_external_ids(asset, catalog_id, collection_id)
         except Exception as e:
             raise handle_exception(
                 e,
@@ -1131,9 +1161,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         await require_catalog_ready(catalog_id)
         await require_collection_ready(catalog_id, collection_id)
         try:
-            return await self.assets.create_asset(
+            asset = await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=collection_id
             )
+            return self._stamp_external_ids(asset, catalog_id, collection_id)
         except Exception as e:
             raise handle_exception(
                 e,
@@ -1183,6 +1214,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             raise HTTPException(
                 status_code=404, detail="Asset not found in this collection"
             )
+        self._stamp_external_ids(asset, catalog_id, collection_id)
         asset.links = self._asset_links_for(asset, request)
         return asset
 
@@ -1198,12 +1230,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         await require_catalog_ready(catalog_id)
         await require_collection_ready(catalog_id, collection_id)
         try:
-            return await self.assets.update_asset(
+            asset = await self.assets.update_asset(
                 catalog_id=catalog_id,
                 asset_id=asset_id,
                 update=asset_in,
                 collection_id=collection_id,
             )
+            return self._stamp_external_ids(asset, catalog_id, collection_id)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -1218,49 +1251,16 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         await require_catalog_ready(catalog_id)
         await require_collection_ready(catalog_id, collection_id)
         try:
-            return await self.assets.patch_asset(
+            asset = await self.assets.patch_asset(
                 catalog_id=catalog_id,
                 asset_id=asset_id,
                 patch=patch,
                 collection_id=collection_id,
             )
+            return self._stamp_external_ids(asset, catalog_id, collection_id)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
-
-    async def rename_collection_asset(
-        self,
-        body: RenameRequest,
-        catalog_id: str = Path(..., description="The catalog ID"),
-        collection_id: str = Path(..., description="The collection ID"),
-        asset_id: str = Path(..., description="The asset ID to rename"),
-    ) -> RenameResponse:
-        """Rename a collection-scoped asset's logical id.
-
-        POST /assets/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}:rename
-
-        Only ``asset_id`` (the presentation label) changes.  The physical file
-        location, partition key ``collection_physical_id``, and all storage
-        backends are untouched.  An ES reindex is required to reflect the new
-        id in secondary indexes.
-        """
-        from dynastore.modules.catalog.asset_service import AssetRenameConflictError
-
-        await require_collection_ready(catalog_id, collection_id)
-        try:
-            return await self.assets.rename_asset(
-                catalog_id=catalog_id,
-                asset_id=asset_id,
-                new_id=body.new_id,
-                collection_id=collection_id,
-            )
-        except AssetRenameConflictError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            ) from e
-        except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
     async def delete_collection_asset_by_id(
         self,
@@ -1396,18 +1396,6 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                 detail=f"No physical schema for catalog '{catalog_id}'.",
             )
 
-        # Resolve the collection's immutable physical id once so all per-row
-        # upserts in the batch share the same resolved value.
-        collection_physical_id: Optional[str] = None
-        if collection_id is not None:
-            from dynastore.models.driver_context import DriverContext
-            collection_physical_id = await catalogs_svc.resolve_physical_id(
-                catalog_id,
-                collection_id,
-                ctx=DriverContext(db_resource=None),
-                allow_missing=True,
-            )
-
         configs_svc = cast(
             Optional[ConfigsProtocol], get_protocol(ConfigsProtocol)
         )
@@ -1422,11 +1410,20 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             catalog_id=catalog_id,
             collection_id=collection_id,
         )
+        # Resolve public external ids to immutable internal ids before keying
+        # storage so rows are stable across catalog/collection renames.
+        _icat = await catalogs_svc.resolve_catalog_id(catalog_id, allow_missing=True)
+        if _icat is not None:
+            catalog_id = _icat
+        if collection_id is not None:
+            _icol = await catalogs_svc.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if _icol is not None:
+                collection_id = _icol
+
         scope = Scope(
-            schema=schema,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            collection_physical_id=collection_physical_id,
+            schema=schema, catalog_id=catalog_id, collection_id=collection_id
         )
         policy_source = (
             f"/configs/catalogs/{catalog_id}"
@@ -1596,12 +1593,27 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         every collection under the catalog in one call.
         """
         try:
-            return await self._run_scoped_search(
+            assets = await self._run_scoped_search(
                 catalog_id=catalog_id,
                 collection_id=None,
                 query=query,
                 offset=query.offset,
                 all_collections=all_collections,
+            )
+            # When all_collections=False every asset is catalog-tier (no
+            # collection); stamp catalog from the path param and leave
+            # collection_id as-is (it will be None for catalog-tier assets).
+            # When all_collections=True assets may span multiple collections;
+            # we cannot echo one fixed collection_id, so only stamp catalog_id
+            # and leave each asset's collection_id for per-row resolution.
+            # Per-row collection resolution is deferred: the caller can filter
+            # by collection using the search filters if needed.
+            if not all_collections:
+                return self._stamp_external_ids_list(assets, catalog_id, None)
+            # all_collections=True: stamp catalog_id from path; resolve each
+            # asset's collection_id from internal→external if set.
+            return await self._stamp_external_ids_list_resolve_collections(
+                assets, catalog_id
             )
         except Exception as e:
             logger.error(f"Search failed: {e}")
@@ -1618,12 +1630,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         The ``collection_id`` from the path is authoritative.
         """
         try:
-            return await self._run_scoped_search(
+            assets = await self._run_scoped_search(
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 query=query,
                 offset=query.offset,
             )
+            return self._stamp_external_ids_list(assets, catalog_id, collection_id)
         except Exception as e:
             logger.error(f"Search failed: {e}")
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1663,12 +1676,19 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         for cat in catalogs:
             if remaining <= 0:
                 break
-            cat_id = getattr(cat, "catalog_id", None) or getattr(cat, "id", None)
-            if not cat_id:
+            # Use the internal id for the storage query (search_assets resolves
+            # it to schema-level ids internally), but keep the public label so
+            # the response carries the logical external id, not the c_... token.
+            cat_internal_id = getattr(cat, "id", None)
+            if not cat_internal_id:
                 continue
+            # Explicit None check, not `or`: an empty external_id must never
+            # silently fall through to the internal c_... token (leak guard).
+            _cat_ext = getattr(cat, "external_id", None)
+            cat_external_id = str(_cat_ext) if _cat_ext is not None else cat_internal_id
             try:
                 rows = await self._run_scoped_search(
-                    catalog_id=cat_id,
+                    catalog_id=cat_internal_id,
                     collection_id=None,
                     query=query,
                     limit=remaining,
@@ -1676,8 +1696,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                     all_collections=all_collections,
                 )
             except Exception as e:
-                logger.warning(f"Global search: catalog={cat_id} failed: {e}")
+                logger.warning(f"Global search: catalog={cat_internal_id} failed: {e}")
                 continue
+            # Stamp external catalog_id; resolve each asset's collection_id
+            # (may be internal) to its external label.
+            rows = await self._stamp_external_ids_list_resolve_collections(
+                rows, cat_external_id
+            )
             aggregated.extend(rows)
             remaining = query.limit - len(aggregated)
 
@@ -1889,18 +1914,6 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                 detail=f"No physical schema for catalog '{catalog_id}'.",
             )
 
-        # Resolve the collection's immutable physical id so the Scope carries
-        # it for all write / probe operations inside this upload session.
-        from dynastore.models.driver_context import DriverContext
-        collection_physical_id: Optional[str] = None
-        if collection_id is not None:
-            collection_physical_id = await catalogs_svc.resolve_physical_id(
-                catalog_id,
-                collection_id,
-                ctx=DriverContext(db_resource=None),
-                allow_missing=True,
-            )
-
         configs_svc = cast(
             Optional[ConfigsProtocol], get_protocol(ConfigsProtocol)
         )
@@ -1941,11 +1954,20 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             owned_by=None,
         )
 
+        # Resolve public external ids to immutable internal ids before keying
+        # storage so rows are stable across catalog/collection renames.
+        _icat = await catalogs_svc.resolve_catalog_id(catalog_id, allow_missing=True)
+        if _icat is not None:
+            catalog_id = _icat
+        if collection_id is not None:
+            _icol = await catalogs_svc.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if _icol is not None:
+                collection_id = _icol
+
         scope = Scope(
-            schema=schema,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            collection_physical_id=collection_physical_id,
+            schema=schema, catalog_id=catalog_id, collection_id=collection_id
         )
 
         # 5. Atomic policy + born-claimed PENDING INSERT.
@@ -2061,13 +2083,15 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             f'UPDATE "{scope.schema}".assets '
             "SET metadata = metadata || CAST(:upload_meta AS jsonb), "
             "    updated_at = NOW() "
-            "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+            "WHERE catalog_id = :catalog_id "
+            "AND collection_id IS NOT DISTINCT FROM :collection_id "
             "AND asset_id = :asset_id"
         )
         async with managed_transaction(engine) as conn:
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
                 conn,
-                collection_physical_id=scope.collection_physical_id,
+                catalog_id=scope.catalog_id,
+                collection_id=scope.collection_id,
                 asset_id=asset_id,
                 upload_meta=json.dumps(upload_blob),
             )
@@ -2086,7 +2110,8 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         sql = (
             f'UPDATE "{scope.schema}".assets '
             "SET status = 'deleted', updated_at = NOW() "
-            "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+            "WHERE catalog_id = :catalog_id "
+            "AND collection_id IS NOT DISTINCT FROM :collection_id "
             "AND asset_id = :asset_id "
             "AND status = 'pending'"
         )
@@ -2094,7 +2119,8 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             async with managed_transaction(engine) as conn:
                 await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
                     conn,
-                    collection_physical_id=scope.collection_physical_id,
+                    catalog_id=scope.catalog_id,
+                    collection_id=scope.collection_id,
                     asset_id=asset_id,
                 )
         except Exception as cleanup_exc:

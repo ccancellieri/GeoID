@@ -76,7 +76,6 @@ Quick reference
 from typing import Protocol, Optional, List, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dynastore.extensions.ogc_models_shared import RenameResponse
     from dynastore.modules.catalog.asset_service import (
         Asset,
         AssetBase,
@@ -519,87 +518,5 @@ class AssetsProtocol(Protocol):
             )
             for asset_id in asset_ids:
                 await assets.delete_assets(catalog_id, asset_id=asset_id, hard=False)
-        """
-        ...
-
-    async def rename_asset(
-        self,
-        catalog_id: str,
-        asset_id: str,
-        new_id: str,
-        collection_id: Optional[str] = None,
-    ) -> "RenameResponse":
-        """Rename an asset's logical ``asset_id`` (presentation label only).
-
-        The physical file location (URI/bucket/path) is NOT moved.  Only
-        ``{schema}.assets.asset_id`` and ``{schema}.asset_references.asset_id``
-        are updated in a single tight transaction.
-
-        Args:
-            catalog_id: Catalog scope.
-            asset_id: Current logical asset identifier.
-            new_id: Desired new identifier (case-preserving; must pass
-                ``validate_asset_id`` charset rules).
-            collection_id: Optional collection scope.  When provided, the rename
-                is restricted to assets whose ``collection_physical_id`` matches
-                the resolved physical id of this collection.
-
-        Returns:
-            :class:`RenameResponse` with ``reindex_required=True`` (ES holds
-            old ids in document fields) and ``iam_manual_update_required=False``
-            (assets are not addressable in IAM bindings).
-
-        Raises:
-            ValueError: When ``asset_id`` is not found (HTTP 404 at the route).
-            AssetRenameConflictError: When ``new_id`` already exists in the same
-                scope (HTTP 409 at the route).
-        """
-        ...
-
-    async def resolve_asset_physical_id(
-        self,
-        catalog_id: str,
-        asset_id: str,
-        collection_id: Optional[str] = None,
-        *,
-        ctx: Optional["DriverContext"] = None,
-        allow_missing: bool = True,
-    ) -> Optional[str]:
-        """Resolve a logical ``asset_id`` to its immutable ``physical_id`` (#2296).
-
-        ``physical_id`` is a UUIDv7 minted once at creation and stable across
-        ``asset_id`` renames.  References and denormalized surfaces (the PG
-        sidecar, ``stac_virtual``, GCS finalize metadata, the DuckDB items
-        config) key on this rather than the mutable logical id so a rename is a
-        pure one-column label change with no downstream propagation.
-
-        In-transaction callers pass ``ctx.db_resource`` to read uncommitted
-        state straight from their connection; cache-friendly callers omit it and
-        route through the shared L1/L2 accelerator.  ``allow_missing`` defaults
-        ``True`` so callers can resolve opportunistically and fall back to the
-        logical id; pass ``False`` to raise :class:`ValueError` on a miss.
-        """
-        ...
-
-    async def resolve_asset_logical_id(
-        self,
-        catalog_id: str,
-        physical_id: str,
-        *,
-        ctx: Optional["DriverContext"] = None,
-    ) -> Optional[str]:
-        """Resolve an asset's immutable ``physical_id`` back to its current logical ``asset_id``.
-
-        The inverse of :meth:`resolve_asset_physical_id`: given the UUIDv7
-        ``physical_id`` carried in a persisted config (e.g. the DuckDB items
-        driver config ``asset_physical_id`` field), return the live user-facing
-        ``asset_id`` label.  After an asset rename the logical label changes but
-        the physical_id is stable, so callers that persist the physical_id and
-        re-resolve at dispatch time always find the current asset_id.
-
-        In-transaction callers supply ``ctx.db_resource`` to read straight from
-        their connection; cache-friendly callers omit it and route through the
-        shared L1/L2 accelerator (TTL 300 s).  Returns ``None`` for an unknown
-        physical_id; callers should treat ``None`` as "asset not found".
         """
         ...

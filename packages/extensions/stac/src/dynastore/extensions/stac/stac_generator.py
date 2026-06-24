@@ -61,6 +61,16 @@ SUPPORTED_STAC_EXTENSIONS = [
 ]
 
 
+def _public_id(model: Any) -> str:
+    """Return the public (external) identifier for a Catalog or Collection model.
+
+    Prefers ``external_id`` (the renamable public label) over ``id`` (the
+    immutable internal token) so every URL built by this generator uses the
+    value clients send in requests, not an opaque storage key.
+    """
+    return getattr(model, "external_id", None) or model.id
+
+
 def _apply_extra_metadata_fallbacks(
     collection: "pystac.Collection",
     merged_summaries: Dict[str, Any],
@@ -300,7 +310,7 @@ async def create_root_catalog(request: Request, lang: str = "en") -> Dict[str, A
     all_catalogs = await cast(CatalogsProtocol, catalogs_svc).list_catalogs(lang=lang, limit=1000)
     for cat in all_catalogs:
         # Localize catalog summary for the link title
-        catalog_id = cat.id
+        catalog_id = _public_id(cat)
         child_href = f"{base_url}/catalogs/{catalog_id}"
         root_catalog.add_link(
             pystac.Link(
@@ -323,11 +333,13 @@ def create_catalog_summary(
     # Localize metadata
     meta_dict, available_langs = stac_localize(catalog_model, lang)
 
+    _cat_public_id = _public_id(catalog_model)
+
     catalog = pystac.Catalog(
-        id=catalog_model.id,
+        id=_cat_public_id,
         description=meta_dict.get("description")
-        or f"STAC Catalog for the '{catalog_model.id}' database schema.",
-        title=meta_dict.get("title") or f"Catalog: {catalog_model.id}",
+        or f"STAC Catalog for the '{_cat_public_id}' database schema.",
+        title=meta_dict.get("title") or f"Catalog: {_cat_public_id}",
     )
 
     # The StacContributor registry declares the language extension (URI +
@@ -337,7 +349,7 @@ def create_catalog_summary(
     asset_factory.apply_stac_contributions(
         catalog,
         ResourceRef(
-            catalog_id=catalog_model.id,
+            catalog_id=_cat_public_id,
             collection_id="",
             lang=lang,
             extras={"available_languages": set(available_langs or [])},
@@ -358,7 +370,7 @@ def create_catalog_summary(
 
     # Set Links
     # Self link needs to point to the specific catalog endpoint
-    self_href = f"{get_root_url(request)}/stac/catalogs/{catalog_model.id}"
+    self_href = f"{get_root_url(request)}/stac/catalogs/{_cat_public_id}"
     catalog.add_link(
         pystac.Link(rel="self", target=self_href, media_type="application/json")
     )
@@ -475,8 +487,8 @@ async def create_catalog(
         raise RuntimeError("CatalogsProtocol not available")
     collections = await cast(CatalogsProtocol, catalogs_svc).list_collections(catalog_id, lang=lang, limit=1000)
     for coll in collections:
-        # Localize collection summary for the link title
-        collection_id = coll.id
+        # Localize collection summary for the link title; use the public label
+        collection_id = _public_id(coll)
         collection_href = f"{base_url}/collections/{collection_id}"
         catalog.add_link(
             pystac.Link(
@@ -503,7 +515,7 @@ async def create_collections_catalog(
 
     stac_collections = []
     for coll in collections:
-        stac_coll = await create_collection(request, catalog_id, coll.id, lang=lang, hints=hints)
+        stac_coll = await create_collection(request, catalog_id, _public_id(coll), lang=lang, hints=hints)
         if stac_coll:
             stac_collections.append(stac_coll.to_dict())
 

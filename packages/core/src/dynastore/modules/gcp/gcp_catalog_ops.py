@@ -30,7 +30,6 @@ from dynastore.modules.db_config.query_executor import (
 )
 from dynastore.models.protocols import (
     ConfigsProtocol,
-    CatalogsProtocol,
 )
 from dynastore.modules.gcp.gcp_config import (
     GcpCatalogBucketConfig,
@@ -175,14 +174,7 @@ class GcpCatalogOpsMixin:
                 # writes it with ``check_immutability=False``. Catalog existence
                 # is guaranteed: this post-create hook only runs after the
                 # ``catalog.catalogs`` row was inserted.
-                # physical_schema is already the resolved physical_id at this
-                # call-site (passed from the post-create hook that receives it
-                # directly from the INSERT).  Fall back to catalog_id only when
-                # it is absent so teardown paths that lost the catalog row still
-                # produce a deterministic name.
-                bucket_name = self.get_bucket_service().generate_bucket_name(
-                    physical_schema or catalog_id
-                )
+                bucket_name = self.get_bucket_service().generate_bucket_name(catalog_id, physical_schema=physical_schema)
                 if config_mgr:
                     bucket_config.bucket_name = bucket_name
                     await config_mgr.set_config(
@@ -358,15 +350,7 @@ class GcpCatalogOpsMixin:
             # by the new, live catalog.
             if not recreated:
                 try:
-                    # Capture the immutable physical id from the lifecycle context
-                    # before the row is gone: the deterministic topic/subscription
-                    # names are derived from it, and it can no longer be resolved
-                    # once the catalog row is dropped.
-                    await self.teardown_catalog_eventing(
-                        catalog_id,
-                        config=None,
-                        physical_id=context.physical_schema if context else None,
-                    )
+                    await self.teardown_catalog_eventing(catalog_id, config=None)
                 except Exception as e:
                     logger.warning(
                         f"Best-effort default eventing cleanup failed for "
@@ -389,7 +373,7 @@ class GcpCatalogOpsMixin:
             if not old_bucket_name:
                 try:
                     old_bucket_name = bucket_manager.generate_bucket_name(
-                        context.physical_schema
+                        catalog_id, physical_schema=context.physical_schema
                     )
                 except Exception:
                     old_bucket_name = None
@@ -547,19 +531,8 @@ class GcpCatalogOpsMixin:
                 eventing_config.managed_eventing
                 and eventing_config.managed_eventing.enabled
             ):
-                # Resolve physical_id before building deterministic resource names.
-                _gcp_physical_id: Optional[str] = (
-                    context.physical_schema if context else None
-                )
-                if not _gcp_physical_id:
-                    _catalogs_gcp = get_protocol(CatalogsProtocol)
-                    if _catalogs_gcp:
-                        _gcp_physical_id = await _catalogs_gcp.resolve_physical_id(
-                            catalog_id, allow_missing=True
-                        )
-                _gcp_physical_id = _gcp_physical_id or catalog_id
                 eventing_config.managed_eventing.subscription = PushSubscriptionConfig(
-                    subscription_id=self.generate_default_subscription_id(_gcp_physical_id)
+                    subscription_id=self.generate_default_subscription_id(catalog_id)
                 )
                 updated_managed_eventing = await self.setup_managed_eventing_channel(
                     catalog_id,

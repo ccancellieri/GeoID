@@ -128,7 +128,7 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
     # 'ASYNC' which is not a valid enum value in the tasks table.
     insert_sql = (
         f"INSERT INTO {task_schema}.tasks"
-        f" (task_id, schema_name, scope, task_type, type, execution_mode,"
+        f" (task_id, catalog_id, scope, task_type, type, execution_mode,"
         f"  inputs, timestamp, status, dedup_key)"
         f" SELECT :task_id, 'platform', 'platform', 'storage_drain',"
         f"        'task', 'ASYNCHRONOUS', '{{}}'::jsonb, now(), 'PENDING',"
@@ -136,7 +136,7 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
         f" WHERE NOT EXISTS ("
         f"     SELECT 1 FROM {task_schema}.tasks"
         f"     WHERE dedup_key = 'storage_drain'"
-        f"       AND schema_name = 'platform'"
+        f"       AND catalog_id = 'platform'"
         # Full terminal set (matches the claim query in tasks_module). A
         # DISMISSED (terminal) drain task must NOT block a fresh enqueue —
         # otherwise the co-transactional NOTIFY trigger stays silenced until

@@ -20,7 +20,7 @@
 
 The global ``tasks.tasks`` table is provisioned exactly once, at
 ``TasksModule.lifespan``, in ``get_task_schema()`` (default ``"tasks"``).
-Every CRUD path pins that schema; the per-row ``schema_name`` column is the
+Every CRUD path pins that schema; the per-row ``catalog_id`` column is the
 tenant discriminator.
 
 Previously, three task runners (``tiles_preseed``, ``tiles_export``,
@@ -71,7 +71,7 @@ async def test_error_message_names_expected_schema(monkeypatch: pytest.MonkeyPat
     assert "s_abc" in msg
     assert "tasks" in msg
     # Names the column-based discriminator pattern the caller likely meant
-    assert "schema_name" in msg
+    assert "catalog_id" in msg
 
 
 @pytest.mark.asyncio

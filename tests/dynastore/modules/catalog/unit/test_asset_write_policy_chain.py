@@ -216,10 +216,6 @@ def _spec_conn() -> MagicMock:
 
 EXISTING_ROW: Dict[str, Any] = {
     "asset_id": "alpha",
-    # physical_id (#2296): immutable UUIDv7 join key, always present on real
-    # rows (NOT NULL). The NEW_VERSION archive stamps asset_references via this,
-    # not the mutable asset_id.
-    "physical_id": "0190a0aa-0000-7000-8000-000000000001",
     "catalog_id": "cat",
     "collection_id": "col",
     "asset_type": "RASTER",
@@ -710,9 +706,8 @@ async def test_new_version_archive_stamps_asset_references_valid_until(
     fake_dql: _Recorder,
 ) -> None:
     """When NEW_VERSION archives an existing row, it must also stamp
-    ``valid_until`` on any active asset_references for that asset via its
-    immutable ``physical_id`` (#2296) so the new row inheriting the same
-    logical id isn't blocked by stale references.
+    ``valid_until`` on any active asset_references for that asset_id so
+    the new row inheriting the same id isn't blocked by stale references.
     """
     fake_dql.when(is_select_by("asset_id"), EXISTING_ROW)
 
@@ -731,13 +726,10 @@ async def test_new_version_archive_stamps_asset_references_valid_until(
     assert len(refs_invalidated) == 1, (
         "expected exactly one asset_references invalidation UPDATE"
     )
-    # The invalidation targets the archived asset's immutable physical_id and
-    # only active rows. The mutable asset_id / catalog_id are absent — the
-    # reference key is the rename-stable physical_id.
+    # The invalidation targets the archived asset_id and only active rows.
     binds = refs_invalidated[0]["params"]
-    assert binds["physical_id"] == EXISTING_ROW["physical_id"]
-    assert "asset_id" not in binds
-    assert "catalog_id" not in binds
+    assert binds["asset_id"] == EXISTING_ROW["asset_id"]
+    assert binds["catalog_id"] == SCOPE.catalog_id
 
 
 # ---------------------------------------------------------------------------

@@ -89,7 +89,7 @@ async def list_catalog_dead_letter(catalog_id: str) -> list[dict]:
     if engine is None:
         raise HTTPException(status_code=503, detail="Database unavailable.")
     schema = await _catalog_task_schema(catalog_id, engine)
-    return await _dlq_list(engine, schema_name=schema)  # type: ignore[arg-type]
+    return await _dlq_list(engine, catalog_id=schema)  # type: ignore[arg-type]
 
 
 async def requeue_catalog_dead_letter(catalog_id: str, task_id: str) -> dict:
@@ -105,7 +105,7 @@ async def requeue_catalog_dead_letter(catalog_id: str, task_id: str) -> dict:
     if engine is None:
         raise HTTPException(status_code=503, detail="Database unavailable.")
     schema = await _catalog_task_schema(catalog_id, engine)
-    ok = await _dlq_requeue(engine, task_id, reset_retries=True, schema_name=schema)  # type: ignore[arg-type]
+    ok = await _dlq_requeue(engine, task_id, reset_retries=True, catalog_id=schema)  # type: ignore[arg-type]
     return {"task_id": task_id, "requeued": bool(ok)}
 
 
@@ -263,7 +263,6 @@ class CatalogStatusService(ExtensionProtocol):
         return CatalogStatusView(
             catalog_id=catalog_id,
             physical_schema=physical_schema,
-            physical_id=physical_schema,
             provisioning_status=provisioning_status,
             task=task_view,
             provisioning_checklist=provisioning_checklist,
@@ -335,24 +334,10 @@ class CatalogStatusService(ExtensionProtocol):
                 exc_info=True,
             )
 
-        physical_id: Optional[str] = None
-        try:
-            physical_id = await catalogs.resolve_physical_id(
-                catalog_id, collection_id, allow_missing=True
-            )
-        except Exception as exc:
-            logger.warning(
-                "catalog_status: failed to resolve physical id for collection %s/%s: %s",
-                catalog_id, collection_id, exc,
-                exc_info=True,
-            )
-
         return CollectionStatusView(
             catalog_id=catalog_id,
             collection_id=collection_id,
             physical_schema=physical_schema,
-            catalog_physical_id=physical_schema,
-            physical_id=physical_id,
             catalog_provisioning_status=provisioning_status,
         )
 

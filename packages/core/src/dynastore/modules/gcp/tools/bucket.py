@@ -282,33 +282,21 @@ def get_gcs_catalog_path(bucket_name: str) -> str:
     """Returns the full GCS URI for the catalog folder (e.g., gs://bucket/catalog/)."""
     return f"gs://{bucket_name}/{CATALOG_FOLDER}/"
 
-def get_gcs_collection_path(bucket_name: str, physical_id: str) -> str:
-    """Returns the full GCS URI for a specific collection's folder.
-
-    ``physical_id`` must be the immutable physical identifier of the
-    collection, not the mutable logical collection id.
-    """
-    return f"gs://{bucket_name}/{COLLECTIONS_FOLDER}/{physical_id}/"
+def get_gcs_collection_path(bucket_name: str, collection_id: str) -> str:
+    """Returns the full GCS URI for a specific collection's folder (e.g., gs://bucket/collections/my-collection/)."""
+    return f"gs://{bucket_name}/{COLLECTIONS_FOLDER}/{collection_id}/"
 
 def get_blob_path_for_catalog_file(filename: str) -> str:
     """Returns the relative blob path for a file in the catalog folder (e.g., catalog/my-file.txt)."""
     return f"{CATALOG_FOLDER}/{filename}"
 
-def get_blob_path_for_collection_folder(physical_id: str) -> str:
-    """Returns the relative blob path prefix for a collection's folder.
+def get_blob_path_for_collection_folder(collection_id: str) -> str:
+    """Returns the relative blob path prefix for a collection's folder (e.g., collections/my-collection/)."""
+    return f"{COLLECTIONS_FOLDER}/{collection_id}/"
 
-    ``physical_id`` must be the immutable physical identifier of the
-    collection, not the mutable logical collection id.
-    """
-    return f"{COLLECTIONS_FOLDER}/{physical_id}/"
-
-def get_blob_path_for_collection_file(physical_id: str, filename: str) -> str:
-    """Returns the relative blob path for a file in a collection's folder.
-
-    ``physical_id`` must be the immutable physical identifier of the
-    collection, not the mutable logical collection id.
-    """
-    return f"{get_blob_path_for_collection_folder(physical_id)}{filename}"
+def get_blob_path_for_collection_file(collection_id: str, filename: str) -> str:
+    """Returns the relative blob path for a file in a collection's folder (e.g., collections/my-collection/my-file.txt)."""
+    return f"{get_blob_path_for_collection_folder(collection_id)}{filename}"
 
 def parse_url(url: str) -> ParsedURL:
     """

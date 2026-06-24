@@ -46,9 +46,7 @@ Key models
 
 ``AssetReference``
     A dependency row in ``{schema}.asset_references`` that links an asset to a
-    referencing entity (collection, DuckDB table, Iceberg table, …).  Rows key
-    on the asset's immutable ``physical_id`` (UUIDv7) so a rename of
-    ``asset_id`` requires no propagation in this table.  The
+    referencing entity (collection, DuckDB table, Iceberg table, …).  The
     ``cascade_delete`` flag controls deletion safety:
 
     * ``True`` — informational; the referring driver handles its own cleanup
@@ -148,11 +146,10 @@ Hard-deletion of an ``owned_by`` asset with blocking references raises
 import json
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List, Literal, Optional, Dict, Any, Union, Callable, Annotated
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Dict, Any, Union, Callable, Annotated
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.router import ResolvedDriver
-    from dynastore.extensions.ogc_models_shared import RenameResponse
 from dynastore.tools.cache import cached
 from pydantic import BaseModel, Field, ConfigDict, StringConstraints, model_validator
 
@@ -168,7 +165,9 @@ from dynastore.modules.catalog.models import AssetReferenceType, EventType
 from dynastore.modules.catalog.log_manager import log_info
 from dynastore.models.shared_models import Link
 from dynastore.models.protocols.assets import AssetsProtocol
+from dynastore.models.protocols.catalogs import CatalogsProtocol
 from dynastore.models.driver_context import DriverContext
+from dynastore.tools.discovery import get_protocol
 from dynastore.models.query_builder import AssetFilter
 from enum import Enum
 
@@ -423,14 +422,7 @@ class AssetReference(BaseModel):
         )
     """
 
-    asset_id: str = Field(
-        ...,
-        description=(
-            "The current live logical asset ID.  Populated from the ``assets`` "
-            "JOIN in driver read paths so it always reflects the post-rename "
-            "label; never a stale stored copy."
-        ),
-    )
+    asset_id: str = Field(..., description="The referenced asset ID.")
     catalog_id: str = Field(..., description="Catalog scope of the asset.")
     ref_type: Union[AssetReferenceType, str] = Field(
         ...,
@@ -469,16 +461,6 @@ class AssetReference(BaseModel):
     )
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
-
-class AssetRenameConflictError(ValueError):
-    """Raised when the target ``new_id`` already exists in the assets table."""
-
-    def __init__(self, new_id: str) -> None:
-        super().__init__(
-            f"Asset id '{new_id}' already exists."
-        )
-        self.new_id = new_id
 
 
 class AssetReferencedError(ValueError):
@@ -537,12 +519,6 @@ class Asset(AssetBase):
     size_bytes: Optional[int] = Field(default=None, description="Object size in bytes.")
     created_at: datetime
     updated_at: Optional[datetime] = None
-    # physical_id (#2296) is the immutable UUIDv7 join key. It is INTERNAL-ONLY
-    # and intentionally NOT a field on this public model so it never serializes
-    # to the REST/STAC API — users only ever deal with asset_id/external_id.
-    # Internal callers read it from the row dict (it is in the SQL projections)
-    # or via AssetsProtocol.resolve_asset_physical_id; the model strips any
-    # stray copy by simply not declaring it.
     links: Optional[List[Link]] = Field(
         default=None,
         description=(
@@ -566,94 +542,6 @@ class Asset(AssetBase):
 # Assets correspond to {schema}.assets in the tenant schema.
 
 
-@cached(
-    maxsize=4096,
-    ttl=300,
-    namespace="asset_physical_id",
-    ignore=["service"],
-    condition=lambda v: v is not None,
-)
-async def _asset_physical_id_cache(
-    service: "AssetService",
-    catalog_id: str,
-    asset_id: str,
-    collection_id: Optional[str],
-) -> Optional[str]:
-    """Resolve an asset's immutable ``physical_id`` (UUIDv7) as a plain string.
-
-    Pure accelerator over ``{schema}.assets.physical_id`` (the single source of
-    truth, #2296).  Shared L1/L2 cache — the same ``@cached`` machinery as the
-    collection resolver — so hot callers (the sidecar writer, ``stac_virtual``,
-    the GCS finalize-metadata and DuckDB dispatch paths) pay the DB round-trip
-    at most once per TTL window.  ``condition`` keeps misses out so a freshly
-    created asset resolves immediately; ``service`` is ignored for keying so
-    every service instance shares one backend.  Only the cache-friendly (no
-    ``db_resource``) path routes here; in-transaction callers read straight
-    from their connection.
-    """
-    return await service._resolve_asset_physical_id_db(
-        catalog_id, asset_id, collection_id
-    )
-
-
-def _invalidate_asset_physical_id_cache(
-    catalog_id: str, asset_id: str, collection_id: Optional[str]
-) -> None:
-    """Drop the shared asset physical-id cache entry for one logical id.
-
-    Wired into ``rename_asset`` to bust both the old and the new logical id so a
-    stale ``old_id -> physical_id`` mapping cannot survive the label change.
-    The asset keeps its ``physical_id`` across the rename; only the logical key
-    into this cache moves.
-    """
-    _asset_physical_id_cache.cache_invalidate(None, catalog_id, asset_id, collection_id)
-
-
-# ---------------------------------------------------------------------------
-# Reverse resolver: physical_id (UUIDv7) -> current logical asset_id
-# ---------------------------------------------------------------------------
-# Mirrors the collection-level _collection_logical_id_cache pattern from
-# catalog_service.py.  The DuckDB items driver config persists the immutable
-# physical_id so that a rename of the logical asset_id does not strand the
-# config; at dispatch time it resolves the live asset_id here and calls
-# get_asset(...) with the current label.
-
-@cached(
-    maxsize=4096,
-    ttl=300,
-    namespace="asset_logical_id",
-    ignore=["service"],
-    condition=lambda v: v is not None,
-)
-async def _asset_logical_id_cache(
-    service: "AssetService",
-    catalog_id: str,
-    physical_id: str,
-) -> Optional[str]:
-    """Resolve an asset's current logical ``asset_id`` from its immutable ``physical_id``.
-
-    The reverse of ``_asset_physical_id_cache``: reads ``{schema}.assets.asset_id``
-    keyed on the stable UUIDv7 ``physical_id``.  Shared L1/L2 cache (TTL 300 s) —
-    the same ``@cached`` machinery as the forward resolver.  ``condition`` keeps
-    misses out so a just-created asset is resolvable immediately without a stale
-    ``None`` entry blocking the hot path.  ``service`` is ignored for keying so
-    every service instance shares one backend.  Only the cache-friendly (no live
-    ``db_resource``) path routes through here; in-transaction callers read straight
-    from their connection via ``_resolve_asset_logical_id_db``.
-    """
-    return await service._resolve_asset_logical_id_db(catalog_id, physical_id)
-
-
-def _invalidate_asset_logical_id_cache(catalog_id: str, physical_id: str) -> None:
-    """Drop the shared reverse cache entry for one asset physical_id.
-
-    Must be called in ``rename_asset`` after the label change commits so a stale
-    ``physical_id -> old_asset_id`` entry cannot outlive the TTL window.  The
-    physical_id itself is immutable; only the logical label it maps to has moved.
-    """
-    _asset_logical_id_cache.cache_invalidate(None, catalog_id, physical_id)
-
-
 class AssetService(AssetsProtocol):
     """
     SQL-backed implementation of ``AssetsProtocol``.
@@ -671,36 +559,33 @@ class AssetService(AssetsProtocol):
     ~~~~~~~~~~~~~
     ::
 
-        {catalog_schema}.assets   (PARTITION BY LIST (collection_physical_id))
-          asset_id               VARCHAR   (mutable logical label)
-          asset_physical_id      UUID NOT NULL  (immutable UUIDv7; join key)
-          catalog_id             VARCHAR
-          collection_id          VARCHAR   (NULL = catalog-tier; default partition)
-          collection_physical_id VARCHAR   (immutable partition key)
-          asset_type             VARCHAR
-          kind                   VARCHAR   ('physical' | 'virtual')
-          status                 VARCHAR   ('pending' | 'active' | 'failed' | 'deleted')
-          filename               VARCHAR   (NOT NULL for kind=physical, CHECK)
-          href                   TEXT      (NOT NULL for kind=virtual, CHECK)
-          uri                    TEXT      (resolved storage URI for PHYSICAL, set by finalize)
-          content_hash           VARCHAR(96)
-          size_bytes             BIGINT
-          metadata               JSONB
-          owned_by               VARCHAR   (NULL = not file-owned; set = deletion guard active)
-          created_at             TIMESTAMPTZ
-          updated_at             TIMESTAMPTZ
-          CONSTRAINT assets_identity_uq UNIQUE NULLS NOT DISTINCT (collection_physical_id, asset_id)
-          CONSTRAINT assets_physical_uq UNIQUE (collection_physical_id, asset_physical_id)
+        {catalog_schema}.assets   (PARTITION BY LIST (collection_id))
+          asset_id       VARCHAR
+          catalog_id     VARCHAR
+          collection_id  VARCHAR  (NULL = catalog-tier; default partition)
+          asset_type     VARCHAR
+          kind           VARCHAR  ('physical' | 'virtual')
+          status         VARCHAR  ('pending' | 'active' | 'failed' | 'deleted')
+          filename       VARCHAR  (NOT NULL for kind=physical, CHECK)
+          href           TEXT     (NOT NULL for kind=virtual,  CHECK)
+          uri            TEXT     (resolved storage URI for PHYSICAL, set by finalize)
+          content_hash   VARCHAR(64)
+          size_bytes     BIGINT
+          metadata       JSONB
+          owned_by       VARCHAR  (NULL = not file-owned; set = deletion guard active)
+          created_at     TIMESTAMPTZ
+          updated_at     TIMESTAMPTZ
+          PRIMARY KEY (catalog_id, collection_id, asset_id)
 
         {catalog_schema}.asset_references
-          asset_physical_id    UUID NOT NULL  (immutable join key from assets.asset_physical_id)
-          ref_type             VARCHAR        (namespaced enum value, e.g. 'collection', 'duckdb:table')
-          ref_id               VARCHAR        (collection_id, table_name, …)
-          cascade_delete       BOOLEAN        DEFAULT TRUE
-          created_at           TIMESTAMPTZ
-          valid_until          TIMESTAMPTZ    (NULL = active; stamped by soft-delete/NEW_VERSION)
-          PRIMARY KEY (asset_physical_id, ref_type, ref_id)
-          PARTIAL INDEX  on (asset_physical_id) WHERE cascade_delete = FALSE AND valid_until IS NULL
+          asset_id       VARCHAR  FK → assets
+          catalog_id     VARCHAR
+          ref_type       VARCHAR  (namespaced enum value, e.g. 'collection', 'duckdb:table')
+          ref_id         VARCHAR  (collection_id, table_name, …)
+          cascade_delete BOOLEAN  DEFAULT TRUE
+          created_at     TIMESTAMPTZ
+          PRIMARY KEY (catalog_id, asset_id, ref_type, ref_id)
+          PARTIAL INDEX  on (catalog_id, asset_id) WHERE cascade_delete = FALSE
     """
 
     # Protocol attributes
@@ -753,9 +638,6 @@ class AssetService(AssetsProtocol):
     async def _resolve_schema(
         self, catalog_id: str, db_resource: DbResource
     ) -> Optional[str]:
-        from dynastore.tools.discovery import get_protocol
-        from dynastore.models.protocols.catalogs import CatalogsProtocol
-
         catalogs = get_protocol(CatalogsProtocol)
         if catalogs is None:
             return None
@@ -763,140 +645,30 @@ class AssetService(AssetsProtocol):
             catalog_id, ctx=DriverContext(db_resource=db_resource)
         )
 
+    async def _resolve_external_ids(
+        self, catalog_id: str, collection_id: Optional[str] = None
+    ) -> Tuple[str, Optional[str]]:
+        """Resolve public external catalog/collection ids to immutable internal
+        ids at the asset boundary, so asset rows key on rename-stable ids.
+        Idempotent: an already-internal id is returned unchanged."""
+        catalogs_svc = get_protocol(CatalogsProtocol)
+        if catalogs_svc is None:
+            return catalog_id, collection_id
+        internal_cat = await catalogs_svc.resolve_catalog_id(catalog_id, allow_missing=True)
+        if internal_cat is not None:
+            catalog_id = internal_cat
+        if collection_id is not None:
+            internal_col = await catalogs_svc.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if internal_col is not None:
+                collection_id = internal_col
+        return catalog_id, collection_id
+
     def _get_partition_name(self, catalog_id: str, collection_id: str) -> str:
         """Generates the partition name for a given catalog and collection."""
         # Standardize: remove dots or other non-identifier chars if necessary, but here we assume safe
         return f"assets_{catalog_id}_{collection_id}"
-
-    async def _resolve_asset_physical_id_db(
-        self,
-        catalog_id: str,
-        asset_id: str,
-        collection_id: Optional[str] = None,
-        db_resource: Optional[DbResource] = None,
-    ) -> Optional[str]:
-        """Read ``physical_id`` from the per-tenant assets table.
-
-        ``{schema}.assets.physical_id`` is the single source of truth for an
-        asset's immutable join key.  Returns ``None`` when the catalog schema
-        cannot be resolved, no engine is available, or the (non-deleted) row is
-        absent.  When ``collection_id`` is given the lookup is scoped to that
-        collection's physical shard; otherwise the most recent live row for the
-        logical id wins (catalog-tier and cross-collection callers).
-        """
-        engine = db_resource or getattr(self, "engine", None)
-        if engine is None:
-            return None
-        async with managed_transaction(engine) as conn:
-            phys_schema = await self._resolve_schema(catalog_id, conn)
-            if not phys_schema:
-                return None
-            if collection_id is not None:
-                coll_phys = await DQLQuery(
-                    f'SELECT physical_id FROM "{phys_schema}".collections '
-                    "WHERE id = :collection_id AND deleted_at IS NULL;",
-                    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-                ).execute(conn, collection_id=collection_id)
-                if coll_phys is not None:
-                    return await DQLQuery(
-                        f'SELECT asset_physical_id::text FROM "{phys_schema}".assets '
-                        "WHERE asset_id = :asset_id "
-                        "AND collection_physical_id = :coll_phys "
-                        "AND status <> 'deleted';",
-                        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-                    ).execute(conn, asset_id=asset_id, coll_phys=coll_phys)
-            return await DQLQuery(
-                f'SELECT asset_physical_id::text FROM "{phys_schema}".assets '
-                "WHERE asset_id = :asset_id AND status <> 'deleted' "
-                "ORDER BY created_at DESC LIMIT 1;",
-                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-            ).execute(conn, asset_id=asset_id)
-
-    async def resolve_asset_physical_id(
-        self,
-        catalog_id: str,
-        asset_id: str,
-        collection_id: Optional[str] = None,
-        *,
-        ctx: Optional[DriverContext] = None,
-        allow_missing: bool = True,
-    ) -> Optional[str]:
-        """Return the immutable ``physical_id`` (UUIDv7) for a logical asset.
-
-        Mirrors ``CatalogsProtocol.resolve_physical_id``: in-transaction callers
-        (``ctx.db_resource`` set) read straight from their connection so
-        uncommitted state is visible and never serve from the cache; everyone
-        else routes through the shared L1/L2 accelerator.  ``allow_missing``
-        defaults ``True`` — denormalized surfaces resolve opportunistically and
-        fall back to the logical id when the row has not landed yet.
-        """
-        db_resource = ctx.db_resource if ctx else None
-        if db_resource is not None:
-            phys = await self._resolve_asset_physical_id_db(
-                catalog_id, asset_id, collection_id, db_resource=db_resource
-            )
-        else:
-            phys = await _asset_physical_id_cache(
-                self, catalog_id, asset_id, collection_id
-            )
-        if not phys and not allow_missing:
-            raise ValueError(f"Asset '{catalog_id}/{asset_id}' not found.")
-        return phys
-
-    async def _resolve_asset_logical_id_db(
-        self,
-        catalog_id: str,
-        physical_id: str,
-        db_resource: Optional[DbResource] = None,
-    ) -> Optional[str]:
-        """Read the current logical ``asset_id`` for an asset's immutable physical id.
-
-        The reverse of :meth:`_resolve_asset_physical_id_db`: keys on the stable
-        UUIDv7 ``physical_id`` column and returns the live logical ``asset_id``.
-        Returns ``None`` when the catalog schema cannot be resolved, no engine is
-        available, or the (non-deleted) row is absent.
-        """
-        engine = db_resource or getattr(self, "engine", None)
-        if engine is None:
-            return None
-        async with managed_transaction(engine) as conn:
-            phys_schema = await self._resolve_schema(catalog_id, conn)
-            if not phys_schema:
-                return None
-            return await DQLQuery(
-                f'SELECT asset_id FROM "{phys_schema}".assets '
-                "WHERE asset_physical_id = :physical_id AND status <> 'deleted' "
-                "ORDER BY created_at DESC LIMIT 1;",
-                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-            ).execute(conn, physical_id=physical_id)
-
-    async def resolve_asset_logical_id(
-        self,
-        catalog_id: str,
-        physical_id: str,
-        *,
-        ctx: Optional[DriverContext] = None,
-    ) -> Optional[str]:
-        """Return the current logical ``asset_id`` for an asset's immutable physical id.
-
-        The inverse of :meth:`resolve_asset_physical_id`: given the UUIDv7
-        ``physical_id`` stored in a persisted config (e.g. ``asset_physical_id`` on
-        the DuckDB items driver config), return the live user-facing ``asset_id``.
-        After an asset rename the physical_id is stable while the logical label
-        changes, so dispatch paths that persist the physical_id and re-resolve here
-        remain rename-safe.
-
-        When ``ctx`` carries a connection the lookup joins that transaction directly
-        so uncommitted state is visible; otherwise the shared ``_asset_logical_id_cache``
-        (TTL 300 s) serves as a lossless accelerator.  Returns ``None`` for an unknown
-        physical_id; callers should treat ``None`` as "asset not found".
-        """
-        db_resource = ctx.db_resource if ctx else None
-        if db_resource is not None:
-            return await self._resolve_asset_logical_id_db(
-                catalog_id, physical_id, db_resource=db_resource
-            )
-        return await _asset_logical_id_cache(self, catalog_id, physical_id)
 
     # --- Retrieval & Advanced Search ---
 
@@ -1029,6 +801,7 @@ class AssetService(AssetsProtocol):
         db_resource: Optional[DbResource] = None,
     ) -> Optional[Asset]:
         """Get asset by ID, routing through the configured read driver."""
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
 
         if db_resource:
@@ -1067,6 +840,7 @@ class AssetService(AssetsProtocol):
         offset: int = 0,
         db_resource: Optional[DbResource] = None,
     ) -> List[Asset]:
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
         driver = await get_asset_driver("READ", catalog_id, collection_id)
         docs = await driver.search_assets(
@@ -1101,6 +875,7 @@ class AssetService(AssetsProtocol):
         vocabulary shared by the PG and ES backends). Unsupported operators
         raise ``ValueError`` from that layer (mapped to HTTP 400).
         """
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_search_driver
 
         driver = await get_asset_search_driver(catalog_id, collection_id)
@@ -1124,6 +899,7 @@ class AssetService(AssetsProtocol):
         collection_id: Optional[str] = None,
         ctx: Optional[DriverContext] = None,
     ) -> Asset:
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
         db_resource = ctx.db_resource if ctx else None
         now = datetime.now(timezone.utc)
@@ -1196,6 +972,7 @@ class AssetService(AssetsProtocol):
         db_resource: Optional[DbResource] = None,
     ) -> Asset:
         """Updates an existing asset's metadata via the configured write driver."""
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
 
         # Fetch current asset
@@ -1261,6 +1038,7 @@ class AssetService(AssetsProtocol):
         writer (e.g. gdalinfo) and an end-user editing ``metadata.title``
         no longer clobber each other.
         """
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
         from dynastore.modules.catalog._merge_patch import merge_patch
 
@@ -1350,26 +1128,11 @@ class AssetService(AssetsProtocol):
         if not schema:
             return None
 
-        # Resolve the collection's physical id for partition-pruning predicates.
-        from dynastore.tools.discovery import get_protocol as _get_proto
-        from dynastore.models.protocols.catalogs import CatalogsProtocol as _CatProto
-        from dynastore.models.driver_context import DriverContext as _DCtx
-        _catalogs = _get_proto(_CatProto)
-        collection_physical_id: Optional[str] = None
-        if collection_id is not None and _catalogs is not None:
-            collection_physical_id = await _catalogs.resolve_physical_id(
-                catalog_id,
-                collection_id,
-                ctx=_DCtx(db_resource=engine),
-                allow_missing=True,
-            )
-
-        # Schema scopes the catalog; catalog_id is a mutable label, omitted here
-        # to stay rename-robust.
         select_sql = (
             f'SELECT asset_id, status, metadata '
             f'FROM "{schema}".assets '
-            "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+            "WHERE catalog_id = :catalog_id "
+            "AND collection_id IS NOT DISTINCT FROM :collection_id "
             "AND kind = 'physical' "
             "AND status = 'pending' "
             "ORDER BY created_at ASC "
@@ -1384,17 +1147,15 @@ class AssetService(AssetsProtocol):
             "    size_bytes = :size_bytes, "
             "    metadata = metadata - '_upload', "
             "    updated_at = NOW() "
-            "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+            "WHERE catalog_id = :catalog_id "
+            "AND collection_id IS NOT DISTINCT FROM :collection_id "
             "AND asset_id = :asset_id"
         )
 
         async with managed_transaction(engine) as conn:
             rows = await DQLQuery(
                 select_sql, result_handler=ResultHandler.ALL
-            ).execute(
-                conn,
-                collection_physical_id=collection_physical_id,
-            )
+            ).execute(conn, catalog_id=catalog_id, collection_id=collection_id)
             rows = list(rows or [])
             if not rows:
                 return None
@@ -1424,7 +1185,8 @@ class AssetService(AssetsProtocol):
                 owned_by=owned_by,
                 content_hash=content_hash,
                 size_bytes=size_bytes,
-                collection_physical_id=collection_physical_id,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
                 asset_id=chosen_asset_id,
             )
 
@@ -1505,6 +1267,7 @@ class AssetService(AssetsProtocol):
         I/O here would hold the transaction's connection idle in-transaction and
         the commit would fail (idle_in_transaction_session_timeout).
         """
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
         from dynastore.modules.catalog.drivers.pg_asset_driver import AssetPostgresqlDriver
 
@@ -1597,6 +1360,7 @@ class AssetService(AssetsProtocol):
         collection_id: Optional[str] = None,
         db_resource: Optional[DbResource] = None,
     ) -> int:
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         return await self.delete_assets(
             catalog_id,
             asset_id=asset_id,
@@ -1611,6 +1375,7 @@ class AssetService(AssetsProtocol):
         propagate: bool = False,
         db_resource: Optional[DbResource] = None,
     ) -> int:
+        catalog_id, _ = await self._resolve_external_ids(catalog_id)
         return await self.delete_assets(
             catalog_id,
             asset_id=asset_id,
@@ -1704,25 +1469,27 @@ class AssetService(AssetsProtocol):
         schema: str,
         db_resource: Optional[DbResource] = None,
     ) -> None:
-        """Idempotently creates the ``asset_references`` table in *schema*.
-
-        Delegates to ``AssetPostgresqlDriver.ensure_storage`` which owns the
-        canonical DDL for both ``assets`` and ``asset_references``.  This
-        method is kept for call-site compatibility but is a thin wrapper.
         """
-        from dynastore.modules.catalog.drivers.pg_asset_driver import (
-            AssetPostgresqlDriver,
-        )
-
-        driver = AssetPostgresqlDriver(engine=db_resource or self.engine)
-        # Resolve catalog_id from the schema name is not trivial here; callers
-        # that only have a schema string can pass it through kwargs so
-        # ensure_storage skips the schema-resolution step.
-        await driver.ensure_storage(
-            catalog_id="",  # unused when schema is supplied
-            db_resource=db_resource or self.engine,
-            schema=schema,
-        )
+        Idempotently creates the ``asset_references`` table in *schema* if it
+        does not yet exist.  Called during tenant schema initialisation alongside
+        the ``assets`` table creation.
+        """
+        ddl = f"""
+        CREATE TABLE IF NOT EXISTS "{schema}".asset_references (
+            asset_id       VARCHAR     NOT NULL,
+            catalog_id     VARCHAR     NOT NULL,
+            ref_type       VARCHAR     NOT NULL,
+            ref_id         VARCHAR     NOT NULL,
+            cascade_delete BOOLEAN     NOT NULL DEFAULT TRUE,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (catalog_id, asset_id, ref_type, ref_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_asset_refs_blocking_{schema}
+            ON "{schema}".asset_references (catalog_id, asset_id)
+            WHERE cascade_delete = FALSE;
+        """.strip()
+        async with managed_transaction(db_resource or self.engine) as conn:
+            await DDLQuery(ddl).execute(conn, schema=schema)
 
     # -------------------------------------------------------------------------
     # Asset reference CRUD
@@ -1794,6 +1561,7 @@ class AssetService(AssetsProtocol):
         db_resource: Optional[DbResource] = None,
     ) -> List[str]:
         """Returns asset IDs that carry a given reference (inverse lookup)."""
+        catalog_id, _ = await self._resolve_external_ids(catalog_id)
         from dynastore.modules.catalog.drivers.pg_asset_driver import AssetPostgresqlDriver
         pg = AssetPostgresqlDriver(engine=db_resource or self.engine)
         return await pg.list_assets_for_reference(
@@ -1805,183 +1573,20 @@ class AssetService(AssetsProtocol):
 
     async def _list_blocking_references_bulk(
         self,
-        physical_ids: List[str],
+        asset_ids: List[str],
         catalog_id: str,
         conn: DbConnection,
         phys_schema: str,
     ) -> List[AssetReference]:
-        """Return cascade_delete=False references for all given asset physical_ids.
-
-        Passes ``physical_ids`` (not logical asset_ids) to
-        ``check_blocking_references`` so the lookup is rename-stable.
-        """
+        """Returns cascade_delete=False references for all given asset IDs in one round trip."""
         from dynastore.modules.catalog.drivers.pg_asset_driver import AssetPostgresqlDriver
         pg = AssetPostgresqlDriver(engine=conn)
         rows = await pg.check_blocking_references(
-            physical_ids=physical_ids,
+            asset_ids=asset_ids,
             catalog_id=catalog_id,
             db_resource=conn,
         )
         return [AssetReference.model_validate(r) for r in rows]
-
-    async def rename_asset(
-        self,
-        catalog_id: str,
-        asset_id: str,
-        new_id: str,
-        collection_id: Optional[str] = None,
-        db_resource: Optional[DbResource] = None,
-    ) -> "RenameResponse":
-        """Rename an asset's logical ``asset_id`` (label change only).
-
-        The physical file (GCS URI, S3 key, disk path) is NOT moved.  The
-        partition key ``collection_physical_id`` and the storage backends are
-        unchanged.  Only the label column ``{schema}.assets.asset_id`` is
-        updated inside a single tight transaction.
-
-        ``asset_references`` is NOT touched: it keys on the immutable
-        ``physical_id`` (UUIDv7), so a rename is a pure one-column label
-        change on ``assets`` and zero propagation is needed in the
-        references table.  Any active reference still resolves to the new
-        ``asset_id`` via the ``assets`` JOIN in the driver query methods.
-
-        The ``collection_physical_id`` partition key is the immutable physical
-        identity of the collection shard and is never touched.
-        """
-        from dynastore.tools.db import validate_asset_id
-        from dynastore.extensions.ogc_models_shared import RenameResponse
-
-        new_id = validate_asset_id(new_id)
-
-        # Fast path: no-op when the ids are already identical.
-        if new_id == asset_id:
-            return RenameResponse(
-                old_id=asset_id,
-                new_id=new_id,
-                level="asset",
-                warnings=[],
-                reindex_required=False,
-                iam_manual_update_required=False,
-            )
-
-        engine = db_resource or self.engine
-
-        async with managed_transaction(engine) as conn:
-            if db_resource is None:
-                from typing import cast as _cast
-                from sqlalchemy import text as _text
-                from sqlalchemy.ext.asyncio import AsyncConnection as _AsyncConn
-                await _cast(_AsyncConn, conn).execute(
-                    _text("SET LOCAL idle_in_transaction_session_timeout = '0'")
-                )
-
-            phys_schema = await self._resolve_schema(catalog_id, conn)
-            if not phys_schema:
-                raise ValueError(f"Catalog '{catalog_id}' not found.")
-
-            # Derive the physical collection id for locking and scope filtering.
-            coll_phys: Optional[str] = None
-            if collection_id is not None:
-                coll_phys_row = await DQLQuery(
-                    f'SELECT physical_id FROM "{phys_schema}".collections '
-                    "WHERE id = :collection_id AND deleted_at IS NULL;",
-                    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-                ).execute(conn, collection_id=collection_id)
-                coll_phys = coll_phys_row
-
-            # Serialize concurrent renames on the same asset in this scope.
-            lock_key = (
-                f"{phys_schema}:asset_rename:{coll_phys or '_cat_'}:{asset_id}"
-            )
-            await DQLQuery(
-                "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
-                result_handler=ResultHandler.SCALAR,
-            ).execute(conn, lock_key=lock_key)
-
-            # Existence check (404).  Also fetch asset_physical_id so the
-            # reverse cache (asset_physical_id -> logical asset_id) can be
-            # busted post-commit.
-            if collection_id is not None and coll_phys is not None:
-                existing_row = await DQLQuery(
-                    f'SELECT asset_id, asset_physical_id::text FROM "{phys_schema}".assets '
-                    "WHERE asset_id = :asset_id "
-                    "AND collection_physical_id = :coll_phys "
-                    "AND status <> 'deleted';",
-                    result_handler=ResultHandler.ONE_OR_NONE,
-                ).execute(conn, asset_id=asset_id, coll_phys=coll_phys)
-            else:
-                existing_row = await DQLQuery(
-                    f'SELECT asset_id, asset_physical_id::text FROM "{phys_schema}".assets '
-                    "WHERE asset_id = :asset_id AND status <> 'deleted' "
-                    "ORDER BY created_at DESC LIMIT 1;",
-                    result_handler=ResultHandler.ONE_OR_NONE,
-                ).execute(conn, asset_id=asset_id)
-
-            if existing_row is None:
-                raise ValueError(
-                    f"Asset '{asset_id}' not found in catalog '{catalog_id}'."
-                )
-            existing_physical_id: Optional[str] = existing_row[1]
-
-            # Collision check — any existing row with the new_id (409).
-            if collection_id is not None and coll_phys is not None:
-                collision = await DQLQuery(
-                    f'SELECT asset_id FROM "{phys_schema}".assets '
-                    "WHERE asset_id = :new_id "
-                    "AND collection_physical_id = :coll_phys;",
-                    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-                ).execute(conn, new_id=new_id, coll_phys=coll_phys)
-            else:
-                collision = await DQLQuery(
-                    f'SELECT asset_id FROM "{phys_schema}".assets '
-                    "WHERE asset_id = :new_id;",
-                    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-                ).execute(conn, new_id=new_id)
-
-            if collision is not None:
-                raise AssetRenameConflictError(new_id)
-
-            # Update assets.asset_id (the mutable logical label).
-            # asset_references keys on the immutable physical_id and needs
-            # no update — the rename is complete in one statement.
-            if collection_id is not None and coll_phys is not None:
-                await DDLQuery(
-                    f'UPDATE "{phys_schema}".assets '
-                    "SET asset_id = :new_id "
-                    "WHERE asset_id = :old_id "
-                    "AND collection_physical_id = :coll_phys;",
-                ).execute(conn, new_id=new_id, old_id=asset_id, coll_phys=coll_phys)
-            else:
-                await DDLQuery(
-                    f'UPDATE "{phys_schema}".assets '
-                    "SET asset_id = :new_id "
-                    "WHERE asset_id = :old_id;",
-                ).execute(conn, new_id=new_id, old_id=asset_id)
-
-        # Bust read caches for both old and new logical ids post-commit.
-        # The physical_id cache for the old id becomes stale (the label moved);
-        # the new id cache needs to be warm-able immediately.  The underlying
-        # physical_id is unchanged — only the logical key into this cache moves.
-        self._invalidate_cache(asset_id, catalog_id, collection_id)
-        self._invalidate_cache(new_id, catalog_id, collection_id)
-        _invalidate_asset_physical_id_cache(catalog_id, asset_id, collection_id)
-        _invalidate_asset_physical_id_cache(catalog_id, new_id, collection_id)
-        # Also bust the reverse (physical_id -> logical asset_id) cache: the
-        # physical_id is immutable but the logical label it maps to has changed.
-        if existing_physical_id:
-            _invalidate_asset_logical_id_cache(catalog_id, existing_physical_id)
-
-        # ES items index keys on the immutable asset_physical_id UUID, not the
-        # logical asset_id, so an asset rename leaves every indexed item doc
-        # correct as-is.  No reindex is needed.
-        return RenameResponse(
-            old_id=asset_id,
-            new_id=new_id,
-            level="asset",
-            warnings=[],
-            reindex_required=False,
-            iam_manual_update_required=False,
-        )
 
 
 # assets and asset_references tables are now created by

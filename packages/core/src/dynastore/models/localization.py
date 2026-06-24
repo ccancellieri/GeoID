@@ -590,6 +590,14 @@ class LocalizableModelMixin:
             updates = updates.model_dump(by_alias=True, exclude_none=True)
             lang = "*"
 
+        # Capture identity fields before the dump.  model_dump(by_alias=True)
+        # fires _serialize_public_id which replaces the "id" key with the
+        # external_id value and drops "external_id".  Without this capture the
+        # round-trip through model_validate would set .id = external_id value,
+        # violating the invariant that .id is always the internal token.
+        _orig_id: Any = getattr(self, "id", None)
+        _orig_external_id: Any = getattr(self, "external_id", None)
+
         updated_data = self.model_dump(by_alias=True)
 
         for field_name, new_value in updates.items():
@@ -634,7 +642,17 @@ class LocalizableModelMixin:
             else:
                 updated_data[field_name] = new_value
 
-        return self.__class__.model_validate(updated_data)
+        rebuilt = self.__class__.model_validate(updated_data)
+
+        # Restore identity fields that were clobbered by the serializer during
+        # the dump above.  We set the attributes directly to avoid re-triggering
+        # validators; model_validate already validated the full payload.
+        if _orig_id is not None and hasattr(rebuilt, "id"):
+            object.__setattr__(rebuilt, "id", _orig_id)
+        if hasattr(rebuilt, "external_id"):
+            object.__setattr__(rebuilt, "external_id", _orig_external_id)
+
+        return rebuilt
 
     @classmethod
     def create_from_localized_input(cls, data: Dict[str, Any], lang: str) -> "Self":

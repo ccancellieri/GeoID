@@ -130,10 +130,10 @@ class LifecycleReaperConfig(PluginConfig):
 # ---------------------------------------------------------------------------
 
 # Find collections stuck in PROVISIONING past the threshold, across all active
-# tenant schemas.  Returns (catalog_id, physical_schema) pairs so we can
+# tenant schemas.  Returns catalog ids (schema name = catalog id) so we can
 # enumerate per-tenant.
 _ACTIVE_CATALOG_SCHEMAS_SQL = (
-    "SELECT id, physical_schema FROM catalog.catalogs "
+    "SELECT id FROM catalog.catalogs "
     "WHERE deleted_at IS NULL ORDER BY id"
 )
 
@@ -212,20 +212,20 @@ class LifecycleReaper(PeriodicService):
             logger.debug("lifecycle_reaper: no active catalogs; skipping scan.")
             return
 
-        for catalog_id, physical_schema in catalog_ids:
+        for catalog_id in catalog_ids:
             await self._reap_provisioning_in_schema(
-                catalog_id, physical_schema, threshold, limit
+                catalog_id, catalog_id, threshold, limit
             )
             await self._reap_deleting_in_schema(
-                catalog_id, physical_schema, threshold, limit
+                catalog_id, catalog_id, threshold, limit
             )
 
     # ------------------------------------------------------------------
     # Catalog enumeration
     # ------------------------------------------------------------------
 
-    async def _list_active_catalogs(self) -> list[tuple[str, str]]:
-        """Return (catalog_id, physical_schema) for all non-deleted catalogs."""
+    async def _list_active_catalogs(self) -> list[str]:
+        """Return catalog ids (= schema names) for all non-deleted catalogs."""
         engine = get_engine()
         if engine is None:
             logger.warning(
@@ -245,7 +245,7 @@ class LifecycleReaper(PeriodicService):
             )
             return []
 
-        return [(r[0], r[1]) for r in rows] if rows else []
+        return [r[0] for r in rows] if rows else []
 
     # ------------------------------------------------------------------
     # PROVISIONING reap: clear overlay back to NULL (→ ACTIVE)
@@ -254,7 +254,7 @@ class LifecycleReaper(PeriodicService):
     async def _reap_provisioning_in_schema(
         self,
         catalog_id: str,
-        physical_schema: str,
+        schema: str,
         threshold_seconds: int,
         limit: int,
     ) -> None:
@@ -263,7 +263,7 @@ class LifecycleReaper(PeriodicService):
         if engine is None:
             return
 
-        query_sql = _STUCK_PROVISIONING_SQL.format(schema=physical_schema)
+        query_sql = _STUCK_PROVISIONING_SQL.format(schema=schema)
         try:
             async with managed_transaction(engine) as conn:
                 rows = await DQLQuery(
@@ -274,7 +274,7 @@ class LifecycleReaper(PeriodicService):
             logger.warning(
                 "lifecycle_reaper: failed to query stuck PROVISIONING collections "
                 "in schema %r (catalog %r): %s",
-                physical_schema, catalog_id, exc,
+                schema, catalog_id, exc,
             )
             return
 
@@ -290,13 +290,13 @@ class LifecycleReaper(PeriodicService):
 
         for collection_id in collection_ids:
             await self._clear_provisioning(
-                catalog_id, physical_schema, collection_id
+                catalog_id, schema, collection_id
             )
 
     async def _clear_provisioning(
         self,
         catalog_id: str,
-        physical_schema: str,
+        schema: str,
         collection_id: str,
     ) -> None:
         """Clear the PROVISIONING overlay for one collection (→ ACTIVE).
@@ -309,7 +309,7 @@ class LifecycleReaper(PeriodicService):
         if engine is None:
             return
 
-        update_sql = _CLEAR_PROVISIONING_SQL.format(schema=physical_schema)
+        update_sql = _CLEAR_PROVISIONING_SQL.format(schema=schema)
         try:
             async with managed_transaction(engine) as conn:
                 rows = await DQLQuery(
@@ -359,7 +359,7 @@ class LifecycleReaper(PeriodicService):
     async def _reap_deleting_in_schema(
         self,
         catalog_id: str,
-        physical_schema: str,
+        schema: str,
         threshold_seconds: int,
         limit: int,
     ) -> None:
@@ -368,7 +368,7 @@ class LifecycleReaper(PeriodicService):
         if engine is None:
             return
 
-        query_sql = _STUCK_DELETING_SQL.format(schema=physical_schema)
+        query_sql = _STUCK_DELETING_SQL.format(schema=schema)
         try:
             async with managed_transaction(engine) as conn:
                 rows = await DQLQuery(
@@ -379,7 +379,7 @@ class LifecycleReaper(PeriodicService):
             logger.warning(
                 "lifecycle_reaper: failed to query stuck DELETING collections "
                 "in schema %r (catalog %r): %s",
-                physical_schema, catalog_id, exc,
+                schema, catalog_id, exc,
             )
             return
 

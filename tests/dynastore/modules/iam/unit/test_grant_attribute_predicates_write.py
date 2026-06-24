@@ -248,11 +248,13 @@ def _patch_protocols(mgr: MagicMock, *, policy_exists: bool = True) -> Any:
     from dynastore.modules.iam.iam_service import IamService
 
     catalogs = MagicMock()
+    catalogs.resolve_catalog_id = AsyncMock(return_value=_CATALOG)
     catalogs.get_catalog_model = AsyncMock(return_value=SimpleNamespace(id=_CATALOG))
     catalogs.collections = MagicMock()
     catalogs.collections.get_collection = AsyncMock(
         return_value=SimpleNamespace(id=_COLL)
     )
+    catalogs.collections.resolve_collection_id = AsyncMock(return_value=_COLL)
 
     perm = MagicMock()
     perm.get_policy = AsyncMock(

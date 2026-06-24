@@ -413,7 +413,6 @@ class TaskEventDriver(ModuleProtocol):
         event_type: str,
         payload: Dict[str, Any],
         scope: str = "PLATFORM",
-        schema_name: Optional[str] = None,
         catalog_id: Optional[str] = None,
         collection_id: Optional[str] = None,
         identity_id: Optional[str] = None,
@@ -433,7 +432,6 @@ class TaskEventDriver(ModuleProtocol):
                 conn,
                 event_type=event_type,
                 scope=scope,
-                schema_name=schema_name,
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 identity_id=identity_id,
@@ -471,10 +469,10 @@ class TaskEventDriver(ModuleProtocol):
             # arguments nested under payload->'kwargs' (shape:
             # {"args": [...], "kwargs": {"catalog_id": ..., "collection_id": ...}}).
             # catalog_id/collection_id/identity_id therefore live at
-            # payload->'kwargs'->>'<key>', NOT at the top level, and schema_name
-            # holds the *physical* schema (s_xxxx), never the logical catalog_id.
+            # payload->'kwargs'->>'<key>', NOT at the top level, and catalog_id
+            # holds the catalog internal id (or NULL for platform-scoped events).
             # Filtering on the nested kwargs key surfaces both platform-scoped
-            # lifecycle events (catalog_creation, schema_name=NULL) and
+            # lifecycle events (catalog_creation, catalog_id=NULL) and
             # tenant-scoped events for the same catalog (#2256).
             if catalog_id and catalog_id != "_system_":
                 clauses.append("payload->'kwargs'->>'catalog_id' = :catalog_id")
@@ -491,7 +489,7 @@ class TaskEventDriver(ModuleProtocol):
 
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             sql = (
-                f"SELECT event_id::text as id, event_type, schema_name, "
+                f"SELECT event_id::text as id, event_type, catalog_id, "
                 f"scope, payload, created_at, status "
                 f"FROM {task_schema}.events {where} "
                 f"ORDER BY created_at DESC LIMIT :limit OFFSET :offset"

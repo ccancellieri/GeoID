@@ -375,9 +375,7 @@ async def test_force_teardown_topic_emits_durable_log(monkeypatch):
 
     monkeypatch.setattr(ops_mod, "log_info", _log_info)
 
-    # Deterministic teardown derives names from the immutable physical id,
-    # captured by the caller before the catalog row is dropped.
-    await m.teardown_catalog_eventing(CATALOG_ID, config=None, physical_id=CATALOG_ID)
+    await m.teardown_catalog_eventing(CATALOG_ID, config=None)
 
     assert any(
         cid == CATALOG_ID and et == "gcp_topic_deleted"
@@ -404,9 +402,7 @@ async def test_force_teardown_subscription_emits_durable_log(monkeypatch):
 
     monkeypatch.setattr(ops_mod, "log_info", _log_info)
 
-    # Deterministic teardown derives names from the immutable physical id,
-    # captured by the caller before the catalog row is dropped.
-    await m.teardown_catalog_eventing(CATALOG_ID, config=None, physical_id=CATALOG_ID)
+    await m.teardown_catalog_eventing(CATALOG_ID, config=None)
 
     assert any(
         cid == CATALOG_ID and et == "gcp_subscription_deleted"

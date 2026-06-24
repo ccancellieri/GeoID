@@ -58,7 +58,7 @@ INSERT INTO {task_schema}.events (
     event_id,
     day,
     shard,
-    schema_name,
+    catalog_id,
     scope,
     event_type,
     payload
@@ -66,7 +66,7 @@ INSERT INTO {task_schema}.events (
     CAST(:event_id AS uuid),
     CURRENT_DATE,
     :shard,
-    :schema_name,
+    :catalog_id,
     :scope,
     :event_type,
     CAST(:payload AS jsonb)
@@ -136,7 +136,7 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
 
     insert_sql = (
         f"INSERT INTO {task_schema}.tasks"
-        f" (task_id, schema_name, scope, caller_id, task_type, type,"
+        f" (task_id, catalog_id, scope, caller_id, task_type, type,"
         f"  execution_mode, inputs, timestamp, status, dedup_key)"
         f" SELECT :task_id, 'platform', 'platform', :caller_id, 'event_drain',"
         f"        'task', 'ASYNCHRONOUS', '{{}}'::jsonb, now(), 'PENDING',"
@@ -144,7 +144,7 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
         f" WHERE NOT EXISTS ("
         f"     SELECT 1 FROM {task_schema}.tasks"
         f"     WHERE dedup_key = 'event_drain'"
-        f"       AND schema_name = 'platform'"
+        f"       AND catalog_id = 'platform'"
         # Terminal set matches the dispatcher's claim query: a terminal-state
         # drain task (incl. DISMISSED) must NOT block a fresh enqueue, or the
         # co-transactional NOTIFY stays silenced until manual cleanup.
@@ -183,7 +183,6 @@ async def emit_event_row(
     *,
     event_type: str,
     scope: str,
-    schema_name: Optional[str],
     catalog_id: Optional[str],
     collection_id: Optional[str],
     identity_id: Optional[str],
@@ -208,10 +207,9 @@ async def emit_event_row(
         The event scope as the caller provides it (e.g. ``"PLATFORM"``).
         Lowercased before the INSERT to satisfy the ``tasks.events`` CHECK
         constraint (``scope = lower(scope)``).
-    schema_name:
-        Tenant schema name; ``None`` means platform-wide.
     catalog_id:
-        Catalog identifier, or ``None``.
+        Catalog internal id (after identity collapse, the physical PG schema
+        name equals the catalog internal id); ``None`` means platform-wide.
     collection_id:
         Collection identifier, or ``None``; stored in ``payload`` if needed
         by listeners — the ``tasks.events`` schema does not have a dedicated
@@ -239,7 +237,7 @@ async def emit_event_row(
         conn,
         event_id=event_id,
         shard=shard,
-        schema_name=schema_name,
+        catalog_id=catalog_id,
         scope=scope_lower,
         event_type=event_type,
         payload=payload_str,

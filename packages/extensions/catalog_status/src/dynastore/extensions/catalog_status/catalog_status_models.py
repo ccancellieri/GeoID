@@ -52,10 +52,6 @@ class CatalogStatusView(BaseModel):
 
     catalog_id: str
     physical_schema: Optional[str] = None
-    physical_id: Optional[str] = None
-    """Immutable physical identifier of this catalog.  In P0 this always
-    equals ``physical_schema``; a future migration step will decouple them
-    once a dedicated column is added."""
     provisioning_status: str
     task: Optional[ProvisioningTaskView] = None
     provisioning_checklist: dict[str, str] = {}
@@ -81,15 +77,6 @@ class CollectionStatusView(BaseModel):
     """Physical schema of the *parent catalog*, resolved via
     ``CatalogsProtocol.resolve_physical_schema``.  ``None`` when the catalog
     is still provisioning or the schema resolver is unavailable."""
-    catalog_physical_id: Optional[str] = None
-    """Immutable physical identifier of the *parent catalog*.  In P0 this
-    always equals ``physical_schema``."""
-    physical_id: Optional[str] = None
-    """Immutable physical identifier of *this collection* (the physical table
-    name).  Bare ``physical_id`` always refers to the entity the view
-    represents — here, the collection; the parent catalog's id is the
-    qualified ``catalog_physical_id``.  ``None`` when not yet resolved or when
-    the collection has no dedicated physical table."""
 
     catalog_provisioning_status: str
     """Lifecycle state of the parent catalog (``provisioning`` | ``ready`` |

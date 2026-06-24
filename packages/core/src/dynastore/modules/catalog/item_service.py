@@ -415,11 +415,8 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             config = await driver.get_driver_config(
                 catalog_id, collection_id, db_resource=db_resource
             )
-            # Return the PG items driver config (the canonical writer).
-            from dynastore.modules.storage.driver_config import (
-                ItemsPostgresqlDriverConfig,
-            )
-            if isinstance(config, ItemsPostgresqlDriverConfig):
+            # If the driver config has physical_table support (PG), use it.
+            if hasattr(config, "physical_table"):
                 return config
             # Non-PG config (e.g. DuckDB) — try next driver.
         return config  # Return whatever we got last (may be None)
@@ -1063,6 +1060,28 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+
+        # ── Resolve external → internal ids at the write boundary ─────────────
+        # catalog_id and collection_id from URL path params are public external
+        # ids.  Everything persisted (ES _source catalog_id/collection_id, ES
+        # index name, ES _routing, PG hub schema name, OUTBOX task rows) must
+        # use the IMMUTABLE internal id so a rename never stales stored items.
+        # Resolution is done once here so all downstream code (Branch A and B,
+        # _dispatch_index_upsert, fan-out) receives internal ids.
+        from dynastore.tools.discovery import get_protocol as _get_proto
+        from dynastore.models.protocols import CatalogsProtocol as _CatProto
+        _catalogs_svc = _get_proto(_CatProto)
+        if _catalogs_svc is not None:
+            _internal_cat = await _catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=True
+            )
+            if _internal_cat is not None:
+                catalog_id = _internal_cat
+            _internal_col = await _catalogs_svc.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if _internal_col is not None:
+                collection_id = _internal_col
 
         # Determine if single or bulk to return consistent type
         is_single = False

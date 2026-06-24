@@ -268,7 +268,7 @@ class TestItemsElasticsearchDriverWriteEntities:
             ),
             patch.object(
                 ItemsElasticsearchDriver, "get_driver_config",
-                new=AsyncMock(return_value=MagicMock(simplify_geometry=False)),
+                new=AsyncMock(return_value=MagicMock(simplify_geometry=False, simplify_target_bytes=None)),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "_enforce_field_constraints",
@@ -330,7 +330,7 @@ class TestItemsElasticsearchDriverWriteEntities:
             ),
             patch.object(
                 ItemsElasticsearchDriver, "get_driver_config",
-                new=AsyncMock(return_value=MagicMock(simplify_geometry=False)),
+                new=AsyncMock(return_value=MagicMock(simplify_geometry=False, simplify_target_bytes=None)),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "_enforce_field_constraints",

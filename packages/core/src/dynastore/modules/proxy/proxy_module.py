@@ -65,17 +65,8 @@ class ProxyModule(ModuleProtocol, ProxyProtocol):
             )
             if not schema:
                 raise ValueError(f"Catalog '{catalog_id}' not found.")
-            collection_physical_id: Optional[str] = None
-            if collection_id:
-                collection_physical_id = await catalogs.resolve_physical_id(
-                    catalog_id,
-                    collection_id,
-                    ctx=DriverContext(db_resource=tx_engine),
-                    allow_missing=True,
-                )
             return await self.storage_driver.insert_short_url(
-                tx_engine, schema, long_url, custom_key, collection_id,
-                collection_physical_id, comment
+                tx_engine, schema, long_url, custom_key, collection_id, comment
             )
 
     async def get_urls_by_collection(
@@ -91,20 +82,12 @@ class ProxyModule(ModuleProtocol, ProxyProtocol):
         catalogs = get_protocol(CatalogsProtocol)
         if catalogs is None:
             raise RuntimeError("CatalogsProtocol not registered")
+        schema = await catalogs.resolve_physical_schema(catalog_id)
+        if schema is None:
+            raise ValueError(f"Catalog '{catalog_id}' not found.")
         async with managed_transaction(engine) as conn:
-            schema = await catalogs.resolve_physical_schema(
-                catalog_id, ctx=DriverContext(db_resource=conn)
-            )
-            if schema is None:
-                raise ValueError(f"Catalog '{catalog_id}' not found.")
-            collection_physical_id = await catalogs.resolve_physical_id(
-                catalog_id,
-                collection_id,
-                ctx=DriverContext(db_resource=conn),
-                allow_missing=True,
-            )
             return await self.storage_driver.select_urls_by_collection(
-                conn, schema, collection_physical_id or collection_id, limit, offset
+                conn, schema, collection_id, limit, offset
             )
 
     async def get_long_url(

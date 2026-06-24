@@ -78,31 +78,17 @@ class TestWriteOnceLockedRegardlessOfMaterialization:
 
 
 class TestRestoreSystemAssignedFields:
-    def test_physical_table_no_longer_system_assigned(self):
-        """physical_table was retired as a Computed field.  Callers that pass
-        it in a config dict get it absorbed as an extra field (extra='allow'),
-        but restore_system_assigned_fields must not touch it because it is not
-        in model_fields.
-        """
-        from dynastore.models.mutability import computed_fields
-
-        # physical_table must NOT appear in the computed fields set.
-        assert "physical_table" not in computed_fields(ItemsPostgresqlDriverConfig), (
-            "physical_table must not be a Computed field — it was retired"
-        )
-
-    def test_sidecars_is_system_assigned_and_reset(self):
-        """sidecars is still a Computed field; restore_system_assigned_fields
-        must set it to the current_config value (None when no current config)."""
-        from dynastore.models.mutability import computed_fields
-
-        assert "sidecars" in computed_fields(ItemsPostgresqlDriverConfig)
-        new = ItemsPostgresqlDriverConfig.model_validate({})
+    def test_caller_value_discarded_when_no_current(self):
+        new = ItemsPostgresqlDriverConfig.model_validate({"physical_table": "t_caller01"})
         restore_system_assigned_fields(ItemsPostgresqlDriverConfig, new, None)
-        # When current_config is None, computed fields are reset to None
-        # (their persisted value is absent).  The default [] only applies at
-        # model construction time; the restore logic targets "what is stored".
-        assert new.sidecars is None
+        assert new.physical_table is None
+        assert "physical_table" not in new.model_dump(exclude_unset=True)
+
+    def test_caller_value_replaced_by_current(self):
+        current = ItemsPostgresqlDriverConfig.model_construct(physical_table="t_system01")
+        new = ItemsPostgresqlDriverConfig.model_validate({"physical_table": "t_caller01"})
+        restore_system_assigned_fields(ItemsPostgresqlDriverConfig, new, current)
+        assert new.physical_table == "t_system01"
 
     def test_noop_for_config_without_system_fields(self):
         # A class without _system_assigned_fields must be untouched.

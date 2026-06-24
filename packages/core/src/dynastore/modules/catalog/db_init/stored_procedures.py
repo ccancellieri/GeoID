@@ -44,11 +44,12 @@ BEGIN
         RETURN NULL;
     END IF;
 
-    -- Resolve Logical Collection ID from the hub table name.  The hub table
-    -- is named after the collection's immutable physical_id; the collections
-    -- registry maps that back to the (renamable) logical collection id.
+    -- Resolve Logical Collection ID from Hub Physical Table Name
+    -- The collection_configs table stores driver config with physical_table in JSONB.
     EXECUTE format(
-        'SELECT id FROM %I.collections WHERE physical_id = $1 LIMIT 1',
+        'SELECT collection_id FROM %I.collection_configs '
+        'WHERE class_key = ''ItemsPostgresqlDriver'' '
+        'AND config_data->>''physical_table'' = $1 LIMIT 1',
         TG_TABLE_SCHEMA
     )
     INTO target_collection_id
@@ -64,16 +65,11 @@ BEGIN
     INTO remaining_count
     USING asset_id_val;
 
-    -- If remaining_count is NULL (no rows found), then proceed.
-    -- The partition key is collection_physical_id (the hub table name passed
-    -- as TG_ARGV[0]); include it so the planner can prune to the right
-    -- partition without a full-table scan.
+    -- If remaining_count is NULL (no rows found), then proceed
     IF remaining_count IS NULL THEN
-        EXECUTE format(
-            'DELETE FROM %I.assets WHERE asset_id = $1 AND collection_physical_id = $2',
-            TG_TABLE_SCHEMA
-        )
-        USING asset_id_val, hub_physical_table;
+        -- assets PK is (collection_id, asset_id); pass both so the planner can prune the partition.
+        EXECUTE format('DELETE FROM %I.assets WHERE asset_id = $1 AND collection_id = $2', TG_TABLE_SCHEMA)
+        USING asset_id_val, target_collection_id;
     END IF;
 
     RETURN NULL;

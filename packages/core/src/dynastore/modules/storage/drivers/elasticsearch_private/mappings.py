@@ -385,10 +385,10 @@ def _collect_search_tokens(values: Iterable[Any], out: List[str]) -> None:
             out.append(str(v))
 
 
-def get_private_index_name(prefix: str, catalog_physical_id: str) -> str:
+def get_private_index_name(prefix: str, catalog_id: str) -> str:
     """Per-catalog private items index. Owned by the private items
     driver; the platform never references this naming. Catalog-first
     naming mirrors ``get_tenant_items_index`` so all per-catalog indexes
     cluster lexicographically.
     """
-    return f"{prefix}-{catalog_physical_id}-private-items"
+    return f"{prefix}-{catalog_id}-private-items"

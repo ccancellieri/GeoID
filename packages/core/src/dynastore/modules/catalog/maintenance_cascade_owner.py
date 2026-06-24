@@ -106,22 +106,22 @@ class MaintenancePendingOwner(BaseResourceOwner):
             ResultHandler,
         )
 
-        physical_schema: str | None = await DQLQuery(
-            "SELECT physical_schema FROM catalog.catalogs"
+        schema: str | None = await DQLQuery(
+            "SELECT id FROM catalog.catalogs"
             " WHERE id = :catalog_id AND deleted_at IS NULL;",
             result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
         ).execute(conn, catalog_id=scope_ref.catalog_id)
 
-        if not physical_schema:
+        if not schema:
             logger.warning(
-                "MaintenancePendingOwner: could not resolve physical_schema "
+                "MaintenancePendingOwner: could not resolve schema "
                 "for catalog_id=%r — skipping cleanup ref.",
                 scope_ref.catalog_id,
             )
             return []
 
         metadata: dict[str, Any] = {
-            "schema": physical_schema,
+            "schema": schema,
             "catalog_id": scope_ref.catalog_id,
         }
         if scope_ref.scope == ResourceScope.COLLECTION and scope_ref.collection_id:
@@ -229,11 +229,11 @@ async def _cancel_pending_tasks(
 ) -> int:
     """UPDATE tasks.tasks PENDING → DEAD_LETTER for the given tenant schema.
 
-    Scoped by ``schema_name = :schema`` (the tenant physical schema column
-    value).  ``AND schema_name <> 'system'`` is a defensive guard that
-    ensures the cascade_cleanup task itself — which uses ``schema_name='system'``
-    — is never touched; the tenant-schema filter already structurally excludes
-    it.
+    Scoped by ``catalog_id = :schema`` (the catalog internal id, which equals
+    the tenant schema name).  ``AND catalog_id <> 'system'`` is a defensive
+    guard that ensures the cascade_cleanup task itself — which uses
+    ``catalog_id='system'`` — is never touched; the tenant filter already
+    structurally excludes it.
 
     COLLECTION scope adds ``AND collection_id = :collection_id``.
     Only PENDING rows are touched; ACTIVE rows may be mid-flight.
@@ -248,8 +248,8 @@ async def _cancel_pending_tasks(
         f" SET status = 'DEAD_LETTER',"
         f"     error_message = :reason,"
         f"     finished_at = NOW()"
-        f" WHERE schema_name = :schema"
-        f"   AND schema_name <> 'system'"
+        f" WHERE catalog_id = :schema"
+        f"   AND catalog_id <> 'system'"
         f"   AND status = 'PENDING'"
         f"   {collection_clause}"
     )

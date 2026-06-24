@@ -92,20 +92,15 @@ UpsertAction = Literal[
 class Scope:
     """Address of the (catalog, optional collection) the write targets.
 
-    ``collection_physical_id`` is ``None`` for catalog-tier assets (no
-    collection). The unique constraint on ``assets`` uses ``UNIQUE NULLS NOT
-    DISTINCT`` so NULL is meaningful: catalog-tier rows are unique on
-    ``(catalog_id, NULL, asset_id)``.
-
-    ``collection_id`` is the mutable logical identifier; kept here for
-    presentation so INSERT/UPDATE paths can echo it back without a join.
-    It does NOT participate in any key or partition expression.
+    ``collection_id`` is ``None`` for catalog-tier assets — the partial
+    unique indexes on ``assets`` use ``UNIQUE NULLS NOT DISTINCT`` so this
+    NULL is meaningful (catalog-tier rows are unique on
+    ``(catalog_id, NULL, asset_id)``).
     """
 
     schema: str
     catalog_id: str
     collection_id: Optional[str] = None
-    collection_physical_id: Optional[str] = None
 
 
 @dataclass
@@ -164,10 +159,9 @@ class AssetSidecarRejectedError(Exception):
 
 
 _BASE_SELECT_COLS = (
-    "asset_id, collection_physical_id, "
-    "asset_type, kind, status, "
+    "asset_id, catalog_id, collection_id, asset_type, kind, status, "
     "filename, href, uri, content_hash, size_bytes, created_at, updated_at, "
-    "metadata, owned_by, asset_physical_id::text AS asset_physical_id"
+    "metadata, owned_by"
 )
 
 
@@ -177,24 +171,22 @@ async def _probe_by_asset_id(
     payload: AssetCreatePayload,
     policy: AssetsWritePolicy,
 ) -> Optional[Dict[str, Any]]:
-    """Match by the canonical (collection_physical_id, asset_id) key.
-
-    Schema scopes the catalog; catalog_id is a mutable label, omitted to
-    stay rename-robust.
-    """
+    """Match by the canonical (catalog_id, collection_id, asset_id) key."""
     sql = (
         f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
-        "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+        "WHERE catalog_id = :catalog_id "
+        "AND collection_id IS NOT DISTINCT FROM :collection_id "
         "AND asset_id = :asset_id "
         "AND status <> 'deleted' "
         "LIMIT 1"
     )
     row = await DQLQuery(sql, result_handler=ResultHandler.ONE_OR_NONE).execute(
         conn,
-        collection_physical_id=scope.collection_physical_id,
+        catalog_id=scope.catalog_id,
+        collection_id=scope.collection_id,
         asset_id=payload.asset_id,
     )
-    return _row_to_dict(row, scope)
+    return _row_to_dict(row)
 
 
 async def _probe_by_filename(
@@ -209,7 +201,8 @@ async def _probe_by_filename(
         return None
     sql = (
         f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
-        "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+        "WHERE catalog_id = :catalog_id "
+        "AND collection_id IS NOT DISTINCT FROM :collection_id "
         "AND filename = :filename "
         "AND kind = 'physical' "
         "AND status <> 'deleted' "
@@ -217,10 +210,11 @@ async def _probe_by_filename(
     )
     row = await DQLQuery(sql, result_handler=ResultHandler.ONE_OR_NONE).execute(
         conn,
-        collection_physical_id=scope.collection_physical_id,
+        catalog_id=scope.catalog_id,
+        collection_id=scope.collection_id,
         filename=filename,
     )
-    return _row_to_dict(row, scope)
+    return _row_to_dict(row)
 
 
 async def _probe_by_url(
@@ -251,7 +245,8 @@ async def _probe_by_url(
     if incoming_uri:
         sql = (
             f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
-            "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+            "WHERE catalog_id = :catalog_id "
+            "AND collection_id IS NOT DISTINCT FROM :collection_id "
             "AND kind = 'physical' AND status = 'active' AND uri = :uri "
             "LIMIT 1"
         )
@@ -259,17 +254,19 @@ async def _probe_by_url(
             sql, result_handler=ResultHandler.ONE_OR_NONE
         ).execute(
             conn,
-            collection_physical_id=scope.collection_physical_id,
+            catalog_id=scope.catalog_id,
+            collection_id=scope.collection_id,
             uri=incoming_uri,
         )
-        hit = _row_to_dict(row, scope)
+        hit = _row_to_dict(row)
         if hit:
             return hit
 
     if incoming_href:
         sql = (
             f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
-            "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+            "WHERE catalog_id = :catalog_id "
+            "AND collection_id IS NOT DISTINCT FROM :collection_id "
             "AND kind = 'virtual' AND status <> 'deleted' AND href = :href "
             "LIMIT 1"
         )
@@ -277,10 +274,11 @@ async def _probe_by_url(
             sql, result_handler=ResultHandler.ONE_OR_NONE
         ).execute(
             conn,
-            collection_physical_id=scope.collection_physical_id,
+            catalog_id=scope.catalog_id,
+            collection_id=scope.collection_id,
             href=incoming_href,
         )
-        return _row_to_dict(row, scope)
+        return _row_to_dict(row)
 
     return None
 
@@ -312,17 +310,19 @@ async def _probe_by_metadata_field(
     pg_path = "{" + ",".join(path.split(".")) + "}"
     sql = (
         f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
-        "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+        "WHERE catalog_id = :catalog_id "
+        "AND collection_id IS NOT DISTINCT FROM :collection_id "
         f"AND metadata #>> '{pg_path}' = :value "
         "AND status <> 'deleted' "
         "LIMIT 1"
     )
     row = await DQLQuery(sql, result_handler=ResultHandler.ONE_OR_NONE).execute(
         conn,
-        collection_physical_id=scope.collection_physical_id,
+        catalog_id=scope.catalog_id,
+        collection_id=scope.collection_id,
         value=str(incoming_value),
     )
-    return _row_to_dict(row, scope)
+    return _row_to_dict(row)
 
 
 async def _probe_by_content_hash(
@@ -349,7 +349,8 @@ async def _probe_by_content_hash(
         return None
     sql = (
         f'SELECT {_BASE_SELECT_COLS} FROM "{scope.schema}".assets '
-        "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+        "WHERE catalog_id = :catalog_id "
+        "AND collection_id IS NOT DISTINCT FROM :collection_id "
         "AND kind = 'physical' "
         "AND status <> 'deleted' "
         "AND content_hash = :tagged "
@@ -357,10 +358,11 @@ async def _probe_by_content_hash(
     )
     row = await DQLQuery(sql, result_handler=ResultHandler.ONE_OR_NONE).execute(
         conn,
-        collection_physical_id=scope.collection_physical_id,
+        catalog_id=scope.catalog_id,
+        collection_id=scope.collection_id,
         tagged=incoming_hash,
     )
-    return _row_to_dict(row, scope)
+    return _row_to_dict(row)
 
 
 # Probe lookup map: identity kind → coroutine.
@@ -569,11 +571,11 @@ async def upsert_asset(
     #    REST surface returns 409 (matching the application-level policy
     #    rejection) instead of bubbling a 500.
     if existing is None:
-        # Assets is partitioned BY LIST (collection_physical_id); ensure the
-        # per-collection partition exists before INSERT. NULL rows land in
-        # assets_catalog_tier created by ensure_storage; only non-NULL values
-        # need a named partition. Mirrors pg_asset_driver.index_asset.
-        if scope.collection_physical_id is not None:
+        # Assets is partitioned BY LIST (collection_id); ensure the per-collection
+        # partition exists before INSERT. NULL collection_id rows land in the
+        # default partition created by ensure_storage; only non-NULL values need
+        # a per-value partition. Mirrors pg_asset_driver.index_asset.
+        if scope.collection_id is not None:
             from dynastore.modules.db_config.partition_tools import (
                 ensure_partition_exists,
             )
@@ -581,7 +583,7 @@ async def upsert_asset(
                 conn,
                 table_name="assets",
                 strategy="LIST",
-                partition_value=scope.collection_physical_id,
+                partition_value=scope.collection_id,
                 schema=scope.schema,
                 parent_table_name="assets",
                 parent_table_schema=scope.schema,
@@ -729,29 +731,23 @@ async def _insert_new_row(
     href = getattr(payload, "href", None)
     uri = getattr(payload, "uri", None) if isinstance(payload, AssetCreate) else None
 
-    # physical_id (#2296): mint an immutable UUIDv7 join key on every insert
-    # path so it is never NULL.  Stable across asset_id renames — references and
-    # denormalized surfaces key on this, not the mutable logical asset_id.
-    from dynastore.tools.identifiers import generate_geoid
-
     sql = (
         f'INSERT INTO "{scope.schema}".assets ('
-        "asset_id, collection_physical_id, "
-        "asset_type, kind, status, "
+        "asset_id, catalog_id, collection_id, asset_type, kind, status, "
         "filename, href, uri, content_hash, size_bytes, "
-        "created_at, updated_at, metadata, owned_by, physical_id"
+        "created_at, updated_at, metadata, owned_by"
         ") VALUES ("
-        ":asset_id, :collection_physical_id, "
-        ":asset_type, :kind, :status, "
+        ":asset_id, :catalog_id, :collection_id, :asset_type, :kind, :status, "
         ":filename, :href, :uri, :content_hash, :size_bytes, "
-        ":created_at, :updated_at, CAST(:metadata AS jsonb), :owned_by, :physical_id"
+        ":created_at, :updated_at, CAST(:metadata AS jsonb), :owned_by"
         ") RETURNING " + _BASE_SELECT_COLS
     )
 
     row = await DQLQuery(sql, result_handler=ResultHandler.ONE_OR_NONE).execute(
         conn,
         asset_id=payload.asset_id,
-        collection_physical_id=scope.collection_physical_id,
+        catalog_id=scope.catalog_id,
+        collection_id=scope.collection_id,
         asset_type=asset_type_val,
         kind=kind_val,
         status=initial_status.value,
@@ -764,9 +760,8 @@ async def _insert_new_row(
         updated_at=now,
         metadata=json.dumps(payload.metadata or {}),
         owned_by=getattr(payload, "owned_by", None),
-        physical_id=generate_geoid(),
     )
-    return _row_to_dict(row, scope) or {}
+    return _row_to_dict(row) or {}
 
 
 async def _update_row(
@@ -779,7 +774,8 @@ async def _update_row(
     sql = (
         f'UPDATE "{scope.schema}".assets '
         "SET metadata = CAST(:metadata AS jsonb), updated_at = :updated_at "
-        "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+        "WHERE catalog_id = :catalog_id "
+        "AND collection_id IS NOT DISTINCT FROM :collection_id "
         "AND asset_id = :asset_id "
         "RETURNING " + _BASE_SELECT_COLS
     )
@@ -787,10 +783,11 @@ async def _update_row(
         conn,
         metadata=json.dumps(payload.metadata or {}),
         updated_at=datetime.now(timezone.utc),
-        collection_physical_id=scope.collection_physical_id,
+        catalog_id=scope.catalog_id,
+        collection_id=scope.collection_id,
         asset_id=existing["asset_id"],
     )
-    return _row_to_dict(row, scope) or existing
+    return _row_to_dict(row) or existing
 
 
 async def _archive_row(
@@ -804,7 +801,7 @@ async def _archive_row(
     The DDL in ``pg_asset_driver.py`` declares::
 
         CREATE UNIQUE INDEX assets_uq_filename_*
-            ON assets (catalog_id, collection_physical_id, filename)
+            ON assets (catalog_id, collection_id, filename)
             WHERE kind = 'physical' AND status <> 'deleted';
 
     so flipping the row to ``status='deleted'`` is sufficient for the new
@@ -820,43 +817,32 @@ async def _archive_row(
     sql = (
         f'UPDATE "{scope.schema}".assets '
         "SET status = 'deleted', updated_at = :updated_at "
-        "WHERE collection_physical_id IS NOT DISTINCT FROM :collection_physical_id "
+        "WHERE catalog_id = :catalog_id "
+        "AND collection_id IS NOT DISTINCT FROM :collection_id "
         "AND asset_id = :asset_id "
         "AND status <> 'deleted'"
     )
     await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
         conn,
         updated_at=now,
-        collection_physical_id=scope.collection_physical_id,
+        catalog_id=scope.catalog_id,
+        collection_id=scope.collection_id,
         asset_id=existing["asset_id"],
     )
 
-    # asset_references key on the immutable physical_id (#2296), not the mutable
-    # asset_id (that column was dropped). Stamp the archived asset's references
-    # via its physical_id so a future hard-delete of a same-id successor isn't
-    # blocked by a stale reference to the version we just archived.
-    physical_id = existing.get("physical_id")
-    if physical_id is not None:
-        refs_sql = (
-            f'UPDATE "{scope.schema}".asset_references '
-            "SET valid_until = :now "
-            "WHERE physical_id = :physical_id "
-            "AND valid_until IS NULL"
-        )
-        await DQLQuery(refs_sql, result_handler=ResultHandler.NONE).execute(
-            conn,
-            now=now,
-            physical_id=physical_id,
-        )
-    else:
-        # Post-#2296 every row mints physical_id (NOT NULL); a NULL here is a
-        # pre-reset legacy row. Surface it so a NEW_VERSION chain stuck behind a
-        # stale reference isn't an invisible failure.
-        logger.warning(
-            "archive: asset '%s' in '%s' has no physical_id — asset_references "
-            "not stamped (row pre-dates #2296; expected only on a non-reset schema)",
-            existing.get("asset_id"), scope.schema,
-        )
+    refs_sql = (
+        f'UPDATE "{scope.schema}".asset_references '
+        "SET valid_until = :now "
+        "WHERE catalog_id = :catalog_id "
+        "AND asset_id = :asset_id "
+        "AND valid_until IS NULL"
+    )
+    await DQLQuery(refs_sql, result_handler=ResultHandler.NONE).execute(
+        conn,
+        now=now,
+        catalog_id=scope.catalog_id,
+        asset_id=existing["asset_id"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -864,41 +850,26 @@ async def _archive_row(
 # ---------------------------------------------------------------------------
 
 
-def _row_to_dict(
-    row: Any,
-    scope: Optional["Scope"] = None,
-) -> Optional[Dict[str, Any]]:
-    """Coerce a SQLAlchemy / asyncpg row-like into a plain dict (or None).
-
-    When ``scope`` is provided, ``catalog_id`` and ``collection_id`` are
-    injected from the scope so callers always see the current logical ids
-    even though those columns are no longer stored in the ``assets`` table.
-    """
+def _row_to_dict(row: Any) -> Optional[Dict[str, Any]]:
+    """Coerce a SQLAlchemy / asyncpg row-like into a plain dict (or None)."""
     if row is None:
         return None
     if isinstance(row, dict):
-        d = dict(row)
-    else:
-        mapping = getattr(row, "_mapping", None)
-        if mapping is not None:
-            d = dict(mapping)
-        else:
-            asdict = getattr(row, "_asdict", None)
-            if callable(asdict):
-                result: Any = asdict()
-                if result is None:
-                    return None
-                d = dict(result)
-            else:
-                # asyncpg.Record exposes dict() directly.
-                try:
-                    d = dict(row)
-                except Exception:
-                    return None
-    if scope is not None:
-        d["catalog_id"] = scope.catalog_id
-        d["collection_id"] = scope.collection_id
-    return d
+        return dict(row)
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return dict(mapping)
+    asdict = getattr(row, "_asdict", None)
+    if callable(asdict):
+        result: Any = asdict()
+        if result is None:
+            return None
+        return dict(result)
+    # asyncpg.Record exposes dict() directly.
+    try:
+        return dict(row)
+    except Exception:
+        return None
 
 
 def _walk_dot_path(data: Dict[str, Any], path: str) -> Optional[Any]:

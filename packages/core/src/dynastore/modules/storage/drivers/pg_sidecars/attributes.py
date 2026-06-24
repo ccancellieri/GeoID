@@ -672,55 +672,6 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                     f"AssetsProtocol not available. Skipping asset cleanup trigger for {schema}.{table_name}"
                 )
 
-    async def resolve_physical_id_for_context(
-        self,
-        context: Dict[str, Any],
-        catalog_id: str,
-        collection_id: Optional[str] = None,
-        *,
-        conn: Optional[Any] = None,
-    ) -> None:
-        """Resolve the logical asset_id in *context* to its immutable physical_id
-        and store the result under ``context["_asset_physical_id"]`` (#2296).
-
-        Call this once per batch *before* the ``prepare_upsert_payload`` loop so
-        every item in the batch writes the stable uuid to the tracked column
-        instead of the mutable logical id.  When the resolver returns ``None``
-        (asset not yet landed or the protocol is unavailable) the context is left
-        unchanged; ``prepare_upsert_payload`` will fall back to the logical id so
-        no row is silently dropped.
-
-        Parameters
-        ----------
-        context:
-            Shared processing context dict (mutated in-place).
-        catalog_id:
-            Tenant catalog id needed to scope the assets lookup.
-        collection_id:
-            Optional; narrows the lookup to a specific collection shard.
-        conn:
-            Optional open DB connection for in-transaction resolution; omit to
-            route through the shared L1/L2 cache (safe outside a transaction).
-        """
-        if not self.config.asset_id_field:
-            return
-        asset_id = context.get("asset_id")
-        if not asset_id:
-            return
-        from dynastore.models.driver_context import DriverContext
-        assets = get_protocol(AssetsProtocol)
-        if not assets:
-            return
-        phys = await assets.resolve_asset_physical_id(
-            catalog_id,
-            str(asset_id),
-            collection_id=collection_id,
-            ctx=DriverContext(db_resource=conn) if conn is not None else None,
-            allow_missing=True,
-        )
-        if phys:
-            context["_asset_physical_id"] = phys
-
     async def on_partition_create(
         self,
         conn: DbResource,
@@ -1150,16 +1101,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         if self.config.asset_id_field is not None:
             # IMPORTANT: asset_id is ONLY extracted from context, not feature body.
-            # The sidecar column stores the immutable physical_id (UUIDv7) so that
-            # an asset rename — which only updates assets.asset_id, not
-            # assets.physical_id — does not strand these rows (#2296).
-            # Callers that run through an async boundary (e.g. the ingestion
-            # orchestrator) should pre-resolve the logical asset_id to its
-            # physical_id and inject it as context["_asset_physical_id"] before
-            # the batch prepare loop.  The logical asset_id is kept as a
-            # fallback so a row is never silently dropped when the resolver
-            # has not run (e.g. unit tests that only set context["asset_id"]).
-            asset_id = context.get("_asset_physical_id") or context.get("asset_id")
+            asset_id = context.get("asset_id")
             if asset_id:
                 asset_id_str = str(asset_id)
                 payload[self.config.asset_id_field] = asset_id_str
@@ -1376,11 +1318,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
                 if asset_col in props_to_save:
                     del props_to_save[asset_col]
 
-                # Prefer the pre-resolved physical_id (immutable UUIDv7) injected
-                # by the async orchestrator under "_asset_physical_id".  Falls back
-                # to the logical asset_id so the row is still written when the
-                # pre-resolution step has not run (#2296).
-                asset_id = context.get("_asset_physical_id") or context.get("asset_id")
+                asset_id = context.get("asset_id")
                 if not asset_id:
                     asset_id = self._extract_value(feature_as_dict, asset_col)
                 if asset_id:

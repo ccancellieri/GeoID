@@ -913,16 +913,37 @@ class ItemsPostgresqlDriverConfig(CollectionDriverConfig):
         {DriverCapability.SYNC, DriverCapability.TRANSACTIONAL}
     )
 
-    # The physical table name for a collection is now the collection's
-    # ``physical_id`` from ``{schema}.collections.physical_id`` — minted at
-    # collection registry create time and resolved via
-    # ``CatalogsProtocol.resolve_physical_id``.  It is never stored in
-    # ``collection_configs`` JSONB.  The former ``physical_table`` Computed
-    # field has been retired: callers that previously read
-    # ``config.physical_table`` must call
-    # ``CatalogsProtocol.resolve_physical_id(catalog_id, collection_id)``
-    # or ``ItemsPostgresqlDriver.resolve_physical_table`` (which delegates
-    # to the registry column).
+    # ``physical_table`` is machine-assigned by ``ensure_storage()`` at
+    # provisioning and flows into SQL identifiers — it must never be supplied
+    # or altered by an API caller (would enable identifier injection and
+    # cross-collection table targeting; see #1135).  ``Computed`` marks it
+    # read-only on the wire AND opts it into the config-write strip
+    # (``restore_system_assigned_fields``), so any caller value on the external
+    # path is discarded.  The internal provisioner sets it via
+    # ``model_copy`` + ``check_immutability=False`` (which bypasses the strip).
+    #
+    # The catalog's physical schema is resolved from ``CatalogsProtocol``
+    # (system-generated, per-tenant); there is intentionally NO per-collection
+    # schema override field — a caller-settable schema would break tenant
+    # isolation (#1135 Issue 2 — the former ``physical_schema`` override was
+    # vestigial/read-nowhere and has been removed).
+    physical_table: Computed[Optional[str]] = Field(
+        default=None,
+        description="Machine-assigned physical table name (set by ensure_storage()). Read-only.",
+    )
+
+    @field_validator("physical_table")
+    @classmethod
+    def _validate_physical_table_identifier(cls, v: Optional[str]) -> Optional[str]:
+        """Defense-in-depth: reject any non-identifier ``physical_table`` at
+        validation time so a malformed value can never reach SQL even if a path
+        bypasses the resolver-level guard.  ``None`` (the default / unset) is
+        always allowed; the provisioner assigns a safe generated name."""
+        if v is None:
+            return v
+        from dynastore.tools.db import validate_sql_identifier
+
+        return validate_sql_identifier(v)
 
     # From CollectionPluginConfig — PG-specific structural fields.
     # Discriminated union via `sidecar_type`; default is EMPTY (M1b.2).
@@ -1313,21 +1334,6 @@ class ItemsDuckdbDriverConfig(CollectionDriverConfig):
         default=None,
         description="Catalog asset id to read from. Resolved to the asset's "
                     "storage URI at dispatch; preferred over `path` when set.",
-    )
-    # Immutable join key derived from ``asset_id`` at config-persist time (#2296).
-    # Keyed on the UUIDv7 physical_id so a rename of the logical asset_id does
-    # not strand the config. INTERNAL ONLY — never user-settable or exposed in
-    # the public config schema. Populated by the dispatch layer
-    # (ItemsDuckdbDriver._resolve_asset_path) when asset_id is resolved;
-    # callers should prefer resolving via physical_id -> URI over asset_id ->
-    # URI so the lookup survives an asset rename.
-    asset_physical_id: Computed[Optional[str]] = Field(
-        default=None,
-        description=(
-            "INTERNAL. Immutable UUIDv7 of the asset referenced by ``asset_id``. "
-            "Derived at dispatch time; not user-settable. A DuckDB collection "
-            "keyed here remains readable after an asset rename."
-        ),
     )
     # Declared id column whose value becomes the deterministic geoid source (fid).
     # When unset, the driver falls back to a content hash of the feature.

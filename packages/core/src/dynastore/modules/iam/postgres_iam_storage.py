@@ -1260,7 +1260,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
 
         async with managed_transaction(self.engine) as db:
             rows = await DQLQuery(
-                "SELECT id, physical_schema FROM catalog.catalogs "
+                "SELECT id FROM catalog.catalogs "
                 "WHERE deleted_at IS NULL ORDER BY id;",
                 result_handler=ResultHandler.ALL_DICTS,
             ).execute(conn=db)
@@ -1268,7 +1268,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         result: Dict[str, List[str]] = {}
         for row in rows or []:
             cid = row.get("id")
-            schema = row.get("physical_schema") or row.get("schema")
+            schema = cid  # the catalog's internal id IS its per-tenant schema name
             if not cid or not schema:
                 continue
             try:

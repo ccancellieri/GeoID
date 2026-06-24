@@ -602,20 +602,7 @@ async def _list_files(
     bucket = storage_client.bucket(bucket_name)
 
     if collection_id:
-        # Resolve the immutable physical_id for the collection so listing always
-        # hits the correct prefix even when the logical id has been renamed.
-        _catalogs_list = get_protocol(CatalogsProtocol)
-        _collection_physical_id: Optional[str] = None
-        if _catalogs_list:
-            try:
-                _collection_physical_id = await _catalogs_list.resolve_physical_id(
-                    catalog_id, collection_id, allow_missing=True
-                )
-            except Exception:
-                pass
-        prefix = bucket_tool.get_blob_path_for_collection_folder(
-            _collection_physical_id or collection_id
-        )
+        prefix = bucket_tool.get_blob_path_for_collection_folder(collection_id)
     else:
         prefix = bucket_tool.CATALOG_FOLDER + "/"
 

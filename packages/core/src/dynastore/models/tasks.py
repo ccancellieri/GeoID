@@ -74,12 +74,13 @@ Tasks live in **one global PG table**, ``{DYNASTORE_TASK_SCHEMA}.tasks`` (defaul
 ``tasks.tasks``), provisioned once at ``TasksModule.lifespan``. Multi-tenancy is
 modelled via columns, not per-tenant tables:
 
-*   **Tenant / Catalog discriminator:** the ``schema_name`` column carries the
-    catalog's physical PG schema (e.g. ``s_2ka8fbc3``) for ``CATALOG``-scoped
-    tasks, ``"public"`` for ``PLATFORM`` tasks, and ``"system"`` for
-    cross-tenant platform tasks. Every CRUD path (``get_task``,
-    ``update_task``, ``claim_batch``) filters on **both** ``task_id`` AND
-    ``schema_name`` — a ``task_id`` alone is not tenant-safe.
+*   **Tenant / Catalog discriminator:** the ``catalog_id`` column carries the
+    catalog internal id (after identity collapse, equal to the physical PG
+    schema, e.g. ``s_2ka8fbc3``) for ``CATALOG``-scoped tasks, ``"platform"``
+    for ``PLATFORM`` tasks, and ``"system"`` for cross-tenant platform tasks.
+    Every CRUD path (``get_task``, ``update_task``, ``claim_batch``) filters
+    on **both** ``task_id`` AND ``catalog_id`` — a ``task_id`` alone is not
+    tenant-safe.
 *   **Collection scope:** the ``collection_id`` column carries the target
     STAC Collection id for collection-scoped work (ingestion, tile preseed/
     invalidation, exports). NULL when the task is catalog-wide.
@@ -88,14 +89,14 @@ modelled via columns, not per-tenant tables:
     ``"system:<reason>"`` sentinel for system-emitted tasks (e.g.
     ``"system:platform"``, ``"system:tile_cache_invalidation"``).
 *   **Dedup:** the partial unique index ``idx_tasks_dedup`` on
-    ``(schema_name, dedup_key, timestamp)`` for non-terminal rows guarantees
+    ``(catalog_id, dedup_key, timestamp)`` for non-terminal rows guarantees
     that two tenants sharing the same ``dedup_key`` do not collide. The
-    cross-partition dedup guard in ``enqueue()`` is also ``schema_name``-scoped.
+    cross-partition dedup guard in ``enqueue()`` is also ``catalog_id``-scoped.
 
 A single global dispatcher claims tasks across all tenants via ``FOR UPDATE
 SKIP LOCKED`` against the partial ``idx_tasks_queue`` index (filtered on
 ``status IN ('PENDING','ACTIVE')`` — the hot working set, never the full
-partition). Runners receive ``schema_name`` so they operate in the correct
+partition). Runners receive ``catalog_id`` so they operate in the correct
 tenant context.
 
 There is no per-catalog ``{tenant}.tasks`` table.
@@ -232,8 +233,8 @@ class TaskExecutionScope(str, Enum):
 
 class TaskScope(str, Enum):
     """Scope of a task within the platform."""
-    CATALOG = "CATALOG"      # Scoped to a catalog (schema_name = tenant schema)
-    SYSTEM = "SYSTEM"        # Platform-level (schema_name = 'system')
+    CATALOG = "CATALOG"      # Scoped to a catalog (catalog_id = tenant catalog internal id)
+    SYSTEM = "SYSTEM"        # Platform-level (catalog_id = 'system')
     ASSET = "ASSET"          # Scoped to an asset operation
 
 # --- Generic Payload Model ---
@@ -349,7 +350,7 @@ class Task(TaskBase):
     type: str = Field(default="task", description="Type of job: 'task' or 'process'")
 
     # Global table fields
-    schema_name: Optional[str] = Field(default=None, description="Tenant schema name (e.g. s_2ka8fbc3) or 'system'")
+    catalog_id: Optional[str] = Field(default=None, description="Catalog internal id (e.g. s_2ka8fbc3), or the reserved sentinels 'platform'/'system'")
     scope: str = Field(default=TaskScope.CATALOG, description="Task scope: CATALOG, SYSTEM, or ASSET")
     execution_mode: str = Field(default=TaskExecutionMode.ASYNCHRONOUS, description="SYNCHRONOUS or ASYNCHRONOUS")
     dedup_key: Optional[str] = Field(default=None, description="Deduplication key for event-driven task creation")

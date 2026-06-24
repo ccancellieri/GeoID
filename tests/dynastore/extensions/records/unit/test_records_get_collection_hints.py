@@ -64,6 +64,18 @@ class _FakeCatalogs:
     async def get_collection_config(self, catalog_id, collection_id, ctx=None):
         return None
 
+    async def resolve_catalog_id(self, catalog_id, allow_missing=False):
+        return None
+
+    async def resolve_catalog_alias(self, catalog_id):
+        return None
+
+    async def resolve_collection_alias(self, catalog_internal_id, collection_id):
+        return None
+
+    async def get_catalog_model(self, catalog_internal_id):
+        return None
+
 
 @pytest.mark.asyncio
 async def test_records_get_collection_forwards_hints(monkeypatch):

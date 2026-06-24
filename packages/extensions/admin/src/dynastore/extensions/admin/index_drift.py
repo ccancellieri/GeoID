@@ -84,9 +84,6 @@ async def _drift_for_collection(
     from dynastore.modules.elasticsearch.client import get_index_prefix
     from dynastore.modules.elasticsearch.mappings import get_tenant_items_index
     from dynastore.modules.elasticsearch.items_es_ops import es_count_items
-    from dynastore.modules.storage.drivers.elasticsearch import (
-        _resolve_catalog_physical_id,
-    )
 
     es_active = await is_es_active_for(catalog_id, collection_id)
 
@@ -112,8 +109,7 @@ async def _drift_for_collection(
     if es_active:
         try:
             es = get_es_client()
-            catalog_physical_id = await _resolve_catalog_physical_id(catalog_id)
-            index_name = get_tenant_items_index(get_index_prefix(), catalog_physical_id)
+            index_name = get_tenant_items_index(get_index_prefix(), catalog_id)
             es_count = await es_count_items(
                 es, index_name, collection=collection_id, routing=collection_id
             )

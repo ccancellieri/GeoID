@@ -18,7 +18,7 @@
 
 """Unit tests for BucketAnnotationPatcher (Phase 2)."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -58,23 +58,6 @@ class TestBuildMetadata:
             "asset_id": "asset-1",
             "asset_type": "RASTER",
         }
-
-    def test_includes_physical_id_when_provided(self):
-        result = _build_metadata(
-            {"metadata": {"author": "alice"}},
-            "asset-1",
-            physical_id="01966b7f-0000-7000-8000-000000000001",
-        )
-        assert result["asset_physical_id"] == "01966b7f-0000-7000-8000-000000000001"
-        assert result["asset_id"] == "asset-1"
-
-    def test_omits_physical_id_when_none(self):
-        result = _build_metadata({}, "asset-1", physical_id=None)
-        assert "asset_physical_id" not in result
-
-    def test_omits_physical_id_when_empty_string(self):
-        result = _build_metadata({}, "asset-1", physical_id="")
-        assert "asset_physical_id" not in result
 
     def test_drops_none_values(self):
         result = _build_metadata(
@@ -152,29 +135,19 @@ class TestBucketAnnotationPatcherSkips:
             mock_get.assert_not_called()
 
 
-_FAKE_PHYS_ID = "01966b7f-0000-7000-8000-000000000001"
-
-
-def _make_mock_gcp_client(existing_blob_metadata: dict):
-    mock_blob = MagicMock()
-    mock_blob.metadata = existing_blob_metadata
-    mock_bucket = MagicMock()
-    mock_bucket.blob.return_value = mock_blob
-    mock_client = MagicMock()
-    mock_client.bucket.return_value = mock_bucket
-    mock_gcp = MagicMock()
-    mock_gcp.get_storage_client.return_value = mock_client
-    return mock_gcp, mock_client, mock_bucket, mock_blob
-
-
 class TestBucketAnnotationPatcherPatch:
     """Patcher must call blob.patch() on a real GCS-backed payload."""
 
     @pytest.mark.asyncio
     async def test_patches_when_metadata_drift(self):
-        mock_gcp, mock_client, mock_bucket, mock_blob = _make_mock_gcp_client(
-            {"asset_id": "aid-1", "stale": "yes"}
-        )
+        mock_blob = MagicMock()
+        mock_blob.metadata = {"asset_id": "aid-1", "stale": "yes"}
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        mock_gcp = MagicMock()
+        mock_gcp.get_storage_client.return_value = mock_client
 
         with patch(
             "dynastore.modules.gcp.asset_sync.get_protocol",
@@ -194,110 +167,25 @@ class TestBucketAnnotationPatcherPatch:
         mock_bucket.blob.assert_called_once_with("blob/path.tif")
         mock_blob.reload.assert_called_once()
         mock_blob.patch.assert_called_once()
-        # asset_id always present; asset_physical_id absent (protocol unavailable)
-        assert mock_blob.metadata["asset_id"] == "aid-1"
-        assert mock_blob.metadata["asset_type"] == "RASTER"
-        assert mock_blob.metadata["author"] == "alice"
-        assert "asset_physical_id" not in mock_blob.metadata
-
-    @pytest.mark.asyncio
-    async def test_physical_id_from_payload_written_to_blob(self):
-        """physical_id already in the event payload is stamped onto the blob."""
-        mock_gcp, mock_client, mock_bucket, mock_blob = _make_mock_gcp_client({})
-
-        with patch(
-            "dynastore.modules.gcp.asset_sync.get_protocol",
-            return_value=mock_gcp,
-        ):
-            await BucketAnnotationPatcher.on_asset_upsert(
-                catalog_id="cat-1", asset_id="aid-1",
-                payload={
-                    "owned_by": "gcs",
-                    "uri": "gs://my-bucket/blob/path.tif",
-                    "physical_id": _FAKE_PHYS_ID,
-                    "metadata": {},
-                },
-            )
-
-        assert mock_blob.metadata["asset_physical_id"] == _FAKE_PHYS_ID
-        assert mock_blob.metadata["asset_id"] == "aid-1"
-
-    @pytest.mark.asyncio
-    async def test_physical_id_resolved_via_assets_protocol(self):
-        """When physical_id is absent from payload, the resolver is called."""
-        mock_assets = MagicMock()
-        mock_assets.resolve_asset_physical_id = AsyncMock(return_value=_FAKE_PHYS_ID)
-
-        mock_gcp, mock_client, mock_bucket, mock_blob = _make_mock_gcp_client({})
-
-        def _side_effect(protocol_cls):
-            from dynastore.models.protocols.assets import AssetsProtocol
-            if protocol_cls is AssetsProtocol:
-                return mock_assets
-            return mock_gcp
-
-        with patch(
-            "dynastore.modules.gcp.asset_sync.get_protocol",
-            side_effect=_side_effect,
-        ):
-            await BucketAnnotationPatcher.on_asset_upsert(
-                catalog_id="cat-1", asset_id="aid-1",
-                collection_id="coll-1",
-                payload={
-                    "owned_by": "gcs",
-                    "uri": "gs://my-bucket/blob/path.tif",
-                    "metadata": {},
-                },
-            )
-
-        mock_assets.resolve_asset_physical_id.assert_called_once_with(
-            "cat-1", "aid-1", "coll-1", allow_missing=True,
-        )
-        assert mock_blob.metadata["asset_physical_id"] == _FAKE_PHYS_ID
-        assert mock_blob.metadata["asset_id"] == "aid-1"
-
-    @pytest.mark.asyncio
-    async def test_physical_id_resolver_returns_none_no_key_written(self):
-        """When the resolver returns None, asset_physical_id is omitted."""
-        mock_assets = MagicMock()
-        mock_assets.resolve_asset_physical_id = AsyncMock(return_value=None)
-
-        mock_gcp, mock_client, mock_bucket, mock_blob = _make_mock_gcp_client({})
-
-        def _side_effect(protocol_cls):
-            from dynastore.models.protocols.assets import AssetsProtocol
-            if protocol_cls is AssetsProtocol:
-                return mock_assets
-            return mock_gcp
-
-        with patch(
-            "dynastore.modules.gcp.asset_sync.get_protocol",
-            side_effect=_side_effect,
-        ):
-            await BucketAnnotationPatcher.on_asset_upsert(
-                catalog_id="cat-1", asset_id="aid-1",
-                payload={
-                    "owned_by": "gcs",
-                    "uri": "gs://my-bucket/blob/path.tif",
-                    "metadata": {},
-                },
-            )
-
-        assert "asset_physical_id" not in mock_blob.metadata
-
-    @pytest.mark.asyncio
-    async def test_idempotent_when_metadata_matches_with_physical_id(self):
-        """No blob.patch() call when current metadata already matches desired."""
-        phys_id = _FAKE_PHYS_ID
-        target = {
+        # Metadata reflects payload
+        assert mock_blob.metadata == {
             "author": "alice",
             "asset_id": "aid-1",
             "asset_type": "RASTER",
-            "asset_physical_id": phys_id,
         }
-        mock_gcp, mock_client, mock_bucket, mock_blob = _make_mock_gcp_client(
-            dict(target)
-        )
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_metadata_matches(self):
+        """No blob.patch() call when current matches desired."""
+        target = {"author": "alice", "asset_id": "aid-1", "asset_type": "RASTER"}
+        mock_blob = MagicMock()
+        mock_blob.metadata = dict(target)  # already matches
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        mock_gcp = MagicMock()
+        mock_gcp.get_storage_client.return_value = mock_client
 
         with patch(
             "dynastore.modules.gcp.asset_sync.get_protocol",
@@ -309,7 +197,6 @@ class TestBucketAnnotationPatcherPatch:
                     "owned_by": "gcs",
                     "uri": "gs://my-bucket/blob/path.tif",
                     "asset_type": "RASTER",
-                    "physical_id": phys_id,
                     "metadata": {"author": "alice"},
                 },
             )

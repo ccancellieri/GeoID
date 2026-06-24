@@ -111,11 +111,11 @@ ENVELOPE_FEATURE_MAPPING: Dict[str, Any] = {
 }
 
 
-def get_envelope_index_name(prefix: str, catalog_physical_id: str) -> str:
-    """Per-catalog envelope items index ``{prefix}-{catalog_physical_id}-envelope-items``.
+def get_envelope_index_name(prefix: str, catalog_id: str) -> str:
+    """Per-catalog envelope items index ``{prefix}-{catalog_id}-envelope-items``.
 
     Owned by the envelope items driver; the platform never references this
     naming. Catalog-first naming mirrors ``get_private_index_name`` so all
     per-catalog indexes cluster lexicographically.
     """
-    return f"{prefix}-{catalog_physical_id}-envelope-items"
+    return f"{prefix}-{catalog_id}-envelope-items"

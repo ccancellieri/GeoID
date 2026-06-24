@@ -97,46 +97,6 @@ def validate_sql_identifier(identifier: str) -> str:
     return identifier_lower
 
 
-def validate_asset_id(identifier: str) -> str:
-    """Validate a user-supplied asset_id, preserving its case.
-
-    Asset ids are NOT lowercased on the create path (unlike catalog/collection
-    ids which go through ``validate_sql_identifier``). This validator mirrors
-    the ``validate_column_identifier`` charset rules — plain alphanumerics,
-    underscores, hyphens, and dots — without forcing lowercase.
-
-    Raises:
-        InvalidIdentifierError: If the identifier is invalid.
-
-    Returns:
-        str: The validated asset_id, unchanged.
-    """
-    if not isinstance(identifier, str) or not identifier:
-        raise InvalidIdentifierError("Asset id must be a non-empty string.")
-
-    if "{{" in identifier or "}}" in identifier:
-        raise InvalidIdentifierError(
-            f"Asset id '{identifier}' contains an unsubstituted template placeholder."
-        )
-
-    if len(identifier) > 255:
-        raise InvalidIdentifierError("Asset id must be 255 characters or less.")
-
-    if identifier.lower() in POSTGRES_RESERVED_WORDS:
-        raise InvalidIdentifierError(
-            f"Asset id '{identifier}' is a reserved keyword."
-        )
-
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_.>-]*$", identifier):
-        raise InvalidIdentifierError(
-            f"Asset id '{identifier}' is invalid: it must start with a letter or "
-            "underscore and contain only letters, digits, underscores, dots, "
-            "hyphens, or JSON operators (->)."
-        )
-
-    return identifier
-
-
 def validate_column_identifier(identifier: str) -> str:
     """
     Validate a user-supplied physical column name, preserving its case.

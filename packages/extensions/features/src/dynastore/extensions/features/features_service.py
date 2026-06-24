@@ -427,13 +427,16 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         result_catalogs = []
         for catalog in catalogs:
             catalog_dict, _ = catalog.localize(language)
+            # catalog_dict["id"] is the public external label (projected by
+            # _serialize_public_id via model_dump inside localize()).
+            cat_pub = catalog_dict["id"]
             # Add links to each catalog
             catalog_dict["links"] = [
                 Link(
-                    href=f"{self_url}/{catalog.id}", rel="self", type="application/json"
+                    href=f"{self_url}/{cat_pub}", rel="self", type="application/json"
                 ).model_dump(),
                 Link(
-                    href=f"{self_url}/{catalog.id}/collections",
+                    href=f"{self_url}/{cat_pub}/collections",
                     rel="items",
                     type="application/json",
                 ).model_dump(),
@@ -497,42 +500,54 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         self,
         catalog_id: str,
         definition: ogc_models.CatalogDefinition,
+        request: Request,
         conn: AsyncConnection = Depends(get_async_connection),
         language: str = Depends(get_language),
     ):
         """OGC API Features Part 4 — replace the whole catalog (PUT).
 
-        ``CatalogDefinition`` enforces required fields (id/title/...) so
-        partial bodies are rejected by Pydantic before the handler runs.
+        Per OGC API Features Part 4 Req 11, a body ``id`` that differs from the
+        path parameter is silently ignored and the path-addressed resource is
+        replaced (on_id_mismatch="ignore").  To rename instead, send
+        ``Prefer: handling=move``; the catalog is then renamed to the body id
+        and the response carries ``Content-Location``, ``Link: rel=canonical``,
+        and ``Preference-Applied: handling=move``.
         """
         from dynastore.models.localization import normalize_i18n_for_replace
 
-        if definition.id != catalog_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Body 'id' ({definition.id!r}) must match path catalog_id "
-                    f"({catalog_id!r})."
-                ),
-            )
+        body_id = definition.id
         catalog_dict = definition.model_dump(exclude_unset=False)
         catalog_dict = normalize_i18n_for_replace(catalog_dict, language)
-        return await self._ogc_replace_catalog(catalog_id, catalog_dict, language, conn)
+        return await self._ogc_replace_catalog(
+            catalog_id, catalog_dict, language, conn,
+            request=request, body_id=body_id, on_id_mismatch="ignore",
+        )
 
     async def update_catalog(
         self,
         catalog_id: str,
         definition: ogc_models.CatalogDefinition,
+        request: Request,
         conn: AsyncConnection = Depends(get_async_connection),
         language: str = Depends(get_language),
     ):
-        """Updates an existing catalog."""
+        """OGC API Features Part 4 — partial update of a catalog (PATCH).
+
+        A body ``id`` that differs from the path parameter is silently ignored
+        per OGC API Features Part 4 Req 11.  Send ``Prefer: handling=move`` to
+        rename instead.
+        """
         catalog_dict = definition.model_dump(exclude_unset=True)
-        return await self._ogc_update_catalog(catalog_id, catalog_dict, language, conn)
+        body_id: Optional[str] = catalog_dict.get("id")
+        return await self._ogc_update_catalog(
+            catalog_id, catalog_dict, language, conn,
+            body_id=body_id, request=request, on_id_mismatch="ignore",
+        )
 
     async def delete_catalog(
         self,
         catalog_id: str,
+        request: Request,
         force: bool = Query(False),
         conn: AsyncConnection = Depends(get_async_connection),
     ):
@@ -704,27 +719,26 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalog_id: str,
         collection_id: str,
         collection_def: ogc_models.CollectionDefinition,
+        request: Request,
         language: str = Depends(get_language),
     ):
         """OGC API Features Part 4 — replace the whole collection (PUT).
 
-        ``CollectionDefinition`` enforces required fields, so a partial
-        body returns 422 before the handler runs.
+        Per OGC API Features Part 4 Req 11, a body ``id`` that differs from the
+        path parameter is silently ignored and the path-addressed resource is
+        replaced (on_id_mismatch="ignore").  To rename instead, send
+        ``Prefer: handling=move``; the collection is then renamed to the body id
+        and the response carries ``Content-Location``, ``Link: rel=canonical``,
+        and ``Preference-Applied: handling=move``.
         """
         from dynastore.models.localization import normalize_i18n_for_replace
 
-        if collection_def.id != collection_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Body 'id' ({collection_def.id!r}) must match path "
-                    f"collection_id ({collection_id!r})."
-                ),
-            )
+        body_id = collection_def.id
         updates_dict = collection_def.model_dump(exclude_unset=False)
         updates_dict = normalize_i18n_for_replace(updates_dict, language)
         return await self._ogc_replace_collection(
-            catalog_id, collection_id, updates_dict, language
+            catalog_id, collection_id, updates_dict, language,
+            request=request, body_id=body_id, on_id_mismatch="ignore",
         )
 
     async def update_collection(
@@ -732,11 +746,21 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalog_id: str,
         collection_id: str,
         collection_def: ogc_models.CollectionDefinition,
+        request: Request,
         language: str = Depends(get_language),
     ):
-        """Updates an existing collection's metadata."""
+        """OGC API Features Part 4 — partial update of a collection (PATCH).
+
+        A body ``id`` that differs from the path parameter is silently ignored
+        per OGC API Features Part 4 Req 11.  Send ``Prefer: handling=move`` to
+        rename instead.
+        """
         updates_dict = collection_def.model_dump(exclude_unset=True)
-        return await self._ogc_update_collection(catalog_id, collection_id, updates_dict, language)
+        body_id: Optional[str] = updates_dict.get("id")
+        return await self._ogc_update_collection(
+            catalog_id, collection_id, updates_dict, language, request,
+            body_id=body_id, on_id_mismatch="ignore",
+        )
 
     async def delete_collection(
         self,

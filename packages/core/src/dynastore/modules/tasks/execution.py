@@ -1160,7 +1160,7 @@ class ExecutionEngine:
             task_type=task_type,
             caller_id=raw_payload["caller_id"],
             inputs=task_inputs,
-            db_schema=task_row.get("schema_name", "tasks"),
+            db_schema=task_row.get("catalog_id", "tasks"),
             extra_context=_extra_context,
         )
 

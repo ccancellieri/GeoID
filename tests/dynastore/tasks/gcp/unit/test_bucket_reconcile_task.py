@@ -192,7 +192,6 @@ async def test_no_drift_returns_empty_report(
             {
                 "asset_id": "a1",
                 "collection_id": "col1",
-                "collection_physical_id": "col1",
                 "filename": "data.tif",
                 "status": "active",
                 "uri": "gs://bkt/collections/col1/data.tif",
@@ -252,9 +251,6 @@ async def test_orphan_blob_imported_when_apply_true(
     assert params["kind"] == "physical"
     assert params["filename"] == "data.tif"
     assert params["uri"] == "gs://bkt/collections/col1/data.tif"
-    # collection_physical_id is the partition key; must be set to the physical id
-    # parsed from the blob path (immutable path segment, survives any rename).
-    assert params["collection_physical_id"] == "col1"
     assert params["collection_id"] == "col1"
 
 
@@ -299,7 +295,6 @@ async def test_ghost_row_marked_failed(
             {
                 "asset_id": "phantom-1",
                 "collection_id": "col1",
-                "collection_physical_id": "col1",
                 "filename": "phantom.tif",
                 "status": "active",
                 "uri": "gs://bkt/collections/col1/phantom.tif",
@@ -324,8 +319,7 @@ async def test_ghost_row_marked_failed(
     assert len(updates) == 1
     sql, params = updates[0]
     assert params["asset_id"] == "phantom-1"
-    # UPDATE predicates on the immutable physical id, not the mutable logical label.
-    assert params["collection_physical_id"] == "col1"
+    assert params["collection_id"] == "col1"
     # The patch JSON carries reason=missing_blob so the audit trail is
     # discoverable in the row's metadata.
     assert "missing_blob" in params["patch"]
@@ -350,7 +344,6 @@ async def test_stuck_pending_failed(
             {
                 "asset_id": "stuck-1",
                 "collection_id": "col1",
-                "collection_physical_id": "col1",
                 "filename": "stuck.tif",
                 "status": "pending",
                 "uri": None,
@@ -397,7 +390,7 @@ async def test_collection_scope_filters_blobs(
         monkeypatch,
         [("collections/col1/scoped.tif", "scoped.tif")],
     )
-    # The DB SELECT was issued with WHERE collection_physical_id = :collection_physical_id
+    # The DB SELECT was issued with WHERE collection_id = :collection_id
     # so the result rows are already scoped — return only the col1 row.
     captured: List[Tuple[str, Dict[str, Any]]] = []
     _patch_db_rows(
@@ -406,7 +399,6 @@ async def test_collection_scope_filters_blobs(
             {
                 "asset_id": "scoped-1",
                 "collection_id": "col1",
-                "collection_physical_id": "col1",
                 "filename": "scoped.tif",
                 "status": "active",
                 "uri": "gs://bkt/collections/col1/scoped.tif",

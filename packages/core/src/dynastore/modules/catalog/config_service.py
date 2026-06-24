@@ -186,15 +186,9 @@ async def _collection_config_cache(
         if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
             return None
 
-        physical_id = await catalog_manager.resolve_physical_id(
-            catalog_id, collection_id, ctx=DriverContext(db_resource=conn), allow_missing=True
-        )
-        if not physical_id:
-            return None
-
         return await _cq.select_collection_config(phys_schema).execute(
             conn,
-            physical_id=physical_id,
+            collection_id=collection_id,
             ref_key=class_key,
         )
 
@@ -391,16 +385,9 @@ class ConfigService(ConfigsProtocol):
                     if phys_schema and await check_table_exists(
                         conn, COLLECTION_CONFIGS_TABLE, phys_schema
                     ):
-                        physical_id = await self._get_catalog_manager().resolve_physical_id(
-                            catalog_id, collection_id,
-                            ctx=DriverContext(db_resource=conn), allow_missing=True,
+                        collection_delta = await _cq.select_collection_config(phys_schema).execute(
+                            conn, collection_id=collection_id, ref_key=class_key
                         )
-                        if physical_id:
-                            collection_delta = await _cq.select_collection_config(phys_schema).execute(
-                                conn, physical_id=physical_id, ref_key=class_key
-                            )
-                        else:
-                            collection_delta = None
                     else:
                         collection_delta = None
             if collection_delta:
@@ -741,15 +728,10 @@ class ConfigService(ConfigsProtocol):
                 catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
             )
 
-            physical_id = await self._get_catalog_manager().resolve_physical_id(
-                catalog_id, collection_id,
-                ctx=DriverContext(db_resource=conn), allow_missing=False,
-            )
-
             if check_immutability:
                 current_data = await _cq.select_collection_config_for_update(phys_schema).execute(
                     conn,
-                    physical_id=physical_id,
+                    collection_id=collection_id,
                     ref_key=class_key,
                 )
                 await self._enforce_write_immutability(
@@ -763,7 +745,7 @@ class ConfigService(ConfigsProtocol):
 
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
-                physical_id=physical_id,
+                collection_id=collection_id,
                 ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
@@ -803,16 +785,9 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return {"total": 0, "results": []}
 
-                physical_id = await self._get_catalog_manager().resolve_physical_id(
-                    catalog_id, collection_id,
-                    ctx=DriverContext(db_resource=conn), allow_missing=True,
-                )
-                if not physical_id:
-                    return {"total": 0, "results": []}
-
                 rows = await _cq.list_collection_configs_paginated(phys_schema).execute(
                     conn,
-                    physical_id=physical_id,
+                    collection_id=collection_id,
                     limit=limit,
                     offset=offset,
                 )
@@ -927,14 +902,8 @@ class ConfigService(ConfigsProtocol):
                     return {}
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return {}
-                physical_id = await self._get_catalog_manager().resolve_physical_id(
-                    catalog_id, collection_id,
-                    ctx=DriverContext(db_resource=conn), allow_missing=True,
-                )
-                if not physical_id:
-                    return {}
                 rows = await _cq.list_collection_refs(phys_schema).execute(
-                    conn, physical_id=physical_id
+                    conn, collection_id=collection_id
                 )
             return {r["ref_key"]: r["class_key"] for r in rows}
 
@@ -987,14 +956,8 @@ class ConfigService(ConfigsProtocol):
                     return None
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return None
-                physical_id = await self._get_catalog_manager().resolve_physical_id(
-                    catalog_id, collection_id,
-                    ctx=DriverContext(db_resource=conn), allow_missing=True,
-                )
-                if not physical_id:
-                    return None
                 row = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                    conn, physical_id=physical_id, ref_key=ref_key
+                    conn, collection_id=collection_id, ref_key=ref_key
                 )
             return _materialise_ref_row(row, ref_key)
 
@@ -1159,13 +1122,8 @@ class ConfigService(ConfigsProtocol):
                 catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
             )
 
-            physical_id = await self._get_catalog_manager().resolve_physical_id(
-                catalog_id, collection_id,
-                ctx=DriverContext(db_resource=conn), allow_missing=False,
-            )
-
             existing = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                conn, physical_id=physical_id, ref_key=ref_key
+                conn, collection_id=collection_id, ref_key=ref_key
             )
             if existing:
                 stored_class_key = existing["class_key"]
@@ -1189,7 +1147,7 @@ class ConfigService(ConfigsProtocol):
 
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
-                physical_id=physical_id,
+                collection_id=collection_id,
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
@@ -1231,20 +1189,14 @@ class ConfigService(ConfigsProtocol):
                     return False
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return False
-                physical_id = await self._get_catalog_manager().resolve_physical_id(
-                    catalog_id, collection_id,
-                    ctx=DriverContext(db_resource=conn), allow_missing=True,
-                )
-                if not physical_id:
-                    return False
                 existing = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                    conn, physical_id=physical_id, ref_key=ref_key
+                    conn, collection_id=collection_id, ref_key=ref_key
                 )
                 if not existing:
                     return False
                 stored_class_key = existing["class_key"]
                 await _cq.delete_collection_config(phys_schema).execute(
-                    conn, physical_id=physical_id, ref_key=ref_key,
+                    conn, collection_id=collection_id, ref_key=ref_key,
                 )
             _collection_config_cache.cache_invalidate(
                 self.engine, self._get_catalog_manager(),
@@ -1322,18 +1274,10 @@ class ConfigService(ConfigsProtocol):
                 if collection_id:
                     if not collection_table_exists:
                         return {"total": 0, "results": []}
-                    search_phys_id = await self._get_catalog_manager().resolve_physical_id(
-                        catalog_id, collection_id,
-                        ctx=DriverContext(db_resource=conn), allow_missing=True,
-                    )
-                    if not search_phys_id:
-                        return {"total": 0, "results": []}
-                    # physical_id aliased as collection_id so the result mapper below
-                    # continues to read r.get("collection_id") without change.
                     sql = f"""
-                    SELECT COUNT(*) OVER() as total_count, 'collection' as level, physical_id AS collection_id, class_key, config_data
+                    SELECT COUNT(*) OVER() as total_count, 'collection' as level, collection_id, class_key, config_data
                     FROM \"{phys_schema}\".{COLLECTION_CONFIGS_TABLE}
-                    WHERE physical_id = :search_phys_id
+                    WHERE collection_id = :collection_id
                     """
                 else:
                     parts = []
@@ -1342,9 +1286,8 @@ class ConfigService(ConfigsProtocol):
                         SELECT 'catalog' as level, NULL as collection_id, class_key, config_data
                         FROM \"{phys_schema}\".{CATALOG_CONFIGS_TABLE}""")
                     if collection_table_exists:
-                        # physical_id aliased as collection_id for a uniform result shape
                         parts.append(f"""
-                        SELECT 'collection' as level, physical_id AS collection_id, class_key, config_data
+                        SELECT 'collection' as level, collection_id, class_key, config_data
                         FROM \"{phys_schema}\".{COLLECTION_CONFIGS_TABLE}""")
                     sql = f"""
                     SELECT COUNT(*) OVER() as total_count, level, collection_id, class_key, config_data FROM (
@@ -1357,17 +1300,15 @@ class ConfigService(ConfigsProtocol):
 
                 sql += " ORDER BY level, collection_id, class_key LIMIT :limit OFFSET :offset;"
 
-                execute_kwargs: dict = {
-                    "query": f"%{query}%" if query else None,
-                    "limit": limit,
-                    "offset": offset,
-                }
-                if collection_id:
-                    execute_kwargs["search_phys_id"] = search_phys_id
-
                 rows = await DQLQuery(
                     sql, result_handler=ResultHandler.ALL_DICTS
-                ).execute(conn, **execute_kwargs)
+                ).execute(
+                    conn,
+                    collection_id=collection_id,
+                    query=f"%{query}%" if query else None,
+                    limit=limit,
+                    offset=offset,
+                )
 
                 total = rows[0]["total_count"] if rows else 0
                 results = []
@@ -1473,16 +1414,9 @@ class ConfigService(ConfigsProtocol):
             if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                 return False
 
-            physical_id = await self._get_catalog_manager().resolve_physical_id(
-                catalog_id, collection_id,
-                ctx=DriverContext(db_resource=conn), allow_missing=True,
-            )
-            if not physical_id:
-                return False
-
             rows_affected = await _cq.delete_collection_config(phys_schema).execute(
                 conn,
-                physical_id=physical_id,
+                collection_id=collection_id,
                 ref_key=class_key,
             )
 

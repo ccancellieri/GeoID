@@ -23,7 +23,7 @@
 ``tasks.events``
     Global events queue replacing ``events.events``.  Partitioned daily by
     ``day`` (a DATE column equal to ``created_at::date``).  Tenancy is
-    column-based: ``schema_name NULL`` means platform-wide / PLATFORM scope.
+    column-based: ``catalog_id NULL`` means platform-wide / PLATFORM scope.
     Enforces lowercase ``scope`` at the DB level (CHECK constraint) — legacy
     ``events.events`` stored mixed-case values; this table requires lowercase
     from day one (see PR #1804).
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS {schema}.events (
     event_id        UUID            NOT NULL,
     day             DATE            NOT NULL,
     shard           SMALLINT        NOT NULL,
-    schema_name     TEXT,
+    catalog_id      TEXT,
     scope           TEXT            NOT NULL DEFAULT 'platform'
                         CHECK (scope = lower(scope)),
     event_type      TEXT            NOT NULL,
@@ -123,11 +123,11 @@ CREATE TABLE IF NOT EXISTS {schema}.events_default
 """
 
 EVENTS_INDEXES_DDL = """
--- Fairness partial index: leads with (schema_name, created_at) so per-tenant
+-- Fairness partial index: leads with (catalog_id, created_at) so per-tenant
 -- drain queries get an index-only scan without cross-tenant interference.
 -- Partial keeps the index small — only PENDING rows are eligible for claiming.
 CREATE INDEX IF NOT EXISTS idx_events_fairness
-    ON {schema}.events (schema_name, created_at)
+    ON {schema}.events (catalog_id, created_at)
     WHERE status = 'PENDING';
 -- Shard index: enables shard-affine drain workers to restrict their scan.
 CREATE INDEX IF NOT EXISTS idx_events_shard

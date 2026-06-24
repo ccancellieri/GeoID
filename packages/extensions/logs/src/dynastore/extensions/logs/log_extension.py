@@ -662,28 +662,27 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         both tenant logs and system logs associated with that tenant.
         """
         async with managed_transaction(self.engine) as conn:
-            # 1. Prepare shared filters for the system_logs branch (uses the
-            # logical collection_id column — system_logs is flat, not partitioned).
-            sys_clauses = ["catalog_id = :catalog_id"]
-            params: dict = {"catalog_id": catalog_id, "limit": limit, "offset": offset}
+            # 1. Prepare shared filters
+            base_clauses = ["catalog_id = :catalog_id"]
+            params = {"catalog_id": catalog_id, "limit": limit, "offset": offset}
 
             if collection_id:
-                sys_clauses.append("collection_id = :collection_id")
+                base_clauses.append("collection_id = :collection_id")
                 params["collection_id"] = collection_id
             if event_type:
-                sys_clauses.append("event_type = :event_type")
+                base_clauses.append("event_type = :event_type")
                 params["event_type"] = event_type
             if level:
-                sys_clauses.append("level = :level")
+                base_clauses.append("level = :level")
                 params["level"] = level
             if start_date:
-                sys_clauses.append("timestamp >= :start_date")
+                base_clauses.append("timestamp >= :start_date")
                 params["start_date"] = start_date
             if end_date:
-                sys_clauses.append("timestamp <= :end_date")
+                base_clauses.append("timestamp <= :end_date")
                 params["end_date"] = end_date
 
-            sys_where = " AND ".join(sys_clauses)
+            where_clause = " AND ".join(base_clauses)
 
             # System logs (catalog.system_logs) and tenant logs ({schema}.logs)
             # declare their columns in a DIFFERENT physical order — notably
@@ -701,20 +700,20 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
             # 2. Determine tables to query
             queries = []
 
-            # System Logs — filter by logical collection_id (flat table, no partition).
-            # If asking for _system_, return ALL system logs regardless of catalog_id.
-            effective_sys_where = sys_where
+            # System Logs
+            # If asking for _system_, we return ALL system logs.
+            # If asking for a tenant, we return system logs matching that tenant.
+            sys_where = where_clause
             if catalog_id == SYSTEM_CATALOG_ID:
-                effective_sys_where = sys_where.replace(
-                    "catalog_id = :catalog_id", "TRUE"
-                )
+                sys_where = where_clause.replace("catalog_id = :catalog_id", "TRUE")
 
             queries.append(
-                f"SELECT {cols} FROM catalog.{SYSTEM_LOGS_TABLE} WHERE {effective_sys_where}"
+                f"SELECT {cols} FROM catalog.{SYSTEM_LOGS_TABLE} WHERE {sys_where}"
             )
 
-            # Tenant Logs — partitioned by collection_physical_id.
+            # Tenant Logs
             if catalog_id != SYSTEM_CATALOG_ID:
+                    # 1. Resolve Physical Names
                 catalogs_provider = self.catalogs
                 if not catalogs_provider:
                     raise HTTPException(
@@ -730,51 +729,13 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                     )
 
                 if physical_schema:
-                    # Build a separate WHERE for the tenant branch.
-                    # The schema already scopes to one catalog, so catalog_id is a
-                    # mutable label that becomes stale after a rename — omit it.
-                    tenant_clauses: list = []
-                    if collection_id:
-                        # Resolve the immutable physical id for partition pruning.
-                        # When resolution fails, omit the collection filter rather
-                        # than matching the stale logical id.
-                        coll_phys_id: Optional[str] = None
-                        try:
-                            coll_phys_id = await catalogs_provider.resolve_physical_id(
-                                catalog_id,
-                                collection_id,
-                                ctx=None,
-                                allow_missing=True,
-                            )
-                        except Exception:
-                            pass
-                        if coll_phys_id:
-                            tenant_clauses.append(
-                                "collection_physical_id = :collection_physical_id"
-                            )
-                            params["collection_physical_id"] = coll_phys_id
-                        # else: physical id unresolved — return catalog-scoped rows
-                        # without a collection filter.
-                    if event_type:
-                        tenant_clauses.append("event_type = :event_type")
-                    if level:
-                        tenant_clauses.append("level = :level")
-                    if start_date:
-                        tenant_clauses.append("timestamp >= :start_date")
-                    if end_date:
-                        tenant_clauses.append("timestamp <= :end_date")
-
-                    tenant_where = " AND ".join(tenant_clauses) if tenant_clauses else "TRUE"
                     queries.append(
-                        f'SELECT {cols} FROM "{physical_schema}".logs WHERE {tenant_where}'
+                        f'SELECT {cols} FROM "{physical_schema}".logs WHERE {where_clause}'
                     )
 
             # 3. Combine queries with UNION ALL and sort
             final_sql = " UNION ALL ".join(queries)
-            final_sql = (
-                f"SELECT * FROM ({final_sql}) AS combined_logs "
-                f"ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
-            )
+            final_sql = f"SELECT * FROM ({final_sql}) AS combined_logs ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
 
             try:
                 rows = await DQLQuery(

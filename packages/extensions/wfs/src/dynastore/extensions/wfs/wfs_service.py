@@ -412,20 +412,22 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             # Root request: fetch all catalogs and their respective collections.
             catalogs = await catalogs_svc.list_catalogs(limit=1000, ctx=DriverContext(db_resource=conn))
             for catalog in catalogs:
+                _cat_internal_id = catalog.id
+                _cat_external_id = getattr(catalog, "external_id", None) or catalog.id
                 all_collections_summary = await catalogs_svc.list_collections(
-                    catalog.id, limit=1000, ctx=DriverContext(db_resource=conn)
+                    _cat_internal_id, limit=1000, ctx=DriverContext(db_resource=conn)
                 )
                 vector_collections = []
                 for c_summary in all_collections_summary:
-                    if await _is_vector(catalog.id, c_summary.id):
+                    if await _is_vector(_cat_internal_id, c_summary.id):
                         full_collection_details = await catalogs_svc.get_collection(
-                            catalog.id, c_summary.id, ctx=DriverContext(db_resource=conn)
+                            _cat_internal_id, c_summary.id, ctx=DriverContext(db_resource=conn)
                         )
                         if full_collection_details:
                             localized, _ = full_collection_details.localize(language)
                             vector_collections.append(localized)
                 if vector_collections:
-                    catalogs_with_collections[catalog.id] = vector_collections
+                    catalogs_with_collections[_cat_external_id] = vector_collections
 
         # The generator already handles localization based on the localized dictionaries passed.
         xml_content = wfs_generator.create_capabilities_response(

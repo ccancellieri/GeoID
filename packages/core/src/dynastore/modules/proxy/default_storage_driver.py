@@ -72,27 +72,22 @@ class PostgresProxyStorage(AbstractProxyStorage):
         long_url: str,
         custom_key: Optional[str] = None,
         collection_id: Optional[str] = None,
-        collection_physical_id: Optional[str] = None,
         comment: Optional[str] = None,
     ) -> ShortURL:
-        _coll_id = collection_id or "_catalog_"
-        _coll_phys_id = collection_physical_id or _coll_id
         if custom_key:
             return await queries.INSERT_SHORT_URL_WITH_CUSTOM_KEY.execute(
                 conn,
                 schema=schema,
                 custom_key=custom_key,
                 long_url=long_url,
-                collection_id=_coll_id,
-                collection_physical_id=_coll_phys_id,
+                collection_id=collection_id or "_catalog_",
                 comment=comment,
             )
         return await queries.INSERT_SHORT_URL_WITH_GENERATED_KEY.execute(
             conn,
             schema=schema,
             long_url=long_url,
-            collection_id=_coll_id,
-            collection_physical_id=_coll_phys_id,
+            collection_id=collection_id or "_catalog_",
             comment=comment,
         )
 
@@ -100,14 +95,14 @@ class PostgresProxyStorage(AbstractProxyStorage):
         self,
         conn: DbResource,
         schema: str,
-        collection_physical_id: str,
+        collection_id: str,
         limit: int = 100,
         offset: int = 0,
     ) -> List[ShortURL]:
         return await queries.GET_URLS_BY_COLLECTION.execute(
             conn,
             schema=schema,
-            collection_physical_id=collection_physical_id,
+            collection_id=collection_id,
             limit=limit,
             offset=offset,
         )

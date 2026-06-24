@@ -392,19 +392,9 @@ def cql_ast_to_es_query(
 # Both the public STAC item doc and the private tenant-feature doc keep these
 # at the document root (see the public items mapping and
 # ``elasticsearch_private/doc_builder.build_tenant_feature_doc``).
-#
-# ``asset_id`` is the mutable logical label; the items index stores only the
-# immutable ``asset_physical_id`` UUID (the logical label is internal-only and
-# never written to item _source).  CQL filters on ``asset_id`` are therefore
-# routed to the ``asset_physical_id`` ES field so they hit the indexed keyword.
-# ``asset_physical_id`` is also registered directly for callers that know the
-# UUID.  This map is consumed exclusively by item/STAC-search paths; the
-# separate assets index retains its own ``asset_id`` keyword field and is not
-# queried through this translator.
 _ENVELOPE_FIELD_PATHS: Dict[str, str] = {
     "external_id": "external_id",
-    "asset_id": "asset_physical_id",
-    "asset_physical_id": "asset_physical_id",
+    "asset_id": "asset_id",
     "geoid": "geoid",
     "id": "id",
     "geometry": "geometry",

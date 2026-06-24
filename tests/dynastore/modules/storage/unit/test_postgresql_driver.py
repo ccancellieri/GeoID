@@ -305,52 +305,52 @@ class TestLocation:
     @pytest.mark.asyncio
     async def test_location_with_collection(self):
         driver = ItemsPostgresqlDriver()
-        # Pre-populate the confirmed-active cache so resolve_physical_table
-        # skips the to_regclass existence probe (the collection is already
-        # known to be provisioned in this process).
-        from dynastore.modules.catalog.collection_service import (
-            _mark_confirmed_active,
-            _unmark_confirmed_active,
-        )
-        _mark_confirmed_active("cat1", "col1")
-        try:
-            with patch("dynastore.tools.discovery.get_protocol") as mock_gp:
-                mock_catalogs = AsyncMock()
-                mock_catalogs.resolve_physical_schema = AsyncMock(return_value="my_schema")
-                # resolve_physical_id returns the collection's physical_id
-                # which is also the physical table name (clean-break: no JSONB pin).
-                mock_catalogs.resolve_physical_id = AsyncMock(return_value="c__mytable1")
-
-                def side_effect(proto):
-                    name = proto.__name__ if hasattr(proto, "__name__") else str(proto)
-                    if "Catalogs" in name:
-                        return mock_catalogs
-                    return None
-
-                mock_gp.side_effect = side_effect
-                loc = await driver.location("cat1", "col1")
-                assert loc.backend == "postgresql"
-                assert loc.identifiers["schema"] == "my_schema"
-                assert loc.identifiers["table"] == "c__mytable1"
-        finally:
-            _unmark_confirmed_active("cat1", "col1")
-
-    @pytest.mark.asyncio
-    async def test_location_raises_when_physical_id_unset(self):
-        """When collections.physical_id is NULL (unprovisioned), location()
-        must raise rather than silently falling back — the silent fallback
-        previously hid lifecycle gaps."""
-        driver = ItemsPostgresqlDriver()
         with patch("dynastore.tools.discovery.get_protocol") as mock_gp:
             mock_catalogs = AsyncMock()
             mock_catalogs.resolve_physical_schema = AsyncMock(return_value="my_schema")
-            # NULL physical_id means the collection was never provisioned.
-            mock_catalogs.resolve_physical_id = AsyncMock(return_value=None)
+
+            mock_configs = AsyncMock()
+            mock_configs.get_config = AsyncMock(
+                return_value=ItemsPostgresqlDriverConfig(physical_table="my_table")
+            )
 
             def side_effect(proto):
                 name = proto.__name__ if hasattr(proto, "__name__") else str(proto)
                 if "Catalogs" in name:
                     return mock_catalogs
+                if "Configs" in name:
+                    return mock_configs
+                return None
+
+            mock_gp.side_effect = side_effect
+            loc = await driver.location("cat1", "col1")
+            assert loc.backend == "postgresql"
+            assert loc.identifiers["schema"] == "my_schema"
+            assert loc.identifiers["table"] == "my_table"
+
+    @pytest.mark.asyncio
+    async def test_location_raises_when_physical_table_unset(self):
+        """Driver config with no physical_table must raise instead of
+        silently using collection_id — the silent fallback hid lifecycle
+        gaps (collection registered but not activated) until the deeper
+        resolver in _apply_query_transformations raised the opaque
+        'Could not resolve storage' from a frame far from the cause."""
+        driver = ItemsPostgresqlDriver()
+        with patch("dynastore.tools.discovery.get_protocol") as mock_gp:
+            mock_catalogs = AsyncMock()
+            mock_catalogs.resolve_physical_schema = AsyncMock(return_value="my_schema")
+
+            mock_configs = AsyncMock()
+            mock_configs.get_config = AsyncMock(
+                return_value=ItemsPostgresqlDriverConfig(physical_table=None)
+            )
+
+            def side_effect(proto):
+                name = proto.__name__ if hasattr(proto, "__name__") else str(proto)
+                if "Catalogs" in name:
+                    return mock_catalogs
+                if "Configs" in name:
+                    return mock_configs
                 return None
 
             mock_gp.side_effect = side_effect

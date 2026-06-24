@@ -385,7 +385,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         return {
             "catalogs": [
                 {
-                    "id": c.id,
+                    "id": getattr(c, "external_id", None) or c.id,
                     "title": resolve_localized(getattr(c, "title", None), language),
                 }
                 for c in (catalogs or [])
@@ -406,7 +406,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         )
         items = []
         for c in (collections or []):
-            entry: dict = {"id": c.id}
+            entry: dict = {"id": getattr(c, "external_id", None) or c.id}
             title = resolve_localized(getattr(c, "title", None), language)
             if title is not None:
                 entry["title"] = title

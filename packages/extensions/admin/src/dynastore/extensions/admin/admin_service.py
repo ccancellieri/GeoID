@@ -203,8 +203,11 @@ async def _is_catalog_only_admin(request: Request) -> bool:
 
 
 
-async def _assert_catalog_exists(catalog_id: str) -> None:
+async def _assert_catalog_exists(catalog_id: str) -> Optional[str]:
     """Raise 404 if ``catalog_id`` does not resolve to a known catalog.
+
+    Returns the immutable internal catalog id (or ``None`` when the
+    ``CatalogsProtocol`` is unavailable and no resolution was possible).
 
     Required because ``IamService.resolve_schema`` is intentionally lenient:
     on an unknown catalog it logs a warning and falls back to the global
@@ -218,10 +221,17 @@ async def _assert_catalog_exists(catalog_id: str) -> None:
     if catalogs is None:
         # No catalogs service → can't validate; let resolve_schema's
         # fallback path run. This matches IamService's own posture.
-        return
-    model = await catalogs.get_catalog_model(catalog_id)
+        return None
+    # Phase 2: resolve external catalog_id → internal before calling the
+    # internal get_catalog_model (which queries by internal id).  A missing
+    # external_id is surfaced as 404, matching the pre-Phase-2 behaviour.
+    internal_id = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+    if internal_id is None:
+        raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+    model = await catalogs.get_catalog_model(internal_id)
     if model is None:
         raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+    return internal_id
 
 
 async def _assert_collection_exists(catalog_id: str, collection_id: str) -> None:
@@ -240,6 +250,40 @@ async def _assert_collection_exists(catalog_id: str, collection_id: str) -> None
             status_code=404,
             detail=f"Collection '{collection_id}' not found in catalog '{catalog_id}'.",
         )
+
+
+async def _resolve_collection_internal_id(
+    catalog_internal_id: Optional[str],
+    collection_external_id: str,
+) -> str:
+    """Resolve a collection ``external_id`` to its immutable internal id.
+
+    Returns ``collection_external_id`` unchanged when the ``CatalogsProtocol``
+    is unavailable or the collection is not found — the caller already verified
+    the collection exists via ``_assert_collection_exists``, so a non-resolution
+    here means the protocol is absent (test / slim deploy).
+
+    Used by collection-scoped grant write/read paths so ``grants.resource_ref``
+    is keyed on the rename-stable internal id rather than the public external_id.
+    """
+    if not catalog_internal_id:
+        return collection_external_id
+    catalogs = get_protocol(CatalogsProtocol)
+    if catalogs is None:
+        return collection_external_id
+    try:
+        internal = await catalogs.collections.resolve_collection_id(
+            catalog_internal_id, collection_external_id, allow_missing=True
+        )
+        return internal if internal is not None else collection_external_id
+    except Exception:
+        logger.warning(
+            "admin: could not resolve collection external_id %r in catalog %r; "
+            "using value as-is (collection-scoped grant resource_ref may be stale).",
+            collection_external_id,
+            catalog_internal_id,
+        )
+        return collection_external_id
 
 
 from dynastore.modules.tasks.registry import repository as _registry_repo  # noqa: E402
@@ -584,12 +628,14 @@ class AdminService(ExtensionProtocol):
         )
         out = []
         for c in items:
-            title_raw = c.model_dump(mode="json").get("title")
+            dump = c.model_dump(mode="json")
+            title_raw = dump.get("title")
             if isinstance(title_raw, dict):
                 title = title_raw.get(lang) or next(iter(title_raw.values()), None)
             else:
                 title = title_raw
-            out.append({"id": c.id, "title": title or c.id})
+            public_id = dump.get("id") or c.id
+            out.append({"id": public_id, "title": title or public_id})
         return out
 
     # -------------------------------------------------------------------------
@@ -1372,8 +1418,14 @@ class AdminService(ExtensionProtocol):
                 request, body.object_ref,
                 protected_roles=IamRolesConfig().platform_admin_tier_role_set,
             )
-        await _assert_catalog_exists(catalog_id)
+        catalog_internal_id = await _assert_catalog_exists(catalog_id)
         await _assert_collection_exists(catalog_id, collection_id)
+        # Resolve collection external_id → internal id so the stored
+        # resource_ref is rename-stable.  Uses the already-validated internal
+        # catalog id returned by _assert_catalog_exists.
+        collection_ref = await _resolve_collection_internal_id(
+            catalog_internal_id, collection_id
+        )
         p = await mgr.get_principal(body.principal_id)
         if not p:
             raise HTTPException(status_code=404, detail="Principal not found.")
@@ -1417,7 +1469,7 @@ class AdminService(ExtensionProtocol):
                 quota=body.quota,
                 granted_by=granted_by,
                 resource_kind="collection",
-                resource_ref=collection_id,
+                resource_ref=collection_ref,
                 attribute_predicates=body.attribute_predicates,
             )
         except Exception as e:
@@ -1429,7 +1481,7 @@ class AdminService(ExtensionProtocol):
             "object_ref": body.object_ref,
             "effect": body.effect,
             "resource_kind": "collection",
-            "resource_ref": collection_id,
+            "resource_ref": collection_ref,
             "attribute_predicates": body.attribute_predicates,
         }
 
@@ -1446,8 +1498,11 @@ class AdminService(ExtensionProtocol):
         ),
     ):
         mgr = _iam()
-        await _assert_catalog_exists(catalog_id)
+        catalog_internal_id = await _assert_catalog_exists(catalog_id)
         await _assert_collection_exists(catalog_id, collection_id)
+        collection_ref = await _resolve_collection_internal_id(
+            catalog_internal_id, collection_id
+        )
         schema = await mgr.resolve_schema(catalog_id)
         if principal_id is not None:
             rows = await mgr.storage.list_grants_for_subject(
@@ -1457,17 +1512,18 @@ class AdminService(ExtensionProtocol):
             )
             # A binding applies to this collection if it is scoped here or is
             # catalog-wide (resource_kind NULL) — mirrors the resolver's
-            # additive scope semantics.
+            # additive scope semantics.  Compare against the internal id so
+            # rows written after the rename are found correctly.
             return [
                 r for r in rows
-                if r.get("resource_ref") == collection_id
+                if r.get("resource_ref") == collection_ref
                 or r.get("resource_kind") is None
             ]
         # Reverse view: every principal bound on this specific collection.
         return await mgr.storage.list_grants_for_resource(
             scope_schema=schema,
             resource_kind="collection",
-            resource_ref=collection_id,
+            resource_ref=collection_ref,
         )
 
     @router.delete(
@@ -1490,8 +1546,11 @@ class AdminService(ExtensionProtocol):
                 request, object_ref,
                 protected_roles=IamRolesConfig().platform_admin_tier_role_set,
             )
-        await _assert_catalog_exists(catalog_id)
+        catalog_internal_id = await _assert_catalog_exists(catalog_id)
         await _assert_collection_exists(catalog_id, collection_id)
+        collection_ref = await _resolve_collection_internal_id(
+            catalog_internal_id, collection_id
+        )
         try:
             await mgr.storage.revoke_by_match(
                 scope_schema=await mgr.resolve_schema(catalog_id),
@@ -1501,7 +1560,7 @@ class AdminService(ExtensionProtocol):
                 object_ref=object_ref,
                 effect=effect,
                 resource_kind="collection",
-                resource_ref=collection_id,
+                resource_ref=collection_ref,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e

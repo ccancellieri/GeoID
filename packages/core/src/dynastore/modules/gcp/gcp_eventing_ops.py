@@ -147,24 +147,28 @@ class GcpEventingOpsMixin:
         self, catalog_id: str, context: Optional[LifecycleContext] = None
     ) -> Tuple[str, GcpEventingConfig]: ...
 
-    def generate_default_topic_id(self, physical_id: str) -> str:
+    def generate_default_topic_id(self, catalog_id: str) -> str:
         """Generates the deterministic default Pub/Sub topic ID for a catalog.
 
-        ``physical_id`` must be the immutable physical identifier resolved via
-        ``CatalogsProtocol.resolve_physical_id``, not the mutable logical
-        catalog id.  This ensures the topic name remains stable across renames.
-        """
-        return f"ds-{physical_id}-events"
+        ``catalog_id`` is the immutable internal catalog identifier (shape
+        ``c_<suffix>``).  Topics are therefore named ``ds-c_<suffix>-events``.
 
-    def generate_default_subscription_id(self, physical_id: str) -> str:
+        Upgrade note: before the catalog id-model redesign, callers passed the
+        PostgreSQL schema name (shape ``s_<suffix>``) instead, producing topics
+        named ``ds-s_<suffix>-events``.  A non-clean-break upgrade must locate
+        and delete those legacy ``ds-s_*`` topics during catalog hard-delete, as
+        teardown will compute the new ``ds-c_*`` name and will not find them.
+        """
+        return f"ds-{catalog_id}-events"
+
+    def generate_default_subscription_id(self, catalog_id: str) -> str:
         """Generates the deterministic default Pub/Sub subscription ID for a catalog.
 
-        ``physical_id`` must be the immutable physical identifier resolved via
-        ``CatalogsProtocol.resolve_physical_id``, not the mutable logical
-        catalog id.  This ensures the subscription name remains stable across
-        renames.
+        ``catalog_id`` is the immutable internal catalog identifier (shape
+        ``c_<suffix>``).  See ``generate_default_topic_id`` for the upgrade note
+        regarding legacy ``s_<suffix>``-derived names.
         """
-        return f"ds-{physical_id}-default-sub"
+        return f"ds-{catalog_id}-default-sub"
 
     async def apply_eventing_config(
         self, catalog_id: str, config: GcpEventingConfig, conn=None
@@ -236,33 +240,15 @@ class GcpEventingOpsMixin:
             raise RuntimeError(
                 "Cannot setup managed eventing: GCP Project ID is not available."
             )
-
-        # Resolve the immutable physical_id for this catalog once, then use it
-        # for all deterministic resource names in this method.
-        from dynastore.tools.discovery import get_protocol as _get_protocol
-        from dynastore.models.protocols import CatalogsProtocol as _CatalogsProtocol
-        from dynastore.models.driver_context import DriverContext as _DriverContext
-        _catalog_physical_id: Optional[str] = (
-            context.physical_schema if context else None
-        )
-        if not _catalog_physical_id:
-            _catalogs_eventing = _get_protocol(_CatalogsProtocol)
-            if _catalogs_eventing:
-                _ctx_eventing = _DriverContext(db_resource=conn) if conn else None
-                _catalog_physical_id = await _catalogs_eventing.resolve_physical_id(
-                    catalog_id, ctx=_ctx_eventing, allow_missing=True
-                )
-        _catalog_physical_id = _catalog_physical_id or catalog_id
-
         # If managed_config.subscription is None, initialize it with a default ID.
         if managed_config.subscription is None:
             managed_config.subscription = PushSubscriptionConfig(
-                subscription_id=self.generate_default_subscription_id(_catalog_physical_id)
+                subscription_id=self.generate_default_subscription_id(catalog_id)
             )
 
         # 1. Create the managed topic idempotently.
         publisher_client = self.get_publisher_client()
-        topic_id = managed_config.topic_id or self.generate_default_topic_id(_catalog_physical_id)
+        topic_id = managed_config.topic_id or self.generate_default_topic_id(catalog_id)
         topic_path = publisher_client.topic_path(project_id, topic_id)
 
         # Retry on transient concurrency conflicts (Pub/Sub 409 "raced with
@@ -952,62 +938,28 @@ class GcpEventingOpsMixin:
         return await self.setup_catalog_gcp_resources(catalog_id)
 
     async def teardown_catalog_eventing(
-        self,
-        catalog_id: str,
-        config: Optional[Any] = None,
-        physical_id: Optional[str] = None,
+        self, catalog_id: str, config: Optional[Any] = None
     ) -> None:
-        """EventingProtocol: Tears down GCP eventing for a catalog.
-
-        ``physical_id`` must be supplied by callers that run during hard
-        deletion: the deterministic topic/subscription names are derived from
-        the immutable physical id, and by teardown time the catalog row is
-        usually already gone, so it can no longer be resolved.  Callers capture
-        it from the lifecycle context (``physical_schema``) before the row is
-        dropped and pass it here.
-        """
+        """EventingProtocol: Tears down GCP eventing for a catalog."""
         if config and hasattr(config, "managed_eventing") and config.managed_eventing:
             await self.teardown_managed_eventing_channel(
                 catalog_id, config.managed_eventing
             )
 
         if config is None:
-            # Force cleanup of deterministic default resources (topics/subscriptions).
-            # This path is used during hard deletion where the catalog row and its
-            # config may already be gone.
+            # Force cleanup of deterministic default resources (topics/subscriptions)
+            # This is useful during hard deletion where config might be already missing.
             project_id = self.get_project_id()
             if not project_id:
                 return
 
-            _teardown_physical_id: Optional[str] = physical_id
-            if _teardown_physical_id is None:
-                # Legacy callers without a captured physical id: best-effort
-                # resolve while the row may still exist.
-                from dynastore.tools.discovery import get_protocol as _get_protocol_td
-                from dynastore.models.protocols import (
-                    CatalogsProtocol as _CatalogsProtocol_td,
-                )
-                _catalogs_td = _get_protocol_td(_CatalogsProtocol_td)
-                if _catalogs_td:
-                    try:
-                        _teardown_physical_id = await _catalogs_td.resolve_physical_id(
-                            catalog_id, allow_missing=True
-                        )
-                    except Exception:
-                        pass
-            if not _teardown_physical_id:
-                # The physical id is the only safe key for the deterministic
-                # names; guessing from the logical id would delete the wrong
-                # (non-existent) resource and orphan the real one.
-                logger.warning(
-                    "teardown_catalog_eventing: no physical_id for catalog '%s'; "
-                    "skipping deterministic topic/subscription cleanup",
-                    catalog_id,
-                )
-                return
-
-            # Default Topic (deleting topic deletes its subscriptions)
-            topic_id = self.generate_default_topic_id(_teardown_physical_id)
+            # Default Topic (deleting topic deletes its subscriptions).
+            # topic_id is derived from the internal catalog_id (ds-c_<suffix>-events).
+            # Catalogs provisioned before the id-model redesign used a schema-derived
+            # name (ds-s_<suffix>-events).  A non-clean-break upgrade must also attempt
+            # deletion of that legacy name here; this deploy is clean-break so it is
+            # not needed.
+            topic_id = self.generate_default_topic_id(catalog_id)
             topic_path = self.get_publisher_client().topic_path(project_id, topic_id)
             try:
                 await run_in_thread(
@@ -1028,7 +980,7 @@ class GcpEventingOpsMixin:
                 )
 
             # Default Subscription (if it exists separately, though deleting topic should handle it)
-            sub_id = self.generate_default_subscription_id(_teardown_physical_id)
+            sub_id = self.generate_default_subscription_id(catalog_id)
             sub_path = self.get_subscriber_client().subscription_path(
                 project_id, sub_id
             )

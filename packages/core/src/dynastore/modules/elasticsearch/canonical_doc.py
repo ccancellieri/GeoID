@@ -107,11 +107,10 @@ def build_canonical_envelope(
     contract; what fills them is the caller's (per-level) concern:
 
     * **flat identity** — ``identity`` keys sit at the document top level
-      (``id``, ``catalog_id``, ``collection_id``, ``external_id``,
-      ``asset_physical_id``, ``validity`` …). ``id`` is whatever stable
-      identifier the level uses (``geoid`` for items, ``collection_id`` for
-      collections, ``catalog_id`` for catalogs).  The mutable logical
-      ``asset_id`` is NOT stored here — only the immutable physical UUID.
+      (``id``, ``catalog_id``, ``collection_id``, ``external_id``, ``asset_id``,
+      ``validity`` …). ``id`` is whatever
+      stable identifier the level uses (``geoid`` for items, ``collection_id``
+      for collections, ``catalog_id`` for catalogs).
     * **reserved members** — protocol-structural keys surfaced verbatim by the
       read-time projector (``collection``/``geometry``/``bbox`` for items;
       ``extent``/``summaries``/``providers``/``links``/``assets``/
@@ -174,7 +173,7 @@ def build_canonical_index_doc(
 
     Sections:
       - flat identity: id(=geoid), catalog_id, collection_id, external_id,
-        asset_physical_id (immutable), validity
+        asset_id, validity
       - geometry, bbox
       - properties: user attrs, typed-known kept flat, unknown moved to
         properties.extras (via project_item_for_es — same reshape as the
@@ -183,8 +182,8 @@ def build_canonical_index_doc(
         SYSTEM_FIELD_KEYS (system wins the overlap)
       - system: the lifecycle SYSTEM_FIELD_KEYS that are NOT identity axes
         (content hashes / validity / timestamps belong here). The identity
-        axes (geoid / external_id / asset_physical_id) live flat at the
-        root, never duplicated into ``system`` (#1285 identity convergence).
+        axes (geoid / external_id / asset_id) live flat at the root, never
+        duplicated into ``system`` (#1285 identity convergence).
       - access: pass-through when non-empty
 
     ``id`` is ALWAYS ``row["geoid"]``, regardless of any policy.
@@ -227,17 +226,7 @@ def build_canonical_index_doc(
         identity["external_id"] = str(external_id)
 
     if row.get("asset_id") is not None:
-        # Stamp only the immutable join key under ``asset_physical_id``.
-        # The logical asset_id (mutable, renamed freely) is intentionally
-        # NOT written to ``_source``: visibility filters and the virtual-asset
-        # view key on asset_physical_id so asset renames require no ES reindex.
-        # ``row["asset_physical_id"]`` is the canonical key (column-renamed
-        # from ``physical_id`` in #2296).  ``row["physical_id"]`` is kept as a
-        # backward-compat fallback for callers that pre-date the rename;
-        # otherwise ``row["asset_id"]`` holds the physical UUID because the PG
-        # attributes sidecar already resolved and stored it there at write time.
-        _raw_phys = row.get("asset_physical_id") or row.get("physical_id") or row["asset_id"]
-        identity["asset_physical_id"] = str(_raw_phys)
+        identity["asset_id"] = str(row["asset_id"])
 
     # validity is a PG tstzrange (Range-like object) — convert it once to the ES
     # date_range shape ({gte|gt, lte|lt}) so it is JSON-serializable and lands in
@@ -248,11 +237,11 @@ def build_canonical_index_doc(
         identity["validity"] = validity_range
 
     # system: the lifecycle SYSTEM_FIELD_KEYS that are NOT identity axes
-    # (content hashes / validity / timestamps live here). The identity axes
-    # (geoid / external_id / asset_physical_id) live flat at the document root —
+    # (content hashes / validity / timestamps live here). The three identity
+    # axes (geoid / external_id / asset_id) live flat at the document root —
     # ``classify_container`` routes them to "identity", and the strict ``system``
-    # mapping never declared them, so the old ``system.{external_id,geoid}``
-    # copies were unindexed ``_source`` duplicates. Building from
+    # mapping never declared them, so the old ``system.{external_id,asset_id,
+    # geoid}`` copies were unindexed ``_source`` duplicates. Building from
     # ``_SYSTEM_ONLY_FIELD_NAMES`` keeps ``_source`` aligned with the mapping
     # and the classifier (#1285 identity convergence). The expose_all read
     # rebuilds the wire ``system`` section from the PG row, not from this

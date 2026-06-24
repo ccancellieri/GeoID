@@ -156,7 +156,7 @@ FOR UPDATE SKIP LOCKED
 # Returns (catalog_id, collection_id) pairs for collections whose deleted_at
 # has aged past the grace interval and have no in-flight cascade task.
 _OVERDUE_COLLECTIONS_SQL = """
-SELECT cat.id AS catalog_id, col.id AS collection_id, cat.physical_schema
+SELECT cat.id AS catalog_id, col.id AS collection_id
 FROM catalog.catalogs cat
 JOIN LATERAL (
     SELECT id
@@ -303,27 +303,27 @@ class SoftDeleteReaper(PeriodicService):
             )
             return
 
-        for catalog_id, physical_schema in catalog_ids:
+        for catalog_id in catalog_ids:
             await self._reap_collections_in_schema(
-                catalog_id, physical_schema, grace_seconds, limit, catalogs_svc
+                catalog_id, catalog_id, grace_seconds, limit, catalogs_svc
             )
 
     async def _list_active_catalog_ids(
         self, engine: "DbResource"
-    ) -> list[tuple[str, str]]:
-        """Return (catalog_id, physical_schema) for all non-deleted catalogs."""
+    ) -> list[str]:
+        """Return catalog ids (= schema names) for all non-deleted catalogs."""
         async with managed_transaction(engine) as conn:
             rows = await DQLQuery(
-                "SELECT id, physical_schema FROM catalog.catalogs "
+                "SELECT id FROM catalog.catalogs "
                 "WHERE deleted_at IS NULL ORDER BY id",
                 result_handler=ResultHandler.ALL,
             ).execute(conn)
-        return [(r[0], r[1]) for r in rows] if rows else []
+        return [r[0] for r in rows] if rows else []
 
     async def _reap_collections_in_schema(
         self,
         catalog_id: str,
-        physical_schema: str,
+        schema: str,
         grace_seconds: int,
         limit: int,
         catalogs_svc: Any,
@@ -336,7 +336,7 @@ class SoftDeleteReaper(PeriodicService):
         # The LATERAL join query uses a literal schema name; build it safely.
         query_sql = (
             "SELECT col.id AS collection_id "
-            f'FROM "{physical_schema}".collections col '
+            f'FROM "{schema}".collections col '
             "WHERE col.deleted_at IS NOT NULL "
             "  AND col.deleted_at + (:grace_seconds || ' seconds')::INTERVAL < NOW() "
             "  AND NOT EXISTS ( "
@@ -368,7 +368,7 @@ class SoftDeleteReaper(PeriodicService):
             logger.exception(
                 "soft_delete_reaper: failed to query collections in "
                 "schema %r (catalog %r).",
-                physical_schema, catalog_id,
+                schema, catalog_id,
             )
             return
 

@@ -242,7 +242,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
         return {
             "catalogs": [
-                {"id": c.id, "title": getattr(c, "title", None)}
+                {"id": getattr(c, "external_id", None) or c.id, "title": getattr(c, "title", None)}
                 for c in (catalogs or [])
             ]
         }

@@ -40,7 +40,7 @@ def build_edr_collection(
     objects; any other value collapses to a single string, falling back to
     ``"en"`` if the requested language is absent.
     """
-    collection_id = getattr(collection, "id", None) or ""
+    collection_id = getattr(collection, "external_id", None) or getattr(collection, "id", None) or ""
     raw_title = getattr(collection, "title", None)
     title = resolve_localized(raw_title, language) or collection_id
     raw_description = getattr(collection, "description", None)

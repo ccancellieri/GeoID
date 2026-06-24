@@ -280,16 +280,23 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
             # list_catalogs may return Catalog models or dicts depending on
             # the protocol implementation — handle both.
             catalog_id = (
+                getattr(catalog, "external_id", None)
+                or getattr(catalog, "id", None)
+                or (catalog.get("id", "") if isinstance(catalog, dict) else "")
+            )
+            # Use internal id for routing (list_collections expects it)
+            _catalog_internal_id = (
                 getattr(catalog, "id", None)
                 or (catalog.get("id", "") if isinstance(catalog, dict) else "")
             )
             try:
-                collections = await catalogs_svc.list_collections(catalog_id)
+                collections = await catalogs_svc.list_collections(_catalog_internal_id)
             except Exception:
                 continue
             for col in collections or []:
                 col_id = (
-                    getattr(col, "id", None)
+                    getattr(col, "external_id", None)
+                    or getattr(col, "id", None)
                     or (col.get("id", "") if isinstance(col, dict) else "")
                 )
                 result.append(

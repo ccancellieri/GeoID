@@ -111,11 +111,11 @@ def test_events_scope_lowercase_check():
     assert "CHECK (scope = lower(scope))" in sql
 
 
-def test_events_fairness_index_leads_schema_name():
-    """Fairness partial index must lead with schema_name and be WHERE status='PENDING'."""
+def test_events_fairness_index_leads_catalog_id():
+    """Fairness partial index must lead with catalog_id and be WHERE status='PENDING'."""
     sql = _render(EVENTS_INDEXES_DDL)
-    # The index columns must start with schema_name
-    assert "(schema_name, created_at)" in sql
+    # The index columns must start with catalog_id (the tenant-routing key)
+    assert "(catalog_id, created_at)" in sql
     assert "WHERE status = 'PENDING'" in sql
 
 
@@ -737,7 +737,7 @@ async def test_live_pg_events_table_structure(workclass_async_conn):
         col_names = {r["column_name"] for r in cols}
 
         expected = {
-            "event_id", "day", "shard", "schema_name", "scope", "status",
+            "event_id", "day", "shard", "catalog_id", "scope", "status",
             "payload", "claim_version", "owner_id", "locked_until",
             "retry_count", "max_retries", "created_at", "processed_at",
         }

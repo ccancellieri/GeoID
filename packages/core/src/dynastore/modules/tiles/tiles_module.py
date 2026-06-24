@@ -348,39 +348,10 @@ class TilePGPreseedStorage(TileStorageProtocol):
 
     async def _ensure_storage(self, conn, schema: str):
         """Ensures the catalog-specific preseed table exists."""
+        # This function should be idempotent and fast.
+        # We rely on 'CREATE TABLE IF NOT EXISTS'.
+        # Using a proper creation function that handles schema existence.
         await ensure_preseed_storage_exists(conn, schema)
-
-    async def _resolve_collection_physical_id(
-        self, catalog_id: str, collection_id: str
-    ) -> str:
-        """Return the physical id for keying tile rows.
-
-        The ``collection_id`` parameter received by tile methods may be a bare
-        logical id (``"my_coll"``), a parameterized effective_cache_id
-        (``"my_coll@hash"``), or a multi-collection composite
-        (``"col_a,col_b"``).
-
-        * Bare ids — resolved to the collection's immutable physical id so a
-          rename never invalidates the PK lookup.  Resolution goes through
-          ``resolve_physical_id`` (no ``db_resource``), which serves from the
-          shared ``_collection_physical_id_cache`` L1/L2 accelerator, so repeated
-          save/get/delete calls pay the DB round-trip at most once per TTL
-          window (300 s); rename/delete bust the entry via
-          ``_invalidate_collection_lifecycle_caches``.
-        * Parameterized / composite ids — already content-addressed; returned
-          unchanged so the uniqueness constraint is preserved.
-        """
-        # Parameterized or multi-collection effective_cache_ids are already
-        # content-addressed — no rename can affect them, so use as-is.
-        if "@" in collection_id or "," in collection_id:
-            return collection_id
-        try:
-            phys_id = await self.catalogs.resolve_physical_id(
-                catalog_id, collection_id, allow_missing=True
-            )
-        except Exception:
-            phys_id = None
-        return phys_id or collection_id
 
     async def save_tile(
         self,
@@ -404,29 +375,21 @@ class TilePGPreseedStorage(TileStorageProtocol):
             )
             return None
 
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         async with managed_transaction(self.engine) as conn:
             schema = await self._get_schema(catalog_id)
             await self._ensure_storage(conn, schema)
 
+            # Dynamic table name: "{catalog_id}".preseeded_tiles
             query_str = f"""
-                INSERT INTO "{schema}".preseeded_tiles
-                    (collection_physical_id, collection_id, tms_id, z, x, y, format, data)
-                VALUES
-                    (:collection_physical_id, :collection_id, :tms_id, :z, :x, :y, :format, :data)
-                ON CONFLICT (collection_physical_id, tms_id, z, x, y, format)
-                DO UPDATE SET
-                    data = EXCLUDED.data,
-                    collection_id = EXCLUDED.collection_id,
-                    created_at = NOW()
+                INSERT INTO "{schema}".preseeded_tiles (collection_id, tms_id, z, x, y, format, data) 
+                VALUES (:collection_id, :tms_id, :z, :x, :y, :format, :data) 
+                ON CONFLICT (collection_id, tms_id, z, x, y, format) 
+                DO UPDATE SET data = EXCLUDED.data, created_at = NOW() 
                 RETURNING created_at;
             """
 
             await DQLQuery(query_str, result_handler=ResultHandler.ROWCOUNT).execute(
                 conn,
-                collection_physical_id=collection_physical_id,
                 collection_id=collection_id,
                 tms_id=tms_id,
                 z=z,
@@ -453,14 +416,14 @@ class TilePGPreseedStorage(TileStorageProtocol):
         if not cfg.cache_enabled:
             return None
 
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
+        # We assume storage exists if we are reading. If table missing -> error or None?
+        # Better to return None implies "not found". SQL error means "system error".
+        # But for "table not found", it effectively means no tiles.
+
         schema = await self._get_schema(catalog_id)
         query_str = f"""
-            SELECT data FROM "{schema}".preseeded_tiles
-            WHERE collection_physical_id=:collection_physical_id
-              AND tms_id=:tms_id AND z=:z AND x=:x AND y=:y AND format=:format;
+            SELECT data FROM "{schema}".preseeded_tiles 
+            WHERE collection_id=:collection_id AND tms_id=:tms_id AND z=:z AND x=:x AND y=:y AND format=:format;
         """
 
         try:
@@ -469,7 +432,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
                     query_str, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
                 ).execute(
                     conn,
-                    collection_physical_id=collection_physical_id,
+                    collection_id=collection_id,
                     tms_id=tms_id,
                     z=z,
                     x=x,
@@ -477,6 +440,12 @@ class TilePGPreseedStorage(TileStorageProtocol):
                     format=format,
                 )
         except Exception as e:
+            # If table doesn't exist, we can treat as miss
+            # But we must be careful not to mask other errors.
+            # Checking error code for "undefined table" (42P01) is robust.
+            # For now, let's log and re-raise or return None?
+            # Re-raising is safer for now to detect issues.
+            # But if a catalog has no preseed table, it's just a miss.
             if "UndefinedTableError" in str(type(e).__name__) or "42P01" in str(e):
                 return None
             raise e
@@ -487,24 +456,17 @@ class TilePGPreseedStorage(TileStorageProtocol):
         """
         Returns stats about pre-seeded tiles.
         """
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
         query_str = f"""
-            SELECT count(*) as tile_count, sum(octet_length(data)) as total_size
-            FROM "{schema}".preseeded_tiles
-            WHERE collection_physical_id=:collection_physical_id AND tms_id=:tms_id;
+            SELECT count(*) as tile_count, sum(octet_length(data)) as total_size 
+            FROM "{schema}".preseeded_tiles 
+            WHERE collection_id=:collection_id AND tms_id=:tms_id;
         """
         try:
             async with managed_transaction(self.engine) as conn:
                 result = await DQLQuery(
                     query_str, result_handler=ResultHandler.ONE_DICT
-                ).execute(
-                    conn,
-                    collection_physical_id=collection_physical_id,
-                    tms_id=tms_id,
-                )
+                ).execute(conn, collection_id=collection_id, tms_id=tms_id)
                 return {
                     "tile_count": result.get("tile_count", 0),
                     "total_size_bytes": result.get("total_size", 0),
@@ -532,15 +494,11 @@ class TilePGPreseedStorage(TileStorageProtocol):
         if not cfg.cache_enabled:
             return False
 
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
         query_str = f"""
             SELECT EXISTS (
-                SELECT 1 FROM "{schema}".preseeded_tiles
-                WHERE collection_physical_id=:collection_physical_id
-                  AND tms_id=:tms_id AND z=:z AND x=:x AND y=:y AND format=:format
+                SELECT 1 FROM "{schema}".preseeded_tiles 
+                WHERE collection_id=:collection_id AND tms_id=:tms_id AND z=:z AND x=:x AND y=:y AND format=:format
             );
         """
         try:
@@ -549,7 +507,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
                     query_str, result_handler=ResultHandler.SCALAR_ONE
                 ).execute(
                     conn,
-                    collection_physical_id=collection_physical_id,
+                    collection_id=collection_id,
                     tms_id=tms_id,
                     z=z,
                     x=x,
@@ -578,34 +536,26 @@ class TilePGPreseedStorage(TileStorageProtocol):
         self, catalog_id: str, collection_id: str
     ) -> int:
         """Deletes all tiles associated with a collection from the PG storage."""
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
         query_str = f"""
             DELETE FROM "{schema}".preseeded_tiles
-            WHERE collection_physical_id = :collection_physical_id;
+            WHERE collection_id = :collection_id;
         """
         try:
             async with managed_transaction(self.engine) as conn:
+                # We use ROWCOUNT to get the number of deleted rows.
                 deleted_count = await DQLQuery(
                     query_str, result_handler=ResultHandler.ROWCOUNT
-                ).execute(conn, collection_physical_id=collection_physical_id)
+                ).execute(conn, collection_id=collection_id)
                 return deleted_count or 0
         except Exception as e:
             if "UndefinedTableError" in str(type(e).__name__) or "42P01" in str(e):
                 logger.info(
-                    "Preseed table for catalog '%s' not found. "
-                    "No tiles to delete for collection '%s'.",
-                    catalog_id,
-                    collection_id,
+                    f"Preseed table for catalog '{catalog_id}' not found. No tiles to delete for collection '{collection_id}'."
                 )
-                return 0
+                return 0  # Table doesn't exist, so 0 tiles deleted.
             logger.error(
-                "Error deleting tiles for collection '%s' in catalog '%s': %s",
-                collection_id,
-                catalog_id,
-                e,
+                f"Error deleting tiles for collection '{collection_id}' in catalog '{catalog_id}': {e}",
                 exc_info=True,
             )
             raise e
@@ -621,13 +571,10 @@ class TilePGPreseedStorage(TileStorageProtocol):
         format: str,
     ) -> bool:
         """Delete a single cached tile row (idempotent mark-stale)."""
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
         query_str = f"""
             DELETE FROM "{schema}".preseeded_tiles
-            WHERE collection_physical_id=:collection_physical_id AND tms_id=:tms_id
+            WHERE collection_id=:collection_id AND tms_id=:tms_id
               AND z=:z AND x=:x AND y=:y AND format=:format;
         """
         try:
@@ -636,7 +583,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
                     query_str, result_handler=ResultHandler.ROWCOUNT
                 ).execute(
                     conn,
-                    collection_physical_id=collection_physical_id,
+                    collection_id=collection_id,
                     tms_id=tms_id,
                     z=z,
                     x=x,
@@ -678,36 +625,29 @@ class TilePGPreseedStorage(TileStorageProtocol):
     ) -> bool:
         """Delete every cached variant of one coordinate (#1292).
 
-        After the physical-id re-key the table is keyed on
-        ``collection_physical_id``.  Bare single-collection tiles use the
-        resolved physical id as their ``collection_physical_id``.  Parameterized
-        (``coll@hash``) and multi-collection (``col_a,col_b``) tiles store the
-        effective_cache_id itself in ``collection_physical_id`` (already
-        content-addressed).
-
-        The DELETE matches by the physical id for the bare-collection rows AND
-        by the LIKE patterns on ``collection_id`` (the stored effective_cache_id)
-        for parameterized / multi-collection rows — covering all variants in a
-        single statement.
+        Matches the bare ``collection_id``, every ``{collection_id}@%``
+        parameterized cache-id, AND multi-collection comma-joined cache-ids in
+        which this collection appears (with or without an ``@hash`` suffix),
+        across all served ``formats`` — in a single DELETE so suffixed and
+        multi-collection tiles can't survive an edit. Idempotent.
         """
         if not formats:
             return True
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
         # ``collection_id`` (the stored ``effective_cache_id``) may be:
-        #   exact            collection_id         → collection_physical_id = physical id
-        #   parameterized    collection_id@<hash>  → collection_physical_id = "coll@hash"
-        #   multi-collection a,collection_id,b     → collection_physical_id = "a,coll,b"
-        # Match bare single-collection tiles via collection_physical_id equality;
-        # parameterized/multi-collection tiles via LIKE on collection_id.
+        #   exact            collection_id
+        #   parameterized    collection_id@<hash>
+        #   multi-collection a,collection_id,b  (optionally @<hash>)
+        # The ``@`` patterns also cover the ``@hash`` suffix on multi-collection
+        # keys because ``%`` after the collection id absorbs both ``,...`` and
+        # ``@hash``. LIKE wildcards in the literal cache id are not a concern:
+        # cache ids are server-generated from collection ids + a hex hash.
         query_str = f"""
             DELETE FROM "{schema}".preseeded_tiles
             WHERE tms_id=:tms_id AND z=:z AND x=:x AND y=:y
               AND format = ANY(:formats)
               AND (
-                    collection_physical_id = :cid
+                    collection_id = :cid
                  OR collection_id LIKE :p_param
                  OR collection_id LIKE :p_head
                  OR collection_id LIKE :p_tail
@@ -726,7 +666,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
                     x=x,
                     y=y,
                     formats=list(formats),
-                    cid=collection_physical_id,
+                    cid=collection_id,
                     p_param=f"{collection_id}@%",       # collection_id@hash
                     p_head=f"{collection_id},%",        # collection_id,b[,...][@hash]
                     p_tail=f"%,{collection_id}",        # a,collection_id (last, no hash)
@@ -816,48 +756,36 @@ _insert_srid_query = DQLQuery(
 async def ensure_preseed_storage_exists(conn: DbResource, schema: str):
     """
     Ensures that the catalog-specific preseeded_tiles table exists.
-
-    Partition / PK key
-    ~~~~~~~~~~~~~~~~~~
-    The table is keyed on ``collection_physical_id`` — the immutable physical id
-    (``c_…`` token) of the owning collection.  This decouples the PK from the
-    mutable logical ``collection_id`` so a collection rename touches zero tile
-    rows.
-
-    ``collection_id`` stores the ``effective_cache_id`` (which may be a bare
-    collection id, a parameterized variant like ``coll@hash``, or a
-    comma-joined multi-collection key) and is kept as a plain data column for
-    cache-key matching.  It does NOT appear in the PK or any index.
-
-    For parameterized or multi-collection effective_cache_ids the caller
-    populates ``collection_physical_id`` with the effective_cache_id itself
-    (already content-addressed), preserving uniqueness.
     """
+    # Create schema if not exists (should already exist for a catalog, but good for safety)
     from dynastore.modules.db_config import maintenance_tools
 
     await maintenance_tools.ensure_schema_exists(conn, schema)
 
+    # Simplified table definition for catalog-specific storage
+    # We remove 'schema' from columns as it is implicit in the schema.
+    # We remove 'PARTITION BY' as each catalog has its own independent table.
     ddl = f"""
     CREATE TABLE IF NOT EXISTS "{schema}".preseeded_tiles (
-        collection_physical_id VARCHAR NOT NULL,
-        collection_id          VARCHAR NOT NULL,
-        tms_id                 VARCHAR NOT NULL,
-        z                      INTEGER NOT NULL,
-        x                      INTEGER NOT NULL,
-        y                      INTEGER NOT NULL,
-        format                 VARCHAR NOT NULL,
-        data                   BYTEA   NOT NULL,
-        created_at             TIMESTAMPTZ DEFAULT NOW(),
-        PRIMARY KEY (collection_physical_id, tms_id, z, x, y, format)
+        collection_id VARCHAR NOT NULL,
+        tms_id VARCHAR NOT NULL,
+        z INTEGER NOT NULL,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        format VARCHAR NOT NULL,
+        data BYTEA NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (collection_id, tms_id, z, x, y, format)
     );
     """
     await DDLQuery(ddl).execute(conn)
 
-    # Index on (collection_physical_id, tms_id) supports deletion and stats
-    # queries that key on the physical id; the old (collection_id, tms_id)
-    # index is replaced because the PK already covers exact retrieval.
+    # Indexes for performance
+    # Usually PK covers it, but maybe we want index on just TMS/Z/X/Y for ranges?
+    # PK (collection_id, tms_id, z, x, y, format) is good for exact retrieval.
+    # An index on (collection_id, tms_id) might help for deletions or stats.
     index_ddl = f"""
-    CREATE INDEX IF NOT EXISTS idx_preseeded_tiles_tms ON "{schema}".preseeded_tiles (collection_physical_id, tms_id);
+    CREATE INDEX IF NOT EXISTS idx_preseeded_tiles_tms ON "{schema}".preseeded_tiles (collection_id, tms_id);
     """
     await DDLQuery(index_ddl).execute(conn)
 
@@ -1386,21 +1314,17 @@ class TileArchiveStorageProtocol(Protocol):
         ...
 
 
-# DDL for the PG fallback pmtiles_archives table (per-catalog schema).
-# Keyed on collection_physical_id — the immutable physical id of the owning
-# collection — so a collection rename never invalidates an existing archive
-# row.  collection_id is kept as a plain data column for presentation reads.
+# DDL for the PG fallback pmtiles_archives table (per-catalog schema)
 _PMTILES_ARCHIVE_DDL = """
 CREATE TABLE IF NOT EXISTS "{schema}".pmtiles_archives (
-    collection_physical_id VARCHAR NOT NULL,
-    collection_id          VARCHAR NOT NULL,
-    tms_id                 VARCHAR NOT NULL,
-    data                   BYTEA   NOT NULL,
-    n_tiles                INTEGER,
-    min_zoom               INTEGER,
-    max_zoom               INTEGER,
-    created_at             TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (collection_physical_id, tms_id)
+    collection_id VARCHAR NOT NULL,
+    tms_id        VARCHAR NOT NULL,
+    data          BYTEA   NOT NULL,
+    n_tiles       INTEGER,
+    min_zoom      INTEGER,
+    max_zoom      INTEGER,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (collection_id, tms_id)
 );
 """
 
@@ -1483,10 +1407,6 @@ class PGTileArchive(TileArchiveStorageProtocol):
     tile, via ``substring()`` over the (EXTERNAL-stored) BYTEA — so serving one
     tile never materialises the whole archive. This mirrors the range-read
     contract of the object-storage-backed ``StorageBackedTileArchive`` (#1206).
-
-    The ``pmtiles_archives`` table is keyed on ``collection_physical_id``
-    (the collection's immutable physical id) so a rename leaves all archive
-    rows untouched.  ``collection_id`` is kept as a plain data column.
     """
 
     def __init__(self):
@@ -1503,23 +1423,6 @@ class PGTileArchive(TileArchiveStorageProtocol):
         )
         return phys_schema or catalog_id
 
-    async def _resolve_collection_physical_id(
-        self, catalog_id: str, collection_id: str
-    ) -> str:
-        """Return the immutable physical id for keying archive rows."""
-        catalogs = get_protocol(CatalogsProtocol)
-        if not catalogs:
-            return collection_id
-        try:
-            phys_id = await catalogs.resolve_physical_id(
-                catalog_id,
-                collection_id,
-                allow_missing=True,
-            )
-            return phys_id or collection_id
-        except Exception:
-            return collection_id
-
     async def save_archive(
         self,
         catalog_id: str,
@@ -1528,28 +1431,18 @@ class PGTileArchive(TileArchiveStorageProtocol):
         data_file: BinaryIO,
     ) -> str:
         data = data_file.read()
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
         sql = f"""
             INSERT INTO "{schema}".pmtiles_archives
-                (collection_physical_id, collection_id, tms_id, data)
-            VALUES (:collection_physical_id, :collection_id, :tms_id, :data)
-            ON CONFLICT (collection_physical_id, tms_id)
-            DO UPDATE SET
-                data = EXCLUDED.data,
-                collection_id = EXCLUDED.collection_id,
-                created_at = NOW();
+                (collection_id, tms_id, data)
+            VALUES (:collection_id, :tms_id, :data)
+            ON CONFLICT (collection_id, tms_id)
+            DO UPDATE SET data = EXCLUDED.data, created_at = NOW();
         """
         async with managed_transaction(self.engine) as conn:
             await ensure_pmtiles_archive_storage_exists(conn, schema)
             await DDLQuery(sql).execute(
-                conn,
-                collection_physical_id=collection_physical_id,
-                collection_id=collection_id,
-                tms_id=tms_id,
-                data=data,
+                conn, collection_id=collection_id, tms_id=tms_id, data=data
             )
         return f"pg://{catalog_id}/{collection_id}/{tms_id}.pmtiles"
 
@@ -1557,22 +1450,17 @@ class PGTileArchive(TileArchiveStorageProtocol):
     async def archive_exists(
         self, catalog_id: str, collection_id: str, tms_id: str
     ) -> bool:
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
         sql = f"""
             SELECT EXISTS (
                 SELECT 1 FROM "{schema}".pmtiles_archives
-                WHERE collection_physical_id=:collection_physical_id AND tms_id=:tms_id
+                WHERE collection_id=:collection_id AND tms_id=:tms_id
             );
         """
         try:
             async with managed_transaction(self.engine) as conn:
                 return await DQLQuery(sql, result_handler=ResultHandler.SCALAR).execute(
-                    conn,
-                    collection_physical_id=collection_physical_id,
-                    tms_id=tms_id,
+                    conn, collection_id=collection_id, tms_id=tms_id
                 ) or False
         except Exception as exc:
             if "42P01" in str(exc):
@@ -1582,7 +1470,7 @@ class PGTileArchive(TileArchiveStorageProtocol):
     async def _read_archive_range(
         self,
         schema: str,
-        collection_physical_id: str,
+        collection_id: str,
         tms_id: str,
         offset: int,
         length: int,
@@ -1597,7 +1485,7 @@ class PGTileArchive(TileArchiveStorageProtocol):
         sql = f"""
             SELECT substring(data FROM :start FOR :length)
             FROM "{schema}".pmtiles_archives
-            WHERE collection_physical_id=:collection_physical_id AND tms_id=:tms_id;
+            WHERE collection_id=:collection_id AND tms_id=:tms_id;
         """
         async with managed_transaction(self.engine) as conn:
             chunk = await DQLQuery(
@@ -1606,7 +1494,7 @@ class PGTileArchive(TileArchiveStorageProtocol):
                 conn,
                 start=offset + 1,
                 length=length,
-                collection_physical_id=collection_physical_id,
+                collection_id=collection_id,
                 tms_id=tms_id,
             )
         return bytes(chunk) if chunk is not None else None
@@ -1620,14 +1508,11 @@ class PGTileArchive(TileArchiveStorageProtocol):
         x: int,
         y: int,
     ) -> Optional[bytes]:
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
 
         async def _range_read(offset: int, length: int) -> Optional[bytes]:
             return await self._read_archive_range(
-                schema, collection_physical_id, tms_id, offset, length
+                schema, collection_id, tms_id, offset, length
             )
 
         try:
@@ -1636,29 +1521,23 @@ class PGTileArchive(TileArchiveStorageProtocol):
             if "42P01" in str(exc):  # archive table not provisioned yet
                 return None
             logger.warning(
-                "PGTileArchive: failed to extract tile z=%s x=%s y=%s "
-                "from archive for %s/%s: %s",
-                z, x, y, collection_id, tms_id, exc,
+                f"PGTileArchive: failed to extract tile z={z} x={x} y={y} "
+                f"from archive for {collection_id}/{tms_id}: {exc}"
             )
             return None
 
     async def delete_archive(
         self, catalog_id: str, collection_id: str, tms_id: str
     ) -> bool:
-        collection_physical_id = await self._resolve_collection_physical_id(
-            catalog_id, collection_id
-        )
         schema = await self._get_schema(catalog_id)
         sql = f"""
             DELETE FROM "{schema}".pmtiles_archives
-            WHERE collection_physical_id=:collection_physical_id AND tms_id=:tms_id;
+            WHERE collection_id=:collection_id AND tms_id=:tms_id;
         """
         try:
             async with managed_transaction(self.engine) as conn:
                 await DDLQuery(sql).execute(
-                    conn,
-                    collection_physical_id=collection_physical_id,
-                    tms_id=tms_id,
+                    conn, collection_id=collection_id, tms_id=tms_id
                 )
             return True
         except Exception as exc:

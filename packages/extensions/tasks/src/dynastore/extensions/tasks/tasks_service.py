@@ -55,7 +55,7 @@ async def _get_task_scoped_uncached(
 
     schema = await _resolve_catalog_schema(catalog_id, conn)
     task = await tasks_module.get_task_by_id_unscoped(conn, task_id)
-    if not task or task.schema_name != schema:
+    if not task or task.catalog_id != schema:
         raise HTTPException(
             status_code=404,
             detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.",

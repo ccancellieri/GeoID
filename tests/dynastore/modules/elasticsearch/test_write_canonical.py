@@ -416,6 +416,7 @@ class TestWriteEntitiesGeoidId:
         # Driver config with no special conflict policy.
         mock_config = MagicMock()
         mock_config.simplify_geometry = False
+        mock_config.simplify_target_bytes = None
         mock_config.external_id_path = MagicMock(return_value=None)
         mock_config.on_batch_conflict = None
         mock_config.on_conflict = None
@@ -505,6 +506,7 @@ class TestWriteEntitiesCanonicalSource:
 
         mock_config = MagicMock()
         mock_config.simplify_geometry = False
+        mock_config.simplify_target_bytes = None
         mock_config.external_id_path = MagicMock(return_value=None)
         mock_config.on_batch_conflict = None
         mock_config.on_conflict = None
@@ -674,6 +676,7 @@ class TestWriteEntitiesCanonicalSource:
 
         mock_config = MagicMock()
         mock_config.simplify_geometry = False
+        mock_config.simplify_target_bytes = None
         mock_config.external_id_path = MagicMock(return_value=None)
         mock_config.on_batch_conflict = None
         mock_config.on_conflict = None
@@ -839,6 +842,7 @@ class TestConvergenceInvariant:
 
         mock_config = MagicMock()
         mock_config.simplify_geometry = False
+        mock_config.simplify_target_bytes = None
         mock_config.external_id_path = MagicMock(return_value=None)
         mock_config.on_batch_conflict = None
         mock_config.on_conflict = None

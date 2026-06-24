@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 CATALOG_METADATA_CORE_DDL = """
 CREATE TABLE IF NOT EXISTS catalog.catalog_core (
-    catalog_id     VARCHAR PRIMARY KEY REFERENCES catalog.catalogs(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    catalog_id     VARCHAR PRIMARY KEY REFERENCES catalog.catalogs(id) ON DELETE CASCADE,
     title          JSONB,
     description    JSONB,
     keywords       JSONB,
@@ -78,10 +78,7 @@ CREATE TABLE IF NOT EXISTS catalog.catalog_core (
 
 TENANT_METADATA_CORE_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.collection_core (
-    -- Keyed on the immutable collection physical id (the c_… token from
-    -- {schema}.collections.physical_id).  A collection rename only changes
-    -- collections.id; these metadata rows are never touched by a rename.
-    collection_physical_id VARCHAR PRIMARY KEY,
+    collection_id  VARCHAR PRIMARY KEY,
     title          JSONB,
     description    JSONB,
     keywords       JSONB,

@@ -40,7 +40,7 @@ from dynastore.modules.db_config.query_executor import (
 
 CATALOG_METADATA_STAC_DDL = """
 CREATE TABLE IF NOT EXISTS catalog.catalog_stac (
-    catalog_id      VARCHAR PRIMARY KEY REFERENCES catalog.catalogs(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    catalog_id      VARCHAR PRIMARY KEY REFERENCES catalog.catalogs(id) ON DELETE CASCADE,
     stac_version    VARCHAR(20),
     stac_extensions JSONB,
     conforms_to     JSONB,
@@ -54,10 +54,7 @@ CREATE TABLE IF NOT EXISTS catalog.catalog_stac (
 
 TENANT_METADATA_STAC_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.collection_stac (
-    -- Keyed on the immutable collection physical id (the c_… token from
-    -- {schema}.collections.physical_id).  A collection rename only changes
-    -- collections.id; these metadata rows are never touched by a rename.
-    collection_physical_id VARCHAR PRIMARY KEY,
+    collection_id   VARCHAR PRIMARY KEY,
     stac_version    VARCHAR(20),
     stac_extensions JSONB,
     extent          JSONB,

@@ -460,7 +460,7 @@ class GcpLivenessReconciler(PeriodicService):
                         inputs=row.get("inputs"),
                         caller_id=row.get("caller_id"),
                         collection_id=row.get("collection_id"),
-                        schema=row.get("schema_name", "tasks"),
+                        schema=row.get("catalog_id", "tasks"),
                         scope=row.get("scope"),
                     )
                 except Exception as _ta_exc:
@@ -516,7 +516,7 @@ class GcpLivenessReconciler(PeriodicService):
                         inputs=row.get("inputs"),
                         caller_id=row.get("caller_id"),
                         collection_id=row.get("collection_id"),
-                        schema=row.get("schema_name", "tasks"),
+                        schema=row.get("catalog_id", "tasks"),
                         scope=row.get("scope"),
                     )
                 except Exception as _ta_exc:

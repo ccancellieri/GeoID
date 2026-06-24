@@ -279,7 +279,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         return {
             "catalogs": [
                 {
-                    "id": c.id,
+                    "id": getattr(c, "external_id", None) or c.id,
                     "title": resolve_localized_field(
                         getattr(c, "title", None), language
                     ),

@@ -187,24 +187,28 @@ async def _asset_event_bridge(
 CATALOGS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS catalog.catalogs (
     id VARCHAR PRIMARY KEY,
-    physical_schema VARCHAR NOT NULL UNIQUE,
+    external_id VARCHAR NOT NULL,
     provisioning_status VARCHAR(50) NOT NULL DEFAULT 'ready',
     provisioning_checklist JSONB DEFAULT NULL,
     deleted_at TIMESTAMPTZ DEFAULT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS catalogs_external_uq
+    ON catalog.catalogs (external_id)
+    WHERE deleted_at IS NULL;
 """
 
 SHARED_PROPERTIES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS catalog.shared_properties (
-    key_name VARCHAR PRIMARY KEY, 
-    key_value VARCHAR NOT NULL, 
-    owner_code VARCHAR, 
-    created_at TIMESTAMPTZ DEFAULT NOW(), 
+    key_name VARCHAR PRIMARY KEY,
+    key_value VARCHAR NOT NULL,
+    owner_code VARCHAR,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 """
+
 
 
 _module_instance: Optional[ModuleProtocol] = None
@@ -385,7 +389,9 @@ class CatalogModule(ModuleProtocol):
                 # Centralized system-level maintenance initialization
                 await initialize_system_logs(conn)
 
-                await DDLQuery(CATALOGS_TABLE_DDL + SHARED_PROPERTIES_SCHEMA).execute(conn)
+                await DDLQuery(
+                    CATALOGS_TABLE_DDL + SHARED_PROPERTIES_SCHEMA
+                ).execute(conn)
 
                 # Metadata-domain tables: catalog.catalog_core +
                 # catalog.catalog_stac.  The only collection- and

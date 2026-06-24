@@ -211,9 +211,9 @@ async def _bounded_batch_delete(
 
 
 async def _list_active_catalog_schemas(conn: Any) -> list[str]:
-    """Return physical_schema for all non-deleted catalogs."""
+    """Return schema names (= catalog id) for all non-deleted catalogs."""
     rows = await DQLQuery(
-        "SELECT physical_schema FROM catalog.catalogs WHERE deleted_at IS NULL ORDER BY physical_schema",
+        "SELECT id FROM catalog.catalogs WHERE deleted_at IS NULL ORDER BY id",
         result_handler=ResultHandler.ALL,
     ).execute(conn)
     return [r[0] for r in rows] if rows else []

@@ -30,6 +30,7 @@ from typing import (
     List,
     Dict,
     Set,
+    Tuple,
     Union,
     runtime_checkable,
     TYPE_CHECKING,
@@ -48,6 +49,38 @@ class CollectionsProtocol(Protocol):
     """
     Protocol for collection management operations.
     """
+
+    async def resolve_collection_id(
+        self,
+        catalog_id: str,
+        external_id: str,
+        allow_missing: bool = False,
+    ) -> Optional[str]:
+        """
+        Resolves a public collection ``external_id`` to the immutable internal
+        collection id, scoped by the (already-internal) ``catalog_id``.
+
+        Returns ``None`` when no live collection in the catalog carries that
+        ``external_id``; with ``allow_missing=False`` callers treat that as
+        not-found.
+        """
+        ...
+
+    async def resolve_collection_external_id(
+        self,
+        catalog_id: str,
+        internal_id: str,
+        allow_missing: bool = True,
+    ) -> Optional[str]:
+        """
+        Resolves a collection's public ``external_id`` from its immutable
+        internal ``id``.  Used by the item read path to project stored
+        internal collection ids back to client-visible labels.
+
+        Returns ``None`` (default) or raises ``ValueError`` when the collection
+        is not found, depending on ``allow_missing``.
+        """
+        ...
 
     async def get_collection(
         self,
@@ -304,3 +337,24 @@ class CollectionsProtocol(Protocol):
         Does NOT rewrite data — only updates metadata.
         """
         ...
+
+    # === Rename / Alias Operations ===
+
+    async def rename_collection(
+        self,
+        catalog_internal_id: str,
+        collection_internal_id: str,
+        new_external_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Tuple[str, str]:
+        """Rename a collection's public label (external_id) within a catalog.
+
+        Returns ``(prev_external_id, new_external_id)``.
+
+        Raises:
+            CollectionRenameConflictError: if another live collection in the
+                same catalog already holds ``external_id = new_external_id``.
+            ValueError: if no live collection row exists for the given internal ids.
+        """
+        ...
+

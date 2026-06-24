@@ -155,6 +155,12 @@ def svc(monkeypatch):
         async def list_catalog_configs(self, catalog_id):
             return {}
 
+        async def resolve_catalog_id(self, external_id, allow_missing=False):
+            # No external_id mapping in unit tests — passthrough.
+            if allow_missing:
+                return None
+            raise ValueError(f"Catalog '{external_id}' not found.")
+
     monkeypatch.setattr(
         collection_service_mod,
         "get_protocol",
@@ -263,8 +269,17 @@ async def test_create_collection_emits_correct_ids(svc, record_emit):
         "COLLECTION_CREATION must be emitted exactly once per create_collection call."
     )
     kwargs = creation_calls[0]
+    # Phase 2: catalog_id stays as-is (no external_id mapping in unit test →
+    # passthrough); collection_id is the generated immutable internal key.
     assert kwargs["catalog_id"] == "cat_b"
-    assert kwargs["collection_id"] == "col_b"
+    assert isinstance(kwargs["collection_id"], str), (
+        "collection_id in the COLLECTION_CREATION event must be a string "
+        "(the internal key emitted for downstream listeners to key on)."
+    )
+    assert kwargs["collection_id"].startswith("col_"), (
+        "collection_id must be the generated internal key (col_<suffix>) — "
+        "not the user-supplied external label 'col_b' (#external-id-redesign)."
+    )
 
 
 @pytest.mark.asyncio

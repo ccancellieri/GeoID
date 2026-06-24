@@ -100,7 +100,7 @@ def get_task_lookback() -> timedelta:
 GLOBAL_TASKS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.tasks (
     task_id           UUID          NOT NULL,
-    schema_name       VARCHAR(255)  NOT NULL,
+    catalog_id        VARCHAR(255)  NOT NULL,
     scope             VARCHAR(50)   NOT NULL DEFAULT 'CATALOG',
     caller_id         VARCHAR(255),
     task_type         VARCHAR       NOT NULL,
@@ -135,12 +135,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_queue
     ON {schema}.tasks (status, task_type, execution_mode, locked_until)
     WHERE status IN ('PENDING', 'ACTIVE');
 CREATE INDEX IF NOT EXISTS idx_tasks_schema_status
-    ON {schema}.tasks (schema_name, status);
+    ON {schema}.tasks (catalog_id, status);
 -- Dedup index: includes timestamp (partition key) as PG requires it for
 -- unique indexes on partitioned tables. Per-partition uniqueness.
 -- cross-partition dedup enforced at the application layer in enqueue().
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_dedup
-    ON {schema}.tasks (schema_name, dedup_key, timestamp)
+    ON {schema}.tasks (catalog_id, dedup_key, timestamp)
     WHERE dedup_key IS NOT NULL AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER');
 CREATE INDEX IF NOT EXISTS idx_tasks_caller
     ON {schema}.tasks (caller_id);
@@ -914,7 +914,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
 
 
 # --- Internal Query Objects ---
-# All queries target the global tasks table. The `schema_name` column
+# All queries target the global tasks table. The `catalog_id` column
 # distinguishes tenants; `get_task_schema()` returns the PostgreSQL schema
 # that hosts the global table (default: "tasks").
 
@@ -1019,7 +1019,7 @@ class StuckPendingWarnerService(PeriodicService):
         # Build the DQLQuery once; it is stateless and safe to share across ticks.
         self._query = DQLQuery(
             (
-                f'SELECT task_id, task_type, schema_name, inputs, '  # nosec
+                f'SELECT task_id, task_type, catalog_id, inputs, '  # nosec
                 f'  EXTRACT(EPOCH FROM NOW() - timestamp) AS age_s '
                 f'FROM "{schema}".tasks '
                 f"WHERE status = 'PENDING' "
@@ -1347,7 +1347,7 @@ async def _emit_stuck_pending_logs(rows: List[Dict[str, Any]]) -> None:
         logger.warning(
             "stuck-pending: task '%s' (%s, schema=%s) has been "
             "PENDING for %.0fs with retry_count=0 — %s",
-            row["task_id"], row["task_type"], row.get("schema_name"),
+            row["task_id"], row["task_type"], row.get("catalog_id"),
             row["age_s"],
             _stuck_pending_hint(row["task_type"], cap_id, cap_live),
         )
@@ -1457,8 +1457,8 @@ async def ensure_task_storage_exists(conn: DbResource, schema: str):
 
     There is exactly ONE legitimate caller: ``TasksModule.lifespan`` at app
     startup, with ``schema == get_task_schema()`` (default ``"tasks"``).
-    Multi-tenancy is column-based — ``schema_name`` on each task row carries
-    the catalog physical schema; the table itself is never duplicated per
+    Multi-tenancy is column-based — ``catalog_id`` on each task row carries
+    the catalog internal id; the table itself is never duplicated per
     tenant. Callers that pass a catalog/tenant schema are a bug: they would
     create an unread shadow table per tenant.
 
@@ -1490,7 +1490,7 @@ async def ensure_task_storage_exists(conn: DbResource, schema: str):
             f"ensure_task_storage_exists: refusing DDL on non-global schema "
             f"{schema!r} (expected {global_schema!r}). Tasks live in a single "
             f"global partitioned table; per-tenant tasks tables are a bug "
-            f"and were never read. Use schema_name='{schema}' on the row "
+            f"and were never read. Use catalog_id='{schema}' on the row "
             f"instead (the tenant discriminator column)."
         )
 
@@ -1696,9 +1696,9 @@ async def update_task_for_catalog(
 
 
 # --- Low-level functions ---
-# The `schema` parameter in these functions refers to the `schema_name` column
-# value (e.g. tenant schema "s_abc123" or "system"), NOT the PostgreSQL schema
-# that hosts the table.  The actual table lives in `get_task_schema()`.tasks.
+# The `schema` parameter in these functions refers to the `catalog_id` column
+# value (e.g. catalog internal id "s_abc123" or the sentinel "system"), NOT the
+# PostgreSQL schema that hosts the table.  The table lives in `get_task_schema()`.tasks.
 
 async def create_task(
     engine: DbResource,
@@ -1710,7 +1710,7 @@ async def create_task(
     locked_until: Optional[datetime] = None,
 ) -> Optional[Task]:
     """
-    Creates a new task in the global tasks table with schema_name = `schema`.
+    Creates a new task in the global tasks table with catalog_id = `schema`.
 
     Pass initial_status='RUNNING' to bypass the dispatcher queue (e.g. for
     audit tasks created by BackgroundRunner that are already being executed
@@ -1726,7 +1726,7 @@ async def create_task(
     update_task(ACTIVE), spawning a duplicate Cloud Run Job.
 
     Dedup: if `task_data.dedup_key` is set, a pre-check rejects insert when
-    a non-terminal task already carries the same (schema_name, dedup_key) —
+    a non-terminal task already carries the same (catalog_id, dedup_key) —
     this is what lets every event-driven caller survive at-least-once
     redelivery. Returns None on dedup hit.
     """
@@ -1741,13 +1741,13 @@ async def create_task(
             check_sql = f"""
                 SELECT task_id FROM {task_schema}.tasks
                 WHERE dedup_key = :dedup_key
-                  AND schema_name = :schema_name
+                  AND catalog_id = :catalog_id
                   AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')
                 LIMIT 1;
             """
             existing = await DQLQuery(
                 check_sql, result_handler=ResultHandler.ONE_DICT
-            ).execute(conn, dedup_key=task_data.dedup_key, schema_name=schema)
+            ).execute(conn, dedup_key=task_data.dedup_key, catalog_id=schema)
             if existing:
                 return None
 
@@ -1776,7 +1776,7 @@ async def create_task(
         # ingestion job is capped at the deploy-time intent (typically 1) rather
         # than a generic 3-retry default.
         cols: List[str] = [
-            "task_id", "schema_name", "scope", "caller_id", "task_type", "type",
+            "task_id", "catalog_id", "scope", "caller_id", "task_type", "type",
             "execution_mode", "inputs", "timestamp", "collection_id", "dedup_key",
             "status",
         ]
@@ -1789,7 +1789,7 @@ async def create_task(
         resolved_type = resolve_task_type_kind(task_data.task_type, task_data.type)
         insert_kwargs: Dict[str, Any] = dict(
             task_id=task_id,
-            schema_name=schema,
+            catalog_id=schema,
             scope=task_data.scope,
             caller_id=task_data.caller_id,
             task_type=task_data.task_type,
@@ -1855,9 +1855,9 @@ async def update_task(
 
     set_sql = ", ".join(set_clauses)
 
-    sql = f'UPDATE {task_schema}.tasks SET {set_sql} WHERE task_id = :task_id AND schema_name = :schema_name RETURNING *;'
+    sql = f'UPDATE {task_schema}.tasks SET {set_sql} WHERE task_id = :task_id AND catalog_id = :catalog_id RETURNING *;'
 
-    query_params = {**update_fields, "task_id": task_id, "schema_name": schema}
+    query_params = {**update_fields, "task_id": task_id, "catalog_id": schema}
 
     # Commit the write explicitly. ``conn`` is frequently a bare engine — every
     # BackgroundRunner / GcpJobRunner terminal flip passes ``context.engine`` —
@@ -1882,9 +1882,9 @@ async def update_task(
 async def get_task(conn: DbResource, task_id: uuid.UUID, schema: str) -> Optional[Task]:
     """Retrieves a single task by its ID from the global tasks table."""
     task_schema = get_task_schema()
-    sql = f'SELECT * FROM {task_schema}.tasks WHERE task_id = :task_id AND schema_name = :schema_name;'
+    sql = f'SELECT * FROM {task_schema}.tasks WHERE task_id = :task_id AND catalog_id = :catalog_id;'
     task_dict = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
-        conn, task_id=task_id, schema_name=schema
+        conn, task_id=task_id, catalog_id=schema
     )
     return Task.model_validate(task_dict) if task_dict else None
 
@@ -1892,7 +1892,7 @@ async def get_task(conn: DbResource, task_id: uuid.UUID, schema: str) -> Optiona
 async def get_task_by_id_unscoped(
     conn: DbResource, task_id: uuid.UUID
 ) -> Optional[Task]:
-    """Retrieve a task by ``task_id`` alone, ignoring the tenant ``schema_name``.
+    """Retrieve a task by ``task_id`` alone, ignoring the tenant ``catalog_id``.
 
     Task IDs are UUIDv7 — globally unique — so a single task_id matches at most
     one row in the partitioned ``tasks`` table. Used by the unscoped OGC
@@ -1919,7 +1919,7 @@ async def list_tasks(
     offset: int = 0,
     kind: Optional[str] = None,
 ) -> List[Task]:
-    """Lists tasks filtered by schema_name, ordered by creation date.
+    """Lists tasks filtered by catalog_id, ordered by creation date.
 
     Pass ``kind`` to narrow results to a specific task type (e.g. ``'process'``
     for OGC Process jobs only).  When ``None`` all types are returned — the
@@ -1927,14 +1927,14 @@ async def list_tasks(
     """
     task_schema = get_task_schema()
     if kind is not None:
-        sql = f'SELECT * FROM {task_schema}.tasks WHERE schema_name = :schema_name AND type = :kind ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
+        sql = f'SELECT * FROM {task_schema}.tasks WHERE catalog_id = :catalog_id AND type = :kind ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
         task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, schema_name=schema, limit=limit, offset=offset, kind=kind
+            conn, catalog_id=schema, limit=limit, offset=offset, kind=kind
         )
     else:
-        sql = f'SELECT * FROM {task_schema}.tasks WHERE schema_name = :schema_name ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
+        sql = f'SELECT * FROM {task_schema}.tasks WHERE catalog_id = :catalog_id ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
         task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, schema_name=schema, limit=limit, offset=offset
+            conn, catalog_id=schema, limit=limit, offset=offset
         )
     return [Task.model_validate(t) for t in task_dicts]
 
@@ -1983,24 +1983,24 @@ async def enqueue(
             check_sql = f"""
                 SELECT task_id FROM {task_schema}.tasks
                 WHERE dedup_key = :dedup_key
-                  AND schema_name = :schema_name
+                  AND catalog_id = :catalog_id
                   AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')
                 LIMIT 1;
             """
             existing = await DQLQuery(
                 check_sql, result_handler=ResultHandler.ONE_DICT
-            ).execute(conn, dedup_key=dedup_key, schema_name=schema_name)
+            ).execute(conn, dedup_key=dedup_key, catalog_id=schema_name)
             if existing:
                 return None
 
             sql = f"""
                 INSERT INTO {task_schema}.tasks
-                    (task_id, schema_name, scope, caller_id, task_type, type,
+                    (task_id, catalog_id, scope, caller_id, task_type, type,
                      execution_mode, inputs, timestamp, collection_id, dedup_key)
                 VALUES
-                    (:task_id, :schema_name, :scope, :caller_id, :task_type, :type,
+                    (:task_id, :catalog_id, :scope, :caller_id, :task_type, :type,
                      :execution_mode, :inputs, :timestamp, :collection_id, :dedup_key)
-                ON CONFLICT (schema_name, dedup_key, timestamp)
+                ON CONFLICT (catalog_id, dedup_key, timestamp)
                     WHERE dedup_key IS NOT NULL
                     AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')
                 DO NOTHING
@@ -2009,10 +2009,10 @@ async def enqueue(
         else:
             sql = f"""
                 INSERT INTO {task_schema}.tasks
-                    (task_id, schema_name, scope, caller_id, task_type, type,
+                    (task_id, catalog_id, scope, caller_id, task_type, type,
                      execution_mode, inputs, timestamp, collection_id)
                 VALUES
-                    (:task_id, :schema_name, :scope, :caller_id, :task_type, :type,
+                    (:task_id, :catalog_id, :scope, :caller_id, :task_type, :type,
                      :execution_mode, :inputs, :timestamp, :collection_id)
                 RETURNING *;
             """
@@ -2024,7 +2024,7 @@ async def enqueue(
         task_dict = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
             conn,
             task_id=task_id,
-            schema_name=schema_name,
+            catalog_id=schema_name,
             scope=scope,
             caller_id=task_data.caller_id,
             task_type=task_data.task_type,
@@ -2105,7 +2105,7 @@ async def claim_next(
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
-        RETURNING task_id, schema_name, scope, task_type, execution_mode,
+        RETURNING task_id, catalog_id, scope, task_type, execution_mode,
                   caller_id, inputs, collection_id, retry_count, max_retries,
                   timestamp, dedup_key, owner_id;
     """
@@ -2164,10 +2164,10 @@ async def claim_batch(
 
     mode_filter = " OR ".join(conditions)
 
-    # Fairness: pick the oldest PENDING task per tenant (schema_name) first,
+    # Fairness: pick the oldest PENDING task per tenant (catalog_id) first,
     # then fill remaining batch slots from those results. This prevents a
     # single high-volume tenant from monopolising all claim slots.
-    # DISTINCT ON (schema_name) ORDER BY schema_name, timestamp ASC
+    # DISTINCT ON (catalog_id) ORDER BY catalog_id, timestamp ASC
     # returns exactly one row per tenant — the oldest eligible task.
     # DISTINCT ON and FOR UPDATE SKIP LOCKED cannot be combined in the same
     # SELECT (PostgreSQL forbids FOR UPDATE with DISTINCT). Use a two-step
@@ -2179,14 +2179,14 @@ async def claim_batch(
     # its next pass. This caps the cost of any future re-enqueue regression.
     sql = f"""
         WITH candidates AS (
-            SELECT DISTINCT ON (schema_name) timestamp, task_id
+            SELECT DISTINCT ON (catalog_id) timestamp, task_id
             FROM {task_schema}.tasks
             WHERE status = 'PENDING'
               AND timestamp >= :lookback
               AND (locked_until IS NULL OR locked_until <= :now)
               AND retry_count < :hard_cap
               AND ({mode_filter})
-            ORDER BY schema_name, timestamp ASC
+            ORDER BY catalog_id, timestamp ASC
         )
         UPDATE {task_schema}.tasks
         SET status = 'ACTIVE',
@@ -2202,7 +2202,7 @@ async def claim_batch(
             LIMIT :batch_size
             FOR UPDATE SKIP LOCKED
         )
-        RETURNING task_id, schema_name, scope, task_type, execution_mode,
+        RETURNING task_id, catalog_id, scope, task_type, execution_mode,
                   caller_id, inputs, collection_id, retry_count, max_retries,
                   timestamp, dedup_key, owner_id;
     """
@@ -2669,7 +2669,7 @@ async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
     """
     task_schema = get_task_schema()
     sql = f"""
-        SELECT task_id, schema_name, task_type, owner_id, runner_ref,
+        SELECT task_id, catalog_id, task_type, owner_id, runner_ref,
                started_at, locked_until, retry_count, max_retries, outputs,
                scope, caller_id, inputs, collection_id
         FROM {task_schema}.tasks
@@ -2709,7 +2709,7 @@ async def select_dismissed_unconfirmed_gcp_tasks(
     """
     task_schema = get_task_schema()
     sql = f"""
-        SELECT task_id, schema_name, task_type, owner_id, runner_ref,
+        SELECT task_id, catalog_id, task_type, owner_id, runner_ref,
                timestamp, started_at, last_heartbeat_at, retry_count, max_retries
         FROM {task_schema}.tasks
         WHERE status = 'DISMISSED'
@@ -2768,7 +2768,7 @@ async def claim_by_id(
             last_heartbeat_at = NOW()
         WHERE task_id = :task_id
           AND status = 'PENDING'
-        RETURNING task_id, schema_name, scope, task_type, execution_mode,
+        RETURNING task_id, catalog_id, scope, task_type, execution_mode,
                   caller_id, inputs, collection_id, retry_count, max_retries,
                   timestamp, dedup_key, owner_id;
     """
@@ -2818,7 +2818,7 @@ async def claim_for_execution(
             started_at = COALESCE(started_at, NOW()),
             last_heartbeat_at = NOW()
         WHERE task_id = :task_id
-          AND schema_name = :schema_name
+          AND catalog_id = :catalog_id
           AND status NOT IN ('COMPLETED', 'FAILED', 'DISMISSED', 'DEAD_LETTER')
           AND NOT (
                 status = 'ACTIVE'
@@ -2832,7 +2832,7 @@ async def claim_for_execution(
         return await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
             conn,
             task_id=task_id,
-            schema_name=schema,
+            catalog_id=schema,
             owner_id=owner_id,
             locked_until=locked_until,
         )
@@ -2942,7 +2942,7 @@ async def find_stale_tasks(
 ) -> List[Dict[str, Any]]:
     """
     Find active tasks with expired locks (janitor use).
-    If schema_name is provided, scopes to that tenant.
+    If schema_name is provided, scopes to that tenant (matches the catalog_id column value).
     """
     task_schema = get_task_schema()
     cutoff = datetime.now(timezone.utc) - stale_threshold
@@ -2950,11 +2950,11 @@ async def find_stale_tasks(
     schema_filter = ""
     params: Dict[str, Any] = {"cutoff": cutoff}
     if schema_name is not None:
-        schema_filter = "AND schema_name = :schema_name"
-        params["schema_name"] = schema_name
+        schema_filter = "AND catalog_id = :catalog_id"
+        params["catalog_id"] = schema_name
 
     sql = f"""
-        SELECT task_id, schema_name, task_type, execution_mode, retry_count, max_retries,
+        SELECT task_id, catalog_id, task_type, execution_mode, retry_count, max_retries,
                owner_id, locked_until, last_heartbeat_at
         FROM {task_schema}.tasks
         WHERE status = 'ACTIVE'
@@ -2977,8 +2977,8 @@ async def cleanup_orphan_tasks(
     """
     Move tasks for deleted catalogs to DEAD_LETTER.
 
-    Checks schema_name against existing catalog schemas. Tasks whose
-    schema_name no longer exists and whose creation timestamp is older
+    Checks catalog_id against existing catalog ids. Tasks whose
+    catalog_id no longer exists and whose creation timestamp is older
     than grace_period are dead-lettered.
     """
     task_schema = get_task_schema()
@@ -2989,24 +2989,24 @@ async def cleanup_orphan_tasks(
         if not await check_table_exists(conn, "catalogs", "catalog"):
             return 0
 
-        # Find orphaned tasks: schema_name not in any active catalog schema
+        # Find orphaned tasks: catalog_id not in any active catalog id
         # and task is not already in a terminal state
         sql = f"""
             WITH active_schemas AS (
-                SELECT DISTINCT physical_schema
+                SELECT DISTINCT id
                 FROM catalog.catalogs
                 WHERE deleted_at IS NULL
             )
             UPDATE {task_schema}.tasks t
             SET status = 'DEAD_LETTER',
-                error_message = 'Orphaned: catalog schema no longer exists',
+                error_message = 'Orphaned: catalog no longer exists',
                 finished_at = NOW(),
                 locked_until = NULL
             WHERE t.status IN ('PENDING', 'ACTIVE')
               AND t.scope = 'CATALOG'
               AND t.timestamp < :cutoff
-              AND t.schema_name NOT IN (SELECT physical_schema FROM active_schemas)
-              AND t.schema_name != 'system';
+              AND t.catalog_id NOT IN (SELECT id FROM active_schemas)
+              AND t.catalog_id != 'system';
         """
 
         result = await DQLQuery(sql, result_handler=ResultHandler.ROWCOUNT).execute(

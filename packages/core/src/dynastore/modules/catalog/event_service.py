@@ -289,7 +289,11 @@ class EventService(EventBusProtocol):
             collection_id = kwargs.get("collection_id")
             identity_id = kwargs.get("identity_id")
             payload = {"args": args, "kwargs": kwargs}
-            schema_name = None
+            # The tasks.events.catalog_id column is the tenant-routing key: it
+            # holds the catalog INTERNAL id (== the physical schema after the
+            # identity collapse), never the logical/external id. The logical
+            # catalog_id stays in payload->kwargs for listener filtering (#2256).
+            catalog_internal_id = None
 
             from dynastore.tools.discovery import get_protocol
 
@@ -298,7 +302,7 @@ class EventService(EventBusProtocol):
 
                 catalogs = get_protocol(CatalogsProtocol)
                 if catalogs:
-                    schema_name = await catalogs.resolve_physical_schema(
+                    catalog_internal_id = await catalogs.resolve_physical_schema(
                         catalog_id, ctx=DriverContext(db_resource=db_resource)
                     )
 
@@ -308,8 +312,7 @@ class EventService(EventBusProtocol):
                     event_type=e_val,
                     payload=payload,
                     scope=str(scope),
-                    schema_name=schema_name,
-                    catalog_id=catalog_id,
+                    catalog_id=catalog_internal_id,
                     collection_id=collection_id,
                     identity_id=identity_id,
                     db_resource=db_resource,
@@ -404,7 +407,6 @@ class EventService(EventBusProtocol):
         event_type: str,
         payload: Dict[str, Any],
         scope: str = "PLATFORM",
-        schema_name: Optional[str] = None,
         catalog_id: Optional[str] = None,
         collection_id: Optional[str] = None,
         identity_id: Optional[str] = None,
@@ -420,7 +422,6 @@ class EventService(EventBusProtocol):
             event_type=event_type,
             payload=payload,
             scope=scope,
-            schema_name=schema_name,
             catalog_id=catalog_id,
             collection_id=collection_id,
             identity_id=identity_id,

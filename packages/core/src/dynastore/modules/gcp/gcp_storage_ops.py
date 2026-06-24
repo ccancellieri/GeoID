@@ -142,13 +142,9 @@ class GcpStorageOpsMixin:
             catalog_id, collection_id
         )
 
-    def generate_bucket_name(self, physical_id: str) -> str:
-        """Generates the deterministic bucket name for a catalog.
-
-        ``physical_id`` must be the immutable physical identifier resolved via
-        ``CatalogsProtocol.resolve_physical_id`` before calling this method.
-        """
-        return self.get_bucket_service().generate_bucket_name(physical_id)
+    def generate_bucket_name(self, catalog_id: str) -> str:
+        """Generates the deterministic bucket name for a catalog."""
+        return self.get_bucket_service().generate_bucket_name(catalog_id)
 
     # -------------------------------------------------------------------------
     # AssetUploadProtocol implementation
@@ -239,18 +235,7 @@ class GcpStorageOpsMixin:
         bucket = storage_client.bucket(bucket_name)
 
         if collection_id:
-            # Resolve the immutable physical_id for the collection so the GCS
-            # object path remains stable even when the logical collection id
-            # is renamed.
-            _collection_physical_id: Optional[str] = None
-            _catalogs_upload = get_protocol(CatalogsProtocol)
-            if _catalogs_upload:
-                _collection_physical_id = await _catalogs_upload.resolve_physical_id(
-                    catalog_id, collection_id, allow_missing=True
-                )
-            blob_path = bucket_tool.get_blob_path_for_collection_file(
-                _collection_physical_id or collection_id, filename
-            )
+            blob_path = bucket_tool.get_blob_path_for_collection_file(collection_id, filename)
         else:
             blob_path = bucket_tool.get_blob_path_for_catalog_file(filename)
 

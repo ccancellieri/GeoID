@@ -187,9 +187,6 @@ def fake_conn_with_dql():
         patch.object(mod, "managed_transaction", lambda engine: fake_txn),
         patch.object(mod, "_get_engine", return_value=fake_engine),
         patch.object(mod, "_resolve_physical_schema", AsyncMock(return_value="t_alpha")),
-        patch.object(
-            mod, "_resolve_collection_physical_id", AsyncMock(return_value="c_col"),
-        ),
     ]
     for p in patches:
         p.start()
@@ -296,12 +293,9 @@ async def test_collection_core_upsert_empty_payload_only_bumps_updated_at(
     sql, params = dql_execute.call_args.args[0], dql_execute.call_args.kwargs
     assert sql.startswith(
         'INSERT INTO "t_alpha".collection_core '
-        '(collection_physical_id, updated_at)'
+        '(collection_id, updated_at)'
     )
-    assert (
-        "ON CONFLICT (collection_physical_id) DO UPDATE SET updated_at = NOW()"
-        in sql
-    )
+    assert "ON CONFLICT (collection_id) DO UPDATE SET updated_at = NOW()" in sql
     assert set(params) == {"id"}
 
 
@@ -362,10 +356,7 @@ class TestColumnTupleAlignment:
                 continue
             name = m.group(1)
             if name in {
-                # PKs — not in the column tuple. Tenant metadata tables now
-                # key on the immutable collection_physical_id; the global
-                # catalog metadata tables still key on catalog_id.
-                "catalog_id", "collection_id", "collection_physical_id",
+                "catalog_id", "collection_id",  # PKs — not in the tuple
                 "created_at", "updated_at",     # bookkeeping — not in the tuple
             }:
                 continue
