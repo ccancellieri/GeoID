@@ -16,25 +16,34 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Schema-registry CLI for the typed-config store.
+"""Schema CLI for the typed-config store.
+
+JSON schemas are not persisted; they are generated on demand from each
+registered class. These subcommands operate on the live class registry and on
+the ``schema_id`` version tags actually serialized in config rows.
 
 Subcommands:
 
-* ``list``   — print ``(class_key, schema_id, created_at)`` from ``configs.schemas``.
-* ``audit``  — report, for every currently-imported ``PersistentModel``, whether
-  its computed ``schema_id`` matches a row in the registry and whether every
-  distinct stored ``schema_id`` for that ``class_key`` has a migrator path to the
-  current hash. Exits non-zero on drift.
-* ``diff``   — pretty JSON-schema diff between two stored schema_ids.
+* ``list``   — print ``(class_key, current schema_id)`` for every registered
+  ``PersistentModel`` (generated from the class, no DB read).
+* ``audit``  — for every registered ``PersistentModel``, report whether its
+  current ``schema_id`` matches the version tags serialized in
+  ``configs.platform_configs`` rows, and whether each distinct stored
+  ``schema_id`` has a migrator path to the current hash. Exits non-zero on
+  drift. (Audits platform-level rows; per-tenant config tables are not
+  enumerated.)
+* ``diff``   — pretty JSON-schema diff between two registered classes' current
+  schemas (by ``class_key``).
 
 Run::
 
     python -m dynastore.modules.db_config.typed_store.cli list
     python -m dynastore.modules.db_config.typed_store.cli audit
-    python -m dynastore.modules.db_config.typed_store.cli diff <id_a> <id_b>
+    python -m dynastore.modules.db_config.typed_store.cli diff <class_key_a> <class_key_b>
 
-``DATABASE_URL`` must be set; dynastore plugin discovery is performed so every
-``PersistentModel`` subclass is known to :class:`TypedModelRegistry`.
+``DATABASE_URL`` must be set for ``audit``; dynastore plugin discovery is
+performed so every ``PersistentModel`` subclass is known to
+:class:`TypedModelRegistry`.
 """
 
 from __future__ import annotations
@@ -73,12 +82,9 @@ async def _discover() -> None:
 
 
 async def cmd_list(args: argparse.Namespace) -> int:
-    engine = _engine(args.database_url)
-    async with engine.connect() as conn:
-        rows = await _cq.list_schemas.execute(conn)
-    for class_key, schema_id, created_at in rows or []:
-        print(f"{class_key}\t{schema_id}\t{created_at.isoformat()}")
-    await engine.dispose()
+    await _discover()
+    for model in TypedModelRegistry.all().values():
+        print(f"{model.class_key()}\t{model.schema_id()}")
     return 0
 
 
@@ -86,7 +92,7 @@ async def cmd_audit(args: argparse.Namespace) -> int:
     await _discover()
     engine = _engine(args.database_url)
     async with engine.connect() as conn:
-        stored = await _cq.list_schemas_keys.execute(conn)
+        stored = await _cq.list_platform_config_schema_ids.execute(conn)
     await engine.dispose()
     stored = stored or []
 
@@ -104,7 +110,7 @@ async def cmd_audit(args: argparse.Namespace) -> int:
         stored_ids = by_key.get(key, [])
 
         if current not in stored_ids and stored_ids:
-            drift.append(f"{key}: current {current!s} not in registry")
+            drift.append(f"{key}: current {current!s} not in serialized rows")
 
         for sid in stored_ids:
             if sid == current:
@@ -127,19 +133,24 @@ async def cmd_audit(args: argparse.Namespace) -> int:
 
 
 async def cmd_diff(args: argparse.Namespace) -> int:
-    engine = _engine(args.database_url)
-    async with engine.connect() as conn:
-        rows = await _cq.get_schemas_by_ids.execute(conn, ids=[args.id_a, args.id_b])
-    await engine.dispose()
-    by_id: Dict[str, Any] = {sid: js for sid, js in rows or []}
-    if args.id_a not in by_id or args.id_b not in by_id:
-        print("one or both schema_ids not found", file=sys.stderr)
+    await _discover()
+    by_key: Dict[str, Any] = {
+        m.class_key(): m for m in TypedModelRegistry.all().values()
+    }
+    if args.class_key_a not in by_key or args.class_key_b not in by_key:
+        print("one or both class_keys not registered", file=sys.stderr)
         return 2
-    a = json.dumps(by_id[args.id_a], indent=2, sort_keys=True).splitlines()
-    b = json.dumps(by_id[args.id_b], indent=2, sort_keys=True).splitlines()
+    a = json.dumps(
+        by_key[args.class_key_a].model_json_schema(), indent=2, sort_keys=True
+    ).splitlines()
+    b = json.dumps(
+        by_key[args.class_key_b].model_json_schema(), indent=2, sort_keys=True
+    ).splitlines()
     import difflib
 
-    for line in difflib.unified_diff(a, b, fromfile=args.id_a, tofile=args.id_b, lineterm=""):
+    for line in difflib.unified_diff(
+        a, b, fromfile=args.class_key_a, tofile=args.class_key_b, lineterm=""
+    ):
         print(line)
     return 0
 
@@ -151,8 +162,8 @@ def main(argv: List[str] | None = None) -> int:
     sub.add_parser("list")
     sub.add_parser("audit")
     d = sub.add_parser("diff")
-    d.add_argument("id_a")
-    d.add_argument("id_b")
+    d.add_argument("class_key_a")
+    d.add_argument("class_key_b")
     args = p.parse_args(argv)
 
     handlers = {"list": cmd_list, "audit": cmd_audit, "diff": cmd_diff}

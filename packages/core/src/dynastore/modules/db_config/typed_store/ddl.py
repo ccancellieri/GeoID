@@ -18,9 +18,11 @@
 
 """DDL for the PostgreSQL :class:`TypedStore` backend.
 
-Three scope-specific tables + one content-addressed schema registry:
+Three scope-specific config tables. JSON schemas are not persisted — they are
+generated on demand from the registered class (``cls.model_json_schema()``);
+each config row carries the content-addressed ``schema_id`` (sha256) as a plain
+version tag for drift detection.
 
-* ``configs.schemas`` — global schema registry (content-addressed by sha256).
 * ``configs.platform_configs`` — global, keyed by ``ref_key`` (Cycle F.4c.1).
 * ``"<tenant_schema>".catalog_configs`` — per-tenant, keyed by ``ref_key``.
 * ``"<tenant_schema>".collection_configs`` — per-tenant, keyed by
@@ -52,21 +54,10 @@ COLLECTION_CONFIGS_TABLE = "collection_configs"
 PLATFORM_SCHEMAS_DDL = f"""
 CREATE SCHEMA IF NOT EXISTS {CONFIGS_SCHEMA};
 
-CREATE TABLE IF NOT EXISTS {CONFIGS_SCHEMA}.schemas (
-    schema_id    TEXT        PRIMARY KEY,
-    class_key    TEXT        NOT NULL,
-    schema_json  JSONB       NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by   TEXT
-);
-
-CREATE INDEX IF NOT EXISTS ix_schemas_class_key
-    ON {CONFIGS_SCHEMA}.schemas (class_key);
-
 CREATE TABLE IF NOT EXISTS {CONFIGS_SCHEMA}.platform_configs (
     ref_key     TEXT        PRIMARY KEY,
     class_key   TEXT        NOT NULL,
-    schema_id   TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
+    schema_id   TEXT        NOT NULL,
     config_data JSONB       NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -122,7 +113,7 @@ def tenant_configs_ddl(tenant_schema: str) -> str:
     CREATE TABLE IF NOT EXISTS "{tenant_schema}".catalog_configs (
         ref_key     TEXT        PRIMARY KEY,
         class_key   TEXT        NOT NULL,
-        schema_id   TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
+        schema_id   TEXT        NOT NULL,
         config_data JSONB       NOT NULL,
         updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -134,7 +125,7 @@ def tenant_configs_ddl(tenant_schema: str) -> str:
         collection_id TEXT        NOT NULL,
         ref_key       TEXT        NOT NULL,
         class_key     TEXT        NOT NULL,
-        schema_id     TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
+        schema_id     TEXT        NOT NULL,
         config_data   JSONB       NOT NULL,
         updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (collection_id, ref_key)

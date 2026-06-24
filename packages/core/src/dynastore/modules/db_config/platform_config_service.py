@@ -537,17 +537,6 @@ get_platform_config_by_ref_query = _cq.get_platform_config_by_ref
 list_platform_refs_query = _cq.list_platform_refs
 
 
-async def _register_schema(conn: DbResource, config: "PluginConfig") -> None:
-    """Upsert the config's current JSON schema into ``configs.schemas``."""
-    cls = type(config)
-    await _cq.register_schema.execute(
-        conn,
-        schema_id=cls.schema_id(),
-        class_key=cls.class_key(),
-        schema_json=json.dumps(cls.model_json_schema(), sort_keys=True),
-    )
-
-
 # --- Manager ---
 
 
@@ -718,8 +707,6 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             # ``managed_transaction`` rolls back the (not-yet-issued) upsert.
             await run_validate_handlers(cls, config, None, None, conn)
 
-            await _register_schema(conn, config)
-
             # exclude_unset=True → platform row stores only fields the caller
             # explicitly sent. Class defaults are resolved at read time, so
             # bumping a class default propagates without rewriting this row.
@@ -872,8 +859,6 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
 
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, None, None, conn)
-
-            await _register_schema(conn, config)
 
             await upsert_platform_config_query.execute(
                 conn,

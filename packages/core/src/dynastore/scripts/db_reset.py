@@ -144,21 +144,10 @@ def _get_platform_ddl() -> str:
     return """
 CREATE SCHEMA IF NOT EXISTS configs;
 
-CREATE TABLE IF NOT EXISTS configs.schemas (
-    schema_id    TEXT        PRIMARY KEY,
-    class_key    TEXT        NOT NULL,
-    schema_json  JSONB       NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by   TEXT
-);
-
-CREATE INDEX IF NOT EXISTS ix_schemas_class_key
-    ON configs.schemas (class_key);
-
 CREATE TABLE IF NOT EXISTS configs.platform_configs (
     ref_key     TEXT        PRIMARY KEY,
     class_key   TEXT        NOT NULL,
-    schema_id   TEXT        NOT NULL REFERENCES configs.schemas(schema_id),
+    schema_id   TEXT        NOT NULL,
     config_data JSONB       NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

@@ -18,9 +18,8 @@
 
 """DQL query factories for the typed-config store tables.
 
-All SQL that touches the four config tables is defined here:
+All SQL that touches the config tables is defined here:
 
-* ``configs.schemas``          — schema registry (platform-level)
 * ``configs.platform_configs`` — platform-level config store
 * ``<tenant>.catalog_configs`` — per-tenant catalog config store
 * ``<tenant>.collection_configs`` — per-tenant collection config store
@@ -107,27 +106,12 @@ delete_platform_config = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
-register_schema = DQLQuery(
-    f"""
-    INSERT INTO {CONFIGS_SCHEMA}.schemas (schema_id, class_key, schema_json)
-    VALUES (:schema_id, :class_key, CAST(:schema_json AS jsonb))
-    ON CONFLICT (schema_id) DO NOTHING;
-    """,
-    result_handler=ResultHandler.ROWCOUNT,
-)
-
-list_schemas = DQLQuery(
-    f"SELECT class_key, schema_id, created_at FROM {CONFIGS_SCHEMA}.schemas ORDER BY class_key, created_at",
-    result_handler=ResultHandler.ALL,
-)
-
-list_schemas_keys = DQLQuery(
-    f"SELECT class_key, schema_id FROM {CONFIGS_SCHEMA}.schemas",
-    result_handler=ResultHandler.ALL,
-)
-
-get_schemas_by_ids = DQLQuery(
-    f"SELECT schema_id, schema_json FROM {CONFIGS_SCHEMA}.schemas WHERE schema_id = ANY(:ids)",
+# Distinct (class_key, schema_id) actually serialized in platform config rows.
+# Schemas are not persisted in a registry table — they are generated on demand
+# from the registered class (``cls.model_json_schema()``). This query backs the
+# diagnostic audit of which schema versions live in real config rows.
+list_platform_config_schema_ids = DQLQuery(
+    f"SELECT DISTINCT class_key, schema_id FROM {CONFIGS_SCHEMA}.platform_configs ORDER BY class_key, schema_id;",
     result_handler=ResultHandler.ALL,
 )
 

@@ -73,7 +73,6 @@ from dynastore.tools.json import CustomJSONEncoder
 # Class-as-identity config API.
 from dynastore.models.plugin_config import PluginConfig, require_config_class, resolve_config_class
 from dynastore.modules.db_config.platform_config_service import (
-    _register_schema,
     enforce_config_immutability,
     restore_system_assigned_fields,
     run_apply_handlers,
@@ -527,16 +526,9 @@ class ConfigService(ConfigsProtocol):
             )
             if not phys_schema:
                 return
-            # ``catalog_configs.schema_id`` is NOT NULL with a FK into
-            # ``configs.schemas``. Register a fixed sentinel schema (ON CONFLICT
-            # DO NOTHING) so the reserved blob row satisfies the constraint
-            # without inventing a PluginConfig class for the snapshot envelope.
-            await _cq.register_schema.execute(
-                conn,
-                schema_id=SNAPSHOT_REF_KEY,
-                class_key=SNAPSHOT_REF_KEY,
-                schema_json="{}",
-            )
+            # ``catalog_configs.schema_id`` is NOT NULL; the reserved snapshot
+            # blob has no PluginConfig class, so it carries the sentinel ref as
+            # its schema_id (schemas are no longer persisted in a registry).
             await _cq.upsert_catalog_config(phys_schema).execute(
                 conn,
                 ref_key=SNAPSHOT_REF_KEY,
@@ -683,8 +675,6 @@ class ConfigService(ConfigsProtocol):
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, None, conn)
 
-            await _register_schema(conn, config)
-
             await _cq.upsert_catalog_config(phys_schema).execute(
                 conn,
                 ref_key=class_key,
@@ -740,8 +730,6 @@ class ConfigService(ConfigsProtocol):
 
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
-
-            await _register_schema(conn, config)
 
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
@@ -1082,8 +1070,6 @@ class ConfigService(ConfigsProtocol):
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, None, conn)
 
-            await _register_schema(conn, config)
-
             await _cq.upsert_catalog_config(phys_schema).execute(
                 conn,
                 ref_key=ref_key,
@@ -1142,8 +1128,6 @@ class ConfigService(ConfigsProtocol):
 
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
-
-            await _register_schema(conn, config)
 
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
