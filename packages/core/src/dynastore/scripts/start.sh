@@ -35,9 +35,6 @@ set -e
 : "${ACCESS_LOG:=-}"
 : "${ERROR_LOG:=-}"
 : "${VENV_PATH:=/opt/venv}"
-# Worker concurrency: number of parallel worker processes for the in-app worker.
-# Multiple processes prevent deadlocks when tasks write to shared resources (e.g. static files).
-: "${WORKER_CONCURRENCY:=4}"
 # --- Durable Task Environment ---
 : "${RUNNER_ID:=$(hostname)}"
 : "${NAME:=$(hostname)}"
@@ -97,7 +94,7 @@ case "$MODE" in
         ;;
 
     worker)
-        echo "Starting Worker (${WORKER_CONCURRENCY} concurrent processes)..."
+        echo "Starting Worker..."
         # Expose a minimal HTTP probe for Cloud Run liveness checks.
         # The probe returns 200 only while the worker process is alive.
         #
@@ -142,10 +139,7 @@ if __name__ == "__main__":
 PROBE_EOF
         fi
 
-        # Run with --concurrency to spawn multiple worker processes.
-        # This prevents deadlocks when tasks write to shared resources (e.g. static files)
-        # while other tasks are waiting for I/O.
-        exec python -m "${APP}.main" --worker --concurrency "${WORKER_CONCURRENCY}" "$@"
+        exec python -m "${APP}.main" --worker "$@"
         ;;
 
     *)

@@ -35,9 +35,6 @@ set -e
 : "${ACCESS_LOG:=-}"
 : "${ERROR_LOG:=-}"
 : "${VENV_PATH:=/opt/venv}"
-# Worker concurrency: number of parallel worker processes for the Procrastinate worker.
-# Multiple processes prevent deadlocks when tasks write to shared resources (e.g. static files).
-: "${WORKER_CONCURRENCY:=4}"
 
 # --- Environment Loading ---
 # Load env vars from baked .env file if it exists, respecting existing vars.
@@ -90,16 +87,13 @@ case "$MODE" in
         ;;
 
     worker)
-        echo "Starting Worker (${WORKER_CONCURRENCY} concurrent processes)..."
+        echo "Starting Worker..."
         # Optionally expose a minimal HTTP health check endpoint for Cloud Run liveness probes.
         if [ -n "$TCP_PORT" ]; then
             python -m http.server "$TCP_PORT" &>/dev/null &
         fi
 
-        # Run with --concurrency to spawn multiple worker processes.
-        # This prevents deadlocks when tasks write to shared resources (e.g. static files)
-        # while other tasks are waiting for I/O.
-        exec python -m "${APP}.main" --worker --concurrency "${WORKER_CONCURRENCY}" "$@"
+        exec python -m "${APP}.main" --worker "$@"
         ;;
 
     *)

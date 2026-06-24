@@ -36,7 +36,6 @@ apps:
       RAM: "4Gi"
       MIN_INSTANCES: "1"
       MAX_INSTANCES: "5"
-      WORKER_CONCURRENCY: "4"
       SCOPE: worker_service
 
   - id: my-project-ingestion-job

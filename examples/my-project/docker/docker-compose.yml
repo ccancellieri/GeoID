@@ -47,7 +47,6 @@ services:
     environment:
       APP: my_project
       TCP_PORT: 81
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
     ports:
       - "${HOST_PORT_WORKER:-81}:81"
     depends_on:

@@ -365,19 +365,17 @@ bootstrap_app(app)
 logger.info("--- [main.py] FastAPI application instance created. ---")
 
 
-async def run_worker(concurrency: int = 1):
+async def run_worker():
     """
     Initializes the application's modules via their lifespans and runs as a
     long-lived worker process.
 
     The TasksModule lifespan is responsible for starting the dispatcher and
     queue listener internally — no schema or dispatcher knowledge is needed here.
-
-    Args:
-        concurrency: Reserved for future use. The dispatcher concurrency is
-                     configured via the TasksModule.
+    Dispatcher concurrency is configured by the TasksModule (dispatcher batch
+    size); the worker itself is a single process running one event loop.
     """
-    logger.info("--- [main.py] Initializing worker context (concurrency=%d)... ---", concurrency)
+    logger.info("--- [main.py] Initializing worker context... ---")
 
     app_state = SimpleNamespace()
 
@@ -402,11 +400,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="DynaStore Application Entry Point")
     parser.add_argument("--worker", action="store_true", help="Run as a background worker instead of API server")
-    parser.add_argument("--concurrency", type=int, default=1,
-                        help="Number of concurrent worker processes (worker mode only, default: 1)")
     args = parser.parse_args()
 
     if args.worker:
-        asyncio.run(run_worker(concurrency=args.concurrency))
+        asyncio.run(run_worker())
     else:
         print("This script is intended to be imported by an ASGI server (for API) or run with --worker (for Worker).")
