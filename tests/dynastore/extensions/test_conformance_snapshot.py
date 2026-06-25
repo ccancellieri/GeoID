@@ -147,10 +147,12 @@ def test_full_pass1_uri_set_is_declared_somewhere():
     )
 
 
+# Coverages is OGC 19-087 (DRAFT); these track the current axis-typed taxonomy.
+# Spatial-only: no temporal subsetting/scaling is implemented, so no
+# subsetting-temporal / scaling-temporal / *-general is declared.
 EXPECTED_PASS2_COVERAGES_URIS = {
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-subset",
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-bbox",
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-datetime",
+    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/subsetting-spatial",
+    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/scaling-spatial",
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/geotiff",
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/netcdf",
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coveragejson",

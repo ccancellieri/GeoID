@@ -55,8 +55,9 @@ from . import coverages_models as cm
 def _bbox_to_subset(bbox: str) -> SubsetRequest:
     """Parse OGC bbox query param and convert to a SubsetRequest.
 
-    OGC API - Coverages §7.8 /req/coverage-bbox: the ``bbox`` query parameter
-    follows the OGC API Common Part 2 convention:
+    OGC API - Coverages /req/subsetting-spatial (bbox is folded into spatial
+    subsetting in the current draft): the ``bbox`` query parameter follows the
+    OGC API Common Part 2 convention:
       ``minlon,minlat,maxlon,maxlat``
     which maps directly to Lon(minlon:maxlon),Lat(minlat:maxlat) subset axes.
     """
@@ -424,26 +425,30 @@ logger = logging.getLogger(__name__)
 # OGC API - Coverages conformance URIs (OGC 19-087r6)
 # ---------------------------------------------------------------------------
 
+# OGC API - Coverages Part 1 is a DRAFT (OGC 19-087). Conformance URIs track
+# the current draft's axis-typed taxonomy (subsetting-spatial / scaling-spatial);
+# re-verify these slugs on each 19-087 revision. Only spatial classes are claimed
+# because no temporal subsetting/scaling is implemented; general (arbitrary-axis)
+# is not claimed either.
 OGC_API_COVERAGES_URIS = [
-    # OGC 19-087r6 §7.1 /req/core — landing page, conformance, /coverage endpoint
+    # /req/core — landing page, conformance, /coverage endpoint
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/core",
-    # OGC 19-087r6 §7.2 /req/geodata-coverage — collection-tied coverage resource
+    # /req/geodata-coverage — collection-tied coverage resource
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/geodata-coverage",
-    # OGC 19-087r6 §7.3 /req/json — JSON-encoded coverage metadata responses
+    # /req/json — JSON-encoded coverage metadata responses
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/json",
-    # OGC 19-087r6 §7.4 /req/html — HTML landing page and navigation
+    # /req/html — HTML landing page and navigation
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/html",
-    # OGC 19-087r6 §7.7 /req/coverage-subset — ?subset=Axis(low:high) trimming
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-subset",
-    # OGC 19-087r6 §7.8 /req/coverage-bbox — ?bbox=minlon,minlat,maxlon,maxlat shorthand
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-bbox",
-    # OGC 19-087r6 §7.11 /req/scale-factor — ?scale-factor=<ratio> downsampling
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/scaling",
-    # OGC 19-087r6 §7.5 /req/geotiff — GeoTIFF binary output
+    # /req/subsetting-spatial — ?subset=Axis(low:high) and ?bbox= spatial trimming
+    # (bbox is folded into spatial subsetting in the current draft taxonomy)
+    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/subsetting-spatial",
+    # /req/scaling-spatial — ?scale-factor / ?scale-size spatial resampling
+    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/scaling-spatial",
+    # /req/geotiff — GeoTIFF binary output
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/geotiff",
-    # OGC 19-087r6 §7.5 /req/netcdf — NetCDF-4 binary output
+    # /req/netcdf — NetCDF-4 binary output
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/netcdf",
-    # OGC 19-087r6 §7.5 /req/coveragejson — CoverageJSON output with populated range
+    # /req/coveragejson — CoverageJSON output with populated range
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coveragejson",
 ]
 
@@ -648,7 +653,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
             None,
             description=(
                 "Bounding-box filter in CRS84: minlon,minlat,maxlon,maxlat. "
-                "OGC 19-087 §7.8 /req/coverage-bbox. "
+                "OGC 19-087 /req/subsetting-spatial. "
                 "Cannot repeat an axis already named in the 'subset' parameter."
             ),
         ),
