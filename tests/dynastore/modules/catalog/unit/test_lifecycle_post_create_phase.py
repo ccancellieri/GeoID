@@ -144,9 +144,11 @@ def test_post_create_noop_when_no_hooks(fake_conn):
 
 def test_create_catalog_runs_post_create_after_insert():
     """Source-level pin: ``_run_core_init`` must invoke ``init_catalog``
-    before ``post_create_catalog``, and ``create_catalog`` must delegate to
-    ``_run_core_init`` after inserting the catalog row.  This is the #1131
-    ordering guarantee, now captured in the extracted private method."""
+    before ``post_create_catalog``, and the synchronous create path must
+    delegate to ``_run_core_init`` after inserting the catalog row.  This is
+    the #1131 ordering guarantee, now captured in the extracted private
+    method; the INSERT→delegate ordering lives in ``_create_catalog_sync``
+    since #2329 split create into sync/async paths."""
     from dynastore.modules.catalog.catalog_service import CatalogService
 
     # The init steps moved into _run_core_init; check ordering there.
@@ -161,13 +163,13 @@ def test_create_catalog_runs_post_create_after_insert():
         f"in _run_core_init. Got init={idx_init}, post={idx_post}."
     )
 
-    # create_catalog must call _run_core_init after inserting the row.
-    src_create = inspect.getsource(CatalogService.create_catalog)
+    # The sync create path must call _run_core_init after inserting the row.
+    src_create = inspect.getsource(CatalogService._create_catalog_sync)
     idx_insert = src_create.find("_insert_catalog_row_with_pk_retry(")
     idx_delegate = src_create.find("_run_core_init(")
 
-    assert idx_insert != -1, "create_catalog should still INSERT the catalog row"
-    assert idx_delegate != -1, "create_catalog must delegate to _run_core_init"
+    assert idx_insert != -1, "_create_catalog_sync should still INSERT the catalog row"
+    assert idx_delegate != -1, "_create_catalog_sync must delegate to _run_core_init"
     assert idx_insert < idx_delegate, (
         "ordering regression: _run_core_init must be called AFTER the catalog "
         f"row INSERT. Got insert={idx_insert}, delegate={idx_delegate}."

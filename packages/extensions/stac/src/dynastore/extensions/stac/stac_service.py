@@ -364,7 +364,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ("/catalogs/{catalog_id}/collections", "list_stac_collections", ["GET"], {"response_class": _J}),
             ("/catalogs/{catalog_id}/collections/{collection_id}", "get_stac_collection", ["GET"], {"response_class": _J}),
             # Write Operations
-            ("/catalogs", "create_stac_catalog", ["POST"], {"status_code": status.HTTP_201_CREATED}),
+            ("/catalogs", "create_stac_catalog", ["POST"], {}),
             ("/catalogs/{catalog_id}/collections", "create_stac_collection", ["POST"], {"status_code": status.HTTP_201_CREATED}),
             ("/catalogs/{catalog_id}", "replace_stac_catalog", ["PUT"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}", "update_stac_catalog", ["PATCH"], {"status_code": status.HTTP_200_OK}),

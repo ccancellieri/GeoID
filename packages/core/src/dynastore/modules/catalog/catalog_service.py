@@ -29,6 +29,7 @@ This service implements CatalogsProtocol and provides:
 import asyncio
 import logging
 import json
+import os
 from typing import (
     Awaitable,
     Callable,
@@ -218,6 +219,17 @@ def get_catalog_engine(db_resource: Optional[DbResource] = None) -> DbResource:
     from dynastore.tools.protocol_helpers import get_engine
 
     return get_engine()  # type: ignore[return-value]
+
+
+def _async_catalog_create_enabled() -> bool:
+    """Return True when DYNASTORE_ASYNC_CATALOG_CREATE=true/1/yes.
+
+    Default is False — catalog creation is synchronous and returns 201, identical
+    to the pre-2329 behaviour.  When enabled, the core tenant-provisioning steps
+    are deferred to the ``catalog_core_init`` worker task and the create endpoint
+    returns 202 with a Location header pointing at the catalog resource.
+    """
+    return os.getenv("DYNASTORE_ASYNC_CATALOG_CREATE", "false").lower() in ("true", "1", "yes")
 
 
 _T = TypeVar("_T")
@@ -1247,6 +1259,124 @@ class CatalogService(CatalogsProtocol):
         # 'provisioning' when at least one provisioner is active for it. On-prem
         # with no active provisioner stays 'ready' immediately.
         catalog_model.provisioning_status = "ready"
+
+        if _async_catalog_create_enabled():
+            return await self._create_catalog_async(
+                catalog_model, external_id, db_resource
+            )
+        return await self._create_catalog_sync(
+            catalog_model, external_id, db_resource
+        )
+
+    async def _create_catalog_async(
+        self,
+        catalog_model: "Catalog",
+        external_id: str,
+        db_resource: Any,
+    ) -> "Catalog":
+        """Async create path (DYNASTORE_ASYNC_CATALOG_CREATE=true).
+
+        Inserts the catalog.catalogs row, seeds the provisioning checklist with
+        ``catalog_core: pending`` (plus any other active provisioners), then
+        enqueues a ``catalog_core_init`` task that runs the full tenant
+        provisioning steps.  Returns immediately with
+        ``provisioning_status='provisioning'`` — the caller converts this to a
+        202 response.
+
+        The tenant schema does NOT exist when this method returns; all code
+        that assumes the schema is ready must stay inside the task.
+        """
+        from dynastore.modules.catalog.provisioning_registry import (
+            provisioning_registry,
+            STATUS_PROVISIONING,
+            STEP_PENDING,
+        )
+        from dynastore.modules.tasks.models import TaskCreate
+        from dynastore.modules.tasks.tasks_module import create_task, get_task_schema
+
+        catalog_model.provisioning_status = STATUS_PROVISIONING
+
+        async with managed_transaction(get_catalog_engine(db_resource)) as conn:
+            await emit_event(
+                CatalogEventType.BEFORE_CATALOG_CREATION,
+                catalog_id=catalog_model.id,
+                db_resource=conn,
+            )
+
+            tombstoned_row = await DQLQuery(
+                "SELECT id FROM catalog.catalogs WHERE external_id = :external_id AND deleted_at IS NOT NULL;",
+                result_handler=ResultHandler.ONE_OR_NONE,
+            ).execute(conn, external_id=external_id)
+            if tombstoned_row is not None:
+                old_internal_id = tombstoned_row[0] if tombstoned_row else None
+                _reclaim_id = old_internal_id or catalog_model.id
+                logger.info(
+                    "[LIFECYCLE] Reclaiming soft-deleted catalog external_id='%s' "
+                    "(internal_id='%s') for reuse",
+                    external_id,
+                    _reclaim_id,
+                )
+                await self._purge_catalog_storage(conn, _reclaim_id)
+                _invalidate_catalog_external_id_cache(external_id)
+
+            committed_internal_id = await _insert_catalog_row_with_pk_retry(
+                conn,
+                external_id=external_id,
+                provisioning_status=catalog_model.provisioning_status,
+            )
+            catalog_model.id = committed_internal_id
+
+            # Seed the provisioning checklist.  ``catalog_core`` is always
+            # pending on this path (the task will mark it complete or failed).
+            # Active provisioners (e.g. GCP bucket/eventing) that were already
+            # registered are also included so their steps are barriers.
+            checklist: Dict[str, str] = {"catalog_core": STEP_PENDING}
+            extra = await provisioning_registry.build_checklist(
+                catalog_model.id, conn
+            )
+            checklist.update(extra)
+
+            await _set_provisioning_checklist_query.execute(
+                conn,
+                id=catalog_model.id,
+                status=STATUS_PROVISIONING,
+                checklist=json.dumps(checklist),
+            )
+
+            # Enqueue the durable task into the GLOBAL task schema.
+            # The tenant schema does not exist yet; the task creates it.
+            task_request = TaskCreate(
+                task_type="catalog_core_init",
+                inputs={"catalog_id": committed_internal_id, "external_id": external_id},
+                caller_id="system",
+                type="task",
+            )
+            await create_task(conn, task_request, get_task_schema())
+
+            _invalidate_catalog_model_cache(catalog_model.id)
+            _invalidate_catalog_external_id_cache(external_id)
+
+        logger.info(
+            "catalog '%s' (external='%s'): async create committed; "
+            "catalog_core_init task enqueued",
+            catalog_model.id, external_id,
+        )
+        catalog_model.external_id = external_id  # type: ignore[attr-defined]
+        return catalog_model
+
+    async def _create_catalog_sync(
+        self,
+        catalog_model: "Catalog",
+        external_id: str,
+        db_resource: Any,
+    ) -> "Catalog":
+        """Synchronous create path (default, DYNASTORE_ASYNC_CATALOG_CREATE=false).
+
+        Runs all provisioning steps inline inside a single transaction and
+        returns the fully-provisioned catalog model.  This is the pre-2329
+        behaviour, unchanged.
+        """
+        physical_schema: str = ""  # set after INSERT below
 
         async with managed_transaction(get_catalog_engine(db_resource)) as conn:
             # Lifecycle Phase 1: BEFORE

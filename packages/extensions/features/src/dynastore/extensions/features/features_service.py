@@ -223,7 +223,6 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
             self.create_catalog,
             methods=["POST"],
             response_model=Catalog,
-            status_code=status.HTTP_201_CREATED,
         )
         self.router.add_api_route(
             "/catalogs/{catalog_id}",
