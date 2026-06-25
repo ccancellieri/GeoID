@@ -26,7 +26,6 @@ This service implements CatalogsProtocol and provides:
 - Catalog-level caching
 """
 
-import asyncio
 import logging
 import json
 import re
@@ -57,8 +56,8 @@ from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     DbResource,
     ResultHandler,
-    _is_transient_asyncpg_error,
     managed_transaction,
+    provisioning_write_with_retry,
 )
 from dynastore.modules.catalog.models import (
     Catalog,
@@ -247,40 +246,16 @@ async def _provisioning_write_with_retry(
     engine: DbResource,
     fn: Callable[[Any], Awaitable[_T]],
 ) -> _T:
-    """Run ``fn(conn)`` inside a short, committed PG transaction.
+    """Run ``fn(conn)`` inside a short, committed PG transaction with retry.
 
-    Retries exactly once on dead-connection transient errors (asyncpg
-    InterfaceError / ConnectionDoesNotExistError) that surface when the
-    pool recycles a wire that was closed server-side by
-    ``idle_in_transaction_session_timeout``.  The retry uses a fresh
-    connection acquired from the pool — never the stale one.
+    Delegates to :func:`~dynastore.modules.db_config.query_executor.provisioning_write_with_retry`
+    with ``attempts=2``, preserving the original two-attempt contract for
+    existing callers while inheriting the broader transient-error predicate
+    (connection closed, ``LockNotAvailableError``, sync psycopg2 disconnect).
 
-    This helper exists solely to centralise the retry logic for the
-    provisioning write path (#1895).  It must NOT be used for non-
-    idempotent writes.
+    Must NOT be used for non-idempotent writes.
     """
-    for attempt in range(2):
-        try:
-            async with managed_transaction(engine) as conn:
-                return await fn(conn)
-        except Exception as exc:
-            orig = getattr(exc, "orig", exc)
-            is_transient = (
-                _is_transient_asyncpg_error(exc)
-                or _is_transient_asyncpg_error(orig)
-            )
-            if attempt == 0 and is_transient:
-                logger.warning(
-                    "provisioning_write_retry "
-                    "attempt=0 exc=%s cause=%s; retrying on fresh connection",
-                    exc.__class__.__name__,
-                    orig.__class__.__name__,
-                )
-                await asyncio.sleep(0)  # yield to event loop before retry
-                continue
-            raise
-    # Unreachable: the loop always returns or raises on both iterations.
-    raise AssertionError("_provisioning_write_with_retry: exhausted attempts")
+    return await provisioning_write_with_retry(engine, fn, attempts=2)
 
 
 # PK constraint name for catalog.catalogs; asyncpg surfaces this in

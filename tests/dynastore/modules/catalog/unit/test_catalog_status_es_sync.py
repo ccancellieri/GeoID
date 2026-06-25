@@ -172,7 +172,7 @@ async def test_update_provisioning_status_fans_out_to_metadata_router() -> None:
         upsert_called_with["db_resource"] = db_resource
 
     with patch(
-        "dynastore.modules.catalog.catalog_service.managed_transaction",
+        "dynastore.modules.db_config.query_executor.managed_transaction",
         return_value=_CtxMgr(),
     ), patch(
         "dynastore.modules.catalog.catalog_service.get_catalog_engine",
@@ -220,7 +220,7 @@ async def test_update_provisioning_status_skips_router_when_pg_returns_no_row() 
         router_called = True
 
     with patch(
-        "dynastore.modules.catalog.catalog_service.managed_transaction",
+        "dynastore.modules.db_config.query_executor.managed_transaction",
         return_value=_CtxMgr(),
     ), patch(
         "dynastore.modules.catalog.catalog_service.get_catalog_engine",
@@ -271,7 +271,7 @@ async def test_update_provisioning_status_skips_router_when_payload_empty() -> N
         router_called = True
 
     with patch(
-        "dynastore.modules.catalog.catalog_service.managed_transaction",
+        "dynastore.modules.db_config.query_executor.managed_transaction",
         return_value=_CtxMgr(),
     ), patch(
         "dynastore.modules.catalog.catalog_service.get_catalog_engine",

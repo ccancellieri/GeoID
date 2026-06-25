@@ -43,7 +43,7 @@ else:
 
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.models.driver_context import DriverContext
-from dynastore.modules.db_config.query_executor import managed_transaction
+from dynastore.modules.db_config.query_executor import provisioning_write_with_retry
 from dynastore.modules.catalog.log_manager import log_info
 from dynastore.modules.gcp.gcp_config import (
     GcpCatalogBucketConfig,
@@ -345,13 +345,17 @@ class GcpEventingOpsMixin:
                 )
                 bucket_name = cfg.bucket_name
             else:
-                async with managed_transaction(self.engine) as legacy_conn:
+                # Acquire a fresh connection with retry so a connection closed
+                # during the preceding GCP API calls does not abort the lookup.
+                async def _read_bucket_name(legacy_conn, _cid=catalog_id):
                     cfg = await config_service.get_config(
                         GcpCatalogBucketConfig,
-                        catalog_id=catalog_id,
+                        catalog_id=_cid,
                         ctx=DriverContext(db_resource=legacy_conn),
                     )
-                    bucket_name = cfg.bucket_name
+                    return cfg.bucket_name
+
+                bucket_name = await provisioning_write_with_retry(self.engine, _read_bucket_name)
         if not bucket_name:
             raise RuntimeError(
                 f"Cannot setup GCS notification: Bucket for catalog '{catalog_id}' does not exist."

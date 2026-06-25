@@ -25,6 +25,7 @@ from dynastore.models.driver_context import DriverContext
 from dynastore.modules.db_config.query_executor import (
     DbResource,
     managed_transaction,
+    provisioning_write_with_retry,
     DQLQuery,
     ResultHandler,
 )
@@ -427,9 +428,15 @@ class GcpCatalogOpsMixin:
             max_retries, retry_interval = _get_catalog_visibility_tunables()
             catalog_exists = None
             for attempt in range(max_retries):
-                # Use a fresh connection/transaction for each check to avoid snapshot isolation issues
-                async with managed_transaction(self.engine) as conn:
-                    catalog_exists = await _CATALOG_EXISTS_QUERY.execute(conn, catalog_id=catalog_id)
+                # Each iteration acquires a fresh connection. provisioning_write_with_retry
+                # adds one retry on transient closed-connection / lock-timeout errors so a
+                # single dead wire does not abort the whole visibility wait loop.
+                async def _check_catalog_exists(conn, _cid=catalog_id):
+                    return await _CATALOG_EXISTS_QUERY.execute(conn, catalog_id=_cid)
+
+                catalog_exists = await provisioning_write_with_retry(
+                    self.engine, _check_catalog_exists, attempts=2
+                )
 
                 if catalog_exists:
                     break
@@ -449,18 +456,17 @@ class GcpCatalogOpsMixin:
                 catalog_vanished = True
                 raise asyncio.CancelledError(f"Catalog {catalog_id} not found during provisioning.")
 
-            async with managed_transaction(self.engine) as conn:
-                # Persist eventing config if managed eventing was set up
-                if (
-                    eventing_config.managed_eventing
-                    and eventing_config.managed_eventing.enabled
-                ):
-                    saved_config = await self.set_eventing_config(
-                        catalog_id, eventing_config, conn=conn
-                    )
+            # Persist eventing config in a short committed transaction with retry so a
+            # connection closed during the preceding GCP API calls does not abort the write.
+            async def _write_eventing_config(conn, _cid=catalog_id, _cfg=eventing_config):
+                if _cfg.managed_eventing and _cfg.managed_eventing.enabled:
+                    saved_config = await self.set_eventing_config(_cid, _cfg, conn=conn)
                     logger.debug(
                         f"saved_config.managed_eventing.topic_path from DB: {saved_config.managed_eventing.topic_path}"
                     )
+                return None
+
+            await provisioning_write_with_retry(self.engine, _write_eventing_config)
 
             # SUCCESS - Resources committed to DB. Clear provisioning tracking.
             provisioned_bucket = None

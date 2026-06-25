@@ -124,6 +124,96 @@ def _is_transient_asyncpg_error(exc: Optional[BaseException]) -> bool:
     return any(fragment in msg for fragment in _TRANSIENT_ASYNCPG_MESSAGE_FRAGMENTS)
 
 
+# --- Lock-not-available detection (pgcode 55P03) ----------------------------
+# Covers both the async asyncpg path (LockNotAvailableError class) and the
+# sync psycopg2 path (OperationalError wrapping pgcode 55P03 in its .orig).
+# Used by ``is_transient_db_error`` for the provisioning retry wrapper.
+
+_LOCK_NOT_AVAILABLE_PGCODE = "55P03"
+_LOCK_NOT_AVAILABLE_CLASS_NAMES = frozenset({"LockNotAvailableError"})
+_LOCK_TIMEOUT_MESSAGE_FRAGMENTS = (
+    "canceling statement due to lock timeout",
+    "lock timeout",
+)
+
+
+def _is_lock_not_available_error(exc: Optional[BaseException]) -> bool:
+    """Return True if ``exc`` is a PG lock-not-available / lock-timeout error (55P03).
+
+    Walks the ``.orig`` / ``__cause__`` chain so asyncpg errors wrapped inside
+    SQLAlchemy ``DBAPIError`` are still detected.
+    """
+    if exc is None:
+        return False
+    if type(exc).__name__ in _LOCK_NOT_AVAILABLE_CLASS_NAMES:
+        return True
+    seen: set[int] = set()
+    candidate: Optional[BaseException] = exc
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        pgcode = getattr(candidate, "pgcode", None) or getattr(candidate, "sqlstate", None)
+        if pgcode == _LOCK_NOT_AVAILABLE_PGCODE:
+            return True
+        candidate = getattr(candidate, "orig", None) or getattr(candidate, "__cause__", None)
+    msg = str(exc)
+    return any(fragment in msg for fragment in _LOCK_TIMEOUT_MESSAGE_FRAGMENTS)
+
+
+# --- Sync (psycopg2 / SQLAlchemy) closed-connection detection ----------------
+
+_SYNC_CLOSED_CONN_MESSAGE_FRAGMENTS = (
+    "server closed the connection",
+    "connection already closed",
+)
+
+
+def _is_sync_closed_connection_error(exc: Optional[BaseException]) -> bool:
+    """Return True for sync SQLAlchemy/psycopg2 connection-closed errors.
+
+    Matches only ``OperationalError`` with ``connection_invalidated=True`` (the
+    flag SQLAlchemy's pool sets on a detected disconnect) or one of the known
+    server-closed message fragments from psycopg2.  Generic ``OperationalError``
+    without these markers is NOT matched — it must surface as a real bug.
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, OperationalError):
+        if getattr(exc, "connection_invalidated", False):
+            return True
+        msg = str(exc)
+        return any(f in msg for f in _SYNC_CLOSED_CONN_MESSAGE_FRAGMENTS)
+    return False
+
+
+def is_transient_db_error(exc: Optional[BaseException]) -> bool:
+    """Return True if ``exc`` is a transient DB error safe to retry on a fresh connection.
+
+    Covers:
+    - Async asyncpg: ``InterfaceError``, ``ConnectionDoesNotExistError``,
+      ``InternalClientError``, "connection was closed" (via ``_is_transient_asyncpg_error``).
+    - Async asyncpg: ``LockNotAvailableError`` (pgcode 55P03 / lock timeout).
+    - Sync SQLAlchemy/psycopg2: ``OperationalError.connection_invalidated``,
+      "server closed the connection" / "connection already closed".
+    - Sync: lock timeout via pgcode 55P03 in the ``.orig`` chain.
+
+    Conservative by design: does NOT match a bare ``OperationalError`` without
+    the above markers, or any ``IntegrityError`` / ``ProgrammingError``.
+
+    Used exclusively by :func:`provisioning_write_with_retry`.  Existing callers
+    of ``_is_transient_asyncpg_error`` are unaffected.
+    """
+    if exc is None:
+        return False
+    orig = getattr(exc, "orig", None)
+    return (
+        _is_transient_asyncpg_error(exc)
+        or (orig is not None and _is_transient_asyncpg_error(orig))
+        or _is_lock_not_available_error(exc)
+        or (orig is not None and _is_lock_not_available_error(orig))
+        or _is_sync_closed_connection_error(exc)
+    )
+
+
 # PG SQLSTATEs that signal "object already exists" — fired when a concurrent
 # worker created the same DDL object between our existence check and our
 # CREATE attempt. PG's IF NOT EXISTS clause is not perfectly race-free at the
@@ -1661,6 +1751,63 @@ async def managed_nested_transaction(conn: DbResource):
     """
     async with managed_transaction(conn) as active_conn:
         yield active_conn
+
+
+_T = TypeVar("_T")
+
+
+async def provisioning_write_with_retry(
+    engine: DbResource,
+    fn: Callable[[Any], Awaitable["_T"]],
+    *,
+    attempts: int = 3,
+    lock_backoff: float = 1.0,
+) -> "_T":
+    """Run ``fn(conn)`` in a short committed transaction, retrying on transient errors.
+
+    Designed for idempotent provisioning operations that follow a long GCP API
+    call window, during which the pooled connection may have been closed by
+    ``idle_in_transaction_session_timeout`` or a lock-wait may have fired.
+
+    Each retry acquires a FRESH connection from the pool — the stale or
+    lock-blocked one is never reused.  Works with both async (``AsyncEngine`` /
+    asyncpg) and sync (``Engine`` / psycopg2) engines via
+    :func:`managed_transaction`.
+
+    ``lock_backoff`` controls the sleep before retrying a
+    ``LockNotAvailableError``: ``lock_backoff * attempt`` seconds, giving PG
+    time to release the conflicting lock.  Transient connection-closed errors
+    use a zero-length yield (``asyncio.sleep(0)``) — the connection is simply
+    dead and a fresh one is available immediately from the pool.
+
+    Must NOT be used for non-idempotent writes.  The caller is responsible for
+    ON CONFLICT / upsert semantics.
+    """
+    for attempt in range(attempts):
+        try:
+            async with managed_transaction(engine) as conn:
+                return await fn(conn)
+        except Exception as exc:
+            orig = getattr(exc, "orig", None)
+            if is_transient_db_error(exc):
+                if attempt < attempts - 1:
+                    is_lock = _is_lock_not_available_error(exc) or (
+                        orig is not None and _is_lock_not_available_error(orig)
+                    )
+                    delay = lock_backoff * (attempt + 1) if is_lock else 0.0
+                    logger.warning(
+                        "provisioning_write_retry "
+                        "attempt=%d/%d exc=%s cause=%s delay=%.1fs; retrying on fresh connection",
+                        attempt + 1,
+                        attempts,
+                        exc.__class__.__name__,
+                        orig.__class__.__name__ if orig is not None else "none",
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+            raise
+    raise AssertionError("provisioning_write_with_retry: exhausted attempts without raising")
 
 
 def run_in_event_loop(awaitable: Awaitable[R]) -> R:
