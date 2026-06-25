@@ -213,6 +213,8 @@ def _build_list_observations_query(
         "offset": raw_params["offset"],
     }
     
+    needs_systems_join = False
+    
     datetime_str = raw_params.get("datetime")
     if datetime_str:
         if "/" in datetime_str:
@@ -236,13 +238,28 @@ def _build_list_observations_query(
             conditions.append("o.phenomenon_time = :dt")
             bind_params["dt"] = dt
     
+    bbox = raw_params.get("bbox")
+    if bbox:
+        xmin, ymin, xmax, ymax = bbox
+        conditions.append("s.geometry IS NOT NULL")
+        conditions.append("ST_Intersects(s.geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))")
+        bind_params["xmin"] = xmin
+        bind_params["ymin"] = ymin
+        bind_params["xmax"] = xmax
+        bind_params["ymax"] = ymax
+        needs_systems_join = True
+    
     where_clause = " AND ".join(conditions)
+    
+    systems_join = "JOIN consys.systems s ON s.id = ds.system_id AND s.catalog_id = ds.catalog_id" if needs_systems_join else ""
+    
     sql = text(
         f"""
         SELECT o.id, o.catalog_id, o.datastream_id, o.phenomenon_time, o.result_time,
                o.result_value, o.result_quality, o.parameters
         FROM consys.observations o
         JOIN consys.datastreams ds ON ds.id = o.datastream_id AND ds.catalog_id = o.catalog_id
+        {systems_join}
         WHERE {where_clause}
         ORDER BY o.phenomenon_time DESC
         LIMIT :limit OFFSET :offset;
@@ -515,6 +532,7 @@ async def list_observations(
     limit: int = 100,
     offset: int = 0,
     datetime: Optional[str] = None,
+    bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> List[Observation]:
     params = {
         "catalog_id": catalog_id,
@@ -522,6 +540,7 @@ async def list_observations(
         "limit": limit,
         "offset": offset,
         "datetime": datetime,
+        "bbox": bbox,
     }
     
     executor = DQLQuery.from_builder(

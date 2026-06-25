@@ -296,6 +296,22 @@ def test_observations_brin_index_ddl():
     assert "phenomenon_time" in CONSYS_OBSERVATIONS_IDX_DDL
 
 
+def test_systems_geometry_gist_index_ddl():
+    from dynastore.modules.connected_systems.ddl import CONSYS_SYSTEMS_GEOM_IDX_DDL
+
+    assert "systems_geometry_idx" in CONSYS_SYSTEMS_GEOM_IDX_DDL
+    assert "GIST" in CONSYS_SYSTEMS_GEOM_IDX_DDL
+    assert "geometry" in CONSYS_SYSTEMS_GEOM_IDX_DDL
+
+
+def test_deployments_geometry_gist_index_ddl():
+    from dynastore.modules.connected_systems.ddl import CONSYS_DEPLOYMENTS_GEOM_IDX_DDL
+
+    assert "deployments_geometry_idx" in CONSYS_DEPLOYMENTS_GEOM_IDX_DDL
+    assert "GIST" in CONSYS_DEPLOYMENTS_GEOM_IDX_DDL
+    assert "geometry" in CONSYS_DEPLOYMENTS_GEOM_IDX_DDL
+
+
 # ---------------------------------------------------------------------------
 # DB functions — async stubs (no live DB)
 # ---------------------------------------------------------------------------
@@ -378,6 +394,57 @@ async def test_list_observations_with_open_interval():
         )
         assert result == []
         mock_builder.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_list_systems_with_bbox():
+    from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
+
+    conn = AsyncMock()
+    bbox = (10.0, 40.0, 15.0, 45.0)
+    
+    with patch.object(
+        DQLQuery, "__init__", return_value=None
+    ) as mock_init, patch.object(
+        DQLQuery, "execute", new_callable=AsyncMock, return_value=[]
+    ) as mock_execute:
+        result = await consys_db.list_systems(conn, "cat1", limit=10, offset=0, bbox=bbox)
+        
+        mock_init.assert_called_once()
+        call_args = str(mock_init.call_args)
+        assert "ST_Intersects" in call_args
+        assert "ST_MakeEnvelope" in call_args
+        mock_execute.assert_called_once()
+    
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_observations_with_bbox():
+    from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
+
+    conn = AsyncMock()
+    bbox = (10.0, 40.0, 15.0, 45.0)
+    
+    with patch.object(
+        DQLQuery, "__init__", return_value=None
+    ) as mock_init, patch.object(
+        DQLQuery, "execute", new_callable=AsyncMock, return_value=[]
+    ) as mock_execute:
+        result = await consys_db.list_observations(
+            conn, "cat1", "ds-001", limit=10, offset=0, bbox=bbox
+        )
+        
+        mock_init.assert_called_once()
+        call_args = str(mock_init.call_args)
+        assert "ST_Intersects" in call_args
+        assert "ST_MakeEnvelope" in call_args
+        assert "consys.systems" in call_args
+        mock_execute.assert_called_once()
+    
+    assert result == []
 
 
 @pytest.mark.asyncio

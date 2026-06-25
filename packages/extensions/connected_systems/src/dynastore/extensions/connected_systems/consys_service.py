@@ -25,7 +25,7 @@ Scoped per catalog; all write endpoints respect the catalog-readiness guard.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Optional
+from typing import FrozenSet, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
 from sqlalchemy.exc import IntegrityError
@@ -51,6 +51,7 @@ from dynastore.modules.connected_systems.models import (
     SystemUpdate,
 )
 from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.geospatial import parse_bbox_string
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +455,10 @@ class ConnectedSystemsService(
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         datetime: Optional[str] = Query(None, description="Temporal filter (ISO 8601 instant or interval)."),
+        bbox: Optional[str] = Query(
+            None,
+            description="Bounding box filter (xmin,ymin,xmax,ymax in EPSG:4326). Filters by parent system geometry.",
+        ),
         conn: AsyncConnection = Depends(get_async_connection),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[Observation]:
@@ -461,8 +466,13 @@ class ConnectedSystemsService(
         ds = await consys_db.get_datastream(conn, catalog_id, datastream_id)
         if not ds:
             raise HTTPException(status_code=404, detail="DataStream not found.")
+        
+        parsed_bbox: Optional[Tuple[float, float, float, float]] = None
+        if bbox:
+            parsed_bbox = parse_bbox_string(bbox)
+        
         return await consys_db.list_observations(
-            conn, catalog_id, datastream_id, limit=limit, offset=offset, datetime=datetime
+            conn, catalog_id, datastream_id, limit=limit, offset=offset, datetime=datetime, bbox=parsed_bbox
         )
 
     async def create_observation(

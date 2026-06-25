@@ -108,6 +108,16 @@ CONSYS_OBSERVATIONS_IDX_DDL = """
     ON consys.observations USING BRIN (phenomenon_time);
 """
 
+CONSYS_SYSTEMS_GEOM_IDX_DDL = """
+    CREATE INDEX IF NOT EXISTS systems_geometry_idx
+    ON consys.systems USING GIST (geometry);
+"""
+
+CONSYS_DEPLOYMENTS_GEOM_IDX_DDL = """
+    CREATE INDEX IF NOT EXISTS deployments_geometry_idx
+    ON consys.deployments USING GIST (geometry);
+"""
+
 CONSYS_FK_DATASTREAM_SYSTEM_DDL = """
 DO $$
 BEGIN
@@ -183,6 +193,8 @@ class ConnectedSystemsModule(ModuleProtocol):
                     await DDLQuery(CONSYS_DATASTREAMS_DDL).execute(conn)
                     await DDLQuery(CONSYS_OBSERVATIONS_DDL).execute(conn)
                     await DDLQuery(CONSYS_OBSERVATIONS_IDX_DDL).execute(conn)
+                    await DDLQuery(CONSYS_SYSTEMS_GEOM_IDX_DDL).execute(conn)
+                    await DDLQuery(CONSYS_DEPLOYMENTS_GEOM_IDX_DDL).execute(conn)
                     await DDLQuery(CONSYS_FK_DATASTREAM_SYSTEM_DDL).execute(conn)
                     await DDLQuery(CONSYS_FK_OBSERVATION_DATASTREAM_DDL).execute(conn)
                     await DDLQuery(CONSYS_FK_DEPLOYMENT_SYSTEM_DDL).execute(conn)
