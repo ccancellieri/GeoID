@@ -785,16 +785,30 @@ class CatalogService(CatalogsProtocol):
         external_id: str,
         allow_missing: bool = False,
     ) -> Optional[str]:
-        """Resolve the immutable internal ``id`` for a catalog from its public ``external_id``.
+        """Resolve the immutable internal ``id`` for a catalog.
 
-        Authoritative source: the ``catalog.catalogs`` registry. Goes through
-        ``_catalog_external_id_cache`` — a lossless string cache. The cache is
-        a pure accelerator; on any miss the registry SELECT is the source of
-        truth.
+        Accepts either a public ``external_id`` or an already-internal ``id`` and
+        is **idempotent**: given an internal id it returns that id unchanged.
 
-        Returns the internal id string, or ``None`` / raises ``ValueError``
-        depending on ``allow_missing``.
+        Resolution is **internal-first**: ``id`` is the immutable, unambiguous PK,
+        so a direct id hit is authoritative and returned as-is.  Only when the
+        argument is not a known internal id is it interpreted as a public
+        ``external_id``.  The reverse order is unsafe — an already-internal id
+        passed straight to the external resolver can collide with a *different*
+        catalog whose ``external_id`` happens to equal that id (legacy
+        ``c_…``-shaped external_ids observed on dev), silently routing to — or
+        JIT-creating — the wrong catalog.  Mirrors ``resolve_physical_schema``.
+
+        Both lookups go through lossless string caches — pure accelerators; on
+        any miss the registry SELECT is the source of truth.  Returns the internal
+        id string, or ``None`` / raises ``ValueError`` depending on
+        ``allow_missing``.
         """
+        # Internal-first: ``id`` IS the schema name, so a direct id hit is
+        # authoritative and the resolver is idempotent for already-internal ids.
+        if await _physical_schema_cache(self, external_id):
+            return external_id
+        # Not a known internal id — interpret as a public external_id.
         internal_id = await _catalog_external_id_cache(self, external_id)
         if not internal_id and not allow_missing:
             raise ValueError(f"Catalog '{external_id}' not found.")

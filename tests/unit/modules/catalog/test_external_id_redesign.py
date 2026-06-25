@@ -1200,3 +1200,96 @@ class TestItemReadProjectsExternalCollectionId:
         assert call_count == 1
         for f in features:
             assert f.__pydantic_extra__["collection"] == "my_collection"
+
+
+# ---------------------------------------------------------------------------
+# Regression — resolve_catalog_id is internal-first / idempotent
+# ---------------------------------------------------------------------------
+#
+# An already-internal catalog id (e.g. the asset-upload flow pre-resolves the
+# external label to the immutable internal id before minting the upload URL)
+# was fed to the JIT provisioning gate, which called resolve_catalog_id() →
+# ensure_catalog_exists().  The old external-only resolver could not recognise
+# an internal id, reported "missing", and JIT-created a *phantom* catalog whose
+# external_id equalled the real catalog's internal id.  Subsequent get_catalog()
+# then resolved to the never-ready phantom → 500 "storage is still being
+# provisioned".  resolve_catalog_id is now internal-first (mirrors
+# resolve_physical_schema): a direct id hit is authoritative and returned as-is.
+class TestResolveCatalogIdInternalFirst:
+    """resolve_catalog_id accepts both id-spaces and never JIT-creates a phantom."""
+
+    @pytest.mark.asyncio
+    async def test_already_internal_id_returned_unchanged(self):
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        with patch.object(
+            cs, "_physical_schema_cache", AsyncMock(return_value="c_internal1")
+        ) as ps, patch.object(
+            cs, "_catalog_external_id_cache", AsyncMock(return_value=None)
+        ) as ext:
+            result = await svc.resolve_catalog_id("c_internal1", allow_missing=True)
+
+        assert result == "c_internal1"
+        ps.assert_awaited_once_with(svc, "c_internal1")
+        # A known-internal id must NOT fall through to the external resolver,
+        # where a colliding phantom external_id could hijack resolution.
+        ext.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_external_label_resolves_to_internal(self):
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        with patch.object(
+            cs, "_physical_schema_cache", AsyncMock(return_value=None)
+        ), patch.object(
+            cs, "_catalog_external_id_cache", AsyncMock(return_value="c_internal1")
+        ):
+            result = await svc.resolve_catalog_id("cat_friendly_label", allow_missing=True)
+
+        assert result == "c_internal1"
+
+    @pytest.mark.asyncio
+    async def test_missing_returns_none_when_allowed(self):
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        with patch.object(
+            cs, "_physical_schema_cache", AsyncMock(return_value=None)
+        ), patch.object(
+            cs, "_catalog_external_id_cache", AsyncMock(return_value=None)
+        ):
+            result = await svc.resolve_catalog_id("nope", allow_missing=True)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_missing_raises_when_not_allowed(self):
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        with patch.object(
+            cs, "_physical_schema_cache", AsyncMock(return_value=None)
+        ), patch.object(
+            cs, "_catalog_external_id_cache", AsyncMock(return_value=None)
+        ):
+            with pytest.raises(ValueError):
+                await svc.resolve_catalog_id("nope", allow_missing=False)
+
+    @pytest.mark.asyncio
+    async def test_ensure_catalog_exists_does_not_recreate_internal_id(self):
+        """The phantom-catalog regression: given an already-internal id,
+        ensure_catalog_exists must short-circuit and never create a catalog."""
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        svc.create_catalog = AsyncMock()
+        with patch.object(
+            cs, "_physical_schema_cache", AsyncMock(return_value="c_internal1")
+        ), patch.object(
+            cs, "_catalog_external_id_cache", AsyncMock(return_value=None)
+        ):
+            await svc.ensure_catalog_exists("c_internal1")
+
+        svc.create_catalog.assert_not_called()
