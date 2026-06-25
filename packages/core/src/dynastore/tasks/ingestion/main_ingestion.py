@@ -526,6 +526,14 @@ async def run_ingestion_task(
         catalog_id, collection_id, lang=task_request.lang, ctx=DriverContext(db_resource=engine)
     )
 
+    # Best-effort reap of orphaned extraction dirs left by prior crashed tasks
+    # on this shared temp volume.  A failure here must never abort ingestion.
+    try:
+        from dynastore.tasks.ingestion.temp_reaper import reap_orphan_task_dirs
+        await reap_orphan_task_dirs(engine)
+    except Exception:
+        logger.warning("temp_reaper: sweep failed — continuing ingestion", exc_info=True)
+
     logger.info(f"Task '{task_id}': Beginning main ingestion process.")
     try:
         # --- Fetch Physical Configuration (Immutable Storage) ---
@@ -901,6 +909,8 @@ async def run_ingestion_task(
             source_file_path,
             encoding=task_request.encoding,
             content_type=source_content_type,
+            task_id=task_id,
+            task_schema=phys_schema,
         ) as reader:
             sliced_reader = itertools.islice(
                 reader,

@@ -51,6 +51,7 @@ from dynastore.models.protocols.eventing import EventingProtocol
 from dynastore.models.protocols.gcp_provisioning import GcpCatalogProvisioning
 from dynastore.models.protocols.events import EventsProtocol
 from dynastore.models.protocols.tasks import TasksProtocol
+from dynastore.models.protocols.temp_dir import TempDirProtocol, DefaultTempDir, TASK_DIR_PREFIX
 from dynastore.models.protocols.task_queue import TaskQueueProtocol
 from dynastore.models.protocols.event_bus import EventBusProtocol
 from dynastore.models.protocols.event_driver import EventDriverProtocol
@@ -164,6 +165,9 @@ __all__ = [
     "GcpCatalogProvisioning",
     "EventsProtocol",
     "TasksProtocol",
+    "TempDirProtocol",
+    "DefaultTempDir",
+    "TASK_DIR_PREFIX",
     "TaskQueueProtocol",
     "EventBusProtocol",
     "EventDriverProtocol",

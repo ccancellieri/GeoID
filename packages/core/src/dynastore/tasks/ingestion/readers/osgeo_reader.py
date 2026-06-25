@@ -35,9 +35,13 @@ codebase).
 from __future__ import annotations
 
 import contextlib
+import glob
 import json
 import logging
-from typing import Any, ClassVar, Iterable, Iterator, Tuple
+import os
+import shutil
+import zipfile
+from typing import Any, ClassVar, Generator, Iterable, Iterator, Tuple
 
 # Hard-import gates registration.  When module_gdal isn't installed
 # (most worker scopes), the ImportError prevents this module's
@@ -54,6 +58,21 @@ logger = logging.getLogger(__name__)
 # Initialize once.  Idempotent — safe to call repeatedly.
 ogr.UseExceptions()
 gdal.UseExceptions()
+
+
+def _resolve_temp_dir():
+    """Return the registered ``TempDirProtocol`` implementation.
+
+    Falls back to ``DefaultTempDir`` when no implementation is registered so
+    the reader works out of the box on plain local disk and on-premise deployments.
+    """
+    try:
+        from dynastore.tools.protocol_helpers import resolve
+        from dynastore.models.protocols.temp_dir import TempDirProtocol
+        return resolve(TempDirProtocol)
+    except Exception:  # noqa: BLE001 — protocol is optional
+        from dynastore.models.protocols.temp_dir import DefaultTempDir
+        return DefaultTempDir()
 
 
 class GdalOsgeoReader(SourceReaderProtocol):
@@ -172,15 +191,42 @@ class GdalOsgeoReader(SourceReaderProtocol):
         encoding: str = "utf-8",
         content_type: str | None = None,
         **opts: Any,
-    ) -> Iterator[Iterable[dict]]:
+    ) -> Generator[Iterable[dict], None, None]:
         from dynastore.tools.mime import ext_from_content_type
         is_zip = (ext_from_content_type(content_type) or "").lower() == ".zip"
-        path = self._to_gdal_uri(uri, is_zip=is_zip or None)
+        if is_zip is None or not is_zip:
+            is_zip = _to_vsigs(uri).lower().endswith(".zip")
+
         # OGR doesn't honour `encoding=` directly — set via config option.
         # Most modern drivers (Parquet, FGB, GeoJSON, GPKG) are UTF-8 by
         # spec; this only matters for shapefile dbf / CSV.
         prev_enc = gdal.GetConfigOption("SHAPE_ENCODING")
         gdal.SetConfigOption("SHAPE_ENCODING", encoding.upper())
+        try:
+            # A zipped shapefile read in-place over ``/vsizip//vsigs/`` forces
+            # GDAL to decompress the archive member into memory and keep it
+            # resident for the random access the .shx index drives — so reading
+            # a large layer grows RSS with the read progress and OOMs the worker
+            # mid-stream. Instead extract the archive ONCE to the local temp
+            # disk, so feature iteration does bounded range reads.
+            if is_zip:
+                task_id: str | None = opts.get("task_id")
+                task_schema: str | None = opts.get("task_schema")
+                with self._extract_archive_to_local(
+                    uri, task_id=task_id, task_schema=task_schema
+                ) as local_dir:
+                    path = self._find_local_dataset(local_dir)
+                    yield from self._open_path_and_iter(path)
+            else:
+                path = self._to_gdal_uri(uri, is_zip=False)
+                yield from self._open_path_and_iter(path)
+        finally:
+            if prev_enc is None:
+                gdal.SetConfigOption("SHAPE_ENCODING", "")
+            else:
+                gdal.SetConfigOption("SHAPE_ENCODING", prev_enc)
+
+    def _open_path_and_iter(self, path: str) -> Iterator[Iterable[dict]]:
         ds = ogr.Open(path)
         if ds is None:
             raise RuntimeError(
@@ -196,10 +242,114 @@ class GdalOsgeoReader(SourceReaderProtocol):
             yield self._iter_features(ds)
         finally:
             ds = None  # noqa: F841 — release the dataset / file handle
-            if prev_enc is None:
-                gdal.SetConfigOption("SHAPE_ENCODING", "")
-            else:
-                gdal.SetConfigOption("SHAPE_ENCODING", prev_enc)
+
+    @contextlib.contextmanager
+    def _extract_archive_to_local(
+        self,
+        uri: str,
+        *,
+        task_id: str | None = None,
+        task_schema: str | None = None,
+    ) -> Generator[str, None, None]:
+        """Stream a (possibly remote) zip archive to the local temp disk and
+        extract it, yielding the extraction directory.
+
+        The scratch directory is allocated via ``TempDirProtocol.mkdtemp()``
+        so the root and the naming convention are controlled by the deployment
+        (GCSFuse mount, NFS share, or plain local disk on-premise).  The
+        protocol's ``TASK_DIR_PREFIX`` ensures the reaper can glob all task
+        scratch dirs regardless of which task type created them.
+
+        A ``.owner`` JSON sidecar is written immediately after the directory
+        is created so a liveness-aware reaper can decide whether to reclaim
+        an abandoned directory.  The directory is always cleaned up on exit.
+        """
+        src = _to_vsigs(uri)
+        tmp_provider = _resolve_temp_dir()
+        work_dir = tmp_provider.mkdtemp(task_id=task_id, task_schema=task_schema)
+        try:
+            # Write the owner sidecar before any heavy I/O so an OOM mid-copy
+            # still leaves an attributable directory for the reaper.
+            try:
+                owner_path = os.path.join(work_dir, ".owner")
+                with open(owner_path, "w") as _f:
+                    json.dump({"task_id": task_id, "schema": task_schema}, _f)
+            except Exception:  # noqa: BLE001
+                pass  # sidecar is best-effort; extraction must not fail here
+
+            local_zip = os.path.join(work_dir, "source.zip")
+            self._vsi_copy(src, local_zip)
+            extract_dir = os.path.join(work_dir, "extracted")
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(local_zip) as zf:
+                self._safe_extractall(zf, extract_dir)
+            # The archive copy is no longer needed once expanded — drop it so it
+            # does not occupy the temp volume during the (long) read.
+            try:
+                os.remove(local_zip)
+            except OSError:
+                pass
+            logger.info(
+                "GdalOsgeoReader: extracted %r → %s (in-memory /vsizip avoided)",
+                src, extract_dir,
+            )
+            yield extract_dir
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    @staticmethod
+    def _safe_extractall(zf: zipfile.ZipFile, dest: str) -> None:
+        """Extract every member of *zf* into *dest*, rejecting any entry whose
+        path would escape *dest* (Zip-Slip / path traversal). Source archives
+        are operator/uploaded content, so a crafted ``../`` member must not be
+        allowed to write outside the extraction directory.
+        """
+        dest_abs = os.path.abspath(dest)
+        for member in zf.infolist():
+            target = os.path.abspath(os.path.join(dest, member.filename))
+            if target != dest_abs and not target.startswith(dest_abs + os.sep):
+                raise RuntimeError(
+                    "GdalOsgeoReader: refusing archive entry that escapes the "
+                    f"extraction directory (possible Zip-Slip): {member.filename!r}"
+                )
+        zf.extractall(dest)
+
+    @staticmethod
+    def _vsi_copy(src_vsi: str, dst_path: str, chunk: int = 8 * 1024 * 1024) -> None:
+        """Copy a GDAL-VSI-readable source to a local path in bounded chunks."""
+        fh = gdal.VSIFOpenL(src_vsi, "rb")
+        if fh is None:
+            raise RuntimeError(
+                f"GdalOsgeoReader: cannot open source {src_vsi!r} to stage locally."
+            )
+        try:
+            with open(dst_path, "wb") as out:
+                while True:
+                    buf = gdal.VSIFReadL(1, chunk, fh)
+                    if not buf:
+                        break
+                    out.write(buf)
+        finally:
+            gdal.VSIFCloseL(fh)
+
+    @staticmethod
+    def _find_local_dataset(extract_dir: str) -> str:
+        """Locate the openable vector dataset inside an extracted archive.
+
+        Prefers an explicit geospatial file (shapefile first — the common
+        archived format), searching nested directories. Falls back to the
+        directory itself so OGR's shapefile driver can introspect it.
+        """
+        for pat in (
+            "*.shp", "*.gpkg", "*.geojson", "*.json",
+            "*.fgb", "*.gml", "*.tab", "*.gdb",
+        ):
+            hits = sorted(
+                glob.glob(os.path.join(extract_dir, "**", pat), recursive=True)
+            )
+            if hits:
+                return hits[0]
+        return extract_dir
 
     @staticmethod
     def _iter_features(ds: Any) -> Iterator[dict]:
