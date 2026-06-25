@@ -219,6 +219,55 @@ def _merge_index_results(
             accumulated[indexer_id] = bulk_res
 
 
+# Per-batch memory budgeting -------------------------------------------------
+#
+# A batch is flushed when EITHER an explicit row cap (database_batch_size) OR an
+# accumulated-geometry budget (max_batch_memory_mb) is reached — whichever comes
+# first. The memory budget keeps a handful of very large geometries (e.g.
+# administrative multipolygons) from exhausting the container before a fixed row
+# count is ever hit. Cost is dominated by geometry coordinates, so a feature's
+# footprint is approximated by counting its coordinate ordinates; each is carried
+# as a Python float (~24 bytes) inside nested lists, plus a flat per-feature
+# overhead for the properties dict.
+_FEATURE_BASE_BYTES = 512
+_BYTES_PER_COORD_ORDINATE = 24
+
+
+def _count_coordinate_ordinates(value: Any) -> int:
+    """Total scalar ordinates in a (possibly deeply nested) GeoJSON
+    ``coordinates`` array. Iterative to stay cheap on dense geometries."""
+    total = 0
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (list, tuple)):
+            if node and isinstance(node[0], (int, float)):
+                total += len(node)
+            else:
+                stack.extend(node)
+        elif isinstance(node, (int, float)):
+            total += 1
+    return total
+
+
+def _estimate_feature_bytes(feature: Any) -> int:
+    """Rough, geometry-dominated estimate of a prepared feature's in-memory
+    footprint, used to bound a batch by accumulated bytes so a few very large
+    geometries cannot blow the container's memory before the row-count cap."""
+    if not isinstance(feature, dict):
+        return _FEATURE_BASE_BYTES
+    geom = feature.get("geometry")
+    ordinates = 0
+    if isinstance(geom, dict):
+        if geom.get("type") == "GeometryCollection":
+            for g in geom.get("geometries") or ():
+                if isinstance(g, dict):
+                    ordinates += _count_coordinate_ordinates(g.get("coordinates"))
+        else:
+            ordinates += _count_coordinate_ordinates(geom.get("coordinates"))
+    return _FEATURE_BASE_BYTES + ordinates * _BYTES_PER_COORD_ORDINATE
+
+
 # Canonical items-schema data types that denote a temporal value. A property
 # declared as one of these is coerced from common string representations to a
 # canonical ISO-8601 string during ingestion — see ``apply_temporal_coercion``.
@@ -739,8 +788,15 @@ async def run_ingestion_task(
         except Exception as e:
             logger.warning(f"Could not determine total feature count: {e}")
 
-        batch_size = task_request.database_batch_size or 500
+        # Flush a batch on whichever limit is reached first: an explicit row cap
+        # (database_batch_size, default 500) or an accumulated-geometry memory
+        # budget (max_batch_memory_mb, default 100 MB). The memory budget is what
+        # auto-shrinks batches for geometry-heavy sources (e.g. admin
+        # multipolygons) so a fixed row count cannot exhaust the container.
+        row_cap = task_request.database_batch_size or 500
+        mem_budget_bytes = max(1, task_request.max_batch_memory_mb) * 1024 * 1024
         current_batch = []
+        current_batch_bytes = 0
         rows_ingested = 0
         # Accumulate per-indexer BulkResult totals across all batches so we can
         # classify secondary-index health at the end of the loop.
@@ -927,8 +983,12 @@ async def run_ingestion_task(
             for idx, raw_record in enumerate(sliced_reader, start=task_request.offset):
                 feature = prepare_record_for_upsert(dict(raw_record), task_request)
                 current_batch.append(feature)
+                current_batch_bytes += _estimate_feature_bytes(feature)
 
-                if len(current_batch) >= batch_size:
+                if (
+                    len(current_batch) >= row_cap
+                    or current_batch_bytes >= mem_budget_bytes
+                ):
                     upsert_ctx = DriverContext(db_resource=engine)
                     upsert_result = await catalog_module.upsert(
                         catalog_id,
@@ -954,6 +1014,7 @@ async def run_ingestion_task(
                         )
                     )
                     current_batch = []
+                    current_batch_bytes = 0
 
             if current_batch:
                 upsert_ctx = DriverContext(db_resource=engine)
