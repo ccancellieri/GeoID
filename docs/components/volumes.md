@@ -1,5 +1,18 @@
 # The 3D GeoVolumes Extension
 
+## Implementation Status
+
+**OGC Conformance**: Working Draft (Part 1)
+
+**Status**: 🚧 Working Draft
+
+**Known Gaps**:
+- [Config resolution from ConfigsProtocol](https://github.com/un-fao/GeoID/issues/2404) - Per-collection config not wired up
+- [Persistent tile cache](https://github.com/un-fao/GeoID/issues/2407) - In-memory only, lost on restart
+- [EmptyBoundsSource default](https://github.com/un-fao/GeoID/issues/XXXX) - SidecarBoundsSource must be explicitly registered
+
+**Last Updated**: 2025-06-26
+
 The `volumes` extension implements a working-draft of **OGC API – 3D GeoVolumes
 Part 1** for DynaStore. It serves 3D tile content (B3DM + glTF 2.0) derived
 from feature geometry stored in PostGIS, suitable for consumption by Cesium,

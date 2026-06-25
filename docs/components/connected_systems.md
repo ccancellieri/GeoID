@@ -1,5 +1,17 @@
 # The Connected Systems Extension
 
+## Implementation Status
+
+**OGC Conformance**: Part 1
+
+**Status**: ✅ Production-Ready
+
+**Known Gaps**:
+- [SamplingFeature support](https://github.com/un-fao/GeoID/issues/XXXX) - Sampling features not yet modelled
+- [Spatial/temporal filtering](https://github.com/un-fao/GeoID/issues/XXXX) - List endpoints lack bbox and phenomenon_time filters
+
+**Last Updated**: 2025-06-26
+
 The `connected_systems` extension implements **OGC API – Connected Systems
 Part 1**. It provides a REST surface for registering IoT sensors, weather
 stations, and field devices — the successor domain to the SensorThings API —
@@ -72,9 +84,9 @@ observation validates that its parent datastream exists. Duplicate
 - **No spatial or temporal filtering** — list endpoints page by
   `catalog_id` only; there is no `bbox`, geometry, or `phenomenon_time`
   window filter. Clients must post-filter.
-- **Parent links are not enforced by the database** — `deployment.system_id`,
-  `datastream.system_id`, and `observation.datastream_id` are validated in
-  the service layer rather than by foreign-key constraints.
+- **Parent links FK constraints added (PR pending)** — `deployment.system_id`,
+  `datastream.system_id`, and `observation.datastream_id` now have foreign-key
+  constraints implemented (awaiting merge).
 
 ## Key files
 

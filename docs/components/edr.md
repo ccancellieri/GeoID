@@ -1,5 +1,18 @@
 # The EDR Extension
 
+## Implementation Status
+
+**OGC Conformance**: Part 1 v1.1
+
+**Status**: ⚠️ Partial Implementation
+
+**Known Gaps**:
+- [Vertical level (z) support](https://github.com/un-fao/GeoID/issues/2399) - Parameter accepted but ignored
+- [Output CRS reprojection](https://github.com/un-fao/GeoID/issues/2399) - Output in raster native CRS only
+- [Locations endpoints](https://github.com/un-fao/GeoID/issues/XXXX) - Stub implementations (empty list, 404)
+
+**Last Updated**: 2025-06-26
+
 The `edr` extension implements **OGC API – Environmental Data Retrieval (EDR)
 Part 1 v1.1** for DynaStore. It exposes raster data (GeoTIFF, COG, or any
 GDAL-readable format stored as STAC item assets) through point, area, and

@@ -1,5 +1,17 @@
 # The Moving Features Extension
 
+## Implementation Status
+
+**OGC Conformance**: Part 1
+
+**Status**: ⚠️ Partial Implementation
+
+**Known Gaps**:
+- [Spatial queries on trajectories](https://github.com/un-fao/GeoID/issues/2401) - No bbox/geometry filter on tgsequence endpoints
+- [FK constraint on mf_id](https://github.com/un-fao/GeoID/issues/XXXX) - No database-level foreign key (cascade in service layer)
+
+**Last Updated**: 2025-06-26
+
 The `moving_features` extension implements **OGC API – Moving Features Part 1**
 (approved February 2026) for DynaStore. It stores and retrieves features whose
 position changes over time as sequences of (timestamp, coordinate) pairs.

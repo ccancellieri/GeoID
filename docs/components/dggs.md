@@ -1,5 +1,16 @@
 # The DGGS Extension
 
+## Implementation Status
+
+**OGC Conformance**: Part 1
+
+**Status**: ✅ Production-Ready
+
+**Known Gaps**:
+- [Antimeridian handling for H3](https://github.com/un-fao/GeoID/issues/XXXX) - Cells straddling antimeridian produce incorrect bboxes
+
+**Last Updated**: 2025-06-26
+
 The `dggs` extension implements **OGC API – Discrete Global Grid Systems
 (DGGS) Part 1** for DynaStore. It aggregates vector collection features into
 DGGS zones (hexagonal H3 or quadrilateral S2 cells) and returns per-zone
@@ -128,9 +139,9 @@ import error.
    from H3 polygon vertices using `min/max`. Cells straddling the antimeridian
    produce incorrect bounding boxes. S2 is correct (`rect_bound_for_cell` with
    full-range fallback).
-2. **Temporal filter is equality-only** — the `_build_query` helper uses
-   `FilterOperator.EQ`; open intervals (`"2024-01-01/.."`) are not handled at
-   the DB layer.
+2. **Temporal filter supports all interval formats (PR pending)** — open intervals
+   (`"2024-01-01/.."`) and other interval formats are now supported at the DB layer
+   (awaiting merge).
 3. **`bbox_to_cells` utilities unused** — both indexers implement this helper
    but the service uses GIST bbox scans with post-filtering instead of
    covering-cell pre-computation.
