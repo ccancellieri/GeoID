@@ -40,7 +40,7 @@ EXPECTED_PASS1_WEB_URIS = {
 
 EXPECTED_PASS1_MAPS_URIS = {
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",       # T7
-    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/geotiff",    # T7
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tiff",       # T7 (Maps uses tiff; geotiff is a Coverages class)
 }
 
 EXPECTED_PASS1_STYLES_URIS = {
@@ -109,7 +109,7 @@ def _read_styles_conformance_uris_from_source() -> set:
     )
 
 
-def test_maps_declares_jpeg_and_geotiff_conformance():
+def test_maps_declares_jpeg_and_tiff_conformance():
     declared = _read_maps_conformance_uris_from_source()
     missing = EXPECTED_PASS1_MAPS_URIS - declared
     assert not missing, f"Maps extension missing Pass 1 URIs: {sorted(missing)}"
