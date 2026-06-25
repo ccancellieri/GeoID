@@ -53,7 +53,7 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import (
     ConsumerType,
 )
 from dynastore.tools.discovery import get_protocol
-from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.db import validate_sql_identifier, validate_column_identifier
 from dynastore.models.query_builder import QueryRequest, QueryResponse
 from dynastore.modules.catalog.query_optimizer import QueryOptimizer
 
@@ -836,9 +836,12 @@ class ItemQueryMixin:
                 sidecar = SidecarRegistry.get_sidecar(sc)
                 if sidecar is None:
                     continue
-                sc_table = f"{phys_table}_{sidecar.sidecar_id}"
+                # Validate identifiers before SQL interpolation (#2314)
+                fid_col = validate_column_identifier(sc.feature_id_field_name)
+                sc_id = validate_column_identifier(str(sidecar.sidecar_id))
+                sc_table = f"{phys_table}_{sc_id}"
                 ext_id = await DQLQuery(
-                    f'SELECT s.{sc.feature_id_field_name} '
+                    f'SELECT s.{fid_col} '
                     f'FROM "{phys_schema}"."{phys_table}" h '
                     f'JOIN "{phys_schema}"."{sc_table}" s '
                     f"ON s.geoid = h.geoid "
@@ -1190,7 +1193,10 @@ class ItemQueryMixin:
                         sidecar = SidecarRegistry.get_sidecar(sc)
                         if sidecar is None:
                             continue
-                        sc_table = f"{phys_table}_{sidecar.sidecar_id}"
+                        # Validate identifiers before SQL interpolation (#2314)
+                        fid_col = validate_column_identifier(sc.feature_id_field_name)
+                        sc_id = validate_column_identifier(str(sidecar.sidecar_id))
+                        sc_table = f"{phys_table}_{sc_id}"
                         # Soft-delete ALL hub rows linked to this external_id via the sidecar.
                         # DQLQuery handles both async/sync conns uniformly.
                         deleted_geoids = [
@@ -1198,7 +1204,7 @@ class ItemQueryMixin:
                                 f'UPDATE "{phys_schema}"."{phys_table}" h '
                                 f"SET deleted_at = NOW() "
                                 f'FROM "{phys_schema}"."{sc_table}" s '
-                                f"WHERE s.{sc.feature_id_field_name} = :ext_id "
+                                f"WHERE s.{fid_col} = :ext_id "
                                 f"AND h.deleted_at IS NULL "
                                 f"AND h.geoid = s.geoid "
                                 f"RETURNING h.geoid",
