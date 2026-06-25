@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.db import get_async_connection
 
-from dynastore.modules.crs.models import CRS, CRSCreate
+from dynastore.modules.crs.models import CRS, CRSCreate, CRSDefinition
 
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.models.protocols.crs import CRSProtocol
@@ -34,6 +34,39 @@ from dynastore.models.driver_context import DriverContext
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_global_crs(crs_uri: str) -> CRSDefinition:
+    """Resolve a global authority CRS identifier to a canonical WKT2 definition.
+
+    Accepts the standard identifier forms PROJ understands offline — EPSG codes
+    (``EPSG:4326`` / ``4326``), URNs (``urn:ogc:def:crs:EPSG::4326``) and OGC
+    register URLs (``http://www.opengis.net/def/crs/EPSG/0/4326``). Resolution is
+    read-only and pyproj-backed; it touches no tenant data, so it is safe to
+    expose at platform scope. Tenant-registered custom CRS are NOT resolved here —
+    they live under ``/crs/catalogs/{catalog_id}/...`` and stay catalog-isolated.
+    """
+    try:
+        from pyproj import CRS as PyprojCRS
+        from pyproj.exceptions import CRSError
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503, detail="pyproj is not available for CRS resolution."
+        ) from e
+
+    try:
+        crs_obj = PyprojCRS.from_user_input(crs_uri)
+    except (CRSError, ValueError, TypeError) as e:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown authority CRS '{crs_uri}'."
+        ) from e
+
+    wkt = crs_obj.to_wkt(version="WKT2_2019")
+    return CRSDefinition(
+        definition_type=CRSDefinition.CRSDefinitionType.WKT2, definition=wkt
+    )
+
+
 class CRSExtension(ExtensionProtocol):
     priority: int = 100
     """
@@ -47,53 +80,65 @@ class CRSExtension(ExtensionProtocol):
         self._setup_routes()
 
     def _setup_routes(self):
+        # Routes follow the platform convention: /crs/catalogs/{catalog_id}/...
         self.router.add_api_route(
-            "/{catalog_id}",
+            "/catalogs/{catalog_id}",
             self.create_crs_endpoint,
             methods=["POST"],
             response_model=CRS,
             status_code=status.HTTP_201_CREATED,
-            summary="Register a New CRS",
+            summary="Register a New CRS (OGC aligned path)",
         )
         self.router.add_api_route(
-            "/{catalog_id}/{crs_uri:path}",
+            "/catalogs/{catalog_id}/{crs_uri:path}",
             self.update_crs_endpoint,
             methods=["PUT"],
             response_model=CRS,
-            summary="Update a CRS Definition",
+            summary="Update a CRS Definition (OGC aligned path)",
         )
         self.router.add_api_route(
-            "/{catalog_id}",
+            "/catalogs/{catalog_id}",
             self.list_crs_endpoint,
             methods=["GET"],
             response_model=List[CRS],
-            summary="List All CRS Definitions",
+            summary="List All CRS Definitions (OGC aligned path)",
         )
         self.router.add_api_route(
-            "/{catalog_id}/search",
+            "/catalogs/{catalog_id}/search",
             self.search_crs_endpoint,
             methods=["GET"],
             response_model=List[CRS],
-            summary="Search CRS Definitions",
+            summary="Search CRS Definitions (OGC aligned path)",
         )
         self.router.add_api_route(
-            "/{catalog_id}/by-name/{crs_name}",
+            "/catalogs/{catalog_id}/by-name/{crs_name}",
             self.get_crs_by_name_endpoint,
             methods=["GET"],
             response_model=CRS,
-            summary="Get CRS by Name",
+            summary="Get CRS by Name (OGC aligned path)",
         )
         self.router.add_api_route(
-            "/{catalog_id}/{crs_uri:path}",
+            "/catalogs/{catalog_id}/{crs_uri:path}",
             self.get_crs_by_uri_endpoint,
             methods=["GET"],
-            summary="Get CRS by URI (Resolvable Endpoint)",
+            summary="Get CRS by URI (OGC aligned path)",
         )
         self.router.add_api_route(
-            "/{catalog_id}/{crs_uri:path}",
+            "/catalogs/{catalog_id}/{crs_uri:path}",
             self.delete_crs_endpoint,
             methods=["DELETE"],
             status_code=status.HTTP_204_NO_CONTENT,
+            summary="Delete a CRS (OGC aligned path)",
+        )
+        # Platform scope: read-only resolution of global authority CRS (EPSG/OGC).
+        # Registered LAST — the greedy {crs_uri:path} converter must not shadow the
+        # catalog-scoped routes above, which are matched first by registration order.
+        self.router.add_api_route(
+            "/{crs_uri:path}",
+            self.resolve_global_crs_endpoint,
+            methods=["GET"],
+            response_model=CRSDefinition,
+            summary="Resolve a global authority CRS (EPSG/OGC) — platform scope, read-only",
         )
 
     @property
@@ -219,6 +264,28 @@ class CRSExtension(ExtensionProtocol):
         
         # Default to returning the full JSON model
         return crs
+
+
+    async def resolve_global_crs_endpoint(
+        self,
+        request: Request,
+        crs_uri: str,
+    ):
+        """Resolve a global authority CRS (EPSG/OGC) at platform scope (read-only).
+
+        **Content Negotiation** (mirrors the catalog-scoped resolver):
+        - ``Accept: text/plain`` → the canonical WKT2 string.
+        - otherwise → the full ``CRSDefinition`` JSON (name/area auto-extracted).
+
+        Only globally-defined authority CRS are resolved here; tenant-registered
+        custom CRS are served per-catalog under ``/crs/catalogs/{catalog_id}/...``.
+        """
+        definition = _resolve_global_crs(crs_uri)
+
+        accept_header = request.headers.get("Accept", "application/json")
+        if "text/plain" in accept_header:
+            return Response(content=definition.definition, media_type="text/plain")
+        return definition
 
 
     async def delete_crs_endpoint(

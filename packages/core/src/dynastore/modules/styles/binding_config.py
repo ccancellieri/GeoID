@@ -48,7 +48,7 @@ collection binding).
 **No conformance URI**: OGC API — Styles (OGC 20-009 DRAFT) has no item-
 level or attribute-level style-association class.  Binding is outside the
 standard.  The binding state never appears on the wire — only its projection
-(``render:renders`` + style links emitted by ``RendersStacContributor``) does.
+(``render:renders`` + style links emitted by ``TilesStacContributor``) does.
 """
 
 from __future__ import annotations

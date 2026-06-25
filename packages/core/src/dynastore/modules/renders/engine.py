@@ -526,13 +526,14 @@ def _apply_colormap_hillshade(
         out_b[mask] = np.clip(b * hs, 0, 255).astype(np.uint8)
         out_a[mask] = a
 
-    # Pixels below the lowest key get the lowest colour (no prior class).
+    # Pixels below the lowest key get the lowest colour with hillshade applied.
     lowest_key = keys[0]
     r0, g0, b0, a0 = colormap[lowest_key]
     below = elevation < lowest_key
-    out_r[below] = r0
-    out_g[below] = g0
-    out_b[below] = b0
+    hs_below = shade[below]
+    out_r[below] = np.clip(r0 * hs_below, 0, 255).astype(np.uint8)
+    out_g[below] = np.clip(g0 * hs_below, 0, 255).astype(np.uint8)
+    out_b[below] = np.clip(b0 * hs_below, 0, 255).astype(np.uint8)
     out_a[below] = a0
 
     return np.stack([out_r, out_g, out_b, out_a], axis=0)

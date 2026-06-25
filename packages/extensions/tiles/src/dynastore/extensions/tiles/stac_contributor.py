@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""STAC enrichment contributor for the renders extension.
+"""STAC enrichment contributor for the tiles extension (map-tile routes).
 
 For STAC items/collections whose assets include a COG (``image/tiff;
 application=geotiff`` or ``image/tiff`` with ``cloud-optimized``/``data``
@@ -28,20 +28,12 @@ roles) and for which a default style can be resolved, this contributor adds:
    URI and injects a ``renders`` map entry under ``properties``.
 3. A ``rel=style`` link on the item pointing at the style endpoint.
 
-Capability-gate: the contributor only emits enrichment when the renders route
-is actually registered (``_renders_route_registered()``). A STAC assembly that
-runs in a scope without the renders extension loaded sees nothing — no
-orphan URLs, no false conformance claims.
+The tile URL template uses the new map-tile route shape under ``/tiles``:
+``{base}/tiles/catalogs/{cat}/collections/{coll}/map/tiles/WebMercatorQuad/{z}/{x}/{y}.png``
 
-Design constraints:
-- No DB access: all inputs come through ``ResourceRef.extras``, populated by
-  the STAC generator from already-loaded data.
-- No inter-extension imports: the ``AssetContributor`` / ``StacContributor``
-  protocol is neutral (lives in ``models/protocols``).
-- Enrich-don't-rewrite: never mutate ``item_assets`` hrefs.
-- External IDs in public URLs: catalog/collection IDs in tile URLs come from
-  ``ResourceRef.catalog_id`` / ``.collection_id``, which the STAC generator
-  already fills with external (public) IDs.
+Capability-gate: the contributor only emits enrichment when the tiles route
+is actually registered (``_tiles_route_registered()``). A STAC assembly
+without the tiles extension loaded sees nothing.
 """
 
 from __future__ import annotations
@@ -71,23 +63,18 @@ _COG_MEDIA_TYPES = frozenset(
 # Asset roles that indicate a COG data file.
 _COG_ROLES = frozenset({"data", "cloud-optimized", "overview"})
 
-# Route prefix used by the renders service — must match renders_service.py.
-_RENDERS_PREFIX = "/renders"
+# Route prefix used by the tiles service — must match tiles_service.py.
+_TILES_PREFIX = "/tiles"
 
 
-def _renders_route_registered() -> bool:
-    """Return True when the renders extension is active in this process.
-
-    Checks by looking for the renders service in the registered protocols.
-    This is the same pattern the WMTS contributor uses (it inspects item_assets
-    at call time; we inspect the protocol registry).
-    """
+def _tiles_route_registered() -> bool:
+    """Return True when the tiles extension is active in this process."""
     try:
         from dynastore.tools.discovery import get_protocols
         from dynastore.extensions.protocols import ExtensionProtocol
         for ext in get_protocols(ExtensionProtocol):
             prefix = getattr(ext, "prefix", None)
-            if prefix == _RENDERS_PREFIX:
+            if prefix == _TILES_PREFIX:
                 return True
     except Exception:
         pass
@@ -112,24 +99,26 @@ def _default_style_id(ref: ResourceRef) -> Optional[str]:
     return ref.extras.get("default_style_id") or None
 
 
-class RendersStacContributor:
-    """AssetContributor + StacContributor that adds render tile links for COG items.
+class TilesStacContributor:
+    """AssetContributor + StacContributor that adds map-tile links for COG items.
 
-    Registered in ``RendersService.lifespan`` so it is active wherever the
+    Registered in ``TilesService.lifespan`` so it is active wherever the
     STAC read path is served. A single instance satisfies both protocols
     structurally (``contribute`` + ``contribute_stac``).
+
+    Emits tile URL templates using the default-style map-tile route:
+    ``/tiles/catalogs/{cat}/collections/{coll}/map/tiles/WebMercatorQuad/{z}/{x}/{y}.png``
     """
 
     priority: int = 60  # run after language (10) and WMTS (50)
 
     def contribute(self, ref: ResourceRef) -> Iterable[AssetLink]:
         """Emit a render tile XYZ-template asset for COG items."""
-        if not _renders_route_registered():
+        if not _tiles_route_registered():
             return
 
         item_assets: dict = ref.extras.get("item_assets") or {}
         if not item_assets:
-            # Collection-level ref or no assets — nothing to emit.
             return
 
         cog_href = _first_cog_href(item_assets)
@@ -140,11 +129,10 @@ class RendersStacContributor:
         if not style_id:
             return
 
-        # Build the tile URL template using external (public) IDs.
         href = (
-            f"{ref.base_url}{_RENDERS_PREFIX}/catalogs/{ref.catalog_id}"
+            f"{ref.base_url}{_TILES_PREFIX}/catalogs/{ref.catalog_id}"
             f"/collections/{ref.collection_id}"
-            f"/styles/{style_id}/tiles/WebMercatorQuad"
+            f"/map/tiles/WebMercatorQuad"
             f"/{{z}}/{{x}}/{{y}}.png"
         )
         yield AssetLink(
@@ -159,7 +147,7 @@ class RendersStacContributor:
         """Declare render:renders and inject the renders map when a COG+style exist."""
         from dynastore.extensions.stac.stac_contributor import StacContribution
 
-        if not _renders_route_registered():
+        if not _tiles_route_registered():
             return
 
         item_assets: dict = ref.extras.get("item_assets") or {}
@@ -175,9 +163,9 @@ class RendersStacContributor:
             return
 
         tile_url_template = (
-            f"{ref.base_url}{_RENDERS_PREFIX}/catalogs/{ref.catalog_id}"
+            f"{ref.base_url}{_TILES_PREFIX}/catalogs/{ref.catalog_id}"
             f"/collections/{ref.collection_id}"
-            f"/styles/{style_id}/tiles/WebMercatorQuad"
+            f"/map/tiles/WebMercatorQuad"
             f"/{{z}}/{{x}}/{{y}}.png"
         )
         style_url = (

@@ -120,7 +120,7 @@
             if (!collectionId) return;
             var layerId = dataset + ':' + collectionId;
             if (!activeLayers[layerId]) {
-                var tileUrl = _apiPrefix + '/maps/' + dataset + '/map/tiles/WebMercatorQuad/{z}/{x}/{y}?collections=' + collectionId;
+                var tileUrl = _apiPrefix + '/tiles/catalogs/' + dataset + '/collections/' + collectionId + '/map/tiles/WebMercatorQuad/{z}/{x}/{y}.png';
                 var layer = L.tileLayer(tileUrl, { maxZoom: 19, attribution: collectionId }).addTo(map);
                 activeLayers[layerId] = layer;
             }

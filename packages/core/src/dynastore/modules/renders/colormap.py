@@ -84,6 +84,32 @@ def _opacity_to_alpha(opacity: Optional[str]) -> int:
         return 255
 
 
+def extract_sld_body(style_obj: object) -> Optional[str]:
+    """Extract the SLD body string from a ``Style`` model.
+
+    Looks for the first ``SLDContent`` stylesheet in the style object's
+    ``stylesheets`` list (the shape returned by ``StylesProtocol.get_style``).
+    Returns ``None`` when no SLD stylesheet is present.
+
+    This is the module-level counterpart of the helper previously inlined in
+    the renders extension service, decoupled here so the preseed task and the
+    tiles extension can use it without importing the renders extension.
+    """
+    from dynastore.modules.styles.models import SLDContent, StyleFormatEnum
+
+    stylesheets = getattr(style_obj, "stylesheets", None) or []
+    for sheet in stylesheets:
+        content = getattr(sheet, "content", None)
+        if content is None:
+            continue
+        if isinstance(content, SLDContent):
+            return content.sld_body
+        # Also handle the case where content is a dict (from JSON deserialisation)
+        if isinstance(content, dict) and content.get("format") == StyleFormatEnum.SLD_1_1:
+            return content.get("sld_body")
+    return None
+
+
 def parse_sld_colormap(sld_body: str) -> RioColormap:
     """Parse an SLD 1.1 XML document and extract a discrete colormap.
 

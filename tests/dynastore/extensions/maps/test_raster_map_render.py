@@ -139,11 +139,13 @@ class TestConformanceUris:
             "Over-claim: geotiff is a Coverages slug; Maps uses tiff"
         )
 
-    def test_contains_tilesets_not_tilesets_map(self):
-        # The registered Maps tileset slug is `tilesets` (plain), not `tilesets-map`.
-        # /map/tiles returns OGC-API-Tiles-conformant TileMatrixSetList + TileMatrixSet
-        # resources, satisfying the tilesets class (Req 22-24).
-        assert f"{self.BASE}tilesets" in ms.OGC_API_MAPS_URIS
+    def test_does_not_claim_tilesets(self):
+        # Map-tile generation (the Maps /conf/tilesets class, Req 22-24) moved to the
+        # Tiles extension, served as map-tiles (dataType=map) under
+        # /tiles/catalogs/{cat}/collections/{coll}/map/tiles/... — Maps must not claim it.
+        assert f"{self.BASE}tilesets" not in ms.OGC_API_MAPS_URIS, (
+            "Stale claim: map-tile generation moved to the Tiles extension"
+        )
         assert f"{self.BASE}tilesets-map" not in ms.OGC_API_MAPS_URIS, (
             "Over-claim: tilesets-map is not a registered Maps conformance class"
         )
@@ -174,6 +176,7 @@ class TestConformanceUris:
             f"{self.BASE}general-subsetting",
             f"{self.BASE}display-resolution",
             f"{self.BASE}geotiff",
+            f"{self.BASE}tilesets",
             f"{self.BASE}tilesets-map",
             f"{self.BASE}display",
         ]
@@ -545,170 +548,6 @@ async def test_render_raster_map_rio_tiler_unavailable_returns_422(monkeypatch):
 
     assert exc.value.status_code == 422
     assert "rio-tiler" in exc.value.detail
-
-
-# ---------------------------------------------------------------------------
-# 7. _render_raster_map_tile — WebMercatorQuad uses render_cog_tile
-# ---------------------------------------------------------------------------
-
-
-def _make_fake_tms_def(tms_id: str = "WebMercatorQuad") -> MagicMock:
-    matrix = MagicMock()
-    matrix.id = "0"
-    matrix.tileWidth = 256
-    matrix.tileHeight = 256
-    matrix.cellSize = 78271.5
-    matrix.pointOfOrigin = (-20037508.34, 20037508.34)
-    tms = MagicMock()
-    tms.id = tms_id
-    tms.tileMatrices = [matrix]
-    return tms
-
-
-@pytest.mark.asyncio
-async def test_render_raster_map_tile_wmq_uses_tile_reader(monkeypatch):
-    """WebMercatorQuad tiles must route through render_cog_tile, not render_cog_map."""
-    tile_called: dict[str, Any] = {}
-
-    def _fake_tile(href, z, x, y, *, colormap, output_format):
-        tile_called.update({"z": z, "x": x, "y": y, "href": href})
-        return _FAKE_PNG
-
-    def _fake_map(href, *, bbox, width, height, colormap, output_format):
-        raise AssertionError("render_cog_map must NOT be called for WebMercatorQuad")
-
-    catalogs_mock = MagicMock()
-    catalogs_mock.resolve_catalog_id = AsyncMock(return_value="cat_internal")
-    catalogs_mock.collections.resolve_collection_id = AsyncMock(return_value="coll_internal")
-    catalogs_mock.search_items = AsyncMock(
-        return_value=[{"assets": {"data": {"href": "gs://b/f.tif"}}}]
-    )
-    monkeypatch.setattr(ms, "get_protocol", lambda _proto: catalogs_mock)
-
-    import dynastore.models.protocols.visibility as vis_mod  # type: ignore[import]
-    monkeypatch.setattr(
-        vis_mod, "resolve_collection_listing_ids", AsyncMock(return_value=None)
-    )
-
-    monkeypatch.setattr(ms, "_RENDER_COG_TILE", _fake_tile)
-    monkeypatch.setattr(ms, "_RENDER_COG_MAP", _fake_map)
-
-    async def _fake_run_in_thread(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
-    monkeypatch.setattr(ms, "run_in_thread", _fake_run_in_thread)
-
-    tms_def = _make_fake_tms_def("WebMercatorQuad")
-
-    response = await ms._render_raster_map_tile(
-        catalog_id="my-cat",
-        collection_id="my-coll",
-        tms_id="WebMercatorQuad",
-        z=0,
-        x=0,
-        y=0,
-        tile_width=256,
-        tile_height=256,
-        tms_def=tms_def,
-        style_name=None,
-        request=_mock_request(),
-    )
-
-    assert response.status_code == 200
-    assert response.media_type == "image/png"
-    assert tile_called["z"] == 0
-    assert tile_called["x"] == 0
-    assert tile_called["y"] == 0
-
-
-@pytest.mark.asyncio
-async def test_render_raster_map_tile_non_wmq_uses_bbox_reader(monkeypatch):
-    """Non-WebMercatorQuad TMS falls back to render_cog_map with bbox."""
-    map_called: dict[str, Any] = {}
-
-    def _fake_tile(*args, **kwargs):
-        raise AssertionError("render_cog_tile must NOT be called for non-WMQ TMS")
-
-    def _fake_map(href, *, bbox, width, height, colormap, output_format):
-        map_called.update({"bbox": bbox, "width": width, "height": height})
-        return _FAKE_PNG
-
-    catalogs_mock = MagicMock()
-    catalogs_mock.resolve_catalog_id = AsyncMock(return_value="cat_internal")
-    catalogs_mock.collections.resolve_collection_id = AsyncMock(return_value="coll_internal")
-    catalogs_mock.search_items = AsyncMock(
-        return_value=[{"assets": {"data": {"href": "gs://b/f.tif"}}}]
-    )
-    monkeypatch.setattr(ms, "get_protocol", lambda _proto: catalogs_mock)
-
-    import dynastore.models.protocols.visibility as vis_mod  # type: ignore[import]
-    monkeypatch.setattr(
-        vis_mod, "resolve_collection_listing_ids", AsyncMock(return_value=None)
-    )
-
-    monkeypatch.setattr(ms, "_RENDER_COG_TILE", _fake_tile)
-    monkeypatch.setattr(ms, "_RENDER_COG_MAP", _fake_map)
-
-    async def _fake_run_in_thread(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
-    monkeypatch.setattr(ms, "run_in_thread", _fake_run_in_thread)
-
-    tms_def = _make_fake_tms_def("WorldCRS84Quad")
-    tms_def.tileMatrices[0].id = "0"
-
-    response = await ms._render_raster_map_tile(
-        catalog_id="my-cat",
-        collection_id="my-coll",
-        tms_id="WorldCRS84Quad",
-        z=0,
-        x=0,
-        y=0,
-        tile_width=256,
-        tile_height=256,
-        tms_def=tms_def,
-        style_name=None,
-        request=_mock_request(),
-    )
-
-    assert response.status_code == 200
-    assert response.media_type == "image/png"
-    assert "bbox" in map_called
-
-
-@pytest.mark.asyncio
-async def test_render_raster_map_tile_hidden_collection_returns_404(monkeypatch):
-    catalogs_mock = MagicMock()
-    catalogs_mock.resolve_catalog_id = AsyncMock(return_value="cat_internal")
-    catalogs_mock.collections.resolve_collection_id = AsyncMock(return_value="coll_internal")
-    monkeypatch.setattr(ms, "get_protocol", lambda _proto: catalogs_mock)
-
-    import dynastore.models.protocols.visibility as vis_mod  # type: ignore[import]
-    monkeypatch.setattr(
-        vis_mod, "resolve_collection_listing_ids", AsyncMock(return_value=set())
-    )
-
-    monkeypatch.setattr(ms, "_RENDER_COG_TILE", lambda *a, **kw: _FAKE_PNG)
-    monkeypatch.setattr(ms, "_RENDER_COG_MAP", lambda *a, **kw: _FAKE_PNG)
-
-    from fastapi import HTTPException
-
-    with pytest.raises(HTTPException) as exc:
-        await ms._render_raster_map_tile(
-            catalog_id="cat",
-            collection_id="secret-coll",
-            tms_id="WebMercatorQuad",
-            z=0,
-            x=0,
-            y=0,
-            tile_width=256,
-            tile_height=256,
-            tms_def=_make_fake_tms_def(),
-            style_name=None,
-            request=_mock_request(),
-        )
-
-    assert exc.value.status_code == 404
 
 
 # ---------------------------------------------------------------------------

@@ -283,31 +283,31 @@
 
     function buildTerrainRgbUrl(catalogId, collectionId, tms) {
         return (
-            apiUrl('/renders') +
+            apiUrl('/tiles') +
             `/catalogs/${encodeURIComponent(catalogId)}` +
             `/collections/${encodeURIComponent(collectionId)}` +
-            `/terrain-rgb/${tms}/{z}/{x}/{y}.png`
+            `/styles/terrain-rgb/map/tiles/${tms}/{z}/{x}/{y}.png`
         );
     }
 
     function buildHillshadeUrl(catalogId, collectionId, styleId, tms, azimuth, altitude) {
         return (
-            apiUrl('/renders') +
+            apiUrl('/tiles') +
             `/catalogs/${encodeURIComponent(catalogId)}` +
             `/collections/${encodeURIComponent(collectionId)}` +
             `/styles/${encodeURIComponent(styleId)}` +
-            `/hillshade/${tms}/{z}/{x}/{y}.png` +
-            `?azimuth=${azimuth}&altitude=${altitude}`
+            `/map/tiles/${tms}/{z}/{x}/{y}.png` +
+            `?relief=hillshade&azimuth=${azimuth}&altitude=${altitude}`
         );
     }
 
     function buildColormapUrl(catalogId, collectionId, styleId, tms) {
         return (
-            apiUrl('/renders') +
+            apiUrl('/tiles') +
             `/catalogs/${encodeURIComponent(catalogId)}` +
             `/collections/${encodeURIComponent(collectionId)}` +
             `/styles/${encodeURIComponent(styleId)}` +
-            `/tiles/${tms}/{z}/{x}/{y}.png`
+            `/map/tiles/${tms}/{z}/{x}/{y}.png`
         );
     }
 

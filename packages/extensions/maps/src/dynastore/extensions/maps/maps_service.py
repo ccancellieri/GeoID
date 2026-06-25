@@ -20,9 +20,9 @@
 
 import logging
 import asyncio
-from typing import Any, FrozenSet, List, Optional
+from typing import Any, List, Optional
 from concurrent.futures import ProcessPoolExecutor
-from fastapi import Depends, FastAPI, APIRouter, HTTPException, Response, Query, Request, Path
+from fastapi import Depends, FastAPI, APIRouter, HTTPException, Response, Query, Request
 from sqlalchemy.ext.asyncio import AsyncConnection
 from contextlib import asynccontextmanager
 
@@ -37,7 +37,6 @@ from dynastore.extensions.maps.format_convert import (
     convert_png_to_format as _convert_png_to_format,
 )
 from dynastore.extensions.maps.renderer import render_map_image
-import dynastore.modules.tiles.tiles_module as tms_manager
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config import shared_queries
@@ -50,13 +49,9 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.ogc_common_models import Conformance
 from dynastore.extensions.web.decorators import expose_web_page
-from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.extensions.tools.language_utils import get_language
 import os
 
-# Imports for Tiling Support
-from dynastore.modules.tiles.tiles_models import TileMatrixSetList, TileMatrixSet, TileMatrixSetRef, Link as TileLink
-from dynastore.modules.tiles.tms_definitions import BUILTIN_TILE_MATRIX_SETS
 
 logger = logging.getLogger(__name__)
 
@@ -97,10 +92,9 @@ OGC_API_MAPS_URIS = [
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tiff",
-    # /conf/tilesets — exposes /map/tiles (OGC-API-Tiles-conformant tileset list)
-    # and /map/tiles/{tms} (tileset metadata); map-tile generation (Req 24).
-    # The Maps slug is `tilesets` (plain), not `tilesets-map`.
-    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets",
+    # Map-tile generation (OGC API - Maps /conf/tilesets, Req 24) is served by the
+    # Tiles extension as map-tiles (dataType=map) under
+    # /tiles/catalogs/{cat}/collections/{coll}/map/tiles/... — not claimed here.
     # /conf/scaling — width/height on /map resample output to the requested
     # pixel dimensions via rio-tiler COGReader.part(width=, height=) (Req 15).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
@@ -406,141 +400,6 @@ async def _render_raster_map(
     return Response(content=out_bytes, media_type=_FORMAT_MEDIA_TYPES[fmt])
 
 
-async def _render_raster_map_tile(
-    *,
-    catalog_id: str,
-    collection_id: str,
-    tms_id: str,
-    z: int,
-    x: int,
-    y: int,
-    tile_width: int,
-    tile_height: int,
-    tms_def: Any,
-    style_name: Optional[str],
-    request: Any,
-) -> Response:
-    """Raster branch for ``GET /{dataset}/map/tiles/{tms}/{z}/{x}/{y}``.
-
-    For WebMercatorQuad the native ``render_cog_tile`` path is used (rio-tiler
-    reads the correct overview directly).  For other TMS the bbox is computed
-    from the tile matrix geometry and rendered via ``render_cog_map``.
-
-    DB connection is opened only for the style lookup and released before the
-    CPU-bound render (GeoID #703).
-    """
-    if _RENDER_COG_TILE is None or _RENDER_COG_MAP is None:
-        raise HTTPException(
-            status_code=422,
-            detail="Raster rendering is not available: rio-tiler is not installed.",
-        )
-
-    # External → internal ID resolution at the request boundary.
-    internal_catalog_id = catalog_id
-    catalogs_svc = get_protocol(CatalogsProtocol)
-    if catalogs_svc:
-        try:
-            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
-                catalog_id, allow_missing=False
-            ) or catalog_id
-        except Exception:
-            pass
-
-    internal_collection_id = await _resolve_internal_collection_id(
-        internal_catalog_id, collection_id
-    )
-
-    # Visibility guard.
-    from dynastore.models.protocols.visibility import resolve_collection_listing_ids  # type: ignore[import]
-    visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
-    if visible_ids is not None and internal_collection_id not in visible_ids:
-        raise HTTPException(status_code=404, detail="Collection not found.")
-
-    # COG href from the first item.
-    cog_href = await _resolve_raster_cog_href(internal_catalog_id, internal_collection_id)
-    if not cog_href:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No COG asset found for collection '{collection_id}'.",
-        )
-
-    # Colormap from SLD style (DB connection released before render).
-    colormap = None
-    if style_name:
-        engine = get_async_engine(request)
-        async with managed_transaction(engine) as conn:
-            colormap = await _resolve_raster_colormap(
-                internal_catalog_id, internal_collection_id, style_name, conn
-            )
-
-    # Render in a thread.  WebMercatorQuad uses the native tile reader;
-    # other TMS fall back to the bbox reader so the overview selection is
-    # still correct (rio-tiler picks the best overview for the given area).
-    _WMQ = "WebMercatorQuad"
-    try:
-        if tms_id == _WMQ:
-            tile_bytes: bytes = await run_in_thread(
-                _RENDER_COG_TILE,
-                cog_href,
-                z,
-                x,
-                y,
-                colormap=colormap,
-                output_format="PNG",
-            )
-        else:
-            # Compute geographic bbox from tile matrix geometry (TopLeft origin).
-            matrix_def = next(
-                (m for m in tms_def.tileMatrices if m.id == str(z)), None
-            )
-            if matrix_def is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Zoom level '{z}' not found in TMS '{tms_id}'.",
-                )
-            px = matrix_def.tileWidth * matrix_def.cellSize
-            py = matrix_def.tileHeight * matrix_def.cellSize
-            min_x = matrix_def.pointOfOrigin[0] + x * px
-            max_y = matrix_def.pointOfOrigin[1] - y * py
-            bbox_tile = [min_x, max_y - py, min_x + px, max_y]
-            tile_bytes = await run_in_thread(
-                _RENDER_COG_MAP,
-                cog_href,
-                bbox=bbox_tile,
-                width=tile_width,
-                height=tile_height,
-                colormap=colormap,
-                output_format="PNG",
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(
-            "maps/raster: tile render failed for %s/%s tms=%s z=%s x=%s y=%s: %s",
-            internal_catalog_id, internal_collection_id, tms_id, z, x, y, exc,
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=500, detail=f"Raster tile render failed: {exc}"
-        ) from exc
-
-    return Response(content=tile_bytes, media_type="image/png")
-
-
-def _return_empty_tile(width, height):
-    # Create a transparent 1x1 pixel or full size empty PNG
-    # Minimal 1x1 transparent PNG signature
-    empty_png = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
-    # To generate a full-size empty tile, a library like Pillow would be better,
-    # but for now, we return a minimal valid PNG to avoid client errors.
-    # from PIL import Image
-    # img = Image.new('RGBA', (width, height), (255, 255, 255, 0))
-    # buffer = io.BytesIO()
-    # img.save(buffer, format="PNG")
-    # return Response(content=buffer.getvalue(), media_type="image/png")
-    return Response(content=empty_png, media_type="image/png")
-
-
 class MapsService(ExtensionProtocol, OGCServiceMixin):
     priority: int = 100
     """Provides OGC API - Maps (WMS-like) functionality with filtering and Tiling."""
@@ -611,10 +470,11 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
     async def get_maps_landing_page(request: Request):  # type: ignore[reportGeneralTypeIssues]
         catalogs_svc = get_protocol(CatalogsProtocol)
         catalogs = await catalogs_svc.list_catalogs(limit=1000) if catalogs_svc else []
+        base = str(request.url).rstrip("/")
         links = [Link(href=str(request.url), rel="self", type="application/json", title=LocalizedText(en="this document"))]
         for cat in catalogs:
             links.append(Link(
-                href=str(request.url_for('get_dataset_maps', dataset=cat.id)),
+                href=f"{base}/catalogs/{cat.id}",
                 rel="dataset", type="application/json", title=LocalizedText(en=f"Maps for dataset '{cat.id}'")
             ))
         return MapsLandingPage(links=links)
@@ -636,247 +496,41 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         with open(file_path, "r", encoding="utf-8") as f:
              return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
-    @router.get("/{dataset}", response_model=DatasetMaps)
-    async def get_dataset_maps(  # type: ignore[reportGeneralTypeIssues]
+    # --- Map Endpoint (shared implementation) ---
+
+    @staticmethod
+    async def _get_map_impl(
+        *,
         dataset: str,
-        request: Request,
-        request_hints: FrozenSet = Depends(parse_hints_param),
-        language: str = Depends(get_language),
-    ):
-        # Accepted for uniform cross-protocol routing-hints support; this route
-        # returns dataset-maps metadata (links) and performs no vector-geometry read.
-        catalogs_svc = get_protocol(CatalogsProtocol)
-        if not catalogs_svc or not await catalogs_svc.get_catalog_model(dataset):
-            raise HTTPException(status_code=404, detail=f"Dataset '{dataset}' not found.")
+        request: Any,
+        collections: str,
+        bbox: str,
+        bbox_crs: Optional[str],
+        crs: str,
+        width: int,
+        height: int,
+        style: Optional[str],
+        bgcolor: Optional[str],
+        transparent: bool,
+        datetime: Optional[str],
+        subset: Optional[str],
+        f: str,
+    ) -> Response:
+        """Shared implementation for the /map endpoint.
 
-        collections = await catalogs_svc.list_collections(dataset, limit=1000)
-        maps = []
-        for coll in collections:
-            map_links = [
-                Link(href=f"{request.url}/map?collections={coll.id}&bbox=-180,-90,180,90&crs=EPSG:4326", rel="item", type="image/png"),
-                Link(href=f"{request.url}/map/tiles", rel="http://www.opengis.net/def/rel/ogc/1.0/tilesets-map", type="application/json", title=LocalizedText(en="Map Tilesets"))
-            ]
-            # The collection title is stored as a multi-language LocalizedText,
-            # but OGC MapContent.title is a single string. Resolve to the
-            # requested language (lang query param / Accept-Language, default
-            # 'en'); lang='*' returns the full multi-language object.
-            title = coll.title.resolve(language) if coll.title is not None else None
-            maps.append(MapContent(title=title, links=map_links))
-        
-        links = [Link(href=str(request.url), rel="self"), Link(href=str(request.url_for('get_maps_landing_page')), rel="up")]
-        return DatasetMaps(title=f"Maps for '{dataset}'", maps=maps, links=links)
-
-    # --- Tiling Endpoints (Requirements Class "Map Tilesets") ---
-
-    @router.get("/{dataset}/map/tiles", response_model=TileMatrixSetList, summary="Retrieve available Map Tile Matrix Sets")
-    async def get_map_tilesets(dataset: str, request: Request):  # type: ignore[reportGeneralTypeIssues]
-        """List all supported Tile Matrix Sets for rendering raster map tiles."""
-        catalogs_svc = get_protocol(CatalogsProtocol)
-        if not catalogs_svc or not await catalogs_svc.get_catalog_model(dataset):
-            raise HTTPException(status_code=404, detail=f"Dataset '{dataset}' not found.")
-
-        tms_refs = []
-        # 1. Built-in TMS
-        for tms_id, tms_def in BUILTIN_TILE_MATRIX_SETS.items():
-            tms_refs.append(TileMatrixSetRef(
-                id=tms_id,
-                title=tms_def.title,
-                links=[
-                    TileLink(
-                        href=str(request.url_for("get_map_tileset", dataset=dataset, tileMatrixSetId=tms_id)), 
-                        rel="self", 
-                        type="application/json",
-                        title=tms_def.title)
-                ]
-            ))
-        
-        # 2. Custom TMS from DB
-        custom_tms_list = await tms_manager.list_custom_tms(catalog_id=dataset)
-        for tms in custom_tms_list:
-            if not any(ref.id == tms.id for ref in tms_refs):
-                tms_refs.append(TileMatrixSetRef(
-                    id=tms.id,
-                    title=tms.title,
-                    links=[TileLink(
-                        href=str(request.url_for("get_map_tileset", dataset=dataset, tileMatrixSetId=tms.id)), 
-                        rel="self", 
-                        type="application/json",
-                        title=tms.title)]
-                ))
-        return TileMatrixSetList(tileMatrixSets=tms_refs)
-
-    @router.get("/{dataset}/map/tiles/{tileMatrixSetId}", response_model=TileMatrixSet, summary="Retrieve a Map Tile Matrix Set definition")
-    async def get_map_tileset(dataset: str, tileMatrixSetId: str = Path(..., description="The Identifier of the Tile Matrix Set")):  # type: ignore[reportGeneralTypeIssues]
-        """Return the full definition of a specific Tile Matrix Set."""
-        tms = await tms_manager.get_custom_tms(catalog_id=dataset, tms_id=tileMatrixSetId)
-        if not tms:
-            tms = BUILTIN_TILE_MATRIX_SETS.get(tileMatrixSetId)
-            if not tms:
-                raise HTTPException(status_code=404, detail=f"TileMatrixSet '{tileMatrixSetId}' not found.")
-        return tms
-
-    @router.get("/{dataset}/map/tiles/{tileMatrixSetId}/{z}/{x}/{y}", summary="Get Rendered Map Tile")
-    async def get_map_tile(
-        request: Request, dataset: str, tileMatrixSetId: str, z: str, x: int, y: int,  # type: ignore[reportGeneralTypeIssues]
-        collections: str = Query(..., description="Comma-separated list of collection IDs."),
-        datetime: Optional[str] = Query(None, description="Temporal filter."),
-        subset: Optional[str] = Query(None, description="Custom dimension filter."),
-        bgcolor: Optional[str] = Query(None),
-        transparent: bool = Query(True),
-        style: Optional[str] = Query(None)
-    ):
+        Called by both the deprecated ``/{dataset}/map`` route and the new aligned
+        ``/catalogs/{catalog_id}/collections/{collection_id}/map`` route.
+        The caller is responsible for resolving ``dataset`` to the internal catalog
+        ID and for enforcing collection visibility before calling this helper.
         """
-        Generates a raster map tile (PNG) for the specific Z/X/Y.
-        """
-        # 1. Fetch TMS Definition
-        tms_def = await tms_manager.get_custom_tms(catalog_id=dataset, tms_id=tileMatrixSetId)
-        if not tms_def:
-            tms_def = BUILTIN_TILE_MATRIX_SETS.get(tileMatrixSetId)
-            if not tms_def:
-                raise HTTPException(status_code=404, detail=f"TileMatrixSet {tileMatrixSetId} not supported.")
+        import re
 
-        # 2. Validate Matrix (Zoom Level)
-        matrix_def = next((m for m in tms_def.tileMatrices if m.id == str(z)), None)
-        if not matrix_def:
-            raise HTTPException(status_code=400, detail=f"Zoom level '{z}' not found in TMS '{tileMatrixSetId}'.")
-
-        # 3. Validate Coordinates
-        if not (0 <= x < matrix_def.matrixWidth and 0 <= y < matrix_def.matrixHeight):
-            raise HTTPException(status_code=400, detail="Tile coordinates out of bounds.")
-
-        # 3a. Raster branch — when the first collection is RASTER-kind, use the
-        # COG tile engine instead of the vector pipeline. DB connection is not
-        # opened here; the COG path resolves items and styles without one.
-        requested_collections_raw = [c.strip() for c in collections.split(',')]
-        first_collection = requested_collections_raw[0] if requested_collections_raw else ""
-        if first_collection and await _is_raster_collection(dataset, first_collection):
-            return await _render_raster_map_tile(
-                catalog_id=dataset,
-                collection_id=first_collection,
-                tms_id=tileMatrixSetId,
-                z=int(z),
-                x=x,
-                y=y,
-                tile_width=matrix_def.tileWidth,
-                tile_height=matrix_def.tileHeight,
-                tms_def=tms_def,
-                style_name=style,
-                request=request,
-            )
-
-        # Steps 4-8 only need the DB. Acquire a connection for that window and
-        # release it before the CPU-bound render (step 9) so a pooled slot is
-        # never held across run_in_executor (GeoID #703).
-        engine = get_async_engine(request)
-        async with managed_transaction(engine) as conn:
-            ctx = DriverContext(db_resource=conn)
-
-            # 4. Resolve CRS and SRID
-            try:
-                target_srid = await tms_manager.resolve_srid(conn=conn, crs_str=tms_def.crs, catalog_id=dataset)
-            except Exception as e:
-                logger.error(f"CRS Error: {e}")
-                raise HTTPException(status_code=500, detail=f"Could not process CRS '{tms_def.crs}' in TMS '{tileMatrixSetId}'.") from e
-
-            # 5. Calculate Bounding Box for the Tile
-            # OGC Tiles usually assume TopLeft origin for the matrix
-            pixel_span_x = matrix_def.tileWidth * matrix_def.cellSize
-            pixel_span_y = matrix_def.tileHeight * matrix_def.cellSize
-
-            tile_min_x = matrix_def.pointOfOrigin[0] + (x * pixel_span_x)
-            tile_max_y = matrix_def.pointOfOrigin[1] - (y * pixel_span_y)
-            tile_max_x = tile_min_x + pixel_span_x
-            tile_min_y = tile_max_y - pixel_span_y
-
-            bbox_list = [tile_min_x, tile_min_y, tile_max_x, tile_max_y]
-
-            # 6. Validate Collections
-            requested_collections = [c.strip() for c in collections.split(',')]
-            # Reuse validation logic (check metadata + table existence)
-            valid_collections = await _validate_collections_helper(conn, dataset, requested_collections)
-            if not valid_collections:
-                 # Return transparent empty tile if no valid data source
-                 return _return_empty_tile(matrix_def.tileWidth, matrix_def.tileHeight)
-
-            subset_params = parse_subset_parameter(subset)
-
-            # 7. Fetch Features (Optimized for Render)
-            # Note: We pass the Tile Width/Height and the TMS SRID (target_srid) as the BBOX SRID
-            catalogs_svc = get_protocol(CatalogsProtocol)
-            if not catalogs_svc:
-                raise HTTPException(status_code=500, detail="Catalogs service not available.")
-            try:
-                layer_config, layers_data = await asyncio.gather(
-                    catalogs_svc.get_collection_config(dataset, valid_collections[0], ctx=ctx),
-                    maps_db.get_features_for_rendering(
-                        conn=conn,
-                        schema=dataset,
-                        collections=valid_collections,
-                        bbox=bbox_list,
-                        crs=tms_def.crs,
-                        width=matrix_def.tileWidth,
-                        height=matrix_def.tileHeight,
-                        bbox_srid=target_srid, # Vital: The computed BBOX is in the TMS CRS
-                        datetime_str=datetime,
-                        subset_params=subset_params
-                    )
-                )
-            except ValueError as e:
-                logger.error(f"Render Fetch Error: {e}")
-                raise HTTPException(status_code=400, detail=str(e)) from e
-            if layer_config is None or layer_config.geometry_storage is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Collection '{valid_collections[0]}' has no geometry storage config.",
-                )
-
-            # 8. Resolve style
-            style_to_render = await _get_style_to_render(
-                conn, dataset, valid_collections[0] if valid_collections else None, style
-            )
-
-        # 9. Render Image (CPU-bound, no DB connection held)
-        try:
-            loop = asyncio.get_running_loop()
-            image_bytes = await loop.run_in_executor(
-                MapsService.process_pool,
-                render_map_image,
-                matrix_def.tileWidth, matrix_def.tileHeight, 
-                bbox_list, tms_def.crs, 
-                layer_config.geometry_storage.target_srid, # Source SRID
-                layers_data, style_to_render,
-                transparent, bgcolor
-            )
-            return Response(content=image_bytes, media_type="image/png")
-        except Exception as e:
-            logger.error(f"Tile Render Failed: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Rendering failed.") from e
-
-    # --- Existing Map Endpoint ---
-
-    @router.get("/{dataset}/map")
-    async def get_map(
-        dataset: str,  # type: ignore[reportGeneralTypeIssues]
-        request: Request,
-        collections: str = Query(..., description="Comma-separated list of collections to render."),
-        bbox: str = Query(..., description="Bounding box in CRS coordinates."),
-        bbox_crs: str = Query(None, description="CRS of the BBOX (defaults to OGC:CRS84)."),
-        crs: str = Query("EPSG:3857", description="Coordinate Reference System."),
-        width: int = Query(768, description="Width of the output image."),
-        height: int = Query(768, description="Height of the output image."),
-        style: Optional[str] = Query(None, description="Name of the style to apply."),
-        bgcolor: Optional[str] = Query(None, description="Background color of the map."),
-        transparent: bool = Query(True, description="Whether the map background should be transparent."),
-        datetime: Optional[str] = Query(None, description="Temporal filter (timestamp or interval)."),
-        subset: Optional[str] = Query(None, description="Custom dimension filter."),
-        f: str = Query("png", description="Output format: png | jpeg | geotiff."),
-    ):
         fmt = f.lower()
         if fmt not in _SUPPORTED_MAP_FORMATS:
             raise HTTPException(
                 status_code=415, detail=f"Unsupported map format: {f!r}",
             )
-        # ... (Existing validation logic) ...
+
         catalogs_svc = get_protocol(CatalogsProtocol)
         if not catalogs_svc or not await catalogs_svc.get_catalog_model(dataset):
             raise HTTPException(status_code=404, detail=f"Dataset '{dataset}' not found.")
@@ -884,17 +538,14 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         requested_collections = [c.strip() for c in collections.split(',')]
 
         # Handle BBOX CRS (Req 18)
-        # If bbox_crs is provided, extract SRID. If NOT provided, standard says default is CRS84 (4326).
         bbox_srid = 4326
         if bbox_crs:
             try:
-                # Simple parsing for [EPSG:XXXX] or URIs
-                import re
                 match = re.search(r'(\d+)$', bbox_crs)
                 if match:
                     bbox_srid = int(match.group(1))
             except Exception:
-                pass # Fallback or error handling
+                pass
 
         try:
             bbox_list = [float(coord) for coord in bbox.split(',')]
@@ -920,15 +571,14 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         # resolution) run under a single connection that is released before the
         # CPU-bound render below, so a pooled slot is never held across
         # run_in_executor (GeoID #703).
-        engine = get_async_engine(request)
-        async with managed_transaction(engine) as conn:
+        db_engine = get_async_engine(request)
+        async with managed_transaction(db_engine) as conn:
             ctx = DriverContext(db_resource=conn)
 
             valid_collections = await _validate_collections_helper(conn, dataset, requested_collections)
             if not valid_collections:
                 raise HTTPException(status_code=404, detail="One or more collections not found.")
 
-            # Fetch Data with Updated DB Signature
             if not catalogs_svc:
                 raise HTTPException(status_code=500, detail="Catalogs service not available.")
             try:
@@ -944,8 +594,8 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                         height=height,
                         bbox_srid=bbox_srid,
                         datetime_str=datetime,
-                        subset_params=parse_subset_parameter(subset)
-                    )
+                        subset_params=parse_subset_parameter(subset),
+                    ),
                 )
             except ValueError as e:
                 logger.error(f"Data Error: {e}")
@@ -956,7 +606,6 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                     detail=f"Collection '{valid_collections[0]}' has no geometry storage config.",
                 )
 
-            # Fetch style to render
             style_to_render = await _get_style_to_render(
                 conn, dataset, valid_collections[0] if valid_collections else None, style
             )
@@ -970,13 +619,12 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 width, height, bbox_list, crs,
                 layer_config.geometry_storage.target_srid,
                 layers_data, style_to_render,
-                transparent, bgcolor
+                transparent, bgcolor,
             )
         except Exception as e:
             logger.error(f"Render Error: {e}")
             raise HTTPException(status_code=500, detail="Failed to render map.") from e
 
-        # Convert PNG to requested format (png passthrough; jpeg/geotiff post-process).
         try:
             out_bytes = _convert_png_to_format(
                 image_bytes, fmt, bbox=bbox_list, crs=crs,
@@ -986,4 +634,350 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         except Exception as e:
             logger.error(f"Format conversion error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Format conversion failed.") from e
+
         return Response(content=out_bytes, media_type=_FORMAT_MEDIA_TYPES[fmt])
+
+    # --- Aligned endpoints: /maps/catalogs/{catalog_id}[/collections/{collection_id}]/... ---
+
+    @router.get(
+        "/catalogs/{catalog_id}",
+        response_model=DatasetMaps,
+        summary="Catalog map metadata (OGC API - Maps aligned path)",
+    )
+    async def get_catalog_maps(  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
+        request: Request,
+        language: str = Depends(get_language),
+    ):
+        """Return map metadata for every visible collection in a catalog under the aligned path."""
+        catalogs_svc = get_protocol(CatalogsProtocol)
+        if not catalogs_svc:
+            raise HTTPException(status_code=500, detail="Catalogs service not available.")
+
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not internal_catalog_id:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+
+        from dynastore.models.protocols.visibility import resolve_collection_listing_ids
+        visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
+
+        collections = await catalogs_svc.list_collections(internal_catalog_id, limit=1000)
+        base = str(request.url).rstrip("/")
+        maps = []
+        for coll in collections:
+            # visible_ids is the internal-id allowlist; coll.id is the internal id
+            # (the public external_id is only swapped in at serialization time).
+            if visible_ids is not None and coll.id not in visible_ids:
+                continue
+            public_id = coll.external_id or coll.id
+            title = coll.title.resolve(language) if coll.title is not None else None
+            maps.append(
+                MapContent(
+                    title=title,
+                    links=[
+                        Link(
+                            href=f"{base}/collections/{public_id}",
+                            rel="item",
+                            type="application/json",
+                            title=LocalizedText(en=f"Maps for collection '{public_id}'"),
+                        )
+                    ],
+                )
+            )
+        links = [
+            Link(href=str(request.url), rel="self"),
+            Link(href=str(request.url_for("get_maps_landing_page")), rel="up"),
+        ]
+        return DatasetMaps(
+            title=f"Maps for catalog '{catalog_id}'",
+            maps=maps,
+            links=links,
+        )
+
+    @router.get(
+        "/catalogs/{catalog_id}/map",
+        summary="Render a dataset-level map for a catalog (OGC API - Maps aligned path)",
+    )
+    async def get_catalog_map(  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
+        request: Request,
+        collections: str = Query(..., description="Comma-separated list of collections to render."),
+        bbox: str = Query("-180,-90,180,90", description="Bounding box in CRS coordinates."),
+        bbox_crs: str = Query(None, description="CRS of the BBOX (defaults to OGC:CRS84)."),
+        crs: str = Query("EPSG:3857", description="Coordinate Reference System."),
+        width: int = Query(768, description="Width of the output image."),
+        height: int = Query(768, description="Height of the output image."),
+        style: Optional[str] = Query(None, description="Name of the style to apply."),
+        bgcolor: Optional[str] = Query(None, description="Background color of the map."),
+        transparent: bool = Query(True, description="Whether the map background should be transparent."),
+        datetime: Optional[str] = Query(None, description="Temporal filter (timestamp or interval)."),
+        subset: Optional[str] = Query(None, description="Custom dimension filter."),
+        f: str = Query("png", description="Output format: png | jpeg | geotiff."),
+    ):
+        """Render a composited dataset-level map for selected collections under the aligned path.
+
+        Resolves the external catalog_id and each external collection id to internal
+        immutable IDs, enforces visibility per collection, then delegates to
+        ``_get_map_impl`` (OGC API - Maps /conf/dataset-map, Req 10).
+        """
+        catalogs_svc = get_protocol(CatalogsProtocol)
+        if not catalogs_svc:
+            raise HTTPException(status_code=500, detail="Catalogs service not available.")
+
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not internal_catalog_id:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+
+        from dynastore.models.protocols.visibility import resolve_collection_listing_ids
+        visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
+
+        requested = [c.strip() for c in collections.split(",") if c.strip()]
+        if not requested:
+            raise HTTPException(status_code=400, detail="At least one collection is required.")
+        internal_collections: List[str] = []
+        for ext_id in requested:
+            try:
+                internal_id = await catalogs_svc.collections.resolve_collection_id(
+                    internal_catalog_id, ext_id, allow_missing=False
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except AttributeError:
+                internal_id = ext_id
+            if not internal_id:
+                raise HTTPException(status_code=404, detail=f"Collection '{ext_id}' not found.")
+            if visible_ids is not None and internal_id not in visible_ids:
+                raise HTTPException(status_code=404, detail="Collection not found.")
+            internal_collections.append(internal_id)
+
+        return await MapsService._get_map_impl(
+            dataset=internal_catalog_id,
+            request=request,
+            collections=",".join(internal_collections),
+            bbox=bbox,
+            bbox_crs=bbox_crs,
+            crs=crs,
+            width=width,
+            height=height,
+            style=style,
+            bgcolor=bgcolor,
+            transparent=transparent,
+            datetime=datetime,
+            subset=subset,
+            f=f,
+        )
+
+    @router.get(
+        "/catalogs/{catalog_id}/collections/{collection_id}",
+        response_model=DatasetMaps,
+        summary="Collection map metadata (OGC API - Maps aligned path)",
+    )
+    async def get_collection_maps(  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
+        collection_id: str,
+        request: Request,
+        language: str = Depends(get_language),
+    ):
+        """Return map metadata for a single collection under the aligned platform path."""
+        catalogs_svc = get_protocol(CatalogsProtocol)
+        if not catalogs_svc:
+            raise HTTPException(status_code=500, detail="Catalogs service not available.")
+
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not internal_catalog_id:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+
+        try:
+            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
+                internal_catalog_id, collection_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AttributeError:
+            internal_collection_id = collection_id
+        if not internal_collection_id:
+            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+
+        from dynastore.models.protocols.visibility import resolve_collection_listing_ids
+        visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
+        if visible_ids is not None and internal_collection_id not in visible_ids:
+            raise HTTPException(status_code=404, detail="Collection not found.")
+
+        coll = await catalogs_svc.get_collection(
+            catalog_id=internal_catalog_id, collection_id=internal_collection_id
+        )
+        if not coll:
+            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+
+        title = coll.title.resolve(language) if coll.title is not None else None
+        base = str(request.url)
+        map_links = [
+            Link(href=f"{base}/map?bbox=-180,-90,180,90&crs=EPSG:4326", rel="item", type="image/png"),
+        ]
+        links = [
+            Link(href=base, rel="self"),
+            Link(href=str(request.url_for("get_maps_landing_page")), rel="up"),
+        ]
+        return DatasetMaps(
+            title=f"Maps for collection '{collection_id}' in '{catalog_id}'",
+            maps=[MapContent(title=title, links=map_links)],
+            links=links,
+        )
+
+    @router.get(
+        "/catalogs/{catalog_id}/collections/{collection_id}/map",
+        summary="Render map for a collection (OGC API - Maps aligned path, default style)",
+    )
+    async def get_collection_map(  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
+        collection_id: str,
+        request: Request,
+        bbox: str = Query("-180,-90,180,90", description="Bounding box in CRS coordinates."),
+        bbox_crs: str = Query(None, description="CRS of the BBOX (defaults to OGC:CRS84)."),
+        crs: str = Query("EPSG:3857", description="Coordinate Reference System."),
+        width: int = Query(768, description="Width of the output image."),
+        height: int = Query(768, description="Height of the output image."),
+        bgcolor: Optional[str] = Query(None, description="Background color of the map."),
+        transparent: bool = Query(True, description="Whether the map background should be transparent."),
+        datetime: Optional[str] = Query(None, description="Temporal filter (timestamp or interval)."),
+        subset: Optional[str] = Query(None, description="Custom dimension filter."),
+        f: str = Query("png", description="Output format: png | jpeg | geotiff."),
+    ):
+        """Render the default-style map for a specific collection under the aligned path.
+
+        Resolves catalog_id and collection_id from external (public) IDs to
+        internal immutable IDs, enforces visibility, then delegates to
+        ``_get_map_impl``.
+        """
+        catalogs_svc = get_protocol(CatalogsProtocol)
+        if not catalogs_svc:
+            raise HTTPException(status_code=500, detail="Catalogs service not available.")
+
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not internal_catalog_id:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+
+        try:
+            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
+                internal_catalog_id, collection_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AttributeError:
+            internal_collection_id = collection_id
+        if not internal_collection_id:
+            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+
+        from dynastore.models.protocols.visibility import resolve_collection_listing_ids
+        visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
+        if visible_ids is not None and internal_collection_id not in visible_ids:
+            raise HTTPException(status_code=404, detail="Collection not found.")
+
+        return await MapsService._get_map_impl(
+            dataset=internal_catalog_id,
+            request=request,
+            collections=internal_collection_id,
+            bbox=bbox,
+            bbox_crs=bbox_crs,
+            crs=crs,
+            width=width,
+            height=height,
+            style=None,
+            bgcolor=bgcolor,
+            transparent=transparent,
+            datetime=datetime,
+            subset=subset,
+            f=f,
+        )
+
+    @router.get(
+        "/catalogs/{catalog_id}/collections/{collection_id}/styles/{style_id}/map",
+        summary="Render styled map for a collection (OGC API - Maps aligned path, explicit style)",
+    )
+    async def get_collection_map_styled(  # type: ignore[reportGeneralTypeIssues]
+        catalog_id: str,
+        collection_id: str,
+        style_id: str,
+        request: Request,
+        bbox: str = Query("-180,-90,180,90", description="Bounding box in CRS coordinates."),
+        bbox_crs: str = Query(None, description="CRS of the BBOX (defaults to OGC:CRS84)."),
+        crs: str = Query("EPSG:3857", description="Coordinate Reference System."),
+        width: int = Query(768, description="Width of the output image."),
+        height: int = Query(768, description="Height of the output image."),
+        bgcolor: Optional[str] = Query(None, description="Background color of the map."),
+        transparent: bool = Query(True, description="Whether the map background should be transparent."),
+        datetime: Optional[str] = Query(None, description="Temporal filter (timestamp or interval)."),
+        subset: Optional[str] = Query(None, description="Custom dimension filter."),
+        f: str = Query("png", description="Output format: png | jpeg | geotiff."),
+    ):
+        """Render a map for a specific collection with an explicit style under the aligned path.
+
+        Resolves catalog_id and collection_id from external (public) IDs to
+        internal immutable IDs, enforces visibility, then delegates to
+        ``_get_map_impl``.
+        """
+        catalogs_svc = get_protocol(CatalogsProtocol)
+        if not catalogs_svc:
+            raise HTTPException(status_code=500, detail="Catalogs service not available.")
+
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not internal_catalog_id:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+
+        try:
+            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
+                internal_catalog_id, collection_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AttributeError:
+            internal_collection_id = collection_id
+        if not internal_collection_id:
+            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+
+        from dynastore.models.protocols.visibility import resolve_collection_listing_ids
+        visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
+        if visible_ids is not None and internal_collection_id not in visible_ids:
+            raise HTTPException(status_code=404, detail="Collection not found.")
+
+        return await MapsService._get_map_impl(
+            dataset=internal_catalog_id,
+            request=request,
+            collections=internal_collection_id,
+            bbox=bbox,
+            bbox_crs=bbox_crs,
+            crs=crs,
+            width=width,
+            height=height,
+            style=style_id,
+            bgcolor=bgcolor,
+            transparent=transparent,
+            datetime=datetime,
+            subset=subset,
+            f=f,
+        )

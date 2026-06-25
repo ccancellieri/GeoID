@@ -18,12 +18,12 @@
 
 """MapContent title localization.
 
-Regression: GET /maps/{catalog} returned 422 because MapContent.title was a
+Regression: the maps metadata routes returned 422 because MapContent.title was a
 plain ``str`` while the collection title is a multi-language ``LocalizedText``.
-The route now resolves the title to a single language (lang query param /
+The routes now resolve the title to a single language (lang query param /
 Accept-Language header, default 'en'), and ``lang='*'`` returns the full
-multi-language object. These tests mirror what get_dataset_maps does:
-``coll.title.resolve(language)`` then ``MapContent(title=...)``.
+multi-language object. These tests mirror what the aligned catalog/collection
+maps metadata routes do: ``coll.title.resolve(language)`` then ``MapContent(title=...)``.
 """
 from __future__ import annotations
 

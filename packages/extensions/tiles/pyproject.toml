@@ -15,6 +15,13 @@ dependencies = [
     "DynaStore",
 ]
 
+[project.optional-dependencies]
+raster = [
+    "rio-tiler>=9.0",
+    "rasterio>=1.4",
+    "lxml>=4.9",
+]
+
 [project.entry-points."dynastore.extensions"]
 tiles = "dynastore.extensions.tiles.tiles_service:TilesService"
 

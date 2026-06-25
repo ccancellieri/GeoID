@@ -100,8 +100,8 @@ class RenderPreseedTask(TaskProtocol):
         except ImportError as exc:
             raise RuntimeError(
                 "render_preseed: rio-tiler not installed — raster preseed "
-                "requires the renders extension. "
-                f"Install 'dynastore-ext-renders'. Original error: {exc}"
+                "requires the tiles extension with raster extras. "
+                f"Install 'dynastore-ext-tiles[raster]'. Original error: {exc}"
             ) from exc
 
         from dynastore.modules.renders.config import (
@@ -141,7 +141,7 @@ class RenderPreseedTask(TaskProtocol):
             )
 
         # Resolve COG href: read the triggering asset's href from the first
-        # item in the collection (same approach as RendersService._get_first_item).
+        # item in the collection (first-item lookup for the preseed render).
         cog_href = await self._resolve_cog_href(
             inputs.catalog_id, inputs.collection_id
         )
@@ -475,8 +475,7 @@ class RenderPreseedTask(TaskProtocol):
         try:
             from dynastore.models.protocols import StylesProtocol  # type: ignore[attr-defined]
             from dynastore.modules import get_protocol
-            from dynastore.modules.renders.colormap import parse_sld_colormap
-            from dynastore.extensions.renders.renders_service import RendersService  # type: ignore[import]
+            from dynastore.modules.renders.colormap import extract_sld_body, parse_sld_colormap
 
             styles_svc = get_protocol(StylesProtocol)
             if styles_svc is None:
@@ -486,11 +485,7 @@ class RenderPreseedTask(TaskProtocol):
             if not style_obj:
                 return None
 
-            renders_svc = get_protocol(RendersService)
-            if renders_svc is None:
-                return None
-
-            sld_body = renders_svc._extract_sld_body(style_obj)  # type: ignore[union-attr]
+            sld_body = extract_sld_body(style_obj)
             if not sld_body:
                 return None
 

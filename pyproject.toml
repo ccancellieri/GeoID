@@ -72,7 +72,7 @@ dynastore-ext-logs = { workspace = true }
 dynastore-ext-configs = { workspace = true }
 dynastore-ext-assets = { workspace = true }
 dynastore-ext-catalog-status = { workspace = true }
-dynastore-ext-renders = { workspace = true }
+
 
 [project.optional-dependencies]
 # ==========================================================================
@@ -124,6 +124,7 @@ extension_template = ["dynastore[extension_base]", "attrs>=25.3.0", "aiohttp>=3.
 extension_processes = ["dynastore[extension_base]", "jsonschema", "dynastore-ext-processes"]
 extension_features = ["dynastore[extension_base,geospatial_core,geospatial_io]", "pygeofilter[backend-sqlalchemy]", "dynastore-ext-features"]
 extension_tiles = ["dynastore[extension_base,module_tiles]", "dynastore-ext-tiles"]
+extension_tiles_raster = ["dynastore[extension_tiles,module_styles]", "rio-tiler>=9.0", "rasterio>=1.4", "lxml>=4.9", "dynastore-ext-tiles"]
 extension_volumes = ["dynastore[extension_base,geospatial_core]", "shapely>=2.0", "pyproj>=3.0.0", "cjio>=0.10.1", "dynastore-ext-volumes"]
 extension_tasks = ["dynastore[extension_base,module_tasks]", "dynastore-ext-tasks"]
 extension_proxy = ["dynastore[extension_base,module_proxy]", "dynastore-ext-proxy"]
@@ -147,7 +148,6 @@ extension_gcp_bucket = ["dynastore[extension_base,module_gcp]", "dynastore-ext-g
 extension_geoid = ["dynastore[extension_base,extension_web]", "user-agents>=2.2.0", "dynastore-ext-geoid"]
 extension_maps = ["dynastore[extension_base,geospatial_core,mvt]", "GDAL==3.13.0", "dynastore-ext-maps"]
 extension_coverages = ["dynastore[extension_base,geospatial_core]", "rasterio>=1.4.3", "dynastore-ext-coverages"]
-extension_renders = ["dynastore[extension_base,module_styles]", "rio-tiler>=9.0", "rasterio>=1.4", "lxml>=4.9", "dynastore-ext-renders"]
 extension_edr = ["dynastore[extension_base,geospatial_core]", "dynastore-ext-edr"]
 extension_dggs = ["dynastore[extension_base,geospatial_core]", "h3>=4.1.0", "s2sphere>=0.2.5", "dynastore-ext-dggs"]
 module_coverages_netcdf = ["netCDF4>=1.6.0", "xarray>=2024.0.0"]
@@ -271,7 +271,7 @@ core = ["dynastore[db_async,web,configs,storage,cache]"]
 catalog_data_grp = ["dynastore[geospatial_core,catalog,features]"]
 catalog_routes_grp = ["dynastore[stac,assets,extension_records,extension_catalog_status]"]
 catalog_grp = ["dynastore[catalog_data_grp,catalog_routes_grp,module_local,events]"]
-maps_grp = ["dynastore[styles,maps,extension_wfs,tiles,crs,gdal,extension_coverages,extension_renders]"]
+maps_grp = ["dynastore[styles,maps,extension_wfs,tiles,crs,gdal,extension_coverages,extension_tiles_raster]"]
 # google_grp split: dwh is rendering input (BQ joins also live here),
 # gcp is the bucket-admin router (not on maps).
 dwh_grp = ["dynastore[extension_dwh,module_gcp]"]
@@ -560,7 +560,7 @@ all = ["dynastore[api_full,geoid_service,worker_service]"]
 # `everything` = `all` + every `extension_*` extra, so all 35 ext wheels resolve.
 # Build the CI test image with SCOPE=everything. Keep service images on the
 # narrow `scope_*` extras to stay slim.
-everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,extension_catalog_status,extension_configs,extension_connected_systems,extension_coverages,extension_crs,extension_dggs,extension_dimensions,extension_dwh,extension_edr,extension_events,extension_features,extension_gcp_bucket,extension_gdal,extension_geoid,extension_httpx,extension_iam,extension_logs,extension_maps,extension_moving_features,extension_notebooks,extension_processes,extension_proxy,extension_records,extension_renders,extension_stac,extension_stats,extension_styles,extension_tasks,extension_template,extension_tiles,extension_volumes,extension_web,extension_wfs]"]
+everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,extension_catalog_status,extension_configs,extension_connected_systems,extension_coverages,extension_crs,extension_dggs,extension_dimensions,extension_dwh,extension_edr,extension_events,extension_features,extension_gcp_bucket,extension_gdal,extension_geoid,extension_httpx,extension_iam,extension_logs,extension_maps,extension_moving_features,extension_notebooks,extension_processes,extension_proxy,extension_records,extension_stac,extension_stats,extension_styles,extension_tasks,extension_template,extension_tiles,extension_tiles_raster,extension_volumes,extension_web,extension_wfs]"]
 # Superset of `everything` that pulls in every optional driver / task-only
 # dependency referenced anywhere in src/. Pyright/mypy need these resolvable to
 # clear `reportMissingImports` on optional code paths (duckdb, pyiceberg,

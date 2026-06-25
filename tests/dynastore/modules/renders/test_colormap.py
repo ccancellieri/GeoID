@@ -22,6 +22,7 @@ import pytest
 from dynastore.modules.renders.colormap import (
     _opacity_to_alpha,
     _parse_hex_color,
+    extract_sld_body,
     parse_sld_colormap,
 )
 
@@ -203,3 +204,77 @@ class TestParseSldColormap:
         </StyledLayerDescriptor>"""
         cmap = parse_sld_colormap(sld)
         assert cmap == {}
+
+
+# ---------------------------------------------------------------------------
+# extract_sld_body
+# ---------------------------------------------------------------------------
+
+
+class TestExtractSldBody:
+    """Tests for the module-level extract_sld_body helper.
+
+    Uses lightweight stub objects rather than the real styles models so this
+    test runs without the styles extension installed.
+    """
+
+    def test_returns_none_when_no_stylesheets(self):
+        class _StyleObj:
+            stylesheets = []
+
+        assert extract_sld_body(_StyleObj()) is None
+
+    def test_returns_none_when_stylesheets_is_none(self):
+        class _StyleObj:
+            stylesheets = None
+
+        assert extract_sld_body(_StyleObj()) is None
+
+    def test_returns_none_for_object_without_stylesheets(self):
+        assert extract_sld_body(object()) is None
+
+    def test_extracts_sld_body_from_sld_content_instance(self):
+        """When a stylesheet carries an SLDContent instance, the sld_body is returned."""
+        try:
+            from dynastore.modules.styles.models import SLDContent
+        except ImportError:
+            pytest.skip("styles models not available in this test environment")
+
+        sld_content = SLDContent(sld_body="<sld>body</sld>")
+
+        class _Sheet:
+            content = sld_content
+
+        class _StyleObj:
+            stylesheets = [_Sheet()]
+
+        result = extract_sld_body(_StyleObj())
+        assert result == "<sld>body</sld>"
+
+    def test_extracts_sld_body_from_dict_content(self):
+        """When a stylesheet.content is a dict with SLD format, the sld_body is returned."""
+        try:
+            from dynastore.modules.styles.models import StyleFormatEnum
+        except ImportError:
+            pytest.skip("styles models not available in this test environment")
+
+        class _Sheet:
+            content = {
+                "format": StyleFormatEnum.SLD_1_1,
+                "sld_body": "<sld>from dict</sld>",
+            }
+
+        class _StyleObj:
+            stylesheets = [_Sheet()]
+
+        result = extract_sld_body(_StyleObj())
+        assert result == "<sld>from dict</sld>"
+
+    def test_skips_sheets_without_content(self):
+        class _SheetNoContent:
+            content = None
+
+        class _StyleObj:
+            stylesheets = [_SheetNoContent()]
+
+        assert extract_sld_body(_StyleObj()) is None

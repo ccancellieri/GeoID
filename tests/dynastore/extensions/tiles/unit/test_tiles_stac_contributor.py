@@ -12,25 +12,24 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-"""Unit tests for RendersStacContributor.
+"""Unit tests for TilesStacContributor.
 
-Pure: no DB, no rio-tiler, no HTTP.  Mocks _renders_route_registered so
-tests don't depend on a real protocol registry.
+Pure: no DB, no rio-tiler, no HTTP. Mocks _tiles_route_registered so tests
+don't depend on a real protocol registry. Verifies the map-tile URL shape
+uses /tiles/.../map/tiles/WebMercatorQuad/{z}/{x}/{y}.png.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
 from unittest.mock import patch
 
-import pytest
-
 from dynastore.models.protocols.asset_contrib import ResourceRef
-from dynastore.extensions.renders.stac_contributor import (
-    RendersStacContributor,
+from dynastore.extensions.tiles.stac_contributor import (
+    TilesStacContributor,
     _first_cog_href,
     _RENDER_EXTENSION_URI,
-    _RENDERS_PREFIX,
+    _TILES_PREFIX,
 )
 
 
@@ -117,17 +116,17 @@ class TestFirstCogHref:
 
 
 # ---------------------------------------------------------------------------
-# RendersStacContributor.contribute — AssetLink emission
+# TilesStacContributor.contribute — AssetLink emission
 # ---------------------------------------------------------------------------
 
 
 class TestContribute:
     def test_emits_asset_link_when_route_registered(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_COG_ASSET, default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             links = list(contributor.contribute(ref))
@@ -136,20 +135,24 @@ class TestContribute:
         link = links[0]
         assert link.key == "render_tiles"
         assert link.media_type == "image/png"
-        assert "renders" in link.href
+        # New URL shape: /tiles/.../map/tiles/WebMercatorQuad/{z}/{x}/{y}.png
+        assert "/tiles/" in link.href
+        assert "/map/tiles/" in link.href
+        assert "WebMercatorQuad" in link.href
         assert "my-catalog" in link.href
         assert "my-collection" in link.href
-        assert "ndvi" in link.href
         assert "{z}" in link.href
         assert "{x}" in link.href
         assert "{y}" in link.href
+        # No style_id in the default-style URL
+        assert "ndvi" not in link.href
 
     def test_no_emission_when_route_not_registered(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_COG_ASSET, default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=False,
         ):
             links = list(contributor.contribute(ref))
@@ -157,11 +160,11 @@ class TestContribute:
         assert links == []
 
     def test_no_emission_when_no_cog_asset(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_NON_COG_ASSET, default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             links = list(contributor.contribute(ref))
@@ -169,11 +172,11 @@ class TestContribute:
         assert links == []
 
     def test_no_emission_when_no_default_style(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_COG_ASSET, default_style_id=None)
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             links = list(contributor.contribute(ref))
@@ -181,11 +184,11 @@ class TestContribute:
         assert links == []
 
     def test_no_emission_when_no_item_assets(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             links = list(contributor.contribute(ref))
@@ -194,7 +197,7 @@ class TestContribute:
 
     def test_uses_external_ids_in_url(self):
         """The URL must contain the external (public) catalog/collection IDs."""
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(
             catalog_id="public-cat-id",
             collection_id="public-col-id",
@@ -202,7 +205,7 @@ class TestContribute:
             default_style_id="fire",
         )
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             links = list(contributor.contribute(ref))
@@ -211,19 +214,34 @@ class TestContribute:
         assert "public-cat-id" in links[0].href
         assert "public-col-id" in links[0].href
 
+    def test_url_uses_tiles_prefix(self):
+        """URL must start with /tiles, not /renders."""
+        contributor = TilesStacContributor()
+        ref = _ref(item_assets=_COG_ASSET, default_style_id="ndvi")
+
+        with patch(
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
+            return_value=True,
+        ):
+            links = list(contributor.contribute(ref))
+
+        assert len(links) == 1
+        assert _TILES_PREFIX in links[0].href
+        assert "/renders" not in links[0].href
+
 
 # ---------------------------------------------------------------------------
-# RendersStacContributor.contribute_stac — StacContribution emission
+# TilesStacContributor.contribute_stac — StacContribution emission
 # ---------------------------------------------------------------------------
 
 
 class TestContributeStac:
     def test_emits_render_extension_uri(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_COG_ASSET, default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             contributions = list(contributor.contribute_stac(ref))
@@ -233,11 +251,11 @@ class TestContributeStac:
         assert _RENDER_EXTENSION_URI in contrib.stac_extensions
 
     def test_renders_map_key_is_style_id(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_COG_ASSET, default_style_id="my_style")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             contributions = list(contributor.contribute_stac(ref))
@@ -246,11 +264,11 @@ class TestContributeStac:
         assert "my_style" in renders
 
     def test_renders_map_contains_href_and_type(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_COG_ASSET, default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             contributions = list(contributor.contribute_stac(ref))
@@ -259,13 +277,15 @@ class TestContributeStac:
         assert "href" in entry
         assert entry["type"] == "image/png"
         assert "{z}" in entry["href"]
+        # URL uses new map-tile shape
+        assert "/map/tiles/" in entry["href"]
 
     def test_renders_map_contains_style_link(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_COG_ASSET, default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             contributions = list(contributor.contribute_stac(ref))
@@ -275,11 +295,11 @@ class TestContributeStac:
         assert any(lnk.get("rel") == "style" for lnk in links)
 
     def test_no_emission_when_route_not_registered(self):
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         ref = _ref(item_assets=_COG_ASSET, default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=False,
         ):
             contributions = list(contributor.contribute_stac(ref))
@@ -288,17 +308,16 @@ class TestContributeStac:
 
     def test_never_mutates_item_assets(self):
         """Enrich-don't-rewrite: the original assets dict must be unchanged."""
-        contributor = RendersStacContributor()
+        contributor = TilesStacContributor()
         original_assets = dict(_COG_ASSET)
         original_href = original_assets["cog_band1"]["href"]
         ref = _ref(item_assets=original_assets, default_style_id="ndvi")
 
         with patch(
-            "dynastore.extensions.renders.stac_contributor._renders_route_registered",
+            "dynastore.extensions.tiles.stac_contributor._tiles_route_registered",
             return_value=True,
         ):
             list(contributor.contribute_stac(ref))
             list(contributor.contribute(ref))
 
-        # Original href must not have been modified
         assert original_assets["cog_band1"]["href"] == original_href

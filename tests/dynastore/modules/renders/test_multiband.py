@@ -195,8 +195,8 @@ class TestParseMultibandParams:
     """
 
     def _parse(self, bands=None, expression=None, rescale=None):
-        from dynastore.extensions.renders.renders_service import _parse_multiband_params
-        return _parse_multiband_params(bands, expression, rescale)
+        from dynastore.extensions.tiles.tiles_service import TilesService
+        return TilesService._parse_multiband_params(bands, expression, rescale)
 
     def test_all_none_returns_nones(self):
         b, e, r = self._parse()
