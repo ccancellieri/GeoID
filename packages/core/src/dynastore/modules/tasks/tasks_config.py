@@ -124,19 +124,6 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         default=3600, ge=1,
         description="Cloud Run Job lease duration for a task executing on a Cloud Run Job.")
 
-    provisioning_inproc_offload_threshold: Mutable[int] = Field(
-        default=8,
-        ge=1,
-        description=(
-            "In-flight in-process task count at or above which an offloadable "
-            "provisioning task (catalog_provision) is routed to a Cloud Run Job "
-            "instead of running in-process on the catalog service.  Keeps "
-            "provisioning from competing with request-serving when the dispatcher "
-            "is already under load.  Reads live via the configs hot-reload path; "
-            "no service restart required."
-        ),
-    )
-
     provisioning_group_concurrency: Mutable[int] = Field(
         default=4,
         ge=1,

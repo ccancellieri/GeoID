@@ -174,11 +174,6 @@ async def select_runner_for(task_key: str):
 
 _OFFLOAD_RUNNER_TYPES = frozenset({"gcp_cloud_run", "worker_queue"})
 
-# Default in-process task count threshold above which an offloadable
-# provisioning task flips to a Cloud Run Job.  Overridable via
-# TasksPluginConfig.provisioning_inproc_offload_threshold (no restart required).
-_DEFAULT_PROVISIONING_OFFLOAD_THRESHOLD = 8
-
 
 async def offload_required(task_key: str) -> bool:
     """True when routing tags ``task_key`` OFFLOAD/HEAVY (must not run in-process).
@@ -212,52 +207,6 @@ def _restrict_to_offload_runners(runners: list) -> list:
         if getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
     ]
     return offload if offload else runners
-
-
-async def _should_offload_provisioning(task_key: str) -> bool:
-    """True when ``task_key`` is offloadable AND the in-process pool is at or
-    above the configured load threshold.
-
-    Fail-open contract: any exception (config unavailable, runner not found)
-    returns ``False`` so provisioning always has an in-process fallback.
-
-    Decision:
-    - task_key not in OFFLOADABLE_SYSTEM_TASKS → False (fast path, no I/O).
-    - in-flight count < threshold          → False (run in-process).
-    - in-flight count >= threshold         → True  (offload to Cloud Run Job).
-    """
-    from dynastore.modules.tasks.routing.matrix import OFFLOADABLE_SYSTEM_TASKS
-
-    if task_key not in OFFLOADABLE_SYSTEM_TASKS:
-        return False
-
-    try:
-        from dynastore.modules.tasks.runners import get_runners
-        from dynastore.models.tasks import TaskExecutionMode
-        from dynastore.tasks._helpers import get_tasks_config
-
-        threshold = _DEFAULT_PROVISIONING_OFFLOAD_THRESHOLD
-        cfg = await get_tasks_config()
-        if cfg is not None:
-            threshold = cfg.provisioning_inproc_offload_threshold
-
-        in_flight = 0
-        for runner in get_runners(TaskExecutionMode.ASYNCHRONOUS):
-            if getattr(runner, "runner_type", None) == "background":
-                # active_count reflects tasks currently running under the
-                # dispatcher's claimed path (populated via _running_tasks).
-                in_flight = getattr(runner, "active_count", 0)
-                break
-
-        return in_flight >= threshold
-
-    except Exception:  # noqa: BLE001 — fail-open: never block provisioning
-        logger.debug(
-            "_should_offload_provisioning: load probe failed for '%s'; "
-            "defaulting to in-process",
-            task_key,
-        )
-        return False
 
 
 # ----------------------------------------------------------------------
@@ -768,11 +717,6 @@ class ExecutionEngine:
         if mode == TaskExecutionMode.ASYNCHRONOUS:
             if await offload_required(task_type):
                 runners = _restrict_to_offload_runners(runners)
-            elif await _should_offload_provisioning(task_key=task_type):
-                # Dynamic load-adaptive offload for offloadable system tasks:
-                # the in-process pool is above threshold; route to Cloud Run
-                # Job if one is available (fail-open: unchanged when absent).
-                runners = _restrict_to_offload_runners(runners)
 
         context = RunnerContext(
             engine=engine,
@@ -1240,16 +1184,6 @@ class ExecutionEngine:
                     # offload runner exists here, runners is unchanged and the
                     # in-process path remains the legitimate option (e.g. maps
                     # running gdal).
-                    _offload_enforced = restricted is not runners and any(
-                        getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
-                        for r in restricted
-                    )
-                    runners = restricted
-                elif await _should_offload_provisioning(task_key=task_type):
-                    # Dynamic load-adaptive offload for offloadable system
-                    # tasks: the in-process pool is above threshold; route to
-                    # Cloud Run Job if one is available (fail-open).
-                    restricted = _restrict_to_offload_runners(runners)
                     _offload_enforced = restricted is not runners and any(
                         getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
                         for r in restricted

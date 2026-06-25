@@ -33,6 +33,7 @@ from dynastore.modules.tasks.routing.exec_hints import ExecHint
 from dynastore.modules.tasks.routing.matrix import (
     CLOUD_PROCESS_CONSUMERS,
     LIGHTWEIGHT_PROCESSES,
+    OFFLOADABLE_SYSTEM_TASKS,
     InventoryItem,
     build_routing_matrix,
 )
@@ -160,6 +161,49 @@ def test_onprem_never_offloads_to_cloud_run():
         assert t.runner == "background"
         assert ExecHint.OFFLOAD not in t.hints
         assert t.consumers != ["worker"]
+
+
+# ---------------------------------------------------------------------------
+# OFFLOADABLE_SYSTEM_TASKS — preset-driven offload
+# ---------------------------------------------------------------------------
+
+
+def test_cloud_offloadable_task_routes_to_gcp_cloud_run():
+    """Under cloud preset, catalog_provision must emit gcp_cloud_run + OFFLOAD
+    so offload_required() returns True and _restrict_to_offload_runners drops
+    BackgroundRunner, routing to the Cloud Run Job."""
+    for key in OFFLOADABLE_SYSTEM_TASKS:
+        tasks, _ = build_routing_matrix([_task(key, affinity="catalog")], preset="cloud")
+        t = tasks[key][0]
+        assert t.runner == "gcp_cloud_run", (
+            f"{key} under cloud must use gcp_cloud_run, got {t.runner!r}"
+        )
+        assert ExecHint.OFFLOAD in t.hints, (
+            f"{key} under cloud must carry OFFLOAD hint"
+        )
+        assert ExecHint.BACKGROUND not in t.hints
+        assert t.consumers == ["catalog"]
+
+
+def test_onprem_offloadable_task_stays_background():
+    """Under onprem preset, catalog_provision stays in-process (no Job available)."""
+    for key in OFFLOADABLE_SYSTEM_TASKS:
+        tasks, _ = build_routing_matrix([_task(key, affinity="catalog")], preset="onprem")
+        t = tasks[key][0]
+        assert t.runner == "background", (
+            f"{key} under onprem must use background, got {t.runner!r}"
+        )
+        assert ExecHint.BACKGROUND in t.hints
+        assert ExecHint.OFFLOAD not in t.hints
+
+
+def test_offloadable_task_consumers_match_affinity():
+    """catalog_provision consumer must match its affinity_tier under both presets."""
+    for preset in ("cloud", "onprem"):
+        tasks, _ = build_routing_matrix(
+            [_task("catalog_provision", affinity="catalog")], preset=preset
+        )
+        assert tasks["catalog_provision"][0].consumers == ["catalog"]
 
 
 # ---------------------------------------------------------------------------

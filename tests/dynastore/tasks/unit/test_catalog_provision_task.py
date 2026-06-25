@@ -27,9 +27,8 @@ Covers:
   - deprovision_soft/hard selects .deprovision hook.
   - Failing hook marks step "failed" and aborts the run (re-raises).
   - catalog_provision is in _PROVISIONING_TASK_TYPES.
-  - Routing matrix: offloadable system task emits a single [background] target (no static
-    OFFLOAD/HEAVY hint) under both presets; offload is decided dynamically at dispatch.
-  - _should_offload_provisioning: below threshold → False; at/above → True; exception → False.
+  - Routing matrix: under the cloud preset catalog_provision routes to gcp_cloud_run + OFFLOAD
+    (offload_required returns True); under onprem it stays background (no Cloud Run Job).
 """
 
 from __future__ import annotations
@@ -663,30 +662,36 @@ class TestRoutingMatrix:
 
         return InventoryItem(task_key=key, kind="task", affinity_tier="catalog")
 
-    def test_offloadable_task_yields_single_background_no_static_offload_hint(self):
-        """An offloadable system task routes to a SINGLE background target with
-        NO static OFFLOAD/HEAVY hint, under both cloud and onprem.
-
-        Regression guard: a static gcp_cloud_run target with OFFLOAD/HEAVY would
-        make ``offload_required`` true unconditionally and turn the dynamic
-        load-probe into dead code. Offload for these tasks is decided at
-        dispatch time by ``_should_offload_provisioning``, never by routing.
-        """
+    def test_cloud_offloadable_task_routes_to_gcp_cloud_run(self):
+        """Under the cloud preset, catalog_provision must route to gcp_cloud_run
+        with OFFLOAD hint so offload_required() returns True and the dispatcher
+        routes to the Cloud Run Job instead of running in-process."""
         from dynastore.modules.tasks.routing.matrix import build_routing_matrix
         from dynastore.modules.tasks.routing.exec_hints import ExecHint
 
-        for preset in ("cloud", "onprem"):
-            tasks, _ = build_routing_matrix(
-                [self._task_item("catalog_provision")], preset=preset
-            )
-            targets = tasks["catalog_provision"]
-            assert len(targets) == 1, (
-                f"Expected 1 target under {preset}; got {len(targets)}"
-            )
-            assert targets[0].runner == "background"
-            assert ExecHint.BACKGROUND in targets[0].hints
-            assert ExecHint.OFFLOAD not in targets[0].hints
-            assert ExecHint.HEAVY not in targets[0].hints
+        tasks, _ = build_routing_matrix(
+            [self._task_item("catalog_provision")], preset="cloud"
+        )
+        targets = tasks["catalog_provision"]
+        assert len(targets) == 1
+        assert targets[0].runner == "gcp_cloud_run"
+        assert ExecHint.OFFLOAD in targets[0].hints
+        assert ExecHint.BACKGROUND not in targets[0].hints
+
+    def test_onprem_offloadable_task_stays_background(self):
+        """Under the onprem preset, catalog_provision stays in-process
+        (no Cloud Run Job available in that topology)."""
+        from dynastore.modules.tasks.routing.matrix import build_routing_matrix
+        from dynastore.modules.tasks.routing.exec_hints import ExecHint
+
+        tasks, _ = build_routing_matrix(
+            [self._task_item("catalog_provision")], preset="onprem"
+        )
+        targets = tasks["catalog_provision"]
+        assert len(targets) == 1
+        assert targets[0].runner == "background"
+        assert ExecHint.BACKGROUND in targets[0].hints
+        assert ExecHint.OFFLOAD not in targets[0].hints
 
     def test_non_offloadable_task_always_single_background(self):
         """A regular system task (not in OFFLOADABLE_SYSTEM_TASKS) stays single background."""
@@ -708,120 +713,3 @@ class TestRoutingMatrix:
 
         assert "catalog_provision" in OFFLOADABLE_SYSTEM_TASKS
 
-
-# ---------------------------------------------------------------------------
-# _should_offload_provisioning
-# ---------------------------------------------------------------------------
-
-
-class TestShouldOffloadProvisioning:
-    @pytest.mark.asyncio
-    async def test_non_offloadable_task_returns_false(self):
-        from dynastore.modules.tasks.execution import _should_offload_provisioning
-
-        result = await _should_offload_provisioning("gcp_provision_catalog")
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_below_threshold_returns_false(self):
-        """In-flight count below threshold → in-process (False)."""
-        from dynastore.modules.tasks.execution import _should_offload_provisioning
-
-        mock_runner = MagicMock()
-        mock_runner.runner_type = "background"
-        mock_runner.active_count = 3  # below default threshold of 8
-
-        mock_config = MagicMock()
-        mock_config.provisioning_inproc_offload_threshold = 8
-
-        with patch(
-            "dynastore.tasks._helpers.get_protocol",
-            return_value=MagicMock(get_config=AsyncMock(return_value=mock_config)),
-        ), patch(
-            # get_runners is lazily imported inside _should_offload_provisioning;
-            # patch at the source module so all import-time callers see the mock.
-            "dynastore.modules.tasks.runners.get_runners",
-            return_value=[mock_runner],
-        ):
-            result = await _should_offload_provisioning("catalog_provision")
-
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_at_threshold_returns_true(self):
-        """In-flight count at threshold → offload (True)."""
-        from dynastore.modules.tasks.execution import _should_offload_provisioning
-
-        mock_runner = MagicMock()
-        mock_runner.runner_type = "background"
-        mock_runner.active_count = 8  # equals threshold
-
-        mock_config = MagicMock()
-        mock_config.provisioning_inproc_offload_threshold = 8
-
-        with patch(
-            "dynastore.tasks._helpers.get_protocol",
-            return_value=MagicMock(get_config=AsyncMock(return_value=mock_config)),
-        ), patch(
-            "dynastore.modules.tasks.runners.get_runners",
-            return_value=[mock_runner],
-        ):
-            result = await _should_offload_provisioning("catalog_provision")
-
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_above_threshold_returns_true(self):
-        """In-flight count above threshold → offload (True)."""
-        from dynastore.modules.tasks.execution import _should_offload_provisioning
-
-        mock_runner = MagicMock()
-        mock_runner.runner_type = "background"
-        mock_runner.active_count = 50
-
-        mock_config = MagicMock()
-        mock_config.provisioning_inproc_offload_threshold = 8
-
-        with patch(
-            "dynastore.tasks._helpers.get_protocol",
-            return_value=MagicMock(get_config=AsyncMock(return_value=mock_config)),
-        ), patch(
-            "dynastore.modules.tasks.runners.get_runners",
-            return_value=[mock_runner],
-        ):
-            result = await _should_offload_provisioning("catalog_provision")
-
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_exception_returns_false_fail_open(self):
-        """Any probe exception must return False (fail-open: never block provisioning)."""
-        from dynastore.modules.tasks.execution import _should_offload_provisioning
-
-        with patch(
-            "dynastore.modules.tasks.runners.get_runners",
-            side_effect=RuntimeError("runner unavailable"),
-        ):
-            result = await _should_offload_provisioning("catalog_provision")
-
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_config_unavailable_uses_default_threshold(self):
-        """When config is unavailable, default threshold (8) is used; below it → False."""
-        from dynastore.modules.tasks.execution import _should_offload_provisioning
-
-        mock_runner = MagicMock()
-        mock_runner.runner_type = "background"
-        mock_runner.active_count = 5  # below default 8
-
-        with patch(
-            "dynastore.tasks._helpers.get_protocol",
-            return_value=None,  # ConfigsProtocol not available
-        ), patch(
-            "dynastore.modules.tasks.runners.get_runners",
-            return_value=[mock_runner],
-        ):
-            result = await _should_offload_provisioning("catalog_provision")
-
-        assert result is False
