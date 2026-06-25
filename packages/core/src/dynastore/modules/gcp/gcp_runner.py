@@ -278,11 +278,30 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
             if not claimed:
                 logger.warning(
                     "GcpJobRunner: dispatcher-path race detected — task '%s' "
-                    "already owned by a non-GcpJobRunner worker. Skipping Cloud "
-                    "Run dispatch (no double-spawn).",
+                    "already owned by a non-GcpJobRunner worker. Probing owner...",
                     task_id_uuid,
                 )
-                return DEFERRED_COMPLETION
+                existing = await tasks_module.get_task_by_id_unscoped(
+                    context.engine, task_id_uuid
+                )
+                if existing and existing.owner_id:
+                    if existing.owner_id.startswith("gcp_cloud_run_"):
+                        logger.info(
+                            "GcpJobRunner: task '%s' owned by REST-path worker '%s' "
+                            "— deferring to that execution (no double-spawn).",
+                            task_id_uuid, existing.owner_id,
+                        )
+                        return DEFERRED_COMPLETION
+                    else:
+                        logger.warning(
+                            "GcpJobRunner: task '%s' owned by unknown worker '%s' "
+                            "— resetting to PENDING for recovery.",
+                            task_id_uuid, existing.owner_id,
+                        )
+                await tasks_module.reset_task_to_pending(
+                    context.engine, task_id_uuid, backoff=timedelta(seconds=5)
+                )
+                return None
             task_id_for_payload = task_id_uuid
             logger.info(
                 f"GcpJobRunner: dispatcher-path reuse of task '{task_id_uuid}' for "

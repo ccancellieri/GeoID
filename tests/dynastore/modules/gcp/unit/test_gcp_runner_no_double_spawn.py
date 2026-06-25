@@ -156,16 +156,14 @@ async def test_rest_path_dedup_hit_returns_none_no_runjob():
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_path_skips_runjob_when_claim_lost():
-    """If a non-GcpJobRunner peer already owns the claimed row,
-    ``claim_for_dispatch`` returns False and the runner MUST return
-    ``DEFERRED_COMPLETION`` without spawning Cloud Run.  Belt-and-
-    suspenders against any future regression that re-opens the producer
-    race window.
+async def test_dispatcher_path_defers_when_rest_path_owns():
+    """When claim_for_dispatch fails because a REST-path worker owns the task,
+    the runner MUST return DEFERRED_COMPLETION without spawning Cloud Run.
     """
     from dynastore.modules.gcp.gcp_runner import GcpJobRunner
 
     runner = GcpJobRunner()
+    task_id = _uuid.uuid4()
     ctx = RunnerContext(
         engine=_fake_engine(),
         task_type="ingestion",
@@ -173,15 +171,21 @@ async def test_dispatcher_path_skips_runjob_when_claim_lost():
         inputs={},
         db_schema="s_test",
         extra_context={
-            "task_id": str(_uuid.uuid4()),
+            "task_id": str(task_id),
             "task_timestamp": "2026-04-27T12:00:00Z",
         },
     )
+
+    fake_task = MagicMock()
+    fake_task.owner_id = "gcp_cloud_run_abc123"
 
     run_job_mock = AsyncMock()
     with patch(
         "dynastore.modules.tasks.tasks_module.claim_for_dispatch",
         AsyncMock(return_value=False),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.get_task_by_id_unscoped",
+        AsyncMock(return_value=fake_task),
     ), patch(
         "dynastore.modules.gcp.tools.jobs.load_job_config",
         AsyncMock(return_value={"ingestion": "dynastore-ingestion-job"}),
@@ -191,6 +195,53 @@ async def test_dispatcher_path_skips_runjob_when_claim_lost():
         result = await runner.run(ctx)
 
     assert result is DEFERRED_COMPLETION
+    run_job_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_path_resets_to_pending_when_unknown_owner():
+    """When claim_for_dispatch fails and the task is owned by an unknown worker,
+    the runner MUST reset the task to PENDING and return None (no spawn).
+    """
+    from dynastore.modules.gcp.gcp_runner import GcpJobRunner
+
+    runner = GcpJobRunner()
+    task_id = _uuid.uuid4()
+    ctx = RunnerContext(
+        engine=_fake_engine(),
+        task_type="ingestion",
+        caller_id="system",
+        inputs={},
+        db_schema="s_test",
+        extra_context={
+            "task_id": str(task_id),
+            "task_timestamp": "2026-04-27T12:00:00Z",
+        },
+    )
+
+    fake_task = MagicMock()
+    fake_task.owner_id = "unknown-worker-123"
+
+    run_job_mock = AsyncMock()
+    reset_mock = AsyncMock()
+    with patch(
+        "dynastore.modules.tasks.tasks_module.claim_for_dispatch",
+        AsyncMock(return_value=False),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.get_task_by_id_unscoped",
+        AsyncMock(return_value=fake_task),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.reset_task_to_pending", reset_mock
+    ), patch(
+        "dynastore.modules.gcp.tools.jobs.load_job_config",
+        AsyncMock(return_value={"ingestion": "dynastore-ingestion-job"}),
+    ), patch(
+        "dynastore.modules.gcp.tools.jobs.run_cloud_run_job_async", run_job_mock
+    ):
+        result = await runner.run(ctx)
+
+    assert result is None
+    reset_mock.assert_awaited_once()
     run_job_mock.assert_not_called()
 
 
