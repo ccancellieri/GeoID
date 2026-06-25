@@ -26,7 +26,7 @@ and protocol-specific response models. Zero core changes needed.
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import FrozenSet, Optional
+from typing import FrozenSet, Optional, Tuple
 
 import rasterio as _rasterio_scope_gate  # noqa: F401  # SCOPE gate: extension_coverages requires rasterio
 _ = _rasterio_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
@@ -46,22 +46,176 @@ from dynastore.extensions.tools.response_i18n import localize_response_dict, res
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.modules.coverages.domainset import build_domainset
 from dynastore.modules.coverages.rangetype import build_rangetype
-from dynastore.modules.coverages.subset import parse_subset
+from dynastore.modules.coverages.subset import AxisRange, SubsetRequest, parse_subset
 from dynastore.modules.coverages.writers import MEDIA_TYPE_FOR
 
 from . import coverages_models as cm
 
 
-def _stream_coverage_geotiff(href: str, subset):
+def _bbox_to_subset(bbox: str) -> SubsetRequest:
+    """Parse OGC bbox query param and convert to a SubsetRequest.
+
+    OGC API - Coverages §7.8 /req/coverage-bbox: the ``bbox`` query parameter
+    follows the OGC API Common Part 2 convention:
+      ``minlon,minlat,maxlon,maxlat``
+    which maps directly to Lon(minlon:maxlon),Lat(minlat:maxlat) subset axes.
+    """
+    from fastapi import HTTPException
+    parts = bbox.split(",")
+    if len(parts) != 4:
+        raise HTTPException(
+            status_code=400,
+            detail="bbox must be 'minlon,minlat,maxlon,maxlat' (four comma-separated numbers).",
+        )
+    try:
+        minlon, minlat, maxlon, maxlat = (float(p.strip()) for p in parts)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"bbox values must be numeric: {exc}",
+        ) from exc
+    if minlon > maxlon or minlat > maxlat:
+        raise HTTPException(
+            status_code=400,
+            detail="bbox: min values must be <= max values.",
+        )
+    return SubsetRequest(axes=[
+        AxisRange("Lon", minlon, maxlon),
+        AxisRange("Lat", minlat, maxlat),
+    ])
+
+
+def _merge_subset_and_bbox(
+    subset: Optional[str], bbox: Optional[str]
+) -> Optional[str]:
+    """Merge ``subset`` and ``bbox`` parameters into a single ``subset`` string.
+
+    When both are given, bbox is converted to subset axes and appended; axes
+    appearing in both are rejected with 400 (ambiguous constraint, per
+    OGC 19-087 §7.8).
+    """
+    from fastapi import HTTPException
+    if bbox is None:
+        return subset
+
+    bbox_req = _bbox_to_subset(bbox)
+    if subset is None:
+        # Serialise the bbox SubsetRequest back to the wire format so that
+        # the downstream parse_subset call in each writer handles it uniformly.
+        parts = [
+            f"{ar.axis}({ar.low}:{ar.high})" for ar in bbox_req.axes
+        ]
+        return ",".join(parts)
+
+    # Both present: parse the explicit subset and check for axis collisions.
+    explicit_req = parse_subset(subset)
+    explicit_axes = {ar.axis.lower() for ar in explicit_req.axes}
+    bbox_axes = {ar.axis.lower() for ar in bbox_req.axes}
+    overlap = explicit_axes & bbox_axes
+    if overlap:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Axis conflict: {sorted(overlap)} appear in both "
+                "the 'subset' and 'bbox' parameters. Use one or the other."
+            ),
+        )
+    combined = explicit_req.axes + bbox_req.axes
+    parts = [f"{ar.axis}({ar.low}:{ar.high})" for ar in combined]
+    return ",".join(parts)
+
+
+def _resolve_scale(
+    *,
+    box_width: int,
+    box_height: int,
+    scale_factor: Optional[float],
+    scale_size: Optional[str],
+) -> Tuple[int, int]:
+    """Resolve (out_width, out_height) from scale-factor or scale-size.
+
+    OGC 19-087 §7.11 /req/scale-factor: ``scale-factor`` is a positive real
+    number; the output grid size is floor(native * scale-factor) in each axis.
+    OGC 19-087 §7.12 /req/scale-size: ``scale-size`` is a comma-separated
+    ``AxisLabel(n)`` list; the named axes are resampled to the given pixel count.
+    Only Lon/Lat (X/Y) axes are supported; Time is not.
+
+    Returns ``(out_width, out_height)`` for use with rasterio ``out_shape``.
+    Raises 400 on conflicting or invalid params.
+    """
+    from fastapi import HTTPException
+    import math
+
+    if scale_factor is not None and scale_size is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Use either scale-factor or scale-size, not both.",
+        )
+
+    if scale_factor is not None:
+        if scale_factor <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="scale-factor must be a positive number.",
+            )
+        out_w = max(1, int(math.floor(box_width * scale_factor)))
+        out_h = max(1, int(math.floor(box_height * scale_factor)))
+        return out_w, out_h
+
+    if scale_size is not None:
+        out_w = box_width
+        out_h = box_height
+        # Format: AxisLabel1(n1),AxisLabel2(n2)
+        import re
+        for token in scale_size.split(","):
+            m = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\((\d+)\)$", token.strip())
+            if not m:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"scale-size token {token!r} is not in 'AxisLabel(n)' form."
+                    ),
+                )
+            label, n = m.group(1).lower(), int(m.group(2))
+            if n < 1:
+                raise HTTPException(
+                    status_code=400, detail=f"scale-size: {m.group(1)} size must be >= 1."
+                )
+            if label in {"lon", "longitude", "x", "e", "east"}:
+                out_w = n
+            elif label in {"lat", "latitude", "y", "n", "north"}:
+                out_h = n
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"scale-size: unsupported axis '{m.group(1)}'. "
+                        "Only Lon/Lat (X/Y) axes are supported."
+                    ),
+                )
+        return out_w, out_h
+
+    return box_width, box_height
+
+
+def _stream_coverage_geotiff(
+    href: str,
+    subset,
+    *,
+    scale_factor: Optional[float] = None,
+    scale_size: Optional[str] = None,
+):
     """Stream a GeoTIFF response by reading the source raster at ``href``.
 
-    Imports rasterio lazily so the helper remains importable without it.
+    ``scale_factor`` (OGC 19-087 §7.11) and ``scale_size`` (§7.12) control
+    output resolution. Imports rasterio lazily so the helper remains
+    importable without it.
     """
-    from dynastore.modules.coverages.reader import read_window_iter
+    from dynastore.modules.coverages.reader import read_scaled
     from dynastore.modules.coverages.window import RasterGeoRef, resolve_window
     from dynastore.modules.coverages.writers.geotiff import write_geotiff
     from dynastore.modules.gdal.service import open_raster_vsi
-    from rasterio.transform import from_origin
+    from rasterio.transform import from_bounds
 
     req = parse_subset(subset)
     ds = open_raster_vsi(href)
@@ -75,14 +229,23 @@ def _stream_coverage_geotiff(href: str, subset):
             axis_order=("Lon", "Lat"),
         )
         box = resolve_window(req, ref)
-        out_transform = from_origin(
-            ref.origin_x + ref.pixel_x * box.col_off,
-            ref.origin_y + ref.pixel_y * box.row_off,
-            ref.pixel_x, -ref.pixel_y,
+        out_w, out_h = _resolve_scale(
+            box_width=box.width, box_height=box.height,
+            scale_factor=scale_factor, scale_size=scale_size,
         )
-        tiles = ((0, 0, block) for block in read_window_iter(ds, box))
+        west = ref.origin_x + ref.pixel_x * box.col_off
+        east = ref.origin_x + ref.pixel_x * (box.col_off + box.width)
+        north = ref.origin_y + ref.pixel_y * box.row_off
+        south = ref.origin_y + ref.pixel_y * (box.row_off + box.height)
+        out_transform = from_bounds(
+            min(west, east), min(south, north),
+            max(west, east), max(south, north),
+            out_w, out_h,
+        )
+        arr = read_scaled(ds, box, band=1, out_shape=(out_h, out_w))
+        tiles = ((0, 0, arr),)
         yield from write_geotiff(
-            width=box.width, height=box.height,
+            width=out_w, height=out_h,
             transform=out_transform, crs=ds.crs,
             dtype=str(ds.dtypes[0]), band_count=1,
             tiles=tiles,
@@ -160,6 +323,40 @@ def _stream_coverage_zarr(href: str, subset, *, band_names: list, chunk_size: in
         ds.close()
 
 
+def _read_coverage_values(href: str, subset, rangetype: dict):
+    """Yield one 2-D array per band for a CoverageJSON response.
+
+    Reads the raster at ``href`` restricted to ``subset``, one band per
+    field declared in ``rangetype``.  Each yielded item is a list-of-lists
+    ``[[row0_col0, row0_col1, ...], [row1_col0, ...], ...]`` as expected by
+    :func:`write_coveragejson`.
+    """
+    from dynastore.modules.coverages.reader import read_scaled
+    from dynastore.modules.coverages.window import RasterGeoRef, resolve_window
+    from dynastore.modules.gdal.service import open_raster_vsi
+
+    req = parse_subset(subset)
+    ds = open_raster_vsi(href)
+    try:
+        t = ds.transform
+        ref = RasterGeoRef(
+            width=ds.width, height=ds.height,
+            origin_x=t.c, origin_y=t.f,
+            pixel_x=t.a, pixel_y=t.e,
+            crs=str(ds.crs),
+            axis_order=("Lon", "Lat"),
+        )
+        box = resolve_window(req, ref)
+        n_bands = ds.count
+        field_count = len(rangetype.get("field", []))
+        bands_to_read = range(1, min(n_bands, field_count) + 1) if field_count else range(1, n_bands + 1)
+        for band_idx in bands_to_read:
+            arr = read_scaled(ds, box, band=band_idx)
+            yield arr.tolist()
+    finally:
+        ds.close()
+
+
 def _resolve_format(f) -> str:
     if f is None:
         return "geotiff"
@@ -228,15 +425,25 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 OGC_API_COVERAGES_URIS = [
+    # OGC 19-087r6 §7.1 /req/core — landing page, conformance, /coverage endpoint
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/core",
+    # OGC 19-087r6 §7.2 /req/geodata-coverage — collection-tied coverage resource
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/geodata-coverage",
+    # OGC 19-087r6 §7.3 /req/json — JSON-encoded coverage metadata responses
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/json",
+    # OGC 19-087r6 §7.4 /req/html — HTML landing page and navigation
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/html",
+    # OGC 19-087r6 §7.7 /req/coverage-subset — ?subset=Axis(low:high) trimming
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-subset",
+    # OGC 19-087r6 §7.8 /req/coverage-bbox — ?bbox=minlon,minlat,maxlon,maxlat shorthand
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-bbox",
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-datetime",
+    # OGC 19-087r6 §7.11 /req/scale-factor — ?scale-factor=<ratio> downsampling
+    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/scaling",
+    # OGC 19-087r6 §7.5 /req/geotiff — GeoTIFF binary output
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/geotiff",
+    # OGC 19-087r6 §7.5 /req/netcdf — NetCDF-4 binary output
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/netcdf",
+    # OGC 19-087r6 §7.5 /req/coveragejson — CoverageJSON output with populated range
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coveragejson",
 ]
 
@@ -437,10 +644,43 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         catalog_id: str,
         collection_id: str,
         subset: Optional[str] = Query(None),
+        bbox: Optional[str] = Query(
+            None,
+            description=(
+                "Bounding-box filter in CRS84: minlon,minlat,maxlon,maxlat. "
+                "OGC 19-087 §7.8 /req/coverage-bbox. "
+                "Cannot repeat an axis already named in the 'subset' parameter."
+            ),
+        ),
+        scale_factor: Optional[float] = Query(
+            None,
+            alias="scale-factor",
+            gt=0,
+            description=(
+                "Uniform downsampling ratio applied to the output grid. "
+                "A value of 0.5 halves both width and height. "
+                "OGC 19-087 §7.11 /req/scale-factor."
+            ),
+        ),
+        scale_size: Optional[str] = Query(
+            None,
+            alias="scale-size",
+            description=(
+                "Per-axis output pixel count in 'AxisLabel(n)' form, "
+                "e.g. 'Lon(256),Lat(128)'. "
+                "OGC 19-087 §7.12 /req/scale-size."
+            ),
+        ),
         f: Optional[str] = Query("geotiff"),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Stream a coverage by content-negotiated format with optional subset.
+
+        Supported subsetting: ``subset`` (OGC 19-087 §7.7) and ``bbox``
+        (§7.8). Supported scaling: ``scale-factor`` (§7.11) and ``scale-size``
+        (§7.12).  ``scale-factor`` / ``scale-size`` are implemented for GeoTIFF
+        and CoverageJSON; NetCDF-4 and Zarr return 501 when scaling is
+        requested (the writer pipeline does not support out_shape resampling).
 
         ``?hints=`` is accepted uniformly (e.g. ``hints=geometry_exact``) but
         reserved for forward-compatible routing — coverage data is read from a
@@ -449,27 +689,62 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         """
         await self._require_collection_visible(catalog_id, collection_id)
         fmt = _resolve_format(f)
+        effective_subset = _merge_subset_and_bbox(subset, bbox)
         item = await self._get_first_item(catalog_id, collection_id)
         if item is None:
             raise HTTPException(status_code=404, detail="No coverage item found.")
         href = ogc_asset_href(item, error_detail="No asset href on coverage item.")
         if fmt == "geotiff":
-            gen = _stream_coverage_geotiff(href, subset=subset)
+            gen = _stream_coverage_geotiff(
+                href,
+                subset=effective_subset,
+                scale_factor=scale_factor,
+                scale_size=scale_size,
+            )
         elif fmt == "covjson":
+            if scale_factor is not None or scale_size is not None:
+                raise HTTPException(
+                    status_code=501,
+                    detail=(
+                        "scale-factor and scale-size are not yet supported for "
+                        "CoverageJSON output."
+                    ),
+                )
             from dynastore.modules.coverages.writers.coveragejson import (
                 write_coveragejson,
             )
-            ds = build_domainset(item) or {}
+            ds_meta = build_domainset(item) or {}
             rt = build_rangetype(item) or {"type": "DataRecord", "field": []}
-            gen = write_coveragejson(ds, rt, iter([]))
+            values_iter = _read_coverage_values(href, effective_subset, rt)
+            gen = write_coveragejson(ds_meta, rt, values_iter)
         elif fmt == "netcdf":
+            if scale_factor is not None or scale_size is not None:
+                raise HTTPException(
+                    status_code=501,
+                    detail=(
+                        "scale-factor and scale-size are not yet supported for "
+                        "NetCDF output."
+                    ),
+                )
             rt = build_rangetype(item) or {"type": "DataRecord", "field": []}
-            band_names = [f["name"] for f in rt.get("field", [])] or ["band"]
-            gen = _stream_coverage_netcdf(href, subset=subset, band_names=band_names)
+            band_names = [fld["name"] for fld in rt.get("field", [])] or ["band"]
+            gen = _stream_coverage_netcdf(
+                href, subset=effective_subset, band_names=band_names
+            )
         elif fmt == "zarr":
+            if scale_factor is not None or scale_size is not None:
+                raise HTTPException(
+                    status_code=501,
+                    detail=(
+                        "scale-factor and scale-size are not yet supported for "
+                        "Zarr output."
+                    ),
+                )
             rt = build_rangetype(item) or {"type": "DataRecord", "field": []}
-            band_names = [f["name"] for f in rt.get("field", [])] or ["band"]
-            gen = _stream_coverage_zarr(href, subset=subset, band_names=band_names)
+            band_names = [fld["name"] for fld in rt.get("field", [])] or ["band"]
+            gen = _stream_coverage_zarr(
+                href, subset=effective_subset, band_names=band_names
+            )
         else:  # pragma: no cover - guarded by _resolve_format above
             raise HTTPException(status_code=415, detail=f"Unsupported format: {fmt!r}")
         return StreamingResponse(gen, media_type=MEDIA_TYPE_FOR[fmt])

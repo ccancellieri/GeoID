@@ -24,7 +24,7 @@ Lazy-imports rasterio. Callers must supply an open rasterio dataset
 
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Any, Iterator, Optional, Tuple
 
 from dynastore.modules.coverages.window import WindowBox
 
@@ -43,3 +43,34 @@ def read_window_iter(ds, box: WindowBox, band: int = 1, block: int = 512) -> Ite
             cw = min(block, box.col_off + box.width - col)
             arr = ds.read(band, window=Window(col, row, cw, rh))  # type: ignore
             yield np.asarray(arr)
+
+
+def read_scaled(
+    ds,
+    box: WindowBox,
+    band: int = 1,
+    out_shape: Optional[Tuple[int, int]] = None,
+) -> Any:
+    """Read the raster window in a single call, optionally downsampling.
+
+    ``out_shape`` is ``(out_height, out_width)`` in output pixels. When
+    ``None`` the native resolution of ``box`` is used.  Uses rasterio's
+    built-in ``out_shape`` resampling (Lanczos for downsampling, nearest
+    otherwise) so the full down-sample is GPU/GDAL-accelerated and does not
+    buffer the native-resolution pixels in Python.
+    """
+    import numpy as np
+    from rasterio.enums import Resampling
+    from rasterio.windows import Window
+
+    win = Window(box.col_off, box.row_off, box.width, box.height)
+    if out_shape is None:
+        out_shape = (box.height, box.width)
+
+    arr = ds.read(  # type: ignore[union-attr]
+        band,
+        window=win,
+        out_shape=out_shape,
+        resampling=Resampling.lanczos,
+    )
+    return np.asarray(arr)
