@@ -251,4 +251,11 @@ class RegistryHeartbeatService(PeriodicService):
         self.lock_key: Optional[Union[int, str]] = f"task-registry-heartbeat:{service}"
 
     async def tick(self, ctx: ServiceContext) -> None:
-        await publish_inventory(ctx.engine)
+        """Publish inventory using the lock connection when available.
+        
+        Uses ``ctx.lock_connection`` when available (LEADER_ONLY mode) to reuse
+        the advisory-lock connection for DB work, avoiding a second pool checkout.
+        Falls back to ``ctx.engine`` for RUN_EVERYWHERE mode or non-leader calls.
+        """
+        engine = ctx.lock_connection if ctx.lock_connection is not None else ctx.engine
+        await publish_inventory(engine)

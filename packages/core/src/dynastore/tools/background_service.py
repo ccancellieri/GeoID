@@ -107,12 +107,18 @@ class ServiceContext:
     name:
         Host / service-instance name. Used in log messages and as a fallback
         component in advisory-lock key derivation.
+    lock_connection:
+        For LEADER_ONLY services, the dedicated AUTOCOMMIT connection holding
+        the advisory lock. Services should use this connection for DB work
+        during the tick to avoid acquiring a second connection from the pool.
+        None for RUN_EVERYWHERE services or when not the leader.
     """
 
     engine: Any
     shutdown: asyncio.Event
     is_ephemeral: bool
     name: str
+    lock_connection: Any = None
 
     async def sleep(self, seconds: float) -> bool:
         """Sleep for up to *seconds*, interrupted early on shutdown.
@@ -177,6 +183,15 @@ class PeriodicService(ABC):
     pod_policy: PodPolicy = PodPolicy.ALL
     lock_key: Optional[Union[int, str]] = None
     cadence_seconds: float = 30.0
+    tick_timeout: Optional[float] = None
+    """Maximum time a tick may run before the advisory lock is released.
+
+    When set, a tick exceeding this timeout is cancelled and leadership is
+    resigned, preventing a slow tick from blocking election under pool
+    contention or external API latency. Defaults to ``cadence_seconds`` to
+    ensure the tick completes within one cadence window. Set to ``None`` or
+    ``0`` to disable the timeout (not recommended for leader-elected services).
+    """
 
     async def run(self, ctx: ServiceContext) -> None:
         await self._safe_tick(ctx)
@@ -327,21 +342,32 @@ class BackgroundSupervisor:
         )
 
         def acquire():
-            # pg_advisory_leadership is an async context manager yielding a bool
-            # (True = this pod is the leader). It opens its own dedicated
+            # pg_advisory_leadership is an async context manager yielding
+            # (is_leader, lock_connection). It opens its own dedicated
             # AUTOCOMMIT connection so the session-level lock is never leaked
-            # back into the pool.
+            # back into the pool. The lock_connection can be reused by the
+            # leader for DB work during the tick.
             return pg_advisory_leadership(ctx.engine, key, name=service.name)
 
         if isinstance(service, PeriodicService):
             periodic = service
 
-            async def on_leader_tick() -> None:
+            async def on_leader_tick(lock_conn: Any) -> None:
                 # One unit of work per election; the connection is released as
                 # soon as this returns. run_leader_loop then sleeps the cadence
                 # (lock NOT held) before re-electing, so this throttles to
                 # cadence_seconds instead of hot-re-acquiring every tick.
-                await periodic.tick(ctx)
+                #
+                # Pass the lock connection via ServiceContext so the tick can
+                # reuse it for DB work, avoiding a second pool checkout.
+                leader_ctx = ServiceContext(
+                    engine=ctx.engine,
+                    shutdown=ctx.shutdown,
+                    is_ephemeral=ctx.is_ephemeral,
+                    name=ctx.name,
+                    lock_connection=lock_conn,
+                )
+                await periodic.tick(leader_ctx)
 
             return run_leader_loop(
                 acquire_leadership=acquire,
@@ -350,12 +376,20 @@ class BackgroundSupervisor:
                 cadence_seconds=periodic.cadence_seconds,
                 is_shutdown=ctx.shutdown.is_set,
                 shutdown_event=ctx.shutdown,
+                tick_timeout=periodic.tick_timeout,
             )
 
-        async def on_leader_run() -> None:
+        async def on_leader_run(lock_conn: Any) -> None:
             # Non-periodic leader: it owns its loop, so leadership is held for
             # the full run() tenure (returns when shutdown is set).
-            await service.run(ctx)
+            leader_ctx = ServiceContext(
+                engine=ctx.engine,
+                shutdown=ctx.shutdown,
+                is_ephemeral=ctx.is_ephemeral,
+                name=ctx.name,
+                lock_connection=lock_conn,
+            )
+            await service.run(leader_ctx)
 
         return run_leader_loop(
             acquire_leadership=acquire,

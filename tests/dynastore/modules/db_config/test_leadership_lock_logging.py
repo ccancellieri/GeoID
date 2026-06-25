@@ -75,8 +75,9 @@ async def test_registry_tracks_tenure_and_release_logs_duration(monkeypatch, cap
     key = 0x1234_5678
 
     with caplog.at_level(logging.INFO, logger=lt.logger.name):
-        async with lt.pg_advisory_leadership(engine, key, name="TestLeader") as won:
+        async with lt.pg_advisory_leadership(engine, key, name="TestLeader") as (won, lock_conn):
             assert won is True
+            assert lock_conn is not None
             # Inside the tenure the lock is in the process registry.
             held = lt.held_advisory_locks()
             assert key in held
@@ -100,8 +101,9 @@ async def test_not_leader_does_not_register(monkeypatch):
     monkeypatch.setattr(lt, "DQLQuery", _DenyDQL)
     engine = _fake_engine(_FakeConn())
     key = 0xDEAD_BEEF
-    async with lt.pg_advisory_leadership(engine, key, name="Loser") as won:
+    async with lt.pg_advisory_leadership(engine, key, name="Loser") as (won, lock_conn):
         assert won is False
+        assert lock_conn is None
         assert key not in lt.held_advisory_locks()
 
 

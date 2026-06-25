@@ -453,9 +453,8 @@ class ConnectedSystemsService(
         catalog_id: str = Query(..., description="Catalog identifier"),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
+        datetime: Optional[str] = Query(None, description="Temporal filter (ISO 8601 instant or interval)."),
         conn: AsyncConnection = Depends(get_async_connection),
-        # Accepted for uniform protocol consistency; connected-systems reads go through
-        # a dedicated SQL path that does not yet implement the hints routing layer.
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[Observation]:
         validate_sql_identifier(catalog_id)
@@ -463,7 +462,7 @@ class ConnectedSystemsService(
         if not ds:
             raise HTTPException(status_code=404, detail="DataStream not found.")
         return await consys_db.list_observations(
-            conn, catalog_id, datastream_id, limit=limit, offset=offset
+            conn, catalog_id, datastream_id, limit=limit, offset=offset, datetime=datetime
         )
 
     async def create_observation(

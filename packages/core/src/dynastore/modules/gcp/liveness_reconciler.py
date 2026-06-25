@@ -147,8 +147,15 @@ class GcpLivenessReconciler(PeriodicService):
     # --- PeriodicService tick ----------------------------------------------
 
     async def tick(self, ctx: ServiceContext) -> None:
-        """One reconcile pass, driven by ``BackgroundSupervisor`` on cadence."""
-        self._engine = ctx.engine
+        """One reconcile pass, driven by ``BackgroundSupervisor`` on cadence.
+        
+        Uses ``ctx.lock_connection`` when available (LEADER_ONLY mode) to reuse
+        the advisory-lock connection for DB work, avoiding a second pool checkout.
+        Falls back to ``ctx.engine`` for RUN_EVERYWHERE mode or non-leader calls.
+        """
+        # Prefer lock_connection (AUTOCOMMIT advisory-lock connection) to avoid
+        # acquiring a second connection from the pool during the tick.
+        self._engine = ctx.lock_connection if ctx.lock_connection is not None else ctx.engine
         try:
             await self._reconcile_once()
         except Exception as e:  # noqa: BLE001 — one bad pass must not kill the loop

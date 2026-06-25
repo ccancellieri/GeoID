@@ -20,6 +20,7 @@ import logging
 import os
 import socket
 from contextlib import asynccontextmanager
+from typing import Optional, Any, Protocol, runtime_checkable
 
 # Hard-import the async PG driver at module load.  When SCOPE excludes
 # ``module_db`` (e.g. Cloud Run jobs that use ``db_sync`` + DatastoreModule
@@ -35,12 +36,11 @@ from contextlib import asynccontextmanager
 import asyncpg  # noqa: F401  — gate the entry-point on the async driver
 
 from sqlalchemy import event
-from sqlalchemy.ext.asyncio import create_async_engine
-from typing import Optional, Any, Protocol, runtime_checkable
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy.engine import Engine
 from dynastore.modules import ModuleProtocol
 from dynastore.modules.db_config.db_config import DBConfig
+from dynastore.modules.db_config.db_timeout_config import resolve_timeout_settings
 from dynastore.modules.db_config.tools import (
     get_config,
     normalize_db_url,
@@ -202,6 +202,13 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                     "SERVICE_NAME"
                 ) or "dynastore"
 
+                # Resolve timeout settings from PluginConfig, env, or DBConfig
+                (
+                    lock_timeout,
+                    statement_timeout,
+                    idle_in_transaction_session_timeout,
+                ) = resolve_timeout_settings(db_config)
+
                 # 1. Create Engine
                 app_state.engine = create_async_engine(
                     normalize_db_url(db_config.database_url, is_async=True),
@@ -242,9 +249,9 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                             # transaction is left open idle — even if the client
                             # was interrupted and never rolled back. See
                             # DBConfig.lock_timeout.
-                            "lock_timeout": db_config.lock_timeout,
+                            "lock_timeout": lock_timeout,
                             "idle_in_transaction_session_timeout": (
-                                db_config.idle_in_transaction_session_timeout
+                                idle_in_transaction_session_timeout
                             ),
                             # statement_timeout bounds total statement EXECUTION
                             # (not just the lock wait). "0" = disabled (default,
@@ -252,7 +259,7 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                             # under pool_command_timeout to turn a silent 60s
                             # client-side cancel into a logged 57014 naming the
                             # slow query. SET LOCAL in long jobs overrides it.
-                            "statement_timeout": db_config.statement_timeout,
+                            "statement_timeout": statement_timeout,
                         },
                     },
                 )

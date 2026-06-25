@@ -329,11 +329,55 @@ async def test_list_observations_calls_query():
     from dynastore.modules.connected_systems import db as consys_db
 
     conn = AsyncMock()
-    with patch.object(
-        consys_db._list_observations_query, "execute", new_callable=AsyncMock, return_value=[]
-    ):
+    with patch(
+        "dynastore.modules.connected_systems.db.DQLQuery.from_builder"
+    ) as mock_builder:
+        mock_executor = AsyncMock()
+        mock_executor.execute = AsyncMock(return_value=[])
+        mock_builder.return_value = mock_executor
+        
         result = await consys_db.list_observations(conn, "cat1", "ds-001", limit=10, offset=0)
-    assert result == []
+        assert result == []
+        mock_builder.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_list_observations_with_datetime_filter():
+    from dynastore.modules.connected_systems import db as consys_db
+    from datetime import datetime
+
+    conn = AsyncMock()
+    with patch(
+        "dynastore.modules.connected_systems.db.DQLQuery.from_builder"
+    ) as mock_builder:
+        mock_executor = AsyncMock()
+        mock_executor.execute = AsyncMock(return_value=[])
+        mock_builder.return_value = mock_executor
+        
+        result = await consys_db.list_observations(
+            conn, "cat1", "ds-001", limit=10, offset=0, datetime="2025-06-01/2025-06-25"
+        )
+        assert result == []
+        mock_builder.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_list_observations_with_open_interval():
+    from dynastore.modules.connected_systems import db as consys_db
+
+    conn = AsyncMock()
+    with patch(
+        "dynastore.modules.connected_systems.db.DQLQuery.from_builder"
+    ) as mock_builder:
+        mock_executor = AsyncMock()
+        mock_executor.execute = AsyncMock(return_value=[])
+        mock_builder.return_value = mock_executor
+        
+        result = await consys_db.list_observations(
+            conn, "cat1", "ds-001", limit=10, offset=0, datetime="../2025-06-25"
+        )
+        assert result == []
+        mock_builder.assert_called_once()
 
 
 @pytest.mark.asyncio

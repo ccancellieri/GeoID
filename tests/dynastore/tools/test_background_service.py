@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, Optional, Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
 
@@ -106,14 +106,14 @@ def _make_service(
 
 @asynccontextmanager
 async def _fake_leader_acquirer():
-    """Always yields True (this pod is the leader)."""
-    yield True
+    """Always yields (True, None) (this pod is the leader, no connection)."""
+    yield (True, None)
 
 
 @asynccontextmanager
 async def _fake_non_leader_acquirer():
-    """Always yields False (another pod holds the lock)."""
-    yield False
+    """Always yields (False, None) (another pod holds the lock)."""
+    yield (False, None)
 
 
 # ---------------------------------------------------------------------------
@@ -500,3 +500,61 @@ async def test_start_continues_when_one_submit_fails() -> None:
     if executor._tasks:
         await asyncio.wait_for(executor._tasks[0], timeout=1.0)
     assert ran["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_leader_tick_timeout_releases_lock() -> None:
+    """A LEADER_ONLY PeriodicService with tick_timeout releases the advisory lock
+    when the tick exceeds the timeout, preventing indefinite lock hold."""
+    from sqlalchemy.ext.asyncio import AsyncEngine as _AsyncEngine
+
+    class _SlowPeriodic(PeriodicService):
+        name = "slow-leader"
+        leadership = Leadership.LEADER_ONLY
+        cadence_seconds = 30.0
+        tick_timeout = 0.1  # 100ms timeout
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            await asyncio.sleep(10.0)  # Would hold lock for 10s without timeout
+
+    ctx = _make_ctx(engine=MagicMock(spec=_AsyncEngine))
+    executor = _TrackingExecutor()
+    supervisor = BackgroundSupervisor(executor=executor)
+    supervisor.register(_SlowPeriodic())
+
+    lock_released_at = {"time": None}
+    start_time = {"time": None}
+
+    @asynccontextmanager
+    async def _fake_leader_acquirer_with_tracking():
+        if start_time["time"] is None:
+            start_time["time"] = asyncio.get_event_loop().time()
+        yield (True, MagicMock())
+        lock_released_at["time"] = asyncio.get_event_loop().time()
+
+    original_isinstance = isinstance
+
+    def _patched_isinstance(obj, cls):
+        if cls is _AsyncEngine:
+            return True
+        return original_isinstance(obj, cls)
+
+    with patch(
+        "dynastore.tools.background_service.pg_advisory_leadership",
+        side_effect=lambda *a, **kw: _fake_leader_acquirer_with_tracking(),
+    ):
+        with patch(
+            "dynastore.tools.background_service.isinstance",
+            side_effect=_patched_isinstance,
+        ):
+            supervisor.start(ctx)
+            # Wait for the tick to timeout (should be ~0.1s, not 10s)
+            await asyncio.sleep(0.3)
+            ctx.shutdown.set()
+            await supervisor.stop(timeout=1.0)
+
+    # The lock should have been released within 0.5s of acquisition (0.1s timeout + margin)
+    assert lock_released_at["time"] is not None, "Lock should have been released"
+    assert start_time["time"] is not None, "Start time should be set"
+    elapsed = lock_released_at["time"] - start_time["time"]
+    assert elapsed < 0.5, f"Lock held for {elapsed:.2f}s, expected <0.5s (timeout should fire)"

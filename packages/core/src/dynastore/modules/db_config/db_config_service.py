@@ -33,6 +33,7 @@ from dynastore.tools.discovery import register_plugin, unregister_plugin
 # them under platform.protocols.storage.*.  DBConfigModule loads at priority=0,
 # so this is the earliest reliable trigger.
 from . import engine_config as _engine_config  # noqa: F401
+from . import db_timeout_config as _db_timeout_config  # noqa: F401
 from .db_config import DBConfig
 from .engine_instance_cache import EngineInstanceCache, EngineInstanceCacheSweepService
 from .engine_resolver import (

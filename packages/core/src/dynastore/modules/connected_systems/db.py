@@ -28,6 +28,7 @@ import logging
 import uuid
 from typing import List, Optional
 
+from dateutil.parser import isoparse
 from sqlalchemy import text
 
 from dynastore.models.shared_models import Link
@@ -201,18 +202,54 @@ _create_observation_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
-_list_observations_query = DQLQuery(
-    """
-    SELECT o.id, o.catalog_id, o.datastream_id, o.phenomenon_time, o.result_time,
-           o.result_value, o.result_quality, o.parameters
-    FROM consys.observations o
-    JOIN consys.datastreams ds ON ds.id = o.datastream_id AND ds.catalog_id = o.catalog_id
-    WHERE ds.catalog_id = :catalog_id AND ds.datastream_id = :datastream_id
-    ORDER BY o.phenomenon_time DESC
-    LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
+def _build_list_observations_query(
+    db_resource: DbResource, raw_params: dict
+):
+    conditions = ["ds.catalog_id = :catalog_id", "ds.datastream_id = :datastream_id"]
+    bind_params = {
+        "catalog_id": raw_params["catalog_id"],
+        "datastream_id": raw_params["datastream_id"],
+        "limit": raw_params["limit"],
+        "offset": raw_params["offset"],
+    }
+    
+    datetime_str = raw_params.get("datetime")
+    if datetime_str:
+        if "/" in datetime_str:
+            start_str, end_str = datetime_str.split("/")
+            start_dt = isoparse(start_str) if start_str != ".." else None
+            end_dt = isoparse(end_str) if end_str != ".." else None
+            
+            if start_dt and end_dt:
+                conditions.append("o.phenomenon_time >= :start_dt")
+                conditions.append("o.phenomenon_time <= :end_dt")
+                bind_params["start_dt"] = start_dt
+                bind_params["end_dt"] = end_dt
+            elif start_dt:
+                conditions.append("o.phenomenon_time >= :start_dt")
+                bind_params["start_dt"] = start_dt
+            elif end_dt:
+                conditions.append("o.phenomenon_time <= :end_dt")
+                bind_params["end_dt"] = end_dt
+        else:
+            dt = isoparse(datetime_str)
+            conditions.append("o.phenomenon_time = :dt")
+            bind_params["dt"] = dt
+    
+    where_clause = " AND ".join(conditions)
+    sql = text(
+        f"""
+        SELECT o.id, o.catalog_id, o.datastream_id, o.phenomenon_time, o.result_time,
+               o.result_value, o.result_quality, o.parameters
+        FROM consys.observations o
+        JOIN consys.datastreams ds ON ds.id = o.datastream_id AND ds.catalog_id = o.catalog_id
+        WHERE {where_clause}
+        ORDER BY o.phenomenon_time DESC
+        LIMIT :limit OFFSET :offset;
+        """
+    )
+    return sql, bind_params
+
 
 # ---------------------------------------------------------------------------
 # Row-to-model helpers
@@ -319,7 +356,7 @@ async def update_system(
             if k == "geometry":
                 set_parts.append("geometry = ST_GeomFromGeoJSON(:geometry)")
             elif k == "properties":
-                set_parts.append(f'"properties" = CAST(:properties AS jsonb)')
+                set_parts.append('"properties" = CAST(:properties AS jsonb)')
             else:
                 set_parts.append(f'"{k}" = :{k}')
         set_clause = ", ".join(set_parts)
@@ -477,12 +514,18 @@ async def list_observations(
     datastream_id: str,
     limit: int = 100,
     offset: int = 0,
+    datetime: Optional[str] = None,
 ) -> List[Observation]:
-    rows = await _list_observations_query.execute(
-        conn,
-        catalog_id=catalog_id,
-        datastream_id=datastream_id,
-        limit=limit,
-        offset=offset,
+    params = {
+        "catalog_id": catalog_id,
+        "datastream_id": datastream_id,
+        "limit": limit,
+        "offset": offset,
+        "datetime": datetime,
+    }
+    
+    executor = DQLQuery.from_builder(
+        _build_list_observations_query, result_handler=ResultHandler.ALL_DICTS
     )
+    rows = await executor.execute(conn, **params)
     return [o for r in rows if (o := _observation_from_row(r)) is not None]

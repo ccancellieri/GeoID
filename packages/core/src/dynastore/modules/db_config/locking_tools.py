@@ -186,13 +186,19 @@ async def pg_advisory_leadership(
     key: Union[int, str],
     *,
     name: str = "leader",
-) -> AsyncGenerator[bool, None]:
+) -> AsyncGenerator[Tuple[bool, Optional[AsyncConnection]], None]:
     """Non-blocking leadership election via a PG session advisory lock.
 
     Canonical leadership context manager for :func:`dynastore.tools.
-    async_utils.run_leader_loop`. Yields ``True`` if this process became the
-    leader, ``False`` otherwise — exactly once on every path, as required of
-    a context-manager generator.
+    async_utils.run_leader_loop`. Yields ``(is_leader, lock_connection)`` where
+    ``is_leader`` is ``True`` if this process became the leader, and
+    ``lock_connection`` is the dedicated AUTOCOMMIT connection holding the
+    advisory lock (or ``None`` if not leader).
+
+    The lock connection can be reused by the leader for DB work during the
+    tenure, avoiding the need to acquire a second connection from the pool.
+    This is critical for pool-constrained environments (Cloud Run) where
+    holding both a lock connection and a work connection can starve the pool.
 
     Design invariants (each one fixes a production failure mode):
 
@@ -203,17 +209,18 @@ async def pg_advisory_leadership(
       in ``finally``, which releases the lock even if the explicit unlock
       fails — and a long leadership tenure never holds a transaction open.
     * Failures *before* leadership is yielded (connect, AUTOCOMMIT switch,
-      acquire query) degrade to ``yield False``: the caller is simply not the
-      leader this round.
-    * Failures *after* ``yield True`` (raised in the caller's body, or by the
-      unlock/close steps) propagate so the loop can resign loudly and retry.
-      Never ``yield`` from an ``except`` around the leadership ``yield`` — a
-      second yield makes ``contextlib`` raise ``generator didn't stop``.
+      acquire query) degrade to ``yield (False, None)``: the caller is simply
+      not the leader this round.
+    * Failures *after* ``yield (True, conn)`` (raised in the caller's body, or
+      by the unlock/close steps) propagate so the loop can resign loudly and
+      retry. Never ``yield`` from an ``except`` around the leadership
+      ``yield`` — a second yield makes ``contextlib`` raise
+      ``generator didn't stop``.
 
     ``key`` may be a 64-bit int used as-is, or a string folded to one via
     :func:`_get_stable_lock_id`. Requires an :class:`AsyncEngine`; any other
-    engine (or ``None``) yields ``False`` with a warning, matching the events
-    consumer precedent — single-process sync deployments get no election.
+    engine (or ``None``) yields ``(False, None)`` with a warning, matching the
+    events consumer precedent — single-process sync deployments get no election.
 
     Known property: if the lock connection dies mid-tenure PG releases the
     lock and another instance may become leader while this one finishes its
@@ -225,7 +232,7 @@ async def pg_advisory_leadership(
             name,
             type(engine).__name__ if engine is not None else "None",
         )
-        yield False
+        yield (False, None)
         return
     lock_id = key if isinstance(key, int) else _get_stable_lock_id(key)
     conn_ctx = engine.connect()
@@ -235,7 +242,7 @@ async def pg_advisory_leadership(
         logger.warning(
             "%s: leadership connect failed (%s); not a leader.", name, exc
         )
-        yield False
+        yield (False, None)
         return
     try:
         try:
@@ -254,7 +261,7 @@ async def pg_advisory_leadership(
             )
             acquired = False
         if not acquired:
-            yield False
+            yield (False, None)
             return
         acquired_at = time.monotonic()
         _held_advisory_locks[lock_id] = (name, acquired_at)
@@ -265,7 +272,7 @@ async def pg_advisory_leadership(
             len(_held_advisory_locks),
         )
         try:
-            yield True
+            yield (True, conn)
         finally:
             _held_advisory_locks.pop(lock_id, None)
             logger.info(

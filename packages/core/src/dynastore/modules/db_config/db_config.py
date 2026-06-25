@@ -260,6 +260,11 @@ class DBConfig:
     #     never runs ROLLBACK — the exact failure mode that pinned
     #     catalog.catalogs behind an idle-in-transaction reader while an
     #     ALTER waited on it. A DDL therefore can never leave a lock open.
+    #
+    #     Under burst load, connections can accumulate in idle_in_txn state
+    #     if transactions span external calls (GCS/ES/Cloud Run API). A 10s
+    #     default surfaces issues quickly in dev/staging while allowing
+    #     production to tune higher via the configs API or env var.
     #   * statement_timeout — bounds total EXECUTION time of any single
     #     statement (distinct from lock_timeout, which only bounds the WAIT to
     #     acquire a lock). Disabled by default ("0") to preserve historical
@@ -275,10 +280,14 @@ class DBConfig:
     #     DDL, maintenance jobs) already scope their own budget via SET LOCAL
     #     statement_timeout, which overrides this session default within their
     #     transaction, so a session-wide value is safe to enable.
+    #
+    # These defaults are also available as DbTimeoutConfig (PluginConfig) for
+    # runtime configuration via the configs API. The env var takes precedence
+    # for backwards compatibility, then the PluginConfig, then the code default.
     lock_timeout: str = _cfg_str("DB_LOCK_TIMEOUT", "5s")
     statement_timeout: str = _cfg_str("DB_STATEMENT_TIMEOUT", "0")
     idle_in_transaction_session_timeout: str = _cfg_str(
-        "DB_IDLE_IN_TRANSACTION_TIMEOUT", "30s"
+        "DB_IDLE_IN_TRANSACTION_TIMEOUT", "10s"
     )
     # How long SQLAlchemy's QueuePool will wait for a free connection before
     # raising ``sqlalchemy.exc.TimeoutError`` (fail-fast, not wedge).

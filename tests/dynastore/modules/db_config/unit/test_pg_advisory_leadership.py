@@ -100,8 +100,9 @@ async def test_leader_acquires_unlocks_and_closes_connection(monkeypatch):
 
     async with pg_advisory_leadership(
         _make_engine(conn_ctx), 42, name="test"
-    ) as is_leader:
+    ) as (is_leader, lock_conn):
         assert is_leader is True
+        assert lock_conn is not None
 
     sqls = [sql for sql, _ in calls]
     assert any("pg_try_advisory_lock" in s for s in sqls)
@@ -122,8 +123,9 @@ async def test_unlock_failure_does_not_double_yield(monkeypatch):
 
     async with pg_advisory_leadership(
         _make_engine(conn_ctx), 42, name="test"
-    ) as is_leader:
+    ) as (is_leader, lock_conn):
         assert is_leader is True
+        assert lock_conn is not None
     # reaching here without RuntimeError IS the assertion
     assert conn_ctx.exited is True
 
@@ -136,8 +138,9 @@ async def test_lock_busy_yields_false_without_unlock(monkeypatch):
 
     async with pg_advisory_leadership(
         _make_engine(conn_ctx), 42, name="test"
-    ) as is_leader:
+    ) as (is_leader, lock_conn):
         assert is_leader is False
+        assert lock_conn is None
 
     assert not any("pg_advisory_unlock" in sql for sql, _ in calls)
     assert conn_ctx.exited is True
@@ -151,8 +154,9 @@ async def test_acquire_query_failure_yields_false(monkeypatch):
 
     async with pg_advisory_leadership(
         _make_engine(conn_ctx), 42, name="test"
-    ) as is_leader:
+    ) as (is_leader, lock_conn):
         assert is_leader is False
+        assert lock_conn is None
     assert conn_ctx.exited is True
 
 
@@ -164,15 +168,17 @@ async def test_connect_failure_yields_false(monkeypatch):
 
     async with pg_advisory_leadership(
         _make_engine(conn_ctx), 42, name="test"
-    ) as is_leader:
+    ) as (is_leader, lock_conn):
         assert is_leader is False
+        assert lock_conn is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("engine", [None, object()])
 async def test_non_async_engine_yields_false(engine):
-    async with pg_advisory_leadership(engine, 42, name="test") as is_leader:
+    async with pg_advisory_leadership(engine, 42, name="test") as (is_leader, lock_conn):
         assert is_leader is False
+        assert lock_conn is None
 
 
 @pytest.mark.asyncio
@@ -186,8 +192,9 @@ async def test_body_exception_propagates_but_releases(monkeypatch):
     with pytest.raises(RuntimeError, match="tick failed"):
         async with pg_advisory_leadership(
             _make_engine(conn_ctx), 42, name="test"
-        ) as is_leader:
+        ) as (is_leader, lock_conn):
             assert is_leader is True
+            assert lock_conn is not None
             raise RuntimeError("tick failed")
 
     assert any("pg_advisory_unlock" in sql for sql, _ in calls)
@@ -201,11 +208,11 @@ async def test_key_folding_int_passthrough_str_hashed(monkeypatch):
 
     async with pg_advisory_leadership(
         _make_engine(_FakeConnCtx(_FakeConn())), 0x4D41, name="test"
-    ):
+    ) as (_is_leader, _lock_conn):
         pass
     async with pg_advisory_leadership(
         _make_engine(_FakeConnCtx(_FakeConn())), "events_consumer", name="test"
-    ):
+    ) as (_is_leader, _lock_conn):
         pass
 
     lock_ids = [
