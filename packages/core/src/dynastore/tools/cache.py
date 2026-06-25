@@ -481,13 +481,28 @@ class TieredAsyncBackend:
         return self._priority
 
     async def get(self, key: str) -> Optional[bytes]:
-        """Try each tier in order, populating upstream on miss."""
-        for i, backend in enumerate(self._backends):
-            value = await backend.get(key)
-            if value is not None:
-                for j in range(i):
-                    await self._backends[j].set(key, value, ttl=self._l1_ttl_cap)
-                return value
+        """Try L2+ first for consistency, L1 as fallback, populate on miss.
+
+        Read path prioritizes L2+ (distributed) for consistency across instances.
+        L1 is only checked if L2 is unavailable (degraded mode).
+        On L2 hit, L1 is populated for future fallback reads.
+        """
+        # 1. Try L2+ first (source of truth for cross-instance consistency)
+        for i, backend in enumerate(self._backends[1:], start=1):
+            try:
+                value = await backend.get(key)
+                if value is not None:
+                    # Populate L1 for fallback
+                    await self._backends[0].set(key, value, ttl=self._l1_ttl_cap)
+                    return value
+            except Exception as e:
+                logger.debug("L%d cache get failed (key=%s): %s", i + 1, key, e)
+
+        # 2. L2 miss/unavailable → check L1 (degraded fallback)
+        value = await self._backends[0].get(key)
+        if value is not None:
+            return value
+
         return None
 
     async def set(

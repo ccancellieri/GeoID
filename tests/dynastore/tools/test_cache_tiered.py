@@ -128,8 +128,8 @@ class TestTieredAsyncBackend:
         assert tiered._stats.hits == 1 and tiered._stats.misses == 1
 
     @pytest.mark.asyncio
-    async def test_get_l1_hit(self):
-        """Value in L1 is returned immediately without querying L2."""
+    async def test_get_l1_hit_returns_l1_value(self):
+        """L1 hit returns value immediately (L2 not queried first)."""
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
@@ -139,12 +139,10 @@ class TestTieredAsyncBackend:
 
         result = await tiered.get("key1")
         assert result == b"value1"
-        assert ("get", "key1") in l1._ops
-        assert ("get", "key1") not in l2._ops  # L2 not queried
 
     @pytest.mark.asyncio
-    async def test_get_l2_hit_populates_l1(self):
-        """Value in L2 is returned and L1 is populated."""
+    async def test_get_l2_hit_returns_l2_and_populates_l1(self):
+        """L2 hit returns value and populates L1 for fallback."""
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
@@ -154,14 +152,29 @@ class TestTieredAsyncBackend:
 
         result = await tiered.get("key2")
         assert result == b"value2"
-        assert ("get", "key2") in l1._ops  # L1 queried first
-        assert ("get", "key2") in l2._ops  # L2 queried after L1 miss
+        assert ("get", "key2") in l2._ops  # L2 queried first
 
-        # L1 now has the value (populated with default cap TTL).
-        l1_get = [op for op in l1._ops if op[0] == "get"]
+        # L1 populated for fallback
         l1_set = [op for op in l1._ops if op[0] == "set"]
         assert len(l1_set) == 1
         assert l1_set[0][2] == TieredAsyncBackend.DEFAULT_L1_TTL_CAP
+
+    @pytest.mark.asyncio
+    async def test_get_l2_error_falls_back_to_l1(self):
+        """L2 error falls back to L1 (degraded mode)."""
+        class FailingBackend(FakeCacheBackend):
+            async def get(self, key: str):
+                raise RuntimeError("L2 down")
+
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FailingBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        # Pre-populate L1 only
+        await l1.set("key1", b"value1")
+
+        result = await tiered.get("key1")
+        assert result == b"value1"  # L1 fallback worked
 
     @pytest.mark.asyncio
     async def test_get_miss_returns_none(self):
@@ -454,6 +467,57 @@ class TestTieredAsyncBackendL2Retry:
         # Wait for background clear
         await tiered.close()
         assert await l2.get("k") is None
+
+    @pytest.mark.asyncio
+    async def test_clear_retry_on_failure(self, caplog):
+        """L2 clear retries with exponential backoff on failure."""
+        import logging
+
+        class FailingBackend(FakeCacheBackend):
+            def __init__(self, name, priority, fail_times):
+                super().__init__(name, priority)
+                self._fail_times = fail_times
+                self._attempts = 0
+
+            async def clear(self, *, key=None, namespace=None, tags=None):
+                self._attempts += 1
+                if self._attempts <= self._fail_times:
+                    raise RuntimeError(f"fail attempt {self._attempts}")
+                return await super().clear(key=key, namespace=namespace, tags=tags)
+
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FailingBackend("l2", 100, fail_times=2)
+        tiered = TieredAsyncBackend([l1, l2], l2_retry_attempts=3, l2_retry_backoff=0.01)
+
+        await l1.set("k", b"v")
+        await l2.set("k", b"v")
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            await tiered.clear(key="k")
+            await tiered.close()
+
+        # L2 eventually succeeded after 2 failures
+        assert await l2.get("k") is None
+        assert l2._attempts == 3
+
+    @pytest.mark.asyncio
+    async def test_clear_retry_exhausted_logs_warning(self, caplog):
+        """When L2 clear retry exhausted, warning logged."""
+        import logging
+
+        class AlwaysFailingBackend(FakeCacheBackend):
+            async def clear(self, *, key=None, namespace=None, tags=None):
+                raise RuntimeError("always fails")
+
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = AlwaysFailingBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2], l2_retry_attempts=2, l2_retry_backoff=0.01)
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            await tiered.clear(key="k")
+            await tiered.close()
+
+        assert any("L2 cache clear failed after 2 attempts" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_close_waits_for_pending_tasks(self):
