@@ -1036,6 +1036,37 @@ class CollectionService:
         # after its own resolution step).  collection_id is always external (the
         # public label supplied by the caller).
         #
+        # Resolve the catalog external_id -> internal id ONCE up front and feed
+        # the internal form to BOTH the existence check and create_collection.
+        # The existence check resolves the catalog's physical schema from this
+        # catalog_id (via resolve_physical_schema); create_collection resolves
+        # external -> internal itself before targeting the schema.  Fed
+        # different forms, the two can land on different schemas: the existence
+        # SELECT then misses a collection that the subsequent INSERT collides
+        # with on collections_external_uq.  Resolving once keeps both on the
+        # same schema.  (#2353 family.)
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+
+        # An already-internal collection_id (col_<token>) can only reach here by
+        # having been resolved external -> internal upstream (e.g. the item write
+        # boundary in item_service.upsert resolves before calling
+        # ensure_physical_table_exists -> set_config -> _set_collection_config ->
+        # ensure_collection_exists).  A successful resolution means the collection
+        # provably exists.  resolve_collection_id is forward-only (external ->
+        # internal) and would MISS an internal id, driving a spurious
+        # create_collection that the internal-id-shape guard then rejects with
+        # InvalidIdentifierError ("... is reserved ...").  So an internal-shaped id
+        # is a no-op: it already exists, by construction.  (#2353 family.)
+        from dynastore.modules.catalog.catalog_service import (
+            is_internal_physical_name as _is_internal_name,
+        )
+        if _is_internal_name(collection_id, "col"):
+            return
+
         # Use resolve_collection_id to check existence via the external_id index
         # rather than get_collection_model (which is keyed on internal id and
         # would always miss on an external collection_id).
@@ -1048,12 +1079,29 @@ class CollectionService:
         # If lang is not '*', we provide a simple string which create_collection will localize
         # If lang is '*', we provide the default 'en' dictionary
         title = {"en": collection_id} if lang == "*" else collection_id
-        await self.create_collection(
-            catalog_id,
-            {"id": collection_id, "title": title},
-            lang=lang,
-            ctx=DriverContext(db_resource=db_resource) if db_resource else None,
-        )
+        from dynastore.modules.db_config.exceptions import UniqueViolationError
+        try:
+            await self.create_collection(
+                catalog_id,
+                {"id": collection_id, "title": title},
+                lang=lang,
+                ctx=DriverContext(db_resource=db_resource) if db_resource else None,
+            )
+        except UniqueViolationError:
+            # Idempotent ensure-semantics.  A concurrent or retried caller can
+            # win the race between our existence check and the INSERT (TOCTOU),
+            # surfacing as a collections_external_uq violation.  The collection
+            # now provably exists, which is exactly what this method guarantees,
+            # so the conflict is benign here.  This is load-bearing for
+            # ingestion: those tasks retry on failure, and a non-idempotent
+            # create would fail the whole job on the second attempt.  The
+            # explicit create_collection API path is unchanged and still raises
+            # (HTTP 409) on a genuine user-initiated duplicate.
+            logger.info(
+                "ensure_collection_exists: collection '%s' already present in "
+                "catalog '%s' (concurrent/retry create); treating as success.",
+                collection_id, catalog_id,
+            )
 
     async def create_collection(
         self,
