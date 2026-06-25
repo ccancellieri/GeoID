@@ -108,6 +108,51 @@ CONSYS_OBSERVATIONS_IDX_DDL = """
     ON consys.observations USING BRIN (phenomenon_time);
 """
 
+CONSYS_FK_DATASTREAM_SYSTEM_DDL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_datastream_system'
+    ) THEN
+        ALTER TABLE consys.datastreams
+        ADD CONSTRAINT fk_datastream_system
+        FOREIGN KEY (system_id, catalog_id)
+        REFERENCES consys.systems(id, catalog_id)
+        ON DELETE CASCADE;
+    END IF;
+END $$;
+"""
+
+CONSYS_FK_OBSERVATION_DATASTREAM_DDL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_observation_datastream'
+    ) THEN
+        ALTER TABLE consys.observations
+        ADD CONSTRAINT fk_observation_datastream
+        FOREIGN KEY (datastream_id, catalog_id)
+        REFERENCES consys.datastreams(id, catalog_id)
+        ON DELETE CASCADE;
+    END IF;
+END $$;
+"""
+
+CONSYS_FK_DEPLOYMENT_SYSTEM_DDL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_deployment_system'
+    ) THEN
+        ALTER TABLE consys.deployments
+        ADD CONSTRAINT fk_deployment_system
+        FOREIGN KEY (system_id, catalog_id)
+        REFERENCES consys.systems(id, catalog_id)
+        ON DELETE CASCADE;
+    END IF;
+END $$;
+"""
+
 
 # ---------------------------------------------------------------------------
 # Module
@@ -138,6 +183,9 @@ class ConnectedSystemsModule(ModuleProtocol):
                     await DDLQuery(CONSYS_DATASTREAMS_DDL).execute(conn)
                     await DDLQuery(CONSYS_OBSERVATIONS_DDL).execute(conn)
                     await DDLQuery(CONSYS_OBSERVATIONS_IDX_DDL).execute(conn)
+                    await DDLQuery(CONSYS_FK_DATASTREAM_SYSTEM_DDL).execute(conn)
+                    await DDLQuery(CONSYS_FK_OBSERVATION_DATASTREAM_DDL).execute(conn)
+                    await DDLQuery(CONSYS_FK_DEPLOYMENT_SYSTEM_DDL).execute(conn)
             logger.info("ConnectedSystemsModule: initialisation complete.")
         except Exception as exc:
             logger.error("CRITICAL: ConnectedSystemsModule init failed: %s", exc, exc_info=True)
