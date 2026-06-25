@@ -832,7 +832,11 @@ async def create_custom_tms(
         return StoredTileMatrixSet.model_validate(result)
 
 
-@cached(maxsize=128, namespace="tiles_get_custom_tms")
+@cached(
+    maxsize=128,
+    namespace="tiles_get_custom_tms",
+    ttl=300,
+)
 async def get_custom_tms(catalog_id: str, tms_id: str) -> Optional[TileMatrixSet]:
     """Retrieves a specific custom TileMatrixSet from a catalog."""
     result = await _get_tms_query.execute(
@@ -841,7 +845,11 @@ async def get_custom_tms(catalog_id: str, tms_id: str) -> Optional[TileMatrixSet
     return TileMatrixSet.model_validate(result["definition"]) if result else None
 
 
-@cached(maxsize=32, namespace="tiles_list_custom_tms")
+@cached(
+    maxsize=32,
+    namespace="tiles_list_custom_tms",
+    ttl=300,
+)
 async def list_custom_tms(
     catalog_id: str, limit: int = 100, offset: int = 0
 ) -> List[TileMatrixSet]:
@@ -852,7 +860,12 @@ async def list_custom_tms(
     return [TileMatrixSet.model_validate(row["definition"]) for row in results]
 
 
-@cached(maxsize=128, namespace="tiles_resolve_srid", ignore=["conn"])
+@cached(
+    maxsize=128,
+    namespace="tiles_resolve_srid",
+    ignore=["conn"],
+    ttl=300,
+)
 async def resolve_srid(
     conn: DbResource, crs_str: str, catalog_id: Optional[str] = None
 ) -> int:
@@ -1013,7 +1026,11 @@ async def ensure_custom_crs_in_postgis(
     return next_srid
 
 
-@cached(maxsize=1024, namespace="tiles_collection_source_srid")
+@cached(
+    maxsize=1024,
+    namespace="tiles_collection_source_srid",
+    ttl=300,
+)
 async def get_collection_source_srid(
     catalog_id: str, collection_id: str
 ) -> Optional[int]:

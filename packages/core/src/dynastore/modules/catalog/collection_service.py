@@ -63,7 +63,13 @@ def _unmark_confirmed_active(catalog_id: str, collection_id: str) -> None:
     _confirmed_active.discard((catalog_id, collection_id))
 
 
-@cached(maxsize=1024, namespace="collection_model", ignore=["service"])
+@cached(
+    maxsize=1024,
+    namespace="collection_model",
+    ignore=["service"],
+    ttl=300,
+    l1_ttl=2,
+)
 async def _collection_model_cache(
     service: "CollectionService", catalog_id: str, collection_id: str
 ) -> Optional[Collection]:
@@ -73,10 +79,14 @@ async def _collection_model_cache(
     every ``CollectionService`` instance shares one cache entry per collection.
     A module-level cache (single decorator closure → single backend) is what
     makes ``cache_invalidate`` from any instance visible to reads issued
-    through any other instance; an instance-bound cache would give each
-    service its own backend, so a write+invalidate on one instance would leave
-    stale entries readable through another (e.g. the facade-internal service
-    vs. the standalone one).
+    through any other; an instance-bound cache would give each service its own
+    backend, so a write+invalidate on one instance would leave stale entries
+    readable through another (e.g. the facade-internal service vs. the
+    standalone one).
+
+    TTL bounds staleness: ``ttl=300`` (5 min) ensures L2 self-heals even if
+    invalidation or fresh ``set`` is dropped by an unreliable Valkey (#2328).
+    ``l1_ttl=2`` tightens cross-pod L1 window (same pattern as config/router).
     """
     return await service._get_collection_model_db(catalog_id, collection_id)
 

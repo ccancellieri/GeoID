@@ -1879,7 +1879,13 @@ async def update_task(
     return Task.model_validate(updated_task_dict) if updated_task_dict else None
 
 
-@cached(maxsize=256, namespace="tasks", ignore=["conn"])
+@cached(
+    maxsize=256,
+    namespace="tasks",
+    ignore=["conn"],
+    ttl=60,
+    l1_ttl=2,
+)
 async def get_task(conn: DbResource, task_id: uuid.UUID, schema: str) -> Optional[Task]:
     """Retrieves a single task by its ID from the global tasks table."""
     task_schema = get_task_schema()

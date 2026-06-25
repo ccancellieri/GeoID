@@ -288,7 +288,12 @@ def map_pg_to_json_type(pg_type: Union[str, Any]) -> str:
     return "string"
 
 
-@cached(maxsize=128, namespace="field_mapping", ignore=["conn"])
+@cached(
+    maxsize=128,
+    namespace="field_mapping",
+    ignore=["conn"],
+    ttl=300,
+)
 async def get_dynamic_field_mapping(
     conn: DbResource, schema: str, table: str
 ) -> Dict[str, Column]:

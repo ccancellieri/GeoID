@@ -944,6 +944,9 @@ _notify_backend_upgrade = _notify_backend_change
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_MAX_DISTRIBUTED_TTL: float = 3600.0
+
+
 def cached(
     maxsize: int = 1024,
     ttl: Optional[Union[float, int]] = None,
@@ -956,6 +959,7 @@ def cached(
     key_builder: Optional[Callable[..., str]] = None,
     distributed: bool = True,
     l1_ttl: Optional[Union[float, int]] = None,
+    max_distributed_ttl: Optional[Union[float, int]] = None,
 ) -> Callable:
     """Centralized caching decorator for sync and async functions.
 
@@ -963,7 +967,9 @@ def cached(
 
     Args:
         maxsize: Maximum number of entries.
-        ttl: Time-to-live in seconds. ``None`` = no expiration.
+        ttl: Time-to-live in seconds. ``None`` = no expiration for local caches;
+            for distributed caches, capped by ``max_distributed_ttl`` to prevent
+            unbounded staleness when L2 (Valkey) is unreliable (#2328).
         jitter: Random TTL variance in seconds (prevents thundering herd on expiry).
         backend: Named backend or ``None`` for default local memory.
         namespace: Cache namespace prefix for key isolation.
@@ -980,6 +986,11 @@ def cached(
             post-PUT staleness across sibling Cloud Run processes must converge
             quickly (#930). Ignored when ``distributed=False`` or when no
             distributed backend is registered.
+        max_distributed_ttl: Maximum TTL for distributed (L2) tier when
+            ``ttl=None``. Prevents unbounded staleness when Valkey is unreliable
+            and invalidations are dropped (#2328). Defaults to 3600s (1 hour).
+            Set higher for slowly-changing metadata (e.g., tiles config) or to
+            ``float("inf")`` to disable the cap. Ignored for local-only caches.
 
     The decorated function gets these methods:
         - ``.cache_invalidate(*args, **kwargs)`` -- invalidate specific entry
@@ -1047,6 +1058,17 @@ def cached(
 
         ns = namespace or func_qualname
 
+        _effective_max_distributed_ttl = (
+            float(max_distributed_ttl)
+            if max_distributed_ttl is not None
+            else DEFAULT_MAX_DISTRIBUTED_TTL
+        )
+        if ttl is None and distributed and max_distributed_ttl != float("inf"):
+            logger.debug(
+                "@cached(%s): distributed=True with ttl=None — applying max_distributed_ttl=%.0fs (#2328)",
+                func_qualname, _effective_max_distributed_ttl,
+            )
+
         def _build_key(args: tuple, kwargs: dict) -> str:
             if key_builder is not None:
                 return key_builder(func, *args, **kwargs)
@@ -1056,6 +1078,8 @@ def cached(
 
         def _resolve_ttl() -> Optional[float]:
             if ttl is None:
+                if distributed and max_distributed_ttl != float("inf"):
+                    return _effective_max_distributed_ttl
                 return None
             base = float(ttl)
             if jitter:

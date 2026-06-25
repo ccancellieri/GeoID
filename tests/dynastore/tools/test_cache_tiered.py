@@ -539,3 +539,143 @@ class TestCircuitBreaker:
         finally:
             sys.modules.pop("valkey.asyncio", None)
             sys.modules.pop("valkey", None)
+
+
+class TestMaxDistributedTTL:
+    """Test max_distributed_ttl parameter on @cached decorator (#2328).
+
+    When ttl=None and distributed=True, the decorator must cap the effective TTL
+    to prevent unbounded staleness when L2 (Valkey) is unreliable and invalidations
+    are dropped.
+    """
+
+    async def test_ttl_none_distributed_true_uses_default_cap(self):
+        """ttl=None + distributed=True → uses DEFAULT_MAX_DISTRIBUTED_TTL on L2."""
+        from dynastore.tools.cache import (
+            cached,
+            DEFAULT_MAX_DISTRIBUTED_TTL,
+            get_cache_manager,
+        )
+
+        l2 = FakeCacheBackend("l2", 100)
+        get_cache_manager().register_backend(l2)
+        try:
+            calls = {"n": 0}
+
+            @cached(maxsize=8, namespace="max_ttl_test", distributed=True)
+            async def fetch(key: str):
+                calls["n"] += 1
+                return {"rev": calls["n"]}
+
+            await fetch("k1")
+            assert calls["n"] == 1
+
+            # L2 (distributed tier) received set with DEFAULT_MAX_DISTRIBUTED_TTL
+            set_ops = [op for op in l2._ops if op[0] == "set"]
+            assert len(set_ops) >= 1
+            ttl_passed = set_ops[0][2]
+            assert ttl_passed == DEFAULT_MAX_DISTRIBUTED_TTL
+        finally:
+            get_cache_manager().unregister_backend(l2)
+
+    async def test_ttl_none_distributed_false_uses_none(self):
+        """ttl=None + distributed=False → no cap (local-only caches can live forever)."""
+        from dynastore.tools.cache import cached
+
+        calls = {"n": 0}
+
+        @cached(maxsize=8, namespace="local_uncapped", distributed=False)
+        async def fetch(key: str):
+            calls["n"] += 1
+            return {"rev": calls["n"]}
+
+        await fetch("k1")
+        assert calls["n"] == 1
+
+    async def test_explicit_max_distributed_ttl_overrides_default(self):
+        """max_distributed_ttl=300 overrides DEFAULT_MAX_DISTRIBUTED_TTL."""
+        from dynastore.tools.cache import cached, get_cache_manager
+
+        l2 = FakeCacheBackend("l2", 100)
+        get_cache_manager().register_backend(l2)
+        try:
+            calls = {"n": 0}
+
+            @cached(
+                maxsize=8,
+                namespace="custom_cap",
+                distributed=True,
+                max_distributed_ttl=300,
+            )
+            async def fetch(key: str):
+                calls["n"] += 1
+                return {"rev": calls["n"]}
+
+            await fetch("k1")
+            assert calls["n"] == 1
+
+            set_ops = [op for op in l2._ops if op[0] == "set"]
+            assert len(set_ops) >= 1
+            ttl_passed = set_ops[0][2]
+            assert ttl_passed == 300.0
+        finally:
+            get_cache_manager().unregister_backend(l2)
+
+    async def test_explicit_ttl_unaffected_by_cap(self):
+        """Explicit ttl=60 is used verbatim; max_distributed_ttl ignored."""
+        from dynastore.tools.cache import cached, get_cache_manager
+
+        l2 = FakeCacheBackend("l2", 100)
+        get_cache_manager().register_backend(l2)
+        try:
+            calls = {"n": 0}
+
+            @cached(
+                maxsize=8,
+                ttl=60,
+                namespace="explicit_ttl",
+                distributed=True,
+                max_distributed_ttl=300,
+            )
+            async def fetch(key: str):
+                calls["n"] += 1
+                return {"rev": calls["n"]}
+
+            await fetch("k1")
+            assert calls["n"] == 1
+
+            set_ops = [op for op in l2._ops if op[0] == "set"]
+            assert len(set_ops) >= 1
+            ttl_passed = set_ops[0][2]
+            assert ttl_passed == 60.0
+        finally:
+            get_cache_manager().unregister_backend(l2)
+
+    async def test_infinity_disables_cap(self):
+        """max_distributed_ttl=float('inf') disables the cap → ttl=None passed to L2."""
+        from dynastore.tools.cache import cached, get_cache_manager
+
+        l2 = FakeCacheBackend("l2", 100)
+        get_cache_manager().register_backend(l2)
+        try:
+            calls = {"n": 0}
+
+            @cached(
+                maxsize=8,
+                namespace="inf_cap",
+                distributed=True,
+                max_distributed_ttl=float("inf"),
+            )
+            async def fetch(key: str):
+                calls["n"] += 1
+                return {"rev": calls["n"]}
+
+            await fetch("k1")
+            assert calls["n"] == 1
+
+            set_ops = [op for op in l2._ops if op[0] == "set"]
+            assert len(set_ops) >= 1
+            ttl_passed = set_ops[0][2]
+            assert ttl_passed is None
+        finally:
+            get_cache_manager().unregister_backend(l2)
