@@ -35,7 +35,6 @@ individual provisioner hooks are expected to use IF-NOT-EXISTS semantics.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -46,11 +45,11 @@ from dynastore.modules.tasks.models import (
     TaskPayload,
     PermanentTaskFailure,
 )
-from dynastore.modules import get_protocol
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.modules.catalog.catalog_service import get_catalog_engine
 from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.catalog.provisioning_registry import provisioning_registry
+from dynastore.tasks._helpers import _get_catalog_protocol, call_hook, get_tasks_config
 
 logger = logging.getLogger(__name__)
 
@@ -59,30 +58,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_GROUP_CONCURRENCY = 4
 
 
-def _get_catalog_protocol() -> CatalogsProtocol:
-    protocol = get_protocol(CatalogsProtocol)
-    if not protocol:
-        raise RuntimeError("CatalogsProtocol not available")
-    return protocol
-
-
 async def _get_group_concurrency() -> int:
     """Read provisioning_group_concurrency from TasksPluginConfig; default 4.
 
     Fail-open: any config read failure returns the default so provisioning
     always proceeds.
     """
-    try:
-        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-
-        mgr = get_protocol(PlatformConfigsProtocol)
-        if mgr is not None:
-            cfg = await mgr.get_config(TasksPluginConfig)
-            if isinstance(cfg, TasksPluginConfig):
-                return cfg.provisioning_group_concurrency
-    except Exception:  # noqa: BLE001 — best-effort; use default on any failure
-        pass
+    cfg = await get_tasks_config()
+    if cfg is not None:
+        return cfg.provisioning_group_concurrency
     return _DEFAULT_GROUP_CONCURRENCY
 
 
@@ -178,21 +162,29 @@ class CatalogProvisionTask(TaskProtocol):
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
+            first_exc: Optional[Exception] = None
             for provisioner, result in zip(group, results):
-                if isinstance(result, BaseException):
+                if isinstance(result, BaseException) and not isinstance(result, Exception):
+                    # Hard-cancellation (KeyboardInterrupt, CancelledError, …):
+                    # re-raise immediately without marking the step or tallying.
+                    raise result  # type: ignore[misc]
+                if isinstance(result, Exception):
                     steps_failed += 1
                     logger.error(
                         "CatalogProvisionTask: provisioner '%s' failed for "
                         "catalog '%s': %s",
                         provisioner.key, catalog_id, result, exc_info=False,
                     )
-                    # Abort: re-raise so the task reaches terminal failed state.
-                    # The checklist drain in apply_terminal_action will fill
-                    # remaining pending steps with 'failed'.
-                    raise result  # type: ignore[misc]
+                    if first_exc is None:
+                        first_exc = result
                 elif result is True:
                     steps_completed += 1
                 # result is False → hook was None/skipped; no step marked
+
+            if first_exc is not None:
+                # All group results have been inspected and logged; abort with
+                # the first exception so the task row reaches terminal failed.
+                raise first_exc
 
         logger.info(
             "CatalogProvisionTask: completed operation='%s' scope='%s' "
@@ -236,10 +228,7 @@ class CatalogProvisionTask(TaskProtocol):
 
         async with semaphore:
             try:
-                if inspect.iscoroutinefunction(hook):
-                    await hook(**ctx)
-                else:
-                    hook(**ctx)
+                await call_hook(hook, **ctx)
             except Exception as exc:
                 # Mark the step failed before re-raising so the caller can
                 # tally it and abort.

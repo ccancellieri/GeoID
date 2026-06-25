@@ -58,8 +58,6 @@ from dynastore.models.tasks import (
 from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.models.auth_models import SYSTEM_USER_ID
 
-from dynastore.tools.discovery import get_protocol
-
 logger = logging.getLogger(__name__)
 
 # Terminal statuses — dismiss and update operations check against these
@@ -234,24 +232,20 @@ async def _should_offload_provisioning(task_key: str) -> bool:
         return False
 
     try:
-        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
         from dynastore.modules.tasks.runners import get_runners
         from dynastore.models.tasks import TaskExecutionMode
+        from dynastore.tasks._helpers import get_tasks_config
 
         threshold = _DEFAULT_PROVISIONING_OFFLOAD_THRESHOLD
-        try:
-            mgr = get_protocol(PlatformConfigsProtocol)
-            if mgr is not None:
-                cfg = await mgr.get_config(TasksPluginConfig)
-                if isinstance(cfg, TasksPluginConfig):
-                    threshold = cfg.provisioning_inproc_offload_threshold
-        except Exception:  # noqa: BLE001 — config is optional; use default
-            pass
+        cfg = await get_tasks_config()
+        if cfg is not None:
+            threshold = cfg.provisioning_inproc_offload_threshold
 
         in_flight = 0
         for runner in get_runners(TaskExecutionMode.ASYNCHRONOUS):
             if getattr(runner, "runner_type", None) == "background":
+                # active_count reflects tasks currently running under the
+                # dispatcher's claimed path (populated via _running_tasks).
                 in_flight = getattr(runner, "active_count", 0)
                 break
 

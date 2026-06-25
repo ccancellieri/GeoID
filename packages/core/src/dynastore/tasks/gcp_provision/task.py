@@ -38,12 +38,12 @@ from dynastore.modules import get_protocol
 from dynastore.models.protocols import (
     StorageProtocol,
     EventingProtocol,
-    CatalogsProtocol,
     GcpCatalogProvisioning,
 )
 from dynastore.modules.gcp.tools.bucket import BucketConflictError
 from dynastore.modules.gcp.gcp_eventing_ops import OrphanSubscriptionClash
 from dynastore.modules.catalog.log_manager import log_error
+from dynastore.tasks._helpers import _get_catalog_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +63,6 @@ try:
     )
 except Exception:  # pragma: no cover — google-cloud not installed
     pass
-
-
-def _get_catalog_protocol() -> CatalogsProtocol:
-    protocol = get_protocol(CatalogsProtocol)
-    if not protocol:
-        raise RuntimeError("CatalogsProtocol not available")
-    return protocol
 
 def _get_storage_protocol() -> StorageProtocol:
     protocol = get_protocol(StorageProtocol)

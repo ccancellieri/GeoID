@@ -27,7 +27,8 @@ Covers:
   - deprovision_soft/hard selects .deprovision hook.
   - Failing hook marks step "failed" and aborts the run (re-raises).
   - catalog_provision is in _PROVISIONING_TASK_TYPES.
-  - Routing matrix: cloud preset emits [background, gcp_cloud_run]; onprem emits [background].
+  - Routing matrix: offloadable system task emits a single [background] target (no static
+    OFFLOAD/HEAVY hint) under both presets; offload is decided dynamically at dispatch.
   - _should_offload_provisioning: below threshold → False; at/above → True; exception → False.
 """
 
@@ -150,7 +151,7 @@ class TestPriorityGroupOrdering:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -196,7 +197,7 @@ class TestPriorityGroupOrdering:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -262,7 +263,7 @@ class TestGroupConcurrency:
             return await t
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -303,7 +304,7 @@ class TestGroupConcurrency:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -348,7 +349,7 @@ class TestStepMarking:
         )
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -380,7 +381,7 @@ class TestStepMarking:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -416,7 +417,7 @@ class TestStepMarking:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -471,7 +472,7 @@ class TestOperationSelection:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -511,7 +512,7 @@ class TestOperationSelection:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -552,7 +553,7 @@ class TestFailureHandling:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -594,7 +595,7 @@ class TestFailureHandling:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -630,7 +631,7 @@ class TestFailureHandling:
         mock_catalogs = _mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_provision.task.get_protocol",
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_provision.task.managed_transaction",
@@ -662,39 +663,30 @@ class TestRoutingMatrix:
 
         return InventoryItem(task_key=key, kind="task", affinity_tier="catalog")
 
-    def test_cloud_offloadable_task_yields_two_targets(self):
-        """Under cloud preset, catalog_provision emits [background, gcp_cloud_run]."""
+    def test_offloadable_task_yields_single_background_no_static_offload_hint(self):
+        """An offloadable system task routes to a SINGLE background target with
+        NO static OFFLOAD/HEAVY hint, under both cloud and onprem.
+
+        Regression guard: a static gcp_cloud_run target with OFFLOAD/HEAVY would
+        make ``offload_required`` true unconditionally and turn the dynamic
+        load-probe into dead code. Offload for these tasks is decided at
+        dispatch time by ``_should_offload_provisioning``, never by routing.
+        """
         from dynastore.modules.tasks.routing.matrix import build_routing_matrix
         from dynastore.modules.tasks.routing.exec_hints import ExecHint
 
-        tasks, _ = build_routing_matrix(
-            [self._task_item("catalog_provision")], preset="cloud"
-        )
-        targets = tasks["catalog_provision"]
-        assert len(targets) == 2, (
-            f"Expected 2 targets under cloud; got {len(targets)}"
-        )
-        assert targets[0].runner == "background"
-        assert ExecHint.BACKGROUND in targets[0].hints
-
-        assert targets[1].runner == "gcp_cloud_run"
-        assert ExecHint.OFFLOAD in targets[1].hints
-        assert ExecHint.HEAVY in targets[1].hints
-
-    def test_onprem_offloadable_task_yields_single_background(self):
-        """Under onprem preset, catalog_provision emits a single background target."""
-        from dynastore.modules.tasks.routing.matrix import build_routing_matrix
-        from dynastore.modules.tasks.routing.exec_hints import ExecHint
-
-        tasks, _ = build_routing_matrix(
-            [self._task_item("catalog_provision")], preset="onprem"
-        )
-        targets = tasks["catalog_provision"]
-        assert len(targets) == 1, (
-            f"Expected 1 target under onprem; got {len(targets)}"
-        )
-        assert targets[0].runner == "background"
-        assert ExecHint.OFFLOAD not in targets[0].hints
+        for preset in ("cloud", "onprem"):
+            tasks, _ = build_routing_matrix(
+                [self._task_item("catalog_provision")], preset=preset
+            )
+            targets = tasks["catalog_provision"]
+            assert len(targets) == 1, (
+                f"Expected 1 target under {preset}; got {len(targets)}"
+            )
+            assert targets[0].runner == "background"
+            assert ExecHint.BACKGROUND in targets[0].hints
+            assert ExecHint.OFFLOAD not in targets[0].hints
+            assert ExecHint.HEAVY not in targets[0].hints
 
     def test_non_offloadable_task_always_single_background(self):
         """A regular system task (not in OFFLOADABLE_SYSTEM_TASKS) stays single background."""
@@ -743,7 +735,7 @@ class TestShouldOffloadProvisioning:
         mock_config.provisioning_inproc_offload_threshold = 8
 
         with patch(
-            "dynastore.modules.tasks.execution.get_protocol",
+            "dynastore.tasks._helpers.get_protocol",
             return_value=MagicMock(get_config=AsyncMock(return_value=mock_config)),
         ), patch(
             # get_runners is lazily imported inside _should_offload_provisioning;
@@ -768,7 +760,7 @@ class TestShouldOffloadProvisioning:
         mock_config.provisioning_inproc_offload_threshold = 8
 
         with patch(
-            "dynastore.modules.tasks.execution.get_protocol",
+            "dynastore.tasks._helpers.get_protocol",
             return_value=MagicMock(get_config=AsyncMock(return_value=mock_config)),
         ), patch(
             "dynastore.modules.tasks.runners.get_runners",
@@ -791,7 +783,7 @@ class TestShouldOffloadProvisioning:
         mock_config.provisioning_inproc_offload_threshold = 8
 
         with patch(
-            "dynastore.modules.tasks.execution.get_protocol",
+            "dynastore.tasks._helpers.get_protocol",
             return_value=MagicMock(get_config=AsyncMock(return_value=mock_config)),
         ), patch(
             "dynastore.modules.tasks.runners.get_runners",
@@ -824,7 +816,7 @@ class TestShouldOffloadProvisioning:
         mock_runner.active_count = 5  # below default 8
 
         with patch(
-            "dynastore.modules.tasks.execution.get_protocol",
+            "dynastore.tasks._helpers.get_protocol",
             return_value=None,  # ConfigsProtocol not available
         ), patch(
             "dynastore.modules.tasks.runners.get_runners",

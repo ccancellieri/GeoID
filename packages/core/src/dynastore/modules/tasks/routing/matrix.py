@@ -69,14 +69,15 @@ LIGHTWEIGHT_PROCESSES: frozenset = frozenset(
     {"requeue_dead_letter_tasks", "tiles_invalidate"}
 )
 
-# System tasks (kind="task") that MAY offload to a Cloud Run Job under the
-# cloud profile when the in-process dispatcher is under load.  Each entry
-# here causes build_routing_matrix to emit TWO RunnerTargets in application
-# order: (1) background — the preferred in-process path; (2) gcp_cloud_run —
-# the burst offload.  A dispatcher-local load probe (see execution.py
-# _should_offload_provisioning) chooses between them at dispatch time.
-# Under onprem, the dual-target is NOT emitted — a single background target
-# is returned like any other system task.
+# System tasks (kind="task") that MAY offload to a Cloud Run Job when the
+# in-process dispatcher is under load.  These route like any other system
+# task — a single ``background`` target — because the offload decision is
+# dynamic, not static: a dispatcher-local load probe (see execution.py
+# ``_should_offload_provisioning``) flips the task to an offload runner only
+# when the in-process pool is at/above threshold, and the restriction acts on
+# the registered runners, not on the routing target.  Emitting a static
+# gcp_cloud_run target with an OFFLOAD/HEAVY hint here would make
+# ``offload_required`` true unconditionally and defeat the load-adaptive path.
 OFFLOADABLE_SYSTEM_TASKS: frozenset = frozenset({"catalog_provision"})
 
 
@@ -136,31 +137,17 @@ def build_routing_matrix(
     for item in inventory:
         if item.kind == "task":
             tier = item.affinity_tier or "catalog"
-            if item.task_key in OFFLOADABLE_SYSTEM_TASKS and preset != "onprem":
-                # Offloadable system task under the cloud profile: emit two
-                # candidates so a dispatcher-local load probe can choose
-                # between running in-process (preferred, listed first) and
-                # offloading to a Cloud Run Job under burst conditions.
-                tasks_map[item.task_key] = [
-                    RunnerTarget(
-                        consumers=[tier],
-                        runner="background",
-                        hints={ExecHint.BACKGROUND},
-                    ),
-                    RunnerTarget(
-                        consumers=[tier],
-                        runner="gcp_cloud_run",
-                        hints={ExecHint.OFFLOAD, ExecHint.HEAVY},
-                    ),
-                ]
-            else:
-                tasks_map[item.task_key] = [
-                    RunnerTarget(
-                        consumers=[tier],
-                        runner="background",
-                        hints={ExecHint.BACKGROUND},
-                    )
-                ]
+            # All system tasks route to a single in-process ``background``
+            # target.  Offloadable ones (OFFLOADABLE_SYSTEM_TASKS) are flipped
+            # to a Cloud Run Job dynamically at dispatch time by the load probe
+            # in execution.py — never via a static OFFLOAD/HEAVY routing hint.
+            tasks_map[item.task_key] = [
+                RunnerTarget(
+                    consumers=[tier],
+                    runner="background",
+                    hints={ExecHint.BACKGROUND},
+                )
+            ]
         else:
             # kind == "process"
             if preset != "onprem":

@@ -130,7 +130,7 @@ class TestCatalogCoreInitTaskHappyPath:
         mock_catalogs = _make_mock_catalogs(catalog_model=mock_catalog_model)
 
         with patch(
-            "dynastore.tasks.catalog_core_init.task.get_protocol",
+            "dynastore.tasks.catalog_core_init.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_core_init.task.managed_transaction",
@@ -161,7 +161,7 @@ class TestCatalogCoreInitTaskHappyPath:
         mock_catalogs = _make_mock_catalogs()
 
         with patch(
-            "dynastore.tasks.catalog_core_init.task.get_protocol",
+            "dynastore.tasks.catalog_core_init.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_core_init.task.managed_transaction",
@@ -192,7 +192,7 @@ class TestCatalogCoreInitTaskErrorPaths:
         mock_catalogs = _make_mock_catalogs(catalog_model=None)
 
         with patch(
-            "dynastore.tasks.catalog_core_init.task.get_protocol",
+            "dynastore.tasks.catalog_core_init.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ):
             with pytest.raises(PermanentTaskFailure, match="not found"):
@@ -212,7 +212,7 @@ class TestCatalogCoreInitTaskErrorPaths:
         mock_catalogs = _make_mock_catalogs(init_side_effect=RuntimeError("DDL error"))
 
         with patch(
-            "dynastore.tasks.catalog_core_init.task.get_protocol",
+            "dynastore.tasks.catalog_core_init.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ), patch(
             "dynastore.tasks.catalog_core_init.task.managed_transaction",
@@ -241,7 +241,7 @@ class TestCatalogCoreInitTaskErrorPaths:
         # _run_core_init deliberately absent
 
         with patch(
-            "dynastore.tasks.catalog_core_init.task.get_protocol",
+            "dynastore.tasks.catalog_core_init.task._get_catalog_protocol",
             return_value=mock_catalogs,
         ):
             with pytest.raises(RuntimeError, match="_run_core_init"):

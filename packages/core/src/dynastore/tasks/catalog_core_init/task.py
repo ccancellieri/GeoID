@@ -37,19 +37,11 @@ from dynastore.modules.tasks.models import (
     TaskPayload,
     PermanentTaskFailure,
 )
-from dynastore.modules import get_protocol
-from dynastore.models.protocols import CatalogsProtocol
 from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.catalog.catalog_service import get_catalog_engine
+from dynastore.tasks._helpers import _get_catalog_protocol
 
 logger = logging.getLogger(__name__)
-
-
-def _get_catalog_protocol() -> CatalogsProtocol:
-    protocol = get_protocol(CatalogsProtocol)
-    if not protocol:
-        raise RuntimeError("CatalogsProtocol not available")
-    return protocol
 
 
 class CatalogCoreInitInputs(BaseModel):
