@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, SidecarConfigRegistry
 from dynastore.modules.storage.computed_fields import ComputedField
 from dynastore.models.field_types import CANONICAL_TO_PG_DDL, canonical_data_type
-from dynastore.tools.db import validate_column_identifier
+from dynastore.tools.db import validate_column_identifier, InvalidIdentifierError
 
 
 class AttributePartitionStrategyPreset(str, Enum):
@@ -307,6 +307,27 @@ class FeatureAttributeSidecarConfig(SidecarConfig):
     def enable_asset_id(self) -> bool:
         """True when ``asset_id_field`` is set (null-object pattern)."""
         return self.asset_id_field is not None
+
+    @field_validator("external_id_field", "asset_id_field", "validity_column", mode="before")
+    @classmethod
+    def _validate_column_identifiers(cls, v: Optional[str]) -> Optional[str]:
+        """Validate column identifier fields before they reach SQL interpolation.
+
+        These field names are interpolated into SQL queries (column names cannot
+        be bound parameters). Reject non-identifier values at the config boundary
+        so injection attempts fail early with a clear error, rather than reaching
+        the query string. None is always valid (disables the column). (#2314)
+        """
+        if v is None:
+            return v
+        try:
+            return validate_column_identifier(v)
+        except InvalidIdentifierError as exc:
+            raise ValueError(
+                f"Column name {v!r} is not a valid SQL identifier: {exc}. "
+                "The value is interpolated into SQL; use only letters, "
+                "digits, and underscores, starting with a letter or underscore."
+            ) from exc
 
     # Validity Configuration
     #

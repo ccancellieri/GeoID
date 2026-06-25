@@ -27,13 +27,14 @@ This module is extracted to avoid circular dependencies between:
 
 from typing import List, Optional, Dict, Literal
 from enum import Enum
-from pydantic import Field
+from pydantic import Field, field_validator
 from dynastore.models.mutability import Computed
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
     ComputedKind,
 )
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, SidecarConfigRegistry
+from dynastore.tools.db import validate_column_identifier, InvalidIdentifierError
 
 # ============================================================================
 # ENUMS
@@ -97,6 +98,27 @@ class GeometriesSidecarConfig(SidecarConfig):
         default="bbox_geom", 
         description="Bounding box column name. If set, a separate column for the spatial extent is managed. Set to None to disable."
     )
+
+    @field_validator("geom_column", "bbox_column", mode="before")
+    @classmethod
+    def _validate_column_identifiers(cls, v: Optional[str]) -> Optional[str]:
+        """Validate column identifier fields before they reach SQL interpolation.
+
+        These field names are interpolated into SQL queries (column names cannot
+        be bound parameters). Reject non-identifier values at the config boundary
+        so injection attempts fail early with a clear error, rather than reaching
+        the query string. None is always valid (disables the column). (#2314)
+        """
+        if v is None:
+            return v
+        try:
+            return validate_column_identifier(v)
+        except InvalidIdentifierError as exc:
+            raise ValueError(
+                f"Column name {v!r} is not a valid SQL identifier: {exc}. "
+                "The value is interpolated into SQL; use only letters, "
+                "digits, and underscores, starting with a letter or underscore."
+            ) from exc
 
     @property
     def write_bbox(self) -> bool:

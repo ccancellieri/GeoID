@@ -37,12 +37,13 @@ This sidecar is **opt-in only** — ``is_mandatory()`` returns ``False``.
 
 from typing import List, Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from dynastore.modules.storage.drivers.pg_sidecars.base import (
     SidecarConfig,
     SidecarConfigRegistry,
 )
+from dynastore.tools.db import validate_column_identifier, InvalidIdentifierError
 
 
 class AccessEnvelopeSidecarConfig(SidecarConfig):
@@ -92,6 +93,25 @@ class AccessEnvelopeSidecarConfig(SidecarConfig):
 
     column_name: str = "access_envelope"
     """Column name for the JSONB envelope within the sub-table."""
+
+    @field_validator("column_name", mode="before")
+    @classmethod
+    def _validate_column_identifier(cls, v: str) -> str:
+        """Validate column identifier field before it reaches SQL interpolation.
+
+        The column name is interpolated into SQL queries (column names cannot
+        be bound parameters). Reject non-identifier values at the config boundary
+        so injection attempts fail early with a clear error, rather than reaching
+        the query string. (#2314)
+        """
+        try:
+            return validate_column_identifier(v)
+        except InvalidIdentifierError as exc:
+            raise ValueError(
+                f"Column name {v!r} is not a valid SQL identifier: {exc}. "
+                "The value is interpolated into SQL; use only letters, "
+                "digits, and underscores, starting with a letter or underscore."
+            ) from exc
 
     gin_index: bool = True
     """Create a GIN index on the JSONB envelope column for fast containment queries."""
