@@ -2969,6 +2969,62 @@ class CatalogService(CatalogsProtocol):
             return {}
         return json.loads(raw) if isinstance(raw, str) else dict(raw)
 
+    async def reset_checklist_for_reprovision(
+        self,
+        catalog_id: str,
+        *,
+        force: bool = False,
+        ctx: Optional["DriverContext"] = None,
+    ) -> dict[str, str]:
+        """Reset the checklist for a reprovision and set status='provisioning' (#2395).
+
+        Used by the reprovision trigger before re-enqueuing ``catalog_provision``.
+        With ``force=False`` every step that is not already satisfied
+        (``complete`` / ``skipped``) is reset to ``pending``; satisfied steps are
+        left untouched so the executor re-runs only what failed. With
+        ``force=True`` every step is reset to ``pending`` (full replay).
+
+        Resetting the to-be-rerun steps to ``pending`` (rather than leaving them
+        ``failed``/``degraded``) keeps the catalog status transition monotonic:
+        the catalog stays ``provisioning`` until every step completes, instead of
+        flapping back through ``failed`` when one step in a group completes while
+        a sibling is still marked ``failed``.
+
+        Returns the new checklist, or ``{}`` when the catalog has no checklist
+        (e.g. on-prem / no active provisioners) — nothing to reprovision. The
+        read is row-locked (``FOR UPDATE``) so it serialises with concurrent
+        provisioner step marks.
+        """
+        from dynastore.modules.catalog.provisioning_registry import (
+            STEP_PENDING,
+            STEP_COMPLETE,
+            STEP_SKIPPED,
+            STATUS_PROVISIONING,
+        )
+
+        db_resource = ctx.db_resource if ctx else None
+        engine = get_catalog_engine(db_resource)
+        async with managed_transaction(engine) as conn:
+            row = await _get_provisioning_checklist_query.execute(conn, id=catalog_id)
+            if not row:
+                return {}
+            raw = row.get("provisioning_checklist")
+            if raw is None:
+                return {}
+            checklist = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            if not checklist:
+                return {}
+            for key, state in list(checklist.items()):
+                if force or state not in (STEP_COMPLETE, STEP_SKIPPED):
+                    checklist[key] = STEP_PENDING
+            await _set_provisioning_checklist_query.execute(
+                conn,
+                id=catalog_id,
+                status=STATUS_PROVISIONING,
+                checklist=json.dumps(checklist),
+            )
+        return checklist
+
 
 # --- Standalone Utilities ---
 

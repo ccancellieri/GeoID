@@ -57,6 +57,7 @@ def _make_payload(
     scope: str = "catalog",
     operation: str = "provision",
     collection_id: str | None = None,
+    force: bool = False,
 ) -> Any:
     from dynastore.tasks.catalog_provision.task import CatalogProvisionInputs
     from dynastore.models.tasks import TaskPayload
@@ -66,6 +67,7 @@ def _make_payload(
         scope=scope,
         operation=operation,
         collection_id=collection_id,
+        force=force,
     )
     return TaskPayload(task_id=uuid.uuid4(), caller_id="test", inputs=inputs)
 
@@ -85,10 +87,13 @@ def _make_provisioner(
     return p
 
 
-def _mock_catalogs() -> Any:
+def _mock_catalogs(checklist: Any = None) -> Any:
     mock = AsyncMock()
     mock.get_catalog_model = AsyncMock(return_value=MagicMock(external_id="ext-id"))
     mock.mark_provisioning_step = AsyncMock()
+    # Reprovision skip-filter (#2395) reads the checklist; an empty checklist
+    # models the fresh-create case (nothing satisfied yet → nothing skipped).
+    mock.get_provisioning_checklist = AsyncMock(return_value=checklist or {})
     return mock
 
 
@@ -713,3 +718,143 @@ class TestRoutingMatrix:
 
         assert "catalog_provision" in OFFLOADABLE_SYSTEM_TASKS
 
+
+
+# ---------------------------------------------------------------------------
+# Reprovision: checklist-aware skip + force (#2395)
+# ---------------------------------------------------------------------------
+
+
+async def _run_with(groups, *, checklist=None, force=False, operation="provision"):
+    """Invoke run() with the given provisioner groups and checklist.
+
+    Returns (result, mock_catalogs, emit_mock).
+    """
+    from unittest.mock import patch as _patch
+
+    task = _make_task()
+    payload = _make_payload(force=force, operation=operation)
+    mock_catalogs = _mock_catalogs(checklist=checklist)
+
+    with _patch(
+        "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
+        return_value=mock_catalogs,
+    ), _patch(
+        "dynastore.tasks.catalog_provision.task.managed_transaction",
+        return_value=_txn_ctx(),
+    ), _patch(
+        "dynastore.tasks.catalog_provision.task.get_catalog_engine",
+        return_value=MagicMock(),
+    ), _patch(
+        "dynastore.tasks.catalog_provision.task.provisioning_registry",
+    ) as mock_reg, _patch(
+        "dynastore.tasks.catalog_provision.task._get_group_concurrency",
+        new=AsyncMock(return_value=4),
+    ), _patch.object(
+        task, "_emit_catalog_created_events", new=AsyncMock()
+    ) as emit_mock:
+        mock_reg.active_provisioners = AsyncMock(return_value=groups)
+        result = await task.run(payload)
+    return result, mock_catalogs, emit_mock
+
+
+class TestReprovisionChecklistAware:
+    @pytest.mark.asyncio
+    async def test_skips_satisfied_steps_runs_unsatisfied(self):
+        """complete/skipped steps are skipped; failed/degraded/pending run."""
+        ran: List[str] = []
+
+        def make_hook(name: str):
+            async def hook(**ctx):
+                ran.append(name)
+            return hook
+
+        done = _make_provisioner("catalog_core", priority=0, provision_fn=make_hook("catalog_core"))
+        bucket = _make_provisioner("gcp_bucket", priority=1, provision_fn=make_hook("gcp_bucket"))
+        eventing = _make_provisioner("gcp_eventing", priority=1, provision_fn=make_hook("gcp_eventing"))
+        groups = [[done], [bucket, eventing]]
+        checklist = {
+            "catalog_core": "complete",
+            "gcp_bucket": "skipped",
+            "gcp_eventing": "failed",
+        }
+
+        result, _cat, _emit = await _run_with(groups, checklist=checklist)
+
+        assert ran == ["gcp_eventing"], f"only the failed step should run, got {ran}"
+        assert result["groups_run"] == 1
+        assert result["steps_completed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_degraded_step_is_rerun(self):
+        """A degraded step (best-effort that did not complete) is re-run."""
+        ran: List[str] = []
+
+        async def hook(**ctx):
+            ran.append("gcp_eventing")
+
+        eventing = _make_provisioner("gcp_eventing", priority=1, provision_fn=hook)
+        groups = [[eventing]]
+        checklist = {"gcp_eventing": "degraded"}
+
+        await _run_with(groups, checklist=checklist)
+        assert ran == ["gcp_eventing"]
+
+    @pytest.mark.asyncio
+    async def test_force_runs_all_steps_regardless_of_checklist(self):
+        """force=True ignores the checklist and replays every provisioner."""
+        ran: List[str] = []
+
+        def make_hook(name: str):
+            async def hook(**ctx):
+                ran.append(name)
+            return hook
+
+        core = _make_provisioner("catalog_core", priority=0, provision_fn=make_hook("catalog_core"))
+        bucket = _make_provisioner("gcp_bucket", priority=1, provision_fn=make_hook("gcp_bucket"))
+        groups = [[core], [bucket]]
+        checklist = {"catalog_core": "complete", "gcp_bucket": "complete"}
+
+        result, _cat, _emit = await _run_with(groups, checklist=checklist, force=True)
+
+        assert sorted(ran) == ["catalog_core", "gcp_bucket"]
+        assert result["steps_completed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_noop_reprovision_does_not_re_emit_creation_events(self):
+        """When every step is already satisfied, nothing runs and no
+        CATALOG_CREATION events are re-emitted."""
+        ran: List[str] = []
+
+        async def hook(**ctx):
+            ran.append("x")
+
+        core = _make_provisioner("catalog_core", priority=0, provision_fn=hook)
+        groups = [[core]]
+        checklist = {"catalog_core": "complete"}
+
+        result, _cat, emit_mock = await _run_with(groups, checklist=checklist)
+
+        assert ran == []
+        assert result["groups_run"] == 0
+        emit_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fresh_create_empty_checklist_runs_everything(self):
+        """A fresh create (empty/all-pending checklist) skips nothing."""
+        ran: List[str] = []
+
+        def make_hook(name: str):
+            async def hook(**ctx):
+                ran.append(name)
+            return hook
+
+        core = _make_provisioner("catalog_core", priority=0, provision_fn=make_hook("catalog_core"))
+        bucket = _make_provisioner("gcp_bucket", priority=1, provision_fn=make_hook("gcp_bucket"))
+        groups = [[core], [bucket]]
+
+        result, _cat, emit_mock = await _run_with(groups, checklist={})
+
+        assert sorted(ran) == ["catalog_core", "gcp_bucket"]
+        assert result["groups_run"] == 2
+        emit_mock.assert_awaited_once()

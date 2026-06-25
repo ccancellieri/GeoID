@@ -28,7 +28,8 @@ Covers:
 - Visibility 404 when resolve_catalog_listing_ids returns a frozenset NOT
   containing the catalog; None (IAM off) → unfiltered.
 - Collection status visibility 404 likewise.
-- Reprovision enqueues a gcp_provision_catalog task and returns 202 shape.
+- Reprovision enqueues the unified catalog_provision task (keyed on the
+  physical id) and returns 202 shape; empty checklist → noop.
 - Dead-letter list and requeue call the maintenance primitives with the
   resolved tenant schema.
 - Policies shape: catalog_status_admin gates mutation paths with
@@ -245,6 +246,12 @@ async def test_reprovision_catalog_enqueues_task():
 
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    # #2395: reprovision resolves the physical schema id and resets the
+    # to-be-rerun checklist steps before enqueuing the unified executor.
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="c_phys")
+    catalogs_mock.reset_checklist_for_reprovision = AsyncMock(
+        return_value={"gcp_eventing": "pending"}
+    )
 
     db_mock = SimpleNamespace(engine=MagicMock())
 
@@ -283,9 +290,62 @@ async def test_reprovision_catalog_enqueues_task():
         result = await handler("test-cat")
 
     create_task_mock.assert_awaited_once()
+    # Drives the unified executor (not the legacy gcp_provision_catalog) and
+    # keys it on the physical schema id, never the external id on the wire.
+    kwargs = create_task_mock.await_args.kwargs
+    assert kwargs["task_data"].task_type == "catalog_provision"
+    assert kwargs["task_data"].inputs["catalog_id"] == "c_phys"
+    assert kwargs["task_data"].inputs["operation"] == "provision"
+    assert kwargs["catalog_id"] == "c_phys"
+    catalogs_mock.reset_checklist_for_reprovision.assert_awaited_once()
     assert result["status"] == "queued"
-    assert result["catalog_id"] == "test-cat"
+    assert result["catalog_id"] == "test-cat"  # external id echoed back
+    assert result["provisioning_status"] == "provisioning"
     assert result["task_id"] == str(fake_task_id)
+
+
+async def test_reprovision_noop_when_no_active_provisioners():
+    """An empty checklist (on-prem / no provisioners) returns a noop without
+    enqueuing a task."""
+    fake_cat = _fake_catalog()
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="c_phys")
+    catalogs_mock.reset_checklist_for_reprovision = AsyncMock(return_value={})
+
+    db_mock = SimpleNamespace(engine=MagicMock())
+    create_task_mock = AsyncMock()
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return db_mock
+        return None
+
+    fake_tm = MagicMock()
+    fake_tm.create_task_for_catalog = create_task_mock
+
+    from dynastore.extensions.catalog_status.catalog_status_service import CatalogStatusService
+    handler = None
+    for route in CatalogStatusService.router.routes:
+        if "reprovision" in getattr(route, "path", ""):
+            handler = route.endpoint
+            break
+    assert handler is not None
+
+    with (
+        patch(_GET_PROTOCOL, side_effect=_proto),
+        patch("dynastore.modules.tasks.tasks_module", fake_tm),
+    ):
+        result = await handler("test-cat")
+
+    create_task_mock.assert_not_awaited()
+    assert result["status"] == "noop"
+    assert result["catalog_id"] == "test-cat"
 
 
 # ---------------------------------------------------------------------------

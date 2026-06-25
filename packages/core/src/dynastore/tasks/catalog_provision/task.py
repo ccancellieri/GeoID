@@ -75,6 +75,14 @@ class CatalogProvisionInputs(BaseModel):
     scope: str = "catalog"
     operation: str = "provision"
     collection_id: Optional[str] = None
+    # Reprovision control (#2395). When False (default), a ``provision`` run
+    # skips provisioners whose checklist step is already satisfied
+    # (``complete`` / ``skipped``) and re-runs only the unsatisfied ones
+    # (``failed`` / ``degraded`` / ``pending`` / missing) — "reprovision only
+    # what failed". When True, every provisioner runs regardless of its
+    # current step (full replay). Ignored for deprovision operations, which
+    # always run every teardown hook.
+    force: bool = False
 
 
 class CatalogProvisionTask(TaskProtocol):
@@ -103,6 +111,7 @@ class CatalogProvisionTask(TaskProtocol):
         scope = inputs.scope
         operation = inputs.operation
         collection_id = inputs.collection_id
+        force = inputs.force
 
         if not catalog_id:
             raise PermanentTaskFailure("Missing 'catalog_id' in task inputs")
@@ -133,6 +142,38 @@ class CatalogProvisionTask(TaskProtocol):
             groups: List[List[Any]] = await provisioning_registry.active_provisioners(
                 catalog_id, conn, scope=scope
             )
+
+        # Reprovision only what failed (#2395). For a ``provision`` run that is
+        # not a forced full replay, drop provisioners whose checklist step is
+        # already satisfied (``complete`` / ``skipped``) so a reprovision
+        # re-runs only the unsatisfied steps (``failed`` / ``degraded`` /
+        # ``pending`` / missing). On the first create the checklist is freshly
+        # all-``pending``, so nothing is skipped and behaviour is unchanged;
+        # on a max_retries replay the completed steps are skipped instead of
+        # relying on every hook honouring IF-NOT-EXISTS. Deprovision always
+        # runs every teardown hook, so the filter is provision-only.
+        if operation == "provision" and not force:
+            from dynastore.modules.catalog.provisioning_registry import (
+                STEP_COMPLETE,
+                STEP_SKIPPED,
+            )
+
+            checklist = await catalogs.get_provisioning_checklist(catalog_id)
+            satisfied = {
+                key
+                for key, state in checklist.items()
+                if state in (STEP_COMPLETE, STEP_SKIPPED)
+            }
+            if satisfied:
+                groups = [
+                    [p for p in group if p.key not in satisfied] for group in groups
+                ]
+                groups = [group for group in groups if group]
+                logger.info(
+                    "CatalogProvisionTask: reprovision for catalog '%s' — "
+                    "skipping satisfied steps %s; running remaining provisioners",
+                    catalog_id, sorted(satisfied),
+                )
 
         concurrency = await _get_group_concurrency()
         semaphore = asyncio.Semaphore(concurrency)
@@ -193,10 +234,12 @@ class CatalogProvisionTask(TaskProtocol):
             groups_run, steps_completed, steps_failed,
         )
 
-        if operation == "provision":
+        if operation == "provision" and groups_run > 0:
             # Emit lifecycle events after all provisioning steps complete so
             # non-provisioning subscribers (webhook outbox, audit log) fire
-            # exactly once, after the tenant schema is ready.
+            # after the tenant schema is ready. Gated on ``groups_run > 0`` so a
+            # no-op reprovision (every step already satisfied, nothing ran)
+            # stays silent and does not re-emit creation events (#2395).
             await self._emit_catalog_created_events(catalog_id)
 
         return {

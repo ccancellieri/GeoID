@@ -273,6 +273,22 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         """
         ...
 
+    async def reset_checklist_for_reprovision(
+        self,
+        catalog_id: str,
+        *,
+        force: bool = False,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Dict[str, str]:
+        """Reset the checklist for a reprovision and set status='provisioning' (#2395).
+
+        With ``force=False`` every step that is not already ``complete`` /
+        ``skipped`` is reset to ``pending`` (re-run only what failed); with
+        ``force=True`` every step is reset (full replay). Returns the new
+        checklist, or ``{}`` when there is no checklist to reprovision.
+        """
+        ...
+
     async def get_catalog_config(
         self, catalog_id: str, ctx: Optional["DriverContext"] = None,
     ) ->Any:

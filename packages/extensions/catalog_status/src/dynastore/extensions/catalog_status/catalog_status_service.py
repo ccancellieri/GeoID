@@ -361,15 +361,22 @@ class CatalogStatusService(ExtensionProtocol):
     @router.post(
         "/catalogs/{catalog_id}/reprovision",
         status_code=202,
-        summary="Re-enqueue the gcp_provision_catalog task for a catalog.",
+        summary="Re-run the provisioning checklist to repair a catalog.",
     )
-    async def reprovision_catalog(catalog_id: str):  # type: ignore[reportGeneralTypeIssues]
-        """Re-trigger GCP provisioning for a catalog.
+    async def reprovision_catalog(catalog_id: str, force: bool = False):  # type: ignore[reportGeneralTypeIssues]
+        """Re-run the provisioning checklist for an existing catalog (#2395).
 
-        Idempotent: the underlying task is already idempotent (bucket ensure +
-        eventing attach). Useful when eventing was degraded due to a missing
-        IAM grant — fix the grant, then call this endpoint to repair without
-        recreating the catalog.
+        Re-enqueues the unified ``catalog_provision`` executor, which re-runs
+        every registered provisioner (tenant schema, GCS bucket, eventing, …) —
+        not just GCP. By default only the steps that are not already satisfied
+        (``complete`` / ``skipped``) are re-run — "reprovision only what failed";
+        pass ``?force=true`` to replay every step.
+
+        Idempotent recovery without recreating the catalog: e.g. fix a missing
+        IAM grant that left eventing ``failed`` / ``degraded``, then call this to
+        repair. The to-be-rerun steps are reset to ``pending`` and the catalog is
+        flipped to ``provisioning`` so its status transitions monotonically back
+        to ``ready``.
 
         Gated by the ``catalog_status_admin`` policy (sysadmin + admin +
         catalog-admin delegation via ``catalog_admin_required`` condition).
@@ -393,16 +400,49 @@ class CatalogStatusService(ExtensionProtocol):
         if db is None:
             raise HTTPException(status_code=503, detail="Database unavailable.")
 
-        provisioning_status = getattr(catalog, "provisioning_status", "ready") or "ready"
+        # Resolve the physical schema id. The executor keys the checklist and
+        # the task schema on it; the external id on the wire must never reach
+        # the task inputs.
+        physical_id = await catalogs.resolve_physical_schema(
+            catalog_id, allow_missing=True
+        )
+        if not physical_id:
+            raise HTTPException(
+                status_code=404, detail=f"Catalog '{catalog_id}' not found."
+            )
+
+        # Reset the to-be-rerun steps to 'pending' and set status='provisioning'
+        # so the catalog transitions monotonically back to 'ready'. An empty
+        # checklist means no active provisioners (on-prem) → nothing to do.
+        checklist = await catalogs.reset_checklist_for_reprovision(
+            physical_id, force=force
+        )
+        if not checklist:
+            return {
+                "catalog_id": catalog_id,
+                "provisioning_status": (
+                    getattr(catalog, "provisioning_status", "ready") or "ready"
+                ),
+                "status": "noop",
+                "detail": (
+                    "No active provisioners for this catalog; "
+                    "nothing to reprovision."
+                ),
+            }
 
         task = await tasks_module.create_task_for_catalog(
             engine=db.engine,
             task_data=TaskCreate(
                 caller_id="system:admin",
-                task_type="gcp_provision_catalog",
-                inputs={"catalog_id": catalog_id},
+                task_type="catalog_provision",
+                inputs={
+                    "catalog_id": physical_id,
+                    "scope": "catalog",
+                    "operation": "provision",
+                    "force": force,
+                },
             ),
-            catalog_id=catalog_id,
+            catalog_id=physical_id,
         )
         if task is None:
             raise HTTPException(
@@ -412,7 +452,8 @@ class CatalogStatusService(ExtensionProtocol):
         return {
             "task_id": str(task.task_id),
             "catalog_id": catalog_id,
-            "provisioning_status": provisioning_status,
+            "provisioning_status": "provisioning",
+            "force": force,
             "status": "queued",
         }
 
