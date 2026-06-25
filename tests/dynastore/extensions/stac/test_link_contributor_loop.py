@@ -50,6 +50,7 @@ def _make_context(**overrides):
         "request": fake_request,
         "stac_config": MagicMock(),
         "asset_id": None,
+        "default_style_id": None,
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

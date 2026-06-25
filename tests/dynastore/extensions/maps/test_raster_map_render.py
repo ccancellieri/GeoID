@@ -208,11 +208,12 @@ class TestRenderCogMapEngine:
             def __exit__(self, *_):
                 pass
 
-            def part(self, *, bbox, indexes, width, height):
+            def part(self, *, bbox, indexes, width, height, expression=None):
                 captured["bbox"] = bbox
                 captured["width"] = width
                 captured["height"] = height
                 captured["indexes"] = indexes
+                captured["expression"] = expression
                 return _FakePart()
 
         fake_rio = types.ModuleType("rio_tiler")
@@ -234,6 +235,7 @@ class TestRenderCogMapEngine:
         assert captured["width"] == 256
         assert captured["height"] == 256
         assert captured["indexes"] == (1,)
+        assert captured["expression"] is None
 
     def test_passes_colormap(self, monkeypatch):
         from dynastore.modules.renders import engine

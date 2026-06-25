@@ -290,6 +290,7 @@ def test_add_dynamic_assets_attaches_wmts_link_to_item():
         request=fake_request,
         stac_config=MagicMock(),
         asset_id=None,
+        default_style_id=None,
     )
 
     contributor = WmtsWebMapLinksContributor()

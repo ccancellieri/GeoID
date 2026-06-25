@@ -66,7 +66,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import List, Literal, Optional, Tuple
+from typing import ClassVar, List, Literal, Optional, Tuple
 
 import rio_tiler as _rio_tiler_scope_gate  # noqa: F401  # SCOPE gate: requires rio-tiler
 _ = _rio_tiler_scope_gate  # silence pyright "unused"
@@ -207,7 +207,7 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
     """
 
     priority: int = 100
-    conformance_uris: List[str] = []
+    conformance_uris: ClassVar[List[str]] = []
     prefix = "/renders"
     protocol_title = "DynaStore Raster Tile Renders"
     protocol_description = "Styled PNG/WebP tiles rendered from COG assets via rio-tiler"
