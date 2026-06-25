@@ -246,14 +246,74 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         conn: AsyncConnection = Depends(get_async_connection),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
-        # Accepted for uniform protocol consistency; moving-features reads go through
-        # a dedicated SQL path that does not yet implement the hints routing layer.
+        bbox: Optional[str] = Query(
+            None,
+            description="Bounding box filter. Comma-separated: minx,miny,maxx,maxy (WGS84).",
+        ),
+        intersects: Optional[str] = Query(
+            None,
+            description="Geometry filter (WKT format, WGS84). Filters trajectories intersecting this geometry.",
+        ),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[MovingFeature]:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
         if not await catalog_module.get_collection(catalog_id, collection_id):
             raise HTTPException(status_code=404, detail="Collection not found.")
+        
+        if bbox and intersects:
+            raise HTTPException(
+                status_code=400,
+                detail="Only one of 'bbox' or 'intersects' parameters can be specified.",
+            )
+        
+        if bbox:
+            from dynastore.tools.geospatial import parse_bbox_string, BboxDimensionality
+            try:
+                bbox_coords = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    allow_none=False,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            
+            return await mf_db.list_moving_features_by_bbox(
+                conn,
+                catalog_id,
+                collection_id,
+                min_lon=bbox_coords[0],
+                min_lat=bbox_coords[1],
+                max_lon=bbox_coords[2],
+                max_lat=bbox_coords[3],
+                limit=limit,
+                offset=offset,
+            )
+        
+        if intersects:
+            try:
+                import shapely.wkt as wkt
+                geom = wkt.loads(intersects)
+                if not geom.is_valid:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid geometry: geometry is not valid.",
+                    )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid geometry WKT: {str(e)}",
+                ) from e
+            
+            return await mf_db.list_moving_features_by_geometry(
+                conn,
+                catalog_id,
+                collection_id,
+                geometry_wkt=intersects,
+                limit=limit,
+                offset=offset,
+            )
+        
         return await mf_db.list_moving_features(conn, catalog_id, collection_id, limit, offset)
 
     async def create_moving_feature(

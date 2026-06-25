@@ -27,6 +27,30 @@ from .models import MovingFeature, MovingFeatureCreate, TemporalGeometry, Tempor
 
 logger = logging.getLogger(__name__)
 
+
+def _compute_bbox_wkt(coordinates: List[List[float]]) -> Optional[str]:
+    """Compute bounding box WKT from coordinate array.
+    
+    Args:
+        coordinates: List of [lon, lat] or [lon, lat, elev] coordinates
+    
+    Returns:
+        WKT POLYGON string or None if no valid coordinates
+    """
+    if not coordinates:
+        return None
+    
+    lons = [c[0] for c in coordinates if len(c) >= 2]
+    lats = [c[1] for c in coordinates if len(c) >= 2]
+    
+    if not lons or not lats:
+        return None
+    
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    
+    return f"POLYGON(({min_lon} {min_lat},{min_lon} {max_lat},{max_lon} {max_lat},{max_lon} {min_lat},{min_lon} {min_lat}))"
+
 # ---------------------------------------------------------------------------
 # Moving feature queries
 # ---------------------------------------------------------------------------
@@ -74,8 +98,8 @@ _delete_mf_query = DQLQuery(
 _create_tg_query = DQLQuery(
     """
     INSERT INTO moving_features.temporal_geometries
-        (mf_id, catalog_id, datetimes, coordinates, crs, trs, interpolation, properties)
-    VALUES (:mf_id, :catalog_id, :datetimes, :coordinates, :crs, :trs, :interpolation, :properties)
+        (mf_id, catalog_id, datetimes, coordinates, bbox_geom, crs, trs, interpolation, properties)
+    VALUES (:mf_id, :catalog_id, :datetimes, :coordinates, ST_GeomFromText(:bbox_wkt, 4326), :crs, :trs, :interpolation, :properties)
     RETURNING *;
     """,
     result_handler=ResultHandler.ONE_DICT,
@@ -130,6 +154,32 @@ _list_tg_between_query = DQLQuery(
             WHERE t >= CAST(:dt_start AS timestamptz) AND t <= CAST(:dt_end AS timestamptz)
           )
     ORDER BY created_at ASC;
+    """,
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
+_list_mf_by_bbox_query = DQLQuery(
+    """
+    SELECT DISTINCT mf.* FROM moving_features.moving_features mf
+    JOIN moving_features.temporal_geometries tg ON mf.id = tg.mf_id AND mf.catalog_id = tg.catalog_id
+    WHERE mf.catalog_id = :catalog_id AND mf.collection_id = :collection_id
+      AND tg.bbox_geom IS NOT NULL
+      AND tg.bbox_geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)
+    ORDER BY mf.created_at DESC
+    LIMIT :limit OFFSET :offset;
+    """,
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
+_list_mf_by_geometry_query = DQLQuery(
+    """
+    SELECT DISTINCT mf.* FROM moving_features.moving_features mf
+    JOIN moving_features.temporal_geometries tg ON mf.id = tg.mf_id AND mf.catalog_id = tg.catalog_id
+    WHERE mf.catalog_id = :catalog_id AND mf.collection_id = :collection_id
+      AND tg.bbox_geom IS NOT NULL
+      AND ST_Intersects(tg.bbox_geom, ST_GeomFromText(:geometry_wkt, 4326))
+    ORDER BY mf.created_at DESC
+    LIMIT :limit OFFSET :offset;
     """,
     result_handler=ResultHandler.ALL_DICTS,
 )
@@ -204,6 +254,50 @@ async def list_moving_features(
     return [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
 
 
+async def list_moving_features_by_bbox(
+    conn: DbResource,
+    catalog_id: str,
+    collection_id: str,
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[MovingFeature]:
+    rows = await _list_mf_by_bbox_query.execute(
+        conn,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+        min_lon=min_lon,
+        min_lat=min_lat,
+        max_lon=max_lon,
+        max_lat=max_lat,
+        limit=limit,
+        offset=offset,
+    )
+    return [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
+
+
+async def list_moving_features_by_geometry(
+    conn: DbResource,
+    catalog_id: str,
+    collection_id: str,
+    geometry_wkt: str,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[MovingFeature]:
+    rows = await _list_mf_by_geometry_query.execute(
+        conn,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+        geometry_wkt=geometry_wkt,
+        limit=limit,
+        offset=offset,
+    )
+    return [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
+
+
 async def delete_moving_feature(
     conn: DbResource,
     catalog_id: str,
@@ -223,12 +317,14 @@ async def create_temporal_geometry(
     mf_id: uuid.UUID,
     tg: TemporalGeometryCreate,
 ) -> Optional[TemporalGeometry]:
+    bbox_wkt = _compute_bbox_wkt(tg.coordinates)
     row = await _create_tg_query.execute(
         conn,
         mf_id=str(mf_id),
         catalog_id=catalog_id,
         datetimes=tg.datetimes,
         coordinates=json.dumps(tg.coordinates),
+        bbox_wkt=bbox_wkt,
         crs=tg.crs,
         trs=tg.trs,
         interpolation=tg.interpolation.value,

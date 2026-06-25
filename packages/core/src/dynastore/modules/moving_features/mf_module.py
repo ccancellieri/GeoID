@@ -46,6 +46,7 @@ TEMPORAL_GEOMETRIES_DDL = """
         catalog_id VARCHAR NOT NULL,
         datetimes TIMESTAMPTZ[] NOT NULL,
         coordinates JSONB NOT NULL,
+        bbox_geom GEOMETRY(POLYGON, 4326),
         crs VARCHAR NOT NULL DEFAULT 'http://www.opengis.net/def/crs/OGC/1.3/CRS84',
         trs VARCHAR NOT NULL DEFAULT 'http://www.opengis.net/def/uom/ISO-8601/0/Gregorian',
         interpolation VARCHAR NOT NULL DEFAULT 'Linear',
@@ -53,6 +54,11 @@ TEMPORAL_GEOMETRIES_DDL = """
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (catalog_id, id)
     ) PARTITION BY LIST (catalog_id);
+"""
+
+BBOX_INDEX_DDL = """
+    CREATE INDEX IF NOT EXISTS idx_temporal_geometries_bbox_geom
+    ON moving_features.temporal_geometries USING GIST (bbox_geom);
 """
 
 
@@ -76,6 +82,7 @@ class MovingFeaturesModule(ModuleProtocol):
                     await maintenance_tools.ensure_schema_exists(conn, "moving_features")
                     await DDLQuery(MOVING_FEATURES_DDL).execute(conn)
                     await DDLQuery(TEMPORAL_GEOMETRIES_DDL).execute(conn)
+                    await DDLQuery(BBOX_INDEX_DDL).execute(conn)
 
             logger.info("MovingFeaturesModule: Initialization complete.")
         except Exception as e:

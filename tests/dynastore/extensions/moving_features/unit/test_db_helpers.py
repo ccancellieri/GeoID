@@ -22,7 +22,36 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from dynastore.modules.moving_features.db import _mf_from_row, _tg_from_row
+from dynastore.modules.moving_features.db import _mf_from_row, _tg_from_row, _compute_bbox_wkt
+
+
+# ---------------------------------------------------------------------------
+# _compute_bbox_wkt
+# ---------------------------------------------------------------------------
+
+def test_compute_bbox_wkt_empty():
+    assert _compute_bbox_wkt([]) is None
+
+
+def test_compute_bbox_wkt_single_point():
+    wkt = _compute_bbox_wkt([[10.0, 52.0]])
+    assert wkt == "POLYGON((10.0 52.0,10.0 52.0,10.0 52.0,10.0 52.0,10.0 52.0))"
+
+
+def test_compute_bbox_wkt_multiple_points():
+    wkt = _compute_bbox_wkt([[10.0, 52.0], [11.0, 53.0], [10.5, 52.5]])
+    assert wkt is not None
+    assert "POLYGON" in wkt
+    assert "10.0" in wkt
+    assert "11.0" in wkt
+    assert "52.0" in wkt
+    assert "53.0" in wkt
+
+
+def test_compute_bbox_wkt_3d_coordinates():
+    wkt = _compute_bbox_wkt([[10.0, 52.0, 100.0], [11.0, 53.0, 200.0]])
+    assert wkt is not None
+    assert "POLYGON" in wkt
 
 
 # ---------------------------------------------------------------------------
