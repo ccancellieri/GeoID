@@ -21,10 +21,13 @@ StylesResolver — precedence cascade for the default style on a
 (catalog, collection) pair.
 
 Precedence, highest wins:
-  1. ``CoveragesConfig.default_style_id`` if set on the collection
+  1. ``StyleBindingConfig`` binding resolved by CQL2 selector or
+     ``default_style_id`` from the catalog / collection binding config
+     (Slice 3 addition — passed via ``binding_default_id``).
+  2. ``CoveragesConfig.default_style_id`` if set on the collection
      (coverages is authoritative for its own defaults)
-  2. STAC ``item_assets`` default-style reference (platform-wide default)
-  3. ``None`` — caller emits only ``rel=styles`` (list link), not ``rel=style``
+  3. STAC ``item_assets`` default-style reference (platform-wide default)
+  4. ``None`` — caller emits only ``rel=styles`` (list link), not ``rel=style``
 
 The resolver is a pure function that applies precedence to already-loaded
 inputs. DB access (fetching registered styles, loading the coverages
@@ -78,6 +81,7 @@ class StylesResolver:
         available: Dict[str, List[Any]],
         coverages_config_default_id: Optional[str],
         item_assets_default_id: Optional[str],
+        binding_default_id: Optional[str] = None,
     ) -> StyleResolution:
         """Apply the precedence cascade.
 
@@ -89,6 +93,12 @@ class StylesResolver:
                 collection isn't coverage-backed).
             item_assets_default_id: Default style ID from the STAC
                 ``item_assets`` extension for the collection, or ``None``.
+            binding_default_id: Style ID resolved from ``StyleBindingConfig``
+                (CQL2 selector match or explicit ``default_style_id`` in the
+                binding config).  Highest precedence — wins over both
+                ``coverages_config_default_id`` and ``item_assets_default_id``.
+                Pass ``None`` when the binding layer is not active or returned
+                no match.
 
         Returns:
             StyleResolution with the resolved default ID + registered IDs.
@@ -98,6 +108,7 @@ class StylesResolver:
         registered = list(available.keys())
         default_id = self._pick_default(
             registered,
+            binding_default_id,
             coverages_config_default_id,
             item_assets_default_id,
         )
@@ -110,9 +121,12 @@ class StylesResolver:
     @staticmethod
     def _pick_default(
         registered: List[str],
+        binding_default: Optional[str],
         coverages_default: Optional[str],
         item_assets_default: Optional[str],
     ) -> Optional[str]:
+        if binding_default is not None and binding_default in registered:
+            return binding_default
         if coverages_default is not None and coverages_default in registered:
             return coverages_default
         if item_assets_default is not None and item_assets_default in registered:

@@ -49,6 +49,10 @@ class AssetContext(BaseModel):
     request: Request
     stac_config: StacPluginConfig
     asset_id: Optional[str] = None
+    # Resolved by the style-binding seam (Slice 3). Set to the winning
+    # style_id before dynamic-asset emission so contributors (RendersStacContributor)
+    # can read it from ResourceRef.extras without a further DB round-trip.
+    default_style_id: Optional[str] = None
 
 
 StacTarget = Union[pystac.Item, pystac.Collection]
@@ -68,6 +72,10 @@ def _to_resource_ref(target: StacTarget, context: AssetContext) -> ResourceRef:
             k: {"href": a.href, "type": a.media_type or "", "roles": list(a.roles or [])}
             for k, a in target.assets.items()  # type: ignore[union-attr]
         }
+    # Propagate the binding-resolved default style ID so contributors such as
+    # RendersStacContributor can read it without a further DB round-trip.
+    if context.default_style_id:
+        extras["default_style_id"] = context.default_style_id
     return ResourceRef(
         catalog_id=context.catalog_id,
         collection_id=context.collection_id,
@@ -195,7 +203,34 @@ async def add_dynamic_assets_and_links(item: StacTarget, context: AssetContext) 
     Callers that don't need async LinkContributor emission can keep calling
     the synchronous ``add_dynamic_assets`` — both functions are safe to
     call independently or in sequence; they don't share mutable state.
+
+    Style-binding seam (Slice 3): before emitting asset links, resolve the
+    effective ``default_style_id`` from ``StyleBindingConfig`` and store it
+    on the context.  Contributors (``RendersStacContributor``) read it from
+    ``ResourceRef.extras["default_style_id"]`` without needing their own
+    DB round-trip.
     """
+    # Resolve style binding before building the ResourceRef so the winning
+    # style_id is available in extras when contributors are called.
+    if context.default_style_id is None and isinstance(item, pystac.Item):
+        try:
+            from dynastore.modules.styles.binding_resolver import (
+                resolve_binding_style_id,
+            )
+            item_properties: Optional[dict] = getattr(item, "properties", None)
+            context.default_style_id = await resolve_binding_style_id(
+                context.catalog_id,
+                context.collection_id,
+                item_properties,
+            )
+        except Exception as exc:
+            logger.debug(
+                "style-binding: resolve_binding_style_id failed for %s/%s: %s",
+                context.catalog_id,
+                context.collection_id,
+                exc,
+            )
+
     # Synchronous AssetContributor loop + STAC-local source files.
     add_dynamic_assets(item, context)
 
