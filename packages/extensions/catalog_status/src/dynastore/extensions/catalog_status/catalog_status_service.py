@@ -262,15 +262,16 @@ class CatalogStatusService(ExtensionProtocol):
                     )
 
         provisioning_checklist: dict[str, str] = {}
-        try:
-            provisioning_checklist = await catalogs.get_provisioning_checklist(catalog_id)
-        except Exception as exc:
-            logger.warning(
-                "catalog_status: failed to read provisioning_checklist for "
-                "catalog %s: %s",
-                catalog_id, exc,
-                exc_info=True,
-            )
+        if physical_schema:
+            try:
+                provisioning_checklist = await catalogs.get_provisioning_checklist(physical_schema)
+            except Exception as exc:
+                logger.warning(
+                    "catalog_status: failed to read provisioning_checklist for "
+                    "catalog %s: %s",
+                    catalog_id, exc,
+                    exc_info=True,
+                )
 
         return CatalogStatusView(
             external_id=catalog_id,

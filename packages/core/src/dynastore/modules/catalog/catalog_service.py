@@ -1250,7 +1250,7 @@ class CatalogService(CatalogsProtocol):
             STATUS_PROVISIONING,
         )
         from dynastore.modules.tasks.models import TaskCreate
-        from dynastore.modules.tasks.tasks_module import create_task, get_task_schema
+        from dynastore.modules.tasks.tasks_module import create_task
 
         # catalog_model.provisioning_status is already 'ready' (set by create_catalog).
         # It will be flipped to 'provisioning' below only when the checklist is non-empty.
@@ -1318,7 +1318,7 @@ class CatalogService(CatalogsProtocol):
                     caller_id="system",
                     type="task",
                 )
-                await create_task(conn, task_request, get_task_schema())
+                await create_task(conn, task_request, committed_internal_id)
 
             _invalidate_catalog_model_cache(catalog_model.id)
             _invalidate_catalog_external_id_cache(external_id)

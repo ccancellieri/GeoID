@@ -392,16 +392,18 @@ def _get_catalog_status_handler():
 @pytest.mark.asyncio
 async def test_get_catalog_status_populates_provisioning_checklist():
     """get_catalog_status must read provisioning_checklist via the protocol
-    getter (not from the stripped catalog model attribute) and forward it into
-    the CatalogStatusView response."""
+    getter using the resolved physical id (not the external id from the URL
+    path) and forward it into the CatalogStatusView response."""
     checklist = {"gcp_bucket": "complete", "gcp_eventing": "degraded"}
-    fake_cat = SimpleNamespace(id="cat-checklist", provisioning_status="ready")
+    external_id = "cat-checklist"
+    physical_id = "c_phys_checklist"
+    fake_cat = SimpleNamespace(id=physical_id, provisioning_status="ready")
 
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
-    catalogs_mock.resolve_physical_schema = AsyncMock(return_value=None)
-    # The service calls get_provisioning_checklist (new protocol method) rather
-    # than reading the stripped model attribute.
+    # resolve_physical_schema returns a physical id distinct from the external id.
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value=physical_id)
+    # The service calls get_provisioning_checklist keyed on the physical id.
     catalogs_mock.get_provisioning_checklist = AsyncMock(return_value=checklist)
 
     def _proto(proto):
@@ -419,9 +421,10 @@ async def test_get_catalog_status_populates_provisioning_checklist():
         patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
         patch(_GET_PROTOCOL, side_effect=_proto),
     ):
-        result = await handler("cat-checklist")
+        result = await handler(external_id)
 
-    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with("cat-checklist")
+    # Must be called with the physical id, not the external id from the URL.
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with(physical_id)
     assert result.provisioning_checklist == checklist
 
 
@@ -429,11 +432,11 @@ async def test_get_catalog_status_populates_provisioning_checklist():
 async def test_get_catalog_status_checklist_empty_when_getter_returns_empty():
     """When get_provisioning_checklist returns {} (no checklist in PG),
     the response must include an empty dict — not crash."""
-    fake_cat = SimpleNamespace(id="cat-old", provisioning_status="ready")
+    fake_cat = SimpleNamespace(id="c_phys_old", provisioning_status="ready")
 
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
-    catalogs_mock.resolve_physical_schema = AsyncMock(return_value=None)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="c_phys_old")
     catalogs_mock.get_provisioning_checklist = AsyncMock(return_value={})
 
     def _proto(proto):
@@ -453,6 +456,7 @@ async def test_get_catalog_status_checklist_empty_when_getter_returns_empty():
     ):
         result = await handler("cat-old")
 
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with("c_phys_old")
     assert result.provisioning_checklist == {}
 
 
@@ -460,11 +464,12 @@ async def test_get_catalog_status_checklist_empty_when_getter_returns_empty():
 async def test_get_catalog_status_checklist_empty_on_getter_error():
     """When get_provisioning_checklist raises (e.g. DB unavailable), the
     endpoint must not 500 — it returns an empty checklist and logs a warning."""
-    fake_cat = SimpleNamespace(id="cat-err", provisioning_status="ready")
+    fake_cat = SimpleNamespace(id="c_phys_err", provisioning_status="ready")
 
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
-    catalogs_mock.resolve_physical_schema = AsyncMock(return_value=None)
+    # physical_schema is non-None so the getter is actually invoked.
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="c_phys_err")
     catalogs_mock.get_provisioning_checklist = AsyncMock(
         side_effect=RuntimeError("DB unavailable")
     )
@@ -486,8 +491,50 @@ async def test_get_catalog_status_checklist_empty_on_getter_error():
     ):
         result = await handler("cat-err")
 
-    # Must not raise; checklist degrades gracefully to empty.
+    # Getter was called with the physical id; error degrades gracefully to empty.
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with("c_phys_err")
     assert result.provisioning_checklist == {}
+
+
+@pytest.mark.asyncio
+async def test_get_catalog_status_checklist_uses_physical_id_not_external_id():
+    """When external_id differs from physical_id, get_provisioning_checklist
+    must be called with the physical_id (from resolve_physical_schema), not
+    the external_id from the URL path.  This guards the regression where
+    passing the external id to the query (WHERE id = :id on the physical pk)
+    silently matched nothing and returned {}."""
+    external_id = "my-catalog-external"
+    physical_id = "c_abc123physical"
+    checklist = {"catalog_core": "complete", "gcp_bucket": "complete"}
+
+    fake_cat = SimpleNamespace(id=physical_id, provisioning_status="ready")
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value=physical_id)
+    catalogs_mock.get_provisioning_checklist = AsyncMock(return_value=checklist)
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return None
+        return None
+
+    handler = _get_catalog_status_handler()
+
+    with (
+        patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
+        patch(_GET_PROTOCOL, side_effect=_proto),
+    ):
+        result = await handler(external_id)
+
+    # The physical id and external id must differ for this test to be meaningful.
+    assert physical_id != external_id
+    # Getter must be called with the physical id, not the external id.
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with(physical_id)
+    assert result.provisioning_checklist == checklist
 
 
 @pytest.mark.asyncio
