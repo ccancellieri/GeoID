@@ -2263,6 +2263,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         """
         if not results and not prior_bboxes:
             return
+        if (processing_context or {}).get("defer_tile_invalidation"):
+            # The caller (bulk ingestion) suppresses per-batch invalidation and
+            # enqueues ONE coalesced tiles_invalidate for the whole ingested
+            # extent when it finishes — otherwise a large ingestion spawns one
+            # task per write batch (hundreds of redundant invalidations).
+            return
         from dynastore.modules.tiles.tile_cache_sync import (
             enqueue_tile_invalidation_task,
         )

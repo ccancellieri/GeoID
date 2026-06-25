@@ -746,7 +746,11 @@ async def run_ingestion_task(
         # classify secondary-index health at the end of the loop.
         accumulated_index_results: Dict[str, Any] = {}
 
-        upsert_context = {"asset_id": asset_id}
+        # Defer tile-cache invalidation: the per-batch write path would enqueue
+        # one tiles_invalidate task per batch (hundreds for a large ingestion).
+        # We suppress that here and enqueue ONE coalesced invalidation for the
+        # whole ingested extent after the loop (see below).
+        upsert_context = {"asset_id": asset_id, "defer_tile_invalidation": True}
 
         def prepare_record_for_upsert(raw: dict, request: TaskIngestionRequest) -> dict:
             mapping = request.column_mapping
@@ -977,7 +981,35 @@ async def run_ingestion_task(
                     )
                 )
 
-        await recalculate_and_update_extents(engine, catalog_id, collection_id)
+        ingested_extent = await recalculate_and_update_extents(
+            engine, catalog_id, collection_id
+        )
+
+        # Coalesced tile-cache invalidation (one task per ingestion, not per
+        # batch). Per-batch invalidation was suppressed via
+        # ``defer_tile_invalidation`` above; here we enqueue a SINGLE
+        # tiles_invalidate covering the whole ingested extent. Degrade-safe:
+        # capability-gated inside the enqueue and never fails the ingestion.
+        if rows_ingested > 0 and ingested_extent:
+            try:
+                from dynastore.modules.tiles.tile_cache_sync import (
+                    enqueue_tile_invalidation_task,
+                )
+
+                await enqueue_tile_invalidation_task(
+                    catalog_id,
+                    collection_id,
+                    [],
+                    engine=engine,
+                    schema=phys_schema,
+                    prior_bboxes=ingested_extent,
+                    caller_id=f"ingestion:{task_id}",
+                )
+            except Exception as inv_err:  # noqa: BLE001 — cache upkeep never breaks ingest
+                logger.warning(
+                    "Task '%s': coalesced tile invalidation failed for %s/%s: %s",
+                    task_id, catalog_id, collection_id, inv_err,
+                )
 
         # Register an informational reference: this asset feeds collection_id.
         # cascade_delete=True because the DB trigger (trg_asset_cleanup) already

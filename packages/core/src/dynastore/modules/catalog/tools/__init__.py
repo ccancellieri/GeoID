@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 async def recalculate_and_update_extents(
     db_resource: DbResource, catalog_id: str, collection_id: str
-):
+) -> Optional[list]:
     """
     Recalculates the spatial and temporal extents of a collection's data and
     updates its metadata record via the storage driver.
@@ -107,6 +107,11 @@ async def recalculate_and_update_extents(
             logger.info(
                 f"Successfully updated extents for collection '{catalog_id}:{collection_id}'."
             )
+
+        # Return the computed spatial bbox (STAC ``[[minx,miny,maxx,maxy]]``
+        # shape) so callers can reuse the ingested extent — e.g. a single
+        # coalesced tile-cache invalidation — without recomputing it.
+        return bbox
 
 
 def get_engine() -> Optional[DbResource]:
