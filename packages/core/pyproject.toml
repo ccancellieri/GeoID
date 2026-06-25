@@ -121,6 +121,7 @@ event_drain = "dynastore.tasks.workclass_drain.event_drain_task:EventDrainTask"
 collection_hard_delete = "dynastore.tasks.collection_hard_delete.task:CollectionHardDeleteTask"
 webhook_delivery = "dynastore.tasks.webhook_delivery.task:WebhookDeliveryTask"
 catalog_provision = "dynastore.tasks.catalog_provision.task:CatalogProvisionTask"
+render_preseed = "dynastore.tasks.render_preseed.task:RenderPreseedTask"
 
 [build-system]
 requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]

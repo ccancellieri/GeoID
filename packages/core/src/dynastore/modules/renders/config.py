@@ -33,9 +33,9 @@ all rendered tiles to a new prefix.
 """
 
 import hashlib
-from typing import ClassVar, Optional, Sequence, Tuple
+from typing import ClassVar, List, Optional, Sequence, Tuple
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
@@ -95,6 +95,88 @@ class RenderCachingConfig(PluginConfig):
     )
 
 
+class RenderPreseedConfig(PluginConfig):
+    """Opt-in configuration for durable bounded-zoom render tile pre-seeding.
+
+    Pre-seeding is disabled by default (``enabled=False``).  When enabled, an
+    ``AFTER_ASSET_CREATION`` event triggers a durable ``render_preseed`` task
+    that fills the render cache for the configured zoom range off the request
+    path.  The task uses ``build_render_cache_key`` (raster) or the vector MVT
+    cache-key convention (vector) so a style edit invalidates all pre-seeded
+    renders.
+
+    The zoom bound is mandatory and enforced on every run.  Attempting to
+    pre-seed without bounds set (``min_zoom >= 0``, ``max_zoom >= min_zoom``)
+    is a configuration error — the task logs the bound applied and what was
+    skipped rather than silently capping.
+    """
+
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "renders", "preseed")
+
+    enabled: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Master opt-in for durable tile pre-seeding.  ``False`` by default — "
+            "no pre-seed obligations are enqueued on asset registration.  Set to "
+            "``True`` to enable bounded-zoom cache fill on ``AFTER_ASSET_CREATION``."
+        ),
+    )
+
+    min_zoom: Mutable[int] = Field(
+        default=0,
+        ge=0,
+        description="Lowest zoom level to pre-seed (inclusive).  Must be <= max_zoom.",
+    )
+
+    max_zoom: Mutable[int] = Field(
+        default=6,
+        ge=0,
+        description=(
+            "Highest zoom level to pre-seed (inclusive).  The task enforces this "
+            "bound explicitly and logs the effective range at INFO level."
+        ),
+    )
+
+    seed_raster: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "When ``True``, raster (COG ``data`` asset) pre-seeding is active.  "
+            "Produces PNG/WebP tiles via rio-tiler + ``build_render_cache_key``."
+        ),
+    )
+
+    seed_vector: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When ``True``, vector MVT pre-seeding is active.  Produces ``mvt`` "
+            "tiles via the existing tiles-preseed path using the collection's "
+            "TilesCachingConfig key convention."
+        ),
+    )
+
+    tms_ids: Mutable[List[str]] = Field(
+        default_factory=lambda: ["WebMercatorQuad"],
+        description="TileMatrixSet IDs to pre-seed.  Must overlap the collection's supported_tms_ids.",
+    )
+
+    style_id: Mutable[Optional[str]] = Field(
+        default=None,
+        description=(
+            "Style identifier included in the raster cache key via "
+            "``build_render_cache_key``.  When ``None``, the literal string "
+            "``'default'`` is used so the key remains deterministic."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _zoom_order(self) -> "RenderPreseedConfig":
+        if self.max_zoom < self.min_zoom:
+            raise ValueError(
+                f"max_zoom ({self.max_zoom}) must be >= min_zoom ({self.min_zoom})"
+            )
+        return self
+
+
 def build_render_params_hash(
     bands: Optional[Sequence[int]] = None,
     expression: Optional[str] = None,
@@ -109,7 +191,7 @@ def build_render_params_hash(
     The hash is a 16-char hex prefix of SHA-256 over a canonical string
     representation of the three params.  Single-band requests with no
     expression and no rescale return ``None`` (no hash suffix — same cache key
-    shape as Slice 1).
+    shape as a plain single-band render).
 
     Args:
         bands: Sequence of band indices (e.g. ``(3, 2, 1)``).

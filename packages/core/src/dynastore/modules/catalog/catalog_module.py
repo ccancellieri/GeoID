@@ -465,6 +465,20 @@ class CatalogModule(ModuleProtocol):
                 provision=_catalog_core_provision,
             )
 
+            # Wire render preseed subscriber — enqueues durable render_preseed
+            # obligations on AFTER_ASSET_CREATION when the feature is enabled
+            # via RenderPreseedConfig (disabled by default).
+            try:
+                from dynastore.modules.renders.preseed_sync import (
+                    register_render_preseed_subscriber,
+                )
+                register_render_preseed_subscriber()
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "CatalogModule: render preseed subscriber registration failed "
+                    "(non-fatal): %s", _exc,
+                )
+
             # 4. Initialize Storage & Schemas
             # Hub/sidecar creation is handled by ItemsPostgresqlDriver.ensure_storage()
             # which is called from _create_collection_internal(). No lifecycle hook needed.
