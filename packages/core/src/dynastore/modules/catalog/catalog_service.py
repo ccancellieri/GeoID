@@ -58,7 +58,6 @@ from dynastore.modules.db_config.query_executor import (
     DbResource,
     ResultHandler,
     _is_transient_asyncpg_error,
-    managed_nested_transaction,
     managed_transaction,
 )
 from dynastore.modules.catalog.models import (
@@ -558,13 +557,6 @@ _soft_delete_catalog_query = DQLQuery(
 
 _hard_delete_catalog_query = DQLQuery(
     "DELETE FROM catalog.catalogs WHERE id = :id;",
-    result_handler=ResultHandler.ROWCOUNT,
-)
-
-_drop_schema_query = DDLQuery("DROP SCHEMA IF EXISTS {schema} CASCADE;")
-
-_delete_tenant_cron_jobs_query = DQLQuery(
-    "DELETE FROM cron.job WHERE jobname LIKE :pattern;",
     result_handler=ResultHandler.ROWCOUNT,
 )
 
@@ -2056,8 +2048,8 @@ class CatalogService(CatalogsProtocol):
         Shared by hard delete (``force=True``) and ``create_catalog``'s
         tombstone reset: resolves the physical schema from the registry row
         (skipping the ``deleted_at IS NULL`` filter so it works on tombstoned
-        rows too), drops the physical schema CASCADE, removes cron jobs, and
-        hard-deletes the ``catalog.catalogs`` registry row. The registry-row
+        rows too), drops the physical schema CASCADE, and hard-deletes the
+        ``catalog.catalogs`` registry row. The registry-row
         deletion cascades to ``catalog_core`` and ``catalog_stac`` via the
         ``ON DELETE CASCADE`` FK so no explicit metadata fan-out is needed.
 
@@ -2111,21 +2103,12 @@ class CatalogService(CatalogsProtocol):
                 cascade=True,
                 max_retries=5,
             )
-            try:
-                async with managed_nested_transaction(conn) as nested:
-                    deleted_jobs = await _delete_tenant_cron_jobs_query.execute(
-                        nested, pattern=f"%{old_physical_schema}%"
-                    )
-                if deleted_jobs:
-                    logger.info(
-                        "Removed %d cron job(s) for schema %s",
-                        deleted_jobs, old_physical_schema,
-                    )
-            except Exception as cron_err:
-                logger.warning(
-                    "Could not remove cron jobs for %s (non-fatal): %s",
-                    old_physical_schema, cron_err,
-                )
+            # No per-tenant cron cleanup here: periodic maintenance moved from
+            # pg_cron to the leader-elected MaintenanceSupervisor, so deleting a
+            # catalog no longer leaves behind any cron.job rows to purge. Any
+            # legacy per-tenant jobs from pre-migration databases are swept once
+            # at startup by ``unschedule_superseded_cron_jobs`` (guarded on the
+            # pg_cron extension being present).
 
         # Deleting the registry row cascades to catalog_core and catalog_stac
         # via their ON DELETE CASCADE FK, so no explicit metadata fan-out is
