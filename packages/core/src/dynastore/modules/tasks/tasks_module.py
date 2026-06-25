@@ -596,7 +596,8 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
         from dynastore.tasks import get_loaded_task_types, discover_tasks
         from dynastore.modules.gcp.tools.jobs import try_load_process_definition
 
-        discover_tasks()
+        if not get_loaded_task_types():
+            discover_tasks()
         result = []
         for task_type in get_loaded_task_types():
             defn = try_load_process_definition(task_type)
