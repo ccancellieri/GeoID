@@ -36,6 +36,7 @@ real PG end-to-end is deferred until the docker test-runner fixture lands
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -503,6 +504,46 @@ async def test_url_mint_cancellation_rolls_back_pending_row(
     assert patched_env["rollback"].await_args.args[2] == "asset-1"
     # Ticket was never stamped because minting failed.
     patched_env["stamp"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_url_mint_cancellation_logs_warning(
+    patched_env: Dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A warning must be emitted when CancelledError interrupts the URL mint.
+
+    The log line must appear BEFORE the shielded rollback so operators can
+    correlate the compensation attempt with its trigger even when the rollback
+    itself is still in-flight.
+    """
+    svc = _make_service()
+    driver = AsyncMock()
+    driver.initiate_upload = AsyncMock(side_effect=asyncio.CancelledError())
+    svc.resolve_upload_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
+
+    assets_service_logger = "dynastore.extensions.assets.assets_service"
+    with caplog.at_level(logging.WARNING, logger=assets_service_logger):
+        with pytest.raises(asyncio.CancelledError):
+            await svc._initiate_upload_with_policy(
+                catalog_id="cat",
+                collection_id="col",
+                body=_make_upload_request(asset_id="asset-1"),
+            )
+
+    # A WARNING record containing both the asset id and "cancelled" must exist.
+    matching = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "asset-1" in r.getMessage()
+        and "cancel" in r.getMessage().lower()
+    ]
+    assert matching, (
+        "Expected a WARNING log containing 'asset-1' and 'cancel' in the "
+        "CancelledError branch, but got: "
+        + str([r.getMessage() for r in caplog.records])
+    )
 
 
 # ---------------------------------------------------------------------------

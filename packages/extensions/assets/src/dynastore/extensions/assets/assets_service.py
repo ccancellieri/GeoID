@@ -2020,6 +2020,12 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             # runs to completion as the task unwinds, then re-raise. The inner
             # suppress mirrors managed_transaction's drain: a second cancel
             # arriving mid-drain must not abort the compensation.
+            logger.warning(
+                "Upload initiation cancelled for '%s/%s' (asset=%s); compensating pending row.",
+                catalog_id,
+                collection_id or "_",
+                payload.asset_id,
+            )
             try:
                 await asyncio.shield(
                     self._rollback_pending_row(engine, scope, payload.asset_id)
