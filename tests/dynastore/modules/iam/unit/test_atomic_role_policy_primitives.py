@@ -162,6 +162,7 @@ def _make_ctx() -> tuple["PresetContext", "List[tuple]"]:
     iam_svc = MagicMock()
     iam_svc.bind_policy_to_role = _bind
     iam_svc.update_role = AsyncMock()
+    iam_svc.create_role = AsyncMock()
 
     ctx = PresetContext(
         db=MagicMock(),

@@ -1,10 +1,11 @@
 COMPOSE := docker compose -f packages/core/src/dynastore/docker/docker-compose.yml -f packages/core/src/dynastore/docker/docker-compose.dev.yml
 PYTEST  := .venv/bin/pytest
 
-.PHONY: help db-up db-down db-wait test test-unit test-integration test-coverage clean
+.PHONY: help db-up db-down db-wait test test-unit test-integration test-coverage clean dev-sync
 
 help:
 	@echo "DynaStore developer targets:"
+	@echo "  make dev-sync          Install all extensions for local dev/testing"
 	@echo "  make db-up             Start the test database (host-bound 127.0.0.1:54320)"
 	@echo "  make db-down           Stop and remove the test database (drops volumes)"
 	@echo "  make test              Run unit + integration tests (requires db-up)"
@@ -12,6 +13,9 @@ help:
 	@echo "  make test-integration  Run integration tests only (requires db-up)"
 	@echo "  make test-coverage     Run full suite with coverage report"
 	@echo "  make clean             Remove pytest cache and coverage artefacts"
+
+dev-sync:
+	uv pip install -e packages/core/ packages/extensions/admin/ packages/extensions/assets/ packages/extensions/auth/ packages/extensions/catalog_status/ packages/extensions/configs/ packages/extensions/connected_systems/ packages/extensions/coverages/ packages/extensions/crs/ packages/extensions/dggs/ packages/extensions/dimensions/ packages/extensions/dwh/ packages/extensions/edr/ packages/extensions/events/ packages/extensions/features/ packages/extensions/gcp/ packages/extensions/gdal/ packages/extensions/geoid/ packages/extensions/httpx/ packages/extensions/iam/ packages/extensions/logs/ packages/extensions/maps/ packages/extensions/moving_features/ packages/extensions/notebooks/ packages/extensions/processes/ packages/extensions/proxy/ packages/extensions/records/ packages/extensions/renders/ packages/extensions/stac/ packages/extensions/stats/ packages/extensions/styles/ packages/extensions/tasks/ packages/extensions/template/ packages/extensions/tiles/ packages/extensions/volumes/ packages/extensions/web/ packages/extensions/wfs/
 
 db-up:
 	$(COMPOSE) up -d db
