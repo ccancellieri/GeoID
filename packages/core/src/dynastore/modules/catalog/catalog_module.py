@@ -1150,39 +1150,52 @@ class CatalogModule(ModuleProtocol):
         error_message: str,
         severity: str = "unrecoverable",
         inputs: Optional[Dict[str, Any]] = None,
-        originating_event: Optional[str] = None,
         **kwargs,
     ):
-        """Generic task failure handler. Routes rollback by originating_event, not task_type.
+        """Generic task failure handler. Routes provisioning rollback by task_type.
 
-        Any module (GCP, Elasticsearch, etc.) can dispatch tasks without coupling
-        to CatalogModule. The caller only needs to store the triggering catalog event
-        in extra_context['originating_event'] when creating the TaskCreate.
+        A failed provisioning task (``catalog_provision`` / ``gcp_provision_catalog``)
+        carries the target catalog in ``inputs['catalog_id']``. The catalog's
+        ``provisioning_status`` is already flipped to ``failed`` by the checklist
+        machinery — a failing provisioner marks its own step ``failed`` and any
+        still-pending steps are drained to ``failed`` on terminal task exit
+        (see ``_drain_provisioning_checklist``). What that path does *not* capture
+        is the human-readable failure reason, so this handler records it in
+        ``extra_metadata['provisioning_error']`` for operator diagnostics, and
+        re-asserts ``provisioning_status='failed'`` as idempotent defense-in-depth
+        for the edge case where the task dies before any step mark and the
+        best-effort drain also fails.
+
+        Routing is by ``task_type`` (reliably propagated from the failure
+        emitter) rather than a catalog lifecycle event: ``TaskCreate`` carries no
+        ``originating_event`` and the emitter cannot supply one without a schema
+        change, so the previous ``originating_event`` gate never fired.
         """
         logger.warning(
             f"Task '{task_type}' ({task_id}) FAILED [{severity}]: {error_message}"
         )
         inputs = inputs or {}
 
-        # Route rollback by what catalog lifecycle event triggered this task
-        if originating_event in {
-            CatalogEventType.CATALOG_CREATION,
-            str(CatalogEventType.CATALOG_CREATION),
-        }:
+        # Catalog-provisioning task types that carry a target ``catalog_id`` and
+        # whose failure must be reflected on the catalog row.
+        _PROVISIONING_TASK_TYPES = {"catalog_provision", "gcp_provision_catalog"}
+
+        if task_type in _PROVISIONING_TASK_TYPES:
             catalog_id = inputs.get("catalog_id")
             if catalog_id:
                 logger.info(
-                    f"Rolling back catalog '{catalog_id}' provisioning to 'failed' "
+                    f"Recording provisioning failure for catalog '{catalog_id}' "
                     f"(triggered by '{task_type}' failure, severity={severity})."
                 )
                 catalogs = get_protocol(CatalogsProtocol)
                 if catalogs:
                     _dr = kwargs.get("db_resource")
                     _ctx = DriverContext(db_resource=_dr) if _dr else None
-                    # (1) Flip the provisioning_status column to 'failed' so
-                    #     the fail-fast guard at the API layer rejects
-                    #     write operations on this catalog (endpoints call
+                    # (1) Re-assert provisioning_status='failed' so the
+                    #     fail-fast guard at the API layer rejects write
+                    #     operations on this catalog (endpoints call
                     #     ``require_catalog_ready`` which reads this column).
+                    #     Idempotent: the checklist path usually set it already.
                     try:
                         await catalogs.update_provisioning_status(
                             catalog_id, "failed", ctx=_ctx,
@@ -1193,8 +1206,8 @@ class CatalogModule(ModuleProtocol):
                             f"set provisioning_status='failed': {e}"
                         )
                     # (2) Record the error detail in ``extra_metadata`` —
-                    #     best-effort diagnostic for operators; unrelated
-                    #     to the fail-fast column flip above.
+                    #     best-effort diagnostic for operators; this is the
+                    #     part the checklist path does not capture.
                     try:
                         await catalogs.update_catalog(
                             catalog_id,
