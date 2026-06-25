@@ -4,14 +4,16 @@
 import { getJSON } from "./api.js";
 import { register, t, lang } from "./i18n.js";
 import { initMap } from "./leaflet-map.js";
+import { mountEntitySelector } from "./entity-selector.js";
+import { catalogSource, collectionSource } from "./entity-sources.js";
 
 register({
   en: { "ogc.catalogs": "Catalogs", "ogc.collections": "Collections", "ogc.back": "Back",
         "ogc.loading": "Loading…", "ogc.none": "Nothing to show", "ogc.error": "Failed to load" },
   fr: { "ogc.catalogs": "Catalogues", "ogc.collections": "Collections", "ogc.back": "Retour",
-        "ogc.loading": "Chargement…", "ogc.none": "Rien à afficher", "ogc.error": "Échec du chargement" },
+         "ogc.loading": "Chargement…", "ogc.none": "Rien à afficher", "ogc.error": "Échec du chargement" },
   es: { "ogc.catalogs": "Catálogos", "ogc.collections": "Colecciones", "ogc.back": "Atrás",
-        "ogc.loading": "Cargando…", "ogc.none": "Nada que mostrar", "ogc.error": "Error al cargar" },
+         "ogc.loading": "Cargando…", "ogc.none": "Nada que mostrar", "ogc.error": "Error al cargar" },
 });
 
 // mountOgcBrowser({ root, basePath, adapter, writeActions }) -> void
@@ -26,62 +28,55 @@ export function mountOgcBrowser({ root, basePath, adapter, writeActions }) {
   const map = adapter.needsMap && mapEl ? initMap(mapEl.id) : null;
 
   const state = { catalogId: null };
-
-  function setLoading(el) { el.textContent = t("ogc.loading"); }
+  let catalogCtrl = null;
+  let collectionCtrl = null;
 
   async function showCatalogs() {
     state.catalogId = null;
     bodyEl.replaceChildren();
-    setLoading(navEl);
-    try {
-      const res = await getJSON(`${basePath}/catalogs?language=${lang()}`);
-      const cats = res.catalogs || res.collections || res; // OGC envelope or bare list
-      renderList(navEl, cats, (c) => c.title || c.id, (c) => selectCatalog(c.id));
-    } catch (e) { navEl.textContent = t("ogc.error"); }
+    navEl.replaceChildren();
+
+    const catContainer = document.createElement("div");
+    catContainer.className = "ogc-catalog-selector";
+    navEl.appendChild(catContainer);
+
+    catalogCtrl = mountEntitySelector({
+      root: catContainer,
+      source: catalogSource(),
+      onChange: (cat) => { if (cat) selectCatalog(cat.id); },
+    });
   }
 
   async function selectCatalog(catalogId) {
     state.catalogId = catalogId;
     bodyEl.replaceChildren();
-    setLoading(navEl);
-    try {
-      const res = await getJSON(`${basePath}/catalogs/${catalogId}/collections?language=${lang()}`);
-      const colls = res.collections || res; // OGC envelope or bare list
-      renderList(navEl, colls, (c) => c.title || c.id, (c) => selectCollection(c.id), true);
-    } catch (e) { navEl.textContent = t("ogc.error"); }
+    navEl.replaceChildren();
+
+    const backBtn = document.createElement("button");
+    backBtn.className = "ogc-back-btn";
+    backBtn.textContent = "← " + t("ogc.back");
+    backBtn.addEventListener("click", showCatalogs);
+    navEl.appendChild(backBtn);
+
+    const collContainer = document.createElement("div");
+    collContainer.className = "ogc-collection-selector";
+    navEl.appendChild(collContainer);
+
+    collectionCtrl = mountEntitySelector({
+      root: collContainer,
+      source: collectionSource({ basePath }).forCatalog(catalogId),
+      onChange: (coll) => { if (coll) selectCollection(coll.id); },
+    });
   }
 
   async function selectCollection(collectionId) {
     bodyEl.replaceChildren();
-    setLoading(bodyEl);
+    bodyEl.textContent = t("ogc.loading");
     try {
       await adapter.renderCollectionBody({
         catalogId: state.catalogId, collectionId, contentEl: bodyEl, map, lang: lang(),
       });
     } catch (e) { bodyEl.textContent = t("ogc.error"); }
-  }
-
-  // renderList: builds an accessible list of buttons; prepends a back row when `withBack`.
-  function renderList(el, rows, labelOf, onClick, withBack) {
-    el.replaceChildren();
-    if (withBack) {
-      const back = document.createElement("button");
-      back.textContent = "← " + t("ogc.back");
-      back.addEventListener("click", showCatalogs);
-      el.appendChild(back);
-    }
-    if (!rows || rows.length === 0) {
-      const p = document.createElement("p"); p.textContent = t("ogc.none"); el.appendChild(p); return;
-    }
-    const ul = document.createElement("ul");
-    for (const r of rows) {
-      const li = document.createElement("li");
-      const a = document.createElement("button");
-      a.textContent = labelOf(r);            // textContent => no XSS from API data
-      a.addEventListener("click", () => onClick(r));
-      li.appendChild(a); ul.appendChild(li);
-    }
-    el.appendChild(ul);
   }
 
   if (writeActions && typeof writeActions.mount === "function") writeActions.mount(root, state);
