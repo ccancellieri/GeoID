@@ -21,6 +21,7 @@ import logging
 import argparse
 import json
 import traceback
+import typing
 from datetime import timedelta
 from types import SimpleNamespace
 import sys
@@ -59,6 +60,38 @@ async def _heartbeat_loop(engine, task_id: uuid.UUID, interval_seconds: float) -
             await heartbeat_tasks(engine, [task_id], _VISIBILITY_TIMEOUT)
         except Exception as e:
             logger.warning(f"Heartbeat failed for task {task_id}: {e}")
+
+
+def _resolve_payload_model(target_task: object, task_name: str) -> type:
+    """Return the pydantic model annotated on ``target_task.run``'s ``payload``.
+
+    Uses ``typing.get_type_hints`` rather than the raw ``__annotations__`` dict
+    so that PEP 563 / ``from __future__ import annotations`` string annotations
+    are resolved to the live class.  Without this, a task module that stringizes
+    its annotations yields the *string* ``"TaskPayload[...]"`` instead of the
+    class, and both ``.model_validate`` and ``.__name__`` raise AttributeError —
+    aborting every Cloud Run Job execution for that task.
+
+    Raises ``TypeError`` if ``run`` is missing, its hints can't be resolved, or
+    it has no ``payload`` annotation.
+    """
+    run_method = getattr(target_task, "run", None)
+    if run_method is None:
+        raise TypeError(f"Task '{task_name}' has no `run` method.")
+    try:
+        hints = typing.get_type_hints(run_method)
+    except Exception as exc:
+        raise TypeError(
+            f"Task '{task_name}': failed to resolve type hints for its "
+            f"`run` method: {exc}"
+        ) from exc
+    payload_model = hints.get("payload")
+    if payload_model is None:
+        raise TypeError(
+            f"Task '{task_name}' has a `run` method without a 'payload' "
+            "type annotation."
+        )
+    return payload_model
 
 
 async def report_failure(task_id: str, schema: str, error_message: str):
@@ -166,15 +199,15 @@ async def main(task_name: str, payload: dict, schema: str):
 
                 logging.info(f"--- [main_task.py] Loaded task '{task_name}' successfully. ---")
 
-                # Introspect the `run` method's type hints to find the expected payload model.
-                payload_model = None
-                run_method = getattr(target_task, 'run', None)
-                if run_method and 'payload' in run_method.__annotations__:
-                    payload_model = run_method.__annotations__['payload']
-                if not payload_model:
-                    raise TypeError(f"Task '{task_name}' has a `run` method without a 'payload' type annotation.")
+                # Resolve the expected payload model from the `run` method's
+                # type hints (handles PEP 563 string annotations — see
+                # _resolve_payload_model).
+                payload_model = _resolve_payload_model(target_task, task_name)
 
-                logging.info(f"--- [main_task.py] Task '{task_name}' expects payload of type '{payload_model.__name__}'. ---")
+                logging.info(
+                    f"--- [main_task.py] Task '{task_name}' expects payload of "
+                    f"type '{getattr(payload_model, '__name__', payload_model)}'. ---"
+                )
                 logging.debug(f"--- [main_task.py] Payload: {payload} ---")
                 # Validate the incoming dictionary against the task's expected payload model.
                 validate_payload = payload_model.model_validate(payload)
