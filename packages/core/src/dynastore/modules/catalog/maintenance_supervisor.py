@@ -46,8 +46,12 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional, Union
+from typing import Any, ClassVar, Optional, Tuple, Union
 
+from pydantic import Field
+
+from dynastore.models.mutability import Mutable
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.catalog.db_init.maintenance_schedule import (
     MaintenanceScheduleRepository,
 )
@@ -68,6 +72,68 @@ from dynastore.tools.background_service import (
 from dynastore.tools.protocol_helpers import get_engine
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+class HealthAlertConfig(PluginConfig):
+    """Configuration for the maintenance health watchdog job."""
+
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "catalog")
+
+    error_streak_threshold: Mutable[int] = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Number of consecutive errors before alerting on a maintenance job. "
+            "Default: 3 (alert after 3 consecutive failures)."
+        ),
+    )
+
+    pending_age_seconds: Mutable[int] = Field(
+        default=3600,
+        ge=60,
+        description=(
+            "Age threshold (seconds) for stale PENDING events. "
+            "Default: 3600 (1 hour). Events pending longer trigger an alert."
+        ),
+    )
+
+    dead_letter_threshold: Mutable[int] = Field(
+        default=100,
+        ge=0,
+        description=(
+            "Count threshold for DEAD_LETTER queues. "
+            "Default: 100. DLQ sizes exceeding this trigger an alert."
+        ),
+    )
+
+
+async def load_health_alert_config() -> HealthAlertConfig:
+    """Load ``HealthAlertConfig`` from the platform config store.
+
+    Falls back to the default instance if the store is unavailable or
+    the config has not been set.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is not None:
+            cfg = await config_mgr.get_config(HealthAlertConfig)
+            if isinstance(cfg, HealthAlertConfig):
+                return cfg
+    except Exception as exc:
+        logger.warning(
+            "maintenance_supervisor: failed to load HealthAlertConfig "
+            "(%s) — using defaults.", exc,
+        )
+    return HealthAlertConfig()
+
 
 # ---------------------------------------------------------------------------
 # Advisory lock key — must not collide with SoftDeleteReaper (0x5D3A7E1F_C2B84961)
@@ -90,6 +156,7 @@ JOB_EVENTS_PARTITION_CREATE = "events_partition_create"
 JOB_EVENTS_RETENTION = "events_retention"
 JOB_STORAGE_PARTITION_CREATE = "storage_partition_create"
 JOB_STORAGE_RETENTION = "storage_retention"
+JOB_HEALTH_ALERT = "health_alert"
 
 # Obsolete supervisor job names retired by #1807 renames. An environment that
 # booted a prior build holds these rows in tasks.maintenance_schedule;
@@ -139,6 +206,7 @@ _CADENCE_EVENTS_PARTITION_CREATE = 86400   # daily
 _CADENCE_EVENTS_RETENTION = 86400          # daily
 _CADENCE_STORAGE_PARTITION_CREATE = 86400    # daily
 _CADENCE_STORAGE_RETENTION = 86400           # daily
+_CADENCE_HEALTH_ALERT = 300                  # every 5 minutes
 
 # Bounded-batch DELETE size — no single DELETE removes more than this many rows.
 _PRUNE_BATCH = 1000
@@ -583,6 +651,142 @@ async def _run_storage_retention(conn: Any) -> int:
     return 0
 
 
+async def _run_health_alert(conn: Any) -> int:
+    """Check maintenance health and emit alerts for anomalies.
+
+    Restores the watchdogs lost in the pg_cron → MaintenanceSupervisor migration.
+    Checks three conditions and emits structured events / logs at ERROR level:
+    1. Sustained errors in maintenance_schedule jobs
+    2. Stale PENDING events older than threshold
+    3. DEAD_LETTER counts over threshold
+
+    Returns the number of alerts emitted (0-3).
+    """
+    alerts = 0
+    schema = _TASKS_SCHEMA
+    cfg = await load_health_alert_config()
+
+    # 1. Check for sustained errors in maintenance jobs
+    error_jobs = await DQLQuery(
+        """
+        SELECT job_name, last_error, last_run_at
+        FROM tasks.maintenance_schedule
+        WHERE last_status = 'error'
+          AND last_run_at IS NOT NULL
+          AND last_run_at > NOW() - INTERVAL '1 hour'
+        """,
+        result_handler=ResultHandler.ALL_DICTS,
+    ).execute(conn)
+
+    if error_jobs:
+        for job in error_jobs:
+            logger.error(
+                "maintenance_supervisor: ALERT - job %s in error state: %s",
+                job["job_name"],
+                job["last_error"],
+            )
+        alerts += 1
+
+        try:
+            from dynastore.modules.catalog.event_service import emit_event
+            await emit_event(
+                "maintenance.health_alert",
+                alert_type="job_error_streak",
+                job_errors=[
+                    {"job_name": j["job_name"], "last_error": j["last_error"]}
+                    for j in error_jobs
+                ],
+            )
+        except Exception as emit_exc:
+            logger.error(
+                "maintenance_supervisor: failed to emit maintenance.health_alert: %s",
+                emit_exc,
+            )
+
+    # 2. Check for stale PENDING events (older than threshold)
+    pending_threshold = cfg.pending_age_seconds
+    stale_pending = await DQLQuery(
+        f"""
+        SELECT COUNT(*) as cnt
+        FROM {schema}.events
+        WHERE status = 'PENDING'
+          AND timestamp < NOW() - INTERVAL '1 second' * :threshold
+        """,
+        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    ).execute(conn, threshold=pending_threshold)
+
+    stale_count = int(stale_pending) if stale_pending else 0
+    if stale_count > 0:
+        logger.error(
+            "maintenance_supervisor: ALERT - %d PENDING events older than %ds",
+            stale_count,
+            pending_threshold,
+        )
+        alerts += 1
+
+        try:
+            from dynastore.modules.catalog.event_service import emit_event
+            await emit_event(
+                "maintenance.health_alert",
+                alert_type="stale_pending_events",
+                stale_count=stale_count,
+                threshold_seconds=pending_threshold,
+            )
+        except Exception as emit_exc:
+            logger.error(
+                "maintenance_supervisor: failed to emit maintenance.health_alert: %s",
+                emit_exc,
+            )
+
+    # 3. Check DEAD_LETTER counts in tasks and events
+    dlq_threshold = cfg.dead_letter_threshold
+
+    tasks_dlq = await DQLQuery(
+        f"""
+        SELECT COUNT(*) as cnt FROM {schema}.tasks
+        WHERE status = 'DEAD_LETTER'
+        """,
+        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    ).execute(conn)
+    tasks_dlq_count = int(tasks_dlq) if tasks_dlq else 0
+
+    events_dlq = await DQLQuery(
+        f"""
+        SELECT COUNT(*) as cnt FROM {schema}.events
+        WHERE status = 'DEAD_LETTER'
+        """,
+        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    ).execute(conn)
+    events_dlq_count = int(events_dlq) if events_dlq else 0
+
+    if tasks_dlq_count > dlq_threshold or events_dlq_count > dlq_threshold:
+        logger.error(
+            "maintenance_supervisor: ALERT - DEAD_LETTER counts exceed threshold: "
+            "tasks=%d, events=%d (threshold=%d)",
+            tasks_dlq_count,
+            events_dlq_count,
+            dlq_threshold,
+        )
+        alerts += 1
+
+        try:
+            from dynastore.modules.catalog.event_service import emit_event
+            await emit_event(
+                "maintenance.health_alert",
+                alert_type="dead_letter_overflow",
+                tasks_dlq_count=tasks_dlq_count,
+                events_dlq_count=events_dlq_count,
+                threshold=dlq_threshold,
+            )
+        except Exception as emit_exc:
+            logger.error(
+                "maintenance_supervisor: failed to emit maintenance.health_alert: %s",
+                emit_exc,
+            )
+
+    return alerts
+
+
 # ---------------------------------------------------------------------------
 # Job dispatch table
 # ---------------------------------------------------------------------------
@@ -618,6 +822,8 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
         return await _run_storage_partition_create(conn)
     if job_name == JOB_STORAGE_RETENTION:
         return await _run_storage_retention(conn)
+    if job_name == JOB_HEALTH_ALERT:
+        return await _run_health_alert(conn)
     raise ValueError(f"maintenance_supervisor: unknown job_name {job_name!r}")
 
 
@@ -852,6 +1058,7 @@ async def register_supervisor_jobs(engine: Any) -> None:
         (JOB_EVENTS_RETENTION, _CADENCE_EVENTS_RETENTION),
         (JOB_STORAGE_PARTITION_CREATE, _CADENCE_STORAGE_PARTITION_CREATE),
         (JOB_STORAGE_RETENTION, _CADENCE_STORAGE_RETENTION),
+        (JOB_HEALTH_ALERT, _CADENCE_HEALTH_ALERT),
     ]
     async with managed_transaction(engine) as conn:
         for job_name, cadence in jobs:
