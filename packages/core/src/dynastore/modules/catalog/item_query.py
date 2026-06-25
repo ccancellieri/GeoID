@@ -855,6 +855,56 @@ class ItemQueryMixin:
 
             return None
 
+    async def _resolve_external_ids_to_geoids(
+        self,
+        conn: Any,
+        phys_schema: str,
+        phys_table: str,
+        sidecar_config: Any,
+        feature_id_field: str,
+        ext_ids: List[str],
+    ) -> List[str]:
+        """Resolve external/producer ids to their immutable ``geoid``(s) (#2314).
+
+        ``feature_id_field_name`` is only the *external* representation of a
+        feature. It is NOT unique within a collection — the same external id
+        repeats to represent successive versions of the same feature, each with
+        its own validity. Internally, sidecars are always joinable by ``geoid``,
+        the unique physical id of the item. So instead of matching tile
+        prior-bboxes on the external-id column directly (ambiguous under
+        versioning, and an identifier-interpolation risk because a column name
+        can't be a bound parameter), we resolve external ids to ``geoid`` here,
+        once, behind a validated identifier, and let the caller match on
+        ``h.geoid`` everywhere else.
+
+        When the sidecar manages validity, only the currently-valid version is
+        returned (``validity @> NOW()``); otherwise every matching geoid is
+        returned. The caller is degrade-safe, so any error here propagates to an
+        empty prior-bbox set rather than a captured-but-wrong one.
+        """
+        if not ext_ids:
+            return []
+        # Column/table names are interpolated as SQL identifiers (a parameter
+        # cannot bind an identifier), so validate them against the strict
+        # allowlist before they ever reach the query string.
+        field = validate_sql_identifier(feature_id_field)
+        sidecar_id = validate_sql_identifier(
+            str(getattr(sidecar_config, "sidecar_id", ""))
+        )
+        sc_table = f"{phys_table}_{sidecar_id}"
+        validity_clause = ""
+        validity_column = getattr(sidecar_config, "validity_column", None)
+        if getattr(sidecar_config, "has_validity", False) and validity_column:
+            vcol = validate_sql_identifier(str(validity_column))
+            validity_clause = f" AND s.{vcol} @> NOW()"
+        geoids = await DQLQuery(
+            f'SELECT DISTINCT s.geoid '
+            f'FROM "{phys_schema}"."{sc_table}" s '
+            f"WHERE s.{field} = ANY(:_ext_ids){validity_clause}",
+            result_handler=ResultHandler.ALL_SCALARS,
+        ).execute(conn, _ext_ids=[str(i) for i in ext_ids])
+        return [str(g) for g in (geoids or [])]
+
     async def _fetch_prior_bboxes_bulk(
         self,
         catalog_id: str,
@@ -904,82 +954,87 @@ class ItemQueryMixin:
             # Default is ``bbox_geom``; fall back to that when no sidecar
             # config is found so the helper is robust to minimal environments.
             bbox_col = "bbox_geom"
-            # Also look for the first sidecar that carries the external feature-id
-            # column (``feature_id_field_name``). When found, the WHERE clause
-            # matches against that text column so non-UUID external/producer ids
-            # (e.g. CityJSON GUIDs like ``GUID_FFF9E566-...``) are handled
-            # correctly — the optimizer's ``CAST(:_item_ids AS uuid[])`` path is
-            # bypassed for these collections (#2045).
+            # Find the geometries bbox column and the first sidecar that carries
+            # the external feature-id column (``feature_id_field_name``). The
+            # external id is only a presentation key; it is mutable and repeats
+            # across versions, so it is NEVER used as a match key here (#2314).
             ext_id_field: Optional[str] = None
-            ext_id_sidecar_alias: Optional[str] = None
+            ext_id_sidecar: Any = None
             for sc in driver_sidecars(col_config):
-                sc_type = getattr(sc, "sidecar_type", None)
-                if sc_type == "geometries":
+                if getattr(sc, "sidecar_type", None) == "geometries":
                     bbox_col = getattr(sc, "bbox_column", None) or bbox_col
                 if ext_id_field is None:
                     fid = getattr(sc, "feature_id_field_name", None)
                     if fid:
                         ext_id_field = fid
-                        ext_id_sidecar_alias = f"sc_{sc.sidecar_id}"
+                        ext_id_sidecar = sc
 
-            # Build the id-matching WHERE predicate explicitly so we never pass
-            # non-UUID strings through the optimizer's uuid[] CAST path.
-            id_raw_where: str
-            id_raw_params: Dict[str, Any]
-            if ext_id_field and ext_id_sidecar_alias:
-                # Text column match — accepts any string id (UUID or not).
-                # Mentioning the sidecar alias here causes the optimizer's
-                # raw-SQL scanner to JOIN that sidecar automatically.
-                id_raw_where = (
-                    f"{ext_id_sidecar_alias}.{ext_id_field} = ANY(:_tile_prior_ids)"
-                )
-                id_raw_params = {"_tile_prior_ids": [str(i) for i in item_ids]}
-            else:
-                # No external-id column: ids must be valid UUIDs to match
-                # the ``h.geoid`` uuid column. Filter out non-UUIDs to avoid
-                # a ``invalid UUID`` cast error from PostgreSQL.
-                uuid_ids = []
-                for i in item_ids:
-                    try:
-                        _uuid.UUID(str(i))
-                        uuid_ids.append(str(i))
-                    except (ValueError, AttributeError, TypeError):
-                        pass
-                if not uuid_ids:
-                    return []
-                id_raw_where = "h.geoid = ANY(CAST(:_tile_prior_ids AS uuid[]))"
-                id_raw_params = {"_tile_prior_ids": uuid_ids}
+            # Partition the wire-surface ids: valid UUIDs are already geoids;
+            # anything else is an external/producer id (e.g. a CityJSON GUID)
+            # that must be resolved to its geoid before matching. We ALWAYS match
+            # on ``h.geoid`` — the unique, immutable physical id — never on the
+            # external id, which is mutable, repeats across versions (ambiguous),
+            # and can't be bound as a parameter when used as a column name
+            # (identifier-interpolation risk). This supersedes the #2045
+            # text-column match while still accepting external ids (#2314).
+            geoids: List[str] = []
+            ext_ids: List[str] = []
+            for i in item_ids:
+                try:
+                    _uuid.UUID(str(i))
+                    geoids.append(str(i))
+                except (ValueError, AttributeError, TypeError):
+                    ext_ids.append(str(i))
+
+            can_resolve = bool(
+                ext_ids and ext_id_field is not None and ext_id_sidecar is not None
+            )
+            if not geoids and not can_resolve:
+                # Nothing matchable: no UUID geoids and no sidecar to resolve the
+                # external ids through. Short-circuit before any DB work.
+                return []
 
             from dynastore.models.protocols.access_filter import AccessFilter
 
-            request = QueryRequest(
-                # item_ids is intentionally None: the id-matching WHERE is
-                # injected via raw_where/raw_params above so the optimizer
-                # never applies its own (potentially uuid-casting) predicate.
-                item_ids=None,
-                select=[],
-                raw_selects=[
-                    "h.geoid",
-                    f"ST_XMin(sc_geometries.{bbox_col}) AS _xmin",
-                    f"ST_YMin(sc_geometries.{bbox_col}) AS _ymin",
-                    f"ST_XMax(sc_geometries.{bbox_col}) AS _xmax",
-                    f"ST_YMax(sc_geometries.{bbox_col}) AS _ymax",
-                ],
-                raw_where=id_raw_where,
-                raw_params=id_raw_params,
-                limit=len(item_ids),
-                access_filter=AccessFilter.allow_everything(),
-            )
-            query_ctx: Dict[str, Any] = {
-                "catalog_id": catalog_id,
-                "collection_id": collection_id,
-                "col_config": col_config,
-            }
-            sql, params = await self._apply_query_transformations(
-                request, query_ctx, catalog_id, collection_id, col_config,
-            )
-
             async with managed_transaction(self.engine) as conn:
+                if ext_ids and ext_id_field is not None and ext_id_sidecar is not None:
+                    geoids.extend(
+                        await self._resolve_external_ids_to_geoids(
+                            conn, phys_schema, phys_table,
+                            ext_id_sidecar, ext_id_field, ext_ids,
+                        )
+                    )
+
+                if not geoids:
+                    # External ids resolved to nothing (unknown / fully expired).
+                    return []
+
+                request = QueryRequest(
+                    # item_ids is intentionally None: the id-matching WHERE is
+                    # injected via raw_where/raw_params below so the optimizer
+                    # never applies its own predicate.
+                    item_ids=None,
+                    select=[],
+                    raw_selects=[
+                        "h.geoid",
+                        f"ST_XMin(sc_geometries.{bbox_col}) AS _xmin",
+                        f"ST_YMin(sc_geometries.{bbox_col}) AS _ymin",
+                        f"ST_XMax(sc_geometries.{bbox_col}) AS _xmax",
+                        f"ST_YMax(sc_geometries.{bbox_col}) AS _ymax",
+                    ],
+                    raw_where="h.geoid = ANY(CAST(:_tile_prior_ids AS uuid[]))",
+                    raw_params={"_tile_prior_ids": geoids},
+                    limit=len(geoids),
+                    access_filter=AccessFilter.allow_everything(),
+                )
+                query_ctx: Dict[str, Any] = {
+                    "catalog_id": catalog_id,
+                    "collection_id": collection_id,
+                    "col_config": col_config,
+                }
+                sql, params = await self._apply_query_transformations(
+                    request, query_ctx, catalog_id, collection_id, col_config,
+                )
                 rows = await DQLQuery(
                     sql, result_handler=ResultHandler.ALL_DICTS,
                 ).execute(conn, **params)

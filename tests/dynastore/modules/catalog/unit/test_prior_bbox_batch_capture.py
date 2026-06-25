@@ -104,6 +104,7 @@ def _make_svc(
     phys_schema: Optional[str] = "public",
     phys_table: Optional[str] = "items_cat_col",
     query_rows: Optional[List[Dict[str, Any]]] = None,
+    resolve_geoids: Optional[List[str]] = None,
 ) -> "ItemService":
     """Build a minimal ItemService stub for _fetch_prior_bboxes_bulk tests.
 
@@ -137,7 +138,13 @@ def _make_svc(
     svc._get_collection_config = _get_col_cfg  # type: ignore[attr-defined]
     svc._resolve_physical_schema = _resolve_schema  # type: ignore[attr-defined]
     svc._resolve_physical_table = _resolve_table  # type: ignore[attr-defined]
+    async def _resolve_geoids(_conn, _schema, _table, _sc, _field, ext_ids, *a, **k):
+        # External-id -> geoid resolution is unit-tested directly elsewhere;
+        # here we inject the resolved geoids (default: none).
+        return list(resolve_geoids) if resolve_geoids is not None else []
+
     svc._apply_query_transformations = _apply_transforms  # type: ignore[attr-defined]
+    svc._resolve_external_ids_to_geoids = _resolve_geoids  # type: ignore[attr-defined]
     svc._transform_calls = _transform_calls  # type: ignore[attr-defined]
     svc._query_rows = query_rows if query_rows is not None else []
     return svc
@@ -222,8 +229,11 @@ async def test_degrades_to_empty_on_db_error(monkeypatch):
 
     svc._apply_query_transformations = _failing_transforms  # type: ignore[attr-defined]
 
-    # Valid UUID so we reach _apply_query_transformations (which then fails)
-    result = await svc._fetch_prior_bboxes_bulk("cat", "col", [_UUID_A])
+    # Valid UUID so we reach _apply_query_transformations (which then fails).
+    # _patch_db mocks the transaction so the failure surfaces from the
+    # transform step, not from opening a real connection.
+    with _patch_db([]):
+        result = await svc._fetch_prior_bboxes_bulk("cat", "col", [_UUID_A])
     assert result == []
 
 
@@ -303,19 +313,25 @@ async def test_uuid_ids_forwarded_via_raw_where_not_item_ids(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_non_uuid_ids_use_text_column_when_sidecar_present(monkeypatch):
-    """CityJSON GUID ids (non-UUID) must trigger the text-column match path
-    when the collection has a sidecar with ``feature_id_field_name``.
+async def test_non_uuid_ids_resolved_to_geoid_and_matched_on_geoid(monkeypatch):
+    """CityJSON GUID ids (non-UUID) must be resolved to their ``geoid`` and the
+    bbox query must then match on ``h.geoid`` — never on the mutable external-id
+    column (#2314).
 
-    The query must NOT cast to ``uuid[]`` (which would raise
-    ``invalid UUID 'GUID_...'``); instead the ids are matched via
-    ``sc_attributes.external_id = ANY(:_tile_prior_ids)`` (text comparison).
+    The external id repeats across versions and can't be a bound parameter as a
+    column name, so matching it directly is both ambiguous and an
+    identifier-interpolation risk. After resolution the match is the safe
+    ``h.geoid = ANY(CAST(:_tile_prior_ids AS uuid[]))`` against the resolved
+    geoids, and the external-id column never appears in the bbox WHERE.
     """
     rows = [
         {"_xmin": 1.0, "_ymin": 2.0, "_xmax": 3.0, "_ymax": 4.0},
     ]
     cfg = _make_col_config(feature_id_field_name="external_id")
-    svc = _make_svc(col_config=cfg, query_rows=rows)
+    # The two GUIDs resolve to two geoids.
+    svc = _make_svc(
+        col_config=cfg, query_rows=rows, resolve_geoids=[_UUID_A, _UUID_B],
+    )
 
     with _patch_db(rows):
         result = await svc._fetch_prior_bboxes_bulk(
@@ -326,31 +342,47 @@ async def test_non_uuid_ids_use_text_column_when_sidecar_present(monkeypatch):
     assert len(svc._transform_calls) == 1  # type: ignore[attr-defined]
     req = svc._transform_calls[0]  # type: ignore[attr-defined]
 
-    # item_ids must be None — avoid the optimizer's uuid[] CAST
+    # item_ids must be None — the match goes via raw_where
     assert req.item_ids is None
 
-    # raw_where must reference the sidecar alias (sc_attributes) and field
+    # raw_where matches on h.geoid (uuid), NOT the external-id text column.
     assert req.raw_where is not None
-    assert "sc_attributes" in req.raw_where
-    assert "external_id" in req.raw_where
-    # Must NOT contain a UUID cast
-    assert "uuid" not in req.raw_where.lower()
+    assert "geoid" in req.raw_where.lower()
+    assert "uuid" in req.raw_where.lower()
+    assert "external_id" not in req.raw_where
+    assert "sc_attributes" not in req.raw_where
 
-    # Both GUIDs must be in raw_params
+    # raw_params carries the RESOLVED geoids, not the raw GUIDs.
     forwarded = req.raw_params.get("_tile_prior_ids", [])
-    assert _GUID_A in forwarded
-    assert _GUID_B in forwarded
+    assert sorted(forwarded) == sorted([_UUID_A, _UUID_B])
+    assert _GUID_A not in forwarded
+    assert _GUID_B not in forwarded
 
     # Bboxes from the DB rows are returned
     assert result == [(1.0, 2.0, 3.0, 4.0)]
 
 
 @pytest.mark.asyncio
-async def test_non_uuid_ids_forwarded_in_single_bulk_call(monkeypatch):
-    """All non-UUID ids are forwarded to ``_apply_query_transformations`` in
-    exactly one call when a feature_id sidecar is present."""
+async def test_external_ids_resolving_to_nothing_short_circuit(monkeypatch):
+    """When external ids resolve to no geoid (unknown / fully expired), the
+    helper returns ``[]`` without issuing the bbox query."""
     cfg = _make_col_config(feature_id_field_name="external_id")
-    svc = _make_svc(col_config=cfg, query_rows=[])
+    svc = _make_svc(col_config=cfg, resolve_geoids=[])
+
+    with _patch_db([]):
+        result = await svc._fetch_prior_bboxes_bulk("cat", "col", [_GUID_A])
+
+    assert result == []
+    # No bbox query built — resolution returned nothing.
+    assert svc._transform_calls == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_non_uuid_ids_forwarded_in_single_bulk_call(monkeypatch):
+    """All non-UUID ids resolve and reach ``_apply_query_transformations`` in
+    exactly one bulk call when a feature_id sidecar is present."""
+    cfg = _make_col_config(feature_id_field_name="external_id")
+    svc = _make_svc(col_config=cfg, query_rows=[], resolve_geoids=[_UUID_A, _UUID_B])
 
     with _patch_db([]):
         await svc._fetch_prior_bboxes_bulk(
