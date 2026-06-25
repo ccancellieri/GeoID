@@ -26,7 +26,7 @@ Covers:
 - Backend re-resolution: after circuit breaker trip
 """
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -177,7 +177,10 @@ class TestTieredAsyncBackend:
 
     @pytest.mark.asyncio
     async def test_set_writes_all_tiers(self):
-        """set() writes to both L1 (short TTL) and L2 (full TTL)."""
+        """set() writes to both L1 (short TTL) and L2 (full TTL).
+
+        L2 write is async background, so we must wait for the task.
+        """
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
@@ -185,8 +188,11 @@ class TestTieredAsyncBackend:
         result = await tiered.set("key3", b"value3", ttl=300)
         assert result is True
 
-        # Both tiers have the value
+        # L1 has the value immediately
         assert await l1.get("key3") == b"value3"
+
+        # L2 write is background — wait for pending tasks
+        await tiered.close()
         assert await l2.get("key3") == b"value3"
 
         # Verify TTLs: L1 capped at DEFAULT_L1_TTL_CAP, L2 gets full ttl.
@@ -197,41 +203,46 @@ class TestTieredAsyncBackend:
 
     @pytest.mark.asyncio
     async def test_clear_key_clears_all_tiers(self):
-        """clear(key=...) deletes from all tiers."""
+        """clear(key=...) deletes from L1 sync, L2 background."""
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
-        # Set in both tiers
         await tiered.set("key4", b"value4")
-        assert await tiered.get("key4") == b"value4"
+        await tiered.close()  # wait for background L2 set
+        assert await l1.get("key4") == b"value4"
+        assert await l2.get("key4") == b"value4"
 
-        # Clear the key
         result = await tiered.clear(key="key4")
         assert result is True
 
-        # Both tiers cleared
+        # L1 cleared immediately
         assert await l1.get("key4") is None
+
+        # L2 cleared in background
+        await tiered.close()
         assert await l2.get("key4") is None
 
     @pytest.mark.asyncio
     async def test_clear_namespace_clears_all_tiers(self):
-        """clear(namespace=...) deletes from all tiers."""
+        """clear(namespace=...) deletes from L1 sync, L2 background."""
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
-        # Set multiple keys in namespace
         await tiered.set("app:key1", b"v1")
         await tiered.set("app:key2", b"v2")
+        await tiered.close()  # wait for background L2 sets
 
-        # Clear namespace
         result = await tiered.clear(namespace="app")
         assert result is True
 
-        # Both tiers cleared
+        # L1 cleared immediately
         assert await l1.get("app:key1") is None
         assert await l1.get("app:key2") is None
+
+        # L2 cleared in background
+        await tiered.close()
         assert await l2.get("app:key1") is None
         assert await l2.get("app:key2") is None
 
@@ -304,6 +315,7 @@ class TestTieredAsyncBackendL1TtlCap:
         tiered = TieredAsyncBackend([l1, l2], l1_ttl_cap=2.0)
 
         await tiered.set("k", b"v", ttl=300)
+        await tiered.close()  # wait for background L2 write
         l1_set = [op for op in l1._ops if op[0] == "set"]
         l2_set = [op for op in l2._ops if op[0] == "set"]
         assert l1_set[0][2] == 2.0
@@ -333,8 +345,137 @@ class TestTieredAsyncBackendL1TtlCap:
         tiered = TieredAsyncBackend([l1, l2], l1_ttl_cap=10.0)
 
         await tiered.set("k", b"v", ttl=3)
+        await tiered.close()  # wait for background L2 write
         l1_set = [op for op in l1._ops if op[0] == "set"]
         assert l1_set[0][2] == 3  # min(3, 10)
+
+
+class TestTieredAsyncBackendL2Retry:
+    """L2 background write with retry (#2328).
+
+    L1 writes are synchronous (fast, always succeed). L2+ writes are
+    scheduled as background tasks with exponential backoff retry.
+    """
+
+    @pytest.mark.asyncio
+    async def test_set_returns_immediately_after_l1(self):
+        """set() returns True immediately after L1 write."""
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        result = await tiered.set("k", b"v")
+        assert result is True
+        assert await l1.get("k") == b"v"  # L1 written synchronously
+
+    @pytest.mark.asyncio
+    async def test_l2_write_is_background(self):
+        """L2 write happens in background after set() returns."""
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        await tiered.set("k", b"v")
+
+        # Background task pending
+        assert len(tiered._pending_bg_tasks) > 0 or await l2.get("k") == b"v"
+
+        # Wait for background task
+        await tiered.close()
+        assert await l2.get("k") == b"v"
+
+    @pytest.mark.asyncio
+    async def test_l2_retry_on_failure(self, caplog):
+        """L2 write retries with exponential backoff on failure."""
+        import logging
+
+        class FailingBackend(FakeCacheBackend):
+            def __init__(self, name, priority, fail_times):
+                super().__init__(name, priority)
+                self._fail_times = fail_times
+                self._attempts = 0
+
+            async def set(self, key, value, *, ttl=None, exist=None):
+                self._attempts += 1
+                if self._attempts <= self._fail_times:
+                    raise RuntimeError(f"fail attempt {self._attempts}")
+                return await super().set(key, value, ttl=ttl, exist=exist)
+
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FailingBackend("l2", 100, fail_times=2)
+        tiered = TieredAsyncBackend([l1, l2], l2_retry_attempts=3, l2_retry_backoff=0.01)
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            await tiered.set("k", b"v")
+            await tiered.close()
+
+        # L2 eventually succeeded after 2 failures
+        assert await l2.get("k") == b"v"
+        assert l2._attempts == 3
+
+    @pytest.mark.asyncio
+    async def test_l2_retry_exhausted_logs_warning(self, caplog):
+        """When L2 retry exhausted, warning logged (TTL cap will self-heal)."""
+        import logging
+
+        class AlwaysFailingBackend(FakeCacheBackend):
+            async def set(self, key, value, *, ttl=None, exist=None):
+                raise RuntimeError("always fails")
+
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = AlwaysFailingBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2], l2_retry_attempts=2, l2_retry_backoff=0.01)
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            await tiered.set("k", b"v")
+            await tiered.close()
+
+        assert any("L2 cache set failed after 2 attempts" in r.getMessage() for r in caplog.records)
+        assert any("TTL cap will self-heal" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_clear_is_l1_sync_l2_background(self):
+        """clear() clears L1 sync, L2 in background."""
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        await l1.set("k", b"v")
+        await l2.set("k", b"v")
+
+        result = await tiered.clear(key="k")
+        assert result is True
+
+        # L1 cleared immediately
+        assert await l1.get("k") is None
+        # L2 still has value
+        assert await l2.get("k") == b"v"
+
+        # Wait for background clear
+        await tiered.close()
+        assert await l2.get("k") is None
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_pending_tasks(self):
+        """close() waits for all pending background tasks."""
+        import asyncio
+
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        await tiered.set("k1", b"v1")
+        await tiered.set("k2", b"v2")
+
+        # Pending tasks exist
+        pending_before = len(tiered._pending_bg_tasks)
+
+        await tiered.close()
+
+        # All tasks completed
+        assert len(tiered._pending_bg_tasks) == 0
+        assert await l2.get("k1") == b"v1"
+        assert await l2.get("k2") == b"v2"
 
 
 class TestConfigCachesUseTightL1Cap:
@@ -570,9 +711,12 @@ class TestMaxDistributedTTL:
             await fetch("k1")
             assert calls["n"] == 1
 
+            # L2 write is background - wait for completion
+            await asyncio.sleep(0.1)
+
             # L2 (distributed tier) received set with DEFAULT_MAX_DISTRIBUTED_TTL
             set_ops = [op for op in l2._ops if op[0] == "set"]
-            assert len(set_ops) >= 1
+            assert len(set_ops) >= 1, f"L2 ops: {l2._ops}"
             ttl_passed = set_ops[0][2]
             assert ttl_passed == DEFAULT_MAX_DISTRIBUTED_TTL
         finally:
@@ -614,8 +758,11 @@ class TestMaxDistributedTTL:
             await fetch("k1")
             assert calls["n"] == 1
 
+            # L2 write is background - wait for completion
+            await asyncio.sleep(0.1)
+
             set_ops = [op for op in l2._ops if op[0] == "set"]
-            assert len(set_ops) >= 1
+            assert len(set_ops) >= 1, f"L2 ops: {l2._ops}"
             ttl_passed = set_ops[0][2]
             assert ttl_passed == 300.0
         finally:
@@ -644,8 +791,11 @@ class TestMaxDistributedTTL:
             await fetch("k1")
             assert calls["n"] == 1
 
+            # L2 write is background - wait for completion
+            await asyncio.sleep(0.1)
+
             set_ops = [op for op in l2._ops if op[0] == "set"]
-            assert len(set_ops) >= 1
+            assert len(set_ops) >= 1, f"L2 ops: {l2._ops}"
             ttl_passed = set_ops[0][2]
             assert ttl_passed == 60.0
         finally:
@@ -673,8 +823,11 @@ class TestMaxDistributedTTL:
             await fetch("k1")
             assert calls["n"] == 1
 
+            # L2 write is background - wait for completion
+            await asyncio.sleep(0.1)
+
             set_ops = [op for op in l2._ops if op[0] == "set"]
-            assert len(set_ops) >= 1
+            assert len(set_ops) >= 1, f"L2 ops: {l2._ops}"
             ttl_passed = set_ops[0][2]
             assert ttl_passed is None
         finally:

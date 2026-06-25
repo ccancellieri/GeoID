@@ -416,29 +416,40 @@ class TieredAsyncBackend:
     """Chain multiple cache backends in priority order (L1, L2, L3...).
 
     Read path: tries each tier in order, populating upstream tiers on miss.
-    Write path: writes to all tiers.
-    Delete/clear: deletes from all tiers.
+    Write path: L1 synchronous (fast, always succeeds), L2+ background with retry.
+    Delete/clear: L1 synchronous, L2+ background with retry.
 
     Implements get_lock by delegating to the first tier that supports it.
+
+    Background L2 writes (#2328):
+        L1 (in-process memory) never times out, so we write synchronously and
+        return immediately. L2+ writes are scheduled in the background with
+        retry logic. Combined with TTL caps, this ensures:
+        - Zero latency impact on the hot path
+        - Eventual consistency even if L2 is unreliable
+        - Self-healing via TTL expiry if L2 never succeeds
     """
 
-    # Default L1 TTL cap (seconds). Bounds the per-process staleness window
-    # observable after a cross-process invalidate (#930): process A writes +
-    # invalidates L2, but sibling process B's L1 only converges once its
-    # local entry expires. Correctness-critical caches (config tiers, router)
-    # pass a smaller value via ``cached(l1_ttl=...)``.
     DEFAULT_L1_TTL_CAP: float = 60.0
+    DEFAULT_L2_RETRY_ATTEMPTS: int = 3
+    DEFAULT_L2_RETRY_BACKOFF: float = 0.1
 
     def __init__(
         self,
         backends: List[CacheBackend],
         l1_ttl_cap: Optional[float] = None,
+        l2_retry_attempts: Optional[int] = None,
+        l2_retry_backoff: Optional[float] = None,
     ) -> None:
         """Initialize with an ordered list of backends (best to worst).
 
-        ``l1_ttl_cap`` bounds the TTL written to / populated into the L1
-        (first) tier regardless of the caller-supplied ttl. Defaults to
-        ``DEFAULT_L1_TTL_CAP`` (60s).
+        Args:
+            backends: Ordered list of backends (L1, L2, ...).
+            l1_ttl_cap: Bounds TTL for L1 tier. Defaults to 60s.
+            l2_retry_attempts: Max attempts for L2+ background writes.
+                Defaults to 3. Set to 0 to disable retry (fire-and-forget).
+            l2_retry_backoff: Initial backoff in seconds for L2+ retry.
+                Defaults to 0.1s (100ms). Exponential backoff applied.
         """
         if not backends:
             raise ValueError("TieredAsyncBackend requires at least one backend")
@@ -448,12 +459,18 @@ class TieredAsyncBackend:
         self._l1_ttl_cap = (
             self.DEFAULT_L1_TTL_CAP if l1_ttl_cap is None else float(l1_ttl_cap)
         )
-        # ``cached()`` increments _stats.{hits,misses,size} unconditionally
-        # on every call regardless of the backend type, so the wrapper
-        # must expose the same shape as the leaf backends or it AttributeErrors
-        # on the first call.  Stats here aggregate across tiers — leaves
-        # keep their own per-tier counters for finer-grained inspection.
+        self._l2_retry_attempts = (
+            self.DEFAULT_L2_RETRY_ATTEMPTS
+            if l2_retry_attempts is None
+            else int(l2_retry_attempts)
+        )
+        self._l2_retry_backoff = (
+            self.DEFAULT_L2_RETRY_BACKOFF
+            if l2_retry_backoff is None
+            else float(l2_retry_backoff)
+        )
         self._stats = CacheStats()
+        self._pending_bg_tasks: Set[asyncio.Task] = set()
 
     @property
     def name(self) -> str:
@@ -468,8 +485,6 @@ class TieredAsyncBackend:
         for i, backend in enumerate(self._backends):
             value = await backend.get(key)
             if value is not None:
-                # Populate all upstream tiers (0..i-1) with the L1 cap so the
-                # populate-back path observes the same staleness bound as set().
                 for j in range(i):
                     await self._backends[j].set(key, value, ttl=self._l1_ttl_cap)
                 return value
@@ -483,19 +498,56 @@ class TieredAsyncBackend:
         ttl: Optional[float] = None,
         exist: Optional[bool] = None,
     ) -> bool:
-        """Write to all tiers (with tier-specific TTLs)."""
-        # L1 gets the configured cap; L2+ get the full caller-supplied TTL.
-        results = []
-        for i, backend in enumerate(self._backends):
-            if i == 0:
-                tier_ttl: Optional[float] = (
-                    min(ttl, self._l1_ttl_cap) if ttl is not None else self._l1_ttl_cap
+        """Write to L1 synchronously, L2+ in background with retry.
+
+        L1 (in-process) always succeeds and returns immediately.
+        L2+ writes are scheduled as background tasks with retry logic.
+        Combined with TTL caps, this ensures eventual consistency even
+        when L2 is unreliable (#2328).
+        """
+        l1_ttl: Optional[float] = (
+            min(ttl, self._l1_ttl_cap) if ttl is not None else self._l1_ttl_cap
+        )
+        await self._backends[0].set(key, value, ttl=l1_ttl, exist=exist)
+
+        for i, backend in enumerate(self._backends[1:], start=2):
+            task = asyncio.create_task(
+                self._bg_set_with_retry(backend, key, value, ttl, exist, i)
+            )
+            self._pending_bg_tasks.add(task)
+            task.add_done_callback(self._pending_bg_tasks.discard)
+
+        return True
+
+    async def _bg_set_with_retry(
+        self,
+        backend: CacheBackend,
+        key: str,
+        value: bytes,
+        ttl: Optional[float],
+        exist: Optional[bool],
+        tier: int,
+    ) -> None:
+        """Background L2+ write with exponential backoff retry."""
+        for attempt in range(self._l2_retry_attempts):
+            try:
+                result = await backend.set(key, value, ttl=ttl, exist=exist)
+                if result:
+                    return
+            except Exception as e:
+                logger.debug(
+                    "L%d cache set exception (attempt %d/%d): %s",
+                    tier, attempt + 1, self._l2_retry_attempts, e,
                 )
-            else:
-                tier_ttl = ttl
-            result = await backend.set(key, value, ttl=tier_ttl, exist=exist)
-            results.append(result)
-        return all(results)
+
+            if attempt < self._l2_retry_attempts - 1:
+                backoff = self._l2_retry_backoff * (2**attempt)
+                await asyncio.sleep(backoff)
+
+        logger.warning(
+            "L%d cache set failed after %d attempts (key=%s) — TTL cap will self-heal",
+            tier, self._l2_retry_attempts, key,
+        )
 
     async def clear(
         self,
@@ -504,12 +556,46 @@ class TieredAsyncBackend:
         namespace: Optional[str] = None,
         tags: Optional[List[str]] = None,
     ) -> bool:
-        """Clear from all tiers."""
-        results = []
-        for backend in self._backends:
-            result = await backend.clear(key=key, namespace=namespace, tags=tags)
-            results.append(result)
-        return any(results)
+        """Clear L1 synchronously, L2+ in background with retry."""
+        l1_result = await self._backends[0].clear(key=key, namespace=namespace, tags=tags)
+
+        for i, backend in enumerate(self._backends[1:], start=2):
+            task = asyncio.create_task(
+                self._bg_clear_with_retry(backend, key, namespace, tags, i)
+            )
+            self._pending_bg_tasks.add(task)
+            task.add_done_callback(self._pending_bg_tasks.discard)
+
+        return l1_result
+
+    async def _bg_clear_with_retry(
+        self,
+        backend: CacheBackend,
+        key: Optional[str],
+        namespace: Optional[str],
+        tags: Optional[List[str]],
+        tier: int,
+    ) -> None:
+        """Background L2+ clear with exponential backoff retry."""
+        for attempt in range(self._l2_retry_attempts):
+            try:
+                result = await backend.clear(key=key, namespace=namespace, tags=tags)
+                if result:
+                    return
+            except Exception as e:
+                logger.debug(
+                    "L%d cache clear exception (attempt %d/%d): %s",
+                    tier, attempt + 1, self._l2_retry_attempts, e,
+                )
+
+            if attempt < self._l2_retry_attempts - 1:
+                backoff = self._l2_retry_backoff * (2**attempt)
+                await asyncio.sleep(backoff)
+
+        logger.warning(
+            "L%d cache clear failed after %d attempts (key=%s ns=%s) — TTL cap will self-heal",
+            tier, self._l2_retry_attempts, key, namespace,
+        )
 
     async def exists(self, key: str) -> bool:
         """Check any tier."""
@@ -519,7 +605,9 @@ class TieredAsyncBackend:
         return False
 
     async def close(self) -> None:
-        """Close all backends."""
+        """Wait for pending background tasks, then close all backends."""
+        if self._pending_bg_tasks:
+            await asyncio.gather(*self._pending_bg_tasks, return_exceptions=True)
         for backend in self._backends:
             await backend.close()
 
@@ -528,7 +616,6 @@ class TieredAsyncBackend:
         for backend in self._backends:
             if isinstance(backend, LockableCacheBackend):
                 return await backend.get_lock(key)
-        # Fallback: create a new lock (caller's decorator will cache it)
         return asyncio.Lock()
 
 
