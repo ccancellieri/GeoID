@@ -29,7 +29,6 @@ This service implements CatalogsProtocol and provides:
 import asyncio
 import logging
 import json
-import os
 import re
 from typing import (
     Awaitable,
@@ -85,8 +84,7 @@ from dynastore.models.query_builder import QueryRequest, QueryResponse
 from dynastore.modules.catalog.event_service import CatalogEventType, emit_event
 from dynastore.modules.db_config.maintenance_tools import ensure_schema_exists
 from dynastore.modules.db_config.typed_store.ddl import tenant_configs_ddl
-from dynastore.tools.async_utils import signal_bus
-from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry, LifecycleContext
+from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
 
 logger = logging.getLogger(__name__)
 
@@ -241,16 +239,6 @@ def get_catalog_engine(db_resource: Optional[DbResource] = None) -> DbResource:
 
     return get_engine()  # type: ignore[return-value]
 
-
-def _async_catalog_create_enabled() -> bool:
-    """Return True when DYNASTORE_ASYNC_CATALOG_CREATE=true/1/yes.
-
-    Default is False — catalog creation is synchronous and returns 201, identical
-    to the pre-2329 behaviour.  When enabled, the core tenant-provisioning steps
-    are deferred to the ``catalog_provision`` worker task and the create endpoint
-    returns 202 with a Location header pointing at the catalog resource.
-    """
-    return os.getenv("DYNASTORE_ASYNC_CATALOG_CREATE", "false").lower() in ("true", "1", "yes")
 
 
 _T = TypeVar("_T")
@@ -1090,16 +1078,12 @@ class CatalogService(CatalogsProtocol):
         catalog_model: Catalog,
         external_id: str,
         physical_schema: str,
-        *,
-        _build_checklist: bool = True,
-        _run_post_create: bool = True,
-        _emit_events: bool = True,
     ) -> None:
-        """Run the core tenant-provisioning steps inside an existing transaction.
+        """Run the core tenant-provisioning DDL inside an existing transaction.
 
-        Executes all DDL and lifecycle hooks that must complete atomically with
-        the catalog.catalogs INSERT before the transaction commits.  The caller
-        owns the transaction; this method must NOT open a new one.
+        Called by the ``catalog_core`` provisioner (via ``CatalogProvisionTask``)
+        after the ``catalog.catalogs`` row has been committed.  The caller owns
+        the transaction; this method must NOT open a new one.
 
         Steps (in order):
           1. Create the tenant schema (``IF NOT EXISTS`` — idempotent).
@@ -1109,21 +1093,9 @@ class CatalogService(CatalogsProtocol):
           4. Run module-specific ``init_catalog`` lifecycle hooks (SAVEPOINTs).
           5. Stamp ``external_id`` on ``catalog_model`` for downstream drivers.
           6. Persist catalog metadata via the catalog router.
-          7. Materialise the provisioning checklist and flip status to
-             ``'provisioning'`` when at least one provisioner is active.
-             Skipped when ``_build_checklist=False`` (checklist already seeded
-             by the caller, e.g. the async create path).
-          8. Run ``post_create_catalog`` lifecycle hooks (SAVEPOINTs).
-             Skipped when ``_run_post_create=False`` (async provisioner path —
-             GCP provisioning is driven by the registry executor hooks, not the
-             post-create lifecycle fan-out that would enqueue gcp_provision_catalog
-             as a second task and double-provision GCP).
-          9. Snapshot catalog config defaults (best-effort, non-fatal).
-         10. Emit ``CATALOG_CREATION`` and ``AFTER_CATALOG_CREATION`` events.
-             Skipped when ``_emit_events=False`` (async provisioner path).
+          7. Snapshot catalog config defaults (best-effort, non-fatal).
 
-        Mutates ``catalog_model.external_id`` and
-        ``catalog_model.provisioning_status`` in place.
+        Mutates ``catalog_model.external_id`` in place.
         """
         # --- CRITICAL: Core tenant tables MUST be created directly in the outer
         # transaction, NOT inside a lifecycle SAVEPOINT (begin_nested).
@@ -1204,41 +1176,6 @@ class CatalogService(CatalogsProtocol):
                 db_resource=conn,
             )
 
-        if _build_checklist:
-            # #1175: materialise the provisioning checklist from the registered
-            # provisioners now that the row exists. Built BEFORE the post-create
-            # hooks so the full barrier is in place before any provisioner marks
-            # its step — a step that completes early can't flip the catalog ready
-            # while a slower step is still pending. An empty checklist (on-prem /
-            # no active provider) leaves the catalog 'ready'; otherwise it becomes
-            # 'provisioning' until every step is terminal.
-            from dynastore.modules.catalog.provisioning_registry import (
-                provisioning_registry,
-                STATUS_PROVISIONING,
-            )
-            checklist = await provisioning_registry.build_checklist(
-                catalog_model.id, conn
-            )
-            if checklist:
-                await _set_provisioning_checklist_query.execute(
-                    conn,
-                    id=catalog_model.id,
-                    status=STATUS_PROVISIONING,
-                    checklist=json.dumps(checklist),
-                )
-                catalog_model.provisioning_status = STATUS_PROVISIONING
-                _invalidate_catalog_model_cache(catalog_model.id)
-
-        if _run_post_create:
-            # Post-INSERT sync lifecycle phase: runs after the catalog.catalogs
-            # row exists so module hooks may reference it (FK inserts, status
-            # UPDATEs). A provisioner's post-create hook does its synchronous
-            # work and/or enqueues an async task that later calls
-            # ``mark_provisioning_step`` for its checklist key (#1131 / #1175).
-            await lifecycle_registry.post_create_catalog(
-                conn, physical_schema, catalog_id=catalog_model.id
-            )
-
         # #1079 (c): freeze the catalog's inherited config defaults now that
         # the registry row + tenant config tables exist. Captures the
         # resolved platform/code defaults for stable value-configs into a
@@ -1256,21 +1193,6 @@ class CatalogService(CatalogsProtocol):
                 "catalog %s: defaults-snapshot capture failed",
                 catalog_model.id,
                 exc_info=True,
-            )
-
-        if _emit_events:
-            # Lifecycle Phase 2: EVENT (Now after schema is ready AND record exists)
-            await emit_event(
-                CatalogEventType.CATALOG_CREATION,
-                catalog_id=catalog_model.id,
-                db_resource=conn,
-            )
-
-            # Lifecycle Phase 3: AFTER
-            await emit_event(
-                CatalogEventType.AFTER_CATALOG_CREATION,
-                catalog_id=catalog_model.id,
-                db_resource=conn,
             )
 
     async def create_catalog(
@@ -1325,11 +1247,7 @@ class CatalogService(CatalogsProtocol):
         # with no active provisioner stays 'ready' immediately.
         catalog_model.provisioning_status = "ready"
 
-        if _async_catalog_create_enabled():
-            return await self._create_catalog_async(
-                catalog_model, external_id, db_resource
-            )
-        return await self._create_catalog_sync(
+        return await self._create_catalog_async(
             catalog_model, external_id, db_resource
         )
 
@@ -1339,7 +1257,7 @@ class CatalogService(CatalogsProtocol):
         external_id: str,
         db_resource: Any,
     ) -> "Catalog":
-        """Async create path (DYNASTORE_ASYNC_CATALOG_CREATE=true).
+        """Async create path (always active — catalog creation is always deferred).
 
         Inserts the catalog.catalogs row, seeds the provisioning checklist from
         the active registered provisioners (including ``catalog_core`` at
@@ -1347,6 +1265,9 @@ class CatalogService(CatalogsProtocol):
         every provisioner in priority order.  Returns immediately with
         ``provisioning_status='provisioning'`` — the caller converts this to a
         202 response.
+
+        When the provisioning registry is empty (no active provisioners), the
+        checklist is empty: the catalog stays ``'ready'`` and no task is enqueued.
 
         The tenant schema does NOT exist when this method returns; all code
         that assumes the schema is ready must stay inside the task.
@@ -1358,7 +1279,8 @@ class CatalogService(CatalogsProtocol):
         from dynastore.modules.tasks.models import TaskCreate
         from dynastore.modules.tasks.tasks_module import create_task, get_task_schema
 
-        catalog_model.provisioning_status = STATUS_PROVISIONING
+        # catalog_model.provisioning_status is already 'ready' (set by create_catalog).
+        # It will be flipped to 'provisioning' below only when the checklist is non-empty.
 
         async with managed_transaction(get_catalog_engine(db_resource)) as conn:
             await emit_event(
@@ -1399,168 +1321,44 @@ class CatalogService(CatalogsProtocol):
                 catalog_model.id, conn
             )
 
-            await _set_provisioning_checklist_query.execute(
-                conn,
-                id=catalog_model.id,
-                status=STATUS_PROVISIONING,
-                checklist=json.dumps(checklist),
-            )
+            if checklist:
+                # At least one active provisioner: set status to 'provisioning',
+                # persist the barrier checklist, then enqueue the executor task.
+                # An empty checklist (on-prem / no active provider) leaves the
+                # catalog 'ready' and skips the task enqueue — matching the
+                # evaluate_checklist rule.
+                await _set_provisioning_checklist_query.execute(
+                    conn,
+                    id=catalog_model.id,
+                    status=STATUS_PROVISIONING,
+                    checklist=json.dumps(checklist),
+                )
+                catalog_model.provisioning_status = STATUS_PROVISIONING
 
-            # Enqueue the unified provisioning executor into the GLOBAL task
-            # schema.  The tenant schema does not exist yet; the catalog_core
-            # provisioner (priority 0) creates it.
-            task_request = TaskCreate(
-                task_type="catalog_provision",
-                inputs={
-                    "catalog_id": committed_internal_id,
-                    "scope": "catalog",
-                    "operation": "provision",
-                },
-                caller_id="system",
-                type="task",
-            )
-            await create_task(conn, task_request, get_task_schema())
+                task_request = TaskCreate(
+                    task_type="catalog_provision",
+                    inputs={
+                        "catalog_id": committed_internal_id,
+                        "scope": "catalog",
+                        "operation": "provision",
+                    },
+                    caller_id="system",
+                    type="task",
+                )
+                await create_task(conn, task_request, get_task_schema())
 
             _invalidate_catalog_model_cache(catalog_model.id)
             _invalidate_catalog_external_id_cache(external_id)
 
         logger.info(
             "catalog '%s' (external='%s'): async create committed; "
-            "catalog_provision task enqueued",
+            "checklist=%s task_enqueued=%s",
             catalog_model.id, external_id,
+            list(checklist.keys()) if checklist else "none",
+            bool(checklist),
         )
         catalog_model.external_id = external_id  # type: ignore[attr-defined]
         return catalog_model
-
-    async def _create_catalog_sync(
-        self,
-        catalog_model: "Catalog",
-        external_id: str,
-        db_resource: Any,
-    ) -> "Catalog":
-        """Synchronous create path (default, DYNASTORE_ASYNC_CATALOG_CREATE=false).
-
-        Runs all provisioning steps inline inside a single transaction and
-        returns the fully-provisioned catalog model.  This is the pre-2329
-        behaviour, unchanged.
-        """
-        physical_schema: str = ""  # set after INSERT below
-
-        async with managed_transaction(get_catalog_engine(db_resource)) as conn:
-            # Lifecycle Phase 1: BEFORE
-            await emit_event(
-                CatalogEventType.BEFORE_CATALOG_CREATION,
-                catalog_id=catalog_model.id,
-                db_resource=conn,
-            )
-
-            # Reclaim a soft-deleted (tombstoned) catalog id. A prior default
-            # (soft) DELETE leaves the catalog.catalogs row with deleted_at set,
-            # the physical schema intact, metadata sidecars in the router-
-            # managed tables, and cron jobs still registered. Purge that residue
-            # here so the id is reused as a clean, fresh catalog. A still-live
-            # row (deleted_at IS NULL) is left untouched, so the INSERT below
-            # raises the usual conflict.
-            tombstoned_row = await DQLQuery(
-                "SELECT id FROM catalog.catalogs WHERE external_id = :external_id AND deleted_at IS NOT NULL;",
-                result_handler=ResultHandler.ONE_OR_NONE,
-            ).execute(conn, external_id=external_id)
-            if tombstoned_row is not None:
-                # Reclaim: purge storage keyed on the OLD internal id of the
-                # tombstoned row, then drop the row so our INSERT below succeeds.
-                old_internal_id = tombstoned_row[0] if tombstoned_row else None
-                _reclaim_id = old_internal_id or catalog_model.id
-                logger.info(
-                    "[LIFECYCLE] Reclaiming soft-deleted catalog external_id='%s' "
-                    "(internal_id='%s') for reuse",
-                    external_id,
-                    _reclaim_id,
-                )
-                await self._purge_catalog_storage(conn, _reclaim_id)
-                _invalidate_catalog_external_id_cache(external_id)
-
-            # Insert the catalog.catalogs registry row first so the committed
-            # internal id is known before any schema or DDL is created.
-            # _insert_catalog_row_with_pk_retry regenerates the id on a PK
-            # collision (astronomically rare) and retries up to 5 times.
-            # A unique violation on external_id is a genuine user conflict
-            # and bubbles immediately as UniqueViolationError → HTTP 409.
-            # The schema name IS the committed internal id — we must not create
-            # the schema with a placeholder that may differ from the committed id.
-            committed_internal_id = await _insert_catalog_row_with_pk_retry(
-                conn,
-                external_id=external_id,
-                provisioning_status=catalog_model.provisioning_status,
-            )
-            # Update the model to the committed internal id.
-            catalog_model.id = committed_internal_id
-
-            # The schema name IS the internal id (physical_schema column dropped).
-            # Assigned here, after the INSERT, so schema creation uses the exact
-            # id that was committed — never a placeholder that may have differed.
-            physical_schema = committed_internal_id
-
-            await self._run_core_init(conn, catalog_model, external_id, physical_schema)
-
-            # Invalidate cache to ensure it's re-fetched in subsequent calls
-            _invalidate_catalog_model_cache(catalog_model.id)
-            _invalidate_catalog_external_id_cache(external_id)
-
-        # Execute async external component initializers OUTSIDE transaction
-        config_snapshot = {}
-        try:
-            from dynastore.tools.discovery import get_protocol
-            from dynastore.models.protocols.configs import ConfigsProtocol
-
-            config_mgr = get_protocol(ConfigsProtocol)
-            if config_mgr:
-                config_snapshot.update(
-                    await config_mgr.list_catalog_configs(catalog_model.id)
-                )
-        except Exception as exc:
-            logger.warning(
-                "catalog %s: failed to load config snapshot for lifecycle init: %s",
-                catalog_model.id, exc,
-            )
-
-        lifecycle_registry.init_async_catalog(
-            catalog_model.id,
-            LifecycleContext(
-                physical_schema=physical_schema,
-                config=config_snapshot
-            )
-        )
-
-        # Invalidate caches BEFORE emitting signal to prevent visibility gap race conditions.
-        # (The in-transaction invalidate above already covered the happy path; this second
-        # call guards against readers between the transaction commit and the signal below.)
-        _invalidate_catalog_model_cache(catalog_model.id)
-        _invalidate_catalog_external_id_cache(external_id)
-
-        # Emit signal to wake up background tasks (Visibility Gap fix)
-        # This must happen OUTSIDE the transaction above so that background listeners
-        # (like GCP provisioning) can see the committed 'catalog' row.
-        await signal_bus.emit("AFTER_CATALOG_CREATION", identifier=catalog_model.id)
-
-        # Re-fetch through ``get_catalog_model`` so the returned Catalog
-        # carries metadata merged from the split tables — ``Catalog.model_validate``
-        # of the raw ``catalog.catalogs`` row would yield ``title=None`` /
-        # ``description=None`` etc. since those columns were dropped from the
-        # registry in M2.5b and now live in ``catalog_core`` /
-        # ``_stac`` (router-direct upsert above).
-        merged = await self.get_catalog_model(
-            catalog_model.id,
-            ctx=DriverContext(db_resource=db_resource) if db_resource else None,
-        )
-        if merged is None:
-            # Fallback: registry row missing despite the INSERT above is a
-            # genuine consistency violation — fall back to the original
-            # technical-row hydration so the caller still gets *some* model.
-            result = await _get_catalog_query.execute(
-                get_catalog_engine(db_resource), id=catalog_model.id
-            )
-            return Catalog.model_validate(result)
-        return merged
 
     def _unpack_catalog_row(
         self,

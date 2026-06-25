@@ -16,14 +16,16 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for the async catalog-create path (#2329).
+"""Unit tests for the always-async catalog-create path (#2329).
 
 Verifies:
-  - ``_async_catalog_create_enabled`` reads DYNASTORE_ASYNC_CATALOG_CREATE correctly.
-  - On the async path: ``provisioning_status='provisioning'`` is set, the
-    checklist is seeded from registered provisioners (via build_checklist), and
-    a ``catalog_provision`` task is enqueued in the global task schema.
-  - ``_run_core_init`` is NOT called on the async path.
+  - ``create_catalog`` always returns ``provisioning_status='provisioning'``
+    when at least one provisioner is active (checklist non-empty).
+  - The checklist is seeded from registered provisioners (via build_checklist).
+  - A ``catalog_provision`` task is enqueued in the global task schema.
+  - ``_run_core_init`` is NOT called by the create path.
+  - When the registry returns an empty checklist (no active provisioners),
+    the catalog remains 'ready' and no task is enqueued.
 
 All DB I/O is mocked — no live database required.
 """
@@ -31,7 +33,6 @@ All DB I/O is mocked — no live database required.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -60,44 +61,6 @@ def _make_catalog_model(ext_id: str = "my-catalog") -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Flag helper
-# ---------------------------------------------------------------------------
-
-
-class TestAsyncCatalogCreateFlag:
-    def test_flag_off_by_default(self):
-        from dynastore.modules.catalog.catalog_service import _async_catalog_create_enabled
-
-        env = {k: v for k, v in os.environ.items() if k != "DYNASTORE_ASYNC_CATALOG_CREATE"}
-        with patch.dict("os.environ", env, clear=True):
-            assert _async_catalog_create_enabled() is False
-
-    def test_flag_on_true(self):
-        from dynastore.modules.catalog.catalog_service import _async_catalog_create_enabled
-
-        with patch.dict("os.environ", {"DYNASTORE_ASYNC_CATALOG_CREATE": "true"}):
-            assert _async_catalog_create_enabled() is True
-
-    def test_flag_on_1(self):
-        from dynastore.modules.catalog.catalog_service import _async_catalog_create_enabled
-
-        with patch.dict("os.environ", {"DYNASTORE_ASYNC_CATALOG_CREATE": "1"}):
-            assert _async_catalog_create_enabled() is True
-
-    def test_flag_on_yes(self):
-        from dynastore.modules.catalog.catalog_service import _async_catalog_create_enabled
-
-        with patch.dict("os.environ", {"DYNASTORE_ASYNC_CATALOG_CREATE": "yes"}):
-            assert _async_catalog_create_enabled() is True
-
-    def test_flag_off_explicit_false(self):
-        from dynastore.modules.catalog.catalog_service import _async_catalog_create_enabled
-
-        with patch.dict("os.environ", {"DYNASTORE_ASYNC_CATALOG_CREATE": "false"}):
-            assert _async_catalog_create_enabled() is False
-
-
-# ---------------------------------------------------------------------------
 # Shared patch context for _create_catalog_async
 # ---------------------------------------------------------------------------
 
@@ -119,7 +82,8 @@ def _make_async_create_patches(
     directly.
     """
     state: dict = {"checklist": {}, "tasks": []}
-    registry_checklist = registry_checklist or {"catalog_core": "pending"}
+    if registry_checklist is None:
+        registry_checklist = {"catalog_core": "pending"}
 
     async def _fake_insert(conn, *, external_id, provisioning_status):
         return committed_id
@@ -335,3 +299,42 @@ class TestAsyncCatalogCreatePath:
         assert task_req.inputs["operation"] == "provision"
         # Must go into the global task schema, NOT the (non-existent) tenant schema.
         assert schema == "tasks"  # get_task_schema() default
+
+    @pytest.mark.asyncio
+    async def test_empty_checklist_stays_ready_no_task(self):
+        """When the registry returns an empty checklist, status stays 'ready' and no task is enqueued."""
+        from dynastore.modules.catalog.catalog_service import CatalogService
+
+        svc = object.__new__(CatalogService)
+        fake_conn = AsyncMock()
+        catalog_model = _make_catalog_model("no-prov-cat")
+
+        patches, state, mock_reg, fake_set, fake_create = _make_async_create_patches(
+            fake_conn, committed_id="c_noprov1", registry_checklist={}
+        )
+
+        with (
+            patches[0], patches[1], patches[2],
+            patches[3] as mock_dql_cls,
+            patches[4], patches[5] as mock_cl_q,
+            patches[6], patches[7],
+        ):
+            mock_dql_cls.return_value.execute = AsyncMock(return_value=None)
+            mock_cl_q.execute = AsyncMock(side_effect=fake_set)
+
+            with (
+                patch(
+                    "dynastore.modules.catalog.provisioning_registry.provisioning_registry",
+                    mock_reg,
+                ),
+                patch(
+                    "dynastore.modules.tasks.tasks_module.create_task",
+                    new=AsyncMock(side_effect=fake_create),
+                ),
+            ):
+                result = await svc._create_catalog_async(catalog_model, "no-prov-cat", None)
+
+        # Empty checklist: status must remain 'ready', no task enqueued, no checklist written.
+        assert result.provisioning_status == "ready"
+        assert len(state["tasks"]) == 0
+        assert state["checklist"] == {}

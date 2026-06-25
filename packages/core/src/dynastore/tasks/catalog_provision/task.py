@@ -192,6 +192,13 @@ class CatalogProvisionTask(TaskProtocol):
             operation, scope, catalog_id,
             groups_run, steps_completed, steps_failed,
         )
+
+        if operation == "provision":
+            # Emit lifecycle events after all provisioning steps complete so
+            # non-provisioning subscribers (webhook outbox, audit log) fire
+            # exactly once, after the tenant schema is ready.
+            await self._emit_catalog_created_events(catalog_id)
+
         return {
             "catalog_id": catalog_id,
             "scope": scope,
@@ -200,6 +207,53 @@ class CatalogProvisionTask(TaskProtocol):
             "steps_completed": steps_completed,
             "steps_failed": steps_failed,
         }
+
+    async def _emit_catalog_created_events(self, catalog_id: str) -> None:
+        """Emit CATALOG_CREATION and AFTER_CATALOG_CREATION lifecycle events.
+
+        Fires after all provisioning checklist steps complete so listeners
+        (webhook outbox, audit log) observe a fully-ready catalog.  Each emit
+        is best-effort — a failure is logged but does not fail the task.
+        """
+        from dynastore.modules.catalog.event_service import (
+            CatalogEventType,
+            emit_event,
+        )
+        from dynastore.tools.async_utils import signal_bus
+
+        try:
+            await emit_event(
+                CatalogEventType.CATALOG_CREATION,
+                catalog_id=catalog_id,
+            )
+        except Exception:
+            logger.warning(
+                "CatalogProvisionTask: CATALOG_CREATION emit failed for '%s'",
+                catalog_id,
+                exc_info=True,
+            )
+
+        try:
+            await emit_event(
+                CatalogEventType.AFTER_CATALOG_CREATION,
+                catalog_id=catalog_id,
+            )
+        except Exception:
+            logger.warning(
+                "CatalogProvisionTask: AFTER_CATALOG_CREATION emit failed for '%s'",
+                catalog_id,
+                exc_info=True,
+            )
+
+        try:
+            await signal_bus.emit("AFTER_CATALOG_CREATION", identifier=catalog_id)
+        except Exception:
+            logger.warning(
+                "CatalogProvisionTask: signal_bus AFTER_CATALOG_CREATION emit "
+                "failed for '%s'",
+                catalog_id,
+                exc_info=True,
+            )
 
     async def _run_provisioner(
         self,

@@ -142,50 +142,49 @@ def test_post_create_noop_when_no_hooks(fake_conn):
     assert fake_conn.events == []
 
 
-def test_create_catalog_runs_post_create_after_insert():
-    """Source-level pin: ``_run_core_init`` must invoke ``init_catalog``
-    before ``post_create_catalog``, and the synchronous create path must
-    delegate to ``_run_core_init`` after inserting the catalog row.  This is
-    the #1131 ordering guarantee, now captured in the extracted private
-    method; the INSERT→delegate ordering lives in ``_create_catalog_sync``
-    since #2329 split create into sync/async paths."""
+def test_create_catalog_async_inserts_row_before_checklist():
+    """Source-level pin: ``_create_catalog_async`` must INSERT the catalog row
+    before building and persisting the provisioning checklist.  This is the
+    always-async ordering guarantee (#2329): the checklist barrier must be in
+    place before the executor task can start, and the row must exist first so
+    ``build_checklist`` can query active provisioners against the committed id."""
     from dynastore.modules.catalog.catalog_service import CatalogService
 
-    # The init steps moved into _run_core_init; check ordering there.
-    src_init = inspect.getsource(CatalogService._run_core_init)
-    idx_init = src_init.find("init_catalog(")
-    idx_post = src_init.find("post_create_catalog(")
-
-    assert idx_init != -1, "_run_core_init should call init_catalog"
-    assert idx_post != -1, "_run_core_init must call post_create_catalog"
-    assert idx_init < idx_post, (
-        "ordering regression: post_create_catalog must run AFTER init_catalog "
-        f"in _run_core_init. Got init={idx_init}, post={idx_post}."
-    )
-
-    # The sync create path must call _run_core_init after inserting the row.
-    src_create = inspect.getsource(CatalogService._create_catalog_sync)
+    src_create = inspect.getsource(CatalogService._create_catalog_async)
     idx_insert = src_create.find("_insert_catalog_row_with_pk_retry(")
-    idx_delegate = src_create.find("_run_core_init(")
+    idx_checklist = src_create.find("build_checklist(")
+    idx_task = src_create.find("create_task(")
 
-    assert idx_insert != -1, "_create_catalog_sync should still INSERT the catalog row"
-    assert idx_delegate != -1, "_create_catalog_sync must delegate to _run_core_init"
-    assert idx_insert < idx_delegate, (
-        "ordering regression: _run_core_init must be called AFTER the catalog "
-        f"row INSERT. Got insert={idx_insert}, delegate={idx_delegate}."
+    assert idx_insert != -1, "_create_catalog_async should INSERT the catalog row"
+    assert idx_checklist != -1, "_create_catalog_async must build the checklist"
+    assert idx_task != -1, "_create_catalog_async must enqueue a catalog_provision task"
+    assert idx_insert < idx_checklist, (
+        "ordering regression: checklist build must run AFTER the catalog row INSERT. "
+        f"Got insert={idx_insert}, checklist={idx_checklist}."
+    )
+    assert idx_checklist < idx_task, (
+        "ordering regression: task enqueue must run AFTER the checklist is seeded. "
+        f"Got checklist={idx_checklist}, task={idx_task}."
     )
 
+    # _run_core_init must call init_catalog (schema + lifecycle DDL).
+    src_init = inspect.getsource(CatalogService._run_core_init)
+    assert "init_catalog(" in src_init, "_run_core_init should call init_catalog"
 
-def test_gcp_registers_hook_on_post_create_phase():
-    """Source-level pin: the GCP module must register its catalog hook on
-    the post-create phase, not the pre-INSERT init phase (#1131)."""
+
+def test_gcp_does_not_register_post_create_hook():
+    """Source-level pin: the GCP module must NOT register _on_post_create_catalog.
+
+    Both provisioning paths are now covered by provisioner checklist steps
+    (gcp_config for provision_enabled=False, gcp_bucket/gcp_eventing for True).
+    A lingering sync_catalog_post_create registration would be a dead-code
+    double-provision trap — if post_create_catalog were ever called it would
+    enqueue a second gcp_provision_catalog task and/or race the checklist.
+    """
     from dynastore.modules.gcp import gcp_module
 
     src = inspect.getsource(gcp_module)
-    assert "sync_catalog_post_create()(self._on_post_create_catalog)" in src, (
-        "GCP must register _on_post_create_catalog via sync_catalog_post_create"
-    )
-    assert "sync_catalog_initializer()(self._on_sync_init_catalog)" not in src, (
-        "GCP must no longer register its catalog hook on the pre-INSERT "
-        "init phase (that is the #1131 bug)"
+    assert "sync_catalog_post_create()(self._on_post_create_catalog)" not in src, (
+        "GCP must NOT register _on_post_create_catalog via sync_catalog_post_create "
+        "— that hook is dead; both paths are now provisioner checklist steps"
     )

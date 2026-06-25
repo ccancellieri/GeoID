@@ -650,10 +650,10 @@ class OGCServiceMixin:
         )
         localized_data, _ = self._localize_resource(created, language)
 
-        # When the async-create flag is enabled (DYNASTORE_ASYNC_CATALOG_CREATE)
-        # the catalog row is committed but the tenant schema does not yet exist.
-        # The service signals this by returning provisioning_status='provisioning';
-        # we map that to 202 Accepted + Location so the client knows to poll.
+        # Catalog creation is always asynchronous: the catalog row is committed
+        # but tenant-schema provisioning runs via a background task.  The service
+        # signals this by returning provisioning_status='provisioning'; we map
+        # that to 202 Accepted + Location so the client knows to poll.
         prov_status = getattr(created, "provisioning_status", None)
         if prov_status == "provisioning":
             external_id = getattr(created, "external_id", None) or localized_data.get("id", "")

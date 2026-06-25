@@ -154,9 +154,10 @@ class GcpCatalogBucketConfig(PluginConfig):
     provision_enabled: Mutable[bool] = Field(
         default=True,
         description=(
-            "When False, ``GCPModule._on_post_create_catalog`` skips bucket "
-            "creation and marks the catalog ready immediately — useful when "
-            "a catalog reuses an externally-managed bucket. This is a "
+            "When False, the ``gcp_config`` provisioner persists the deterministic "
+            "bucket name without creating a real GCS bucket — useful when a catalog "
+            "reuses an externally-managed bucket. When True, ``gcp_bucket`` and "
+            "``gcp_eventing`` provisioners drive full bucket creation. This is a "
             "per-catalog provisioning gate, NOT an extension exposure toggle "
             "(the GCP module is always-on at the protocol layer; the canonical "
             "toggle lives on ``GcpModuleConfig.enabled``)."

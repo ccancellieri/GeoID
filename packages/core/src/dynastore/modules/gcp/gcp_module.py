@@ -337,12 +337,11 @@ class GCPModule(
             # has been retired. There is no ``gcp`` schema to initialize.
 
             # --- Register Lifecycle Hooks ---
-            from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
-
-            # Post-INSERT phase: GCP's provision_enabled=False work (mark-ready +
-            # bucket link) and the provision task enqueue must run after the
-            # catalog.catalogs row exists (#1131).
-            lifecycle_registry.sync_catalog_post_create()(self._on_post_create_catalog)
+            # (No post-create lifecycle hook: both provisioning paths are now
+            # registered as provisioner checklist steps — gcp_config for
+            # provision_enabled=False and gcp_bucket/gcp_eventing for
+            # provision_enabled=True.  The old _on_post_create_catalog hook is
+            # removed to eliminate the double-provision trap it created.)
 
             # #1175: register GCP as a catalog provisioner so bucket setup is a
             # checklist step the catalog waits on, instead of GCP directly owning
@@ -385,9 +384,9 @@ class GCPModule(
             ) -> None:
                 """Persist the deterministic bucket name when provision_enabled=False.
 
-                Mirrors the bucket-link branch of _on_post_create_catalog so that
-                the async path (where _run_post_create=False suppresses the lifecycle
-                hook fan-out) still writes GcpCatalogBucketConfig.bucket_name.
+                Writes GcpCatalogBucketConfig.bucket_name via the provisioner
+                path so that the value is recorded even when full GCS bucket
+                provisioning is disabled.
 
                 The catalog schema already exists when this hook runs because
                 catalog_core (priority 0) completes before this group (priority 1).
@@ -508,6 +507,8 @@ class GCPModule(
                 self.provisioner_is_active,
                 provision=_gcp_eventing_provision,
             )
+            from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
+
             # We keep these as async because they don't block the core creation flow
             # and don't cause race conditions in tests as easily as the creation one.
             lifecycle_registry.async_catalog_destroyer()(self._on_async_destroy_catalog)

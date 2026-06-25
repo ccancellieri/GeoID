@@ -403,17 +403,10 @@ class CatalogModule(ModuleProtocol):
 
                 Called by CatalogProvisionTask via call_hook(**ctx).  Opens its
                 own managed transaction because the task runs outside any caller
-                transaction.
-
-                _build_checklist=False: checklist already seeded by
-                  _create_catalog_async before the task was enqueued.
-                _run_post_create=False: post_create lifecycle hooks (including
-                  GCP's _on_post_create_catalog) are skipped here; GCP
-                  provisioning is driven by the gcp_bucket/gcp_eventing
-                  provisioner hooks at priority 100, not via the lifecycle
-                  fan-out that would enqueue a second gcp_provision_catalog task.
-                _emit_events=False: CATALOG_CREATION / AFTER_CATALOG_CREATION
-                  events are not emitted on the async path.
+                transaction.  The checklist was already seeded by
+                _create_catalog_async before the task was enqueued.  Lifecycle
+                events (CATALOG_CREATION / AFTER_CATALOG_CREATION) are emitted
+                by CatalogProvisionTask.run() after all checklist steps complete.
                 """
                 from dynastore.modules.catalog.catalog_service import (
                     get_catalog_engine,
@@ -447,9 +440,6 @@ class CatalogModule(ModuleProtocol):
                         catalog_model,
                         _ext_id,
                         physical_schema,
-                        _build_checklist=False,
-                        _run_post_create=False,
-                        _emit_events=False,
                     )
 
                 _invalidate_catalog_model_cache(catalog_id)

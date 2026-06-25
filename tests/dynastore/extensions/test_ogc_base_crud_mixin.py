@@ -742,7 +742,7 @@ async def test_ogc_delete_collection_soft_404_still_works():
 
 
 # ---------------------------------------------------------------------------
-# Async catalog create — 202 path (DYNASTORE_ASYNC_CATALOG_CREATE=true)
+# Catalog create — always-async 202 path
 # ---------------------------------------------------------------------------
 
 
@@ -762,16 +762,6 @@ class _ProvisioningCatalog:
             "provisioning_status": "provisioning",
             "provisioning_checklist": {"catalog_core": "pending"},
         }, {"en"}
-
-
-class _ReadyCatalog:
-    """Stub catalog returned on the sync path (provisioning_status='ready')."""
-
-    provisioning_status = "ready"
-    external_id = "my-catalog"
-
-    def localize(self, language: str) -> Tuple[Dict[str, Any], Any]:
-        return {"id": "my-catalog", "provisioning_status": "ready"}, {"en"}
 
 
 @pytest.mark.asyncio
@@ -796,30 +786,33 @@ async def test_ogc_create_catalog_returns_202_when_provisioning():
 
 
 @pytest.mark.asyncio
-async def test_ogc_create_catalog_returns_201_when_ready():
-    """When create_catalog returns provisioning_status='ready' (sync path), respond 201."""
+async def test_ogc_create_catalog_returns_202_when_provisioning_from_ready_stub():
+    """Create always returns 202; the OGC layer maps provisioning_status='provisioning' to 202."""
     catalogs_svc = _make_catalogs_svc(
-        create_catalog=AsyncMock(return_value=_ReadyCatalog())
+        create_catalog=AsyncMock(return_value=_ProvisioningCatalog())
     )
     svc = _FeaturesSvc()
     svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
 
     resp = await svc._ogc_create_catalog({"id": "my-catalog"}, {"id": "my-catalog"}, "en", None)
 
-    assert resp.status_code == 201
-    assert "Location" not in resp.headers
+    assert resp.status_code == 202
+    assert "Location" in resp.headers
 
     import json
     body = json.loads(resp.body)
-    assert body["provisioning_status"] == "ready"
+    assert body["provisioning_status"] == "provisioning"
 
 
 @pytest.mark.asyncio
-async def test_ogc_create_catalog_returns_201_when_no_provisioning_status():
-    """Existing models without provisioning_status attribute return 201 unchanged."""
-    catalogs_svc = _make_catalogs_svc()  # returns _LocalizableCatalog (no prov status)
+async def test_ogc_create_catalog_returns_202_from_provisioning_catalog():
+    """The 202 path is exercised end-to-end with the provisioning stub."""
+    catalogs_svc = _make_catalogs_svc(
+        create_catalog=AsyncMock(return_value=_ProvisioningCatalog())
+    )
     svc = _FeaturesSvc()
     svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
 
-    resp = await svc._ogc_create_catalog({"id": "cat1"}, {"id": "cat1"}, "en", None)
-    assert resp.status_code == 201
+    resp = await svc._ogc_create_catalog({"id": "my-catalog"}, {"id": "my-catalog"}, "en", None)
+    assert resp.status_code == 202
+    assert resp.headers.get("Location") == "/catalog/catalogs/my-catalog"

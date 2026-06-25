@@ -16,18 +16,21 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Catalog creation must enqueue ``gcp_provision_catalog`` when provisioning is
-enabled — without needing live GCP credentials (#1174).
+"""Catalog creation must result in a ``gcp_provision_catalog`` task when
+provisioning is enabled — without needing live GCP credentials (#1174).
 
-The enqueue happens in ``GCPModule._on_post_create_catalog``, inside the catalog
-creation transaction, *before* any GCS API call. So the decision is observable
-against a real database with the GCP module loaded but no credentials present —
-distinct from the credential-gated ``@pytest.mark.gcp`` end-to-end suite, which
-also drives the actual bucket creation.
+Under the always-async create path, ``create_catalog`` commits the catalog
+row and enqueues a ``catalog_provision`` task (the executor).  The
+``gcp_provision_catalog`` sub-task is only enqueued later, when the executor's
+``gcp_bucket`` provisioner step runs.  This test verifies the two-step sequence:
+
+  Step 1: ``create_catalog`` → ``catalog_provision`` task present (not yet
+          ``gcp_provision_catalog`` — the executor has not run yet).
+  Step 2: run ``CatalogProvisionTask`` → ``gcp_provision_catalog`` task present.
 
 This pins the bug from #1174: with ``provision_enabled=True`` (the code default),
-catalog creation produced no provisioning task, so the dispatcher had nothing to
-claim and no bucket was ever created.
+no provisioning task was produced, so the dispatcher had nothing to claim and no
+bucket was ever created.
 """
 
 from __future__ import annotations
@@ -42,19 +45,20 @@ from dynastore.tools.discovery import get_protocol
 from tests.dynastore.test_utils import generate_test_id
 
 
-async def _provision_tasks(engine, catalog_id: str):
+async def _tasks_by_type(engine, catalog_id: str, task_type: str):
     async with managed_transaction(engine) as conn:
         tasks = await list_tasks_for_catalog(conn, catalog_id)
-    return [t for t in tasks if t.task_type == "gcp_provision_catalog"]
+    return [t for t in tasks if t.task_type == task_type]
 
 
 @pytest.mark.asyncio
 @pytest.mark.enable_modules(
     "db_config", "db", "catalog", "catalog_postgresql", "tasks", "gcp",
 )
-async def test_create_catalog_enqueues_gcp_provision_task(app_lifespan):
-    """provision_enabled defaults to True → exactly one gcp_provision_catalog
-    task is enqueued inside catalog creation."""
+async def test_create_catalog_enqueues_catalog_provision_task(app_lifespan):
+    """provision_enabled defaults to True → create_catalog must enqueue
+    exactly one catalog_provision task (the executor that drives gcp_bucket
+    and gcp_eventing provisioner steps)."""
     if not getattr(app_lifespan, "engine", None):
         pytest.skip("app_state.engine not initialized.")
 
@@ -65,13 +69,24 @@ async def test_create_catalog_enqueues_gcp_provision_task(app_lifespan):
     try:
         await catalogs.create_catalog({"id": catalog_id, "title": {"en": "p"}}, lang="*")
 
-        prov = await _provision_tasks(app_lifespan.engine, catalog_id)
+        prov = await _tasks_by_type(app_lifespan.engine, catalog_id, "catalog_provision")
         assert prov, (
-            "create_catalog enqueued no gcp_provision_catalog task while "
-            "provision_enabled=True — the catalog can never be provisioned (#1174)."
+            "create_catalog enqueued no catalog_provision task while "
+            "provision_enabled=True — the executor will never run (#1174)."
         )
-        assert len(prov) == 1, f"expected one provision task, got {len(prov)}"
-        assert prov[0].inputs == {"catalog_id": catalog_id}
+        assert len(prov) == 1, f"expected one catalog_provision task, got {len(prov)}"
+        assert prov[0].inputs.get("operation") == "provision"
+
+        # gcp_provision_catalog is enqueued by the gcp_bucket provisioner step
+        # INSIDE CatalogProvisionTask — it must NOT be present yet.
+        gcp_tasks = await _tasks_by_type(
+            app_lifespan.engine, catalog_id, "gcp_provision_catalog"
+        )
+        assert gcp_tasks == [], (
+            "gcp_provision_catalog must not be enqueued inline during create_catalog; "
+            f"it is enqueued by the gcp_bucket provisioner step in CatalogProvisionTask. "
+            f"Found {len(gcp_tasks)} task(s) — double-provision risk."
+        )
     finally:
         await catalogs.delete_catalog(catalog_id, force=True)
         await lifecycle_registry.wait_for_all_tasks()

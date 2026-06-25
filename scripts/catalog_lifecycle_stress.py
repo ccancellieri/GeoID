@@ -226,8 +226,8 @@ class StressRunner:
             "links": [],
         }
         r = await client.post(f"{self.base}/stac/catalogs", json=body)
-        # 202 = async create accepted (DYNASTORE_ASYNC_CATALOG_CREATE); the
-        # caller then polls provisioning_status via _wait_ready below.
+        # 202 = async create accepted; the caller then polls
+        # provisioning_status via _wait_ready below.
         ok = r.status_code in (200, 201, 202)
         return PhaseResult(
             ok,

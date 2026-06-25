@@ -12,7 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-"""Unit tests for the catalog_core and gcp_config provisioner registrations (#2329 PR3).
+"""Unit tests for the catalog_core and gcp_config provisioner registrations (#2329 PR4).
 
 Verifies:
   - provisioning_registry can register catalog_core at priority 0 with a
@@ -20,10 +20,10 @@ Verifies:
   - catalog_core is_active always returns True.
   - catalog_core sorts before any priority-100 provisioner in build_checklist
     and active_provisioners output.
-  - The _catalog_core_provision hook calls _run_core_init with
-    _build_checklist=False, _run_post_create=False, _emit_events=False.
-  - No double-provision: the post_create lifecycle hook is NOT called by the
-    catalog_core provisioner (confirmed via _run_post_create=False).
+  - The _catalog_core_provision hook calls _run_core_init (no flags).
+  - No double-provision: _run_core_init never calls post_create_catalog
+    (that lifecycle phase is invoked only by CatalogProvisionTask after all
+    provisioners complete, not by _run_core_init itself).
   - gcp_config provisioner is active when provision_enabled=False and persists
     the deterministic bucket_name via config_mgr.set_config exactly once.
   - gcp_config is NOT active when provision_enabled=True (no double-persist).
@@ -133,9 +133,8 @@ class TestCatalogCoreProvisionerPriority:
 
 class TestCatalogCoreProvisionHook:
     @pytest.mark.asyncio
-    async def test_provision_hook_calls_run_core_init_with_correct_flags(self):
-        """_run_core_init is called with _build_checklist=False, _run_post_create=False,
-        _emit_events=False when the catalog_core provisioner hook is invoked."""
+    async def test_provision_hook_calls_run_core_init(self):
+        """_run_core_init is called exactly once when the catalog_core provisioner hook is invoked."""
 
         mock_catalog_model = MagicMock()
         mock_catalog_model.external_id = "ext-label"
@@ -169,30 +168,11 @@ class TestCatalogCoreProvisionHook:
             physical_schema = catalog_id
 
             async with txn_ctx as conn:
-                await run_core_init(
-                    conn,
-                    catalog_model,
-                    _ext_id,
-                    physical_schema,
-                    _build_checklist=False,
-                    _run_post_create=False,
-                    _emit_events=False,
-                )
+                await run_core_init(conn, catalog_model, _ext_id, physical_schema)
 
         await _provision_under_test("c_testcat", external_id="ext-label")
 
         mock_run_core_init.assert_awaited_once()
-        _, call_kwargs = mock_run_core_init.call_args
-        assert call_kwargs.get("_build_checklist") is False, (
-            "_build_checklist must be False to avoid re-seeding an already-committed checklist"
-        )
-        assert call_kwargs.get("_run_post_create") is False, (
-            "_run_post_create must be False to prevent post_create lifecycle hooks from "
-            "enqueuing a second gcp_provision_catalog task (double-provision)"
-        )
-        assert call_kwargs.get("_emit_events") is False, (
-            "_emit_events must be False on the async path"
-        )
 
     @pytest.mark.asyncio
     async def test_provision_hook_catalog_not_found_raises(self):
@@ -217,10 +197,14 @@ class TestCatalogCoreProvisionHook:
 
 class TestNoDoubleProvision:
     @pytest.mark.asyncio
-    async def test_post_create_hooks_not_called_from_catalog_core_provisioner(self):
-        """When catalog_core provisioner calls _run_core_init with _run_post_create=False,
-        post_create_catalog lifecycle hooks (including GCP's _on_post_create_catalog)
-        must NOT be invoked."""
+    async def test_post_create_hooks_not_called_from_run_core_init(self):
+        """_run_core_init must never call post_create_catalog lifecycle hooks.
+
+        The post-create fan-out (GCP's _on_post_create_catalog et al.) is
+        emitted by CatalogProvisionTask.run() after all provisioners complete,
+        not inside _run_core_init.  This test pins that invariant so a future
+        change cannot accidentally re-add the call.
+        """
         from dynastore.modules.catalog.catalog_service import CatalogService
 
         # Build a minimal CatalogService with a mock lifecycle_registry
@@ -273,15 +257,12 @@ class TestNoDoubleProvision:
                 catalog_model,
                 "ext-label",
                 "c_abc",
-                _build_checklist=False,
-                _run_post_create=False,
-                _emit_events=False,
             )
 
         # The lifecycle init_catalog MUST have been called (DDL setup hooks).
         mock_lifecycle.init_catalog.assert_awaited_once()
 
-        # post_create_catalog must NOT have been called when _run_post_create=False.
+        # post_create_catalog must NOT be called by _run_core_init.
         mock_lifecycle.post_create_catalog.assert_not_awaited()
 
 
