@@ -546,7 +546,9 @@ async function fetchDashboardStats() {
         // Platform-tier overview — sysadmin-only via the
         // web_dashboard_platform_access policy. Non-sysadmin callers get 403
         // and the catch below swallows it so the UI tile stays empty.
-        const res = await fetch('dashboard/stats');
+        const res = await fetch('dashboard/stats', {
+            headers: authToken ? { 'Authorization': `Bearer ${authToken}` } : {},
+        });
         if (!res.ok) return;
         const stats = await res.json();
         if (document.getElementById('stat-total-requests')) {
@@ -582,7 +584,9 @@ async function fetchDashboardLogs() {
         // proxy root (e.g. https://host/logs/system) and 404s behind a base path
         // like /geospatial/dev/api/catalog. apiRoot() supplies the prefix, as it
         // does for every other absolute API call in this file.
-        const res = await fetch(`${apiRoot()}/logs/system?limit=50&level=${level}`);
+        const res = await fetch(`${apiRoot()}/logs/system?limit=50&level=${level}`, {
+            headers: authToken ? { 'Authorization': `Bearer ${authToken}` } : {},
+        });
         if (!res.ok) return;
         const data = await res.json();
         const logs = data.logs || [];
@@ -624,7 +628,9 @@ async function fetchDashboardLogs() {
 
 async function fetchDashboardTasks() {
     try {
-        const res = await fetch('dashboard/tasks');
+        const res = await fetch('dashboard/tasks', {
+            headers: authToken ? { 'Authorization': `Bearer ${authToken}` } : {},
+        });
         if(!res.ok) return;
         const tasks = await res.json();
         const container = document.getElementById('dashboard-tasks');
