@@ -121,37 +121,61 @@ class TestConformanceUris:
         # /conf/dataset-map: /map at dataset level (Req 10).
         assert f"{self.BASE}dataset-map" in ms.OGC_API_MAPS_URIS
 
+    def test_contains_collection_map(self):
+        # /conf/collection-map: /collections/{cid}/map at collection level (Req 11).
+        assert f"{self.BASE}collection-map" in ms.OGC_API_MAPS_URIS
+
     def test_contains_png(self):
         assert f"{self.BASE}png" in ms.OGC_API_MAPS_URIS
 
     def test_contains_jpeg(self):
         assert f"{self.BASE}jpeg" in ms.OGC_API_MAPS_URIS
 
-    def test_contains_geotiff(self):
-        assert f"{self.BASE}geotiff" in ms.OGC_API_MAPS_URIS
+    def test_contains_tiff_not_geotiff(self):
+        # The registered Maps encoding slug is `tiff`, not `geotiff`.
+        # `geotiff` is a Coverages slug; claiming it here would be over-claiming.
+        assert f"{self.BASE}tiff" in ms.OGC_API_MAPS_URIS
+        assert f"{self.BASE}geotiff" not in ms.OGC_API_MAPS_URIS, (
+            "Over-claim: geotiff is a Coverages slug; Maps uses tiff"
+        )
 
-    def test_contains_tilesets_map(self):
-        # /conf/tilesets-map: /map/tiles/* (Req 22-24).
-        assert f"{self.BASE}tilesets-map" in ms.OGC_API_MAPS_URIS
+    def test_contains_tilesets_not_tilesets_map(self):
+        # The registered Maps tileset slug is `tilesets` (plain), not `tilesets-map`.
+        # /map/tiles returns OGC-API-Tiles-conformant TileMatrixSetList + TileMatrixSet
+        # resources, satisfying the tilesets class (Req 22-24).
+        assert f"{self.BASE}tilesets" in ms.OGC_API_MAPS_URIS
+        assert f"{self.BASE}tilesets-map" not in ms.OGC_API_MAPS_URIS, (
+            "Over-claim: tilesets-map is not a registered Maps conformance class"
+        )
 
     def test_contains_scaling(self):
-        # /conf/scaling: width/height params on /map (Req 15).
+        # /conf/scaling: width/height resample output via COGReader.part() (Req 15).
         assert f"{self.BASE}scaling" in ms.OGC_API_MAPS_URIS
 
-    def test_contains_display(self):
-        # /conf/display: bgcolor/transparent params (Req 16).
-        assert f"{self.BASE}display" in ms.OGC_API_MAPS_URIS
+    def test_contains_background_not_display(self):
+        # /conf/background: bgcolor and transparent params accepted on /map (Req 16).
+        # NOT /conf/display-resolution (mm-per-pixel class, not implemented).
+        assert f"{self.BASE}background" in ms.OGC_API_MAPS_URIS
+        assert f"{self.BASE}display" not in ms.OGC_API_MAPS_URIS, (
+            "Over-claim: display is not the registered slug for bgcolor/transparent"
+        )
+        assert f"{self.BASE}display-resolution" not in ms.OGC_API_MAPS_URIS, (
+            "Over-claim: display-resolution (mm-per-pixel) is not implemented"
+        )
 
     def test_contains_spatial_subsetting(self):
-        # /conf/spatial-subsetting: bbox/bbox-crs params (Req 17/18).
+        # /conf/spatial-subsetting: bbox/bbox-crs params accepted on /map (Req 17/18).
         assert f"{self.BASE}spatial-subsetting" in ms.OGC_API_MAPS_URIS
 
-    def test_no_map_param_not_claimed(self):
-        # /conf/map-param is NOT implemented (no 'f' param with all media types).
-        # Confirm we are not over-claiming it.
+    def test_no_overclaim(self):
+        """Classes we do NOT implement must not appear in the list."""
         not_implemented = [
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/temporal",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/general-subsetting",
+            f"{self.BASE}temporal",
+            f"{self.BASE}general-subsetting",
+            f"{self.BASE}display-resolution",
+            f"{self.BASE}geotiff",
+            f"{self.BASE}tilesets-map",
+            f"{self.BASE}display",
         ]
         for uri in not_implemented:
             assert uri not in ms.OGC_API_MAPS_URIS, f"Over-claimed: {uri}"

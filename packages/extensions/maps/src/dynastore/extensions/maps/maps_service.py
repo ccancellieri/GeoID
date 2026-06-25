@@ -86,19 +86,27 @@ OGC_API_MAPS_URIS = [
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
     # /conf/dataset-map — /map at dataset (landing) level (Req 10).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/dataset-map",
+    # /conf/collection-map — /collections/{cid}/map at collection level (Req 11).
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
     # /conf/styled-map — /styles/{styleId}/map override (Req 12).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
-    # /conf/png, /conf/jpeg, /conf/geotiff — advertised image content types.
+    # /conf/png, /conf/jpeg, /conf/tiff — advertised image content types.
+    # Note: the Maps encoding slug is `tiff` (not `geotiff`; that slug belongs
+    # to OGC API - Coverages). Both PNG and TIFF outputs are served via the
+    # format_convert pipeline (PNG passthrough; TIFF via rasterio).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
-    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/geotiff",
-    # /conf/tilesets-map — exposes /map/tiles tileset list and /map/tiles/{tms}
-    # definition resources (Req 22/23); map-tile generation (Req 24).
-    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets-map",
-    # /conf/scaling — width/height query params accepted on /map (Req 15).
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tiff",
+    # /conf/tilesets — exposes /map/tiles (OGC-API-Tiles-conformant tileset list)
+    # and /map/tiles/{tms} (tileset metadata); map-tile generation (Req 24).
+    # The Maps slug is `tilesets` (plain), not `tilesets-map`.
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets",
+    # /conf/scaling — width/height on /map resample output to the requested
+    # pixel dimensions via rio-tiler COGReader.part(width=, height=) (Req 15).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
-    # /conf/display — bgcolor/transparent accepted on /map (Req 16).
-    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/display",
+    # /conf/background — bgcolor and transparent params accepted on /map (Req 16).
+    # Note: NOT /conf/display-resolution (mm-per-pixel class, not implemented).
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/background",
     # /conf/spatial-subsetting — bbox/bbox-crs accepted on /map (Req 17/18).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
 ]
