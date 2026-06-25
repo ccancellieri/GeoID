@@ -348,12 +348,38 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         """Extract values at a geographic point (position query)."""
         from dynastore.modules.edr.query_handlers.position import (
             extract_point_values,
+            get_raster_crs,
             parse_wkt_point,
         )
-        from dynastore.modules.edr.parameter_metadata import build_parameters
+        from dynastore.modules.edr.parameter_metadata import (
+            _select_bands,
+            build_parameters,
+            filter_parameters,
+        )
+        from dynastore.modules.edr.vertical import parse_z_param, select_bands_by_z
+        from dynastore.modules.edr.crs import (
+            parse_crs_param,
+            validate_crs,
+            transform_point,
+            DEFAULT_OUTPUT_CRS,
+        )
 
         try:
             lon, lat = parse_wkt_point(coords)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            output_crs = parse_crs_param(crs)
+            if output_crs:
+                validate_crs(output_crs)
+            else:
+                output_crs = DEFAULT_OUTPUT_CRS
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            z_low, z_high = parse_z_param(z)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -373,8 +399,29 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             if parameter_name
             else None
         )
-        band_names = _resolve_band_names(item, requested_params)
-        values = extract_point_values(href, lon, lat)
+
+        bands = _select_bands(item)
+        if requested_params:
+            bands = filter_parameters(bands, requested_params)
+        band_names = [b.get("name", f"band_{i + 1}") for i, b in enumerate(bands)] if bands else ["value"]
+
+        z_bands = select_bands_by_z(bands, z_low, z_high) if bands else None
+
+        raster_crs = get_raster_crs(href)
+
+        if raster_crs and output_crs != DEFAULT_OUTPUT_CRS:
+            try:
+                out_lon, out_lat = transform_point(lon, lat, raster_crs, output_crs)
+            except Exception as exc:
+                logger.warning("CRS transformation failed, using native coordinates: %s", exc)
+                out_lon, out_lat = lon, lat
+        else:
+            out_lon, out_lat = lon, lat
+
+        values = extract_point_values(href, lon, lat, z_bands)
+
+        z_level = z_low if z_low == z_high else None
+
         dt = _item_datetime(item)
         parameters = build_parameters(item)
         if requested_params:
@@ -383,12 +430,14 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         if fmt == "covjson":
             from dynastore.modules.edr.output.coveragejson import write_position_coveragejson
 
-            gen = write_position_coveragejson(lon, lat, dt, parameters, values, band_names)
+            gen = write_position_coveragejson(
+                out_lon, out_lat, dt, parameters, values, band_names, output_crs, z_level
+            )
             return StreamingResponse(gen, media_type=_COVJSON_MEDIA_TYPE)
         else:
             from dynastore.modules.edr.output.geojson import write_position_geojson
 
-            gen = write_position_geojson(lon, lat, dt, band_names, values)
+            gen = write_position_geojson(out_lon, out_lat, dt, band_names, values)
             return StreamingResponse(gen, media_type=_GEOJSON_MEDIA_TYPE)
 
     async def query_area(
@@ -415,10 +464,34 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             extract_area_values,
             parse_wkt_polygon_bbox,
         )
-        from dynastore.modules.edr.parameter_metadata import build_parameters
+        from dynastore.modules.edr.parameter_metadata import (
+            _select_bands,
+            build_parameters,
+            filter_parameters,
+        )
+        from dynastore.modules.edr.vertical import parse_z_param, select_bands_by_z
+        from dynastore.modules.edr.crs import (
+            parse_crs_param,
+            validate_crs,
+            DEFAULT_OUTPUT_CRS,
+        )
 
         try:
             bbox = parse_wkt_polygon_bbox(coords)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            output_crs = parse_crs_param(crs)
+            if output_crs:
+                validate_crs(output_crs)
+            else:
+                output_crs = DEFAULT_OUTPUT_CRS
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            z_low, z_high = parse_z_param(z)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -443,8 +516,15 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             if parameter_name
             else None
         )
-        band_names = _resolve_band_names(item, requested_params)
-        _, _, band_arrays = extract_area_values(href, bbox)
+
+        bands = _select_bands(item)
+        if requested_params:
+            bands = filter_parameters(bands, requested_params)
+        band_names = [b.get("name", f"band_{i + 1}") for i, b in enumerate(bands)] if bands else ["value"]
+
+        z_bands = select_bands_by_z(bands, z_low, z_high) if bands else None
+
+        _, _, band_arrays = extract_area_values(href, bbox, z_bands)
 
         parameters = build_parameters(item)
         if requested_params:
@@ -452,7 +532,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
 
         from dynastore.modules.edr.output.coveragejson import write_area_coveragejson
 
-        gen = write_area_coveragejson(bbox, parameters, band_names, band_arrays)
+        gen = write_area_coveragejson(bbox, parameters, band_names, band_arrays, output_crs)
         return StreamingResponse(gen, media_type=_COVJSON_MEDIA_TYPE)
 
     async def query_cube(
@@ -479,10 +559,34 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         """
         from dynastore.modules.edr.query_handlers.area import extract_area_values
         from dynastore.modules.edr.query_handlers.cube import parse_cube_bbox
-        from dynastore.modules.edr.parameter_metadata import build_parameters
+        from dynastore.modules.edr.parameter_metadata import (
+            _select_bands,
+            build_parameters,
+            filter_parameters,
+        )
+        from dynastore.modules.edr.vertical import parse_z_param, select_bands_by_z
+        from dynastore.modules.edr.crs import (
+            parse_crs_param,
+            validate_crs,
+            DEFAULT_OUTPUT_CRS,
+        )
 
         try:
             parsed_bbox = parse_cube_bbox(bbox)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            output_crs = parse_crs_param(crs)
+            if output_crs:
+                validate_crs(output_crs)
+            else:
+                output_crs = DEFAULT_OUTPUT_CRS
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            z_low, z_high = parse_z_param(z)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -507,8 +611,15 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             if parameter_name
             else None
         )
-        band_names = _resolve_band_names(item, requested_params)
-        _, _, band_arrays = extract_area_values(href, parsed_bbox)
+
+        bands = _select_bands(item)
+        if requested_params:
+            bands = filter_parameters(bands, requested_params)
+        band_names = [b.get("name", f"band_{i + 1}") for i, b in enumerate(bands)] if bands else ["value"]
+
+        z_bands = select_bands_by_z(bands, z_low, z_high) if bands else None
+
+        _, _, band_arrays = extract_area_values(href, parsed_bbox, z_bands)
 
         parameters = build_parameters(item)
         if requested_params:
@@ -516,7 +627,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
 
         from dynastore.modules.edr.output.coveragejson import write_area_coveragejson
 
-        gen = write_area_coveragejson(parsed_bbox, parameters, band_names, band_arrays)
+        gen = write_area_coveragejson(parsed_bbox, parameters, band_names, band_arrays, output_crs)
         return StreamingResponse(gen, media_type=_COVJSON_MEDIA_TYPE)
 
     # ------------------------------------------------------------------

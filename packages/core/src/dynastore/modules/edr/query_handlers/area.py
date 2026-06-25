@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def parse_wkt_polygon_bbox(wkt: str) -> Tuple[float, float, float, float]:
@@ -62,8 +62,15 @@ def parse_wkt_polygon_bbox(wkt: str) -> Tuple[float, float, float, float]:
 def extract_area_values(
     href: str,
     bbox: Tuple[float, float, float, float],
+    z_bands: Optional[List[int]] = None,
 ) -> Tuple[Any, Any, Dict[int, List]]:
     """Extract area data from a raster clipped to bbox.
+
+    Args:
+        href: Raster asset URI
+        bbox: Bounding box as (min_lon, min_lat, max_lon, max_lat)
+        z_bands: Optional list of 1-based band indices to extract.
+                 If None, extracts all bands.
 
     Returns (RasterGeoRef, WindowBox, {band_index: [[row values], ...]}).
     Lazy-imports rasterio.
@@ -94,12 +101,32 @@ def extract_area_values(
         )
         box = resolve_window(req, ref)
 
+        bands_to_read = z_bands if z_bands else list(range(1, ds.count + 1))
+
         band_arrays: Dict[int, List] = {}
-        for band_idx in range(1, ds.count + 1):
+        for band_idx in bands_to_read:
+            if band_idx < 1 or band_idx > ds.count:
+                band_arrays[band_idx] = []
+                continue
             rows: List = []
             for chunk in read_window_iter(ds, box, band=band_idx):
                 rows.extend(chunk.tolist())
             band_arrays[band_idx] = rows
         return ref, box, band_arrays
+    finally:
+        ds.close()
+
+
+def get_raster_crs(href: str) -> Optional[str]:
+    """Get the CRS of a raster asset.
+
+    Returns the CRS as a string (typically EPSG:XXXX or WKT).
+    Returns None if CRS cannot be determined.
+    """
+    from dynastore.modules.gdal.service import open_raster_vsi
+
+    ds = open_raster_vsi(href)
+    try:
+        return str(ds.crs) if ds.crs else None
     finally:
         ds.close()

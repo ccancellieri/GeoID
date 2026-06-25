@@ -31,8 +31,21 @@ def write_position_coveragejson(
     parameters: Dict[str, Any],
     values: Dict[int, Optional[float]],
     band_names: List[str],
+    output_crs: str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+    z_level: Optional[float] = None,
 ) -> Iterator[bytes]:
-    """Emit a CoverageJSON Coverage for a point (position) query."""
+    """Emit a CoverageJSON Coverage for a point (position) query.
+
+    Args:
+        lon: X coordinate (transformed to output CRS)
+        lat: Y coordinate (transformed to output CRS)
+        datetime_val: ISO 8601 datetime string
+        parameters: EDR parameter metadata
+        values: Dict of band_index → value
+        band_names: List of band names for the output
+        output_crs: CRS URI for the output coordinates
+        z_level: Optional vertical level value
+    """
     axes: Dict[str, Any] = {
         "x": {"values": [lon]},
         "y": {"values": [lat]},
@@ -42,7 +55,7 @@ def write_position_coveragejson(
             "coordinates": ["x", "y"],
             "system": {
                 "type": "GeographicCRS",
-                "id": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+                "id": output_crs,
             },
         }
     ]
@@ -55,14 +68,26 @@ def write_position_coveragejson(
             }
         )
 
+    if z_level is not None:
+        axes["z"] = {"values": [z_level]}
+        referencing.append(
+            {
+                "coordinates": ["z"],
+                "system": {"type": "VerticalRS", "orientation": "up"},
+            }
+        )
+
     ranges: Dict[str, Any] = {}
     for idx, name in enumerate(band_names, start=1):
         v = values.get(idx)
+        axis_names = ["y", "x"]
+        if z_level is not None:
+            axis_names = ["z"] + axis_names
         ranges[name] = {
             "type": "NdArray",
             "dataType": "float",
-            "axisNames": ["y", "x"],
-            "shape": [1, 1],
+            "axisNames": axis_names,
+            "shape": [1] * len(axis_names),
             "values": [v],
         }
 

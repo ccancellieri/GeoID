@@ -42,8 +42,16 @@ def extract_point_values(
     href: str,
     lon: float,
     lat: float,
+    z_bands: Optional[list[int]] = None,
 ) -> Dict[int, Optional[float]]:
-    """Extract pixel values at (lon, lat) for all bands.
+    """Extract pixel values at (lon, lat) for specified bands.
+
+    Args:
+        href: Raster asset URI
+        lon: Longitude coordinate
+        lat: Latitude coordinate
+        z_bands: Optional list of 1-based band indices to extract.
+                 If None, extracts all bands.
 
     Returns a dict mapping 1-based band index → float value (or None on error).
     Lazy-imports rasterio so callers without it can import this module.
@@ -71,7 +79,6 @@ def extract_point_values(
             axis_order=("Lon", "Lat"),
         )
         box = resolve_window(req, ref)
-        # A point collapses the window to 0x0 — expand to a single pixel.
         if box.width == 0 or box.height == 0:
             col = max(0, min(box.col_off, ref.width - 1))
             row = max(0, min(box.row_off, ref.height - 1))
@@ -79,13 +86,33 @@ def extract_point_values(
 
         import rasterio.windows
 
+        bands_to_read = z_bands if z_bands else list(range(1, ds.count + 1))
+
         values: Dict[int, Optional[float]] = {}
-        for band_idx in range(1, ds.count + 1):
+        for band_idx in bands_to_read:
+            if band_idx < 1 or band_idx > ds.count:
+                values[band_idx] = None
+                continue
             arr = ds.read(
                 band_idx,
-                window=rasterio.windows.Window(box.col_off, box.row_off, box.width, box.height),  # type: ignore
+                window=rasterio.windows.Window(box.col_off, box.row_off, box.width, box.height),
             )
             values[band_idx] = float(arr.flat[0]) if arr.size > 0 else None
         return values
+    finally:
+        ds.close()
+
+
+def get_raster_crs(href: str) -> Optional[str]:
+    """Get the CRS of a raster asset.
+
+    Returns the CRS as a string (typically EPSG:XXXX or WKT).
+    Returns None if CRS cannot be determined.
+    """
+    from dynastore.modules.gdal.service import open_raster_vsi
+
+    ds = open_raster_vsi(href)
+    try:
+        return str(ds.crs) if ds.crs else None
     finally:
         ds.close()
