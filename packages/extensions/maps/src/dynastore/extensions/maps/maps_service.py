@@ -20,11 +20,13 @@
 
 import logging
 import asyncio
-from typing import Any, FrozenSet, Optional
+from typing import Any, FrozenSet, List, Optional
 from concurrent.futures import ProcessPoolExecutor
 from fastapi import Depends, FastAPI, APIRouter, HTTPException, Response, Query, Request, Path
 from sqlalchemy.ext.asyncio import AsyncConnection
 from contextlib import asynccontextmanager
+
+from dynastore.modules.concurrency import run_in_thread
 
 from dynastore.extensions.tools.db import get_async_engine
 from dynastore.modules.db_config.query_executor import managed_transaction
@@ -58,14 +60,47 @@ from dynastore.modules.tiles.tms_definitions import BUILTIN_TILE_MATRIX_SETS
 
 logger = logging.getLogger(__name__)
 
+# Slice 2: raster render imports — guarded so the maps extension can still
+# load in environments without rio-tiler (graceful degradation: raster
+# branch returns 422 when rio-tiler is absent rather than failing import).
+_RENDER_COG_MAP = None
+_RENDER_COG_TILE = None
+_PARSE_SLD_COLORMAP = None
+_BUILD_RENDER_CACHE_KEY = None
+_RenderCachingConfig = None
+try:
+    from dynastore.modules.renders.engine import render_cog_map as _rcm, render_cog_tile as _rct  # noqa: E402
+    from dynastore.modules.renders.colormap import parse_sld_colormap as _psc  # noqa: E402
+    from dynastore.modules.renders.config import build_render_cache_key as _brck, RenderCachingConfig as _RCC  # noqa: E402
+    _RENDER_COG_MAP = _rcm
+    _RENDER_COG_TILE = _rct
+    _PARSE_SLD_COLORMAP = _psc
+    _BUILD_RENDER_CACHE_KEY = _brck
+    _RenderCachingConfig = _RCC
+except ImportError:
+    pass
+
 OGC_API_MAPS_URIS = [
+    # OGC API - Maps Part 1: Core — req/conf classes
+    # /conf/core implements the /map operation (Req 7/8) for any collection.
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
+    # /conf/dataset-map — /map at dataset (landing) level (Req 10).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/dataset-map",
+    # /conf/styled-map — /styles/{styleId}/map override (Req 12).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
+    # /conf/png, /conf/jpeg, /conf/geotiff — advertised image content types.
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/geotiff",
+    # /conf/tilesets-map — exposes /map/tiles tileset list and /map/tiles/{tms}
+    # definition resources (Req 22/23); map-tile generation (Req 24).
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets-map",
+    # /conf/scaling — width/height query params accepted on /map (Req 15).
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
+    # /conf/display — bgcolor/transparent accepted on /map (Req 16).
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/display",
+    # /conf/spatial-subsetting — bbox/bbox-crs accepted on /map (Req 17/18).
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
 ]
 
 
@@ -139,6 +174,350 @@ async def _validate_collections_helper(conn, dataset, requested_collections):
         if collection_metadata_results[i] and physical_table_results[i]:
             valid_collections.append(coll_id)
     return valid_collections
+
+async def _resolve_raster_cog_href(
+    catalog_id: str,
+    collection_id: str,
+) -> Optional[str]:
+    """Return the first COG asset href from a raster collection, or None.
+
+    Searches for a ``data`` or ``coverage`` asset key first, then falls back
+    to the first asset carrying an ``href``.  Returns ``None`` when the
+    collection has no items or no usable href.
+    """
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if not catalogs_svc:
+        return None
+    try:
+        from dynastore.models.query_builder import QueryRequest  # type: ignore[import]
+        features = await catalogs_svc.search_items(
+            catalog_id, collection_id, QueryRequest(limit=1)
+        )
+    except Exception:
+        return None
+    if not features:
+        return None
+    first = features[0]
+    item: dict = (
+        first.model_dump(by_alias=True, exclude_none=True)
+        if hasattr(first, "model_dump")
+        else dict(first)
+    )
+    assets = item.get("assets") or {}
+    for key in ("data", "coverage"):
+        if key in assets and assets[key].get("href"):
+            return assets[key]["href"]
+    for a in assets.values():
+        if a.get("href"):
+            return a["href"]
+    return None
+
+
+async def _resolve_raster_colormap(
+    catalog_id: str,
+    collection_id: str,
+    style_name: Optional[str],
+    conn: Any,
+) -> Optional[Any]:
+    """Parse an SLD colormap for a raster collection.
+
+    Returns the ``RioColormap`` dict (``{int: (R,G,B,A)}``) when an SLD
+    stylesheet is found and parseable, or ``None`` when no style was
+    requested or no SLD stylesheet is available. A parse failure is logged
+    and treated as no colormap (raw pixel values rendered).
+    """
+    if not style_name or _PARSE_SLD_COLORMAP is None:
+        return None
+    sheet = await _get_style_to_render(conn, catalog_id, collection_id, style_name)
+    if sheet is None:
+        return None
+    from dynastore.modules.styles.models import SLDContent, StyleFormatEnum  # type: ignore[import]
+    content = getattr(sheet, "content", None)
+    if content is None:
+        return None
+    if isinstance(content, SLDContent):
+        sld_body = content.sld_body
+    elif isinstance(content, dict) and content.get("format") == StyleFormatEnum.SLD_1_1:
+        sld_body = content.get("sld_body")
+    else:
+        return None
+    if not sld_body:
+        return None
+    try:
+        cmap = _PARSE_SLD_COLORMAP(sld_body)  # type: ignore[misc]
+        return cmap or None
+    except Exception as exc:
+        logger.warning(
+            "maps/raster: SLD colormap parse failed for %s/%s style=%s: %s",
+            catalog_id, collection_id, style_name, exc,
+        )
+        return None
+
+
+async def _resolve_internal_collection_id(
+    catalog_id: str,
+    collection_id: str,
+) -> str:
+    """Resolve external collection id to internal immutable id.
+
+    Returns the provided ``collection_id`` unchanged when the catalogs
+    service does not support ``resolve_collection_id`` (e.g. test stubs).
+    """
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if not catalogs_svc:
+        return collection_id
+    try:
+        internal_id = await catalogs_svc.collections.resolve_collection_id(
+            catalog_id, collection_id, allow_missing=False
+        )
+        return internal_id if internal_id else collection_id
+    except Exception:
+        return collection_id
+
+
+async def _is_raster_collection(catalog_id: str, collection_id: str) -> bool:
+    """Return True when the collection is of kind RASTER."""
+    from dynastore.models.protocols import ConfigsProtocol as _ConfigsProtocol  # type: ignore[import]
+    from dynastore.modules.catalog.catalog_config import CollectionInfo, CollectionKind  # type: ignore[import]
+    configs_svc = get_protocol(_ConfigsProtocol)
+    if not configs_svc:
+        return False
+    try:
+        info = await configs_svc.get_config(CollectionInfo, catalog_id, collection_id)
+        return isinstance(info, CollectionInfo) and info.kind == CollectionKind.RASTER
+    except Exception:
+        return False
+
+
+async def _render_raster_map(
+    *,
+    catalog_id: str,
+    collection_id: str,
+    bbox: List[float],
+    width: int,
+    height: int,
+    style_name: Optional[str],
+    fmt: str,
+    request: Any,
+) -> Response:
+    """Raster branch for ``GET /{dataset}/map``.
+
+    Resolves external→internal IDs, enforces collection visibility, fetches
+    the COG href and SLD colormap (with a brief DB window for the style only),
+    then renders via ``render_cog_map`` in a thread.  The DB connection is
+    released before the CPU-bound render to satisfy GeoID #703.
+
+    Args:
+        catalog_id: External (public) catalog ID.
+        collection_id: External (public) collection ID.
+        bbox: ``[min_lon, min_lat, max_lon, max_lat]`` in EPSG:4326.
+        width: Output pixel width.
+        height: Output pixel height.
+        style_name: Optional style identifier for SLD colormap lookup.
+        fmt: Output format string (``"png"``, ``"jpeg"``, or ``"geotiff"``).
+        request: FastAPI ``Request`` (used to get the async DB engine).
+    """
+    if _RENDER_COG_MAP is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Raster rendering is not available: rio-tiler is not installed.",
+        )
+
+    # Resolve external → internal IDs at the request boundary so cache keys
+    # and visibility checks use the immutable internal id.
+    internal_catalog_id = catalog_id
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if catalogs_svc:
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            ) or catalog_id
+        except Exception:
+            pass
+
+    internal_collection_id = await _resolve_internal_collection_id(
+        internal_catalog_id, collection_id
+    )
+
+    # Visibility guard mirrors tiles/coverages/EDR pattern.
+    from dynastore.models.protocols.visibility import resolve_collection_listing_ids  # type: ignore[import]
+    visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
+    if visible_ids is not None and internal_collection_id not in visible_ids:
+        raise HTTPException(status_code=404, detail="Collection not found.")
+
+    # Fetch the COG href from the first item (no DB connection held).
+    cog_href = await _resolve_raster_cog_href(internal_catalog_id, internal_collection_id)
+    if not cog_href:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No COG asset found for collection '{collection_id}'.",
+        )
+
+    # Resolve colormap from SLD style if requested (opens and closes a DB
+    # connection for the style lookup, then releases before the render).
+    colormap = None
+    if style_name:
+        engine = get_async_engine(request)
+        async with managed_transaction(engine) as conn:
+            colormap = await _resolve_raster_colormap(
+                internal_catalog_id, internal_collection_id, style_name, conn
+            )
+
+    # Render via rio-tiler in a thread (no DB connection held during render).
+    try:
+        image_bytes: bytes = await run_in_thread(
+            _RENDER_COG_MAP,
+            cog_href,
+            bbox=bbox,
+            width=width,
+            height=height,
+            colormap=colormap,
+            output_format="PNG",
+        )
+    except Exception as exc:
+        logger.error(
+            "maps/raster: render_cog_map failed for %s/%s: %s",
+            internal_catalog_id, internal_collection_id, exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Raster map render failed: {exc}"
+        ) from exc
+
+    # Convert to requested output format.
+    try:
+        out_bytes = _convert_png_to_format(image_bytes, fmt, bbox=bbox, crs="EPSG:4326")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("maps/raster: format conversion failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Format conversion failed."
+        ) from exc
+
+    return Response(content=out_bytes, media_type=_FORMAT_MEDIA_TYPES[fmt])
+
+
+async def _render_raster_map_tile(
+    *,
+    catalog_id: str,
+    collection_id: str,
+    tms_id: str,
+    z: int,
+    x: int,
+    y: int,
+    tile_width: int,
+    tile_height: int,
+    tms_def: Any,
+    style_name: Optional[str],
+    request: Any,
+) -> Response:
+    """Raster branch for ``GET /{dataset}/map/tiles/{tms}/{z}/{x}/{y}``.
+
+    For WebMercatorQuad the native ``render_cog_tile`` path is used (rio-tiler
+    reads the correct overview directly).  For other TMS the bbox is computed
+    from the tile matrix geometry and rendered via ``render_cog_map``.
+
+    DB connection is opened only for the style lookup and released before the
+    CPU-bound render (GeoID #703).
+    """
+    if _RENDER_COG_TILE is None or _RENDER_COG_MAP is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Raster rendering is not available: rio-tiler is not installed.",
+        )
+
+    # External → internal ID resolution at the request boundary.
+    internal_catalog_id = catalog_id
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if catalogs_svc:
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            ) or catalog_id
+        except Exception:
+            pass
+
+    internal_collection_id = await _resolve_internal_collection_id(
+        internal_catalog_id, collection_id
+    )
+
+    # Visibility guard.
+    from dynastore.models.protocols.visibility import resolve_collection_listing_ids  # type: ignore[import]
+    visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
+    if visible_ids is not None and internal_collection_id not in visible_ids:
+        raise HTTPException(status_code=404, detail="Collection not found.")
+
+    # COG href from the first item.
+    cog_href = await _resolve_raster_cog_href(internal_catalog_id, internal_collection_id)
+    if not cog_href:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No COG asset found for collection '{collection_id}'.",
+        )
+
+    # Colormap from SLD style (DB connection released before render).
+    colormap = None
+    if style_name:
+        engine = get_async_engine(request)
+        async with managed_transaction(engine) as conn:
+            colormap = await _resolve_raster_colormap(
+                internal_catalog_id, internal_collection_id, style_name, conn
+            )
+
+    # Render in a thread.  WebMercatorQuad uses the native tile reader;
+    # other TMS fall back to the bbox reader so the overview selection is
+    # still correct (rio-tiler picks the best overview for the given area).
+    _WMQ = "WebMercatorQuad"
+    try:
+        if tms_id == _WMQ:
+            tile_bytes: bytes = await run_in_thread(
+                _RENDER_COG_TILE,
+                cog_href,
+                z,
+                x,
+                y,
+                colormap=colormap,
+                output_format="PNG",
+            )
+        else:
+            # Compute geographic bbox from tile matrix geometry (TopLeft origin).
+            matrix_def = next(
+                (m for m in tms_def.tileMatrices if m.id == str(z)), None
+            )
+            if matrix_def is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Zoom level '{z}' not found in TMS '{tms_id}'.",
+                )
+            px = matrix_def.tileWidth * matrix_def.cellSize
+            py = matrix_def.tileHeight * matrix_def.cellSize
+            min_x = matrix_def.pointOfOrigin[0] + x * px
+            max_y = matrix_def.pointOfOrigin[1] - y * py
+            bbox_tile = [min_x, max_y - py, min_x + px, max_y]
+            tile_bytes = await run_in_thread(
+                _RENDER_COG_MAP,
+                cog_href,
+                bbox=bbox_tile,
+                width=tile_width,
+                height=tile_height,
+                colormap=colormap,
+                output_format="PNG",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "maps/raster: tile render failed for %s/%s tms=%s z=%s x=%s y=%s: %s",
+            internal_catalog_id, internal_collection_id, tms_id, z, x, y, exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Raster tile render failed: {exc}"
+        ) from exc
+
+    return Response(content=tile_bytes, media_type="image/png")
+
 
 def _return_empty_tile(width, height):
     # Create a transparent 1x1 pixel or full size empty PNG
@@ -357,6 +736,26 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         if not (0 <= x < matrix_def.matrixWidth and 0 <= y < matrix_def.matrixHeight):
             raise HTTPException(status_code=400, detail="Tile coordinates out of bounds.")
 
+        # 3a. Raster branch — when the first collection is RASTER-kind, use the
+        # COG tile engine instead of the vector pipeline. DB connection is not
+        # opened here; the COG path resolves items and styles without one.
+        requested_collections_raw = [c.strip() for c in collections.split(',')]
+        first_collection = requested_collections_raw[0] if requested_collections_raw else ""
+        if first_collection and await _is_raster_collection(dataset, first_collection):
+            return await _render_raster_map_tile(
+                catalog_id=dataset,
+                collection_id=first_collection,
+                tms_id=tileMatrixSetId,
+                z=int(z),
+                x=x,
+                y=y,
+                tile_width=matrix_def.tileWidth,
+                tile_height=matrix_def.tileHeight,
+                tms_def=tms_def,
+                style_name=style,
+                request=request,
+            )
+
         # Steps 4-8 only need the DB. Acquire a connection for that window and
         # release it before the CPU-bound render (step 9) so a pooled slot is
         # never held across run_in_executor (GeoID #703).
@@ -494,6 +893,21 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         except ValueError as e:
             raise HTTPException(status_code=400, detail="Invalid BBOX format.") from e
 
+        # Raster branch: when the first requested collection is RASTER-kind,
+        # skip the vector DB/render pipeline entirely and use the COG engine.
+        first_collection = requested_collections[0] if requested_collections else ""
+        if first_collection and await _is_raster_collection(dataset, first_collection):
+            return await _render_raster_map(
+                catalog_id=dataset,
+                collection_id=first_collection,
+                bbox=bbox_list,
+                width=width,
+                height=height,
+                style_name=style,
+                fmt=fmt,
+                request=request,
+            )
+
         # The DB-dependent steps (collection validation, feature fetch, style
         # resolution) run under a single connection that is released before the
         # CPU-bound render below, so a pooled slot is never held across
@@ -545,8 +959,8 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             image_bytes = await loop.run_in_executor(
                 MapsService.process_pool,
                 render_map_image,
-                width, height, bbox_list, crs, 
-                layer_config.geometry_storage.target_srid, 
+                width, height, bbox_list, crs,
+                layer_config.geometry_storage.target_srid,
                 layers_data, style_to_render,
                 transparent, bgcolor
             )

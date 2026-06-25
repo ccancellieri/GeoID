@@ -16,21 +16,19 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Render engine seam: COG → styled raster tile bytes via rio-tiler.
+"""Render engine seam: COG → styled raster image bytes via rio-tiler.
 
-The public surface is a single function ``render_cog_tile`` that:
+Public surface:
 
-1. Opens the COG href through rio-tiler's ``COGReader`` (which selects the
-   correct overview for the zoom and handles GDAL VSI for remote hrefs on
-   S3/GCS automatically).
-2. Reads band 1 (single-band assumption: Slice 1 scope).
-3. Applies the caller-supplied colormap (a rio-tiler discrete dict
-   ``{int: (R,G,B,A)}``) and renders to PNG or WebP bytes.
+* ``render_cog_tile`` — reads a WebMercatorQuad tile at (z, x, y).
+* ``render_cog_map``  — reads an arbitrary bbox at a given width/height
+  (Slice 2 addition for OGC API-Maps ``/map`` support).
 
-The function is isolated behind this module so that the colormap parser,
-cache-key logic, and STAC contributor can be unit-tested **without** a
-real GDAL/rio-tiler environment — they only import from ``.colormap`` and
-``.config``, never from ``.engine``.
+Both functions apply the same colormap/format pipeline and are isolated
+behind this module so that the colormap parser, cache-key logic, and STAC
+contributor can be unit-tested **without** a real GDAL/rio-tiler
+environment — they only import from ``.colormap`` and ``.config``, never
+from ``.engine``.
 
 Output format: ``"PNG"`` or ``"WEBP"`` (uppercase, as accepted by
 ``ImageData.render``).
@@ -39,7 +37,7 @@ Output format: ``"PNG"`` or ``"WEBP"`` (uppercase, as accepted by
 from __future__ import annotations
 
 import logging
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +96,68 @@ def render_cog_tile(
             tile_y=y,
             tile_z=z,
             indexes=(band,),
+        )
+
+    return img.render(
+        img_format=output_format,
+        colormap=colormap,
+        add_mask=True,
+    )
+
+
+def render_cog_map(
+    href: str,
+    *,
+    bbox: List[float],
+    width: int,
+    height: int,
+    colormap: Optional[RioColormap] = None,
+    output_format: OutputFormat = "PNG",
+    band: int = 1,
+) -> bytes:
+    """Render a COG asset over an arbitrary geographic bounding box.
+
+    Opens the COG at ``href`` via rio-tiler's ``COGReader``, reads the region
+    defined by ``bbox`` (``[min_lon, min_lat, max_lon, max_lat]`` in
+    WGS-84 / EPSG:4326) at the requested pixel dimensions, applies
+    ``colormap`` if supplied, and returns the rendered image bytes.
+
+    This is the Slice 2 companion to ``render_cog_tile``: the tile function
+    handles WebMercatorQuad z/x/y requests; this function handles the
+    OGC API-Maps ``/map?bbox=...&width=...&height=...`` form.
+
+    Args:
+        href: COG asset URL (S3, GCS, or HTTPS).
+        bbox: ``[min_lon, min_lat, max_lon, max_lat]`` in EPSG:4326.
+        width: Output image width in pixels.
+        height: Output image height in pixels.
+        colormap: Discrete colormap ``{pixel_value: (R, G, B, A)}``.
+            Pass ``None`` to render raw values.
+        output_format: ``"PNG"`` (default) or ``"WEBP"``.
+        band: Band index to read (1-based). Defaults to 1.
+
+    Returns:
+        Raw image bytes in the requested format.
+
+    Raises:
+        ImportError: When ``rio-tiler`` is not installed.
+        Exception: Any rio-tiler / GDAL error is propagated to the caller.
+    """
+    try:
+        from rio_tiler.io import COGReader  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "rio-tiler is required for COG rendering. "
+            "Install the renders extension: `pip install dynastore-ext-renders`."
+        ) from exc
+
+    min_lon, min_lat, max_lon, max_lat = bbox
+    with COGReader(input=href) as cog:  # type: ignore[call-arg]
+        img = cog.part(
+            bbox=(min_lon, min_lat, max_lon, max_lat),
+            indexes=(band,),
+            width=width,
+            height=height,
         )
 
     return img.render(
