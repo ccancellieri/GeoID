@@ -4,6 +4,7 @@
 import { getJSON } from "../static/common/api.js";
 import { register, t } from "../static/common/i18n.js";
 import { apiUrl } from "../static/common/url.js";
+import { mountEntitySelector } from "../static/common/entity-selector.js";
 
 register({
   en: { "sty.loading": "Loading…", "sty.none": "Nothing to show", "sty.error": "Failed to load" },
@@ -58,7 +59,6 @@ async function showDetail(s) {
   row(table, "legend", link(`${base}/legend`, "legend"));
   bodyEl.appendChild(table);
 
-  // Best-effort metadata expansion; the links above remain authoritative.
   try {
     const meta = await getJSON(`${base}/metadata`);
     const pre = document.createElement("pre");
@@ -67,29 +67,22 @@ async function showDetail(s) {
   } catch (e) { /* metadata is optional; links already rendered */ }
 }
 
-async function showStyles() {
-  navEl.textContent = t("sty.loading");
-  try {
-    const res = await getJSON("/styles/all");
-    const styles = res.styles || res;
-    navEl.replaceChildren();
-    if (!styles || styles.length === 0) {
-      const p = document.createElement("p");
-      p.textContent = t("sty.none");
-      navEl.appendChild(p);
-      return;
-    }
-    const ul = document.createElement("ul");
-    for (const s of styles) {
-      const li = document.createElement("li");
-      const b = document.createElement("button");
-      b.textContent = `${s.title || s.id} · ${s.catalog_id}/${s.collection_id}`;
-      b.addEventListener("click", () => showDetail(s));
-      li.appendChild(b);
-      ul.appendChild(li);
-    }
-    navEl.appendChild(ul);
-  } catch (e) { navEl.textContent = t("sty.error"); }
+function styleSource() {
+  return {
+    supportsSearch: false,
+    paginated: false,
+    labelOf: (s) => `${s.title || s.id} · ${s.catalog_id}/${s.collection_id}`,
+    idOf: (s) => `${s.catalog_id}/${s.collection_id}/${s.id}`,
+    async fetch() {
+      const res = await getJSON("/styles/all");
+      const items = res.styles || res || [];
+      return { items, hasMore: false };
+    },
+  };
 }
 
-showStyles();
+mountEntitySelector({
+  root: navEl,
+  source: styleSource(),
+  onChange: (s) => { if (s) showDetail(s); },
+});

@@ -4,6 +4,7 @@
 import { getJSON, postJSON } from "../static/common/api.js";
 import { register, t, lang } from "../static/common/i18n.js";
 import { initMap, showGeoJSON } from "../static/common/leaflet-map.js";
+import { mountEntitySelector } from "../static/common/entity-selector.js";
 
 // ---------------------------------------------------------------------------
 // i18n dictionaries
@@ -142,51 +143,20 @@ register({
 // State
 // ---------------------------------------------------------------------------
 
-let _catalogId = null;   // currently selected catalog
-let _collectionId = null; // currently selected collection
+let _catalogId = null;
+let _collectionId = null;
+let _currentLevel = "catalogs";
 
-// Leaflet map + layer ref for item geometry preview
 let _map = null;
 const _layerRef = { current: null };
+
+let _selectorCtrl = null;
 
 // ---------------------------------------------------------------------------
 // DOM helpers
 // ---------------------------------------------------------------------------
 
 function el(id) { return document.getElementById(id); }
-
-function setLoading(msg) {
-  const list = el("items-list");
-  list.innerHTML = "";
-  const wrap = document.createElement("div");
-  wrap.className = "loading-spinner";
-  // Static author-controlled icon markup — no API data interpolated.
-  const icon = document.createElement("i");
-  icon.className = "fa-solid fa-circle-notch fa-spin text-xl";
-  const p = document.createElement("p");
-  p.className = "mt-2 text-sm";
-  // msg is always a translation string (t(...)) or undefined — plain text only.
-  p.textContent = msg || t("sidebar.loading");
-  wrap.appendChild(icon);
-  wrap.appendChild(p);
-  list.appendChild(wrap);
-}
-
-function setListError(msg) {
-  // msg is always produced by t(...) with e.message substituted — plain text.
-  const list = el("items-list");
-  list.innerHTML = "";
-  const wrap = document.createElement("div");
-  wrap.className = "error-box m-2";
-  // Static author-controlled icon markup — no API data interpolated.
-  const icon = document.createElement("i");
-  icon.className = "fa-solid fa-triangle-exclamation mr-2";
-  const span = document.createElement("span");
-  span.textContent = msg;
-  wrap.appendChild(icon);
-  wrap.appendChild(span);
-  list.appendChild(wrap);
-}
 
 function showNotice(container, text, isError) {
   const div = document.createElement("div");
@@ -221,201 +191,114 @@ function _escHtml(s) {
 }
 
 // ---------------------------------------------------------------------------
-// Auth — gate create buttons client-side (API enforces regardless)
+// Source adapters for entity-selector
 // ---------------------------------------------------------------------------
 
-async function resolveCanWrite() {
-  try {
-    const me = await getJSON("/iam/me");
-    const roles = me.roles || [];
-    // Treat any authenticated principal with a role as potentially allowed;
-    // the API will return 403 if the specific action is denied.
-    return roles.length > 0;
-  } catch (e) {
-    if (e.status === 404 || e.status === 401) {
-      // No-IAM deployment or anonymous — show forms and let the API decide.
-      return true;
-    }
-    // Other errors (network, 500) — default to showing forms; API enforces.
-    return true;
-  }
+function stacCatalogSource() {
+  return {
+    supportsSearch: false,
+    paginated: false,
+    labelOf: (c) => c.title || c.id,
+    idOf: (c) => c.id,
+    async fetch() {
+      const data = await getJSON("/stac/catalogs?language=" + lang());
+      const items = Array.isArray(data) ? data : (data.catalogs || data.collections || []);
+      return { items, hasMore: false };
+    },
+  };
+}
+
+function stacCollectionSource(catalogId) {
+  return {
+    supportsSearch: false,
+    paginated: false,
+    labelOf: (c) => c.title || c.id,
+    idOf: (c) => c.id,
+    async fetch() {
+      const data = await getJSON(
+        "/stac/catalogs/" + encodeURIComponent(catalogId) + "/collections?language=" + lang()
+      );
+      const items = Array.isArray(data) ? data : (data.collections || data.items || []);
+      return { items, hasMore: false };
+    },
+  };
+}
+
+function stacItemSource(catalogId, collectionId) {
+  return {
+    supportsSearch: false,
+    paginated: false,
+    labelOf: (f) => f.id,
+    idOf: (f) => f.id,
+    async fetch() {
+      const data = await getJSON(
+        "/stac/catalogs/" +
+          encodeURIComponent(catalogId) +
+          "/collections/" +
+          encodeURIComponent(collectionId) +
+          "/items?language=" +
+          lang()
+      );
+      const items = Array.isArray(data) ? data : (data.features || data.items || []);
+      return { items, hasMore: false };
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Sidebar rendering — catalog list
+// Navigation
 // ---------------------------------------------------------------------------
 
-async function loadCatalogs() {
-  setLoading();
+function showCatalogs() {
   _catalogId = null;
   _collectionId = null;
-  setBreadcrumb([{ label: t("nav.catalogs"), action: loadCatalogs }]);
+  _currentLevel = "catalogs";
+  setBreadcrumb([{ label: t("nav.catalogs"), action: showCatalogs }]);
   el("btn-create-catalog").style.display = "";
   el("btn-create-collection").style.display = "none";
-
-  try {
-    const data = await getJSON("/stac/catalogs?language=" + lang());
-    const list = Array.isArray(data) ? data : (data.catalogs || data.collections || []);
-    if (list.length === 0) {
-      setLoading(t("sidebar.no_results"));
-      return;
-    }
-    renderSidebarItems(
-      list.map((c) => ({
-        id: c.id,
-        label: c.title || c.id,
-        sub: "catalog",
-        icon: "fa-database",
-        action: () => loadCollections(c.id, c.title || c.id),
-      }))
-    );
-  } catch (e) {
-    setListError(t("err.load", { msg: e.message }));
-  }
+  el("items-list").replaceChildren();
+  _selectorCtrl = mountEntitySelector({
+    root: el("items-list"),
+    source: stacCatalogSource(),
+    onChange: (c) => { if (c) showCollections(c.id, c.title || c.id); },
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Sidebar rendering — collection list
-// ---------------------------------------------------------------------------
-
-async function loadCollections(catalogId, catalogLabel) {
-  setLoading();
+function showCollections(catalogId, catalogLabel) {
   _catalogId = catalogId;
   _collectionId = null;
+  _currentLevel = "collections";
   setBreadcrumb([
-    { label: t("nav.catalogs"), action: loadCatalogs },
-    { label: catalogLabel || catalogId, action: () => loadCollections(catalogId, catalogLabel) },
+    { label: t("nav.catalogs"), action: showCatalogs },
+    { label: catalogLabel || catalogId, action: () => showCollections(catalogId, catalogLabel) },
   ]);
   el("btn-create-catalog").style.display = "none";
   el("btn-create-collection").style.display = "";
-
-  try {
-    const data = await getJSON(
-      "/stac/catalogs/" + encodeURIComponent(catalogId) + "/collections?language=" + lang()
-    );
-    const list = Array.isArray(data)
-      ? data
-      : (data.collections || data.items || []);
-    if (list.length === 0) {
-      setLoading(t("sidebar.no_results"));
-      return;
-    }
-    renderSidebarItems(
-      list.map((c) => ({
-        id: c.id,
-        label: c.title || c.id,
-        sub: "collection",
-        icon: "fa-folder-open",
-        action: () => loadItems(catalogId, c.id, catalogLabel, c.title || c.id),
-      }))
-    );
-
-    // Show catalog summary in detail pane
-    showDetailPlaceholder(catalogLabel || catalogId, t("nav.collections"));
-  } catch (e) {
-    setListError(t("err.load", { msg: e.message }));
-  }
+  showDetailPlaceholder(catalogLabel || catalogId, t("nav.collections"));
+  el("items-list").replaceChildren();
+  _selectorCtrl = mountEntitySelector({
+    root: el("items-list"),
+    source: stacCollectionSource(catalogId),
+    onChange: (c) => { if (c) showItems(catalogId, c.id, catalogLabel, c.title || c.id); },
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Sidebar rendering — item list
-// ---------------------------------------------------------------------------
-
-async function loadItems(catalogId, collectionId, catalogLabel, collectionLabel) {
-  setLoading();
+function showItems(catalogId, collectionId, catalogLabel, collectionLabel) {
   _catalogId = catalogId;
   _collectionId = collectionId;
+  _currentLevel = "items";
   setBreadcrumb([
-    { label: t("nav.catalogs"), action: loadCatalogs },
-    { label: catalogLabel || catalogId, action: () => loadCollections(catalogId, catalogLabel) },
-    { label: collectionLabel || collectionId, action: () => loadItems(catalogId, collectionId, catalogLabel, collectionLabel) },
+    { label: t("nav.catalogs"), action: showCatalogs },
+    { label: catalogLabel || catalogId, action: () => showCollections(catalogId, catalogLabel) },
+    { label: collectionLabel || collectionId, action: () => showItems(catalogId, collectionId, catalogLabel, collectionLabel) },
   ]);
   el("btn-create-catalog").style.display = "none";
   el("btn-create-collection").style.display = "none";
-
-  try {
-    const data = await getJSON(
-      "/stac/catalogs/" +
-        encodeURIComponent(catalogId) +
-        "/collections/" +
-        encodeURIComponent(collectionId) +
-        "/items?language=" +
-        lang()
-    );
-    const features = Array.isArray(data) ? data : (data.features || data.items || []);
-    if (features.length === 0) {
-      setLoading(t("sidebar.no_results"));
-      return;
-    }
-    renderSidebarItems(
-      features.map((f) => ({
-        id: f.id,
-        label: f.id,
-        sub: f.properties?.datetime || f.properties?.start_datetime || "",
-        icon: "fa-file",
-        action: () => showItemDetail(f),
-      }))
-    );
-
-    // Show collection summary in detail pane
-    showDetailPlaceholder(collectionLabel || collectionId, t("nav.items") + " (" + features.length + ")");
-  } catch (e) {
-    setListError(t("err.load", { msg: e.message }));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Sidebar item rendering
-// ---------------------------------------------------------------------------
-
-let _sidebarItems = [];
-
-function renderSidebarItems(items) {
-  _sidebarItems = items;
-  applySidebarFilter("");
-  const box = el("search-box");
-  if (box) box.value = "";
-}
-
-function applySidebarFilter(q) {
-  const filtered = q
-    ? _sidebarItems.filter((i) => (i.label + " " + i.id).toLowerCase().includes(q.toLowerCase()))
-    : _sidebarItems;
-
-  const list = el("items-list");
-  if (filtered.length === 0) {
-    setLoading(t("sidebar.no_results"));
-    return;
-  }
-  // All API-sourced values (item.id, item.label, item.sub) pass through _escHtml().
-  // item.icon is a hardcoded FontAwesome class string set by this module, not from API data.
-  // Click handlers are wired via addEventListener below, not via onclick= attributes.
-  list.innerHTML = filtered
-    .map(
-      (item) => `
-    <div class="item-card" data-id="${_escHtml(item.id)}" role="button" tabindex="0">
-      <span class="icon"><i class="fa-solid ${_escHtml(item.icon)}"></i></span>
-      <div style="min-width:0">
-        <div class="label">${_escHtml(item.label)}</div>
-        ${item.sub ? `<div class="sublabel">${_escHtml(item.sub)}</div>` : ""}
-      </div>
-    </div>
-  `
-    )
-    .join("");
-
-  list.querySelectorAll(".item-card").forEach((card) => {
-    const id = card.dataset.id;
-    const item = filtered.find((i) => i.id === id);
-    if (!item) return;
-    card.addEventListener("click", () => {
-      list.querySelectorAll(".item-card").forEach((c) => c.classList.remove("active"));
-      card.classList.add("active");
-      item.action();
-    });
-    card.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") card.click();
-    });
+  el("items-list").replaceChildren();
+  _selectorCtrl = mountEntitySelector({
+    root: el("items-list"),
+    source: stacItemSource(catalogId, collectionId),
+    onChange: (f) => { if (f) showItemDetail(f); },
   });
 }
 
@@ -446,10 +329,6 @@ function showItemDetail(feature) {
   const props = feature.properties || {};
   const datetime = props.datetime || props.start_datetime || "—";
 
-  // All API-sourced values (feature.id, datetime, property keys and values) are
-  // passed through _escHtml() before being interpolated into innerHTML. The only
-  // unescaped strings are t(...) translation constants and hardcoded CSS/HTML
-  // structure, both of which are author-controlled.
   let propsRows = "";
   for (const [k, v] of Object.entries(props)) {
     propsRows += `<tr><td>${_escHtml(k)}</td><td>${_escHtml(JSON.stringify(v))}</td></tr>`;
@@ -470,7 +349,6 @@ function showItemDetail(feature) {
     ` : ""}
   `;
 
-  // Initialize or re-init the Leaflet map inside the detail pane
   if (feature.geometry) {
     if (_map) {
       _map.remove();
@@ -479,6 +357,23 @@ function showItemDetail(feature) {
     }
     _map = initMap("stac-map");
     showGeoJSON(_map, _layerRef, feature.geometry);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auth — gate create buttons client-side (API enforces regardless)
+// ---------------------------------------------------------------------------
+
+async function resolveCanWrite() {
+  try {
+    const me = await getJSON("/iam/me");
+    const roles = me.roles || [];
+    return roles.length > 0;
+  } catch (e) {
+    if (e.status === 404 || e.status === 401) {
+      return true;
+    }
+    return true;
   }
 }
 
@@ -513,7 +408,7 @@ async function submitCreateCatalog(e) {
     showNotice(el("form-create-catalog"), t("create.ok_catalog"), false);
     toggleCreateCatalogForm(false);
     el("form-create-catalog").reset();
-    await loadCatalogs();
+    if (_selectorCtrl) _selectorCtrl.reload();
   } catch (e) {
     if (e.status === 401 || e.status === 403) {
       showNotice(el("form-create-catalog"), t("err.forbidden"), true);
@@ -564,9 +459,7 @@ async function submitCreateCollection(e) {
     showNotice(el("form-create-collection"), t("create.ok_collection"), false);
     toggleCreateCollectionForm(false);
     el("form-create-collection").reset();
-    // Refresh the collection list for the current catalog
-    const catalogLabel = el("breadcrumb")?.querySelectorAll(".bc-link")[0]?.textContent || _catalogId;
-    await loadCollections(_catalogId, catalogLabel);
+    if (_selectorCtrl) _selectorCtrl.reload();
   } catch (e) {
     if (e.status === 401 || e.status === 403) {
       showNotice(el("form-create-collection"), t("err.forbidden"), true);
@@ -601,8 +494,6 @@ function applyLabels() {
   cancelBtns.forEach((b) => { b.textContent = t("create.cancel"); });
   const submitBtns = document.querySelectorAll(".btn-submit-form");
   submitBtns.forEach((b) => { b.textContent = t("create.submit"); });
-  const filterBox = el("search-box");
-  if (filterBox) filterBox.placeholder = t("sidebar.filter");
   const btnCat = el("btn-create-catalog");
   if (btnCat) btnCat.textContent = "+ " + t("create.catalog");
   const btnColl = el("btn-create-collection");
@@ -616,13 +507,6 @@ function applyLabels() {
 async function init() {
   applyLabels();
 
-  // Search / filter
-  const searchBox = el("search-box");
-  if (searchBox) {
-    searchBox.addEventListener("input", (e) => applySidebarFilter(e.target.value));
-  }
-
-  // Create catalog button
   const btnCat = el("btn-create-catalog");
   if (btnCat) {
     btnCat.addEventListener("click", () => toggleCreateCatalogForm(true));
@@ -636,7 +520,6 @@ async function init() {
     });
   }
 
-  // Create collection button
   const btnColl = el("btn-create-collection");
   if (btnColl) {
     btnColl.addEventListener("click", () => toggleCreateCollectionForm(true));
@@ -650,15 +533,13 @@ async function init() {
     });
   }
 
-  // Gate create buttons based on auth
   const canWrite = await resolveCanWrite();
   if (!canWrite) {
     if (btnCat) btnCat.style.display = "none";
     if (btnColl) btnColl.style.display = "none";
   }
 
-  // Load catalogs
-  await loadCatalogs();
+  showCatalogs();
 }
 
 init();

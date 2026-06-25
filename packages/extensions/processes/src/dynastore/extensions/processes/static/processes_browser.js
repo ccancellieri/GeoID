@@ -16,6 +16,7 @@ import { getJSON, authHeader, fetchCatalogOptions } from "../static/common/api.j
 import { apiUrl } from "../static/common/url.js";
 import { mountSchemaForm } from "../static/common/schema-form.js";
 import { register, t, lang } from "../static/common/i18n.js";
+import { mountEntitySelector } from "../static/common/entity-selector.js";
 
 register({
   en: {
@@ -73,27 +74,6 @@ function setActive(tab) {
   for (const b of [tabProcesses, tabJobs]) b.classList.toggle("active", b === tab);
 }
 
-// --- Generic list renderer ---
-function renderList(rows, labelOf, onClick) {
-  navEl.replaceChildren();
-  if (!rows || rows.length === 0) {
-    const p = document.createElement("p");
-    p.textContent = t("proc.none");
-    navEl.appendChild(p);
-    return;
-  }
-  const ul = document.createElement("ul");
-  for (const r of rows) {
-    const li = document.createElement("li");
-    const b = document.createElement("button");
-    b.textContent = labelOf(r);
-    b.addEventListener("click", () => onClick(r));
-    li.appendChild(b);
-    ul.appendChild(li);
-  }
-  navEl.appendChild(ul);
-}
-
 // Key/value table renderer; objects/arrays land in a <pre> block.
 function renderDetail(title, obj) {
   bodyEl.replaceChildren();
@@ -118,6 +98,38 @@ function renderDetail(title, obj) {
     table.appendChild(tr);
   }
   bodyEl.appendChild(table);
+}
+
+// ============================================================
+// Source adapters for entity-selector
+// ============================================================
+
+function processSource() {
+  return {
+    supportsSearch: false,
+    paginated: false,
+    labelOf: (p) => p.title || p.id,
+    idOf: (p) => p.id,
+    async fetch() {
+      const res = await getJSON(`/processes/processes?language=${lang()}`);
+      const items = res.processes || res || [];
+      return { items, hasMore: false };
+    },
+  };
+}
+
+function jobSource() {
+  return {
+    supportsSearch: false,
+    paginated: false,
+    labelOf: (j) => `${j.processID || j.type || "job"} · ${j.status || ""} · ${j.jobID || j.id}`,
+    idOf: (j) => j.jobID || j.id,
+    async fetch() {
+      const res = await getJSON("/processes/jobs");
+      const items = res.jobs || res || [];
+      return { items, hasMore: false };
+    },
+  };
 }
 
 // ============================================================
@@ -648,20 +660,10 @@ function buildRunPanel(process) {
 // Processes tab
 // ============================================================
 
-/** Current active scope processes URL (may be scoped). */
-function _processListUrlForCurrentScope() {
-  return _processListUrl();
-}
+let _processSelectorCtrl = null;
 
 async function _loadScopedProcessListSilent() {
-  // Reload sidebar list silently (don't overwrite detail pane)
-  try {
-    const res = await getJSON(_processListUrlForCurrentScope());
-    const procs = res.processes || res;
-    renderList(procs, (p) => p.title || p.id, onProcessClick);
-  } catch (e) {
-    // Non-critical; just leave existing list
-  }
+  if (_processSelectorCtrl) _processSelectorCtrl.reload();
 }
 
 async function onProcessClick(p) {
@@ -676,7 +678,6 @@ async function onProcessClick(p) {
       inputs: detail.inputs,
       outputs: detail.outputs,
     });
-    // Append the run panel below the detail table
     const panel = buildRunPanel(detail);
     bodyEl.appendChild(panel);
   } catch (e) {
@@ -684,43 +685,38 @@ async function onProcessClick(p) {
   }
 }
 
-async function showProcesses() {
+function showProcesses() {
   setActive(tabProcesses);
-  navEl.textContent = t("proc.loading");
-  try {
-    const res = await getJSON(`/processes/processes?language=${lang()}`);
-    const procs = res.processes || res;
-    renderList(procs, (p) => p.title || p.id, onProcessClick);
-  } catch (e) {
-    navEl.textContent = t("proc.error");
-  }
+  navEl.replaceChildren();
+  _processSelectorCtrl = mountEntitySelector({
+    root: navEl,
+    source: processSource(),
+    onChange: (p) => { if (p) onProcessClick(p); },
+  });
 }
 
 // ============================================================
 // Jobs tab
 // ============================================================
 
-async function showJobs() {
+let _jobSelectorCtrl = null;
+
+function showJobs() {
   setActive(tabJobs);
-  navEl.textContent = t("proc.loading");
-  try {
-    const res = await getJSON("/processes/jobs");
-    const jobs = res.jobs || res;
-    renderList(
-      jobs,
-      (j) => `${j.processID || j.type || "job"} · ${j.status || ""} · ${j.jobID || j.id}`,
-      async (j) => {
-        bodyEl.textContent = t("proc.loading");
-        try {
-          const id = j.jobID || j.id;
-          const detail = await getJSON(`/processes/jobs/${encodeURIComponent(id)}`);
-          renderDetail(`Job ${id}`, detail);
-        } catch (e) { bodyEl.textContent = t("proc.error"); }
-      }
-    );
-  } catch (e) {
-    navEl.textContent = t("proc.error");
-  }
+  navEl.replaceChildren();
+  _jobSelectorCtrl = mountEntitySelector({
+    root: navEl,
+    source: jobSource(),
+    onChange: async (j) => {
+      if (!j) return;
+      bodyEl.textContent = t("proc.loading");
+      try {
+        const id = j.jobID || j.id;
+        const detail = await getJSON(`/processes/jobs/${encodeURIComponent(id)}`);
+        renderDetail(`Job ${id}`, detail);
+      } catch (e) { bodyEl.textContent = t("proc.error"); }
+    },
+  });
 }
 
 // ============================================================

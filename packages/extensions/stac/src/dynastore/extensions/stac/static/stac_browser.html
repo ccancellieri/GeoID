@@ -17,6 +17,7 @@
     <link rel="stylesheet" href="../static/common/tailwind.css">
     <link rel="stylesheet" href="../static/common/admin.css">
     <link rel="stylesheet" href="../static/common/page-shell.css">
+    <link rel="stylesheet" href="../static/common/entity-selector.css">
     <script src="../static/common/page-shell.js"></script>
 
     <style>
@@ -193,13 +194,6 @@
         .loading-spinner { text-align: center; padding: 3rem 1rem; color: #64748b; }
         .error-box { padding: 1rem; background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); border-radius: 0.5rem; color: #f87171; font-size: 0.85rem; }
         .success-box { padding: 0.6rem 0.75rem; background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.2); border-radius: 0.4rem; color: #86efac; font-size: 0.8rem; margin-bottom: 0.5rem; }
-        .search-input {
-            width: 100%; padding: 0.5rem 0.75rem; background: rgba(30,41,59,0.7);
-            border: 1px solid rgba(255,255,255,0.1); border-radius: 0.4rem;
-            color: #e2e8f0; font-size: 0.85rem; outline: none;
-            box-sizing: border-box;
-        }
-        .search-input:focus { border-color: rgba(59,130,246,0.5); }
     </style>
 </head>
 <body>
@@ -212,16 +206,8 @@
     <div class="main-layout">
         <!-- Sidebar -->
         <div id="sidebar">
-            <div id="sidebar-header">
-                <input class="search-input" id="search-box" type="text" placeholder="Filter…">
-            </div>
             <div id="breadcrumb"></div>
-            <div id="items-list">
-                <div class="loading-spinner">
-                    <i class="fa-solid fa-circle-notch fa-spin text-xl"></i>
-                    <p class="mt-2 text-sm">Loading catalogs…</p>
-                </div>
-            </div>
+            <div id="items-list"></div>
 
             <!-- Create-catalog action button (shown at catalog level) -->
             <div id="sidebar-actions">
