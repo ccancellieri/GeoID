@@ -518,7 +518,7 @@ worker_local = ["dynastore[worker_service,monitor_grp]"]
 # Prefixed with scope_ to avoid collision with module-level extras above.
 # ==========================================================================
 # scope_catalog: catalog API without auth — open for local testing
-scope_catalog = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup,module_cache,notebooks,dimensions,drivers_grp,extension_volumes]"]
+scope_catalog = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup,module_cache,notebooks,dimensions,drivers_grp,extension_volumes,extension_dggs,extension_edr,extension_moving_features,extension_connected_systems]"]
 # scope_catalog_review: scope_catalog + gdal running in-process as a background
 # async runner on the catalog pod.  For review / local images ONLY — not
 # referenced by scope_catalog, scope_geoid, or any production scope.
