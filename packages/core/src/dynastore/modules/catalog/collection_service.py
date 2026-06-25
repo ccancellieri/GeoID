@@ -36,7 +36,7 @@ from dynastore.modules.catalog.catalog_config import (
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.protocols.entity_store import CollectionLifecycle
 from dynastore.tools.discovery import get_protocol
-from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.db import validate_sql_identifier, InvalidIdentifierError
 from dynastore.tools.async_utils import signal_bus
 from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry, LifecycleContext
 from dynastore.modules.catalog.event_service import CatalogEventType, emit_event
@@ -1076,6 +1076,19 @@ class CollectionService:
         )
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_model.id)
+        # Invariant: the public collection external_id must never collide with the
+        # internal id space (``col_<13 base32>``).  Keeping the spaces disjoint is
+        # what lets resolve_collection_id resolve strictly forward and keeps
+        # internal ids off the public API surface (mirrors create_catalog).
+        from dynastore.modules.catalog.catalog_service import (
+            is_internal_physical_name as _is_internal_name,
+        )
+        if _is_internal_name(collection_model.id, "col"):
+            raise InvalidIdentifierError(
+                f"Collection id '{collection_model.id}' is reserved: it matches "
+                "the internal id format 'col_<token>'. Collection ids are public "
+                "labels and must not use the internal id shape."
+            )
         # Phase 2: resolve external catalog_id → internal at the public boundary.
         # The collection external_id is split from internal_id below (lines
         # external_id = collection_model.id / internal_id = _gen("col")), so

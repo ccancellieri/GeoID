@@ -58,6 +58,8 @@ from dynastore.models.tasks import (
 from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.models.auth_models import SYSTEM_USER_ID
 
+from dynastore.tools.discovery import get_protocol
+
 logger = logging.getLogger(__name__)
 
 # Terminal statuses — dismiss and update operations check against these
@@ -174,6 +176,11 @@ async def select_runner_for(task_key: str):
 
 _OFFLOAD_RUNNER_TYPES = frozenset({"gcp_cloud_run", "worker_queue"})
 
+# Default in-process task count threshold above which an offloadable
+# provisioning task flips to a Cloud Run Job.  Overridable via
+# TasksPluginConfig.provisioning_inproc_offload_threshold (no restart required).
+_DEFAULT_PROVISIONING_OFFLOAD_THRESHOLD = 8
+
 
 async def offload_required(task_key: str) -> bool:
     """True when routing tags ``task_key`` OFFLOAD/HEAVY (must not run in-process).
@@ -207,6 +214,56 @@ def _restrict_to_offload_runners(runners: list) -> list:
         if getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
     ]
     return offload if offload else runners
+
+
+async def _should_offload_provisioning(task_key: str) -> bool:
+    """True when ``task_key`` is offloadable AND the in-process pool is at or
+    above the configured load threshold.
+
+    Fail-open contract: any exception (config unavailable, runner not found)
+    returns ``False`` so provisioning always has an in-process fallback.
+
+    Decision:
+    - task_key not in OFFLOADABLE_SYSTEM_TASKS → False (fast path, no I/O).
+    - in-flight count < threshold          → False (run in-process).
+    - in-flight count >= threshold         → True  (offload to Cloud Run Job).
+    """
+    from dynastore.modules.tasks.routing.matrix import OFFLOADABLE_SYSTEM_TASKS
+
+    if task_key not in OFFLOADABLE_SYSTEM_TASKS:
+        return False
+
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.modules.tasks.runners import get_runners
+        from dynastore.models.tasks import TaskExecutionMode
+
+        threshold = _DEFAULT_PROVISIONING_OFFLOAD_THRESHOLD
+        try:
+            mgr = get_protocol(PlatformConfigsProtocol)
+            if mgr is not None:
+                cfg = await mgr.get_config(TasksPluginConfig)
+                if isinstance(cfg, TasksPluginConfig):
+                    threshold = cfg.provisioning_inproc_offload_threshold
+        except Exception:  # noqa: BLE001 — config is optional; use default
+            pass
+
+        in_flight = 0
+        for runner in get_runners(TaskExecutionMode.ASYNCHRONOUS):
+            if getattr(runner, "runner_type", None) == "background":
+                in_flight = getattr(runner, "active_count", 0)
+                break
+
+        return in_flight >= threshold
+
+    except Exception:  # noqa: BLE001 — fail-open: never block provisioning
+        logger.debug(
+            "_should_offload_provisioning: load probe failed for '%s'; "
+            "defaulting to in-process",
+            task_key,
+        )
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -364,7 +421,9 @@ async def _read_task_status(engine: DbResource, task_id: Any) -> Optional[str]:
 
 # Task types that carry a ``catalog_id`` in their inputs and require the
 # provisioning checklist to be drained on terminal exit.
-_PROVISIONING_TASK_TYPES: frozenset = frozenset({"gcp_provision_catalog", "catalog_core_init"})
+_PROVISIONING_TASK_TYPES: frozenset = frozenset(
+    {"gcp_provision_catalog", "catalog_core_init", "catalog_provision"}
+)
 
 
 async def _drain_provisioning_checklist(
@@ -712,10 +771,14 @@ class ExecutionEngine:
         # in-process.  Gated on async mode: SYNCHRONOUS execution is the
         # designated maps-tier path (already filtered by _resolve_execution_mode
         # via block_sync), and dropping in-process runners there would be wrong.
-        if mode == TaskExecutionMode.ASYNCHRONOUS and await offload_required(
-            task_type
-        ):
-            runners = _restrict_to_offload_runners(runners)
+        if mode == TaskExecutionMode.ASYNCHRONOUS:
+            if await offload_required(task_type):
+                runners = _restrict_to_offload_runners(runners)
+            elif await _should_offload_provisioning(task_key=task_type):
+                # Dynamic load-adaptive offload for offloadable system tasks:
+                # the in-process pool is above threshold; route to Cloud Run
+                # Job if one is available (fail-open: unchanged when absent).
+                runners = _restrict_to_offload_runners(runners)
 
         context = RunnerContext(
             engine=engine,
@@ -1175,19 +1238,29 @@ class ExecutionEngine:
             if preferred is not None and any(preferred is r for r in runners):
                 runners = [preferred] + [r for r in runners if r is not preferred]
             _offload_enforced = False
-            if runner_mode == TaskExecutionMode.ASYNCHRONOUS and await offload_required(
-                task_type
-            ):
-                restricted = _restrict_to_offload_runners(runners)
-                # Enforcement happened only if in-process runners were actually
-                # dropped (an offload runner was present). When no offload
-                # runner exists here, runners is unchanged and the in-process
-                # path remains the legitimate option (e.g. maps running gdal).
-                _offload_enforced = restricted is not runners and any(
-                    getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
-                    for r in restricted
-                )
-                runners = restricted
+            if runner_mode == TaskExecutionMode.ASYNCHRONOUS:
+                if await offload_required(task_type):
+                    restricted = _restrict_to_offload_runners(runners)
+                    # Enforcement happened only if in-process runners were
+                    # actually dropped (an offload runner was present). When no
+                    # offload runner exists here, runners is unchanged and the
+                    # in-process path remains the legitimate option (e.g. maps
+                    # running gdal).
+                    _offload_enforced = restricted is not runners and any(
+                        getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
+                        for r in restricted
+                    )
+                    runners = restricted
+                elif await _should_offload_provisioning(task_key=task_type):
+                    # Dynamic load-adaptive offload for offloadable system
+                    # tasks: the in-process pool is above threshold; route to
+                    # Cloud Run Job if one is available (fail-open).
+                    restricted = _restrict_to_offload_runners(runners)
+                    _offload_enforced = restricted is not runners and any(
+                        getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
+                        for r in restricted
+                    )
+                    runners = restricted
 
             result = None
             for runner in runners:

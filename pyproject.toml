@@ -403,6 +403,16 @@ worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elastic
 # Remote fetch is stdlib-only (urllib via asyncio.to_thread), so no httpx dep.
 # module_storage_postgresql kept explicit per the SCOPE × routing invariant.
 worker_task_stac_harvest = ["dynastore[task_base,catalog_grp,drivers_grp,index_grp,configs,storage,geospatial_core,module_storage_postgresql]"]
+# Catalog provisioning executor (#2329): runs the registered provisioners for a
+# catalog or collection in priority order.  Needs:
+#   - task_base          — dispatcher + capability publisher (sync psycopg2 engine)
+#   - catalog_grp        — CatalogsProtocol + provisioning-registry callers
+#   - module_gcp         — GCP provisioner hooks (bucket, pubsub)
+#   - drivers_grp        — storage drivers for any provisioner that writes items
+#   - index_grp          — Elasticsearch client (provisioners may set up ES index)
+#   - configs            — ConfigsProtocol for hot-reloadable threshold/concurrency
+#   - module_storage_postgresql — explicit per SCOPE × routing invariant
+worker_task_catalog_provision = ["dynastore[task_base,catalog_grp,module_gcp,drivers_grp,index_grp,configs,module_storage_postgresql]"]
 # Write-reactive tile-cache invalidation (#1292) needs no dedicated SCOPE / Job
 # (#1298): it reuses the existing tiles_preseed task (operation=invalidate),
 # which already deploys as the geospatial-tiles-preseed-job
@@ -495,7 +505,7 @@ api_full = ["dynastore[api_catalog,maps_grp,geospatial_io]"]
 # geoid_service: api_catalog + geoid extension — the ONLY service with auth
 geoid_service = ["dynastore[api_catalog,extension_geoid]"]
 # worker_service: background task processor (sync-db tasks + async-db catalog reads), no auth
-worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
+worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # catalog_local: local dev catalog — api_open without google_grp/gcp_cloud_runner (no tools_grp: use the dedicated tools service)
 catalog_local = ["dynastore[core,catalog_grp,monitor_grp,index_grp,processes]"]
 # worker_local: local HTTP simulation of Cloud Run Jobs — all tasks + processes/stats UI
@@ -514,7 +524,7 @@ scope_catalog_review = ["dynastore[scope_catalog,module_gdal,worker_task_gdal]"]
 # scope_geoid: catalog + geoid UI + auth/iam — maps to geospatial-auth in cloud
 scope_geoid = ["dynastore[scope_catalog,extension_geoid,auth_grp]"]
 # scope_worker: background task processor — headless Cloud Run job runner
-scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
+scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # scope_tools: proxy + template tools service — no auth
 scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,proxy]"]
 # scope_maps: vector producer + raster renderer (local docker), no auth.

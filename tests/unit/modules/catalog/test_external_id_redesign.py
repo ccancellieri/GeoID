@@ -1215,11 +1215,21 @@ class TestItemReadProjectsExternalCollectionId:
 # then resolved to the never-ready phantom → 500 "storage is still being
 # provisioned".  resolve_catalog_id is now internal-first (mirrors
 # resolve_physical_schema): a direct id hit is authoritative and returned as-is.
-class TestResolveCatalogIdInternalFirst:
-    """resolve_catalog_id accepts both id-spaces and never JIT-creates a phantom."""
+class TestResolveCatalogIdExternalOnly:
+    """resolve_catalog_id is strictly forward (external_id → internal id).
+
+    An internal id is NOT a valid input and resolves to "not found", so security
+    stays keyed on the external id and internal ids never re-enter the public API
+    surface.  The phantom-catalog JIT is prevented at the source (existence is
+    probed via the internal-first resolve_physical_schema) rather than by making
+    this resolver accept internal ids (the reverted #2353 behaviour).
+    """
 
     @pytest.mark.asyncio
-    async def test_already_internal_id_returned_unchanged(self):
+    async def test_internal_id_resolves_to_none(self):
+        """An already-internal id is not a known external_id → None. This is the
+        security invariant: a caller cannot address a catalog by its internal id
+        (e.g. delete_catalog by internal id becomes a no-op, never a real hit)."""
         from dynastore.modules.catalog import catalog_service as cs
 
         svc = cs.CatalogService(engine=None)
@@ -1230,11 +1240,11 @@ class TestResolveCatalogIdInternalFirst:
         ) as ext:
             result = await svc.resolve_catalog_id("c_internal1", allow_missing=True)
 
-        assert result == "c_internal1"
-        ps.assert_awaited_once_with(svc, "c_internal1")
-        # A known-internal id must NOT fall through to the external resolver,
-        # where a colliding phantom external_id could hijack resolution.
-        ext.assert_not_awaited()
+        assert result is None
+        # External-only: resolution goes through the external_id cache, and never
+        # short-circuits on the physical-schema (internal id) cache.
+        ext.assert_awaited_once_with(svc, "c_internal1")
+        ps.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_external_label_resolves_to_internal(self):
@@ -1256,8 +1266,6 @@ class TestResolveCatalogIdInternalFirst:
 
         svc = cs.CatalogService(engine=None)
         with patch.object(
-            cs, "_physical_schema_cache", AsyncMock(return_value=None)
-        ), patch.object(
             cs, "_catalog_external_id_cache", AsyncMock(return_value=None)
         ):
             result = await svc.resolve_catalog_id("nope", allow_missing=True)
@@ -1270,8 +1278,6 @@ class TestResolveCatalogIdInternalFirst:
 
         svc = cs.CatalogService(engine=None)
         with patch.object(
-            cs, "_physical_schema_cache", AsyncMock(return_value=None)
-        ), patch.object(
             cs, "_catalog_external_id_cache", AsyncMock(return_value=None)
         ):
             with pytest.raises(ValueError):
@@ -1280,16 +1286,60 @@ class TestResolveCatalogIdInternalFirst:
     @pytest.mark.asyncio
     async def test_ensure_catalog_exists_does_not_recreate_internal_id(self):
         """The phantom-catalog regression: given an already-internal id,
-        ensure_catalog_exists must short-circuit and never create a catalog."""
+        ensure_catalog_exists must recognise it (via the internal-first
+        resolve_physical_schema) and never JIT-create a phantom catalog."""
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        svc.create_catalog = AsyncMock()
+        # resolve_physical_schema (internal-first, no ctx) resolves an internal id
+        # straight through the physical-schema cache.
+        with patch.object(
+            cs, "_physical_schema_cache", AsyncMock(return_value="c_internal1")
+        ):
+            await svc.ensure_catalog_exists("c_internal1")
+
+        svc.create_catalog.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_catalog_exists_creates_for_unknown_external(self):
+        """A genuinely-new external label resolves nowhere → JIT-create fires."""
         from dynastore.modules.catalog import catalog_service as cs
 
         svc = cs.CatalogService(engine=None)
         svc.create_catalog = AsyncMock()
         with patch.object(
-            cs, "_physical_schema_cache", AsyncMock(return_value="c_internal1")
+            cs, "_physical_schema_cache", AsyncMock(return_value=None)
         ), patch.object(
             cs, "_catalog_external_id_cache", AsyncMock(return_value=None)
         ):
-            await svc.ensure_catalog_exists("c_internal1")
+            await svc.ensure_catalog_exists("brand_new_catalog")
 
-        svc.create_catalog.assert_not_called()
+        svc.create_catalog.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_catalog_rejects_internal_shaped_external_id(self):
+        """The invariant guard: a public id matching the internal shape
+        (``c_<13 base32>``) is rejected before any storage work."""
+        from dynastore.modules.catalog import catalog_service as cs
+        from dynastore.tools.db import InvalidIdentifierError
+
+        svc = cs.CatalogService(engine=None)
+        with pytest.raises(InvalidIdentifierError):
+            # ``c_cw5tetduiu959`` is a real internal-id shape (the phantom cascade
+            # minted exactly these as external_ids).
+            await svc.create_catalog({"id": "c_cw5tetduiu959", "title": "x"}, lang="en")
+
+    def test_is_internal_physical_name_shapes(self):
+        """The shape predicate that keeps the external/internal id spaces disjoint."""
+        from dynastore.modules.catalog import catalog_service as cs
+
+        # Internal shapes (prefix + 13 base32 chars) collide → True.
+        assert cs.is_internal_physical_name("c_cw5tetduiu959", "c") is True
+        assert cs.is_internal_physical_name("col_cw5tetduiu959", "col") is True
+        # Human-friendly public labels do not collide → False.
+        assert cs.is_internal_physical_name("cat_cool_meadow_1284", "c") is False
+        assert cs.is_internal_physical_name("gaul", "col") is False
+        assert cs.is_internal_physical_name("c_short", "c") is False
+        # Wrong prefix does not match the catalog shape.
+        assert cs.is_internal_physical_name("col_cw5tetduiu959", "c") is False

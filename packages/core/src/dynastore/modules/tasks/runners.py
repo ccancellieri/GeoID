@@ -349,6 +349,16 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
         from dynastore.modules.tasks.models import RunnerCapabilities
         return RunnerCapabilities(max_concurrency=self._max_concurrency)
 
+    @property
+    def active_count(self) -> int:
+        """Number of in-flight asyncio tasks currently tracked by this runner.
+
+        Read-only snapshot — safe to call from any coroutine without locking.
+        Used by the dispatcher-local load probe to decide whether to offload
+        an offloadable system task to an external executor.
+        """
+        return len(self._running_tasks)
+
     # ------------------------------------------------------------------
     # StopSignalProtocol — confirmed dismiss for in-process tasks
     # ------------------------------------------------------------------

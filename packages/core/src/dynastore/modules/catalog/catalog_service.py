@@ -30,6 +30,7 @@ import asyncio
 import logging
 import json
 import os
+import re
 from typing import (
     Awaitable,
     Callable,
@@ -77,7 +78,7 @@ from dynastore.models.protocols import (
     ConfigsProtocol,
     LocalizationProtocol,
 )
-from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.db import validate_sql_identifier, InvalidIdentifierError
 from dynastore.tools.json import CustomJSONEncoder
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.query_builder import QueryRequest, QueryResponse
@@ -209,6 +210,26 @@ def generate_physical_name(prefix: str) -> str:
     chars.reverse()
     suffix = "".join(chars)
     return f"{prefix}_{suffix}"
+
+
+# The internal-id shape produced by ``generate_physical_name``: a type prefix,
+# an underscore, then 13 base32 chars (digits 2-9 + a-x — the 32-symbol slice).
+_INTERNAL_NAME_SUFFIX = "[2-9a-x]{13}"
+
+
+def is_internal_physical_name(value: str, prefix: str) -> bool:
+    """Return ``True`` when ``value`` matches the generated internal-id shape
+    (``{prefix}_{13 base32}``) for ``prefix`` — i.e. it collides with the
+    internal id space.
+
+    Used to forbid user-supplied external_ids that look like an internal id.
+    Keeping the two id spaces disjoint is what lets ``resolve_catalog_id`` /
+    ``resolve_collection_id`` resolve strictly forward (external → internal):
+    an internal id can then never be a valid external label, so it never
+    re-enters the public API surface and security stays keyed on the external
+    id (see ``resolve_catalog_id``).
+    """
+    return re.fullmatch(rf"{re.escape(prefix)}_{_INTERNAL_NAME_SUFFIX}", value) is not None
 
 
 def get_catalog_engine(db_resource: Optional[DbResource] = None) -> DbResource:
@@ -785,30 +806,34 @@ class CatalogService(CatalogsProtocol):
         external_id: str,
         allow_missing: bool = False,
     ) -> Optional[str]:
-        """Resolve the immutable internal ``id`` for a catalog.
+        """Resolve the immutable internal ``id`` for a catalog from its public
+        ``external_id``.
 
-        Accepts either a public ``external_id`` or an already-internal ``id`` and
-        is **idempotent**: given an internal id it returns that id unchanged.
+        **External-only / strictly forward.**  The argument is interpreted *only*
+        as a public ``external_id``; the result is the immutable internal ``id``.
+        An already-internal id is therefore *not* a valid input and resolves to
+        "not found" (``None`` / ``ValueError``) **by design**.
 
-        Resolution is **internal-first**: ``id`` is the immutable, unambiguous PK,
-        so a direct id hit is authoritative and returned as-is.  Only when the
-        argument is not a known internal id is it interpreted as a public
-        ``external_id``.  The reverse order is unsafe — an already-internal id
-        passed straight to the external resolver can collide with a *different*
-        catalog whose ``external_id`` happens to equal that id (legacy
-        ``c_…``-shaped external_ids observed on dev), silently routing to — or
-        JIT-creating — the wrong catalog.  Mirrors ``resolve_physical_schema``.
+        Security is enforced on the external id — IAM policies and the public
+        delete boundary key on the logical id — so an internal id must never be
+        accepted as an addressable target here.  Accepting one would let a caller
+        bypass the external-id-keyed policy (e.g. a ``delete_catalog`` issued with
+        an internal id, which would not match any policy yet still hit a real
+        row).  The two id spaces are kept disjoint by ``create_catalog``, which
+        rejects ``c_…``-shaped external_ids (the internal id shape — see
+        ``is_internal_physical_name``), so this forward lookup is unambiguous and
+        an earlier ``c_…``-shaped-external_id collision can no longer occur.
 
-        Both lookups go through lossless string caches — pure accelerators; on
-        any miss the registry SELECT is the source of truth.  Returns the internal
-        id string, or ``None`` / raises ``ValueError`` depending on
-        ``allow_missing``.
+        Internal-keyed data-layer call sites stay idempotent through the
+        ``if resolved is not None: id = resolved`` guard at the call site, which
+        leaves an already-internal id unchanged on a miss — resolution is never
+        re-entered with an internal id here.
+
+        Goes through ``_catalog_external_id_cache`` — a lossless string cache and
+        a pure accelerator; on any miss the registry SELECT is the source of
+        truth.  Returns the internal id string, or ``None`` / raises
+        ``ValueError`` depending on ``allow_missing``.
         """
-        # Internal-first: ``id`` IS the schema name, so a direct id hit is
-        # authoritative and the resolver is idempotent for already-internal ids.
-        if await _physical_schema_cache(self, external_id):
-            return external_id
-        # Not a known internal id — interpret as a public external_id.
         internal_id = await _catalog_external_id_cache(self, external_id)
         if not internal_id and not allow_missing:
             raise ValueError(f"Catalog '{external_id}' not found.")
@@ -958,12 +983,14 @@ class CatalogService(CatalogsProtocol):
         ctx: Optional["DriverContext"] = None,
     ) -> None:
         """Ensures that a catalog exists, creating it if necessary (JIT creation)."""
-        # Phase 2: catalog_id is the external public label.  Resolve to internal
-        # before checking existence so get_catalog_model (which queries by internal
-        # id) does not always report "missing" and trigger spurious re-creation.
-        existing_internal = await self.resolve_catalog_id(catalog_id, allow_missing=True)
-        if existing_internal is not None:
-            # Already exists; nothing to do.
+        # Existence is probed via resolve_physical_schema, which is internal-first
+        # and so recognises BOTH a public external_id and an already-internal id
+        # (the upload path pre-resolves to internal before reaching this JIT gate).
+        # Using the external-only resolve_catalog_id here would report an
+        # already-internal id as "missing" and JIT-create a phantom catalog whose
+        # external_id equals the real catalog's internal id — the phantom cascade.
+        if await self.resolve_physical_schema(catalog_id, ctx=ctx, allow_missing=True) is not None:
+            # Already exists (by external_id or by internal id); nothing to do.
             return
         # If lang is not '*', we provide a simple string which create_catalog will localize
         # If lang is '*', we provide the default 'en' dictionary
@@ -1252,6 +1279,16 @@ class CatalogService(CatalogsProtocol):
             else catalog_data
         )
         validate_sql_identifier(catalog_model.id)
+        # Invariant: the public external_id must never collide with the internal
+        # id space (``c_<13 base32>``).  Keeping the spaces disjoint is what lets
+        # resolve_catalog_id resolve strictly forward and keeps internal ids off
+        # the public API surface (see is_internal_physical_name).
+        if is_internal_physical_name(catalog_model.id, "c"):
+            raise InvalidIdentifierError(
+                f"Catalog id '{catalog_model.id}' is reserved: it matches the "
+                "internal id format 'c_<token>'. Catalog ids are public labels "
+                "and must not use the internal id shape."
+            )
 
         # Split public label from internal key.  The user-supplied ``id`` is
         # the renamable public label (external_id); a generated opaque key

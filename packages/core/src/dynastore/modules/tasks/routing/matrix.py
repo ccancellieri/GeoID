@@ -69,6 +69,16 @@ LIGHTWEIGHT_PROCESSES: frozenset = frozenset(
     {"requeue_dead_letter_tasks", "tiles_invalidate"}
 )
 
+# System tasks (kind="task") that MAY offload to a Cloud Run Job under the
+# cloud profile when the in-process dispatcher is under load.  Each entry
+# here causes build_routing_matrix to emit TWO RunnerTargets in application
+# order: (1) background — the preferred in-process path; (2) gcp_cloud_run —
+# the burst offload.  A dispatcher-local load probe (see execution.py
+# _should_offload_provisioning) chooses between them at dispatch time.
+# Under onprem, the dual-target is NOT emitted — a single background target
+# is returned like any other system task.
+OFFLOADABLE_SYSTEM_TASKS: frozenset = frozenset({"catalog_provision"})
+
 
 def build_routing_matrix(
     inventory: Iterable[InventoryItem],
@@ -126,13 +136,31 @@ def build_routing_matrix(
     for item in inventory:
         if item.kind == "task":
             tier = item.affinity_tier or "catalog"
-            tasks_map[item.task_key] = [
-                RunnerTarget(
-                    consumers=[tier],
-                    runner="background",
-                    hints={ExecHint.BACKGROUND},
-                )
-            ]
+            if item.task_key in OFFLOADABLE_SYSTEM_TASKS and preset != "onprem":
+                # Offloadable system task under the cloud profile: emit two
+                # candidates so a dispatcher-local load probe can choose
+                # between running in-process (preferred, listed first) and
+                # offloading to a Cloud Run Job under burst conditions.
+                tasks_map[item.task_key] = [
+                    RunnerTarget(
+                        consumers=[tier],
+                        runner="background",
+                        hints={ExecHint.BACKGROUND},
+                    ),
+                    RunnerTarget(
+                        consumers=[tier],
+                        runner="gcp_cloud_run",
+                        hints={ExecHint.OFFLOAD, ExecHint.HEAVY},
+                    ),
+                ]
+            else:
+                tasks_map[item.task_key] = [
+                    RunnerTarget(
+                        consumers=[tier],
+                        runner="background",
+                        hints={ExecHint.BACKGROUND},
+                    )
+                ]
         else:
             # kind == "process"
             if preset != "onprem":
