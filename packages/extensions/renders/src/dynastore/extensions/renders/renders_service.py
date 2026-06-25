@@ -22,7 +22,7 @@ Scope: Slice 1 — single-band COG → SLD colormap → PNG/WebP tile, with
 bucket-cache reuse (same per-catalog bucket as the vector tile cache) and
 STAC ``render:renders`` enrichment via the ``RendersStacContributor``.
 
-Slice 5 extends the tile endpoint with optional multiband / band-math params:
+The tile endpoint accepts optional multiband / band-math params:
 
 - ``bands`` — comma-separated 1-based band indices for RGB composites
   (e.g. ``3,2,1`` for true-colour).  Overrides the single-band ``band`` param.
@@ -34,11 +34,26 @@ Slice 5 extends the tile endpoint with optional multiband / band-math params:
 Each distinct combination of ``bands`` / ``expression`` / ``rescale`` maps to a
 separate cache blob via a ``params_hash`` suffix on the style segment of the key.
 
-Route pattern::
+Elevation endpoints:
+
+- Terrain-RGB endpoint: encodes a single-band elevation COG to the Mapbox
+  Terrain-RGB PNG scheme so MapLibre can consume it as a ``raster-dem`` source.
+- Hillshade endpoint: produces shaded-relief + hypsometric-colormap RGBA tiles
+  driven by the same SLD style-resolution path as the coloured raster route.
+- ``terrain_viewer.html``: in-browser MapLibre viewer with terrain, hillshade,
+  colormap overlay, and a vertical-exaggeration / on-off toggle.
+
+Route patterns::
 
     GET /renders/catalogs/{catalog_id}/collections/{collection_id}
         /styles/{style_id}/tiles/{tms_id}/{z}/{x}/{y}.{format}
         ?bands=3,2,1&rescale=0,3000;0,3000;0,3000
+
+    GET /renders/catalogs/{catalog_id}/collections/{collection_id}
+        /terrain-rgb/{tms_id}/{z}/{x}/{y}.png
+
+    GET /renders/catalogs/{catalog_id}/collections/{collection_id}
+        /styles/{style_id}/hillshade/{tms_id}/{z}/{x}/{y}.png
 
 ``catalog_id`` and ``collection_id`` are EXTERNAL (public) IDs in the path.
 They are resolved to INTERNAL IDs at the request boundary, before any cache
@@ -48,12 +63,15 @@ key is built or any DB/storage call is made.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import List, Literal, Optional, Tuple
 
 import rio_tiler as _rio_tiler_scope_gate  # noqa: F401  # SCOPE gate: requires rio-tiler
 _ = _rio_tiler_scope_gate  # silence pyright "unused"
+
+from dynastore.extensions.web.decorators import expose_web_page  # noqa: E402
 
 from fastapi import (  # noqa: E402
     APIRouter,
@@ -76,7 +94,11 @@ from dynastore.modules.renders.config import (  # noqa: E402
     build_render_cache_key,
     build_render_params_hash,
 )
-from dynastore.modules.renders.engine import render_cog_tile  # noqa: E402
+from dynastore.modules.renders.engine import (  # noqa: E402
+    render_cog_hillshade,
+    render_cog_terrain_rgb,
+    render_cog_tile,
+)
 from dynastore.modules.tiles.tiles_module import TileStorageProtocol  # noqa: E402
 from dynastore.tools.discovery import get_protocol  # noqa: E402
 
@@ -178,9 +200,10 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
     needed. Registers ``RendersStacContributor`` at lifespan so STAC reads
     in the same process advertise ``render:renders`` entries for COG items.
 
-    Supports single-band (Slice 1) and multiband / band-math rendering
-    (Slice 5) through the same route; the optional ``bands``, ``expression``,
-    and ``rescale`` query params select the render recipe.
+    Supports single-band and multiband / band-math rendering through the same
+    route (the optional ``bands``, ``expression``, and ``rescale`` query params
+    select the render recipe), plus terrain-RGB and hillshade routes and an
+    in-browser terrain viewer page.
     """
 
     priority: int = 100
@@ -219,6 +242,39 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
         pass
 
     # ------------------------------------------------------------------
+    # Web page + static assets
+    # ------------------------------------------------------------------
+
+    def get_web_pages(self):
+        from dynastore.extensions.tools.web_collect import collect_web_pages
+        return collect_web_pages(self)
+
+    def get_static_assets(self):
+        from dynastore.extensions.tools.web_collect import collect_static_assets
+        return collect_static_assets(self)
+
+    def _serve_page_template(self, filename: str) -> Response:
+        from dynastore._version import VERSION
+        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
+        if not os.path.exists(file_path):
+            return Response(content=f"Template {filename} not found", status_code=404)
+        with open(file_path, "r", encoding="utf-8") as fh:
+            return Response(
+                content=fh.read().replace("{{VERSION}}", VERSION),
+                media_type="text/html",
+            )
+
+    @expose_web_page(
+        page_id="terrain_viewer",
+        title="Terrain Viewer",
+        icon="fa-mountain",
+        description="3D terrain with hillshade and colormap overlay from a DEM COG.",
+        priority=90,
+    )
+    async def provide_terrain_viewer(self, request: Request) -> Response:
+        return self._serve_page_template("terrain_viewer.html")
+
+    # ------------------------------------------------------------------
     # Route registration
     # ------------------------------------------------------------------
 
@@ -233,6 +289,30 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
                 "catalog_id and collection_id are public (external) IDs."
             ),
             name="get_render_tile",
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}"
+            "/terrain-rgb/{tms_id}/{z}/{x}/{y}.png",
+            self.get_terrain_rgb_tile,
+            methods=["GET"],
+            summary=(
+                "Encode a single-band elevation COG tile to Terrain-RGB PNG "
+                "(Mapbox raster-dem scheme). catalog_id and collection_id are "
+                "public (external) IDs."
+            ),
+            name="get_terrain_rgb_tile",
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}"
+            "/styles/{style_id}/hillshade/{tms_id}/{z}/{x}/{y}.png",
+            self.get_hillshade_tile,
+            methods=["GET"],
+            summary=(
+                "Render a shaded-relief (hillshade) + hypsometric-colormap RGBA tile "
+                "from a single-band elevation COG. catalog_id and collection_id are "
+                "public (external) IDs."
+            ),
+            name="get_hillshade_tile",
         )
 
     # ------------------------------------------------------------------
@@ -487,6 +567,348 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
             headers={
                 "X-Render-Cache": "miss",
                 "X-Render-Source": "rio-tiler",
+                "Cache-Control": f"public, max-age={cfg.ttl_seconds}",
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Terrain-RGB tile handler
+    # ------------------------------------------------------------------
+
+    async def get_terrain_rgb_tile(
+        self,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        catalog_id: str = Path(..., description="Public catalog ID (external_id)."),
+        collection_id: str = Path(..., description="Public collection ID (external_id)."),
+        tms_id: str = Path(..., description="Tile Matrix Set ID. Only WebMercatorQuad is supported."),
+        z: int = Path(..., ge=0, le=30, description="Zoom level."),
+        x: int = Path(..., ge=0, description="Tile column."),
+        y: int = Path(..., ge=0, description="Tile row."),
+        band: int = Query(default=1, ge=1, description="Elevation band index (1-based)."),
+    ) -> Response:
+        """Encode a single-band elevation COG to a Terrain-RGB PNG tile.
+
+        The Mapbox Terrain-RGB encoding allows MapLibre to consume this tile
+        as a ``raster-dem`` source for 3-D terrain and vertical exaggeration.
+        Tiles are cached in the per-catalog bucket under the ``terrain-rgb``
+        virtual style segment.
+
+        Flow:
+        1. Validate TMS.
+        2. Resolve external catalog/collection IDs to internal immutable IDs.
+        3. Check bucket cache (307 redirect on hit).
+        4. Resolve the first COG asset href.
+        5. Render via ``render_cog_terrain_rgb`` (run_in_thread).
+        6. Write rendered bytes to bucket cache in background.
+        """
+        start = time.perf_counter()
+
+        if tms_id not in _SUPPORTED_TMS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"TMS '{tms_id}' not supported. "
+                    f"Supported: {sorted(_SUPPORTED_TMS)}"
+                ),
+            )
+
+        # Resolve external → internal IDs
+        catalogs_svc = await self._get_catalogs_service()
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not internal_catalog_id:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+
+        try:
+            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
+                internal_catalog_id, collection_id, allow_missing=False
+            )
+        except (ValueError, AttributeError):
+            internal_collection_id = collection_id
+
+        if not internal_collection_id:
+            raise HTTPException(
+                status_code=404, detail=f"Collection '{collection_id}' not found."
+            )
+
+        await self._require_collection_visible(internal_catalog_id, internal_collection_id)
+
+        # Cache check — virtual style_id "terrain-rgb" ensures no collision with named styles
+        cfg = await _load_render_caching_config()
+        cache_key = build_render_cache_key(
+            cfg.key_prefix,
+            internal_collection_id,
+            "terrain-rgb",
+            tms_id,
+            z,
+            x,
+            y,
+            "png",
+        )
+
+        provider = get_protocol(TileStorageProtocol)
+        if provider and cfg.cache_enabled:
+            res = await self._try_render_cache(
+                provider, internal_catalog_id, cache_key, tms_id, z, x, y, "png", start
+            )
+            if res is not None:
+                return res
+
+        # Resolve COG href
+        item = await self._get_first_item(internal_catalog_id, internal_collection_id)
+        if not item:
+            raise HTTPException(
+                status_code=404, detail=f"Collection '{collection_id}' has no items."
+            )
+
+        from dynastore.extensions.ogc_base import ogc_asset_href
+        cog_href = ogc_asset_href(
+            item,
+            error_detail=(
+                f"No COG asset href found for collection '{collection_id}'."
+            ),
+        )
+
+        logger.info(
+            "renders: terrain-rgb cache=miss catalog=%s collection=%s z=%s x=%s y=%s",
+            internal_catalog_id, internal_collection_id, z, x, y,
+        )
+        try:
+            tile_bytes = await run_in_thread(
+                render_cog_terrain_rgb,
+                cog_href,
+                z,
+                x,
+                y,
+                band=band,
+            )
+        except Exception as exc:
+            logger.error(
+                "renders: terrain-rgb failed for %s/%s z=%s x=%s y=%s: %s",
+                internal_catalog_id, internal_collection_id, z, x, y, exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Terrain-RGB render failed: {exc}"
+            ) from exc
+
+        if provider and cfg.cache_enabled and tile_bytes:
+            background_tasks.add_task(
+                provider.save_tile,
+                internal_catalog_id,
+                cache_key,
+                tms_id,
+                z,
+                x,
+                y,
+                tile_bytes,
+                "png",
+            )
+
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "renders: terrain-rgb catalog=%s collection=%s z=%s x=%s y=%s "
+            "duration_ms=%.2f bytes=%d",
+            internal_catalog_id, internal_collection_id, z, x, y,
+            duration_ms, len(tile_bytes) if tile_bytes else 0,
+        )
+        return Response(
+            content=tile_bytes,
+            media_type="image/png",
+            headers={
+                "X-Render-Cache": "miss",
+                "X-Render-Source": "rio-tiler-terrain-rgb",
+                "Cache-Control": f"public, max-age={cfg.ttl_seconds}",
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Hillshade tile handler
+    # ------------------------------------------------------------------
+
+    async def get_hillshade_tile(
+        self,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        catalog_id: str = Path(..., description="Public catalog ID (external_id)."),
+        collection_id: str = Path(..., description="Public collection ID (external_id)."),
+        style_id: str = Path(..., description="Style ID registered for this collection."),
+        tms_id: str = Path(..., description="Tile Matrix Set ID. Only WebMercatorQuad is supported."),
+        z: int = Path(..., ge=0, le=30, description="Zoom level."),
+        x: int = Path(..., ge=0, description="Tile column."),
+        y: int = Path(..., ge=0, description="Tile row."),
+        band: int = Query(default=1, ge=1, description="Elevation band index (1-based)."),
+        azimuth: float = Query(default=315.0, ge=0.0, lt=360.0, description="Sun azimuth in degrees (0=North, clockwise)."),
+        altitude: float = Query(default=45.0, ge=0.0, le=90.0, description="Sun altitude above horizon in degrees."),
+    ) -> Response:
+        """Render a shaded-relief (hillshade) RGBA tile from an elevation COG.
+
+        Applies the SLD colormap from the named style as a hypsometric tinting
+        layer modulated by hillshade intensity. When the style has no ColorMap,
+        a greyscale hillshade is returned.
+
+        Flow:
+        1. Validate TMS.
+        2. Resolve external catalog/collection IDs to internal immutable IDs.
+        3. Check bucket cache.
+        4. Fetch the style's SLD body and parse its ColorMap (optional).
+        5. Resolve the first COG asset href.
+        6. Render via ``render_cog_hillshade`` (run_in_thread).
+        7. Write rendered bytes to bucket cache in background.
+        """
+        start = time.perf_counter()
+
+        if tms_id not in _SUPPORTED_TMS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"TMS '{tms_id}' not supported. "
+                    f"Supported: {sorted(_SUPPORTED_TMS)}"
+                ),
+            )
+
+        # Resolve external → internal IDs
+        catalogs_svc = await self._get_catalogs_service()
+        try:
+            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=False
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not internal_catalog_id:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+
+        try:
+            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
+                internal_catalog_id, collection_id, allow_missing=False
+            )
+        except (ValueError, AttributeError):
+            internal_collection_id = collection_id
+
+        if not internal_collection_id:
+            raise HTTPException(
+                status_code=404, detail=f"Collection '{collection_id}' not found."
+            )
+
+        await self._require_collection_visible(internal_catalog_id, internal_collection_id)
+
+        # Cache key includes azimuth+altitude so different lighting is cached separately
+        az_int = int(round(azimuth))
+        alt_int = int(round(altitude))
+        hillshade_style_segment = f"hillshade-{style_id}-az{az_int}-alt{alt_int}"
+        cfg = await _load_render_caching_config()
+        cache_key = build_render_cache_key(
+            cfg.key_prefix,
+            internal_collection_id,
+            hillshade_style_segment,
+            tms_id,
+            z,
+            x,
+            y,
+            "png",
+        )
+
+        provider = get_protocol(TileStorageProtocol)
+        if provider and cfg.cache_enabled:
+            res = await self._try_render_cache(
+                provider, internal_catalog_id, cache_key, tms_id, z, x, y, "png", start
+            )
+            if res is not None:
+                return res
+
+        # Resolve style → SLD body → colormap (optional; greyscale fallback if absent)
+        colormap = None
+        styles_svc = get_protocol(StylesProtocol)
+        if styles_svc:
+            style_obj = await styles_svc.get_style(
+                internal_catalog_id, internal_collection_id, style_id
+            )
+            if style_obj:
+                sld_body = self._extract_sld_body(style_obj)
+                if sld_body:
+                    try:
+                        colormap = parse_sld_colormap(sld_body) or None
+                    except ValueError as exc:
+                        logger.warning(
+                            "renders: hillshade SLD parse failed for style=%s: %s — "
+                            "falling back to greyscale",
+                            style_id, exc,
+                        )
+
+        # Resolve COG href
+        item = await self._get_first_item(internal_catalog_id, internal_collection_id)
+        if not item:
+            raise HTTPException(
+                status_code=404, detail=f"Collection '{collection_id}' has no items."
+            )
+
+        from dynastore.extensions.ogc_base import ogc_asset_href
+        cog_href = ogc_asset_href(
+            item,
+            error_detail=(
+                f"No COG asset href found for collection '{collection_id}'."
+            ),
+        )
+
+        logger.info(
+            "renders: hillshade cache=miss catalog=%s collection=%s style=%s "
+            "azimuth=%.1f altitude=%.1f z=%s x=%s y=%s",
+            internal_catalog_id, internal_collection_id, style_id,
+            azimuth, altitude, z, x, y,
+        )
+        try:
+            tile_bytes = await run_in_thread(
+                render_cog_hillshade,
+                cog_href,
+                z,
+                x,
+                y,
+                band=band,
+                azimuth=azimuth,
+                altitude=altitude,
+                colormap=colormap,
+            )
+        except Exception as exc:
+            logger.error(
+                "renders: hillshade failed for %s/%s z=%s x=%s y=%s: %s",
+                internal_catalog_id, internal_collection_id, z, x, y, exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Hillshade render failed: {exc}"
+            ) from exc
+
+        if provider and cfg.cache_enabled and tile_bytes:
+            background_tasks.add_task(
+                provider.save_tile,
+                internal_catalog_id,
+                cache_key,
+                tms_id,
+                z,
+                x,
+                y,
+                tile_bytes,
+                "png",
+            )
+
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "renders: hillshade catalog=%s collection=%s style=%s z=%s x=%s y=%s "
+            "duration_ms=%.2f bytes=%d",
+            internal_catalog_id, internal_collection_id, style_id,
+            z, x, y, duration_ms, len(tile_bytes) if tile_bytes else 0,
+        )
+        return Response(
+            content=tile_bytes,
+            media_type="image/png",
+            headers={
+                "X-Render-Cache": "miss",
+                "X-Render-Source": "rio-tiler-hillshade",
                 "Cache-Control": f"public, max-age={cfg.ttl_seconds}",
             },
         )

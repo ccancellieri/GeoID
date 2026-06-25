@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIP | Terrain Viewer {{VERSION}}</title>
+
+    <!-- Favicon and shared vendor styles -->
+    <link rel="icon" type="image/png" href="../static/dynastore.png">
+    <link rel="stylesheet" href="../static/vendor/vendor.css"/>
+    <link rel="stylesheet" href="../static/common/tailwind.css">
+    <link rel="stylesheet" href="../static/common/page-shell.css">
+    <script src="../static/common/page-shell.js"></script>
+
+    <!-- MapLibre GL JS v5.24.0 -->
+    <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"
+            integrity="sha384-5+cfbwT0iiub6VsQAdn6yz16nr6sDiQoHx6tm4O8OVYXHYOxcffFmCJBL0dgdvGp"
+            crossorigin="anonymous"></script>
+    <link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet"
+          integrity="sha384-uTttxo/aOKbdE5RlD/SPzSDoDmNvGlUYPjONi2MN/b7c9HPSvW07OIuyP7uL6jxK"
+          crossorigin="anonymous">
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #020617;
+            color: #e2e8f0;
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .main-layout {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* Sidebar */
+        #sidebar {
+            width: 300px;
+            min-width: 240px;
+            background: rgba(15, 23, 42, 0.95);
+            border-right: 1px solid rgba(255, 255, 255, 0.07);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            z-index: 5;
+        }
+        #sidebar-header {
+            padding: 1rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        #sidebar-header label {
+            display: block;
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-bottom: 0.25rem;
+        }
+        #sidebar-controls {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+        }
+
+        /* Control groups */
+        .ctrl-group {
+            margin-bottom: 1rem;
+        }
+        .ctrl-group label {
+            display: block;
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-bottom: 0.3rem;
+        }
+        .ctrl-group input[type="range"] {
+            width: 100%;
+            accent-color: #6366f1;
+        }
+        .ctrl-group .val-display {
+            font-size: 0.75rem;
+            color: #94a3b8;
+            text-align: right;
+        }
+        .ctrl-toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            font-size: 0.82rem;
+            color: #e2e8f0;
+            margin-bottom: 0.5rem;
+        }
+        .ctrl-toggle input[type="checkbox"] {
+            accent-color: #6366f1;
+            width: 1rem;
+            height: 1rem;
+        }
+        .divider {
+            border: none;
+            border-top: 1px solid rgba(255,255,255,0.07);
+            margin: 0.75rem 0;
+        }
+        .status-text {
+            font-size: 0.78rem;
+            color: #64748b;
+            padding: 0.25rem 0;
+        }
+
+        /* Map area */
+        #map-area {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+        }
+        #terrain-map {
+            position: absolute;
+            inset: 0;
+        }
+    </style>
+</head>
+<body>
+
+<ds-page-shell data-title="Terrain Viewer"></ds-page-shell>
+
+<div class="main-layout">
+
+    <!-- Sidebar: catalog/collection selector + terrain controls -->
+    <div id="sidebar">
+        <div id="sidebar-header">
+            <label id="lbl-catalog">Catalog</label>
+            <div id="catalog-selector" class="ds-entity-selector"></div>
+            <div style="margin-top:0.5rem;">
+                <label id="lbl-collection">Collection</label>
+                <div id="collection-selector" class="ds-entity-selector"></div>
+            </div>
+            <div style="margin-top:0.5rem;">
+                <label id="lbl-style">Style</label>
+                <div id="style-selector" class="ds-entity-selector"></div>
+            </div>
+        </div>
+
+        <div id="sidebar-controls">
+
+            <!-- Terrain on/off + vertical exaggeration -->
+            <div class="ctrl-group">
+                <label>3D Terrain</label>
+                <label class="ctrl-toggle">
+                    <input type="checkbox" id="chk-terrain" checked>
+                    Enable terrain
+                </label>
+                <label>Vertical exaggeration</label>
+                <input type="range" id="rng-exaggeration" min="1" max="10" step="0.5" value="1.5">
+                <div class="val-display" id="val-exaggeration">1.5×</div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- Hillshade layer -->
+            <div class="ctrl-group">
+                <label>Hillshade</label>
+                <label class="ctrl-toggle">
+                    <input type="checkbox" id="chk-hillshade" checked>
+                    Enable hillshade overlay
+                </label>
+                <label>Sun azimuth (°)</label>
+                <input type="range" id="rng-azimuth" min="0" max="359" step="1" value="315">
+                <div class="val-display" id="val-azimuth">315°</div>
+                <label>Sun altitude (°)</label>
+                <input type="range" id="rng-altitude" min="5" max="90" step="5" value="45">
+                <div class="val-display" id="val-altitude">45°</div>
+                <label>Hillshade opacity</label>
+                <input type="range" id="rng-hs-opacity" min="0" max="1" step="0.05" value="0.6">
+                <div class="val-display" id="val-hs-opacity">0.6</div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- Colormap raster overlay -->
+            <div class="ctrl-group">
+                <label>Colormap overlay</label>
+                <label class="ctrl-toggle">
+                    <input type="checkbox" id="chk-colormap" checked>
+                    Enable colormap overlay
+                </label>
+                <label>Colormap opacity</label>
+                <input type="range" id="rng-cm-opacity" min="0" max="1" step="0.05" value="0.7">
+                <div class="val-display" id="val-cm-opacity">0.7</div>
+            </div>
+
+            <hr class="divider">
+
+            <div class="status-text" id="status-text">
+                Select a catalog, collection, and style to load terrain.
+            </div>
+        </div>
+    </div>
+
+    <!-- Map -->
+    <div id="map-area">
+        <div id="terrain-map"></div>
+    </div>
+</div>
+
+<script type="module">
+    // ---------------------------------------------------------------------------
+    // Configuration helpers
+    // ---------------------------------------------------------------------------
+
+    // Derive the reverse-proxy prefix from the pathname so the page works
+    // behind a path-prefix proxy without hard-coded absolute roots.
+    const _apiPrefix = (function() {
+        const p = window.location.pathname;
+        const i = p.indexOf('/web/');
+        return i >= 0 ? p.slice(0, i) : '';
+    })();
+
+    function apiUrl(path) {
+        return _apiPrefix + path;
+    }
+
+    // Read deep-link query params so the STAC browser "View on map" flow works.
+    const _qs = new URLSearchParams(window.location.search);
+    let _catalogId = _qs.get('catalog') || null;
+    let _collectionId = _qs.get('collection') || null;
+    let _styleId = _qs.get('style') || null;
+
+    // ---------------------------------------------------------------------------
+    // MapLibre initialisation
+    // ---------------------------------------------------------------------------
+
+    const map = new maplibregl.Map({
+        container: 'terrain-map',
+        style: {
+            version: 8,
+            sources: {
+                'osm-base': {
+                    type: 'raster',
+                    tiles: ['https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'],
+                    tileSize: 256,
+                    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+                    maxzoom: 20,
+                }
+            },
+            layers: [
+                { id: 'base-tiles', type: 'raster', source: 'osm-base', minzoom: 0, maxzoom: 22 }
+            ]
+        },
+        center: [0, 20],
+        zoom: 3,
+        pitch: 45,
+        bearing: -17,
+    });
+
+    // Add navigation controls (zoom + compass).
+    map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+    // ---------------------------------------------------------------------------
+    // Layer management
+    // ---------------------------------------------------------------------------
+
+    // Track which dynamic layers are currently on the map.
+    let _hasTerrainSource = false;
+    let _hasHillshadeLayer = false;
+    let _hasColormapLayer = false;
+
+    function _removeDynamic() {
+        ['terrain-hillshade', 'terrain-colormap'].forEach(function(id) {
+            if (map.getLayer(id)) map.removeLayer(id);
+        });
+        if (map.getSource('terrain-rgb-src')) {
+            map.setTerrain(null);
+            map.removeSource('terrain-rgb-src');
+        }
+        if (map.getSource('terrain-hillshade-src')) map.removeSource('terrain-hillshade-src');
+        if (map.getSource('terrain-colormap-src')) map.removeSource('terrain-colormap-src');
+        _hasTerrainSource = false;
+        _hasHillshadeLayer = false;
+        _hasColormapLayer = false;
+    }
+
+    function buildTerrainRgbUrl(catalogId, collectionId, tms) {
+        return (
+            apiUrl('/renders') +
+            `/catalogs/${encodeURIComponent(catalogId)}` +
+            `/collections/${encodeURIComponent(collectionId)}` +
+            `/terrain-rgb/${tms}/{z}/{x}/{y}.png`
+        );
+    }
+
+    function buildHillshadeUrl(catalogId, collectionId, styleId, tms, azimuth, altitude) {
+        return (
+            apiUrl('/renders') +
+            `/catalogs/${encodeURIComponent(catalogId)}` +
+            `/collections/${encodeURIComponent(collectionId)}` +
+            `/styles/${encodeURIComponent(styleId)}` +
+            `/hillshade/${tms}/{z}/{x}/{y}.png` +
+            `?azimuth=${azimuth}&altitude=${altitude}`
+        );
+    }
+
+    function buildColormapUrl(catalogId, collectionId, styleId, tms) {
+        return (
+            apiUrl('/renders') +
+            `/catalogs/${encodeURIComponent(catalogId)}` +
+            `/collections/${encodeURIComponent(collectionId)}` +
+            `/styles/${encodeURIComponent(styleId)}` +
+            `/tiles/${tms}/{z}/{x}/{y}.png`
+        );
+    }
+
+    function _applyTerrain() {
+        if (!_catalogId || !_collectionId) return;
+
+        _removeDynamic();
+        setStatus('Loading terrain…');
+
+        const tms = 'WebMercatorQuad';
+        const exagg = parseFloat(document.getElementById('rng-exaggeration').value);
+        const azimuth = parseInt(document.getElementById('rng-azimuth').value, 10);
+        const altitude = parseInt(document.getElementById('rng-altitude').value, 10);
+        const terrainEnabled = document.getElementById('chk-terrain').checked;
+        const hillshadeEnabled = document.getElementById('chk-hillshade').checked;
+        const colormapEnabled = document.getElementById('chk-colormap').checked;
+        const hsOpacity = parseFloat(document.getElementById('rng-hs-opacity').value);
+        const cmOpacity = parseFloat(document.getElementById('rng-cm-opacity').value);
+
+        // Terrain-RGB source (raster-dem for MapLibre terrain)
+        map.addSource('terrain-rgb-src', {
+            type: 'raster-dem',
+            tiles: [buildTerrainRgbUrl(_catalogId, _collectionId, tms)],
+            tileSize: 256,
+            encoding: 'mapbox',
+        });
+        _hasTerrainSource = true;
+
+        if (terrainEnabled) {
+            map.setTerrain({ source: 'terrain-rgb-src', exaggeration: exagg });
+        }
+
+        // Hillshade layer (uses the same raster-dem source)
+        if (hillshadeEnabled) {
+            map.addLayer({
+                id: 'terrain-hillshade',
+                type: 'hillshade',
+                source: 'terrain-rgb-src',
+                paint: {
+                    'hillshade-exaggeration': 0.5,
+                    'hillshade-shadow-color': 'rgba(0,0,0,0.6)',
+                    'hillshade-highlight-color': 'rgba(255,255,255,0.9)',
+                    'hillshade-accent-color': 'rgba(0,0,0,0.3)',
+                    'hillshade-illumination-direction': azimuth,
+                    'hillshade-illumination-anchor': 'map',
+                },
+                layout: { visibility: hillshadeEnabled ? 'visible' : 'none' },
+            });
+            map.setPaintProperty('terrain-hillshade', 'raster-opacity', hsOpacity);
+            _hasHillshadeLayer = true;
+        }
+
+        // Colormap overlay (optional — needs a style to be selected)
+        if (colormapEnabled && _styleId) {
+            map.addSource('terrain-colormap-src', {
+                type: 'raster',
+                tiles: [buildColormapUrl(_catalogId, _collectionId, _styleId, tms)],
+                tileSize: 256,
+            });
+            map.addLayer({
+                id: 'terrain-colormap',
+                type: 'raster',
+                source: 'terrain-colormap-src',
+                paint: { 'raster-opacity': cmOpacity },
+                layout: { visibility: 'visible' },
+            });
+            _hasColormapLayer = true;
+        }
+
+        setStatus(
+            `Terrain loaded: ${_catalogId} / ${_collectionId}` +
+            (_styleId ? ` / style: ${_styleId}` : ' (no style selected)')
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // UI control wiring
+    // ---------------------------------------------------------------------------
+
+    function setStatus(msg) {
+        document.getElementById('status-text').textContent = msg;
+    }
+
+    // Exaggeration slider
+    const rngExagg = document.getElementById('rng-exaggeration');
+    rngExagg.addEventListener('input', function() {
+        const v = parseFloat(this.value);
+        document.getElementById('val-exaggeration').textContent = v.toFixed(1) + '×';
+        if (_hasTerrainSource && document.getElementById('chk-terrain').checked) {
+            map.setTerrain({ source: 'terrain-rgb-src', exaggeration: v });
+        }
+    });
+
+    // Terrain toggle
+    document.getElementById('chk-terrain').addEventListener('change', function() {
+        if (!_hasTerrainSource) return;
+        if (this.checked) {
+            const v = parseFloat(document.getElementById('rng-exaggeration').value);
+            map.setTerrain({ source: 'terrain-rgb-src', exaggeration: v });
+        } else {
+            map.setTerrain(null);
+        }
+    });
+
+    // Hillshade toggle
+    document.getElementById('chk-hillshade').addEventListener('change', function() {
+        if (!_hasHillshadeLayer) {
+            if (this.checked) _applyTerrain();
+            return;
+        }
+        map.setLayoutProperty('terrain-hillshade', 'visibility', this.checked ? 'visible' : 'none');
+    });
+
+    // Hillshade opacity
+    document.getElementById('rng-hs-opacity').addEventListener('input', function() {
+        const v = parseFloat(this.value);
+        document.getElementById('val-hs-opacity').textContent = v.toFixed(2);
+        if (_hasHillshadeLayer) map.setPaintProperty('terrain-hillshade', 'raster-opacity', v);
+    });
+
+    // Azimuth + altitude — re-apply to reload hillshade tiles with new illumination
+    function _onLightingChange() {
+        const az = parseInt(document.getElementById('rng-azimuth').value, 10);
+        const alt = parseInt(document.getElementById('rng-altitude').value, 10);
+        document.getElementById('val-azimuth').textContent = az + '°';
+        document.getElementById('val-altitude').textContent = alt + '°';
+        // Update MapLibre built-in hillshade direction
+        if (_hasHillshadeLayer) {
+            map.setPaintProperty('terrain-hillshade', 'hillshade-illumination-direction', az);
+        }
+        // Note: the server-side hillshade route tiles also encode azimuth/altitude
+        // in the URL, so they are cached per-lighting. The MapLibre built-in
+        // hillshade layer (which uses the raster-dem source directly) updates
+        // immediately here without a round-trip.
+    }
+    document.getElementById('rng-azimuth').addEventListener('input', _onLightingChange);
+    document.getElementById('rng-altitude').addEventListener('input', _onLightingChange);
+
+    // Colormap toggle
+    document.getElementById('chk-colormap').addEventListener('change', function() {
+        if (!_hasColormapLayer) {
+            if (this.checked && _styleId) _applyTerrain();
+            return;
+        }
+        map.setLayoutProperty('terrain-colormap', 'visibility', this.checked ? 'visible' : 'none');
+    });
+
+    // Colormap opacity
+    document.getElementById('rng-cm-opacity').addEventListener('input', function() {
+        const v = parseFloat(this.value);
+        document.getElementById('val-cm-opacity').textContent = v.toFixed(2);
+        if (_hasColormapLayer) map.setPaintProperty('terrain-colormap', 'raster-opacity', v);
+    });
+
+    // ---------------------------------------------------------------------------
+    // Catalog / collection / style selectors
+    // ---------------------------------------------------------------------------
+
+    // Minimal selector helper: fetches a JSON list and renders a <select> element.
+    async function _fetchJson(url) {
+        try {
+            const r = await fetch(url);
+            if (!r.ok) return [];
+            return await r.json();
+        } catch (_) {
+            return [];
+        }
+    }
+
+    async function _buildSelect(containerId, items, labelFn, valueFn, initialValue, onChange) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        container.innerHTML = '';
+        const sel = document.createElement('select');
+        sel.style.cssText = (
+            'width:100%;background:#0f172a;color:#e2e8f0;border:1px solid rgba(255,255,255,0.15);' +
+            'border-radius:0.35rem;padding:0.3rem 0.4rem;font-size:0.82rem;'
+        );
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = '— select —';
+        sel.appendChild(placeholder);
+        items.forEach(function(item) {
+            const opt = document.createElement('option');
+            opt.value = valueFn(item);
+            opt.textContent = labelFn(item);
+            if (opt.value === initialValue) opt.selected = true;
+            sel.appendChild(opt);
+        });
+        sel.addEventListener('change', function() { onChange(this.value || null); });
+        container.appendChild(sel);
+        // Trigger onChange if we have a pre-selected value
+        if (initialValue && items.some(function(i) { return valueFn(i) === initialValue; })) {
+            onChange(initialValue);
+        }
+    }
+
+    async function _loadStyles(catalogId, collectionId) {
+        if (!catalogId || !collectionId) {
+            document.getElementById('style-selector').innerHTML = '';
+            return;
+        }
+        const url = apiUrl(
+            `/styles/catalogs/${encodeURIComponent(catalogId)}` +
+            `/collections/${encodeURIComponent(collectionId)}/styles`
+        );
+        const data = await _fetchJson(url);
+        const items = (data.styles || data) || [];
+        await _buildSelect(
+            'style-selector',
+            items,
+            function(s) { return s.id || s; },
+            function(s) { return s.id || s; },
+            _styleId,
+            function(val) {
+                _styleId = val;
+                _applyTerrain();
+            }
+        );
+    }
+
+    async function _loadCollections(catalogId) {
+        if (!catalogId) {
+            document.getElementById('collection-selector').innerHTML = '';
+            return;
+        }
+        const url = apiUrl(`/stac/catalogs/${encodeURIComponent(catalogId)}/collections`);
+        const data = await _fetchJson(url);
+        const items = (data.collections || data) || [];
+        await _buildSelect(
+            'collection-selector',
+            items,
+            function(c) { return c.title || c.id || c; },
+            function(c) { return c.id || c; },
+            _collectionId,
+            function(val) {
+                _collectionId = val;
+                _loadStyles(catalogId, val);
+            }
+        );
+    }
+
+    async function _loadCatalogs() {
+        const url = apiUrl('/stac/catalogs');
+        const data = await _fetchJson(url);
+        const items = (data.catalogs || data.collections || data) || [];
+        await _buildSelect(
+            'catalog-selector',
+            items,
+            function(c) { return c.title || c.id || c; },
+            function(c) { return c.id || c; },
+            _catalogId,
+            function(val) {
+                _catalogId = val;
+                _collectionId = null;
+                _styleId = null;
+                _loadCollections(val);
+            }
+        );
+    }
+
+    // Bootstrap the selector chain on load.
+    map.once('load', function() {
+        _loadCatalogs();
+    });
+</script>
+
+<!-- VERSION: {{VERSION}} -->
+</body>
+</html>
