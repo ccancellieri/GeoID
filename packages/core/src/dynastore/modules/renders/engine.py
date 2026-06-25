@@ -24,6 +24,12 @@ Public surface:
 * ``render_cog_map``  — reads an arbitrary bbox at a given width/height
   (Slice 2 addition for OGC API-Maps ``/map`` support).
 
+Both functions support single-band rendering (``band``), multiband RGB
+composites (``bands``, e.g. ``(3, 2, 1)``), band-math expressions
+(``expression``, e.g. ``"(B1-B2)/(B1+B2)"``) via rio-tiler's native parser,
+and per-band rescaling (``rescale``).  Priority when several are supplied:
+``expression`` > ``bands`` > ``band``.
+
 Both functions apply the same colormap/format pipeline and are isolated
 behind this module so that the colormap parser, cache-key logic, and STAC
 contributor can be unit-tested **without** a real GDAL/rio-tiler
@@ -37,7 +43,7 @@ Output format: ``"PNG"`` or ``"WEBP"`` (uppercase, as accepted by
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,27 @@ logger = logging.getLogger(__name__)
 RioColormap = Dict[int, Tuple[int, int, int, int]]
 
 OutputFormat = Literal["PNG", "WEBP"]
+
+# Per-band rescale range: one (min, max) entry per output band.
+RescaleRange = Sequence[Tuple[float, float]]
+
+
+def _resolve_indexes(
+    band: int,
+    bands: Optional[Sequence[int]],
+    expression: Optional[str],
+) -> Tuple[Optional[Sequence[int]], Optional[str]]:
+    """Resolve the effective (indexes, expression) pair for a COGReader call.
+
+    Priority: expression > bands > band.  Returns ``(None, expression)`` when
+    an expression is given so COGReader can apply it natively.  Returns
+    ``(indexes, None)`` otherwise.
+    """
+    if expression:
+        return None, expression
+    if bands:
+        return tuple(bands), None
+    return (band,), None
 
 
 def render_cog_tile(
@@ -56,12 +83,15 @@ def render_cog_tile(
     colormap: Optional[RioColormap] = None,
     output_format: OutputFormat = "PNG",
     band: int = 1,
+    bands: Optional[Sequence[int]] = None,
+    expression: Optional[str] = None,
+    rescale: Optional[RescaleRange] = None,
 ) -> bytes:
-    """Render a single raster tile from a COG asset href.
+    """Render a raster tile from a COG asset href.
 
     Opens the COG at ``href`` via rio-tiler's ``COGReader``, reads the tile
-    at ``(z, x, y)`` in WebMercatorQuad (the only TMS supported in Slice 1),
-    applies ``colormap`` if supplied, and returns the rendered image bytes.
+    at ``(z, x, y)`` in WebMercatorQuad, applies optional per-band rescaling
+    and ``colormap``, and returns the rendered image bytes.
 
     Args:
         href: The COG asset URL (S3, GCS, or HTTPS; GDAL VSI is applied
@@ -70,9 +100,19 @@ def render_cog_tile(
         x: Tile column index.
         y: Tile row index.
         colormap: Discrete colormap dict ``{pixel_value: (R, G, B, A)}``.
-            Pass ``None`` to render the raw pixel values (grey-scale PNG).
+            Pass ``None`` to render the raw pixel values.
         output_format: ``"PNG"`` (default) or ``"WEBP"``.
-        band: Band index to read (1-based). Defaults to 1 (single-band).
+        band: Single band index to read (1-based). Defaults to 1.  Ignored
+            when ``bands`` or ``expression`` is supplied.
+        bands: Sequence of band indices for multiband / RGB composite rendering,
+            e.g. ``(3, 2, 1)`` for true-colour.  Passed as ``indexes=`` to
+            COGReader.  Takes precedence over ``band``.
+        expression: Band-math expression (e.g. ``"(B1-B2)/(B1+B2)"``).
+            Passed directly to COGReader which uses numexpr when available.
+            Takes precedence over ``bands`` and ``band``.
+        rescale: Per-band rescale ranges as a list of ``(min, max)`` tuples,
+            one per output band.  Applied via ``ImageData.rescale()`` before
+            rendering so values are normalised to the uint8 range.
 
     Returns:
         Raw image bytes in the requested format.
@@ -90,13 +130,19 @@ def render_cog_tile(
             "Install the renders extension: `pip install dynastore-ext-renders`."
         ) from exc
 
-    with COGReader(input=href) as cog:  # type: ignore[call-arg]  # rio-tiler attrs NOTHING default
+    indexes, expr = _resolve_indexes(band, bands, expression)
+
+    with COGReader(input=href) as cog:  # type: ignore[call-arg]
         img = cog.tile(
             tile_x=x,
             tile_y=y,
             tile_z=z,
-            indexes=(band,),
+            indexes=indexes,
+            expression=expr,
         )
+
+    if rescale:
+        img.rescale(in_range=list(rescale))
 
     return img.render(
         img_format=output_format,
@@ -114,13 +160,16 @@ def render_cog_map(
     colormap: Optional[RioColormap] = None,
     output_format: OutputFormat = "PNG",
     band: int = 1,
+    bands: Optional[Sequence[int]] = None,
+    expression: Optional[str] = None,
+    rescale: Optional[RescaleRange] = None,
 ) -> bytes:
     """Render a COG asset over an arbitrary geographic bounding box.
 
     Opens the COG at ``href`` via rio-tiler's ``COGReader``, reads the region
     defined by ``bbox`` (``[min_lon, min_lat, max_lon, max_lat]`` in
-    WGS-84 / EPSG:4326) at the requested pixel dimensions, applies
-    ``colormap`` if supplied, and returns the rendered image bytes.
+    WGS-84 / EPSG:4326) at the requested pixel dimensions, applies optional
+    per-band rescaling and ``colormap``, and returns the rendered image bytes.
 
     This is the Slice 2 companion to ``render_cog_tile``: the tile function
     handles WebMercatorQuad z/x/y requests; this function handles the
@@ -134,7 +183,14 @@ def render_cog_map(
         colormap: Discrete colormap ``{pixel_value: (R, G, B, A)}``.
             Pass ``None`` to render raw values.
         output_format: ``"PNG"`` (default) or ``"WEBP"``.
-        band: Band index to read (1-based). Defaults to 1.
+        band: Single band index to read (1-based). Defaults to 1.  Ignored
+            when ``bands`` or ``expression`` is supplied.
+        bands: Sequence of band indices for multiband / RGB composite rendering.
+            Passed as ``indexes=`` to COGReader.  Takes precedence over ``band``.
+        expression: Band-math expression.  Passed directly to COGReader.
+            Takes precedence over ``bands`` and ``band``.
+        rescale: Per-band rescale ranges as a list of ``(min, max)`` tuples.
+            Applied via ``ImageData.rescale()`` before rendering.
 
     Returns:
         Raw image bytes in the requested format.
@@ -151,14 +207,20 @@ def render_cog_map(
             "Install the renders extension: `pip install dynastore-ext-renders`."
         ) from exc
 
+    indexes, expr = _resolve_indexes(band, bands, expression)
     min_lon, min_lat, max_lon, max_lat = bbox
+
     with COGReader(input=href) as cog:  # type: ignore[call-arg]
         img = cog.part(
             bbox=(min_lon, min_lat, max_lon, max_lat),
-            indexes=(band,),
+            indexes=indexes,
+            expression=expr,
             width=width,
             height=height,
         )
+
+    if rescale:
+        img.rescale(in_range=list(rescale))
 
     return img.render(
         img_format=output_format,

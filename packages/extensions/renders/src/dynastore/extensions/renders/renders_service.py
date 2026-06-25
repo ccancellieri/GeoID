@@ -16,26 +16,33 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""OGC Renders extension — styled raster tile service for single-band COG assets.
+"""OGC Renders extension — styled raster tile service for COG assets.
 
 Scope: Slice 1 — single-band COG → SLD colormap → PNG/WebP tile, with
 bucket-cache reuse (same per-catalog bucket as the vector tile cache) and
 STAC ``render:renders`` enrichment via the ``RendersStacContributor``.
 
+Slice 5 extends the tile endpoint with optional multiband / band-math params:
+
+- ``bands`` — comma-separated 1-based band indices for RGB composites
+  (e.g. ``3,2,1`` for true-colour).  Overrides the single-band ``band`` param.
+- ``expression`` — band-math expression evaluated by rio-tiler / numexpr
+  (e.g. ``(B1-B2)/(B1+B2)`` for NDVI).  Overrides ``bands`` when supplied.
+- ``rescale`` — per-band rescale ranges as ``min,max`` pairs separated by
+  semicolons (e.g. ``0,3000;0,3000;0,3000`` for three bands).
+
+Each distinct combination of ``bands`` / ``expression`` / ``rescale`` maps to a
+separate cache blob via a ``params_hash`` suffix on the style segment of the key.
+
 Route pattern::
 
     GET /renders/catalogs/{catalog_id}/collections/{collection_id}
         /styles/{style_id}/tiles/{tms_id}/{z}/{x}/{y}.{format}
+        ?bands=3,2,1&rescale=0,3000;0,3000;0,3000
 
 ``catalog_id`` and ``collection_id`` are EXTERNAL (public) IDs in the path.
 They are resolved to INTERNAL IDs at the request boundary, before any cache
 key is built or any DB/storage call is made.
-
-Deferred (later slices):
-- OGC Maps ``/map`` endpoint (Slice 2)
-- CQL2 style-binding selectors (Slice 3)
-- Terrain-RGB / hillshade (Slice 4)
-- Multiband RGB composite (Slice 5)
 """
 
 from __future__ import annotations
@@ -43,7 +50,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import rio_tiler as _rio_tiler_scope_gate  # noqa: F401  # SCOPE gate: requires rio-tiler
 _ = _rio_tiler_scope_gate  # silence pyright "unused"
@@ -54,6 +61,7 @@ from fastapi import (  # noqa: E402
     FastAPI,
     HTTPException,
     Path,
+    Query,
     Request,
 )
 from fastapi.responses import RedirectResponse, Response  # noqa: E402
@@ -63,7 +71,11 @@ from dynastore.extensions.ogc_base import OGCServiceMixin  # noqa: E402
 from dynastore.models.protocols import StylesProtocol  # noqa: E402
 from dynastore.modules.concurrency import run_in_thread  # noqa: E402
 from dynastore.modules.renders.colormap import parse_sld_colormap  # noqa: E402
-from dynastore.modules.renders.config import RenderCachingConfig, build_render_cache_key  # noqa: E402
+from dynastore.modules.renders.config import (  # noqa: E402
+    RenderCachingConfig,
+    build_render_cache_key,
+    build_render_params_hash,
+)
 from dynastore.modules.renders.engine import render_cog_tile  # noqa: E402
 from dynastore.modules.tiles.tiles_module import TileStorageProtocol  # noqa: E402
 from dynastore.tools.discovery import get_protocol  # noqa: E402
@@ -77,6 +89,66 @@ _FORMAT_MEDIA_TYPE: dict[str, str] = {
 
 # Only WebMercatorQuad is supported in Slice 1.
 _SUPPORTED_TMS = frozenset({"WebMercatorQuad"})
+
+
+def _parse_multiband_params(
+    bands_str: Optional[str],
+    expression: Optional[str],
+    rescale_str: Optional[str],
+) -> Tuple[
+    Optional[List[int]],
+    Optional[str],
+    Optional[List[Tuple[float, float]]],
+]:
+    """Parse and validate the optional multiband query params.
+
+    Args:
+        bands_str: Comma-separated band indices string (e.g. ``"3,2,1"``).
+        expression: Band-math expression (passed through unchanged).
+        rescale_str: Semicolon-separated ``"min,max"`` pairs
+            (e.g. ``"0,3000;0,3000;0,3000"``).
+
+    Returns:
+        Tuple of ``(bands, expression, rescale)`` with types suitable for
+        ``render_cog_tile`` / ``render_cog_map``.  Any unparseable component
+        raises ``HTTPException(400)``.
+    """
+    bands: Optional[List[int]] = None
+    rescale: Optional[List[Tuple[float, float]]] = None
+
+    if bands_str:
+        try:
+            bands = [int(b.strip()) for b in bands_str.split(",") if b.strip()]
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid 'bands' parameter {bands_str!r}: expected comma-separated integers.",
+            ) from exc
+        if not bands:
+            raise HTTPException(
+                status_code=400,
+                detail="'bands' parameter must contain at least one band index.",
+            )
+
+    if rescale_str:
+        try:
+            rescale = []
+            for pair in rescale_str.split(";"):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                lo_s, hi_s = pair.split(",", 1)
+                rescale.append((float(lo_s.strip()), float(hi_s.strip())))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid 'rescale' parameter {rescale_str!r}: "
+                    "expected semicolon-separated 'min,max' pairs."
+                ),
+            ) from exc
+
+    return bands, expression, rescale
 
 
 async def _load_render_caching_config() -> RenderCachingConfig:
@@ -99,12 +171,16 @@ async def _load_render_caching_config() -> RenderCachingConfig:
 
 
 class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
-    """Single-band COG → styled raster tile service.
+    """COG raster tile service with SLD colormap and multiband rendering.
 
     Route prefix: ``/renders``.  Reuses the per-catalog GCS bucket via the
     existing ``TileStorageProtocol`` so no new storage infrastructure is
     needed. Registers ``RendersStacContributor`` at lifespan so STAC reads
     in the same process advertise ``render:renders`` entries for COG items.
+
+    Supports single-band (Slice 1) and multiband / band-math rendering
+    (Slice 5) through the same route; the optional ``bands``, ``expression``,
+    and ``rescale`` query params select the render recipe.
     """
 
     priority: int = 100
@@ -175,11 +251,36 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
         x: int = Path(..., ge=0, description="Tile column."),
         y: int = Path(..., ge=0, description="Tile row."),
         format: str = Path(..., description="Output image format: 'png' or 'webp'."),
+        bands: Optional[str] = Query(
+            None,
+            description=(
+                "Comma-separated 1-based band indices for multiband / RGB composite "
+                "rendering (e.g. '3,2,1' for true-colour). "
+                "Overrides the single-band default. "
+                "Ignored when 'expression' is also supplied."
+            ),
+        ),
+        expression: Optional[str] = Query(
+            None,
+            description=(
+                "Band-math expression evaluated by rio-tiler "
+                "(e.g. '(B1-B2)/(B1+B2)' for NDVI). "
+                "Takes precedence over 'bands'."
+            ),
+        ),
+        rescale: Optional[str] = Query(
+            None,
+            description=(
+                "Per-band rescale ranges as semicolon-separated 'min,max' pairs, "
+                "one per output band (e.g. '0,3000;0,3000;0,3000'). "
+                "Applied before rendering to normalise pixel values."
+            ),
+        ),
     ) -> Response:
-        """Render a single-band COG asset tile with SLD colormap styling.
+        """Render a COG asset tile with optional SLD colormap and multiband params.
 
         Flow:
-        1. Validate format and TMS.
+        1. Validate format and TMS; parse optional multiband params.
         2. Resolve external catalog/collection IDs to internal immutable IDs.
         3. Check bucket cache (signed-URL redirect on hit).
         4. Fetch the style's SLD body and parse its ColorMap.
@@ -189,7 +290,7 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
         """
         start = time.perf_counter()
 
-        # 1. Validate format and TMS
+        # 1. Validate format and TMS; parse optional multiband params.
         fmt_lower = format.lower()
         if fmt_lower not in _FORMAT_MEDIA_TYPE:
             raise HTTPException(
@@ -197,6 +298,10 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
                 detail=f"Unsupported format '{format}'. Use 'png' or 'webp'.",
             )
         output_format: Literal["PNG", "WEBP"] = "PNG" if fmt_lower == "png" else "WEBP"
+
+        bands_parsed, expression_parsed, rescale_parsed = _parse_multiband_params(
+            bands, expression, rescale
+        )
 
         if tms_id not in _SUPPORTED_TMS:
             raise HTTPException(
@@ -241,6 +346,11 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
 
         # 3. Load cache config and check bucket cache
         cfg = await _load_render_caching_config()
+        params_hash = build_render_params_hash(
+            bands=bands_parsed,
+            expression=expression_parsed,
+            rescale=rescale_parsed,
+        )
         cache_key = build_render_cache_key(
             cfg.key_prefix,
             internal_collection_id,
@@ -250,6 +360,7 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
             x,
             y,
             fmt_lower,
+            params_hash=params_hash,
         )
 
         provider = get_protocol(TileStorageProtocol)
@@ -277,28 +388,24 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
             )
 
         sld_body = self._extract_sld_body(style_obj)
-        if not sld_body:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"Style '{style_id}' has no SLD stylesheet. "
-                    "Single-band raster rendering requires an SLD ColorMap."
-                ),
-            )
-
-        try:
-            colormap = parse_sld_colormap(sld_body)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=f"SLD colormap parse failed: {exc}",
-            ) from exc
-
-        if not colormap:
-            logger.warning(
-                "renders: empty colormap for style=%s collection=%s/%s — rendering without colormap",
-                style_id, internal_catalog_id, internal_collection_id,
-            )
+        colormap = None
+        if sld_body:
+            try:
+                colormap = parse_sld_colormap(sld_body) or None
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"SLD colormap parse failed: {exc}",
+                ) from exc
+        else:
+            # Multiband / expression renders do not require an SLD stylesheet;
+            # single-band renders without a colormap produce greyscale output.
+            if not bands_parsed and not expression_parsed:
+                logger.warning(
+                    "renders: style=%s has no SLD stylesheet — rendering greyscale "
+                    "(supply 'bands' or 'expression' for multiband output)",
+                    style_id,
+                )
 
         # 5. Resolve COG href from the collection's first item
         item = await self._get_first_item(internal_catalog_id, internal_collection_id)
@@ -322,8 +429,10 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
 
         # 6. Render via rio-tiler in a thread (avoids blocking the event loop)
         logger.info(
-            "renders: cache=miss catalog=%s collection=%s style=%s z=%s x=%s y=%s fmt=%s",
+            "renders: cache=miss catalog=%s collection=%s style=%s z=%s x=%s y=%s fmt=%s"
+            " bands=%s expression=%s",
             internal_catalog_id, internal_collection_id, style_id, z, x, y, fmt_lower,
+            bands_parsed, expression_parsed,
         )
         try:
             tile_bytes = await run_in_thread(
@@ -334,6 +443,9 @@ class RendersService(protocols.ExtensionProtocol, OGCServiceMixin):
                 y,
                 colormap=colormap or None,
                 output_format=output_format,
+                bands=bands_parsed,
+                expression=expression_parsed,
+                rescale=rescale_parsed,
             )
         except Exception as exc:
             logger.error(

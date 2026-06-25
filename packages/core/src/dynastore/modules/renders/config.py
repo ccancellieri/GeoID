@@ -32,7 +32,8 @@ public ``external_id``) so renaming a collection never silently shifts
 all rendered tiles to a new prefix.
 """
 
-from typing import ClassVar, Tuple
+import hashlib
+from typing import ClassVar, Optional, Sequence, Tuple
 
 from pydantic import Field
 
@@ -94,6 +95,42 @@ class RenderCachingConfig(PluginConfig):
     )
 
 
+def build_render_params_hash(
+    bands: Optional[Sequence[int]] = None,
+    expression: Optional[str] = None,
+    rescale: Optional[Sequence[Tuple[float, float]]] = None,
+) -> Optional[str]:
+    """Return a short hash over multiband render params, or ``None`` when all are absent.
+
+    Used as a ``params_hash`` component in cache keys so that different
+    band selections, expressions, and rescale ranges cache as distinct blobs
+    even when they share the same ``style_id``.
+
+    The hash is a 16-char hex prefix of SHA-256 over a canonical string
+    representation of the three params.  Single-band requests with no
+    expression and no rescale return ``None`` (no hash suffix — same cache key
+    shape as Slice 1).
+
+    Args:
+        bands: Sequence of band indices (e.g. ``(3, 2, 1)``).
+        expression: Band-math expression string (e.g. ``"(B1-B2)/(B1+B2)"``).
+        rescale: Per-band rescale ranges as ``[(min, max), ...]``.
+
+    Returns:
+        A 16-character hex string, or ``None`` when all params are absent/empty.
+    """
+    if not bands and not expression and not rescale:
+        return None
+
+    parts: list[str] = [
+        f"bands={','.join(str(b) for b in bands) if bands else ''}",
+        f"expr={expression or ''}",
+        f"rescale={'|'.join(f'{lo},{hi}' for lo, hi in rescale) if rescale else ''}",
+    ]
+    raw = ";".join(parts)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 def build_render_cache_key(
     key_prefix: str,
     internal_collection_id: str,
@@ -103,14 +140,21 @@ def build_render_cache_key(
     x: int,
     y: int,
     fmt: str,
+    params_hash: Optional[str] = None,
 ) -> str:
     """Build the GCS object key for a rendered raster tile.
 
     The ``internal_collection_id`` MUST be the immutable internal id, not the
     public ``external_id``. Callers are responsible for resolving external →
     internal before calling this function.
+
+    When ``params_hash`` is supplied (non-None), it is appended to the
+    ``style_id`` segment so that distinct band selections, expressions, and
+    rescale ranges cache as distinct blobs:
+    ``{key_prefix}/{internal_collection_id}/{style_id}@{params_hash}/...``
     """
+    style_segment = f"{style_id}@{params_hash}" if params_hash else style_id
     return (
-        f"{key_prefix}/{internal_collection_id}/{style_id}"
+        f"{key_prefix}/{internal_collection_id}/{style_segment}"
         f"/{tms_id}/{z}/{x}/{y}.{fmt}"
     )
