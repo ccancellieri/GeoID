@@ -258,6 +258,21 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         """
         ...
 
+    async def get_provisioning_checklist(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Dict[str, str]:
+        """Return the raw provisioning checklist for a catalog from PG.
+
+        Reads ``catalog.catalogs.provisioning_checklist`` directly (no model
+        cache, no FOR UPDATE lock — this is a pure read).  Returns an empty
+        dict when the row is missing or the column is NULL.  The JSONB value
+        may arrive as a ``str`` or a ``dict`` depending on the asyncpg
+        type-codec configuration; both forms are handled.
+        """
+        ...
+
     async def get_catalog_config(
         self, catalog_id: str, ctx: Optional["DriverContext"] = None,
     ) ->Any:

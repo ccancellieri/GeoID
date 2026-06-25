@@ -534,6 +534,12 @@ _get_provisioning_checklist_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
+# Non-locking variant for read-only callers (e.g. catalog_status).
+_read_provisioning_checklist_query = DQLQuery(
+    "SELECT provisioning_checklist FROM catalog.catalogs WHERE id = :id AND deleted_at IS NULL;",
+    result_handler=ResultHandler.ONE_DICT,
+)
+
 _get_catalog_query = DQLQuery(
     "SELECT * FROM catalog.catalogs WHERE id = :id AND deleted_at IS NULL;",
     result_handler=ResultHandler.ONE_DICT,
@@ -2962,6 +2968,31 @@ class CatalogService(CatalogsProtocol):
                     )
                     await upsert_catalog_metadata(catalog_id, metadata)
         return True
+
+    async def get_provisioning_checklist(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> dict[str, str]:
+        """Return the raw provisioning checklist for a catalog from PG.
+
+        Reads ``catalog.catalogs.provisioning_checklist`` directly without
+        acquiring a row lock — this is a pure read, not a write-serialisation
+        path.  Returns an empty dict when the row is missing or the column is
+        NULL.  The JSONB value may arrive as a ``str`` or a ``dict`` depending
+        on the asyncpg type-codec configuration; both forms are handled
+        (mirrors the pattern in ``mark_provisioning_step``).
+        """
+        db_resource = ctx.db_resource if ctx else None
+        engine = get_catalog_engine(db_resource)
+        async with managed_transaction(engine) as conn:
+            row = await _read_provisioning_checklist_query.execute(conn, id=catalog_id)
+        if not row:
+            return {}
+        raw = row.get("provisioning_checklist")
+        if raw is None:
+            return {}
+        return json.loads(raw) if isinstance(raw, str) else dict(raw)
 
 
 # --- Standalone Utilities ---

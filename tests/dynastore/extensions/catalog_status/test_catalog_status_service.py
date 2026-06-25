@@ -381,20 +381,28 @@ def test_catalog_status_view_includes_provisioning_checklist_field():
     }
 
 
+def _get_catalog_status_handler():
+    from dynastore.extensions.catalog_status.catalog_status_service import CatalogStatusService
+    for route in CatalogStatusService.router.routes:
+        if getattr(route, "name", "") == "get_catalog_status":
+            return route.endpoint
+    raise AssertionError("get_catalog_status route not found")
+
+
 @pytest.mark.asyncio
 async def test_get_catalog_status_populates_provisioning_checklist():
-    """get_catalog_status must forward the catalog's provisioning_checklist
-    attribute into the CatalogStatusView response."""
+    """get_catalog_status must read provisioning_checklist via the protocol
+    getter (not from the stripped catalog model attribute) and forward it into
+    the CatalogStatusView response."""
     checklist = {"gcp_bucket": "complete", "gcp_eventing": "degraded"}
-    fake_cat = SimpleNamespace(
-        id="cat-checklist",
-        provisioning_status="ready",
-        provisioning_checklist=checklist,
-    )
+    fake_cat = SimpleNamespace(id="cat-checklist", provisioning_status="ready")
 
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
     catalogs_mock.resolve_physical_schema = AsyncMock(return_value=None)
+    # The service calls get_provisioning_checklist (new protocol method) rather
+    # than reading the stripped model attribute.
+    catalogs_mock.get_provisioning_checklist = AsyncMock(return_value=checklist)
 
     def _proto(proto):
         from dynastore.models.protocols.catalogs import CatalogsProtocol
@@ -405,15 +413,7 @@ async def test_get_catalog_status_populates_provisioning_checklist():
             return None
         return None
 
-    from dynastore.extensions.catalog_status.catalog_status_service import CatalogStatusService
-
-    handler = None
-    for route in CatalogStatusService.router.routes:
-        name = getattr(route, "name", "")
-        if name == "get_catalog_status":
-            handler = route.endpoint
-            break
-    assert handler is not None, "get_catalog_status route not found"
+    handler = _get_catalog_status_handler()
 
     with (
         patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
@@ -421,19 +421,20 @@ async def test_get_catalog_status_populates_provisioning_checklist():
     ):
         result = await handler("cat-checklist")
 
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with("cat-checklist")
     assert result.provisioning_checklist == checklist
 
 
 @pytest.mark.asyncio
-async def test_get_catalog_status_checklist_empty_when_attribute_absent():
-    """When the catalog model has no provisioning_checklist attribute (older
-    catalog objects), the response must include an empty dict — not crash."""
-    # SimpleNamespace with no provisioning_checklist attribute.
+async def test_get_catalog_status_checklist_empty_when_getter_returns_empty():
+    """When get_provisioning_checklist returns {} (no checklist in PG),
+    the response must include an empty dict — not crash."""
     fake_cat = SimpleNamespace(id="cat-old", provisioning_status="ready")
 
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
     catalogs_mock.resolve_physical_schema = AsyncMock(return_value=None)
+    catalogs_mock.get_provisioning_checklist = AsyncMock(return_value={})
 
     def _proto(proto):
         from dynastore.models.protocols.catalogs import CatalogsProtocol
@@ -444,15 +445,7 @@ async def test_get_catalog_status_checklist_empty_when_attribute_absent():
             return None
         return None
 
-    from dynastore.extensions.catalog_status.catalog_status_service import CatalogStatusService
-
-    handler = None
-    for route in CatalogStatusService.router.routes:
-        name = getattr(route, "name", "")
-        if name == "get_catalog_status":
-            handler = route.endpoint
-            break
-    assert handler is not None, "get_catalog_status route not found"
+    handler = _get_catalog_status_handler()
 
     with (
         patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
@@ -461,6 +454,105 @@ async def test_get_catalog_status_checklist_empty_when_attribute_absent():
         result = await handler("cat-old")
 
     assert result.provisioning_checklist == {}
+
+
+@pytest.mark.asyncio
+async def test_get_catalog_status_checklist_empty_on_getter_error():
+    """When get_provisioning_checklist raises (e.g. DB unavailable), the
+    endpoint must not 500 — it returns an empty checklist and logs a warning."""
+    fake_cat = SimpleNamespace(id="cat-err", provisioning_status="ready")
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value=None)
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        side_effect=RuntimeError("DB unavailable")
+    )
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return None
+        return None
+
+    handler = _get_catalog_status_handler()
+
+    with (
+        patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
+        patch(_GET_PROTOCOL, side_effect=_proto),
+    ):
+        result = await handler("cat-err")
+
+    # Must not raise; checklist degrades gracefully to empty.
+    assert result.provisioning_checklist == {}
+
+
+@pytest.mark.asyncio
+async def test_get_catalog_status_surfaces_catalog_provision_task():
+    """A task of type 'catalog_provision' (the current type used by create_catalog
+    since #2329) must appear in the CatalogStatusView task field."""
+    import contextlib
+    from datetime import datetime
+
+    fake_cat = SimpleNamespace(id="cat-prov", provisioning_status="provisioning")
+    fake_tid = uuid.uuid4()
+    fake_task = SimpleNamespace(
+        jobID=fake_tid,
+        task_type="catalog_provision",
+        status=SimpleNamespace(value="ACTIVE"),
+        error_message=None,
+        retry_count=0,
+        max_retries=3,
+        timestamp=datetime(2026, 1, 1),
+        finished_at=None,
+    )
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="tenant_schema")
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        return_value={"catalog_core": "complete"}
+    )
+
+    db_mock = SimpleNamespace(engine=MagicMock())
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return db_mock
+        return None
+
+    fake_tm = MagicMock()
+    fake_tm.list_tasks = AsyncMock(return_value=[fake_task])
+
+    @contextlib.asynccontextmanager
+    async def _noop_tx(engine):
+        yield MagicMock()
+
+    handler = _get_catalog_status_handler()
+
+    # managed_transaction is imported inside the handler body; patch it where
+    # the module looks it up (the query_executor module), not on catalog_status_service.
+    with (
+        patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
+        patch(_GET_PROTOCOL, side_effect=_proto),
+        patch("dynastore.modules.tasks.tasks_module", fake_tm),
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+            _noop_tx,
+        ),
+    ):
+        result = await handler("cat-prov")
+
+    assert result.task is not None, "task must not be None for catalog_provision tasks"
+    assert str(result.task.task_id) == str(fake_tid)
+    assert result.provisioning_checklist == {"catalog_core": "complete"}
 
 
 def test_catalog_status_role_bindings_admin_mutation():

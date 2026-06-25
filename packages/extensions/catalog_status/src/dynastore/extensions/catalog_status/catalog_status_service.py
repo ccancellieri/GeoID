@@ -226,8 +226,13 @@ class CatalogStatusService(ExtensionProtocol):
                         tasks = await tasks_module.list_tasks(
                             conn, schema=physical_schema, limit=20, offset=0,
                         )
+                    # Accept both the current task type ("catalog_provision",
+                    # enqueued by create_catalog since #2329) and the legacy
+                    # type ("gcp_provision_catalog", enqueued by the old GCP
+                    # module and by the reprovision endpoint).
                     provision_tasks = [
-                        t for t in tasks if t.task_type == "gcp_provision_catalog"
+                        t for t in tasks
+                        if t.task_type in ("catalog_provision", "gcp_provision_catalog")
                     ]
                     if provision_tasks:
                         t = sorted(
@@ -256,9 +261,16 @@ class CatalogStatusService(ExtensionProtocol):
                         exc_info=True,
                     )
 
-        provisioning_checklist: dict[str, str] = (
-            getattr(catalog, "provisioning_checklist", None) or {}
-        )
+        provisioning_checklist: dict[str, str] = {}
+        try:
+            provisioning_checklist = await catalogs.get_provisioning_checklist(catalog_id)
+        except Exception as exc:
+            logger.warning(
+                "catalog_status: failed to read provisioning_checklist for "
+                "catalog %s: %s",
+                catalog_id, exc,
+                exc_info=True,
+            )
 
         return CatalogStatusView(
             catalog_id=catalog_id,
