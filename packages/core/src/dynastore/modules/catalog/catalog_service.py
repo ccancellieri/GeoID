@@ -1031,6 +1031,181 @@ class CatalogService(CatalogsProtocol):
             raise ValueError(f"Catalog '{catalog_id}' not found.")
         return model
 
+    async def _run_core_init(
+        self,
+        conn: Any,
+        catalog_model: Catalog,
+        external_id: str,
+        physical_schema: str,
+    ) -> None:
+        """Run the core tenant-provisioning steps inside an existing transaction.
+
+        Executes all DDL and lifecycle hooks that must complete atomically with
+        the catalog.catalogs INSERT before the transaction commits.  The caller
+        owns the transaction; this method must NOT open a new one.
+
+        Steps (in order):
+          1. Create the tenant schema (``IF NOT EXISTS`` — idempotent).
+          2. Create core tenant tables (collections, configs, IAM) via the
+             module-level DDL batch (warm-path sentinel skips in one round-trip).
+          3. Create per-tenant collection-metadata tables (catalog_core et al.).
+          4. Run module-specific ``init_catalog`` lifecycle hooks (SAVEPOINTs).
+          5. Stamp ``external_id`` on ``catalog_model`` for downstream drivers.
+          6. Persist catalog metadata via the catalog router.
+          7. Materialise the provisioning checklist and flip status to
+             ``'provisioning'`` when at least one provisioner is active.
+          8. Run ``post_create_catalog`` lifecycle hooks (SAVEPOINTs).
+          9. Snapshot catalog config defaults (best-effort, non-fatal).
+         10. Emit ``CATALOG_CREATION`` and ``AFTER_CATALOG_CREATION`` events.
+
+        Mutates ``catalog_model.external_id`` and
+        ``catalog_model.provisioning_status`` in place.
+        """
+        # --- CRITICAL: Core tenant tables MUST be created directly in the outer
+        # transaction, NOT inside a lifecycle SAVEPOINT (begin_nested).
+        #
+        # PostgreSQL DDL (CREATE SCHEMA, CREATE TABLE) inside a SAVEPOINT is
+        # problematic: if any error occurs, only the SAVEPOINT rolls back — but
+        # because DDL is not transactional in some PG contexts (especially when
+        # combined with the asyncpg driver), the schema/tables may or may not be
+        # created, leaving subsequent SAVEPOINT-wrapped hooks (stats, tiles, gcp…)
+        # with nothing to work against.
+        #
+        # By creating schema + core tables here (outer tx), all lifecycle hooks
+        # are guaranteed to find them ready.
+
+        # 1. Tenant schema only. The shared ``configs`` schema and its
+        # tables (the FK target for catalog_configs/collection_configs) are
+        # bootstrapped once at application startup by
+        # PlatformConfigService.initialize_storage. Re-asserting that shared
+        # DDL on every create took schema-level locks and silently
+        # serialized concurrent creates under load. Bootstrap once at boot,
+        # never per request.
+        await ensure_schema_exists(conn, physical_schema)
+
+        # 2. Core Tables (collections, catalog_configs, collection_configs)
+        # Single module-level batch — warm path skips everything in one
+        # round-trip once collection_configs (the last table) exists.
+        logger.info(
+            f"Creating core tenant tables for schema: {physical_schema} (Catalog: {catalog_model.id})"
+        )
+        await _build_tenant_core_ddl_batch(physical_schema).execute(
+            conn, schema=physical_schema
+        )
+
+        # 2b. Catalog-tier IAM seeding is performed by the IamModule's
+        # lifecycle hook ``initialize_iam_tenant`` which calls
+        # ``PolicyService.provision_default_policies(catalog_id, ...)``.
+        # That path is config-driven (``IamRolesConfig.catalog_roles``)
+        # and replaces the historical inline SQL seed (geoid#643).
+
+        # 3. Per-tenant collection-metadata CORE table.  STAC sidecar
+        # (when StacModule is loaded) attaches via lifecycle_registry
+        # below.  MUST precede lifecycle hooks because downstream
+        # drivers may write metadata immediately.
+        from dynastore.modules.catalog.db_init.core_tables import (
+            ensure_tenant_core_tables,
+        )
+        await ensure_tenant_core_tables(conn, physical_schema)
+
+        # 4. Module-specific lifecycle hooks (stats, tiles, …) all run AFTER
+        #    the schema and core tables exist, inside their own SAVEPOINTs.
+        await lifecycle_registry.init_catalog(
+            conn, physical_schema, catalog_id=catalog_model.id
+        )
+
+        # Stamp external_id on the model so metadata drivers and callers
+        # can round-trip it without re-querying the registry.
+        catalog_model.external_id = external_id  # type: ignore[attr-defined]
+
+        # Catalog metadata persistence — router-direct.
+        #
+        # The catalog.catalogs registry row is committed (INSERT above),
+        # so the FK into catalog.catalogs(id) from the domain-scoped
+        # metadata tables is satisfied.  The router fans out the
+        # payload across every registered CatalogStore driver
+        # (PG Core / PG Stac today; ES indexers, etc. in the future).
+        # Each driver filters down to its own domain's columns and
+        # skips the write when the filtered payload is empty — so a
+        # caller who supplied no metadata produces zero rows, and a
+        # STAC-only payload writes only to the STAC driver.
+        catalog_metadata = _build_catalog_metadata_payload(catalog_model)
+        if catalog_metadata:
+            from dynastore.modules.catalog.catalog_router import (
+                upsert_catalog_metadata,
+            )
+            await upsert_catalog_metadata(
+                catalog_model.id,
+                catalog_metadata,
+                db_resource=conn,
+            )
+
+        # #1175: materialise the provisioning checklist from the registered
+        # provisioners now that the row exists. Built BEFORE the post-create
+        # hooks so the full barrier is in place before any provisioner marks
+        # its step — a step that completes early can't flip the catalog ready
+        # while a slower step is still pending. An empty checklist (on-prem /
+        # no active provider) leaves the catalog 'ready'; otherwise it becomes
+        # 'provisioning' until every step is terminal.
+        from dynastore.modules.catalog.provisioning_registry import (
+            provisioning_registry,
+            STATUS_PROVISIONING,
+        )
+        checklist = await provisioning_registry.build_checklist(
+            catalog_model.id, conn
+        )
+        if checklist:
+            await _set_provisioning_checklist_query.execute(
+                conn,
+                id=catalog_model.id,
+                status=STATUS_PROVISIONING,
+                checklist=json.dumps(checklist),
+            )
+            catalog_model.provisioning_status = STATUS_PROVISIONING
+            _invalidate_catalog_model_cache(catalog_model.id)
+
+        # Post-INSERT sync lifecycle phase: runs after the catalog.catalogs
+        # row exists so module hooks may reference it (FK inserts, status
+        # UPDATEs). A provisioner's post-create hook does its synchronous
+        # work and/or enqueues an async task that later calls
+        # ``mark_provisioning_step`` for its checklist key (#1131 / #1175).
+        await lifecycle_registry.post_create_catalog(
+            conn, physical_schema, catalog_id=catalog_model.id
+        )
+
+        # #1079 (c): freeze the catalog's inherited config defaults now that
+        # the registry row + tenant config tables exist. Captures the
+        # resolved platform/code defaults for stable value-configs into a
+        # schema-id-tagged blob so a later default change cannot silently
+        # re-resolve into this catalog's collections. Best-effort — a
+        # snapshot failure must not abort catalog creation.
+        try:
+            _cfg = self.configs
+            if _cfg is not None:
+                await _cfg.snapshot_catalog_defaults(
+                    catalog_model.id, ctx=DriverContext(db_resource=conn)
+                )
+        except Exception:
+            logger.warning(
+                "catalog %s: defaults-snapshot capture failed",
+                catalog_model.id,
+                exc_info=True,
+            )
+
+        # Lifecycle Phase 2: EVENT (Now after schema is ready AND record exists)
+        await emit_event(
+            CatalogEventType.CATALOG_CREATION,
+            catalog_id=catalog_model.id,
+            db_resource=conn,
+        )
+
+        # Lifecycle Phase 3: AFTER
+        await emit_event(
+            CatalogEventType.AFTER_CATALOG_CREATION,
+            catalog_id=catalog_model.id,
+            db_resource=conn,
+        )
+
     async def create_catalog(
         self,
         catalog_data: Union[Dict[str, Any], Catalog],
@@ -1127,150 +1302,7 @@ class CatalogService(CatalogsProtocol):
             # id that was committed — never a placeholder that may have differed.
             physical_schema = committed_internal_id
 
-            # --- CRITICAL: Core tenant tables MUST be created directly in the outer
-            # transaction, NOT inside a lifecycle SAVEPOINT (begin_nested).
-            #
-            # PostgreSQL DDL (CREATE SCHEMA, CREATE TABLE) inside a SAVEPOINT is
-            # problematic: if any error occurs, only the SAVEPOINT rolls back — but
-            # because DDL is not transactional in some PG contexts (especially when
-            # combined with the asyncpg driver), the schema/tables may or may not be
-            # created, leaving subsequent SAVEPOINT-wrapped hooks (stats, tiles, gcp…)
-            # with nothing to work against.
-            #
-            # By creating schema + core tables here (outer tx), all lifecycle hooks
-            # are guaranteed to find them ready.
-
-            # 1. Tenant schema only. The shared ``configs`` schema and its
-            # tables (the FK target for catalog_configs/collection_configs) are
-            # bootstrapped once at application startup by
-            # PlatformConfigService.initialize_storage. Re-asserting that shared
-            # DDL on every create took schema-level locks and silently
-            # serialized concurrent creates under load. Bootstrap once at boot,
-            # never per request.
-            await ensure_schema_exists(conn, physical_schema)
-
-            # 2. Core Tables (collections, catalog_configs, collection_configs)
-            # Single module-level batch — warm path skips everything in one
-            # round-trip once collection_configs (the last table) exists.
-            logger.info(
-                f"Creating core tenant tables for schema: {physical_schema} (Catalog: {catalog_model.id})"
-            )
-            await _build_tenant_core_ddl_batch(physical_schema).execute(
-                conn, schema=physical_schema
-            )
-
-            # 2b. Catalog-tier IAM seeding is performed by the IamModule's
-            # lifecycle hook ``initialize_iam_tenant`` which calls
-            # ``PolicyService.provision_default_policies(catalog_id, ...)``.
-            # That path is config-driven (``IamRolesConfig.catalog_roles``)
-            # and replaces the historical inline SQL seed (geoid#643).
-
-            # 3. Per-tenant collection-metadata CORE table.  STAC sidecar
-            # (when StacModule is loaded) attaches via lifecycle_registry
-            # below.  MUST precede lifecycle hooks because downstream
-            # drivers may write metadata immediately.
-            from dynastore.modules.catalog.db_init.core_tables import (
-                ensure_tenant_core_tables,
-            )
-            await ensure_tenant_core_tables(conn, physical_schema)
-
-            # 4. Module-specific lifecycle hooks (stats, tiles, …) all run AFTER
-            #    the schema and core tables exist, inside their own SAVEPOINTs.
-            await lifecycle_registry.init_catalog(
-                conn, physical_schema, catalog_id=catalog_model.id
-            )
-
-            # Stamp external_id on the model so metadata drivers and callers
-            # can round-trip it without re-querying the registry.
-            catalog_model.external_id = external_id  # type: ignore[attr-defined]
-
-            # Catalog metadata persistence — router-direct.
-            #
-            # The catalog.catalogs registry row is committed (INSERT above),
-            # so the FK into catalog.catalogs(id) from the domain-scoped
-            # metadata tables is satisfied.  The router fans out the
-            # payload across every registered CatalogStore driver
-            # (PG Core / PG Stac today; ES indexers, etc. in the future).
-            # Each driver filters down to its own domain's columns and
-            # skips the write when the filtered payload is empty — so a
-            # caller who supplied no metadata produces zero rows, and a
-            # STAC-only payload writes only to the STAC driver.
-            catalog_metadata = _build_catalog_metadata_payload(catalog_model)
-            if catalog_metadata:
-                from dynastore.modules.catalog.catalog_router import (
-                    upsert_catalog_metadata,
-                )
-                await upsert_catalog_metadata(
-                    catalog_model.id,
-                    catalog_metadata,
-                    db_resource=conn,
-                )
-
-            # #1175: materialise the provisioning checklist from the registered
-            # provisioners now that the row exists. Built BEFORE the post-create
-            # hooks so the full barrier is in place before any provisioner marks
-            # its step — a step that completes early can't flip the catalog ready
-            # while a slower step is still pending. An empty checklist (on-prem /
-            # no active provider) leaves the catalog 'ready'; otherwise it becomes
-            # 'provisioning' until every step is terminal.
-            from dynastore.modules.catalog.provisioning_registry import (
-                provisioning_registry,
-                STATUS_PROVISIONING,
-            )
-            checklist = await provisioning_registry.build_checklist(
-                catalog_model.id, conn
-            )
-            if checklist:
-                await _set_provisioning_checklist_query.execute(
-                    conn,
-                    id=catalog_model.id,
-                    status=STATUS_PROVISIONING,
-                    checklist=json.dumps(checklist),
-                )
-                catalog_model.provisioning_status = STATUS_PROVISIONING
-                _invalidate_catalog_model_cache(catalog_model.id)
-
-            # Post-INSERT sync lifecycle phase: runs after the catalog.catalogs
-            # row exists so module hooks may reference it (FK inserts, status
-            # UPDATEs). A provisioner's post-create hook does its synchronous
-            # work and/or enqueues an async task that later calls
-            # ``mark_provisioning_step`` for its checklist key (#1131 / #1175).
-            await lifecycle_registry.post_create_catalog(
-                conn, physical_schema, catalog_id=catalog_model.id
-            )
-
-            # #1079 (c): freeze the catalog's inherited config defaults now that
-            # the registry row + tenant config tables exist. Captures the
-            # resolved platform/code defaults for stable value-configs into a
-            # schema-id-tagged blob so a later default change cannot silently
-            # re-resolve into this catalog's collections. Best-effort — a
-            # snapshot failure must not abort catalog creation.
-            try:
-                _cfg = self.configs
-                if _cfg is not None:
-                    await _cfg.snapshot_catalog_defaults(
-                        catalog_model.id, ctx=DriverContext(db_resource=conn)
-                    )
-            except Exception:
-                logger.warning(
-                    "catalog %s: defaults-snapshot capture failed",
-                    catalog_model.id,
-                    exc_info=True,
-                )
-
-            # Lifecycle Phase 2: EVENT (Now after schema is ready AND record exists)
-            await emit_event(
-                CatalogEventType.CATALOG_CREATION,
-                catalog_id=catalog_model.id,
-                db_resource=conn,
-            )
-
-            # Lifecycle Phase 3: AFTER
-            await emit_event(
-                CatalogEventType.AFTER_CATALOG_CREATION,
-                catalog_id=catalog_model.id,
-                db_resource=conn,
-            )
+            await self._run_core_init(conn, catalog_model, external_id, physical_schema)
 
             # Invalidate cache to ensure it's re-fetched in subsequent calls
             _invalidate_catalog_model_cache(catalog_model.id)

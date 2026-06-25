@@ -143,23 +143,34 @@ def test_post_create_noop_when_no_hooks(fake_conn):
 
 
 def test_create_catalog_runs_post_create_after_insert():
-    """Source-level pin: ``create_catalog`` must invoke
-    ``post_create_catalog`` AFTER the ``catalog.catalogs`` INSERT
-    (``_create_catalog_strict_query.execute``) and after the pre-INSERT
-    ``init_catalog`` call. This is the #1131 ordering guarantee."""
+    """Source-level pin: ``_run_core_init`` must invoke ``init_catalog``
+    before ``post_create_catalog``, and ``create_catalog`` must delegate to
+    ``_run_core_init`` after inserting the catalog row.  This is the #1131
+    ordering guarantee, now captured in the extracted private method."""
     from dynastore.modules.catalog.catalog_service import CatalogService
 
-    src = inspect.getsource(CatalogService.create_catalog)
-    idx_init = src.find("init_catalog(")
-    idx_insert = src.find("_create_catalog_strict_query.execute")
-    idx_post = src.find("post_create_catalog(")
+    # The init steps moved into _run_core_init; check ordering there.
+    src_init = inspect.getsource(CatalogService._run_core_init)
+    idx_init = src_init.find("init_catalog(")
+    idx_post = src_init.find("post_create_catalog(")
 
-    assert idx_init != -1, "create_catalog should still call init_catalog"
+    assert idx_init != -1, "_run_core_init should call init_catalog"
+    assert idx_post != -1, "_run_core_init must call post_create_catalog"
+    assert idx_init < idx_post, (
+        "ordering regression: post_create_catalog must run AFTER init_catalog "
+        f"in _run_core_init. Got init={idx_init}, post={idx_post}."
+    )
+
+    # create_catalog must call _run_core_init after inserting the row.
+    src_create = inspect.getsource(CatalogService.create_catalog)
+    idx_insert = src_create.find("_insert_catalog_row_with_pk_retry(")
+    idx_delegate = src_create.find("_run_core_init(")
+
     assert idx_insert != -1, "create_catalog should still INSERT the catalog row"
-    assert idx_post != -1, "create_catalog must call post_create_catalog"
-    assert idx_init < idx_insert < idx_post, (
-        "ordering regression: post_create_catalog must run AFTER the catalog "
-        f"row INSERT. Got init={idx_init}, insert={idx_insert}, post={idx_post}."
+    assert idx_delegate != -1, "create_catalog must delegate to _run_core_init"
+    assert idx_insert < idx_delegate, (
+        "ordering regression: _run_core_init must be called AFTER the catalog "
+        f"row INSERT. Got insert={idx_insert}, delegate={idx_delegate}."
     )
 
 
