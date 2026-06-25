@@ -416,7 +416,7 @@ async def _read_task_status(engine: DbResource, task_id: Any) -> Optional[str]:
 # Task types that carry a ``catalog_id`` in their inputs and require the
 # provisioning checklist to be drained on terminal exit.
 _PROVISIONING_TASK_TYPES: frozenset = frozenset(
-    {"gcp_provision_catalog", "catalog_core_init", "catalog_provision"}
+    {"gcp_provision_catalog", "catalog_provision"}
 )
 
 

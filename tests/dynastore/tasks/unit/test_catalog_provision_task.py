@@ -694,11 +694,11 @@ class TestRoutingMatrix:
 
         for preset in ("cloud", "onprem"):
             tasks, _ = build_routing_matrix(
-                [self._task_item("catalog_core_init")], preset=preset
+                [self._task_item("gcp_provision_catalog")], preset=preset
             )
-            targets = tasks["catalog_core_init"]
+            targets = tasks["gcp_provision_catalog"]
             assert len(targets) == 1, (
-                f"catalog_core_init must have 1 target under {preset}; "
+                f"gcp_provision_catalog must have 1 target under {preset}; "
                 f"got {len(targets)}"
             )
             assert targets[0].runner == "background"
@@ -719,7 +719,7 @@ class TestShouldOffloadProvisioning:
     async def test_non_offloadable_task_returns_false(self):
         from dynastore.modules.tasks.execution import _should_offload_provisioning
 
-        result = await _should_offload_provisioning("catalog_core_init")
+        result = await _should_offload_provisioning("gcp_provision_catalog")
         assert result is False
 
     @pytest.mark.asyncio

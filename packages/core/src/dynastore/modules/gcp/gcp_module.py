@@ -353,11 +353,161 @@ class GCPModule(
             # A 'degraded' eventing step does NOT block readiness — see
             # ``evaluate_checklist`` and the fail-soft eventing path in
             # tasks/gcp_provision/task.py.
+            #
+            # 'gcp_config' (priority 1) runs whenever GCP is installed AND
+            # provision_enabled=False.  It persists the deterministic bucket name
+            # onto GcpCatalogBucketConfig so uploads can resolve it without a real
+            # GCS bucket.  When provision_enabled=True this step is skipped (not in
+            # the checklist) because gcp_bucket's ensure_storage_for_catalog already
+            # writes bucket_name in its Phase 3 _write_bucket_name call.
             from dynastore.modules.catalog.provisioning_registry import (
                 provisioning_registry,
+                SCOPE_CATALOG,
             )
-            provisioning_registry.register("gcp_bucket", self.provisioner_is_active)
-            provisioning_registry.register("gcp_eventing", self.provisioner_is_active)
+
+            async def _gcp_config_is_active(catalog_id: str, conn=None) -> bool:
+                """Active when GCP is installed AND provision_enabled=False.
+
+                This is the logical complement of provisioner_is_active: the
+                gcp_config step runs exactly when the real bucket/eventing steps
+                do NOT, ensuring bucket_name is always persisted on the async path
+                regardless of whether provisioning is enabled.
+                """
+                return not await self.provisioner_is_active(catalog_id, conn)
+
+            async def _gcp_config_provision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "provision",
+                collection_id=None,
+                **_kw,
+            ) -> None:
+                """Persist the deterministic bucket name when provision_enabled=False.
+
+                Mirrors the bucket-link branch of _on_post_create_catalog so that
+                the async path (where _run_post_create=False suppresses the lifecycle
+                hook fan-out) still writes GcpCatalogBucketConfig.bucket_name.
+
+                The catalog schema already exists when this hook runs because
+                catalog_core (priority 0) completes before this group (priority 1).
+                """
+                from dynastore.models.protocols.configs import ConfigsProtocol
+                from dynastore.modules.db_config.query_executor import managed_transaction
+                from dynastore.modules.gcp.gcp_config import GcpCatalogBucketConfig
+                from dynastore.models.driver_context import DriverContext
+
+                config_mgr = get_protocol(ConfigsProtocol)
+                if config_mgr is None:
+                    logger.warning(
+                        "gcp_config provisioner: ConfigsProtocol not available for catalog '%s'; "
+                        "skipping bucket-name persistence.",
+                        catalog_id,
+                    )
+                    return
+
+                engine = self._engine
+                if engine is None:
+                    raise RuntimeError(
+                        f"gcp_config provisioner: DB engine not available for catalog '{catalog_id}'"
+                    )
+
+                async with managed_transaction(engine) as conn:
+                    bucket_config = await config_mgr.get_config(
+                        GcpCatalogBucketConfig,
+                        catalog_id=catalog_id,
+                        ctx=DriverContext(db_resource=conn),
+                    )
+                    bucket_name = self.get_bucket_service().generate_bucket_name(
+                        catalog_id, physical_schema=catalog_id
+                    )
+                    bucket_config.bucket_name = bucket_name
+                    await config_mgr.set_config(
+                        GcpCatalogBucketConfig,
+                        bucket_config,
+                        catalog_id=catalog_id,
+                        check_immutability=False,
+                        ctx=DriverContext(db_resource=conn),
+                    )
+                logger.info(
+                    "gcp_config provisioner: bucket name '%s' persisted for catalog '%s'.",
+                    bucket_name, catalog_id,
+                )
+
+            provisioning_registry.register(
+                "gcp_config",
+                _gcp_config_is_active,
+                priority=1,
+                scope=SCOPE_CATALOG,
+                name="GCP bucket config link",
+                description=(
+                    "Persists the deterministic GCS bucket name onto GcpCatalogBucketConfig "
+                    "when provision_enabled=False, so uploads can resolve the bucket without "
+                    "a real GCS provisioning step."
+                ),
+                provision=_gcp_config_provision,
+            )
+
+            async def _gcp_bucket_provision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "provision",
+                collection_id=None,
+                **_kw,
+            ) -> None:
+                """Provision the GCS bucket for a catalog.
+
+                Called by CatalogProvisionTask via call_hook(**ctx).  Delegates
+                to the same _provision_bucket_hard helper used by the standalone
+                gcp_provision_catalog task so the idempotency and error-handling
+                contract is identical.  CatalogProvisionTask marks the
+                gcp_bucket checklist step after this hook returns successfully.
+                """
+                from dynastore.tasks.gcp_provision.task import _provision_bucket_hard, _get_storage_protocol
+
+                storage = _get_storage_protocol()
+                await _provision_bucket_hard(storage, catalog_id)
+
+            async def _gcp_eventing_provision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "provision",
+                collection_id=None,
+                **_kw,
+            ) -> None:
+                """Set up managed eventing for a catalog.
+
+                Called by CatalogProvisionTask via call_hook(**ctx) after
+                gcp_bucket completes.  Delegates to _provision_eventing which
+                encodes the skip (managed_eventing disabled) / permanent-fail
+                (IAM) / transient-fail contract.
+
+                When managed_eventing is disabled, _provision_eventing returns
+                'skipped'.  Both 'complete' and 'skipped' are terminal-good per
+                evaluate_checklist, so the executor marking this step 'complete'
+                (its default on a successful hook) is acceptable — the catalog
+                still reaches 'ready'.  Operator visibility of the 'skipped'
+                distinction is a follow-up concern; the correctness invariant
+                (catalog becomes ready, no step left pending) holds either way.
+                """
+                from dynastore.tasks.gcp_provision.task import _provision_eventing, _get_storage_protocol
+
+                storage = _get_storage_protocol()
+                await _provision_eventing(storage, catalog_id)
+                # executor marks gcp_eventing 'complete' after this returns
+
+            provisioning_registry.register(
+                "gcp_bucket",
+                self.provisioner_is_active,
+                provision=_gcp_bucket_provision,
+            )
+            provisioning_registry.register(
+                "gcp_eventing",
+                self.provisioner_is_active,
+                provision=_gcp_eventing_provision,
+            )
             # We keep these as async because they don't block the core creation flow
             # and don't cause race conditions in tests as easily as the creation one.
             lifecycle_registry.async_catalog_destroyer()(self._on_async_destroy_catalog)

@@ -379,6 +379,92 @@ class CatalogModule(ModuleProtocol):
             register_item_reverse_cascade_subscriber()
             register_item_forward_cascade_subscriber()
 
+            # Register catalog_core as priority-0 provisioner.  It runs the
+            # tenant schema DDL and lifecycle hooks that every other provisioner
+            # (GCP, ES, …) depends on.  Priority 0 guarantees it executes in its
+            # own group before any priority-100 provisioner group.
+            from dynastore.modules.catalog.provisioning_registry import (
+                provisioning_registry as _prov_registry,
+                SCOPE_CATALOG,
+            )
+
+            async def _catalog_core_is_active(catalog_id: str, conn=None) -> bool:
+                return True
+
+            async def _catalog_core_provision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "provision",
+                collection_id=None,
+                **_kw,
+            ) -> None:
+                """Run the core tenant DDL for a catalog.
+
+                Called by CatalogProvisionTask via call_hook(**ctx).  Opens its
+                own managed transaction because the task runs outside any caller
+                transaction.
+
+                _build_checklist=False: checklist already seeded by
+                  _create_catalog_async before the task was enqueued.
+                _run_post_create=False: post_create lifecycle hooks (including
+                  GCP's _on_post_create_catalog) are skipped here; GCP
+                  provisioning is driven by the gcp_bucket/gcp_eventing
+                  provisioner hooks at priority 100, not via the lifecycle
+                  fan-out that would enqueue a second gcp_provision_catalog task.
+                _emit_events=False: CATALOG_CREATION / AFTER_CATALOG_CREATION
+                  events are not emitted on the async path.
+                """
+                from dynastore.modules.catalog.catalog_service import (
+                    get_catalog_engine,
+                    _invalidate_catalog_model_cache,
+                    _invalidate_catalog_external_id_cache,
+                )
+                from dynastore.modules.db_config.query_executor import managed_transaction
+                from dynastore.tools.protocol_helpers import resolve
+                from dynastore.models.protocols import CatalogsProtocol
+
+                catalogs = resolve(CatalogsProtocol)
+                catalog_model = await catalogs.get_catalog_model(catalog_id)
+                if catalog_model is None:
+                    raise RuntimeError(
+                        f"catalog_core provisioner: catalog '{catalog_id}' not found"
+                    )
+
+                run_core_init = getattr(catalogs, "_run_core_init", None)
+                if run_core_init is None:
+                    raise RuntimeError(
+                        f"CatalogsProtocol implementation {type(catalogs).__name__} "
+                        "does not expose _run_core_init; cannot run catalog_core provisioner"
+                    )
+
+                _ext_id = external_id or getattr(catalog_model, "external_id", None) or catalog_id
+                physical_schema = catalog_id
+
+                async with managed_transaction(get_catalog_engine()) as conn:
+                    await run_core_init(
+                        conn,
+                        catalog_model,
+                        _ext_id,
+                        physical_schema,
+                        _build_checklist=False,
+                        _run_post_create=False,
+                        _emit_events=False,
+                    )
+
+                _invalidate_catalog_model_cache(catalog_id)
+                _invalidate_catalog_external_id_cache(_ext_id)
+
+            _prov_registry.register(
+                "catalog_core",
+                _catalog_core_is_active,
+                priority=0,
+                scope=SCOPE_CATALOG,
+                name="Core tenant schema",
+                description="Creates tenant schema, core tables, and lifecycle hooks.",
+                provision=_catalog_core_provision,
+            )
+
             # 4. Initialize Storage & Schemas
             # Hub/sidecar creation is handled by ItemsPostgresqlDriver.ensure_storage()
             # which is called from _create_collection_internal(). No lifecycle hook needed.

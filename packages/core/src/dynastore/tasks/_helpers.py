@@ -19,7 +19,7 @@
 """Shared helpers for provisioning task implementations.
 
 Thin wrappers over protocol lookups and hook invocation used by
-``catalog_core_init``, ``gcp_provision``, and ``catalog_provision``.
+``gcp_provision`` and ``catalog_provision``.
 """
 
 from __future__ import annotations

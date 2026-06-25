@@ -21,9 +21,8 @@
 Verifies:
   - ``_async_catalog_create_enabled`` reads DYNASTORE_ASYNC_CATALOG_CREATE correctly.
   - On the async path: ``provisioning_status='provisioning'`` is set, the
-    checklist is seeded with ``catalog_core: pending`` (plus any other active
-    provisioners), and a ``catalog_core_init`` task is enqueued in the global
-    task schema.
+    checklist is seeded from registered provisioners (via build_checklist), and
+    a ``catalog_provision`` task is enqueued in the global task schema.
   - ``_run_core_init`` is NOT called on the async path.
 
 All DB I/O is mocked — no live database required.
@@ -106,16 +105,21 @@ class TestAsyncCatalogCreateFlag:
 def _make_async_create_patches(
     fake_conn: Any,
     committed_id: str = "c_abc123",
-    extra_checklist: dict | None = None,
+    registry_checklist: dict | None = None,
     create_task_side_effect: Any = None,
 ) -> tuple:
     """Return a tuple of (patch-list, state-dict) for the async create path.
 
     ``state_dict`` accumulates side-effect captures so assertions can read them
     after the context manager exits.
+
+    ``registry_checklist`` is what provisioning_registry.build_checklist returns
+    (i.e. the full checklist including catalog_core, gcp_bucket, etc.).
+    The async path no longer hardcodes catalog_core — it uses build_checklist
+    directly.
     """
     state: dict = {"checklist": {}, "tasks": []}
-    extra_checklist = extra_checklist or {}
+    registry_checklist = registry_checklist or {"catalog_core": "pending"}
 
     async def _fake_insert(conn, *, external_id, provisioning_status):
         return committed_id
@@ -128,7 +132,7 @@ def _make_async_create_patches(
         return MagicMock()
 
     mock_reg = MagicMock()
-    mock_reg.build_checklist = AsyncMock(return_value=extra_checklist)
+    mock_reg.build_checklist = AsyncMock(return_value=registry_checklist)
 
     from unittest.mock import patch as _patch
 
@@ -203,17 +207,24 @@ class TestAsyncCatalogCreatePath:
         assert result.provisioning_status == "provisioning"
 
     @pytest.mark.asyncio
-    async def test_catalog_core_pending_in_checklist(self):
-        """catalog_core: pending must always be in the seeded checklist."""
+    async def test_checklist_sourced_from_registry(self):
+        """The checklist must be sourced entirely from provisioning_registry.build_checklist.
+
+        The async path no longer hardcodes catalog_core: pending — it relies on
+        catalog_core being registered as a priority-0 provisioner.  Whatever the
+        registry returns is written verbatim to the DB.
+        """
         from dynastore.modules.catalog.catalog_service import CatalogService
 
         svc = object.__new__(CatalogService)
         fake_conn = AsyncMock()
         catalog_model = _make_catalog_model("cat2")
 
-        # Simulate one extra active provisioner (e.g. GCP).
+        # Simulate registry returning catalog_core + gcp_bucket (as it would
+        # when CatalogModule and GCPModule are both loaded).
+        full_checklist = {"catalog_core": "pending", "gcp_bucket": "pending"}
         patches, state, mock_reg, fake_set, fake_create = _make_async_create_patches(
-            fake_conn, committed_id="c_def456", extra_checklist={"gcp_bucket": "pending"}
+            fake_conn, committed_id="c_def456", registry_checklist=full_checklist
         )
 
         with (
@@ -237,9 +248,11 @@ class TestAsyncCatalogCreatePath:
             ):
                 await svc._create_catalog_async(catalog_model, "cat2", None)
 
+        # Both items from the registry are present in the seeded checklist.
         assert state["checklist"].get("catalog_core") == "pending"
-        # Other active provisioners are also kept.
         assert state["checklist"].get("gcp_bucket") == "pending"
+        # build_checklist was called exactly once.
+        mock_reg.build_checklist.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_run_core_init_not_called(self):
@@ -281,7 +294,7 @@ class TestAsyncCatalogCreatePath:
 
     @pytest.mark.asyncio
     async def test_task_enqueued_with_correct_type_and_inputs(self):
-        """catalog_core_init task must be enqueued with correct type, inputs, and global schema."""
+        """catalog_provision task must be enqueued with correct type, inputs, and global schema."""
         from dynastore.modules.catalog.catalog_service import CatalogService
 
         svc = object.__new__(CatalogService)
@@ -316,8 +329,9 @@ class TestAsyncCatalogCreatePath:
 
         assert len(state["tasks"]) == 1
         task_req, schema = state["tasks"][0]
-        assert task_req.task_type == "catalog_core_init"
+        assert task_req.task_type == "catalog_provision"
         assert task_req.inputs["catalog_id"] == committed_id
-        assert task_req.inputs["external_id"] == "my-ext-id"
+        assert task_req.inputs["scope"] == "catalog"
+        assert task_req.inputs["operation"] == "provision"
         # Must go into the global task schema, NOT the (non-existent) tenant schema.
         assert schema == "tasks"  # get_task_schema() default

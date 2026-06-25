@@ -120,7 +120,6 @@ storage_drain = "dynastore.tasks.workclass_drain.storage_drain_task:StorageDrain
 event_drain = "dynastore.tasks.workclass_drain.event_drain_task:EventDrainTask"
 collection_hard_delete = "dynastore.tasks.collection_hard_delete.task:CollectionHardDeleteTask"
 webhook_delivery = "dynastore.tasks.webhook_delivery.task:WebhookDeliveryTask"
-catalog_core_init = "dynastore.tasks.catalog_core_init.task:CatalogCoreInitTask"
 catalog_provision = "dynastore.tasks.catalog_provision.task:CatalogProvisionTask"
 
 [build-system]

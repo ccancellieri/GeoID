@@ -247,7 +247,7 @@ def _async_catalog_create_enabled() -> bool:
 
     Default is False — catalog creation is synchronous and returns 201, identical
     to the pre-2329 behaviour.  When enabled, the core tenant-provisioning steps
-    are deferred to the ``catalog_core_init`` worker task and the create endpoint
+    are deferred to the ``catalog_provision`` worker task and the create endpoint
     returns 202 with a Location header pointing at the catalog resource.
     """
     return os.getenv("DYNASTORE_ASYNC_CATALOG_CREATE", "false").lower() in ("true", "1", "yes")
@@ -1090,6 +1090,10 @@ class CatalogService(CatalogsProtocol):
         catalog_model: Catalog,
         external_id: str,
         physical_schema: str,
+        *,
+        _build_checklist: bool = True,
+        _run_post_create: bool = True,
+        _emit_events: bool = True,
     ) -> None:
         """Run the core tenant-provisioning steps inside an existing transaction.
 
@@ -1107,9 +1111,16 @@ class CatalogService(CatalogsProtocol):
           6. Persist catalog metadata via the catalog router.
           7. Materialise the provisioning checklist and flip status to
              ``'provisioning'`` when at least one provisioner is active.
+             Skipped when ``_build_checklist=False`` (checklist already seeded
+             by the caller, e.g. the async create path).
           8. Run ``post_create_catalog`` lifecycle hooks (SAVEPOINTs).
+             Skipped when ``_run_post_create=False`` (async provisioner path —
+             GCP provisioning is driven by the registry executor hooks, not the
+             post-create lifecycle fan-out that would enqueue gcp_provision_catalog
+             as a second task and double-provision GCP).
           9. Snapshot catalog config defaults (best-effort, non-fatal).
          10. Emit ``CATALOG_CREATION`` and ``AFTER_CATALOG_CREATION`` events.
+             Skipped when ``_emit_events=False`` (async provisioner path).
 
         Mutates ``catalog_model.external_id`` and
         ``catalog_model.provisioning_status`` in place.
@@ -1193,38 +1204,40 @@ class CatalogService(CatalogsProtocol):
                 db_resource=conn,
             )
 
-        # #1175: materialise the provisioning checklist from the registered
-        # provisioners now that the row exists. Built BEFORE the post-create
-        # hooks so the full barrier is in place before any provisioner marks
-        # its step — a step that completes early can't flip the catalog ready
-        # while a slower step is still pending. An empty checklist (on-prem /
-        # no active provider) leaves the catalog 'ready'; otherwise it becomes
-        # 'provisioning' until every step is terminal.
-        from dynastore.modules.catalog.provisioning_registry import (
-            provisioning_registry,
-            STATUS_PROVISIONING,
-        )
-        checklist = await provisioning_registry.build_checklist(
-            catalog_model.id, conn
-        )
-        if checklist:
-            await _set_provisioning_checklist_query.execute(
-                conn,
-                id=catalog_model.id,
-                status=STATUS_PROVISIONING,
-                checklist=json.dumps(checklist),
+        if _build_checklist:
+            # #1175: materialise the provisioning checklist from the registered
+            # provisioners now that the row exists. Built BEFORE the post-create
+            # hooks so the full barrier is in place before any provisioner marks
+            # its step — a step that completes early can't flip the catalog ready
+            # while a slower step is still pending. An empty checklist (on-prem /
+            # no active provider) leaves the catalog 'ready'; otherwise it becomes
+            # 'provisioning' until every step is terminal.
+            from dynastore.modules.catalog.provisioning_registry import (
+                provisioning_registry,
+                STATUS_PROVISIONING,
             )
-            catalog_model.provisioning_status = STATUS_PROVISIONING
-            _invalidate_catalog_model_cache(catalog_model.id)
+            checklist = await provisioning_registry.build_checklist(
+                catalog_model.id, conn
+            )
+            if checklist:
+                await _set_provisioning_checklist_query.execute(
+                    conn,
+                    id=catalog_model.id,
+                    status=STATUS_PROVISIONING,
+                    checklist=json.dumps(checklist),
+                )
+                catalog_model.provisioning_status = STATUS_PROVISIONING
+                _invalidate_catalog_model_cache(catalog_model.id)
 
-        # Post-INSERT sync lifecycle phase: runs after the catalog.catalogs
-        # row exists so module hooks may reference it (FK inserts, status
-        # UPDATEs). A provisioner's post-create hook does its synchronous
-        # work and/or enqueues an async task that later calls
-        # ``mark_provisioning_step`` for its checklist key (#1131 / #1175).
-        await lifecycle_registry.post_create_catalog(
-            conn, physical_schema, catalog_id=catalog_model.id
-        )
+        if _run_post_create:
+            # Post-INSERT sync lifecycle phase: runs after the catalog.catalogs
+            # row exists so module hooks may reference it (FK inserts, status
+            # UPDATEs). A provisioner's post-create hook does its synchronous
+            # work and/or enqueues an async task that later calls
+            # ``mark_provisioning_step`` for its checklist key (#1131 / #1175).
+            await lifecycle_registry.post_create_catalog(
+                conn, physical_schema, catalog_id=catalog_model.id
+            )
 
         # #1079 (c): freeze the catalog's inherited config defaults now that
         # the registry row + tenant config tables exist. Captures the
@@ -1245,19 +1258,20 @@ class CatalogService(CatalogsProtocol):
                 exc_info=True,
             )
 
-        # Lifecycle Phase 2: EVENT (Now after schema is ready AND record exists)
-        await emit_event(
-            CatalogEventType.CATALOG_CREATION,
-            catalog_id=catalog_model.id,
-            db_resource=conn,
-        )
+        if _emit_events:
+            # Lifecycle Phase 2: EVENT (Now after schema is ready AND record exists)
+            await emit_event(
+                CatalogEventType.CATALOG_CREATION,
+                catalog_id=catalog_model.id,
+                db_resource=conn,
+            )
 
-        # Lifecycle Phase 3: AFTER
-        await emit_event(
-            CatalogEventType.AFTER_CATALOG_CREATION,
-            catalog_id=catalog_model.id,
-            db_resource=conn,
-        )
+            # Lifecycle Phase 3: AFTER
+            await emit_event(
+                CatalogEventType.AFTER_CATALOG_CREATION,
+                catalog_id=catalog_model.id,
+                db_resource=conn,
+            )
 
     async def create_catalog(
         self,
@@ -1327,10 +1341,10 @@ class CatalogService(CatalogsProtocol):
     ) -> "Catalog":
         """Async create path (DYNASTORE_ASYNC_CATALOG_CREATE=true).
 
-        Inserts the catalog.catalogs row, seeds the provisioning checklist with
-        ``catalog_core: pending`` (plus any other active provisioners), then
-        enqueues a ``catalog_core_init`` task that runs the full tenant
-        provisioning steps.  Returns immediately with
+        Inserts the catalog.catalogs row, seeds the provisioning checklist from
+        the active registered provisioners (including ``catalog_core`` at
+        priority 0), then enqueues a ``catalog_provision`` task that drives
+        every provisioner in priority order.  Returns immediately with
         ``provisioning_status='provisioning'`` — the caller converts this to a
         202 response.
 
@@ -1340,7 +1354,6 @@ class CatalogService(CatalogsProtocol):
         from dynastore.modules.catalog.provisioning_registry import (
             provisioning_registry,
             STATUS_PROVISIONING,
-            STEP_PENDING,
         )
         from dynastore.modules.tasks.models import TaskCreate
         from dynastore.modules.tasks.tasks_module import create_task, get_task_schema
@@ -1377,15 +1390,14 @@ class CatalogService(CatalogsProtocol):
             )
             catalog_model.id = committed_internal_id
 
-            # Seed the provisioning checklist.  ``catalog_core`` is always
-            # pending on this path (the task will mark it complete or failed).
-            # Active provisioners (e.g. GCP bucket/eventing) that were already
-            # registered are also included so their steps are barriers.
-            checklist: Dict[str, str] = {"catalog_core": STEP_PENDING}
-            extra = await provisioning_registry.build_checklist(
+            # Seed the provisioning checklist from all active registered
+            # provisioners (catalog_core at priority 0, GCP at priority 100, …).
+            # The checklist is written before the task is enqueued so every step
+            # is a barrier from the moment the task starts — a step that
+            # completes early cannot prematurely flip the catalog ready.
+            checklist: Dict[str, str] = await provisioning_registry.build_checklist(
                 catalog_model.id, conn
             )
-            checklist.update(extra)
 
             await _set_provisioning_checklist_query.execute(
                 conn,
@@ -1394,11 +1406,16 @@ class CatalogService(CatalogsProtocol):
                 checklist=json.dumps(checklist),
             )
 
-            # Enqueue the durable task into the GLOBAL task schema.
-            # The tenant schema does not exist yet; the task creates it.
+            # Enqueue the unified provisioning executor into the GLOBAL task
+            # schema.  The tenant schema does not exist yet; the catalog_core
+            # provisioner (priority 0) creates it.
             task_request = TaskCreate(
-                task_type="catalog_core_init",
-                inputs={"catalog_id": committed_internal_id, "external_id": external_id},
+                task_type="catalog_provision",
+                inputs={
+                    "catalog_id": committed_internal_id,
+                    "scope": "catalog",
+                    "operation": "provision",
+                },
                 caller_id="system",
                 type="task",
             )
@@ -1409,7 +1426,7 @@ class CatalogService(CatalogsProtocol):
 
         logger.info(
             "catalog '%s' (external='%s'): async create committed; "
-            "catalog_core_init task enqueued",
+            "catalog_provision task enqueued",
             catalog_model.id, external_id,
         )
         catalog_model.external_id = external_id  # type: ignore[attr-defined]
