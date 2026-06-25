@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, field_validator
 
+from dynastore.tools.geospatial import parse_bbox_string, BboxDimensionality
+
 # ---------------------------------------------------------------------------
 # Canonical CRS for 3D WGS84 (OGC 22-029 §7.1)
 # ---------------------------------------------------------------------------
@@ -46,20 +48,13 @@ def _parse_bbox(raw: str) -> Tuple[float, float, Optional[float], float, float, 
     Accepts 4 numbers (2D) or 6 numbers (3D). All other arities raise ValueError.
     Non-numeric values also raise ValueError.
     """
-    try:
-        parts = [float(p) for p in raw.split(",")]
-    except ValueError as exc:
-        raise ValueError(f"bbox values must be numeric: {raw!r}") from exc
-
-    if len(parts) == 4:
-        minx, miny, maxx, maxy = parts
-        return (minx, miny, None, maxx, maxy, None)
-    if len(parts) == 6:
-        minx, miny, zmin, maxx, maxy, zmax = parts
-        return (minx, miny, zmin, maxx, maxy, zmax)
-    raise ValueError(
-        f"bbox must have 4 (2D) or 6 (3D) values, got {len(parts)}: {raw!r}"
+    result = parse_bbox_string(
+        raw,
+        dimensionality=BboxDimensionality.OPTIONAL_3D,
+        allow_none=False,
+        validate_geometry=True,
     )
+    return result
 
 
 def _bbox_intersects(

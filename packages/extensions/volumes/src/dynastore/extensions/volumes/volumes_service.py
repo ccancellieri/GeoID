@@ -161,7 +161,25 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
             logger.warning("volumes: could not register sidecar bounds source: %s", exc)
         yield
 
+    async def get_conformance(self, request: Request):
+        return await self.ogc_conformance_handler(request)
+
+    async def get_landing_page(self, request: Request):
+        return await self.ogc_landing_page_handler(request)
+
     def _register_routes(self) -> None:
+        self.router.add_api_route(
+            "/",
+            self.get_landing_page,
+            methods=["GET"],
+            summary="OGC API - 3D GeoVolumes landing page",
+        )
+        self.router.add_api_route(
+            "/conformance",
+            self.get_conformance,
+            methods=["GET"],
+            summary="OGC API - 3D GeoVolumes conformance",
+        )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tileset.json",
             self.get_tileset_json, methods=["GET"],

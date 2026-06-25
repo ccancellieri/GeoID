@@ -20,6 +20,8 @@
 
 from typing import Optional, Tuple
 
+from dynastore.tools.geospatial import parse_bbox_string, BboxDimensionality
+
 
 def parse_bbox(bbox_str: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
     """Parse a comma-separated bbox string into (xmin, ymin, xmax, ymax).
@@ -27,19 +29,10 @@ def parse_bbox(bbox_str: Optional[str]) -> Optional[Tuple[float, float, float, f
     Returns None if the string is empty or None.
     Raises ValueError on malformed input.
     """
-    if not bbox_str:
-        return None
-    parts = [p.strip() for p in bbox_str.split(",")]
-    if len(parts) != 4:
-        raise ValueError(
-            f"bbox must have exactly 4 comma-separated values (xmin,ymin,xmax,ymax), got {len(parts)}"
-        )
-    try:
-        xmin, ymin, xmax, ymax = (float(p) for p in parts)
-    except ValueError as e:
-        raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}") from e
-    if xmin >= xmax or ymin >= ymax:
-        raise ValueError(
-            f"bbox is degenerate: xmin={xmin} >= xmax={xmax} or ymin={ymin} >= ymax={ymax}"
-        )
-    return xmin, ymin, xmax, ymax
+    result = parse_bbox_string(
+        bbox_str,
+        dimensionality=BboxDimensionality.STRICT_2D,
+        allow_none=True,
+        validate_geometry=True,
+    )
+    return result

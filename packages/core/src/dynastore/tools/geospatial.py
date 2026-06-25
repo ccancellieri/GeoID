@@ -19,7 +19,9 @@
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import logging
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 # shapely is imported lazily inside the geometry-processing helpers below.
@@ -63,9 +65,6 @@ from .geospatial_exceptions import (
     SridMismatchError,
     UnsupportedComputedKind,
 )
-
-logger = logging.getLogger(__name__)
-
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     GeometriesSidecarConfig,
     TargetDimension,
@@ -73,6 +72,125 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     InvalidGeometryPolicy,
     SimplificationAlgorithm,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class BboxDimensionality(Enum):
+    """Dimensionality constraint for bbox parsing."""
+    STRICT_2D = "strict_2d"
+    ALLOW_EXTRA_DIMS = "allow_extra_dims"
+    OPTIONAL_3D = "optional_3d"
+
+
+def parse_bbox_string(
+    bbox_str: Optional[str],
+    *,
+    dimensionality: BboxDimensionality = BboxDimensionality.STRICT_2D,
+    allow_none: bool = True,
+    validate_geometry: bool = True,
+) -> Optional[Tuple]:
+    """Parse a comma-separated bbox string into coordinate tuple.
+    
+    Args:
+        bbox_str: Comma-separated bbox string (e.g., "xmin,ymin,xmax,ymax")
+        dimensionality: Dimensionality constraint:
+            - STRICT_2D: Exactly 4 values (xmin, ymin, xmax, ymax)
+            - ALLOW_EXTRA_DIMS: At least 4 values, extras ignored (for 3D/4D bboxes)
+            - OPTIONAL_3D: 4 or 6 values (xmin, ymin, [zmin,] xmax, ymax, [zmax,])
+        allow_none: If True, return None for empty/None input; if False, raise ValueError
+        validate_geometry: If True, validate that xmin < xmax and ymin < ymax
+    
+    Returns:
+        For STRICT_2D and ALLOW_EXTRA_DIMS: (xmin, ymin, xmax, ymax)
+        For OPTIONAL_3D: (xmin, ymin, zmin, xmax, ymax, zmax) where zmin/zmax may be None
+    
+    Raises:
+        ValueError: On malformed input or constraint violations
+    """
+    if not bbox_str:
+        if allow_none:
+            return None
+        raise ValueError("bbox_str cannot be empty or None")
+    
+    parts = [p.strip() for p in bbox_str.split(",")]
+    
+    if dimensionality == BboxDimensionality.STRICT_2D:
+        if len(parts) != 4:
+            raise ValueError(
+                f"bbox must have exactly 4 comma-separated values (xmin,ymin,xmax,ymax), got {len(parts)}: {bbox_str!r}"
+            )
+        try:
+            xmin, ymin, xmax, ymax = (float(p) for p in parts)
+        except ValueError as e:
+            raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}") from e
+        
+        if validate_geometry:
+            if xmin >= xmax:
+                raise ValueError(
+                    f"bbox is degenerate: xmin={xmin} >= xmax={xmax}"
+                )
+            if ymin >= ymax:
+                raise ValueError(
+                    f"bbox is degenerate: ymin={ymin} >= ymax={ymax}"
+                )
+        
+        return (xmin, ymin, xmax, ymax)
+    
+    elif dimensionality == BboxDimensionality.ALLOW_EXTRA_DIMS:
+        if len(parts) < 4:
+            raise ValueError(
+                f"bbox must have at least 4 comma-separated values, got {len(parts)}: {bbox_str!r}"
+            )
+        try:
+            xmin, ymin, xmax, ymax = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+        except ValueError as e:
+            raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}") from e
+        
+        if validate_geometry:
+            if xmin >= xmax:
+                raise ValueError(
+                    f"bbox is degenerate: xmin={xmin} >= xmax={xmax}"
+                )
+            if ymin >= ymax:
+                raise ValueError(
+                    f"bbox is degenerate: ymin={ymin} >= ymax={ymax}"
+                )
+        
+        return (xmin, ymin, xmax, ymax)
+    
+    elif dimensionality == BboxDimensionality.OPTIONAL_3D:
+        if len(parts) not in (4, 6):
+            raise ValueError(
+                f"bbox must have 4 or 6 comma-separated values for 2D/3D, got {len(parts)}: {bbox_str!r}"
+            )
+        try:
+            if len(parts) == 6:
+                xmin, ymin, zmin, xmax, ymax, zmax = (float(p) for p in parts)
+            else:
+                xmin, ymin, xmax, ymax = (float(p) for p in parts)
+                zmin, zmax = None, None
+        except ValueError as e:
+            raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}") from e
+        
+        if validate_geometry:
+            if xmin >= xmax:
+                raise ValueError(
+                    f"bbox is degenerate: xmin={xmin} >= xmax={xmax}"
+                )
+            if ymin >= ymax:
+                raise ValueError(
+                    f"bbox is degenerate: ymin={ymin} >= ymax={ymax}"
+                )
+            if zmin is not None and zmax is not None and zmin >= zmax:
+                raise ValueError(
+                    f"bbox is degenerate: zmin={zmin} >= zmax={zmax}"
+                )
+        
+        return (xmin, ymin, zmin, xmax, ymax, zmax)
+    
+    else:
+        raise ValueError(f"Unsupported dimensionality: {dimensionality}")
 
 # Issue #220: ``_calculate_geometry_hash`` was removed.  ``geometry_hash`` is
 # now a STORED GENERATED column on the geometries sidecar (PG-maintained via
@@ -241,7 +359,7 @@ def process_geometry(
                         always_xy=True,
                     )
                     bbox_geom = transform(transformer_to_4326.transform, processed_geom)
-                    logger.debug(f"Calculated bbox in EPSG:4326 for validation.")
+                    logger.debug("Calculated bbox in EPSG:4326 for validation.")
                 except Exception as e:
                     logger.warning(
                         f"Could not transform geometry to EPSG:4326 for bbox calculation: {e}. Bbox might be in original SRID and cause validation errors."
@@ -488,8 +606,6 @@ def get_spatial_indices_for_bbox(
 # EXTERNAL_ID is intentionally NOT handled here — it is path-extracted from
 # the feature via ``ItemsWritePolicy.external_id_field`` upstream.
 # ---------------------------------------------------------------------------
-
-import json as _json
 
 # Base32 alphabet used by the standard geohash scheme.
 _GEOHASH_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
