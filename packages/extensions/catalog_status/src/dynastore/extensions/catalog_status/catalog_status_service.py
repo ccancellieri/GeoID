@@ -273,8 +273,8 @@ class CatalogStatusService(ExtensionProtocol):
             )
 
         return CatalogStatusView(
-            catalog_id=catalog_id,
-            physical_schema=physical_schema,
+            external_id=catalog_id,
+            id=physical_schema,
             provisioning_status=provisioning_status,
             task=task_view,
             provisioning_checklist=provisioning_checklist,
@@ -347,9 +347,9 @@ class CatalogStatusService(ExtensionProtocol):
             )
 
         return CollectionStatusView(
-            catalog_id=catalog_id,
+            catalog_external_id=catalog_id,
             collection_id=collection_id,
-            physical_schema=physical_schema,
+            catalog_id=physical_schema,
             catalog_provisioning_status=provisioning_status,
         )
 

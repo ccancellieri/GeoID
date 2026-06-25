@@ -48,10 +48,23 @@ class CatalogStatusView(BaseModel):
     Exposes the catalog's lifecycle state and, when the task-queue is
     available, the most-recent ``gcp_provision_catalog`` task for
     operator troubleshooting.
+
+    Fields:
+    - ``external_id``: the logical, renamable identifier the caller addresses
+      (matches ``catalog.catalogs.external_id``).
+    - ``id``: the physical, immutable catalog identifier — the PostgreSQL
+      schema name used internally (matches ``catalog.catalogs.id``).
     """
 
-    catalog_id: str
-    physical_schema: Optional[str] = None
+    external_id: str
+    """Logical (renamable) catalog identifier — the value the caller uses to
+    address this catalog (``catalog.catalogs.external_id``)."""
+
+    id: Optional[str] = None
+    """Physical (immutable) catalog identifier — the PostgreSQL schema name
+    (``catalog.catalogs.id``).  ``None`` when the schema resolver is
+    unavailable (catalog still provisioning)."""
+
     provisioning_status: str
     task: Optional[ProvisioningTaskView] = None
     provisioning_checklist: dict[str, str] = {}
@@ -69,14 +82,26 @@ class CollectionStatusView(BaseModel):
     parent catalog context.  Per-collection provisioning information would
     require a dedicated collection-lifecycle table — that is out of scope for
     this extension.
+
+    Fields:
+    - ``catalog_external_id``: logical (renamable) identifier of the parent
+      catalog (``catalog.catalogs.external_id``).
+    - ``catalog_id``: physical (immutable) identifier of the parent catalog —
+      the PostgreSQL schema name (``catalog.catalogs.id``).
+    - ``collection_id``: logical identifier of this collection.
     """
 
-    catalog_id: str
+    catalog_external_id: str
+    """Logical (renamable) identifier of the parent catalog
+    (``catalog.catalogs.external_id``)."""
+
     collection_id: str
-    physical_schema: Optional[str] = None
-    """Physical schema of the *parent catalog*, resolved via
-    ``CatalogsProtocol.resolve_physical_schema``.  ``None`` when the catalog
-    is still provisioning or the schema resolver is unavailable."""
+    """Logical identifier of this collection."""
+
+    catalog_id: Optional[str] = None
+    """Physical (immutable) identifier of the parent catalog — the PostgreSQL
+    schema name (``catalog.catalogs.id``).  ``None`` when the catalog is still
+    provisioning or the schema resolver is unavailable."""
 
     catalog_provisioning_status: str
     """Lifecycle state of the parent catalog (``provisioning`` | ``ready`` |

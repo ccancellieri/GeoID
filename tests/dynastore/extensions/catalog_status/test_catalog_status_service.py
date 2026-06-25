@@ -364,14 +364,14 @@ def test_catalog_status_view_includes_provisioning_checklist_field():
 
     # Default: empty dict when no checklist is present.
     view_no_checklist = CatalogStatusView(
-        catalog_id="cat-1",
+        external_id="cat-1",
         provisioning_status="ready",
     )
     assert view_no_checklist.provisioning_checklist == {}
 
     # Populated: degraded eventing is visible to the operator.
     view_with_checklist = CatalogStatusView(
-        catalog_id="cat-1",
+        external_id="cat-1",
         provisioning_status="ready",
         provisioning_checklist={"gcp_bucket": "complete", "gcp_eventing": "degraded"},
     )
