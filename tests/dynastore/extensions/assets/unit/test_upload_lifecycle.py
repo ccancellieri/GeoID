@@ -35,6 +35,7 @@ real PG end-to-end is deferred until the docker test-runner fixture lands
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -469,6 +470,39 @@ async def test_url_mint_http_exception_also_triggers_rollback(
         )
     assert exc_info.value.status_code == 503
     patched_env["rollback"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_url_mint_cancellation_rolls_back_pending_row(
+    patched_env: Dict[str, Any],
+) -> None:
+    """asyncio.CancelledError (a BaseException, not Exception) must still
+    trigger the compensating soft-delete so the PENDING row is not orphaned
+    when a client/gateway ingress timeout cancels the handler mid-mint.
+
+    Note: raising CancelledError as a side_effect (rather than task.cancel())
+    drives the handler's except branch without putting the task into a
+    cancelling state, so it asserts the rollback is reached — not the
+    shield's drain-under-re-cancellation behaviour.
+    """
+    svc = _make_service()
+    driver = AsyncMock()
+    driver.initiate_upload = AsyncMock(side_effect=asyncio.CancelledError())
+    svc.resolve_upload_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await svc._initiate_upload_with_policy(
+            catalog_id="cat",
+            collection_id="col",
+            body=_make_upload_request(),
+        )
+
+    # The PENDING row must be cleaned up despite the cancellation.
+    patched_env["rollback"].assert_awaited_once()
+    # signature: (engine, scope, asset_id) — asset_id is the third positional arg
+    assert patched_env["rollback"].await_args.args[2] == "asset-1"
+    # Ticket was never stamped because minting failed.
+    patched_env["stamp"].assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

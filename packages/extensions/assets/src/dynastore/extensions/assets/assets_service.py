@@ -16,6 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import asyncio
 import json
 import logging
 import os
@@ -2009,6 +2010,22 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             )
         except HTTPException:
             await self._rollback_pending_row(engine, scope, payload.asset_id)
+            raise
+        except asyncio.CancelledError:
+            # A client/gateway disconnect (e.g. the ingress request timeout)
+            # cancels this coroutine with CancelledError — a BaseException the
+            # broad ``except Exception`` below does not catch. Without
+            # compensating here the just-committed PENDING row would linger
+            # until the reconcile sweep's TTL. Shield the soft-delete so it
+            # runs to completion as the task unwinds, then re-raise. The inner
+            # suppress mirrors managed_transaction's drain: a second cancel
+            # arriving mid-drain must not abort the compensation.
+            try:
+                await asyncio.shield(
+                    self._rollback_pending_row(engine, scope, payload.asset_id)
+                )
+            except asyncio.CancelledError:
+                pass
             raise
         except Exception as exc:
             await self._rollback_pending_row(engine, scope, payload.asset_id)
