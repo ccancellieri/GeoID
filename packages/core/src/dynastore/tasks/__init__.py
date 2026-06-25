@@ -158,7 +158,7 @@ def get_definitions_by_type(target_type: Any) -> List[Any]:
             results.append(config.definition)
     return results
 
-def discover_tasks():
+def discover_tasks(force: bool = False):
     """Discover every ``dynastore.tasks`` entry-point from installed packages.
 
     Identity is package metadata + protocol shape: every entry-point whose
@@ -166,7 +166,19 @@ def discover_tasks():
     are missing fall back to definition-only placeholders (Process metadata
     without a runnable class) so remote runners (Cloud Run Jobs) can still
     surface OGC Process schemas via the catalog service.
+
+    Idempotent per process. A full scan re-imports every plugin module
+    (~12-35ms each), so once the registry is populated re-scanning is pure
+    waste — and two bootstraps already call this at startup. Short-circuit on a
+    non-empty registry. Callers that genuinely need a fresh scan (tests after
+    ``_DYNASTORE_TASKS.clear()``, or an explicit plugin reload) clear the
+    registry first or pass ``force=True``. Tying the guard to the registry
+    state rather than a separate sentinel keeps it consistent with the
+    ``list_processes()`` guard and preserves the clear-then-rediscover idiom.
     """
+    if _DYNASTORE_TASKS and not force:
+        return
+
     logger.info("--- [tasks] Discovering components via entry points... ---")
 
     from dynastore.tools.discovery import discover_and_load_plugins
