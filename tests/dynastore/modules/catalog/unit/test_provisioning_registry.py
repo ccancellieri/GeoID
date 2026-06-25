@@ -20,9 +20,10 @@
 
 Covers the pure pieces — the terminal :func:`evaluate_checklist` rule and the
 :class:`ProvisioningRegistry` (active/inactive predicates, idempotent
-re-registration, predicate-failure isolation). The DB-bound parts
-(``create_catalog`` checklist build, ``mark_provisioning_step``) are exercised
-by the integration suite against a live database.
+re-registration, predicate-failure isolation, priority ordering, scope
+filtering, and the ``active_provisioners`` grouped accessor). The DB-bound
+parts (``create_catalog`` checklist build, ``mark_provisioning_step``) are
+exercised by the integration suite against a live database.
 """
 
 from __future__ import annotations
@@ -30,12 +31,16 @@ from __future__ import annotations
 import pytest
 
 from dynastore.modules.catalog.provisioning_registry import (
+    SCOPE_CATALOG,
+    SCOPE_COLLECTION,
     STATUS_FAILED,
     STATUS_READY,
     STEP_COMPLETE,
     STEP_FAILED,
     STEP_PENDING,
     STEP_SKIPPED,
+    LocalizedText,
+    Provisioner,
     ProvisioningRegistry,
     evaluate_checklist,
 )
@@ -127,3 +132,226 @@ class TestProvisioningRegistry:
         assert reg.keys == ["b"]
         reg.clear()
         assert reg.keys == []
+
+
+class TestPriorityOrdering:
+    """Provisioners in build_checklist appear in (priority, key) order."""
+
+    @pytest.mark.asyncio
+    async def test_priority_order_in_checklist(self):
+        reg = ProvisioningRegistry()
+        # Register out of priority order deliberately.
+        reg.register("z_step", _active, priority=200)
+        reg.register("a_step", _active, priority=50)
+        reg.register("m_step", _active, priority=100)
+        checklist = await reg.build_checklist("cat")
+        assert list(checklist.keys()) == ["a_step", "m_step", "z_step"]
+
+    @pytest.mark.asyncio
+    async def test_equal_priority_sorted_by_key(self):
+        reg = ProvisioningRegistry()
+        reg.register("beta", _active, priority=10)
+        reg.register("alpha", _active, priority=10)
+        checklist = await reg.build_checklist("cat")
+        assert list(checklist.keys()) == ["alpha", "beta"]
+
+    @pytest.mark.asyncio
+    async def test_inactive_provisioners_excluded_from_ordering(self):
+        reg = ProvisioningRegistry()
+        reg.register("low", _active, priority=1)
+        reg.register("mid", _inactive, priority=5)
+        reg.register("high", _active, priority=10)
+        checklist = await reg.build_checklist("cat")
+        assert list(checklist.keys()) == ["low", "high"]
+        assert "mid" not in checklist
+
+
+class TestScopeFiltering:
+    """build_checklist only includes provisioners matching the requested scope."""
+
+    @pytest.mark.asyncio
+    async def test_collection_scope_excluded_from_catalog_checklist(self):
+        reg = ProvisioningRegistry()
+        reg.register("catalog_step", _active, scope=SCOPE_CATALOG)
+        reg.register("collection_step", _active, scope=SCOPE_COLLECTION)
+        checklist = await reg.build_checklist("cat")
+        assert "catalog_step" in checklist
+        assert "collection_step" not in checklist
+
+    @pytest.mark.asyncio
+    async def test_collection_scope_included_when_requested(self):
+        reg = ProvisioningRegistry()
+        reg.register("catalog_step", _active, scope=SCOPE_CATALOG)
+        reg.register("collection_step", _active, scope=SCOPE_COLLECTION)
+        checklist = await reg.build_checklist("cat", scope=SCOPE_COLLECTION)
+        assert "collection_step" in checklist
+        assert "catalog_step" not in checklist
+
+    @pytest.mark.asyncio
+    async def test_default_scope_is_catalog(self):
+        reg = ProvisioningRegistry()
+        reg.register("only_catalog", _active, scope=SCOPE_CATALOG)
+        checklist = await reg.build_checklist("cat")
+        assert checklist == {"only_catalog": STEP_PENDING}
+
+
+class TestBackwardCompatRegister:
+    """Two-argument register(key, is_active) keeps working unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_two_arg_register_defaults(self):
+        reg = ProvisioningRegistry()
+        reg.register("gcp_bucket", _active)
+        provisioner = reg._provisioners["gcp_bucket"]
+        assert provisioner.priority == 100
+        assert provisioner.scope == SCOPE_CATALOG
+        assert provisioner.provision is None
+        assert provisioner.deprovision is None
+
+    @pytest.mark.asyncio
+    async def test_two_arg_register_contributes_to_catalog_checklist(self):
+        reg = ProvisioningRegistry()
+        reg.register("gcp_bucket", _active)
+        reg.register("gcp_eventing", _active)
+        checklist = await reg.build_checklist("cat")
+        assert checklist == {
+            "gcp_bucket": STEP_PENDING,
+            "gcp_eventing": STEP_PENDING,
+        }
+
+
+class TestActiveProvisioners:
+    """active_provisioners groups equal priorities and excludes inactive ones."""
+
+    @pytest.mark.asyncio
+    async def test_empty_registry_returns_empty_groups(self):
+        reg = ProvisioningRegistry()
+        groups = await reg.active_provisioners("cat")
+        assert groups == []
+
+    @pytest.mark.asyncio
+    async def test_groups_by_priority_ascending(self):
+        reg = ProvisioningRegistry()
+        reg.register("b_high", _active, priority=200)
+        reg.register("a_low", _active, priority=10)
+        reg.register("c_mid", _active, priority=100)
+        groups = await reg.active_provisioners("cat")
+        assert len(groups) == 3
+        assert [g[0].priority for g in groups] == [10, 100, 200]
+
+    @pytest.mark.asyncio
+    async def test_equal_priority_in_same_group(self):
+        reg = ProvisioningRegistry()
+        reg.register("alpha", _active, priority=50)
+        reg.register("beta", _active, priority=50)
+        reg.register("solo", _active, priority=100)
+        groups = await reg.active_provisioners("cat")
+        assert len(groups) == 2
+        assert len(groups[0]) == 2
+        assert {p.key for p in groups[0]} == {"alpha", "beta"}
+        assert groups[1][0].key == "solo"
+
+    @pytest.mark.asyncio
+    async def test_inactive_provisioners_excluded(self):
+        reg = ProvisioningRegistry()
+        reg.register("active_one", _active, priority=10)
+        reg.register("inactive_one", _inactive, priority=10)
+        groups = await reg.active_provisioners("cat")
+        assert len(groups) == 1
+        assert groups[0][0].key == "active_one"
+
+    @pytest.mark.asyncio
+    async def test_failing_predicate_excluded(self):
+        reg = ProvisioningRegistry()
+        reg.register("good", _active, priority=10)
+        reg.register("bad", _boom, priority=10)
+        groups = await reg.active_provisioners("cat")
+        assert len(groups) == 1
+        assert groups[0][0].key == "good"
+
+    @pytest.mark.asyncio
+    async def test_scope_filtering_in_active_provisioners(self):
+        reg = ProvisioningRegistry()
+        reg.register("cat_step", _active, scope=SCOPE_CATALOG)
+        reg.register("col_step", _active, scope=SCOPE_COLLECTION)
+        catalog_groups = await reg.active_provisioners("cat", scope=SCOPE_CATALOG)
+        collection_groups = await reg.active_provisioners("cat", scope=SCOPE_COLLECTION)
+        assert len(catalog_groups) == 1
+        assert catalog_groups[0][0].key == "cat_step"
+        assert len(collection_groups) == 1
+        assert collection_groups[0][0].key == "col_step"
+
+
+class TestProvisionerRecord:
+    """Provisioner record stores all fields including lifecycle callables."""
+
+    def test_provision_and_deprovision_stored(self):
+        async def my_provision(catalog_id, conn):
+            pass
+
+        async def my_deprovision(catalog_id, conn):
+            pass
+
+        reg = ProvisioningRegistry()
+        reg.register(
+            "step",
+            _active,
+            provision=my_provision,
+            deprovision=my_deprovision,
+        )
+        p = reg._provisioners["step"]
+        assert isinstance(p, Provisioner)
+        assert p.provision is my_provision
+        assert p.deprovision is my_deprovision
+
+    def test_provisioner_without_lifecycle_callables(self):
+        reg = ProvisioningRegistry()
+        reg.register("step", _active)
+        p = reg._provisioners["step"]
+        assert p.provision is None
+        assert p.deprovision is None
+
+
+class TestLocalizedNameDescription:
+    """name and description fields support plain strings and multilanguage maps."""
+
+    def test_plain_string_name_and_description(self):
+        reg = ProvisioningRegistry()
+        reg.register(
+            "step",
+            _active,
+            name="GCP Bucket",
+            description="Provisions the GCS bucket for this catalog.",
+        )
+        p = reg._provisioners["step"]
+        assert p.name == "GCP Bucket"
+        assert p.description == "Provisions the GCS bucket for this catalog."
+
+    def test_multilanguage_name_and_description(self):
+        name: LocalizedText = {"en": "GCP Bucket", "fr": "Seau GCP", "es": "Cubo GCP"}
+        description: LocalizedText = {
+            "en": "Provisions the GCS bucket for this catalog.",
+            "fr": "Provisionne le seau GCS pour ce catalogue.",
+        }
+        reg = ProvisioningRegistry()
+        reg.register("step", _active, name=name, description=description)
+        p = reg._provisioners["step"]
+        assert p.name == name
+        assert p.description == description
+        assert isinstance(p.name, dict)
+        assert p.name["fr"] == "Seau GCP"  # type: ignore[index]
+
+    def test_name_description_default_to_none(self):
+        reg = ProvisioningRegistry()
+        reg.register("step", _active)
+        p = reg._provisioners["step"]
+        assert p.name is None
+        assert p.description is None
+
+    def test_reregistration_updates_name(self):
+        reg = ProvisioningRegistry()
+        reg.register("step", _active, name="Old name")
+        reg.register("step", _active, name={"en": "New name", "it": "Nuovo nome"})
+        p = reg._provisioners["step"]
+        assert isinstance(p.name, dict)
+        assert p.name["it"] == "Nuovo nome"  # type: ignore[index]

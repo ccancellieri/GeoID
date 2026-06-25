@@ -27,15 +27,20 @@ loaded-but-inactive provider can no longer wedge the catalog.
 Model
 -----
 
-- A module registers a *provisioner* with a stable ``key`` and an ``is_active``
-  predicate ``async (catalog_id, conn) -> bool``. The predicate decides, per
-  catalog, whether that provisioner has asynchronous setup work that the catalog
-  must wait for before it is usable.
+- A module registers a *provisioner* with a stable ``key``, an ``is_active``
+  predicate ``async (catalog_id, conn) -> bool``, a ``priority`` (lower runs
+  first; equal-priority provisioners are eligible to run in parallel), and a
+  ``scope`` (``"catalog"`` or ``"collection"``).
+- Optional ``provision`` and ``deprovision`` callables carry the provisioner's
+  actual setup/teardown logic; the registry stores them but does not invoke them
+  directly — that responsibility belongs to the executor task (PR2+).
 - At catalog creation the checklist is materialised from the *active*
   provisioners (:func:`ProvisioningRegistry.build_checklist`) — every active
   provisioner's key starts ``"pending"``. Building the full checklist up front
   means a step that completes early cannot prematurely flip the catalog ready
-  while a slower step is still outstanding (the barrier).
+  while a slower step is still outstanding (the barrier). Provisioners are
+  iterated in ``(priority, key)`` order so the resulting dict's insertion order
+  is deterministic.
 - An empty checklist means nothing must be awaited — the catalog is ready
   immediately.
 - Each provisioner marks its item terminal when its work finishes —
@@ -55,7 +60,9 @@ still becomes ready. ``failed`` is reserved for a genuine provisioning error.
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional
+from dataclasses import dataclass, field
+from itertools import groupby
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +75,10 @@ __all__ = [
     "STATUS_PROVISIONING",
     "STATUS_READY",
     "STATUS_FAILED",
+    "SCOPE_CATALOG",
+    "SCOPE_COLLECTION",
+    "LocalizedText",
+    "Provisioner",
     "ProvisioningRegistry",
     "provisioning_registry",
     "evaluate_checklist",
@@ -89,12 +100,66 @@ STATUS_PROVISIONING = "provisioning"
 STATUS_READY = "ready"
 STATUS_FAILED = "failed"
 
+# Scope constants: ``SCOPE_CATALOG`` provisioners run at catalog-creation time;
+# ``SCOPE_COLLECTION`` provisioners run at collection-creation time.
+SCOPE_CATALOG = "catalog"
+SCOPE_COLLECTION = "collection"
+
 # Terminal-good states: catalog flips to ``ready`` when all steps are in this set.
 # ``degraded`` is intentionally included — a degraded step must not block readiness.
 _TERMINAL_GOOD = frozenset({STEP_COMPLETE, STEP_SKIPPED, STEP_DEGRADED})
 
 # ``async (catalog_id, conn) -> bool``
 ProvisionerPredicate = Callable[[str, Optional[Any]], Awaitable[bool]]
+
+
+# Multilanguage text: a plain string or a ``{language-code: text}`` map (BCP-47
+# language tags, e.g. ``{"en": "GCP bucket", "fr": "Seau GCP"}``).  A plain
+# string is treated as English by convention.
+LocalizedText = Union[str, Dict[str, str]]
+
+
+@dataclass(frozen=True)
+class Provisioner:
+    """Immutable record describing a single registered provisioner.
+
+    Fields
+    ------
+    key
+        Stable identifier; appears as a key in the provisioning checklist.
+    is_active
+        Async predicate ``(catalog_id, conn) -> bool``. When it returns
+        ``True`` the provisioner contributes a ``"pending"`` entry to the
+        checklist for that catalog.
+    priority
+        Execution order hint (lower = earlier). Equal-priority provisioners
+        are eligible to run in parallel.  Defaults to ``100``.
+    scope
+        Either :data:`SCOPE_CATALOG` (runs at catalog-creation time) or
+        :data:`SCOPE_COLLECTION` (runs at collection-creation time).
+    name
+        Human-readable display name for this provisioning step.  Accepts a
+        plain string (English) or a ``{lang: text}`` multilanguage map, e.g.
+        ``{"en": "GCP Bucket", "fr": "Seau GCP"}``.  Surfaces in the catalog
+        status API so a UI can label each checklist item.
+    description
+        Longer explanation of what this provisioner does.  Same multilanguage
+        format as ``name``.  Surfaces in the catalog status API.
+    provision
+        Optional callable carrying the provisioner's setup logic.  The
+        registry stores it; the executor task invokes it.
+    deprovision
+        Optional callable carrying the provisioner's teardown logic.
+    """
+
+    key: str
+    is_active: ProvisionerPredicate
+    priority: int = field(default=100)
+    scope: str = field(default=SCOPE_CATALOG)
+    name: Optional[LocalizedText] = field(default=None)
+    description: Optional[LocalizedText] = field(default=None)
+    provision: Optional[Callable[..., Any]] = field(default=None)
+    deprovision: Optional[Callable[..., Any]] = field(default=None)
 
 
 def evaluate_checklist(checklist: Optional[Dict[str, str]]) -> Optional[str]:
@@ -125,17 +190,62 @@ class ProvisioningRegistry:
     """Process-wide registry of catalog provisioners (one instance, below).
 
     Keyed by the provisioner ``key`` so a module re-registering (test reloads,
-    repeated lifespan) is naturally idempotent — the latest predicate wins.
+    repeated lifespan) is naturally idempotent — the latest registration wins.
+
+    Provisioners carry a ``priority`` and a ``scope``.  :meth:`build_checklist`
+    and :meth:`active_provisioners` filter by scope and iterate in
+    ``(priority, key)`` order so the output order is deterministic.
     """
 
     def __init__(self) -> None:
-        self._provisioners: Dict[str, ProvisionerPredicate] = {}
+        self._provisioners: Dict[str, Provisioner] = {}
 
-    def register(self, key: str, is_active: ProvisionerPredicate) -> None:
-        """Register (or replace) a provisioner contributing checklist item ``key``."""
+    def register(
+        self,
+        key: str,
+        is_active: ProvisionerPredicate,
+        *,
+        priority: int = 100,
+        scope: str = SCOPE_CATALOG,
+        name: Optional[LocalizedText] = None,
+        description: Optional[LocalizedText] = None,
+        provision: Optional[Callable[..., Any]] = None,
+        deprovision: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        """Register (or replace) a provisioner contributing checklist item ``key``.
+
+        Parameters
+        ----------
+        key
+            Non-empty stable identifier; used as the checklist key.
+        is_active
+            Async predicate deciding, per catalog/collection, whether this
+            provisioner has work that must be awaited.
+        priority
+            Execution-order hint (lower = earlier).  Defaults to ``100``.
+        scope
+            :data:`SCOPE_CATALOG` or :data:`SCOPE_COLLECTION`.
+        name
+            Human-readable step name; plain string or ``{lang: text}`` map.
+        description
+            Longer explanation; plain string or ``{lang: text}`` map.
+        provision
+            Optional setup callable stored for use by the executor task.
+        deprovision
+            Optional teardown callable stored for use by the executor task.
+        """
         if not key:
             raise ValueError("provisioner key must be a non-empty string")
-        self._provisioners[key] = is_active
+        self._provisioners[key] = Provisioner(
+            key=key,
+            is_active=is_active,
+            priority=priority,
+            scope=scope,
+            name=name,
+            description=description,
+            provision=provision,
+            deprovision=deprovision,
+        )
         logger.info("Registered catalog provisioner '%s'", key)
 
     def unregister(self, key: str) -> None:
@@ -148,27 +258,67 @@ class ProvisioningRegistry:
     def keys(self) -> list[str]:
         return list(self._provisioners.keys())
 
+    def _sorted_provisioners(self, scope: str) -> list[Provisioner]:
+        """Return provisioners matching ``scope``, sorted by ``(priority, key)``."""
+        return sorted(
+            (p for p in self._provisioners.values() if p.scope == scope),
+            key=lambda p: (p.priority, p.key),
+        )
+
     async def build_checklist(
-        self, catalog_id: str, conn: Optional[Any] = None
+        self, catalog_id: str, conn: Optional[Any] = None, *, scope: str = SCOPE_CATALOG
     ) -> Dict[str, str]:
         """Materialise the checklist for ``catalog_id`` from active provisioners.
+
+        Only provisioners whose ``scope`` matches ``scope`` are considered.
+        They are evaluated in ``(priority, key)`` order so the resulting dict's
+        insertion order is deterministic.
 
         Every active provisioner's key maps to ``"pending"``. A predicate that
         raises is treated as inactive (logged) — a misbehaving provisioner must
         never block catalog readiness.
         """
         checklist: Dict[str, str] = {}
-        for key, predicate in self._provisioners.items():
+        for provisioner in self._sorted_provisioners(scope):
             try:
-                if await predicate(catalog_id, conn):
-                    checklist[key] = STEP_PENDING
+                if await provisioner.is_active(catalog_id, conn):
+                    checklist[provisioner.key] = STEP_PENDING
             except Exception:  # noqa: BLE001 — a bad predicate can't wedge readiness
                 logger.warning(
                     "Provisioner '%s' is_active predicate failed for catalog '%s'; "
                     "treating as inactive.",
-                    key, catalog_id, exc_info=True,
+                    provisioner.key, catalog_id, exc_info=True,
                 )
         return checklist
+
+    async def active_provisioners(
+        self, catalog_id: str, conn: Optional[Any] = None, *, scope: str = SCOPE_CATALOG
+    ) -> List[List[Provisioner]]:
+        """Return the active provisioners for ``scope``, grouped by priority.
+
+        Each inner list contains provisioners that share the same ``priority``
+        and are eligible to run in parallel.  The outer list is ordered
+        ascending by priority (run group 0 first, then group 1, …).
+
+        Provisioners whose ``is_active`` predicate returns ``False`` or raises
+        are excluded (same fail-soft semantics as :meth:`build_checklist`).
+        """
+        active: list[Provisioner] = []
+        for provisioner in self._sorted_provisioners(scope):
+            try:
+                if await provisioner.is_active(catalog_id, conn):
+                    active.append(provisioner)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Provisioner '%s' is_active predicate failed for catalog '%s'; "
+                    "excluding from active list.",
+                    provisioner.key, catalog_id, exc_info=True,
+                )
+
+        groups: List[List[Provisioner]] = []
+        for _, group in groupby(active, key=lambda p: p.priority):
+            groups.append(list(group))
+        return groups
 
 
 # Module-level singleton (mirrors ``lifecycle_registry``).
