@@ -403,3 +403,95 @@ class TestResolveGlobalCrsEndpoint:
         result = await ext.resolve_global_crs_endpoint(request=req, crs_uri="EPSG:4326")
 
         assert result is fake_def
+
+
+# ---------------------------------------------------------------------------
+# Platform list — _list_global_crs + list_global_crs_endpoint (paginated)
+# ---------------------------------------------------------------------------
+
+from collections import namedtuple  # noqa: E402
+
+_CrsInfo = namedtuple("_CrsInfo", ["auth_name", "code"])
+
+
+def _install_fake_pyproj_db(monkeypatch, infos):
+    fake_db = types.ModuleType("pyproj.database")
+    fake_db.query_crs_info = MagicMock(return_value=infos)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pyproj.database", fake_db)
+    return fake_db
+
+
+class TestListGlobalCrs:
+    def test_list_route_registered_before_resolver(self):
+        ext = _make_ext()
+        paths = [r.path for r in ext.router.routes if hasattr(r, "path")]
+        assert "/crs/" in paths
+        assert paths.index("/crs/") < paths.index("/crs/{crs_uri:path}")
+
+    def test_paginates_and_builds_register_uris(self, monkeypatch):
+        infos = [_CrsInfo("EPSG", str(1000 + i)) for i in range(5)]
+        fake_db = _install_fake_pyproj_db(monkeypatch, infos)
+
+        uris, total = _crs_mod._list_global_crs("EPSG", limit=2, offset=1)
+
+        assert total == 5
+        assert uris == [
+            "http://www.opengis.net/def/crs/EPSG/0/1001",
+            "http://www.opengis.net/def/crs/EPSG/0/1002",
+        ]
+        fake_db.query_crs_info.assert_called_once_with(
+            auth_name="EPSG", allow_deprecated=False
+        )
+
+    def test_empty_authority_enumerates_all(self, monkeypatch):
+        fake_db = _install_fake_pyproj_db(monkeypatch, [_CrsInfo("OGC", "CRS84")])
+
+        uris, total = _crs_mod._list_global_crs("", limit=10, offset=0)
+
+        assert total == 1
+        assert uris == ["http://www.opengis.net/def/crs/OGC/0/CRS84"]
+        fake_db.query_crs_info.assert_called_once_with(
+            auth_name=None, allow_deprecated=False
+        )
+
+    def test_missing_pyproj_raises_503(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "pyproj.database", None)
+
+        with pytest.raises(HTTPException) as exc_info:
+            _crs_mod._list_global_crs("EPSG", 10, 0)
+
+        assert exc_info.value.status_code == 503
+
+
+class TestListGlobalCrsEndpoint:
+    @pytest.mark.asyncio
+    async def test_next_link_when_more_pages(self, monkeypatch):
+        ext = _make_ext()
+        monkeypatch.setattr(_crs_mod, "_list_global_crs", lambda a, lim, off: (["u1", "u2"], 10))
+        req = MagicMock()
+        req.url = "http://testserver/crs/?limit=2&offset=0&authority=EPSG"
+
+        result = await ext.list_global_crs_endpoint(
+            request=req, limit=2, offset=0, authority="EPSG"
+        )
+
+        assert result.numberMatched == 10
+        assert result.numberReturned == 2
+        rels = [link.rel for link in result.links]
+        assert "self" in rels and "next" in rels
+        next_link = next(link for link in result.links if link.rel == "next")
+        assert "offset=2" in next_link.href
+
+    @pytest.mark.asyncio
+    async def test_no_next_link_on_last_page(self, monkeypatch):
+        ext = _make_ext()
+        monkeypatch.setattr(_crs_mod, "_list_global_crs", lambda a, lim, off: (["u1"], 1))
+        req = MagicMock()
+        req.url = "http://testserver/crs/?limit=20&offset=0&authority=EPSG"
+
+        result = await ext.list_global_crs_endpoint(
+            request=req, limit=20, offset=0, authority="EPSG"
+        )
+
+        rels = [link.rel for link in result.links]
+        assert "next" not in rels

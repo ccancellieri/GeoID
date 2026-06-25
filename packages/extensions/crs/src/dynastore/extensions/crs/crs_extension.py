@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import List
+from typing import List, Optional
 import pyproj as _pyproj_scope_gate  # noqa: F401  # SCOPE gate: extension_crs requires module_crs (pyproj)
 _ = _pyproj_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Request, FastAPI
@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.db import get_async_connection
 
-from dynastore.modules.crs.models import CRS, CRSCreate, CRSDefinition
+from dynastore.modules.crs.models import CRS, CRSCreate, CRSDefinition, CRSLink, GlobalCRSList
 
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.models.protocols.crs import CRSProtocol
@@ -65,6 +65,36 @@ def _resolve_global_crs(crs_uri: str) -> CRSDefinition:
     return CRSDefinition(
         definition_type=CRSDefinition.CRSDefinitionType.WKT2, definition=wkt
     )
+
+
+def _list_global_crs(
+    authority: Optional[str], limit: int, offset: int
+) -> tuple[list[str], int]:
+    """List global authority CRS as OGC register URIs, with the page total.
+
+    Backed by the PROJ database via pyproj; read-only and tenant-free, so it is
+    safe at platform scope. Deprecated CRS are excluded. Returns the page of URIs
+    and the total match count (for OGC ``numberMatched`` and the ``next`` link).
+    """
+    try:
+        from pyproj.database import query_crs_info
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503, detail="pyproj is not available for CRS listing."
+        ) from e
+
+    try:
+        infos = query_crs_info(auth_name=authority or None, allow_deprecated=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CRS query failed: {e}") from e
+
+    total = len(infos)
+    page = infos[offset : offset + limit]
+    uris = [
+        f"http://www.opengis.net/def/crs/{info.auth_name}/0/{info.code}"
+        for info in page
+    ]
+    return uris, total
 
 
 class CRSExtension(ExtensionProtocol):
@@ -130,9 +160,18 @@ class CRSExtension(ExtensionProtocol):
             status_code=status.HTTP_204_NO_CONTENT,
             summary="Delete a CRS (OGC aligned path)",
         )
+        # Platform scope: paginated catalogue of resolvable global authority CRS.
+        self.router.add_api_route(
+            "/",
+            self.list_global_crs_endpoint,
+            methods=["GET"],
+            response_model=GlobalCRSList,
+            summary="List global authority CRS (EPSG/OGC) — platform scope, paginated",
+        )
         # Platform scope: read-only resolution of global authority CRS (EPSG/OGC).
         # Registered LAST — the greedy {crs_uri:path} converter must not shadow the
-        # catalog-scoped routes above, which are matched first by registration order.
+        # catalog-scoped routes above (or the list route), which are matched first
+        # by registration order.
         self.router.add_api_route(
             "/{crs_uri:path}",
             self.resolve_global_crs_endpoint,
@@ -264,6 +303,43 @@ class CRSExtension(ExtensionProtocol):
         
         # Default to returning the full JSON model
         return crs
+
+
+    async def list_global_crs_endpoint(
+        self,
+        request: Request,
+        limit: int = Query(20, ge=1, le=1000, description="Page size."),
+        offset: int = Query(0, ge=0, description="Number of CRS to skip."),
+        authority: str = Query(
+            "EPSG",
+            description="CRS authority to enumerate (e.g. 'EPSG'). Empty enumerates all.",
+        ),
+    ) -> GlobalCRSList:
+        """List global authority CRS at platform scope (read-only, paginated).
+
+        Each entry is an OGC register URI that can be fed back to the resolver
+        (``/crs/{crs_uri}``) or used as an OGC API - Features ``crs`` value. Only
+        globally-defined authority CRS are listed; tenant-registered custom CRS
+        are served per-catalog under ``/crs/catalogs/{catalog_id}/...``.
+        """
+        uris, total = _list_global_crs(authority, limit, offset)
+
+        base = str(request.url).split("?", 1)[0]
+        links = [CRSLink(href=str(request.url), rel="self", type="application/json")]
+        if offset + limit < total:
+            links.append(
+                CRSLink(
+                    href=f"{base}?limit={limit}&offset={offset + limit}&authority={authority}",
+                    rel="next",
+                    type="application/json",
+                )
+            )
+        return GlobalCRSList(
+            crs=uris,
+            numberMatched=total,
+            numberReturned=len(uris),
+            links=links,
+        )
 
 
     async def resolve_global_crs_endpoint(

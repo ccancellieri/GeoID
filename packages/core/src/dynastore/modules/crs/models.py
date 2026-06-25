@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from pydantic import BaseModel, Field, model_validator, field_validator
-from typing import Optional, Annotated
+from typing import List, Optional, Annotated
 from datetime import datetime
 from enum import Enum
 import logging
@@ -137,3 +137,24 @@ class CRSCreate(BaseModel):
     """
     crs_uri: str = Field(..., description="The unique URI identifier for the CRS within the catalog.")
     definition: CRSDefinition = Field(..., description="The detailed definition of the CRS.")
+
+
+class CRSLink(BaseModel):
+    """A hypermedia link (OGC-style) used by paginated CRS listings."""
+    href: str = Field(..., description="The link target URL.")
+    rel: str = Field(..., description="The link relation type (e.g. 'self', 'next').")
+    type: Optional[str] = Field(None, description="The media type of the target.")
+    title: Optional[str] = Field(None, description="A human-readable label for the link.")
+
+
+class GlobalCRSList(BaseModel):
+    """Paginated catalogue of global authority CRS resolvable at platform scope.
+
+    ``crs`` carries CRS identifiers as OGC register URIs — the same URI form used
+    in the OGC API - Features Part 2 collection ``crs`` member — so a client can
+    feed any entry straight back to the resolver or to a Features ``crs`` param.
+    """
+    crs: List[str] = Field(..., description="CRS identifiers as OGC register URIs.")
+    numberMatched: int = Field(..., description="Total CRS matching the query across all pages.")
+    numberReturned: int = Field(..., description="CRS returned in this page.")
+    links: List[CRSLink] = Field(default_factory=list, description="Pagination links (self, next).")
