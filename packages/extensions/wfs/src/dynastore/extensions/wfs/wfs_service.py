@@ -21,7 +21,7 @@
 from dynastore.models.driver_context import DriverContext
 import logging
 import re
-from typing import Optional, cast
+from typing import Any, AsyncGenerator, AsyncIterator, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, FastAPI
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -32,6 +32,7 @@ from dynastore.modules.db_config.exceptions import TableNotFoundError, SchemaNot
 
 from dynastore.extensions.tools.db import get_async_connection
 from dynastore.models.protocols import ItemsProtocol
+from dynastore.models.query_builder import QueryResponse
 from . import wfs_generator, wfs_db
 from .wfs_models import WFSException
 from dynastore.extensions.protocols import ExtensionProtocol
@@ -57,6 +58,87 @@ from dynastore.extensions.tools.query import parse_ogc_query_request, stream_ogc
 from dynastore.modules.storage.hints import EXACT_READ_HINTS
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# RFC 7946 GeoJSON Feature top-level member allowlist.
+# WFS GetFeature output must not carry any other foreign members.
+# Internal sidecar sections (system/stats/access) injected into
+# Feature.__pydantic_extra__ by _apply_expose_all_sections or the PG sidecar
+# bridge must be stripped before serialisation.
+# ---------------------------------------------------------------------------
+_WFS_GEOJSON_MEMBERS: frozenset = frozenset(
+    {"type", "id", "geometry", "properties", "bbox", "links"}
+)
+
+
+async def _strip_wfs_foreign_members(
+    items: AsyncIterator[Any],
+) -> AsyncGenerator[Any, None]:
+    """Remove non-RFC-7946 foreign members from each Feature before WFS output.
+
+    ``Feature`` uses ``extra="allow"`` so ``model_dump`` returns everything in
+    ``__pydantic_extra__``.  Internal sidecar sections (``system``, ``stats``,
+    ``access``, and any other implementation-detail key) are injected there and
+    must not appear as top-level GeoJSON Feature members on the WFS wire.
+    """
+    async for item in items:
+        extra = getattr(item, "__pydantic_extra__", None)
+        if extra:
+            for k in list(extra):
+                if k not in _WFS_GEOJSON_MEMBERS:
+                    del extra[k]
+        yield item
+
+
+async def _query_pg_or_es_fallback(
+    items_svc: Any,
+    catalog_id: str,
+    collection_id: str,
+    request_obj: Any,
+) -> QueryResponse:
+    """Call ``stream_items`` preferring PG; fall back to ES when PG schema absent.
+
+    WFS GetFeature passes ``EXACT_READ_HINTS`` so the PG driver (which
+    declares ``Hint.GEOMETRY_EXACT``) is tried first for full-precision
+    geometry.  When the PG schema has not been provisioned yet, the call
+    is retried without hints so the ES driver can serve from its index
+    (simplified geometry is better than an empty FeatureCollection).
+    Only when both drivers are unavailable is an empty result returned.
+    """
+    try:
+        return await items_svc.stream_items(
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            request=request_obj,
+            ctx=None,
+            hints=EXACT_READ_HINTS,
+        )
+    except (TableNotFoundError, SchemaNotFoundError):
+        pass
+
+    try:
+        return await items_svc.stream_items(
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            request=request_obj,
+            ctx=None,
+            hints=frozenset(),
+        )
+    except (TableNotFoundError, SchemaNotFoundError):
+        pass
+
+    async def _empty() -> AsyncIterator[Any]:
+        if False:
+            yield  # pragma: no cover
+
+    return QueryResponse(
+        items=_empty(),
+        total_count=0,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+        collection_config=None,
+    )
 
 
 def wfs_sortby_to_ogc(sort_by_str: Optional[str]) -> Optional[str]:
@@ -651,36 +733,17 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             )
 
         try:
-            query_response = await items_svc.stream_items(
+            # Prefer PG (EXACT_READ_HINTS / Hint.GEOMETRY_EXACT); fall back to
+            # ES (empty hints) when the PG schema has not been provisioned yet.
+            query_response = await _query_pg_or_es_fallback(
+                items_svc=items_svc,
                 catalog_id=schema_prefix,
                 collection_id=collection_id,
-                request=request_obj,
-                # Decouple from request connection to allow background streaming
-                # without premature closure errors.
-                ctx=None,
-                # WFS GetFeature must return exact, full-precision geometry.
-                # EXACT_READ_HINTS routes past any simplified-geometry ES driver
-                # to whichever driver declares Hint.GEOMETRY_EXACT.
-                hints=EXACT_READ_HINTS,
+                request_obj=request_obj,
             )
         except ValueError as e:
             xml = wfs_generator.create_exception_report("InvalidParameterValue", None, str(e))
             return Response(content=xml, media_type="application/xml", status_code=400)
-        except (TableNotFoundError, SchemaNotFoundError):
-            # Physical hub table/schema has not been materialized yet (lazy creation
-            # on first write). Return an empty FeatureCollection in the requested
-            # format rather than a 500.
-            from dynastore.models.query_builder import QueryResponse
-            async def _empty():
-                if False:
-                    yield  # pragma: no cover
-            query_response = QueryResponse(
-                items=_empty(),
-                total_count=0,
-                catalog_id=schema_prefix,
-                collection_id=collection_id,
-                collection_config=None,
-            )
 
         total_count = query_response.total_count or 0
 
@@ -750,6 +813,12 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
                 type=normalized_format,
                 title=LocalizedText(en="Next page"),
             ))
+
+        # Strip non-RFC-7946 foreign members (system/stats/access/...) that
+        # internal sidecar paths inject into Feature.__pydantic_extra__.
+        # Only the standard GeoJSON Feature members listed in _WFS_GEOJSON_MEMBERS
+        # must appear on the WFS wire.
+        query_response.items = _strip_wfs_foreign_members(query_response.items)
 
         return stream_ogc_features(
             request=request,
