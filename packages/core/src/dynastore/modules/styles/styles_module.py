@@ -69,6 +69,7 @@ class StylesModule(ModuleProtocol):
 
             logger.info("StylesModule: Initialization complete.")
         except Exception as e:
-            logger.error(f"CRITICAL: StylesModule initialization failed: {e}", exc_info=True)
-        
+            logger.critical("StylesModule initialization failed: %s", e, exc_info=True)
+            raise
+
         yield

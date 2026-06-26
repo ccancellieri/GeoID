@@ -200,6 +200,7 @@ class ConnectedSystemsModule(ModuleProtocol):
                     await DDLQuery(CONSYS_FK_DEPLOYMENT_SYSTEM_DDL).execute(conn)
             logger.info("ConnectedSystemsModule: initialisation complete.")
         except Exception as exc:
-            logger.error("CRITICAL: ConnectedSystemsModule init failed: %s", exc, exc_info=True)
+            logger.critical("ConnectedSystemsModule initialization failed: %s", exc, exc_info=True)
+            raise
 
         yield

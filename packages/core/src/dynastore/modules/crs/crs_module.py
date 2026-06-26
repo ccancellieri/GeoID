@@ -59,7 +59,9 @@ class CRSModule(ModuleProtocol, CRSProtocol):
                     await queries.CREATE_CUSTOM_CRS_TABLE.execute(conn)
                     # Partition creation handled on demand via ensure_partition_exists
         except Exception as e:
-            logger.error(f"CRITICAL: CRSModule initialization failed: {e}", exc_info=True)
+            logger.critical("CRSModule initialization failed: %s", e, exc_info=True)
+            raise
+
         logger.info("CRSModule: Initialization complete.")
         yield
 

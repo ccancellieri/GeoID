@@ -78,6 +78,20 @@ def test_bbox_index_ddl_is_idempotent():
     )
 
 
+def test_bbox_geom_column_declared_before_index():
+    """bbox_geom must be defined in TEMPORAL_GEOMETRIES_DDL so that
+    BBOX_INDEX_DDL can reference it.  A regression here (e.g. the column
+    removed from the table DDL) would cause index creation to fail with
+    'column does not exist' on a fresh schema."""
+    assert "bbox_geom" in TEMPORAL_GEOMETRIES_DDL, (
+        "bbox_geom must be declared in TEMPORAL_GEOMETRIES_DDL "
+        "before BBOX_INDEX_DDL references it"
+    )
+    assert "bbox_geom" in BBOX_INDEX_DDL, (
+        "BBOX_INDEX_DDL must reference the bbox_geom column"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Lifespan — DDL failure must propagate (not be swallowed)
 # ---------------------------------------------------------------------------
