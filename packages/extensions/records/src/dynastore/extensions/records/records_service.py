@@ -42,7 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
 from dynastore.extensions.web.decorators import expose_web_page, expose_static
-from dynastore.extensions.tools.db import get_async_connection
+from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.tools.language_utils import resolve_localized_field
 from dynastore.extensions.tools.url import get_root_url
@@ -243,6 +243,24 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             self.get_record,
             methods=["GET"],
             response_model=rm.Record,
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+            self.replace_record,
+            methods=["PUT"],
+            response_model=rm.Record,
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+            self.update_record,
+            methods=["PATCH"],
+            response_model=rm.Record,
+        )
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+            self.delete_record,
+            methods=["DELETE"],
+            status_code=status.HTTP_204_NO_CONTENT,
         )
 
     # ------------------------------------------------------------------
@@ -736,6 +754,129 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             content=collection.model_dump(exclude_none=True),
             status_code=status.HTTP_201_CREATED,
         )
+
+    async def replace_record(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        record_id: str,
+        request: Request,
+        conn: AsyncConnection = Depends(get_async_connection),
+    ) -> rm.Record:
+        """Replace a record (PUT)."""
+        body = await request.json()
+        if isinstance(body, dict):
+            body["id"] = record_id
+            body["geometry"] = None
+        else:
+            raise HTTPException(status_code=400, detail="Invalid request body.")
+
+        catalogs_svc = await self._get_catalogs_service()
+        updated_row = await catalogs_svc.upsert(
+            catalog_id,
+            collection_id,
+            items=body,
+            ctx=DriverContext(db_resource=conn),
+        )
+        if not updated_row:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update record.",
+            )
+
+        root_url = get_root_url(request)
+        layer_config = await catalogs_svc.get_collection_config(
+            catalog_id, collection_id, ctx=DriverContext(db_resource=conn),
+        )
+        read_policy = await resolve_items_read_policy(catalog_id, collection_id)
+        record = gen.db_row_to_record(
+            updated_row, catalog_id, collection_id, root_url, layer_config,
+            read_policy=read_policy,
+        )
+        content = record.model_dump(exclude_none=True)
+        _resolve_links_titles(content.get("links"), "*")
+        return JSONResponse(content=content)
+
+    async def update_record(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        record_id: str,
+        request: Request,
+        conn: AsyncConnection = Depends(get_async_connection),
+    ) -> rm.Record:
+        """Partially update a record (PATCH)."""
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Invalid request body.")
+
+        catalogs_svc = await self._get_catalogs_service()
+        items_protocol = cast(ItemsProtocol, catalogs_svc)
+        existing = await items_protocol.get_item(
+            catalog_id, collection_id, record_id,
+            ctx=DriverContext(db_resource=conn),
+        )
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Record '{record_id}' not found.",
+            )
+
+        existing_props = getattr(existing, "properties", None) or {}
+        if isinstance(existing_props, dict):
+            merged_props = {**existing_props, **body.get("properties", {})}
+        else:
+            merged_props = body.get("properties", {})
+
+        merged = {
+            "id": record_id,
+            "geometry": None,
+            "properties": merged_props,
+        }
+        if body.get("links"):
+            merged["links"] = body["links"]
+
+        updated_row = await catalogs_svc.upsert(
+            catalog_id,
+            collection_id,
+            items=merged,
+            ctx=DriverContext(db_resource=conn),
+        )
+        if not updated_row:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update record.",
+            )
+
+        root_url = get_root_url(request)
+        layer_config = await catalogs_svc.get_collection_config(
+            catalog_id, collection_id, ctx=DriverContext(db_resource=conn),
+        )
+        read_policy = await resolve_items_read_policy(catalog_id, collection_id)
+        record = gen.db_row_to_record(
+            updated_row, catalog_id, collection_id, root_url, layer_config,
+            read_policy=read_policy,
+        )
+        content = record.model_dump(exclude_none=True)
+        _resolve_links_titles(content.get("links"), "*")
+        return JSONResponse(content=content)
+
+    async def delete_record(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        record_id: str,
+        request: Request,
+        engine=Depends(get_async_engine),
+    ):
+        """Delete a record (DELETE)."""
+        from dynastore.modules.db_config.query_executor import managed_transaction
+
+        async with managed_transaction(engine) as conn:
+            return await self._delete_item(
+                catalog_id, collection_id, record_id, conn,
+                caller_id=self._principal_caller_id(request),
+            )
 
     # ------------------------------------------------------------------
     # Helpers
