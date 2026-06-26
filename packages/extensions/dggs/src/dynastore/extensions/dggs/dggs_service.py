@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from typing import FrozenSet, Optional, Set
 
 # Dependency-free helper (no h3/s2sphere): safe to import before the SCOPE gate.
-from dynastore.modules.dggs.bbox import parse_bbox
+from dynastore.tools.geospatial import parse_bbox_string, BboxDimensionality
 
 import h3 as _h3_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires h3
 import s2sphere as _s2sphere_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires s2sphere
@@ -382,7 +382,12 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
         bbox_tuple = None
         if bbox:
             try:
-                bbox_tuple = parse_bbox(bbox)
+                bbox_tuple = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    allow_none=True,
+                    validate_geometry=True,
+                )
             except ValueError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)

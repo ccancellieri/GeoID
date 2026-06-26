@@ -587,7 +587,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         read seam, so the value has no effect on this route today.
         """
         from dynastore.modules.edr.query_handlers.area import extract_area_values
-        from dynastore.modules.edr.query_handlers.cube import parse_cube_bbox
+        from dynastore.tools.geospatial import parse_bbox_string, BboxDimensionality
         from dynastore.modules.edr.parameter_metadata import (
             _select_bands,
             build_parameters,
@@ -601,7 +601,12 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         )
 
         try:
-            parsed_bbox = parse_cube_bbox(bbox)
+            parsed_bbox = parse_bbox_string(
+                bbox,
+                dimensionality=BboxDimensionality.ALLOW_EXTRA_DIMS,
+                allow_none=False,
+                validate_geometry=True,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
