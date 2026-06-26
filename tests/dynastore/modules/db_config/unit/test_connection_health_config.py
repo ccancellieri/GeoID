@@ -30,6 +30,7 @@ from dynastore.modules.db_config.connection_health_config import (
     ConnectionRetryConfig,
     ProvisioningRetryConfig,
     LeadershipConfig,
+    _ConnectionHealthInfraConfig,
     ConnectionHealthConfig,
     resolve_connection_retry_config,
     resolve_provisioning_retry_config,
@@ -61,9 +62,14 @@ class TestConfigClasses:
         assert config.visibility_extend_seconds == 300
         assert config.unknown_grace_seconds == 180
 
-    def test_health_defaults(self):
-        config = ConnectionHealthConfig()
+    def test_health_infra_defaults(self):
+        config = _ConnectionHealthInfraConfig()
         assert config.slow_pool_acquire_threshold_seconds == 0.5
+
+    def test_connection_health_plugin_config_defaults(self):
+        config = ConnectionHealthConfig()
+        assert config.leader_liveness_probe_enabled is True
+        assert config.leader_liveness_probe_timeout_seconds == 2.0
 
 
 class TestResolveReadsSnapshot:
@@ -80,3 +86,6 @@ class TestResolveReadsSnapshot:
 
     def test_health_default(self):
         assert resolve_slow_pool_acquire_threshold() == 0.5
+
+    def test_connection_health_config_address(self):
+        assert ConnectionHealthConfig._address == ("platform", "db", "health")

@@ -40,7 +40,10 @@ from typing import Any, Awaitable, Coroutine, Optional, Union, Protocol
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from dynastore.modules.concurrency import get_background_executor
-from dynastore.modules.db_config.locking_tools import pg_advisory_leadership
+from dynastore.modules.db_config.locking_tools import (
+    pg_advisory_leadership,
+    probe_lock_connection_liveness,
+)
 from dynastore.tools.async_utils import run_leader_loop
 
 logger = logging.getLogger(__name__)
@@ -362,6 +365,38 @@ class BackgroundSupervisor:
             # leader for DB work during the tick.
             return pg_advisory_leadership(ctx.engine, key, name=service.name)
 
+        # One probe closure shared by both run_leader_loop call sites below.
+        # Reads live config on each tick so operators can toggle or retune
+        # the probe without restarting pods.
+        async def _liveness_probe(lock_conn: Any) -> None:
+            from dynastore.modules.db_config.connection_health_config import (
+                ConnectionHealthConfig,
+            )
+            from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+            from dynastore.tools.discovery import get_protocol
+
+            enabled = True
+            timeout = 2.0
+            try:
+                svc = get_protocol(PlatformConfigsProtocol)
+                if svc is not None:
+                    raw_cfg = await svc.get_config(ConnectionHealthConfig)
+                    # get_config returns PluginConfig (base type); cast to the
+                    # concrete class so attribute access is type-checked.
+                    cfg = raw_cfg if isinstance(raw_cfg, ConnectionHealthConfig) else ConnectionHealthConfig()
+                    enabled = cfg.leader_liveness_probe_enabled
+                    timeout = cfg.leader_liveness_probe_timeout_seconds
+            except Exception as exc:
+                # Config unavailable (DB down at startup, service not yet
+                # registered): fall back to fail-safe defaults but make the
+                # degraded read visible rather than masking it entirely.
+                logger.debug("leader_probe_config_load_failed err=%s", exc)
+
+            if enabled and lock_conn is not None:
+                await probe_lock_connection_liveness(
+                    lock_conn, timeout=timeout, name=service.name
+                )
+
         if isinstance(service, PeriodicService):
             periodic = service
 
@@ -390,6 +425,7 @@ class BackgroundSupervisor:
                 is_shutdown=ctx.shutdown.is_set,
                 shutdown_event=ctx.shutdown,
                 tick_timeout=periodic.tick_timeout,
+                pre_tick_probe=_liveness_probe,
             )
 
         async def on_leader_run(lock_conn: Any) -> None:
@@ -411,6 +447,7 @@ class BackgroundSupervisor:
             cadence_seconds=_REELECT_CADENCE_SECONDS,
             is_shutdown=ctx.shutdown.is_set,
             shutdown_event=ctx.shutdown,
+            pre_tick_probe=_liveness_probe,
         )
 
     async def stop(self, *, timeout: float = 10.0) -> None:

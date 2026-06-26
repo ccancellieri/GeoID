@@ -527,6 +527,7 @@ async def run_leader_loop(
     is_shutdown: Optional[Callable[[], bool]] = None,
     shutdown_event: Optional[asyncio.Event] = None,
     tick_timeout: Optional[float] = None,
+    pre_tick_probe: Optional[Callable[[Any], Awaitable[None]]] = None,
 ) -> None:
     """Run a leader-elected loop that resigns on any exception.
 
@@ -577,7 +578,13 @@ async def run_leader_loop(
     to ensure the tick completes within one cadence window.
     """
     is_shutdown = is_shutdown or (lambda: False)
-    effective_tick_timeout = tick_timeout if tick_timeout is not None else cadence_seconds
+    # When cadence_seconds is zero (test/fast-loop mode) the effective tick
+    # timeout defaults to None (unbounded) rather than zero (instant cancel).
+    # A zero-second wait_for would cancel the body before it runs.
+    effective_tick_timeout: Optional[float] = (
+        tick_timeout if tick_timeout is not None
+        else (cadence_seconds if cadence_seconds > 0 else None)
+    )
 
     async def _sleep_cadence() -> None:
         if shutdown_event is not None:
@@ -595,6 +602,8 @@ async def run_leader_loop(
                     await _sleep_cadence()
                     continue
                 logger.info("%s: leadership acquired", name)
+                if pre_tick_probe is not None:
+                    await pre_tick_probe(lock_conn)
                 try:
                     await asyncio.wait_for(on_leader(lock_conn), timeout=effective_tick_timeout)
                 except asyncio.TimeoutError:

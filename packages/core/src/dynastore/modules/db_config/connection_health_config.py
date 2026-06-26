@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Tuple
+from typing import ClassVar, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -97,10 +97,12 @@ class LeadershipConfig:
 
 
 @dataclass
-class ConnectionHealthConfig:
+class _ConnectionHealthInfraConfig:
     """Infra dimensioning for connection health observability.
 
-    Controls the slow pool-acquire logging threshold.
+    Controls the slow pool-acquire logging threshold. Fixed at process
+    startup; not hot-reloadable. Use ``resolve_slow_pool_acquire_threshold``
+    to read the current value.
 
     Scope: platform-wide.
     """
@@ -119,7 +121,7 @@ class ConnectionHealthConfig:
 _retry_config: ConnectionRetryConfig = ConnectionRetryConfig()
 _provisioning_config: ProvisioningRetryConfig = ProvisioningRetryConfig()
 _leadership_config: LeadershipConfig = LeadershipConfig()
-_health_config: ConnectionHealthConfig = ConnectionHealthConfig()
+_health_config: _ConnectionHealthInfraConfig = _ConnectionHealthInfraConfig()
 
 
 def resolve_connection_retry_config() -> Tuple[int, float, float, float]:
@@ -154,3 +156,64 @@ def resolve_leadership_config() -> Tuple[int, int, float, int, int]:
 def resolve_slow_pool_acquire_threshold() -> float:
     """Return the current slow-pool-acquire logging threshold in seconds."""
     return _health_config.slow_pool_acquire_threshold_seconds
+
+
+# ---------------------------------------------------------------------------
+# Hot-reloadable leader-liveness probe configuration.
+#
+# This PluginConfig is stored in the platform configs table and loaded at
+# runtime via PlatformConfigService.get_config(ConnectionHealthConfig).
+# Changes take effect on the next leader tick without a pod restart.
+#
+# The probe runs a cheap SELECT 1 on the dedicated AUTOCOMMIT connection that
+# holds the session advisory lock before each LEADER_ONLY tick. If the
+# connection wire has died (NAT idle reset, server restart), the probe raises
+# DatabaseConnectionError, causing the leader loop to resign and hand the lock
+# to another pod. Without this check, a dead wire would be invisible to
+# pool_pre_ping (the connection is checked out for the whole tenure) and the
+# leader would continue ticking against a ghost connection.
+# ---------------------------------------------------------------------------
+
+from pydantic import Field  # noqa: E402 — after stdlib/dataclass section
+
+from dynastore.models.mutability import Mutable  # noqa: E402
+from dynastore.models.plugin_config import PluginConfig  # noqa: E402
+
+
+class ConnectionHealthConfig(PluginConfig):
+    """Hot-reloadable configuration for the leader-liveness probe.
+
+    Stored in the platform configs table and read on each LEADER_ONLY tick via
+    ``PlatformConfigService.get_config(ConnectionHealthConfig)``.  All fields
+    are ``Mutable`` so operators can adjust the probe without restarting pods.
+
+    Address: ``("platform", "db", "health")``.
+    """
+
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "db", "health")
+    _tiers: ClassVar[Optional[Tuple[str, ...]]] = ("platform",)
+
+    leader_liveness_probe_enabled: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "When True (default), a cheap SELECT 1 is executed on the advisory "
+            "lock connection before each LEADER_ONLY tick. If the wire has died "
+            "(NAT idle reset, DB server restart), this probe detects the failure "
+            "and resigns leadership so another pod can take over. Set to False "
+            "only if the probe itself causes spurious resignations in a particular "
+            "network topology."
+        ),
+    )
+
+    leader_liveness_probe_timeout_seconds: Mutable[float] = Field(
+        default=2.0,
+        ge=0.5,
+        le=30.0,
+        description=(
+            "Maximum wall-clock seconds the liveness probe may run before it is "
+            "considered failed. A dead TCP socket hangs until the OS connect "
+            "timeout fires (often 75 s or more); bounding the probe here ensures "
+            "a failed wire is detected within this window rather than stalling "
+            "the tick. Must be in [0.5, 30.0] seconds."
+        ),
+    )

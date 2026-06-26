@@ -558,3 +558,39 @@ async def test_leader_tick_timeout_releases_lock() -> None:
     assert start_time["time"] is not None, "Start time should be set"
     elapsed = lock_released_at["time"] - start_time["time"]
     assert elapsed < 0.5, f"Lock held for {elapsed:.2f}s, expected <0.5s (timeout should fire)"
+
+
+@pytest.mark.asyncio
+async def test_leader_elected_coro_passes_pre_tick_probe_for_periodic() -> None:
+    """_leader_elected_coro must wire a non-None pre_tick_probe into run_leader_loop
+    for LEADER_ONLY PeriodicService instances."""
+    from sqlalchemy.ext.asyncio import AsyncEngine as _AsyncEngine
+
+    captured: dict[str, Any] = {}
+
+    # The real run_leader_loop is an async function; replacing it with a MagicMock
+    # whose side_effect is an async coroutine ensures _leader_elected_coro's
+    # "return run_leader_loop(...)" returns an awaitable and captures kwargs.
+    async def _capture_and_exit(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    class _LeaderPeriodic(PeriodicService):
+        name = "leader-periodic"
+        leadership = Leadership.LEADER_ONLY
+        cadence_seconds = 30.0
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            pass
+
+    ctx = _make_ctx(engine=MagicMock(spec=_AsyncEngine))
+    supervisor = BackgroundSupervisor()
+
+    with patch(
+        "dynastore.tools.background_service.run_leader_loop",
+        MagicMock(side_effect=_capture_and_exit),
+    ):
+        coro = supervisor._leader_elected_coro(_LeaderPeriodic(), ctx)
+        await coro
+
+    assert "pre_tick_probe" in captured, "pre_tick_probe must be passed to run_leader_loop"
+    assert captured["pre_tick_probe"] is not None, "pre_tick_probe must be non-None"

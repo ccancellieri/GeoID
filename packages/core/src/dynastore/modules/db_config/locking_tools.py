@@ -22,12 +22,13 @@ import functools
 import time
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Optional, Callable, Awaitable, ClassVar, TypeVar, Dict, AsyncGenerator, Iterator, Set, Tuple, Union, cast
+from typing import Any, Optional, Callable, Awaitable, ClassVar, TypeVar, Dict, AsyncGenerator, Iterator, Set, Tuple, Union, cast
 
 from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
     resolve_leadership_config,
 )
+from dynastore.modules.db_config.exceptions import DatabaseConnectionError
 from sqlalchemy import text, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from dynastore.modules.tasks.durable.locks import stable_lock_id_sha256 as _stable_lock_id_sha256
@@ -71,6 +72,86 @@ def held_advisory_locks() -> Dict[int, Tuple[str, float]]:
     acquired_monotonic``.
     """
     return dict(_held_advisory_locks)
+
+
+def _get_probe_service_name() -> str:
+    """Return the service identity for the probe log line.
+
+    Resolution order mirrors the pattern used by the GCP liveness reconciler:
+    instance.json → SERVICE_NAME env → literal "unknown".
+    """
+    import os
+    try:
+        from dynastore.modules.db_config.instance import get_service_name
+        name = get_service_name()
+        if name:
+            return name
+    except Exception:
+        pass
+    return os.getenv("SERVICE_NAME") or "unknown"
+
+
+async def probe_lock_connection_liveness(
+    conn: Any,
+    *,
+    timeout: float,
+    name: str = "leader",
+) -> None:
+    """Check whether the advisory-lock connection is still alive.
+
+    Runs a cheap ``SELECT 1`` on the provided connection under a bounded
+    timeout.  If the wire has died (NAT idle reset, server restart), the
+    query will hang or error rather than returning promptly.  Bounding it
+    with ``asyncio.wait_for`` ensures detection within ``timeout`` seconds
+    instead of waiting for the OS TCP timeout (often 75 s or more).
+
+    This probe is intentionally NOT a re-lock attempt. PG session advisory
+    locks are re-entrant on the same connection: calling
+    ``pg_try_advisory_lock`` on the holder always returns ``true`` and
+    leaks a lock level, making the lock harder to release. ``SELECT 1``
+    tests wire liveness without touching the lock state.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        Re-raised as-is; never treat shutdown/drain as a dead wire.
+    DatabaseConnectionError
+        On any other failure (including ``asyncio.TimeoutError``). The
+        caller's leader loop catches this and resigns leadership so another
+        pod can take over.
+    """
+    start = time.monotonic()
+    try:
+        await asyncio.wait_for(
+            DQLQuery("SELECT 1", result_handler=ResultHandler.SCALAR).execute(conn),
+            timeout=timeout,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        logger.warning(
+            "leader_liveness_probe_failed service=%s name=%s elapsed_ms=%d err=%s",
+            _get_probe_service_name(),
+            name,
+            elapsed_ms,
+            exc,
+        )
+        # On a dead TCP socket the probe times out while asyncpg is still
+        # awaiting the cancel-ack for the abandoned query. If we leave the
+        # connection in that state, the pg_advisory_unlock issued by
+        # pg_advisory_leadership's finally block blocks on the same dead wire
+        # until the OS TCP timeout fires (~75s), delaying the lock handoff the
+        # probe exists to accelerate. Invalidating the connection now tears the
+        # transport down immediately so the unlock/close path returns promptly.
+        # Best-effort: the connection is being resigned regardless.
+        try:
+            await conn.invalidate()
+        except Exception:
+            pass
+        raise DatabaseConnectionError(
+            f"leader liveness probe failed for {name!r}: {exc}"
+        ) from exc
 
 
 def retry_on_lock_conflict(max_retries: int | None = None, base_delay: float | None = None):

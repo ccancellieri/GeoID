@@ -21,17 +21,25 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Any, Optional
 
 import pytest
 
+from dynastore.modules.db_config.exceptions import DatabaseConnectionError
 from dynastore.tools.async_utils import run_leader_loop
 
 
 class _LeadershipTracker:
     """Records enter/exit pairs around the leader-held context."""
 
-    def __init__(self, *, is_leader_sequence: list[bool]) -> None:
+    def __init__(
+        self,
+        *,
+        is_leader_sequence: list[bool],
+        lock_conn: Any = None,
+    ) -> None:
         self._is_leader = list(is_leader_sequence)
+        self.lock_conn = lock_conn
         self.acquired = 0
         self.released = 0
         self.held = False
@@ -43,7 +51,8 @@ class _LeadershipTracker:
         if is_leader:
             self.held = True
         try:
-            yield is_leader
+            # run_leader_loop unpacks (is_leader, lock_conn)
+            yield (is_leader, self.lock_conn if is_leader else None)
         finally:
             if is_leader:
                 self.held = False
@@ -57,7 +66,7 @@ async def test_resigns_on_exception_inside_on_leader():
     tracker = _LeadershipTracker(is_leader_sequence=[True, True])
     held_during_exception = False
 
-    async def _raising_body():
+    async def _raising_body(lock_conn: Any) -> None:
         nonlocal held_during_exception
         held_during_exception = tracker.held
         raise RuntimeError("boom")
@@ -87,7 +96,7 @@ async def test_non_leader_sleeps_and_retries():
     tracker = _LeadershipTracker(is_leader_sequence=[False, False, True])
     body_calls = {"n": 0}
 
-    async def _body():
+    async def _body(lock_conn: Any) -> None:
         body_calls["n"] += 1
 
     stop_after = {"n": 0}
@@ -112,7 +121,7 @@ async def test_non_leader_sleeps_and_retries():
 async def test_cancelled_error_propagates():
     tracker = _LeadershipTracker(is_leader_sequence=[True])
 
-    async def _cancel_body():
+    async def _cancel_body(lock_conn: Any) -> None:
         raise asyncio.CancelledError()
 
     with pytest.raises(asyncio.CancelledError):
@@ -137,7 +146,7 @@ async def test_leader_paces_to_cadence_not_hot_loop():
     tracker = _LeadershipTracker(is_leader_sequence=[True] * 10_000)
     ticks = {"n": 0}
 
-    async def _one_tick():
+    async def _one_tick(lock_conn: Any) -> None:
         ticks["n"] += 1
         await asyncio.sleep(0)  # real yield, like DB I/O in a real tick
 
@@ -169,7 +178,7 @@ async def test_shutdown_event_interrupts_cadence_sleep():
     shutdown = asyncio.Event()
     ticks = {"n": 0}
 
-    async def _one_tick():
+    async def _one_tick(lock_conn: Any) -> None:
         ticks["n"] += 1
         shutdown.set()  # request stop right after the first tick
 
@@ -186,3 +195,129 @@ async def test_shutdown_event_interrupts_cadence_sleep():
         timeout=2.0,  # must finish well under the 30s cadence
     )
     assert ticks["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# pre_tick_probe tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_runs_before_on_leader():
+    """pre_tick_probe is called once per leader tick, before on_leader."""
+    call_order: list[str] = []
+    fake_conn = object()
+    tracker = _LeadershipTracker(is_leader_sequence=[True], lock_conn=fake_conn)
+
+    async def _probe(lock_conn: Any) -> None:
+        assert lock_conn is fake_conn
+        call_order.append("probe")
+
+    async def _on_leader(lock_conn: Any) -> None:
+        assert lock_conn is fake_conn
+        call_order.append("on_leader")
+
+    def _is_shutdown():
+        # Stop after one full leader cycle
+        return len(call_order) >= 2
+
+    await run_leader_loop(
+        acquire_leadership=tracker.acquire,
+        on_leader=_on_leader,
+        name="probe-order-test",
+        cadence_seconds=0.0,
+        is_shutdown=_is_shutdown,
+        pre_tick_probe=_probe,
+    )
+
+    assert call_order == ["probe", "on_leader"]
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_causes_resign_and_on_leader_not_called():
+    """If the probe raises, on_leader must NOT be called and the lock is released."""
+    fake_conn = object()
+    tracker = _LeadershipTracker(is_leader_sequence=[True, True], lock_conn=fake_conn)
+    on_leader_called = {"n": 0}
+
+    async def _failing_probe(lock_conn: Any) -> None:
+        raise DatabaseConnectionError("wire died")
+
+    async def _on_leader(lock_conn: Any) -> None:
+        on_leader_called["n"] += 1
+
+    stop_after = {"n": 0}
+
+    def _is_shutdown():
+        stop_after["n"] += 1
+        return stop_after["n"] > 2
+
+    await run_leader_loop(
+        acquire_leadership=tracker.acquire,
+        on_leader=_on_leader,
+        name="probe-fail-test",
+        cadence_seconds=0.0,
+        is_shutdown=_is_shutdown,
+        pre_tick_probe=_failing_probe,
+    )
+
+    # on_leader must never be reached when probe fails
+    assert on_leader_called["n"] == 0
+    # Lock is released every time it was acquired
+    assert tracker.released == tracker.acquired
+
+
+@pytest.mark.asyncio
+async def test_probe_skipped_when_not_leader():
+    """pre_tick_probe is NOT called when this pod is not the leader."""
+    probe_called = {"n": 0}
+    tracker = _LeadershipTracker(is_leader_sequence=[False, False])
+
+    async def _probe(lock_conn: Any) -> None:
+        probe_called["n"] += 1
+
+    async def _on_leader(lock_conn: Any) -> None:
+        pass
+
+    stop_after = {"n": 0}
+
+    def _is_shutdown():
+        stop_after["n"] += 1
+        return stop_after["n"] > 2
+
+    await run_leader_loop(
+        acquire_leadership=tracker.acquire,
+        on_leader=_on_leader,
+        name="probe-non-leader-test",
+        cadence_seconds=0.0,
+        is_shutdown=_is_shutdown,
+        pre_tick_probe=_probe,
+    )
+
+    assert probe_called["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_cancelled_error_propagates_without_resign():
+    """CancelledError from the probe must propagate — it is shutdown/drain,
+    not a dead wire. The leader loop must NOT catch it as a resign signal."""
+    fake_conn = object()
+    tracker = _LeadershipTracker(is_leader_sequence=[True], lock_conn=fake_conn)
+
+    async def _cancel_probe(lock_conn: Any) -> None:
+        raise asyncio.CancelledError()
+
+    async def _on_leader(lock_conn: Any) -> None:
+        pass  # must not be reached
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_leader_loop(
+            acquire_leadership=tracker.acquire,
+            on_leader=_on_leader,
+            name="probe-cancel-test",
+            cadence_seconds=0.0,
+            pre_tick_probe=_cancel_probe,
+        )
+
+    # Lock was acquired and released (finally block in pg_advisory_leadership runs)
+    assert tracker.released == 1
