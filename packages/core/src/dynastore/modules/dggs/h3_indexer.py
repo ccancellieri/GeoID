@@ -117,3 +117,67 @@ def cell_int_to_str(val: int) -> str:
     from the DB and needing the canonical cell ID string.
     """
     return format(val, "x")
+
+
+def rect_bound_for_cell(cell: str) -> Tuple[float, float, float, float]:
+    """Return (xmin, ymin, xmax, ymax) bounding box for an H3 cell.
+
+    Correctly handles cells that cross the antimeridian by detecting when
+    longitude values span both sides of ±180° and returning the full
+    longitude range [-180, 180] in that case.
+
+    Args:
+        cell: H3 cell ID string.
+
+    Returns:
+        Tuple of (xmin, ymin, xmax, ymax) in WGS-84 coordinates.
+    """
+    if not is_valid_cell(cell):
+        raise ValueError(f"Invalid H3 cell: {cell!r}")
+    
+    polygon = cell_to_geojson_polygon(cell)
+    coords = polygon["coordinates"][0]
+    lngs = [c[0] for c in coords[:-1]]
+    lats = [c[1] for c in coords[:-1]]
+    
+    ymin, ymax = min(lats), max(lats)
+    
+    if _crosses_antimeridian(lngs):
+        return -180.0, ymin, 180.0, ymax
+    
+    return min(lngs), ymin, max(lngs), ymax
+
+
+def _crosses_antimeridian(lngs: List[float]) -> bool:
+    """Detect if a list of longitudes crosses the antimeridian.
+
+    A cell crosses the antimeridian if:
+    1. It has vertices on both sides of ±180°
+    2. The span would be > 180° if computed naively
+
+    Args:
+        lngs: List of longitude values (not including closing vertex).
+
+    Returns:
+        True if the cell crosses the antimeridian.
+    """
+    if not lngs:
+        return False
+    
+    min_lng, max_lng = min(lngs), max(lngs)
+    
+    if max_lng - min_lng > 180:
+        return True
+    
+    has_positive = any(lng > 0 for lng in lngs)
+    has_negative = any(lng < 0 for lng in lngs)
+    
+    if not (has_positive and has_negative):
+        return False
+    
+    if min_lng >= -180 and max_lng <= 180:
+        near_positive = any(lng > 90 for lng in lngs)
+        near_negative = any(lng < -90 for lng in lngs)
+        return near_positive and near_negative
+    
+    return False

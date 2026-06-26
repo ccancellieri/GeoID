@@ -24,20 +24,20 @@ from dateutil.parser import isoparse
 
 from dynastore.models.query_builder import FilterCondition, FilterOperator, QueryRequest
 from dynastore.modules.dggs.h3_indexer import (
-    cell_to_geojson_polygon,
     is_valid_cell,
+    rect_bound_for_cell,
 )
 
 
 def bbox_for_zone(zone_id: str) -> Tuple[float, float, float, float]:
-    """Return (xmin, ymin, xmax, ymax) bounding box for an H3 cell."""
+    """Return (xmin, ymin, xmax, ymax) bounding box for an H3 cell.
+
+    Correctly handles cells that cross the antimeridian by using
+    :func:`h3_indexer.rect_bound_for_cell`.
+    """
     if not is_valid_cell(zone_id):
         raise ValueError(f"Invalid H3 zone ID: {zone_id!r}")
-    polygon = cell_to_geojson_polygon(zone_id)
-    coords = polygon["coordinates"][0]
-    lngs = [c[0] for c in coords]
-    lats = [c[1] for c in coords]
-    return min(lngs), min(lats), max(lngs), max(lats)
+    return rect_bound_for_cell(zone_id)
 
 
 def build_query_for_zone(

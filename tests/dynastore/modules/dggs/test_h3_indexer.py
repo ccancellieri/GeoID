@@ -34,6 +34,7 @@ from dynastore.modules.dggs.h3_indexer import (
     get_resolution,
     is_valid_cell,
     latlng_to_cell,
+    rect_bound_for_cell,
 )
 
 
@@ -130,3 +131,56 @@ def test_cell_str_to_int_invalid():
     from dynastore.modules.dggs.h3_indexer import cell_str_to_int
     with pytest.raises(ValueError):
         cell_str_to_int("not-valid")
+
+
+# ---------------------------------------------------------------------------
+# Antimeridian handling
+# ---------------------------------------------------------------------------
+
+def test_rect_bound_for_cell_regular():
+    """Test rect_bound_for_cell for a cell not crossing the antimeridian."""
+    cell = latlng_to_cell(FAO_LAT, FAO_LNG, 5)
+    xmin, ymin, xmax, ymax = rect_bound_for_cell(cell)
+    
+    assert -180 <= xmin <= 180
+    assert -180 <= xmax <= 180
+    assert -90 <= ymin <= 90
+    assert -90 <= ymax <= 90
+    assert xmin <= xmax
+    assert ymin <= ymax
+    
+    assert xmin <= FAO_LNG <= xmax
+    assert ymin <= FAO_LAT <= ymax
+
+
+def test_rect_bound_for_cell_antimeridian():
+    """Test that cells near the antimeridian are handled correctly."""
+    cell_west = latlng_to_cell(0, 179.5, 5)
+    xmin_w, ymin_w, xmax_w, ymax_w = rect_bound_for_cell(cell_west)
+    
+    assert xmin_w <= xmax_w, f"Invalid bbox: xmin={xmin_w} > xmax={xmax_w}"
+    
+    cell_east = latlng_to_cell(0, -179.5, 5)
+    xmin_e, ymin_e, xmax_e, ymax_e = rect_bound_for_cell(cell_east)
+    
+    assert xmin_e <= xmax_e, f"Invalid bbox: xmin={xmin_e} > xmax={xmax_e}"
+
+
+def test_rect_bound_all_cells_valid_bounds():
+    """Spot-check that rect_bound_for_cell never returns xmin > xmax."""
+    test_points = [
+        (0, 0), (0, 180), (0, -180), (45, 170), (-45, -170),
+        (0, 179.9), (0, -179.9), (30, 179), (-30, -179),
+    ]
+    for lat, lng in test_points:
+        lat = max(-89.9, min(89.9, lat))
+        cell = latlng_to_cell(lat, lng, 5)
+        xmin, ymin, xmax, ymax = rect_bound_for_cell(cell)
+        assert xmin <= xmax, f"Invalid bbox for cell {cell}: xmin={xmin} xmax={xmax}"
+        assert ymin <= ymax, f"Invalid bbox for cell {cell}: ymin={ymin} ymax={ymax}"
+
+
+def test_rect_bound_for_cell_invalid():
+    """Test that rect_bound_for_cell raises for invalid cells."""
+    with pytest.raises(ValueError, match="Invalid H3 cell"):
+        rect_bound_for_cell("invalid-cell")
