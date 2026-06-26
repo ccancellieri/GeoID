@@ -26,7 +26,7 @@ the position/area/cube query vocabulary on top.
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Optional, cast
+from typing import Any, Dict, FrozenSet, List, Optional, cast
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
@@ -93,6 +93,35 @@ def _resolve_band_names(item: dict, requested_params: Optional[List[str]]) -> Li
 def _item_datetime(item: dict) -> Optional[str]:
     props = item.get("properties") or {}
     return props.get("datetime") or props.get("start_datetime")
+
+
+def _get_edr_locations(coll: Any) -> List[Dict[str, Any]]:
+    """Extract EDR locations from collection extras.
+
+    Locations are stored under ``edr:locations`` key in collection extras.
+    Each location is a GeoJSON Feature with:
+    - ``id``: unique identifier (e.g., station code, GeoHash)
+    - ``geometry``: POINT geometry
+    - ``properties``: optional metadata (name, description, etc.)
+
+    Returns an empty list if no locations are defined.
+    """
+    raw_extra = getattr(coll, "model_extra", None) or {}
+    extras = raw_extra.get("extras") or {}
+    if not extras and isinstance(raw_extra, dict):
+        extras = {k: v for k, v in raw_extra.items() if ":" in k}
+    if not extras:
+        extra_metadata = getattr(coll, "extra_metadata", None) or {}
+        dump = getattr(extra_metadata, "model_dump", None)
+        if callable(dump):
+            extra_metadata = dump()
+        if isinstance(extra_metadata, dict):
+            extras = extra_metadata
+
+    locations = extras.get("edr:locations") or []
+    if not isinstance(locations, list):
+        return []
+    return [loc for loc in locations if isinstance(loc, dict) and loc.get("id")]
 
 
 # ---------------------------------------------------------------------------
@@ -641,12 +670,26 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         request: Request,
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> em.EDRLocations:
-        """Return an empty FeatureCollection — named locations require explicit metadata.
+        """Return named locations from collection extras.
+
+        Locations are stored in collection extras under the ``edr:locations``
+        key as a list of GeoJSON Feature objects. Each feature represents a
+        named position (e.g., weather station, monitoring site) with an ``id``,
+        ``geometry`` (POINT), and optional ``properties``.
 
         ``?hints=`` is accepted uniformly for API consistency; this route
         performs no data reads so the value has no effect today.
         """
-        return em.EDRLocations(features=[])
+        catalogs_svc = await self._get_catalogs_service()
+        coll = await catalogs_svc.get_collection(catalog_id, collection_id)
+        if coll is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Collection {collection_id!r} not found.",
+            )
+
+        locations = _get_edr_locations(coll)
+        return em.EDRLocations(features=locations)
 
     async def get_location(
         self,
@@ -655,6 +698,20 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         location_id: str,
         request: Request,
     ):
+        """Return a specific named location."""
+        catalogs_svc = await self._get_catalogs_service()
+        coll = await catalogs_svc.get_collection(catalog_id, collection_id)
+        if coll is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Collection {collection_id!r} not found.",
+            )
+
+        locations = _get_edr_locations(coll)
+        for loc in locations:
+            if loc.get("id") == location_id:
+                return JSONResponse(content=loc)
+
         raise HTTPException(
             status_code=404,
             detail=f"Location {location_id!r} not found.",
