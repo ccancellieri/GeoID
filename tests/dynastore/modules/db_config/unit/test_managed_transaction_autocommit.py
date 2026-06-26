@@ -277,3 +277,160 @@ def test_is_autocommit_connection_detection():
     sync_conn.sync_connection = SimpleNamespace()
     sync_conn.sync_connection._execution_options = {"isolation_level": "AUTOCOMMIT"}
     assert _is_autocommit_connection(sync_conn) is True
+
+
+# ---------------------------------------------------------------------------
+# Sync path coverage
+#
+# The async AUTOCOMMIT branch above is well covered, but managed_transaction
+# has a separate *sync* branch (psycopg2 Connection / Session) taken by Cloud
+# Run Jobs. It mirrors the async AUTOCOMMIT detection but with synchronous
+# begin()/begin_nested(). These tests exercise that branch directly.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSyncTx:
+    """Fake synchronous transaction context manager."""
+
+    def __init__(self, log: List[str], name: str = "tx"):
+        self._log = log
+        self._name = name
+        self.committed = False
+        self.rolled_back = False
+
+    def __enter__(self):
+        self._log.append(f"{self._name}_enter")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._log.append(f"{self._name}_exit_commit")
+            self.committed = True
+        else:
+            self._log.append(f"{self._name}_exit_rollback")
+            self.rolled_back = True
+        return False
+
+    def commit(self):
+        self._log.append(f"{self._name}_commit")
+        self.committed = True
+
+    def rollback(self):
+        self._log.append(f"{self._name}_rollback")
+        self.rolled_back = True
+
+
+class _FakeSyncConnBase:
+    """Common base so monkeypatched ``SAConnection`` matches both fakes."""
+
+    def __init__(self, log: List[str]):
+        self._log = log
+        self._in_transaction = False
+        self._execution_options: dict = {}
+        self.sync_connection = None
+        self.connection = None
+        self.closed = False
+        self.invalidated = False
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
+
+    def begin(self):
+        self._in_transaction = True
+        self._log.append("begin")
+        return _FakeSyncTx(self._log, "begin")
+
+    @property
+    def is_active(self) -> bool:
+        return True
+
+
+class _FakeSyncAutocommitConn(_FakeSyncConnBase):
+    """Fake sync connection with AUTOCOMMIT isolation level."""
+
+    def __init__(self, log: List[str]):
+        super().__init__(log)
+        self._execution_options = {"isolation_level": "AUTOCOMMIT"}
+
+    def begin_nested(self):
+        # Would raise NoActiveSQLTransactionError on a real AUTOCOMMIT conn.
+        self._log.append("begin_nested")
+        raise Exception("SAVEPOINT can only be used in transaction blocks")
+
+
+class _FakeSyncRegularConn(_FakeSyncConnBase):
+    """Fake sync connection (non-AUTOCOMMIT)."""
+
+    def begin_nested(self):
+        self._in_transaction = True
+        self._log.append("begin_nested")
+        return _FakeSyncTx(self._log, "nested")
+
+
+@pytest.mark.asyncio
+async def test_managed_transaction_sync_autocommit_connection(monkeypatch):
+    """Sync AUTOCOMMIT connection uses begin(), never begin_nested()."""
+    from dynastore.modules.db_config import query_executor as qe
+
+    # Route the fake through the sync branch: it must NOT be an AsyncConnection,
+    # and it must satisfy ``isinstance(conn, (SAConnection, SASession))``.
+    monkeypatch.setattr(qe, "SAConnection", _FakeSyncConnBase, raising=False)
+    monkeypatch.setattr(qe, "_get_wire_identity", lambda c: c, raising=True)
+
+    log: List[str] = []
+    conn = _FakeSyncAutocommitConn(log)
+    conn._in_transaction = True  # autobegin makes in_transaction() True
+
+    async with qe.managed_transaction(conn) as managed_conn:
+        assert managed_conn is conn
+        log.append("body")
+
+    assert "begin" in log
+    assert "begin_nested" not in log
+    assert "begin_enter" in log
+    assert "begin_exit_commit" in log
+    assert "body" in log
+
+
+@pytest.mark.asyncio
+async def test_managed_transaction_sync_autocommit_with_error(monkeypatch):
+    """Sync AUTOCOMMIT transaction rolls back on error."""
+    from dynastore.modules.db_config import query_executor as qe
+
+    monkeypatch.setattr(qe, "SAConnection", _FakeSyncConnBase, raising=False)
+    monkeypatch.setattr(qe, "_get_wire_identity", lambda c: c, raising=True)
+
+    log: List[str] = []
+    conn = _FakeSyncAutocommitConn(log)
+    conn._in_transaction = True
+
+    with pytest.raises(ValueError, match="test error"):
+        async with qe.managed_transaction(conn):
+            log.append("body_before_error")
+            raise ValueError("test error")
+
+    assert "begin" in log
+    assert "begin_enter" in log
+    assert "begin_exit_rollback" in log
+    assert "body_before_error" in log
+
+
+@pytest.mark.asyncio
+async def test_managed_transaction_sync_regular_connection_nested(monkeypatch):
+    """Sync regular connection already in a transaction uses begin_nested()."""
+    from dynastore.modules.db_config import query_executor as qe
+
+    monkeypatch.setattr(qe, "SAConnection", _FakeSyncConnBase, raising=False)
+    monkeypatch.setattr(qe, "_get_wire_identity", lambda c: c, raising=True)
+
+    log: List[str] = []
+    conn = _FakeSyncRegularConn(log)
+    conn._in_transaction = True
+
+    async with qe.managed_transaction(conn) as managed_conn:
+        assert managed_conn is conn
+        log.append("body")
+
+    assert "begin_nested" in log
+    assert "nested_commit" in log
+    assert "body" in log
