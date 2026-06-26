@@ -34,6 +34,10 @@ EXPECTED_PASS1_RECORDS_URIS = {
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/geojson",  # T5
 }
 
+EXPECTED_RECORDS_MANAGE_URIS = {
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/manage-records",
+}
+
 EXPECTED_PASS1_WEB_URIS = {
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas31",  # T6
 }
@@ -60,6 +64,22 @@ def test_records_declares_geojson_conformance():
     declared = set(OGC_API_RECORDS_URIS)
     missing = EXPECTED_PASS1_RECORDS_URIS - declared
     assert not missing, f"Records extension missing Pass 1 URIs: {sorted(missing)}"
+
+
+def test_records_declares_manage_records_conformance():
+    """OGC API - Records Part 1 manage-records class must be advertised.
+
+    PUT/PATCH/DELETE record routes are registered; the conformance endpoint
+    must reflect that by listing the manage-records class URI defined in
+    OGC 20-004 Section 7.12 (OGC API - Records Part 1, manage-records
+    conformance class).
+    """
+    from dynastore.extensions.records.records_service import OGC_API_RECORDS_URIS
+    declared = set(OGC_API_RECORDS_URIS)
+    missing = EXPECTED_RECORDS_MANAGE_URIS - declared
+    assert not missing, (
+        f"Records extension missing manage-records conformance URI: {sorted(missing)}"
+    )
 
 
 def test_web_declares_oas31_conformance():
