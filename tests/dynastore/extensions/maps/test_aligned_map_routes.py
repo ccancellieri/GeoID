@@ -203,6 +203,26 @@ class TestGetCollectionMaps:
 
         assert exc_info.value.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_map_render_link_uses_ogc_map_rel(self, monkeypatch):
+        """The link to the /map render endpoint must use the OGC map relation type."""
+        svc = _mock_catalogs_svc()
+        monkeypatch.setattr(ms, "get_protocol", lambda _proto: svc)
+        _patch_visibility(monkeypatch, visible=True)
+
+        result = await ms.MapsService.get_collection_maps(
+            catalog_id="my-cat",
+            collection_id="my-coll",
+            request=_mock_request(),
+            language="en",
+        )
+
+        assert len(result.maps) == 1
+        map_links = result.maps[0].links
+        assert len(map_links) == 1
+        assert map_links[0].rel == "http://www.opengis.net/def/rel/ogc/1.0/map"
+        assert map_links[0].type == "image/png"
+
 
 # ---------------------------------------------------------------------------
 # get_collection_map — default style raster branch (happy path)

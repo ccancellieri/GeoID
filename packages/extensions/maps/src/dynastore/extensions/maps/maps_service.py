@@ -827,7 +827,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         title = coll.title.resolve(language) if coll.title is not None else None
         base = str(request.url)
         map_links = [
-            Link(href=f"{base}/map?bbox=-180,-90,180,90&crs=EPSG:4326", rel="item", type="image/png"),
+            Link(href=f"{base}/map?bbox=-180,-90,180,90&crs=EPSG:4326", rel="http://www.opengis.net/def/rel/ogc/1.0/map", type="image/png"),
         ]
         links = [
             Link(href=base, rel="self"),
