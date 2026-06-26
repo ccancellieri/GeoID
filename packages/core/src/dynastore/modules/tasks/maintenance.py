@@ -131,25 +131,45 @@ async def _notify_requeued(engine: AsyncEngine, reason: str) -> None:
 
 
 async def list_dead_letter_tasks(
-    engine: AsyncEngine, catalog_id: Optional[str] = None
+    engine: AsyncEngine,
+    catalog_id: Optional[str] = None,
+    *,
+    collection_id: Optional[str] = None,
+    task_type: Optional[str] = None,
+    limit: int = 100,
 ) -> List[Dict[str, Any]]:
     """
-    Returns all tasks in DEAD_LETTER state for operator review.
+    Returns tasks in DEAD_LETTER state for operator review.
+
+    Args:
+        catalog_id: Scope to a single tenant (catalog internal id or reserved
+                    sentinels 'system'/'platform'). ``None`` returns DLQ tasks
+                    across all tenants (sysadmin-wide listing).
+        collection_id: Further scope to a specific STAC collection. Ignored when
+                       ``catalog_id`` is ``None`` (system scope has no collections).
+        task_type: Optional filter to a specific task_type value.
+        limit: Maximum rows returned (default 100, max 500).
     """
     task_schema = get_task_schema()
-    schema_filter = ""
-    params: Dict[str, Any] = {}
+    filters = "WHERE status = 'DEAD_LETTER'"
+    params: Dict[str, Any] = {"limit": limit}
     if catalog_id is not None:
-        schema_filter = "AND catalog_id = :catalog_id"
+        filters += " AND catalog_id = :catalog_id"
         params["catalog_id"] = catalog_id
+        if collection_id is not None:
+            filters += " AND collection_id = :collection_id"
+            params["collection_id"] = collection_id
+    if task_type is not None:
+        filters += " AND task_type = :task_type"
+        params["task_type"] = task_type
 
     sql = f"""
-        SELECT task_id, catalog_id, task_type, owner_id, retry_count, max_retries,
-               timestamp, finished_at, error_message, inputs
+        SELECT task_id, catalog_id, collection_id, task_type, owner_id,
+               retry_count, max_retries, timestamp, finished_at, error_message, inputs
         FROM {task_schema}.tasks
-        WHERE status = 'DEAD_LETTER'
-          {schema_filter}
-        ORDER BY timestamp ASC;
+        {filters}
+        ORDER BY timestamp ASC
+        LIMIT :limit;
     """
     async with managed_transaction(engine) as conn:
         return await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
@@ -158,8 +178,12 @@ async def list_dead_letter_tasks(
 
 
 async def requeue_dead_letter_task(
-    engine: AsyncEngine, task_id: str, reset_retries: bool = True,
+    engine: AsyncEngine,
+    task_id: str,
+    reset_retries: bool = True,
     catalog_id: Optional[str] = None,
+    *,
+    collection_id: Optional[str] = None,
 ) -> bool:
     """
     Resets a DEAD_LETTER or FAILED task back to PENDING for another attempt.
@@ -177,12 +201,20 @@ async def requeue_dead_letter_task(
                     tenant guard so a caller scoped to one tenant cannot requeue
                     another tenant's task by id. None = no tenant filter
                     (platform/sysadmin-wide requeue).
+        collection_id: If provided together with ``catalog_id``, further guards
+                       the UPDATE to tasks whose ``collection_id`` column matches.
+                       Ignored when ``catalog_id`` is None.
     Returns:
         True if the task was found and requeued, False otherwise.
     """
     task_schema = get_task_schema()
     retry_clause = "retry_count = 0," if reset_retries else ""
     tenant_clause = "AND catalog_id = :catalog_id" if catalog_id is not None else ""
+    collection_clause = (
+        "AND collection_id = :collection_id"
+        if catalog_id is not None and collection_id is not None
+        else ""
+    )
     sql = f"""
         UPDATE {task_schema}.tasks
         SET status       = 'PENDING',
@@ -194,11 +226,14 @@ async def requeue_dead_letter_task(
         WHERE task_id = :task_id
           AND status  IN {_REQUEUEABLE_STATUSES}
           {tenant_clause}
+          {collection_clause}
         RETURNING task_id;
     """
-    params = {"task_id": task_id}
+    params: Dict[str, Any] = {"task_id": task_id}
     if catalog_id is not None:
         params["catalog_id"] = catalog_id
+        if collection_id is not None:
+            params["collection_id"] = collection_id
     async with managed_transaction(engine) as conn:
         row = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
             conn, **params
@@ -508,6 +543,46 @@ async def purge_completed_tasks(
         ) or []
     count = len(rows)
     logger.info(f"Maintenance: Purged {count} completed/failed task(s).")
+    return count
+
+
+async def purge_dead_letter_tasks(
+    engine: AsyncEngine,
+    catalog_id: Optional[str] = None,
+    older_than: timedelta = timedelta(days=90),
+) -> int:
+    """Hard-delete DEAD_LETTER tasks older than the given age.
+
+    DEAD_LETTER rows that have exceeded the DLQ retention window are beyond
+    operator intervention and should be removed to bound table growth.
+    ``COALESCE(finished_at, timestamp)`` is used so rows without a
+    ``finished_at`` (e.g. early DLQ without a completion write) are still
+    eligible based on their creation timestamp.
+
+    Returns the number of rows deleted.
+    """
+    task_schema = get_task_schema()
+    cutoff = _now() - older_than
+
+    schema_filter = ""
+    params: Dict[str, Any] = {"cutoff": cutoff}
+    if catalog_id is not None:
+        schema_filter = "AND catalog_id = :catalog_id"
+        params["catalog_id"] = catalog_id
+
+    sql = f"""
+        DELETE FROM {task_schema}.tasks
+        WHERE status = 'DEAD_LETTER'
+          AND COALESCE(finished_at, timestamp) < :cutoff
+          {schema_filter}
+        RETURNING task_id;
+    """
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, **params
+        ) or []
+    count = len(rows)
+    logger.info(f"Maintenance: Purged {count} stale DEAD_LETTER task(s).")
     return count
 
 

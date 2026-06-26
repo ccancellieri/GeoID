@@ -16,3 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+from .tasks_service import TasksService
+from . import presets as _tasks_presets  # noqa: F401  -- preset registration side-effect
+
+__all__ = ["TasksService"]

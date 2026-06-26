@@ -1299,7 +1299,7 @@ class OGCServiceMixin:
         from dynastore.tools.protocol_helpers import get_engine
 
         # Resolve physical schema so the task lands in the catalog's namespace
-        # and is discoverable via GET /tasks/catalogs/{catalog_id}/{task_id}.
+        # and is discoverable via GET /task/catalogs/{catalog_id}/tasks/{task_id}.
         engine = get_engine()
         if engine is None:
             raise HTTPException(
@@ -1364,10 +1364,10 @@ class OGCServiceMixin:
                 base = enforce_https(str(request.base_url).rstrip("/"))
                 root_path = request.scope.get("root_path", "").rstrip("/")
                 status_url = (
-                    f"{base}{root_path}/tasks/catalogs/{catalog_id}/{task_id_str}"
+                    f"{base}{root_path}/task/catalogs/{catalog_id}/tasks/{task_id_str}"
                 )
         else:
-            status_url = f"/tasks/catalogs/{catalog_id}/{task_id_str}"
+            status_url = f"/task/catalogs/{catalog_id}/tasks/{task_id_str}"
 
         body = _json.dumps({
             "status": task.status if hasattr(task, "status") else "PENDING",

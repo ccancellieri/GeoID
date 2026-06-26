@@ -203,7 +203,7 @@ class ProvisioningTask(TaskProtocol):
         catalog 'ready' as a bucket-only catalog (deliberate config choice).
       - Eventing permission/structural failure → permanent: catalog 'failed';
         grant pubsub.topics.attachSubscription, then POST
-        /catalog/catalogs/{id}/reprovision (idempotent) to recover.
+        POST /task/catalogs/{id} {task_type:"catalog_provision",...} to recover.
       - Eventing transient failure → retried by the task queue; on exhaustion
         the catalog is marked 'failed'.
     Recovery is always the same: fix the cause, then reprovision — the task
@@ -280,7 +280,8 @@ class ProvisioningTask(TaskProtocol):
                         "GcpProvisionCatalogTask: eventing setup permission-denied "
                         "for catalog '%s' (%s: %s); marking catalog FAILED. Grant "
                         "'pubsub.topics.attachSubscription' on the Pub/Sub project "
-                        "and POST /catalog/catalogs/%s/reprovision to recover.",
+                        "and POST /task/catalogs/%s to recover "
+                        "{task_type:catalog_provision,inputs:{operation:provision}}.",
                         catalog_id, type(eventing_err).__name__, eventing_err,
                         catalog_id,
                     )
@@ -293,7 +294,9 @@ class ProvisioningTask(TaskProtocol):
                                 f"({type(eventing_err).__name__}): {eventing_err}. "
                                 f"Grant pubsub.topics.attachSubscription on the "
                                 f"Pub/Sub project, then POST "
-                                f"/catalog/catalogs/{catalog_id}/reprovision."
+                                f"/task/catalogs/{catalog_id} with "
+                                f"{{\"task_type\":\"catalog_provision\","
+                                f"\"inputs\":{{\"operation\":\"provision\"}}}}."
                             ),
                         )
                     except Exception as log_err:  # pragma: no cover — best-effort

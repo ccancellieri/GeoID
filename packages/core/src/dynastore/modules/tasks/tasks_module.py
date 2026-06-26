@@ -18,6 +18,7 @@
 
 # dynastore/modules/tasks/tasks_module.py
 
+import base64
 import json
 import logging
 import os
@@ -149,6 +150,17 @@ CREATE INDEX IF NOT EXISTS idx_tasks_timestamp
 -- task_id lookup index: enables complete/fail/heartbeat without full partition scan
 CREATE INDEX IF NOT EXISTS idx_tasks_task_id
     ON {schema}.tasks (task_id);
+-- Listing indexes for the Tasks API (catalog scope, newest-first keyset pagination)
+CREATE INDEX IF NOT EXISTS idx_tasks_scope_listing
+    ON {schema}.tasks (catalog_id, timestamp DESC, task_id DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_catalog_type_ts
+    ON {schema}.tasks (catalog_id, type, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_collection
+    ON {schema}.tasks (catalog_id, collection_id, timestamp DESC)
+    WHERE collection_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_dead_letter
+    ON {schema}.tasks (catalog_id, timestamp DESC)
+    WHERE status = 'DEAD_LETTER';
 
 CREATE OR REPLACE FUNCTION {schema}.notify_task_ready()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -679,6 +691,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 cap_refresh = 30.0
                 sweep_interval = 60.0
                 sweep_min_age = 300.0
+                retention_sweep_interval = 86400.0
                 config_mgr = get_protocol(PlatformConfigsProtocol)
                 if config_mgr:
                     try:
@@ -691,6 +704,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                             cap_refresh = tasks_config.capability_publisher_refresh_seconds
                             sweep_interval = tasks_config.proactive_sweep_interval_seconds
                             sweep_min_age = tasks_config.proactive_sweep_min_age_seconds
+                            retention_sweep_interval = tasks_config.retention_sweep_interval_seconds
                     except Exception as e:
                         logger.warning(f"TasksModule: Failed to load TasksPluginConfig, defaulting to {poll_interval}s / hard_cap={hard_cap}: {e}")
 
@@ -881,6 +895,9 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                         min_age_s=sweep_min_age,
                         capability_ttl_s=cap_ttl,
                     )
+                )
+                supervisor.register(
+                    TaskRetentionService(interval_s=retention_sweep_interval)
                 )
                 # Async capability-sentinel refresh. Initial publish already ran
                 # synchronously above (before the supervisor starts) so
@@ -1285,6 +1302,99 @@ class ProactiveSweepService(PeriodicService):
             logger.warning("proactive_sweep: pass failed: %s", exc)
 
 
+class TaskRetentionService(PeriodicService):
+    """Leader-elected periodic service that enforces task retention policy.
+
+    Runs on a configurable cadence (default daily). On each tick it:
+    1. Purges COMPLETED/FAILED tasks older than ``terminal_task_ttl_days``.
+    2. Hard-deletes DEAD_LETTER tasks older than ``dlq_max_age_days``.
+    3. Emits a ``tasks.health_alert / dead_letter_overflow`` event when the
+       global DEAD_LETTER count exceeds ``dlq_alert_threshold``.
+
+    Only one pod runs each tick (LEADER_ONLY) to avoid duplicate DELETEs.
+    Skipped on ephemeral Cloud Run Jobs (SKIP_EPHEMERAL).  Config values are
+    read live inside tick() so hot-reload via TasksPluginConfig takes effect
+    on the next cadence without a pod restart.
+    """
+
+    name = "task_retention"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = "dynastore.task_retention"
+
+    def __init__(self, *, interval_s: float = 86400.0) -> None:
+        self.cadence_seconds = interval_s
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.maintenance import (
+            purge_completed_tasks,
+            purge_dead_letter_tasks,
+            get_task_statistics,
+        )
+        from dynastore.models.driver_context import DriverContext
+
+        _cfg: Optional[TasksPluginConfig] = None
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr:
+            try:
+                _raw = await config_mgr.get_config(
+                    TasksPluginConfig, ctx=DriverContext(db_resource=ctx.engine)
+                )
+                if isinstance(_raw, TasksPluginConfig):
+                    _cfg = _raw
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("task_retention: failed to load TasksPluginConfig: %s", exc)
+
+        ttl_days = _cfg.terminal_task_ttl_days if _cfg else 30
+        dlq_max_days = _cfg.dlq_max_age_days if _cfg else 90
+        dlq_threshold = _cfg.dlq_alert_threshold if _cfg else 100
+
+        try:
+            purged = await purge_completed_tasks(
+                ctx.engine, older_than=timedelta(days=ttl_days)
+            )
+            if purged:
+                logger.info("task_retention: purged %d terminal task(s)", purged)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("task_retention: terminal-task purge failed: %s", exc)
+
+        try:
+            archived = await purge_dead_letter_tasks(
+                ctx.engine, older_than=timedelta(days=dlq_max_days)
+            )
+            if archived:
+                logger.info("task_retention: purged %d stale DEAD_LETTER task(s)", archived)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("task_retention: DLQ age-cap purge failed: %s", exc)
+
+        try:
+            stats = await get_task_statistics(ctx.engine)
+            dlq_count = int(stats.get("DEAD_LETTER", 0))
+            if dlq_count > dlq_threshold:
+                logger.error(
+                    "task_retention: ALERT — DEAD_LETTER count %d exceeds threshold %d",
+                    dlq_count,
+                    dlq_threshold,
+                )
+                try:
+                    from dynastore.modules.catalog.event_service import emit_event  # noqa: PLC0415
+                    await emit_event(
+                        "tasks.health_alert",
+                        alert_type="dead_letter_overflow",
+                        tasks_dlq_count=dlq_count,
+                        threshold=dlq_threshold,
+                    )
+                except Exception as emit_exc:  # noqa: BLE001
+                    logger.warning(
+                        "task_retention: failed to emit tasks.health_alert: %s", emit_exc
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("task_retention: DLQ count check failed: %s", exc)
+
+
 async def _distinct_pending_capability_ids(
     engine: DbResource,
     schema: str,
@@ -1673,16 +1783,31 @@ async def list_tasks_for_catalog(
     limit: int = 20,
     offset: int = 0,
     kind: Optional[str] = None,
+    *,
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    asset_id: Optional[str] = None,
+    created_before: Optional[datetime] = None,
+    cursor: Optional[str] = None,
 ) -> List[Task]:
     """
     Lists tasks from a catalog's schema.
     Uses CatalogsProtocol to resolve the physical schema.
 
     Pass ``kind`` to narrow results to a specific task type (forwarded to
-    :func:`list_tasks`).
+    :func:`list_tasks`).  All additional keyword filters are forwarded as-is.
     """
     schema = await _resolve_catalog_schema(catalog_id, conn)
-    return await list_tasks(conn, schema, limit, offset, kind=kind)
+    return await list_tasks(
+        conn, schema, limit, offset, kind=kind,
+        status=status,
+        task_type=task_type,
+        collection_id=collection_id,
+        asset_id=asset_id,
+        created_before=created_before,
+        cursor=cursor,
+    )
 
 
 async def update_task_for_catalog(
@@ -1700,6 +1825,31 @@ async def update_task_for_catalog(
 # The `schema` parameter in these functions refers to the `catalog_id` column
 # value (e.g. catalog internal id "s_abc123" or the sentinel "system"), NOT the
 # PostgreSQL schema that hosts the table.  The table lives in `get_task_schema()`.tasks.
+
+async def get_active_task_by_dedup_key(
+    engine: DbResource, schema: str, dedup_key: str
+) -> Optional[Dict[str, Any]]:
+    """Return ``{task_id, status}`` of the non-terminal task carrying
+    ``dedup_key`` in ``schema`` (catalog_id column), or None.
+
+    Mirrors the dedup pre-check inside :func:`create_task`.  The spawn API uses
+    it to return the existing :class:`TaskRef` on a dedup hit, so a retried
+    spawn is idempotent instead of failing with 409.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        SELECT task_id, status FROM {task_schema}.tasks
+        WHERE dedup_key = :dedup_key
+          AND catalog_id = :catalog_id
+          AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')
+        ORDER BY timestamp DESC
+        LIMIT 1;
+    """
+    async with managed_transaction(engine) as conn:
+        return await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
+            conn, dedup_key=dedup_key, catalog_id=schema
+        )
+
 
 async def create_task(
     engine: DbResource,
@@ -1919,31 +2069,189 @@ async def get_task_by_id_unscoped(
     return Task.model_validate(task_dict) if task_dict else None
 
 
+def encode_cursor(task: "Task") -> str:
+    """Encode a keyset cursor from the last row of a page.
+
+    The cursor is an opaque, URL-safe base64 string encoding
+    ``{timestamp_iso}|{task_id}``.  Pass it as ``?cursor=`` on the next
+    request to resume listing from the row after this one.
+    """
+    raw = f"{task.timestamp.isoformat()}|{task.jobID}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def decode_cursor(cursor: str) -> tuple:
+    """Decode a keyset cursor produced by :func:`encode_cursor`.
+
+    Returns a ``(datetime, uuid.UUID)`` tuple for use in the keyset
+    WHERE clause: ``(timestamp, task_id) < (:c_ts, :c_id)``.
+
+    Raises ``ValueError`` on malformed input so the route layer can
+    surface a 422 to the caller.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        ts_str, task_id_str = raw.rsplit("|", 1)
+        return datetime.fromisoformat(ts_str), uuid.UUID(task_id_str)
+    except Exception as exc:
+        raise ValueError(f"Invalid cursor: {exc}") from exc
+
+
 async def list_tasks(
     conn: DbResource,
     schema: str,
     limit: int = 20,
     offset: int = 0,
     kind: Optional[str] = None,
+    *,
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    asset_id: Optional[str] = None,
+    created_before: Optional[datetime] = None,
+    cursor: Optional[str] = None,
 ) -> List[Task]:
-    """Lists tasks filtered by catalog_id, ordered by creation date.
+    """Lists tasks filtered by catalog_id, ordered newest-first.
 
-    Pass ``kind`` to narrow results to a specific task type (e.g. ``'process'``
-    for OGC Process jobs only).  When ``None`` all types are returned — the
-    admin Tasks API relies on this full view.
+    Existing positional callers (``kind`` as keyword, ``offset`` for
+    offset-based pagination) are unaffected — all new parameters are
+    keyword-only with defaults.
+
+    Keyset pagination: when ``cursor`` is provided (a value from
+    :func:`encode_cursor`), offset is ignored and a ``(timestamp, task_id)``
+    ``<`` predicate replaces OFFSET, giving stable pagination on
+    ``timestamp DESC, task_id DESC``.
+
+    The route layer retrieves ``limit+1`` rows by passing ``limit+1`` to
+    detect whether a next page exists, then slices to ``limit`` and encodes
+    :func:`encode_cursor` on the (limit+1)-th row if present.
+
+    Args:
+        conn:           DB connection or engine.
+        schema:         ``catalog_id`` column value (physical schema id, or
+                        'system'/'platform' sentinels).
+        limit:          Max rows to return.  Caller passes ``limit+1`` to
+                        detect next-page existence.
+        offset:         Deprecated for keyset callers; kept for offset-based
+                        back-compat (processes_service).
+        kind:           Filter by the ``type`` column ('task' or 'process').
+        status:         Filter by task status string.
+        task_type:      Filter by the ``task_type`` column.
+        collection_id:  Filter by the ``collection_id`` column.
+        asset_id:       Filter by ``inputs->>'asset_id'`` JSONB extraction.
+        created_before: Filter rows with ``timestamp < created_before``.
+        cursor:         Opaque keyset cursor from :func:`encode_cursor`.
     """
     task_schema = get_task_schema()
+    clauses = ["catalog_id = :catalog_id"]
+    params: Dict[str, Any] = {"catalog_id": schema, "limit": limit}
+
     if kind is not None:
-        sql = f'SELECT * FROM {task_schema}.tasks WHERE catalog_id = :catalog_id AND type = :kind ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
-        task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, catalog_id=schema, limit=limit, offset=offset, kind=kind
+        clauses.append("type = :kind")
+        params["kind"] = kind
+    if status is not None:
+        clauses.append("status = :status")
+        params["status"] = status
+    if task_type is not None:
+        clauses.append("task_type = :task_type")
+        params["task_type"] = task_type
+    if collection_id is not None:
+        clauses.append("collection_id = :collection_id")
+        params["collection_id"] = collection_id
+    if asset_id is not None:
+        clauses.append("inputs->>'asset_id' = :asset_id")  # nosec — parameterised
+        params["asset_id"] = asset_id
+    if created_before is not None:
+        clauses.append("timestamp < :created_before")
+        params["created_before"] = created_before
+
+    where = " AND ".join(clauses)
+
+    if cursor is not None:
+        c_ts, c_id = decode_cursor(cursor)
+        params["c_ts"] = c_ts
+        params["c_id"] = c_id
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"WHERE {where} AND (timestamp, task_id) < (:c_ts, :c_id) "
+            f"ORDER BY timestamp DESC, task_id DESC LIMIT :limit;"
         )
     else:
-        sql = f'SELECT * FROM {task_schema}.tasks WHERE catalog_id = :catalog_id ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
-        task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, catalog_id=schema, limit=limit, offset=offset
+        params["offset"] = offset
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"WHERE {where} "
+            f"ORDER BY timestamp DESC, task_id DESC LIMIT :limit OFFSET :offset;"
         )
-    return [Task.model_validate(t) for t in task_dicts]
+
+    task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+        conn, **params
+    )
+    return [Task.model_validate(t) for t in (task_dicts or [])]
+
+
+async def list_tasks_system(
+    conn: DbResource,
+    limit: int = 20,
+    *,
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    kind: Optional[str] = None,
+    asset_id: Optional[str] = None,
+    created_before: Optional[datetime] = None,
+    cursor: Optional[str] = None,
+) -> List[Task]:
+    """Lists tasks whose ``catalog_id`` is one of the system sentinels.
+
+    Covers ``catalog_id IN ('system', 'platform')`` — the two sentinels used
+    for cross-tenant platform work.  Accepts the same keyset / filter params
+    as :func:`list_tasks` (except ``collection_id`` which is not meaningful
+    at system scope).
+
+    The route layer passes ``limit+1`` to detect next-page existence.
+    """
+    task_schema = get_task_schema()
+    clauses = ["catalog_id IN ('system', 'platform')"]
+    params: Dict[str, Any] = {"limit": limit}
+
+    if status is not None:
+        clauses.append("status = :status")
+        params["status"] = status
+    if task_type is not None:
+        clauses.append("task_type = :task_type")
+        params["task_type"] = task_type
+    if kind is not None:
+        clauses.append("type = :kind")
+        params["kind"] = kind
+    if asset_id is not None:
+        clauses.append("inputs->>'asset_id' = :asset_id")  # nosec — parameterised
+        params["asset_id"] = asset_id
+    if created_before is not None:
+        clauses.append("timestamp < :created_before")
+        params["created_before"] = created_before
+
+    where = " AND ".join(clauses)
+
+    if cursor is not None:
+        c_ts, c_id = decode_cursor(cursor)
+        params["c_ts"] = c_ts
+        params["c_id"] = c_id
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"WHERE {where} AND (timestamp, task_id) < (:c_ts, :c_id) "
+            f"ORDER BY timestamp DESC, task_id DESC LIMIT :limit;"
+        )
+    else:
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"WHERE {where} "
+            f"ORDER BY timestamp DESC, task_id DESC LIMIT :limit;"
+        )
+
+    task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+        conn, **params
+    )
+    return [Task.model_validate(t) for t in (task_dicts or [])]
 
 
 # --- Synchronous Wrappers for Task Runners ---

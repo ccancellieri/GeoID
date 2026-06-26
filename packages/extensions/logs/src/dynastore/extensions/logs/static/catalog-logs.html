@@ -4,7 +4,7 @@
   Calls canonical module REST surfaces directly from the browser:
     /logs/catalogs/{cat}              (always — LogService is core)
     /events/catalogs/{cat}/events     (only if EventsProtocol is mounted)
-    /tasks/catalogs/{cat}             (only if TasksProtocol is mounted)
+    /task/catalogs/{cat}              (only if TasksProtocol is mounted)
 
   The server-side handler injects a `__CATALOG_LOGS_CTX__` JSON block
   listing which canonical roots are available on the current deployment
@@ -73,7 +73,7 @@
   <article class="glass-panel p-6 rounded-xl hidden" data-panel="tasks">
     <h3 class="text-sm font-semibold text-white mb-3">
       <i class="fa-solid fa-list-check mr-2"></i>Tasks
-      <span class="text-xs text-slate-500 ml-2">/tasks/catalogs/&hellip;</span>
+      <span class="text-xs text-slate-500 ml-2">/task/catalogs/&hellip;</span>
     </h3>
     <div id="catalog-tasks-table" class="text-xs text-slate-300"></div>
   </article>
@@ -227,7 +227,7 @@ __CATALOG_LOGS_CTX__
     if (ctx.modules.tasks) {
       await loadPanel(
         document.getElementById("catalog-tasks-table"),
-        "/tasks/catalogs/" + encodeURIComponent(cat),
+        "/task/catalogs/" + encodeURIComponent(cat),
         ["task_id", "task_type", "status", "created_at"],
         d => Array.isArray(d) ? d : (d.tasks || d.items || []),
       );

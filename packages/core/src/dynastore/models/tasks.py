@@ -399,3 +399,112 @@ class Task(TaskBase):
     def task_id(self) -> UUID:
         """Backward compatibility alias for jobID."""
         return self.jobID
+
+
+# ---------------------------------------------------------------------------
+# Tasks API request / response DTOs
+# ---------------------------------------------------------------------------
+
+
+class SpawnTaskRequest(BaseModel):
+    """Request body for the generic task-spawn endpoints.
+
+    Scope identifiers (catalog_id, collection_id) are NEVER accepted in
+    the body — they are always derived from path parameters so the route
+    layer can enforce tenant isolation without trusting the caller.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "task_type": "catalog_provision",
+                    "inputs": {"operation": "provision", "force": False},
+                },
+            ]
+        }
+    )
+
+    task_type: str = Field(
+        ...,
+        description="Registered task type identifier (e.g. 'catalog_provision', "
+                    "'reindex'). Unknown task types are rejected with HTTP 404.",
+    )
+    inputs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Free-form inputs forwarded to the task runner. "
+                    "Path-derived ids (catalog_id, collection_id) are injected "
+                    "by the route layer and must NOT be included here.",
+    )
+    dedup_key: Optional[str] = Field(
+        default=None,
+        description="Optional idempotency token. If a non-terminal task with "
+                    "the same dedup_key and tenant already exists, the spawn "
+                    "returns the existing TaskRef instead of creating a duplicate.",
+    )
+    max_retries: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Per-row retry budget override. When absent the platform "
+                    "default (column DEFAULT = 3) applies.",
+    )
+
+
+class TaskRef(BaseModel):
+    """Lightweight reference returned (HTTP 202) after a successful spawn.
+
+    Callers poll ``status_url`` to track progress without needing to
+    reconstruct the scoped task URL themselves.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "task_id": "018f1a2b-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+                    "status": "PENDING",
+                    "status_url": "/task/catalogs/my-catalog/tasks/018f1a2b-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+                }
+            ]
+        }
+    )
+
+    task_id: UUID = Field(..., description="UUID of the newly created task row.")
+    status: str = Field(..., description="Initial status of the task (typically 'PENDING').")
+    status_url: str = Field(
+        ...,
+        description="Absolute or root-relative URL of the scoped get-by-id "
+                    "endpoint for this task. Callers poll this URL to observe "
+                    "status transitions.",
+    )
+
+
+class TaskPage(BaseModel):
+    """Paginated list of tasks.
+
+    ``next_cursor`` is an opaque keyset token.  Pass it as ``?cursor=`` on
+    the next request to retrieve the following page.  ``None`` means the
+    current page is the last one.
+    """
+
+    items: List[Task] = Field(default_factory=list)
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Keyset pagination token for the next page; None on the last page.",
+    )
+
+
+class RequeueResult(BaseModel):
+    """Result of a single dead-letter requeue operation."""
+
+    task_id: UUID = Field(..., description="UUID of the requeued task.")
+    requeued: bool = Field(
+        ...,
+        description="True when the task was found in a requeueable state "
+                    "(DEAD_LETTER or FAILED) and successfully reset to PENDING. "
+                    "False when the task was not found or was not in a requeueable state.",
+    )
+    detail: Optional[str] = Field(
+        default=None,
+        description="Human-readable explanation when requeued=False.",
+    )

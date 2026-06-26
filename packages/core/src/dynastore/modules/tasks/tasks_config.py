@@ -136,6 +136,50 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    terminal_task_ttl_days: Mutable[int] = Field(
+        default=30,
+        ge=1,
+        description=(
+            "Days to retain COMPLETED and FAILED tasks before the retention "
+            "sweep deletes them. Applies to all tenants. Increase to keep "
+            "longer audit trails; decrease to bound partition growth. "
+            "Changes are picked up on the next retention tick (no restart)."
+        ),
+    )
+
+    dlq_max_age_days: Mutable[int] = Field(
+        default=90,
+        ge=1,
+        description=(
+            "Days to retain DEAD_LETTER tasks before the retention sweep "
+            "hard-deletes them. Rows older than this cutoff have exhausted "
+            "operator intervention time and are purged. "
+            "Changes are picked up on the next retention tick (no restart)."
+        ),
+    )
+
+    dlq_alert_threshold: Mutable[int] = Field(
+        default=100,
+        ge=0,
+        description=(
+            "Emit a health alert (tasks.health_alert / dead_letter_overflow) "
+            "when the platform-wide DEAD_LETTER task count exceeds this value. "
+            "Set to 0 to alert on any DLQ entry. "
+            "Changes are picked up on the next retention tick (no restart)."
+        ),
+    )
+
+    retention_sweep_interval_seconds: Mutable[float] = Field(
+        default=86400.0,  # daily
+        ge=60.0,
+        description=(
+            "Interval (seconds) between task-retention passes: terminal-task "
+            "purge, DLQ age-cap deletion, and DLQ count health-alert. "
+            "Read at startup; changing requires a pod restart to take effect "
+            "(same model as proactive_sweep_interval_seconds)."
+        ),
+    )
+
     @model_validator(mode="after")
     def _enforce_refresh_le_half_ttl(self) -> "TasksPluginConfig":
         if self.capability_publisher_refresh_seconds > self.capability_publisher_ttl_seconds / 2:

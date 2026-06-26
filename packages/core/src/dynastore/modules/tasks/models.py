@@ -33,6 +33,10 @@ from dynastore.models.tasks import (  # noqa: F401 — re-export
     TaskCreate,
     TaskUpdate,
     Task,
+    SpawnTaskRequest,
+    TaskRef,
+    TaskPage,
+    RequeueResult,
 )
 
 from dynastore.modules.db_config.query_executor import DbResource
@@ -55,6 +59,11 @@ __all__ = [
     "TaskCreate",
     "TaskUpdate",
     "Task",
+    # Tasks API request/response DTOs (re-exported from dynastore.models.tasks)
+    "SpawnTaskRequest",
+    "TaskRef",
+    "TaskPage",
+    "RequeueResult",
     # runtime types defined in this module
     "PermanentTaskFailure",
     "DEFERRED_COMPLETION",

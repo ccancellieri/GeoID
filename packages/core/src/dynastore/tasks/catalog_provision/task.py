@@ -199,6 +199,16 @@ class CatalogProvisionTask(TaskProtocol):
                 catalog_id, len(groups),
             )
 
+        # On every provision run, reset non-satisfied checklist steps to
+        # 'pending' and flip the catalog status to 'provisioning' so the
+        # status transitions monotonically (failed → provisioning → ready)
+        # rather than staying on 'failed' while new steps complete.
+        # With force=True every step is reset unconditionally (full replay).
+        # When the checklist is empty or absent (no active provisioners, fresh
+        # create without a checklist row) this is a no-op — reset returns {}.
+        if operation == "provision":
+            await catalogs.reset_checklist_for_reprovision(catalog_id, force=force)
+
         # Reprovision only what failed (#2395). For a ``provision`` run that is
         # not a forced full replay, drop provisioners whose checklist step is
         # already satisfied (``complete`` / ``skipped``) so a reprovision

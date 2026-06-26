@@ -23,8 +23,6 @@ through the preset registered in ``presets/__init__.py`` and forwards them
 to ``PermissionProtocol``.  This file never calls ``register_policy``
 directly.
 
-Two concerns:
-
 ``catalog_status_read``
     ALLOW ``GET`` on catalog/collection status views, gated by the
     ``catalog_membership_required`` condition. The status payload exposes
@@ -38,10 +36,9 @@ Two concerns:
     The 404-on-hidden enforcement in the route handler is the second layer
     (a member of catalog A cannot probe catalog B's status).
 
-``catalog_status_admin``
-    ALLOW mutations (reprovision, dead-letter list/requeue) for
-    catalog-admin-tier and above, gated by the ``catalog_admin_required``
-    condition.  Policy id and shape mirror ``admin_catalog_access``.
+Mutation surfaces (reprovision, dead-letter list/requeue) have moved to the
+unified Tasks API and are governed by the ``tasks_admin`` /
+``tasks_system_admin`` policies registered by the tasks extension.
 """
 from typing import List, Optional
 
@@ -74,26 +71,6 @@ def catalog_status_policies() -> List[Policy]:
                 Condition(type="catalog_membership_required", config={}),
             ],
         ),
-        Policy(
-            id="catalog_status_admin",
-            description=(
-                "Per-catalog admin access for catalog_status mutation surfaces "
-                "(reprovision, dead-letter list and requeue). Gated by the "
-                "catalog_admin_required condition so only catalog-tier admins "
-                "and above may trigger recovery operations."
-            ),
-            actions=["GET", "POST"],
-            resources=[
-                r"^/catalog/catalogs/[^/]+/(reprovision|dead-letter)(/.*)?$",
-            ],
-            effect="ALLOW",
-            conditions=[
-                Condition(
-                    type="catalog_admin_required",
-                    config={"required_roles": [IamRolesConfig().admin_role_name]},
-                )
-            ],
-        ),
     ]
 
 
@@ -115,20 +92,13 @@ def catalog_status_role_bindings(
     read status (the maintainer's "not just admins" requirement), and only the
     base role is guaranteed to be in every member's effective set.
 
-    ``catalog_status_admin`` is bound to sysadmin + admin so both privileged
-    tiers reach the mutation routes; the ``catalog_admin_required`` condition
-    then scopes them to the catalogs they administer (mirrors how
-    ``admin_catalog_access`` is wired in the admin extension).
+    Mutation surfaces (reprovision, dead-letter) have moved to the tasks
+    extension and are governed by ``tasks_admin`` / ``tasks_system_admin``.
     """
     cfg = IamRolesConfig()
-    sysadmin_role_name = sysadmin_role_name or cfg.sysadmin_role_name
-    admin_role_name = admin_role_name or cfg.admin_role_name
     return [
         # Read surface: reachable by every request via the universal base
         # role; catalog_membership_required is the actual access control and
         # fails closed for anonymous callers.
         Role(name=cfg.anonymous_role_name, policies=["catalog_status_read"]),
-        # Mutation surface: sysadmin and admin satisfy catalog_admin_required.
-        Role(name=sysadmin_role_name, policies=["catalog_status_admin"]),
-        Role(name=admin_role_name, policies=["catalog_status_admin"]),
     ]

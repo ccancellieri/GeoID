@@ -72,6 +72,7 @@ from dynastore.modules.processes.inventory import (
 from dynastore.models.auth_models import SYSTEM_USER_ID
 from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 from dynastore.extensions.tools.url import enforce_https  # noqa: E402
+from dynastore.tasks import get_task_config, task_kind as _task_kind
 
 
 logger = logging.getLogger(__name__)
@@ -673,6 +674,13 @@ async def execute_process(
     # never acquire DB resources or emit events.
     process = await _lookup_process_or_404(process_id)
     _validate_process_scope_or_raise(process, catalog_id=None, collection_id=None)
+    # Defence-in-depth: ensure the task registry agrees this is a process.
+    _cfg = get_task_config(process_id)
+    if _cfg is not None and _task_kind(_cfg) != "process":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{process_id}' is not a process; use the Tasks API.",
+        )
 
     principal = getattr(request.state, "principal", None)
     caller_id = str(principal.id) if principal else SYSTEM_USER_ID
@@ -716,6 +724,13 @@ async def execute_process_catalog(
     """
     process = await _lookup_process_or_404(process_id)
     _validate_process_scope_or_raise(process, catalog_id=catalog_id, collection_id=None)
+    # Defence-in-depth: ensure the task registry agrees this is a process.
+    _cfg = get_task_config(process_id)
+    if _cfg is not None and _task_kind(_cfg) != "process":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{process_id}' is not a process; use the Tasks API.",
+        )
     execution_request = _inject_path_into_inputs(
         execution_request, catalog_id=catalog_id, collection_id=None
     )
@@ -765,6 +780,13 @@ async def execute_process_collection(
     _validate_process_scope_or_raise(
         process, catalog_id=catalog_id, collection_id=collection_id
     )
+    # Defence-in-depth: ensure the task registry agrees this is a process.
+    _cfg = get_task_config(process_id)
+    if _cfg is not None and _task_kind(_cfg) != "process":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{process_id}' is not a process; use the Tasks API.",
+        )
     execution_request = _inject_path_into_inputs(
         execution_request, catalog_id=catalog_id, collection_id=collection_id
     )
@@ -933,6 +955,11 @@ async def _get_job_internal(job_id: uuid.UUID, catalog_id: str, conn: AsyncConne
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found in schema '{schema}'.",
         )
+    if task.type != "process":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found.",
+        )
     return task
 
 
@@ -962,6 +989,11 @@ async def get_job_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found.",
         )
+    if task.type != "process":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found.",
+        )
     si = _task_to_status_info(task, request)
     return JSONResponse(
         content=_localize_status_info(si, language),
@@ -983,6 +1015,11 @@ async def get_job_results(
     """
     task = await tasks_module.get_task_by_id_unscoped(conn, job_id)
     if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found.",
+        )
+    if task.type != "process":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found.",
@@ -1191,11 +1228,17 @@ async def list_jobs_collection(
     conn: AsyncConnection = Depends(get_async_connection),
     language: str = Depends(get_language),
 ) -> JSONResponse:
-    """Lists jobs (Collection context). Filters by collection_id."""
+    """Lists jobs (Collection context). Filters by collection_id at the DB layer."""
     schema = await _resolve_catalog_schema(catalog_id, conn)
-    all_tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
-    filtered = [t for t in all_tasks if getattr(t, "collection_id", None) == collection_id]
-    jobs = [_task_to_status_info(t, request) for t in filtered]
+    tasks = await tasks_module.list_tasks(
+        conn,
+        schema=schema,
+        limit=limit,
+        offset=offset,
+        kind="process",
+        collection_id=collection_id,
+    )
+    jobs = [_task_to_status_info(t, request) for t in tasks]
     links = [
         models.Link(
             href=_external_url(request.url),
@@ -1204,7 +1247,7 @@ async def list_jobs_collection(
             title="This document",
         )
     ]
-    if len(filtered) == limit:
+    if len(tasks) == limit:
         next_url = str(request.url.replace_query_params(offset=offset + limit, limit=limit))
         links.append(
             models.Link(

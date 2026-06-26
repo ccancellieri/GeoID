@@ -41,8 +41,8 @@ import dynastore.extensions.tasks.tasks_service as svc
 from dynastore.models.tasks import Task, TaskStatusEnum
 
 
-def _task(status: TaskStatusEnum, schema_name: str) -> Task:
-    return Task(task_type="collection_hard_delete", status=status, schema_name=schema_name)
+def _task(status: TaskStatusEnum, catalog_id: str) -> Task:
+    return Task(task_type="collection_hard_delete", status=status, catalog_id=catalog_id)
 
 
 @pytest.mark.asyncio
