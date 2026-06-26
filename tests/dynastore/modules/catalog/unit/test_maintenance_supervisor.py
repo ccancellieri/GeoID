@@ -74,11 +74,13 @@ from dynastore.modules.catalog.maintenance_supervisor import (
     _STALE_AFTER_SECONDS,
     _SUPERSEDED_CRON_JOBS,
     _SUPERSEDED_TENANT_LOG_PREFIX,
+    _run_health_alert,
     _run_iam_prune,
     _run_system_logs_prune,
     _run_tenant_logs_prune,
     build_supervisor_config,
     register_supervisor_jobs,
+    HealthAlertConfig,
 )
 
 
@@ -547,6 +549,8 @@ async def test_register_supervisor_jobs_upserts_all_expected_jobs():
 
         await register_supervisor_jobs(engine)
 
+    from dynastore.modules.catalog.maintenance_supervisor import JOB_HEALTH_ALERT
+
     job_names = [name for name, _ in upserted]
     assert sorted(job_names) == sorted([
         JOB_TENANT_LOGS_PRUNE,
@@ -559,6 +563,7 @@ async def test_register_supervisor_jobs_upserts_all_expected_jobs():
         JOB_EVENTS_RETENTION,
         JOB_STORAGE_PARTITION_CREATE,
         JOB_STORAGE_RETENTION,
+        JOB_HEALTH_ALERT,
     ])
 
     cadence_map = dict(upserted)
@@ -595,7 +600,8 @@ async def test_tenant_logs_prune_queries_each_active_schema():
         def _dql_factory(sql, **kwargs):
             inst = MagicMock()
             call_num[0] += 1
-            if "physical_schema" in sql:
+            if "catalog.catalogs" in sql:
+                # Schema listing query
                 inst.execute = AsyncMock(return_value=catalog_rows)
             else:
                 # Track which schemas we DELETE from
@@ -609,8 +615,8 @@ async def test_tenant_logs_prune_queries_each_active_schema():
         await _run_tenant_logs_prune(conn)
 
     # Both schemas should have been hit
-    assert "s_abc00001" in schemas_deleted or "s_abc00001" in " ".join(
-        str(c) for c in MockDQL.call_args_list
+    assert "s_abc00001" in schemas_deleted, (
+        "s_abc00001 should have been pruned"
     )
 
 
@@ -884,7 +890,7 @@ async def test_tenant_logs_prune_continues_on_per_schema_error(caplog):
     ):
         def _dql_factory(sql, **kwargs):
             inst = MagicMock()
-            if "physical_schema" in sql:
+            if "catalog.catalogs" in sql:
                 # Schema listing query
                 inst.execute = AsyncMock(return_value=schemas)
             else:
@@ -921,5 +927,182 @@ async def test_tenant_logs_prune_continues_on_per_schema_error(caplog):
     assert dropped_warnings, (
         "Expected a WARNING log message mentioning the dropped schema 's_dropped'"
     )
+
+
+# ---------------------------------------------------------------------------
+# HealthAlertConfig: error_streak_threshold must NOT exist
+# ---------------------------------------------------------------------------
+
+
+def test_health_alert_config_has_no_error_streak_threshold():
+    """HealthAlertConfig must not expose error_streak_threshold.
+
+    The maintenance_schedule table stores only last_status/last_error per job
+    (no per-run history), so a consecutive-error counter cannot be implemented
+    cheaply.  The field was removed to avoid a false promise: callers cannot
+    tune a threshold that was never enforced.
+    """
+    assert not hasattr(HealthAlertConfig.model_fields, "error_streak_threshold"), (
+        "HealthAlertConfig must not declare error_streak_threshold — "
+        "the table has no consecutive-error counter column."
+    )
+    cfg = HealthAlertConfig()
+    assert not hasattr(cfg, "error_streak_threshold")
+
+
+def test_health_alert_config_has_pending_age_and_dlq_fields():
+    """HealthAlertConfig still exposes the two fields that are actually used."""
+    cfg = HealthAlertConfig()
+    assert cfg.pending_age_seconds == 3600
+    assert cfg.dead_letter_threshold == 100
+
+
+# ---------------------------------------------------------------------------
+# _run_health_alert: alerts on ANY error in the past hour (not a streak)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_health_alert_alerts_on_single_error(caplog):
+    """A single job with last_status='error' in the past hour must trigger an alert.
+
+    The check is 'any error in the past hour', not a consecutive-failure count.
+    """
+    import logging
+
+    conn = AsyncMock()
+    emitted_events: list[dict] = []
+
+    # DQLQuery calls in order:
+    # 1. error_jobs SELECT → one row with last_status='error'
+    # 2. stale_pending COUNT → 0
+    # 3. tasks DEAD_LETTER COUNT → 0
+    # 4. events DEAD_LETTER COUNT → 0
+    call_num = [0]
+    error_row = {"job_name": "tenant_logs_prune", "last_error": "boom", "last_run_at": "2026-06-26"}
+
+    def _dql_factory(sql, **kwargs):
+        inst = MagicMock()
+        call_idx = call_num[0]
+        call_num[0] += 1
+        if call_idx == 0:
+            inst.execute = AsyncMock(return_value=[error_row])
+        else:
+            inst.execute = AsyncMock(return_value=0)
+        return inst
+
+    async def _fake_emit(event_type, **kw):
+        emitted_events.append({"event_type": event_type, **kw})
+
+    # emit_event is imported lazily inside _run_health_alert; patch via sys.modules.
+    fake_event_service = MagicMock(emit_event=AsyncMock(side_effect=_fake_emit))
+    with (
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.load_health_alert_config",
+            new=AsyncMock(return_value=HealthAlertConfig()),
+        ),
+        patch.dict("sys.modules", {"dynastore.modules.catalog.event_service": fake_event_service}),
+        caplog.at_level(logging.ERROR, logger="dynastore.modules.catalog.maintenance_supervisor"),
+    ):
+        alerts = await _run_health_alert(conn)
+
+    assert alerts >= 1, "Expected at least 1 alert for a single error job"
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("tenant_logs_prune" in r.message for r in error_logs), (
+        "Expected an ERROR log mentioning the failing job name"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_health_alert_emits_job_error_alert_type():
+    """_run_health_alert must emit alert_type='job_error' (not 'job_error_streak')."""
+    conn = AsyncMock()
+    emitted_events: list[dict] = []
+    error_row = {"job_name": "iam_prune", "last_error": "timeout", "last_run_at": "2026-06-26"}
+
+    call_num = [0]
+
+    def _dql_factory(sql, **kwargs):
+        inst = MagicMock()
+        call_idx = call_num[0]
+        call_num[0] += 1
+        if call_idx == 0:
+            inst.execute = AsyncMock(return_value=[error_row])
+        else:
+            inst.execute = AsyncMock(return_value=0)
+        return inst
+
+    async def _fake_emit(event_type, **kw):
+        emitted_events.append({"event_type": event_type, **kw})
+
+    fake_event_service = MagicMock(emit_event=AsyncMock(side_effect=_fake_emit))
+    with (
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.load_health_alert_config",
+            new=AsyncMock(return_value=HealthAlertConfig()),
+        ),
+        patch.dict("sys.modules", {"dynastore.modules.catalog.event_service": fake_event_service}),
+    ):
+        await _run_health_alert(conn)
+
+    job_error_events = [e for e in emitted_events if e.get("alert_type") == "job_error"]
+    assert job_error_events, (
+        "Expected an emitted event with alert_type='job_error'; "
+        f"got: {[e.get('alert_type') for e in emitted_events]}"
+    )
+    streak_events = [e for e in emitted_events if e.get("alert_type") == "job_error_streak"]
+    assert not streak_events, (
+        "alert_type='job_error_streak' must not be emitted — field was removed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_health_alert_no_alerts_when_no_errors():
+    """_run_health_alert returns 0 when no jobs are in error and counts are below threshold."""
+    conn = AsyncMock()
+
+    def _dql_factory(sql, **kwargs):
+        inst = MagicMock()
+        inst.execute = AsyncMock(return_value=0)
+        return inst
+
+    with (
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.load_health_alert_config",
+            new=AsyncMock(return_value=HealthAlertConfig()),
+        ),
+    ):
+        # First DQLQuery call (error_jobs) must return empty list
+        call_num = [0]
+
+        def _dql_factory2(sql, **kwargs):
+            inst = MagicMock()
+            call_idx = call_num[0]
+            call_num[0] += 1
+            if call_idx == 0:
+                inst.execute = AsyncMock(return_value=[])  # no error jobs
+            else:
+                inst.execute = AsyncMock(return_value=0)
+            return inst
+
+        with patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory2,
+        ):
+            alerts = await _run_health_alert(conn)
+
+    assert alerts == 0, f"Expected 0 alerts, got {alerts}"
 
 

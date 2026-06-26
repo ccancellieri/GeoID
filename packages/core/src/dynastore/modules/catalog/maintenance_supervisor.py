@@ -84,15 +84,6 @@ class HealthAlertConfig(PluginConfig):
 
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "catalog")
 
-    error_streak_threshold: Mutable[int] = Field(
-        default=3,
-        ge=1,
-        description=(
-            "Number of consecutive errors before alerting on a maintenance job. "
-            "Default: 3 (alert after 3 consecutive failures)."
-        ),
-    )
-
     pending_age_seconds: Mutable[int] = Field(
         default=3600,
         ge=60,
@@ -666,7 +657,10 @@ async def _run_health_alert(conn: Any) -> int:
     schema = _TASKS_SCHEMA
     cfg = await load_health_alert_config()
 
-    # 1. Check for sustained errors in maintenance jobs
+    # 1. Check for any maintenance job whose last recorded run ended in error
+    #    within the past hour.  The schedule table stores only the most-recent
+    #    status per job (no per-run history), so the check is "any error in the
+    #    past hour", not a consecutive-failure count.
     error_jobs = await DQLQuery(
         """
         SELECT job_name, last_error, last_run_at
@@ -691,7 +685,7 @@ async def _run_health_alert(conn: Any) -> int:
             from dynastore.modules.catalog.event_service import emit_event
             await emit_event(
                 "maintenance.health_alert",
-                alert_type="job_error_streak",
+                alert_type="job_error",
                 job_errors=[
                     {"job_name": j["job_name"], "last_error": j["last_error"]}
                     for j in error_jobs
