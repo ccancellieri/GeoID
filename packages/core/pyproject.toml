@@ -65,13 +65,14 @@ dependencies = [
 #   dynastore-module-cache        — `cache`.  See #2465.
 #   dynastore-module-storage-iceberg — `storage_iceberg`.  See #2465.
 #   dynastore-module-storage-duckdb  — `storage_duckdb`.  See #2465.
+#   dynastore-module-gdal            — `gdal`.  See #2465.
+#   dynastore-module-tiles           — `tiles`.  See #2465.
+#   dynastore-module-crs             — `crs`.  See #2465.
 # ============================================================================
 [project.entry-points."dynastore.modules"]
 tasks = "dynastore.modules.tasks.tasks_module:TasksModule"
 proxy = "dynastore.modules.proxy.proxy_module:ProxyModule"
-gdal = "dynastore.modules.gdal.gdal_module:GdalModule"
 catalog = "dynastore.modules.catalog.catalog_module:CatalogModule"
-tiles = "dynastore.modules.tiles.tiles_module:TilesModule"
 styles = "dynastore.modules.styles.styles_module:StylesModule"
 moving_features = "dynastore.modules.moving_features.mf_module:MovingFeaturesModule"
 local_upload = "dynastore.modules.local.local_upload:LocalUploadModule"
@@ -79,7 +80,6 @@ connected_systems = "dynastore.modules.connected_systems.ddl:ConnectedSystemsMod
 db_config = "dynastore.modules.db_config.db_config_service:DBConfigModule"
 iam = "dynastore.modules.iam.module:IamModule"
 db = "dynastore.modules.db.db_service:DBService"
-crs = "dynastore.modules.crs.crs_module:CRSModule"
 task_event_driver = "dynastore.modules.tasks.event_driver:TaskEventDriver"
 notebooks = "dynastore.modules.notebooks.notebooks_module:NotebooksModule"
 stac = "dynastore.modules.stac.module:StacModule"

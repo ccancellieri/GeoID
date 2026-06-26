@@ -41,6 +41,9 @@ dynastore-module-gcp = { workspace = true }
 dynastore-module-cache = { workspace = true }
 dynastore-module-storage-iceberg = { workspace = true }
 dynastore-module-storage-duckdb = { workspace = true }
+dynastore-module-gdal = { workspace = true }
+dynastore-module-tiles = { workspace = true }
+dynastore-module-crs = { workspace = true }
 dynastore-ext-tasks = { workspace = true }
 dynastore-ext-stats = { workspace = true }
 dynastore-ext-edr = { workspace = true }
@@ -102,11 +105,11 @@ module_db_config = ["sqlalchemy", "geoalchemy2", "h3>=4.4.2", "s2sphere>=0.2.5",
 module_iam = ["pydantic[email]", "PyJWT>=2.0.0", "tenacity>=8.0"]
 module_local = ["python-multipart>=0.0.27"]
 module_db = ["dynastore[db_async]", "sqlalchemy[asyncio]", "asyncpg"]
-module_crs = ["dynastore[geospatial_core]", "pyproj>=3.0.0"]
+module_crs = ["dynastore[geospatial_core]", "pyproj>=3.0.0", "dynastore-module-crs"]
 module_events = ["psycopg[binary,pool]"]
 module_elasticsearch = ["opensearch-py[async]", "httpx", "dynastore-module-elasticsearch"]
-module_gdal = ["dynastore[geospatial_core]", "GDAL==3.13.0"]
-module_tiles = ["dynastore[geospatial_core]", "pmtiles>=3.2.0", "morecantile>=7.0.3,<8"]
+module_gdal = ["dynastore[geospatial_core]", "GDAL==3.13.0", "dynastore-module-gdal"]
+module_tiles = ["dynastore[geospatial_core]", "pmtiles>=3.2.0", "morecantile>=7.0.3,<8", "dynastore-module-tiles"]
 module_cache = ["valkey>=6.0", "msgpack>=1.0", "dynastore-module-cache"]
 module_tasks = []
 module_proxy = []
