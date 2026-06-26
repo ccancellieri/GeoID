@@ -83,6 +83,18 @@ class BboxDimensionality(Enum):
     OPTIONAL_3D = "optional_3d"
 
 
+def _validate_xy_bbox(xmin: float, ymin: float, xmax: float, ymax: float) -> None:
+    """Raise ValueError if the 2-D portion of a bbox is degenerate."""
+    if xmin >= xmax:
+        raise ValueError(
+            f"bbox is degenerate: xmin={xmin} >= xmax={xmax}"
+        )
+    if ymin >= ymax:
+        raise ValueError(
+            f"bbox is degenerate: ymin={ymin} >= ymax={ymax}"
+        )
+
+
 def parse_bbox_string(
     bbox_str: Optional[str],
     *,
@@ -126,17 +138,10 @@ def parse_bbox_string(
             raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}") from e
         
         if validate_geometry:
-            if xmin >= xmax:
-                raise ValueError(
-                    f"bbox is degenerate: xmin={xmin} >= xmax={xmax}"
-                )
-            if ymin >= ymax:
-                raise ValueError(
-                    f"bbox is degenerate: ymin={ymin} >= ymax={ymax}"
-                )
-        
+            _validate_xy_bbox(xmin, ymin, xmax, ymax)
+
         return (xmin, ymin, xmax, ymax)
-    
+
     elif dimensionality == BboxDimensionality.ALLOW_EXTRA_DIMS:
         if len(parts) < 4:
             raise ValueError(
@@ -148,17 +153,10 @@ def parse_bbox_string(
             raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}") from e
         
         if validate_geometry:
-            if xmin >= xmax:
-                raise ValueError(
-                    f"bbox is degenerate: xmin={xmin} >= xmax={xmax}"
-                )
-            if ymin >= ymax:
-                raise ValueError(
-                    f"bbox is degenerate: ymin={ymin} >= ymax={ymax}"
-                )
-        
+            _validate_xy_bbox(xmin, ymin, xmax, ymax)
+
         return (xmin, ymin, xmax, ymax)
-    
+
     elif dimensionality == BboxDimensionality.OPTIONAL_3D:
         if len(parts) not in (4, 6):
             raise ValueError(
@@ -174,14 +172,7 @@ def parse_bbox_string(
             raise ValueError(f"bbox values must be numeric, got: {bbox_str!r}") from e
         
         if validate_geometry:
-            if xmin >= xmax:
-                raise ValueError(
-                    f"bbox is degenerate: xmin={xmin} >= xmax={xmax}"
-                )
-            if ymin >= ymax:
-                raise ValueError(
-                    f"bbox is degenerate: ymin={ymin} >= ymax={ymax}"
-                )
+            _validate_xy_bbox(xmin, ymin, xmax, ymax)
             if zmin is not None and zmax is not None and zmin >= zmax:
                 raise ValueError(
                     f"bbox is degenerate: zmin={zmin} >= zmax={zmax}"
