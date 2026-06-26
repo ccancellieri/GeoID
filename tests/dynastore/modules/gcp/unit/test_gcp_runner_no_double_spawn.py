@@ -158,7 +158,8 @@ async def test_rest_path_dedup_hit_returns_none_no_runjob():
 @pytest.mark.asyncio
 async def test_dispatcher_path_defers_when_rest_path_owns():
     """When claim_for_dispatch fails because a REST-path worker owns the task,
-    the runner MUST return DEFERRED_COMPLETION without spawning Cloud Run.
+    the runner MUST return DEFERRED_COMPLETION without spawning Cloud Run,
+    AND extend the task's lease so the liveness reconciler can probe it.
     """
     from dynastore.modules.gcp.gcp_runner import GcpJobRunner
 
@@ -180,6 +181,7 @@ async def test_dispatcher_path_defers_when_rest_path_owns():
     fake_task.owner_id = "gcp_cloud_run_abc123"
 
     run_job_mock = AsyncMock()
+    heartbeat_mock = AsyncMock(return_value=True)
     with patch(
         "dynastore.modules.tasks.tasks_module.claim_for_dispatch",
         AsyncMock(return_value=False),
@@ -191,11 +193,17 @@ async def test_dispatcher_path_defers_when_rest_path_owns():
         AsyncMock(return_value={"ingestion": "dynastore-ingestion-job"}),
     ), patch(
         "dynastore.modules.gcp.tools.jobs.run_cloud_run_job_async", run_job_mock
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.heartbeat_task_if_active",
+        heartbeat_mock,
     ):
         result = await runner.run(ctx)
 
     assert result is DEFERRED_COMPLETION
     run_job_mock.assert_not_called()
+    heartbeat_mock.assert_awaited_once()
+    assert heartbeat_mock.await_args is not None
+    assert heartbeat_mock.await_args.args[1] == task_id
 
 
 @pytest.mark.asyncio

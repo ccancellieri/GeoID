@@ -291,6 +291,23 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                             "— deferring to that execution (no double-spawn).",
                             task_id_uuid, existing.owner_id,
                         )
+                        try:
+                            spawn_lease = await _resolve_spawn_lease_seconds()
+                            await tasks_module.heartbeat_task_if_active(
+                                context.engine,
+                                task_id_uuid,
+                                timedelta(seconds=spawn_lease),
+                            )
+                            logger.debug(
+                                "GcpJobRunner: extended lease for racy task '%s' "
+                                "(+%ds) — liveness reconciler will probe.",
+                                task_id_uuid, spawn_lease,
+                            )
+                        except Exception as extend_err:
+                            logger.warning(
+                                "GcpJobRunner: failed to extend lease for racy task '%s': %s",
+                                task_id_uuid, extend_err,
+                            )
                         return DEFERRED_COMPLETION
                     else:
                         logger.warning(
