@@ -89,7 +89,7 @@ def _conn_stub() -> MagicMock:
 
 class TestGetCollectionTilesets:
     @pytest.mark.asyncio
-    async def test_happy_path_returns_tms_list(self):
+    async def test_happy_path_returns_tileset_list(self):
         svc = _make_service()
         svc._resolve_catalog_and_collection = AsyncMock(
             return_value=("internal-cat", "internal-coll")
@@ -106,9 +106,16 @@ class TestGetCollectionTilesets:
                 request=_make_request(),
             )
 
-        assert hasattr(result, "tileMatrixSets")
-        # At minimum the built-in TMS should be present
-        assert len(result.tileMatrixSets) >= 1
+        # Result must be a TileSetList (OGC API Tiles §7.1), not TileMatrixSetList
+        assert hasattr(result, "tilesets"), (
+            "get_collection_tilesets must return TileSetList with 'tilesets' field, "
+            f"got {type(result).__name__}"
+        )
+        # Each built-in TMS contributes two entries (vector + map)
+        assert len(result.tilesets) >= 2
+        data_types = {ts.dataType for ts in result.tilesets}
+        assert "vector" in data_types, "Expected at least one dataType='vector' tileset"
+        assert "map" in data_types, "Expected at least one dataType='map' tileset"
 
     @pytest.mark.asyncio
     async def test_hidden_collection_raises_404(self):

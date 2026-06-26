@@ -68,6 +68,8 @@ from dynastore.modules.tiles.tiles_models import (
     TileMatrixSetRef,
     Link,
     TileMatrixSetCreate,
+    TileSetItem,
+    TileSetList,
 )
 from dynastore.modules.tiles.tms_definitions import BUILTIN_TILE_MATRIX_SETS
 
@@ -125,10 +127,11 @@ OGC_API_TILES_URIS = [
     "http://www.opengis.net/spec/tms/2.0/conf/tilematrixset",
     "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/mvt",
-    # Map-tile (dataType=map) conformance classes
+    # Map-tile (dataType=map) conformance classes — this extension owns /map/tiles/...
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/collections-selection",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/png",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets",
 ]
 
 
@@ -294,8 +297,33 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             "/catalogs/{catalog_id}/collections/{collection_id}/tiles",
             self.get_collection_tilesets,
             methods=["GET"],
-            summary="List available tilesets for a collection (OGC aligned path)",
+            response_model=TileSetList,
+            summary="List available tilesets for a collection (OGC API Tiles §7.1)",
             name="get_collection_tilesets",
+        )
+        # Tileset-metadata: full TileSet document for a specific TMS (vector tiles)
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/tiles/{tileMatrixSetId}",
+            self.get_collection_tileset,
+            methods=["GET"],
+            response_model=TileSetItem,
+            summary=(
+                "Tileset metadata for vector tiles of a collection with a given TMS "
+                "(OGC API Tiles §7.2, dataType='vector')"
+            ),
+            name="get_collection_tileset",
+        )
+        # Tileset-metadata: full TileSet document for map tiles (dataType=map)
+        self.router.add_api_route(
+            "/catalogs/{catalog_id}/collections/{collection_id}/map/tiles/{tms_id}",
+            self.get_collection_map_tileset,
+            methods=["GET"],
+            response_model=TileSetItem,
+            summary=(
+                "Tileset metadata for raster map tiles of a collection with a given TMS "
+                "(OGC API Maps §7.2, dataType='map')"
+            ),
+            name="get_collection_map_tileset",
         )
 
         # Aligned cache invalidation
@@ -2083,16 +2111,53 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             refresh_cache=refresh_cache,
         )
 
+    def _build_tileset_item(
+        self,
+        tms_id: str,
+        title: Optional[str],
+        data_type: Literal["vector", "map", "coverage"],
+        self_href: str,
+        tms_scheme_href: str,
+    ) -> TileSetItem:
+        """Construct a TileSetItem with the required self and tiling-scheme links."""
+        return TileSetItem(
+            id=tms_id,
+            dataType=data_type,
+            title=title,
+            links=[
+                Link(
+                    href=self_href,
+                    rel="self",
+                    type="application/json",
+                    title=title,
+                    hreflang="en",
+                ),
+                Link(
+                    href=tms_scheme_href,
+                    rel="http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
+                    type="application/json",
+                    title=title,
+                    hreflang="en",
+                ),
+            ],
+        )
+
     async def get_collection_tilesets(
         self,
         catalog_id: str,
         collection_id: str,
         request: Request,
-    ):
-        """List available tilesets for a collection (OGC API - Tiles aligned path).
+    ) -> TileSetList:
+        """List available tilesets for a collection (OGC API Tiles §7.1).
 
-        Advertises vector (MVT) tilesets from built-in and per-catalog custom TMS.
-        ``dataType`` is set to ``"vector"`` for MVT tilesets.
+        Returns an OGC API Tiles tilesets list where each entry carries
+        ``dataType`` (``'vector'`` for MVT tilesets, ``'map'`` for raster
+        map-tile tilesets) and the required links:
+
+        - ``rel='self'`` → tileset-metadata resource for this TMS.
+        - ``rel='http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme'`` →
+          the TileMatrixSet definition document.
+
         Resolves external IDs and enforces collection visibility.
         """
         internal_catalog_id, internal_collection_id = await self._resolve_catalog_and_collection(
@@ -2100,52 +2165,154 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         )
         await self._require_collection_visible(internal_catalog_id, internal_collection_id)
 
-        tms_refs = []
-        for tms_id, tms_def in BUILTIN_TILE_MATRIX_SETS.items():
-            tms_refs.append(
-                TileMatrixSetRef(
-                    id=tms_id,
-                    title=tms_def.title,
-                    # dataType="vector" — TileMatrixSetRef does not carry dataType;
-                    # advertised at the tileset-metadata level per OGC API Tiles §7.1.
-                    links=[
-                        Link(
-                            href=str(request.url_for("get_tile_matrix_set", tileMatrixSetId=tms_id)),
-                            rel="self",
-                            type="application/json",
-                            title=tms_def.title,
-                            hreflang="en",
+        # Collect all applicable TMS ids (built-in + per-catalog custom)
+        all_tms: List[Tuple[str, Optional[str]]] = [
+            (tms_id, tms_def.title)
+            for tms_id, tms_def in BUILTIN_TILE_MATRIX_SETS.items()
+        ]
+        seen_ids = {tms_id for tms_id, _ in all_tms}
+        custom_tms_list = await tms_manager.list_custom_tms(catalog_id=internal_catalog_id)
+        for tms in custom_tms_list:
+            if tms.id not in seen_ids:
+                all_tms.append((tms.id, tms.title))
+                seen_ids.add(tms.id)
+
+        tilesets: List[TileSetItem] = []
+        for tms_id, title in all_tms:
+            tms_scheme_href = str(
+                request.url_for("get_tile_matrix_set", tileMatrixSetId=tms_id)
+            )
+            # Vector tileset (MVT) — dataType='vector'
+            tilesets.append(
+                self._build_tileset_item(
+                    tms_id=tms_id,
+                    title=title,
+                    data_type="vector",
+                    self_href=str(
+                        request.url_for(
+                            "get_collection_tileset",
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                            tileMatrixSetId=tms_id,
                         )
-                    ],
+                    ),
+                    tms_scheme_href=tms_scheme_href,
+                )
+            )
+            # Map tileset (raster/COG render) — dataType='map'
+            tilesets.append(
+                self._build_tileset_item(
+                    tms_id=tms_id,
+                    title=title,
+                    data_type="map",
+                    self_href=str(
+                        request.url_for(
+                            "get_collection_map_tileset",
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                            tms_id=tms_id,
+                        )
+                    ),
+                    tms_scheme_href=tms_scheme_href,
                 )
             )
 
-        custom_tms_list = await tms_manager.list_custom_tms(catalog_id=internal_catalog_id)
-        for tms in custom_tms_list:
-            if not any(ref.id == tms.id for ref in tms_refs):
-                tms_refs.append(
-                    TileMatrixSetRef(
-                        id=tms.id,
-                        title=tms.title,
-                        # dataType="vector" — TileMatrixSetRef does not carry dataType;
-                    # advertised at the tileset-metadata level per OGC API Tiles §7.1.
-                        links=[
-                            Link(
-                                href=str(
-                                    request.url_for(
-                                        "get_tile_matrix_set", tileMatrixSetId=tms.id
-                                    ).include_query_params(dataset=internal_catalog_id)
-                                ),
-                                rel="self",
-                                type="application/json",
-                                title=tms.title,
-                                hreflang="en",
-                            )
-                        ],
-                    )
-                )
+        return TileSetList(tilesets=tilesets)
 
-        return TileMatrixSetList(tileMatrixSets=tms_refs)
+    async def get_collection_tileset(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        tileMatrixSetId: str,
+        request: Request,
+    ) -> TileSetItem:
+        """Tileset metadata for vector tiles of a collection (OGC API Tiles §7.2).
+
+        Returns a TileSet document with ``dataType='vector'`` for the requested
+        TileMatrixSet.  Resolves external IDs and enforces collection visibility.
+        """
+        internal_catalog_id, internal_collection_id = await self._resolve_catalog_and_collection(
+            catalog_id, collection_id
+        )
+        await self._require_collection_visible(internal_catalog_id, internal_collection_id)
+
+        # Resolve title from built-in TMS or custom TMS
+        tms_def = BUILTIN_TILE_MATRIX_SETS.get(tileMatrixSetId)
+        title: Optional[str] = tms_def.title if tms_def else None
+        if title is None:
+            custom = await tms_manager.get_custom_tms(
+                catalog_id=internal_catalog_id, tms_id=tileMatrixSetId
+            )
+            if custom is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"TileMatrixSet '{tileMatrixSetId}' not found.",
+                )
+            title = custom.title
+
+        return self._build_tileset_item(
+            tms_id=tileMatrixSetId,
+            title=title,
+            data_type="vector",
+            self_href=str(
+                request.url_for(
+                    "get_collection_tileset",
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    tileMatrixSetId=tileMatrixSetId,
+                )
+            ),
+            tms_scheme_href=str(
+                request.url_for("get_tile_matrix_set", tileMatrixSetId=tileMatrixSetId)
+            ),
+        )
+
+    async def get_collection_map_tileset(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        tms_id: str,
+        request: Request,
+    ) -> TileSetItem:
+        """Tileset metadata for raster map tiles of a collection (OGC API Maps §7.2).
+
+        Returns a TileSet document with ``dataType='map'`` for the requested
+        TileMatrixSet.  Resolves external IDs and enforces collection visibility.
+        """
+        internal_catalog_id, internal_collection_id = await self._resolve_catalog_and_collection(
+            catalog_id, collection_id
+        )
+        await self._require_collection_visible(internal_catalog_id, internal_collection_id)
+
+        tms_def = BUILTIN_TILE_MATRIX_SETS.get(tms_id)
+        title: Optional[str] = tms_def.title if tms_def else None
+        if title is None:
+            custom = await tms_manager.get_custom_tms(
+                catalog_id=internal_catalog_id, tms_id=tms_id
+            )
+            if custom is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"TileMatrixSet '{tms_id}' not found.",
+                )
+            title = custom.title
+
+        return self._build_tileset_item(
+            tms_id=tms_id,
+            title=title,
+            data_type="map",
+            self_href=str(
+                request.url_for(
+                    "get_collection_map_tileset",
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    tms_id=tms_id,
+                )
+            ),
+            tms_scheme_href=str(
+                request.url_for("get_tile_matrix_set", tileMatrixSetId=tms_id)
+            ),
+        )
 
     async def invalidate_collection_tile_cache(
         self,
