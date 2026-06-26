@@ -337,6 +337,29 @@ async def get_catalog_metadata(
     return merged if any_found else None
 
 
+def _is_secondary_index(driver: CatalogStore) -> bool:
+    """True for async secondary-index drivers (e.g. the catalog ES indexer).
+
+    Such drivers are reindexed asynchronously off the
+    ``catalog_metadata_changed`` outbox event emitted after the fan-out (see
+    :func:`_emit_catalog_metadata_changed`), so a *synchronous* write failure
+    here — e.g. the ES client being unavailable during catalog provisioning —
+    must degrade to that async path instead of aborting the canonical PG write.
+    Primary stores (PG core / STAC) stay fatal.
+
+    Identified by ``is_catalog_indexer`` on the driver class, the same marker
+    the ES catalog driver sets to auto-default into the WRITE operation as a
+    secondary index.  Secondary-index drivers (ES) never share the caller's PG
+    ``db_resource``, so swallowing their failure cannot corrupt the outer
+    transaction.
+
+    Tested via identity (``is True``) so the canonical PG drivers — and any
+    ``MagicMock`` stand-in whose attribute access auto-vivifies a truthy mock —
+    are correctly treated as primary (fatal-on-failure).
+    """
+    return getattr(driver, "is_catalog_indexer", False) is True
+
+
 async def upsert_catalog_metadata(
     catalog_id: str,
     metadata: Dict[str, Any],
@@ -402,9 +425,19 @@ async def upsert_catalog_metadata(
             _MISSING_DRIVERS_LOGGED["catalog_write"] = True
         return
     for driver in drivers:
-        await driver.upsert_catalog_metadata(
-            catalog_id, metadata, db_resource=db_resource,
-        )
+        try:
+            await driver.upsert_catalog_metadata(
+                catalog_id, metadata, db_resource=db_resource,
+            )
+        except Exception:
+            if not _is_secondary_index(driver):
+                raise
+            logger.warning(
+                "catalog %s: secondary-index driver %s failed during "
+                "synchronous upsert_catalog_metadata; degrading to async "
+                "reindex via the catalog_metadata_changed event",
+                catalog_id, type(driver).__name__, exc_info=True,
+            )
     await _emit_catalog_metadata_changed(
         catalog_id=catalog_id,
         drivers=drivers,
@@ -455,9 +488,19 @@ async def delete_catalog_metadata(
             _MISSING_DRIVERS_LOGGED["catalog_delete"] = True
         return
     for driver in drivers:
-        await driver.delete_catalog_metadata(
-            catalog_id, soft=soft, db_resource=db_resource,
-        )
+        try:
+            await driver.delete_catalog_metadata(
+                catalog_id, soft=soft, db_resource=db_resource,
+            )
+        except Exception:
+            if not _is_secondary_index(driver):
+                raise
+            logger.warning(
+                "catalog %s: secondary-index driver %s failed during "
+                "synchronous delete_catalog_metadata; degrading to async "
+                "reindex via the catalog_metadata_changed event",
+                catalog_id, type(driver).__name__, exc_info=True,
+            )
     await _emit_catalog_metadata_changed(
         catalog_id=catalog_id,
         drivers=drivers,

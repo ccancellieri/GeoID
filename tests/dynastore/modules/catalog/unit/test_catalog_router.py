@@ -233,9 +233,95 @@ async def test_upsert_catalog_metadata_second_driver_skipped_on_first_failure():
     stac.upsert_catalog_metadata.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_upsert_degrades_when_secondary_index_driver_fails(caplog):
+    """A secondary-index (ES) WRITE failure degrades to async reindex.
+
+    The catalog ES driver marks itself ``is_catalog_indexer = True`` and is
+    reindexed off the ``catalog_metadata_changed`` event emitted after the
+    fan-out.  When its client is unavailable (e.g. on an env with no catalog
+    ES), the synchronous write must NOT abort the canonical PG write — it is
+    logged at WARNING and the primary driver still commits (geoid#2482).
+    """
+    from dynastore.modules.catalog import catalog_router as mod
+    from dynastore.modules.catalog.catalog_router import (
+        upsert_catalog_metadata,
+    )
+
+    core = MagicMock()
+    core.is_catalog_indexer = False
+    core.upsert_catalog_metadata = AsyncMock()
+
+    es = MagicMock()
+    es.is_catalog_indexer = True
+    es.upsert_catalog_metadata = AsyncMock(
+        side_effect=RuntimeError("Elasticsearch client not available"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        # Must NOT raise — secondary failure degrades.
+        await upsert_catalog_metadata("cat-42", {"title": "T"}, drivers=[core, es])
+
+    core.upsert_catalog_metadata.assert_awaited_once()
+    es.upsert_catalog_metadata.assert_awaited_once()
+    assert any(
+        "secondary-index driver" in r.message for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_upsert_primary_failure_still_fatal_even_with_indexer_present():
+    """A primary (PG) WRITE failure stays fatal regardless of indexers.
+
+    Guards the asymmetry: only ``is_catalog_indexer`` drivers degrade; the
+    canonical PG store must still propagate so the lifecycle SAVEPOINT rolls
+    back (and so the existing all-or-nothing dual-write contract holds).
+    """
+    from dynastore.modules.catalog.catalog_router import (
+        upsert_catalog_metadata,
+    )
+
+    core = MagicMock()
+    core.is_catalog_indexer = False
+    core.upsert_catalog_metadata = AsyncMock(
+        side_effect=RuntimeError("pg error on CORE"),
+    )
+
+    with pytest.raises(RuntimeError, match="pg error on CORE"):
+        await upsert_catalog_metadata("cat", {}, drivers=[core])
+
+
 # ---------------------------------------------------------------------------
 # DELETE fan-out
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_degrades_when_secondary_index_driver_fails(caplog):
+    """DELETE mirrors UPSERT: a secondary-index failure degrades, not aborts."""
+    from dynastore.modules.catalog import catalog_router as mod
+    from dynastore.modules.catalog.catalog_router import (
+        delete_catalog_metadata,
+    )
+
+    core = MagicMock()
+    core.is_catalog_indexer = False
+    core.delete_catalog_metadata = AsyncMock()
+
+    es = MagicMock()
+    es.is_catalog_indexer = True
+    es.delete_catalog_metadata = AsyncMock(
+        side_effect=RuntimeError("Elasticsearch client not available"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        await delete_catalog_metadata("cat", drivers=[core, es])
+
+    core.delete_catalog_metadata.assert_awaited_once()
+    es.delete_catalog_metadata.assert_awaited_once()
+    assert any(
+        "secondary-index driver" in r.message for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
