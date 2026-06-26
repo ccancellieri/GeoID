@@ -835,9 +835,9 @@ class BucketService:
             needs_patch = False
 
             # 1. CORS Configuration
-            if config.cors_rules:
+            if config.cors is not None:
                 cors_list = []
-                for rule in config.cors_rules:
+                for rule in config.cors:
                     rule_dict: Dict[str, Any] = {
                         "origin": rule.origin,
                         "method": rule.method,
@@ -892,51 +892,7 @@ class BucketService:
             logger.error(
                 f"Failed to patch GCS bucket '{bucket_name}': {e}", exc_info=True
             )
-            # Re-raise to fail the provisioning - bucket exists but settings
-            # may need manual intervention
             raise
-            return
-
-        def _sync_update():
-            bucket = self.storage_client.bucket(bucket_name)
-            needs_patch = False
-
-            # 1. CORS Configuration
-            if config.cors is not None:
-                cors_list = []
-                for rule in config.cors:
-                    rule_dict: Dict[str, Any] = {
-                        "origin": rule.origin,
-                        "method": rule.method,
-                    }
-                    if rule.response_header:
-                        rule_dict["responseHeader"] = rule.response_header
-                    if rule.max_age_seconds:
-                        rule_dict["maxAgeSeconds"] = rule.max_age_seconds
-                    cors_list.append(rule_dict)
-
-                logger.info(
-                    f"Applying CORS rules to bucket '{bucket_name}': {cors_list}"
-                )
-                bucket.cors = cors_list
-                needs_patch = True
-
-            # 2. Lifecycle Rules (Placeholder)
-            # if config.lifecycle_rules:
-            #     pass
-
-            if needs_patch:
-                bucket.patch()
-                logger.info(
-                    f"Successfully applied settings to GCS bucket '{bucket_name}'."
-                )
-
-        try:
-            await run_in_thread(_sync_update)
-        except Exception as e:
-            logger.error(
-                f"Failed to patch GCS bucket '{bucket_name}': {e}", exc_info=True
-            )
 
     async def teardown_gcs_notification(
         self, bucket_name: str, gcs_notification_id: str

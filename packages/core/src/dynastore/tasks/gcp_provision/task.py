@@ -125,14 +125,18 @@ async def _provision_bucket_hard(
         # is idempotent, calling it a second time in the eventing step is safe;
         # but to avoid a redundant GCP round-trip we instead call the
         # cross-vendor bucket-only path when available.
-        bucket_name = await storage.ensure_storage_for_catalog(catalog_id)
+        bucket_name = await storage.ensure_storage_for_catalog(
+            catalog_id, raise_on_failure=True
+        )
         if bucket_name is None:
             raise RuntimeError(
                 f"ensure_storage_for_catalog returned None for catalog '{catalog_id}'"
             )
         return bucket_name
     else:
-        bucket_name = await storage.ensure_storage_for_catalog(catalog_id)
+        bucket_name = await storage.ensure_storage_for_catalog(
+            catalog_id, raise_on_failure=True
+        )
         if bucket_name is None:
             raise RuntimeError(
                 f"ensure_storage_for_catalog returned None for catalog '{catalog_id}'"
