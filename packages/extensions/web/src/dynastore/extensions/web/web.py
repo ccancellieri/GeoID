@@ -1845,8 +1845,16 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             Returns the manifest of all found documentation, grouped by category.
             Includes ID, Title, and Full Path.
             """
-            # Use raw buckets first
-            buckets = {"root": [], "modules": [], "extensions": [], "tasks": []}
+            # Initialize buckets with all expected categories (must match frontend categoryMapping)
+            buckets = {
+                "platform": [],
+                "architecture": [],
+                "components": [],
+                "modules": [],
+                "extensions": [],
+                "tasks": [],
+                "root": [],
+            }
 
             # Iterate through the registry and bucket items by category
             for doc_item in self.docs_registry.values():
