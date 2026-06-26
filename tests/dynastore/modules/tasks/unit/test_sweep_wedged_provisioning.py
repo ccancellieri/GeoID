@@ -227,3 +227,57 @@ async def test_sweep_returns_zero_when_protocol_unavailable():
         )
 
     assert drained == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression: sweep must exclude BOTH task types from the NOT EXISTS guard
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_sweep_sql_covers_both_provision_task_types() -> None:
+    """The NOT EXISTS guard must match both 'gcp_provision_catalog' and
+    'catalog_provision' so that an active catalog_provision task prevents
+    the sweep from draining a still-running provisioning catalog.
+
+    Before the fix, only 'gcp_provision_catalog' was matched, causing the
+    sweep to mark catalogs 'failed' while their catalog_provision task was
+    still ACTIVE.
+    """
+    captured_sql: list[str] = []
+
+    class _CapturingSqlQuery:
+        def __init__(self, sql: str, **kwargs: object) -> None:
+            captured_sql.append(sql)
+            self._rows: list = []
+
+        async def execute(self, _conn: object, **_kw: object) -> list:
+            return self._rows
+
+    with (
+        patch(
+            "dynastore.modules.tasks.tasks_module.managed_transaction",
+            _fake_managed_transaction,
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module.DQLQuery",
+            _CapturingSqlQuery,
+        ),
+        patch(
+            "dynastore.modules.tasks.tasks_module.check_table_exists",
+            new=AsyncMock(return_value=True),
+        ),
+    ):
+        await sweep_wedged_provisioning_catalogs(
+            engine=object(), min_age_s=600.0, sample_limit=50,
+        )
+
+    assert captured_sql, "DQLQuery must have been instantiated with a SQL string"
+    sql = captured_sql[0]
+    assert "catalog_provision" in sql, (
+        "Sweep SQL must include 'catalog_provision' in the NOT EXISTS guard; "
+        f"got:\n{sql}"
+    )
+    assert "gcp_provision_catalog" in sql, (
+        "Sweep SQL must still include legacy 'gcp_provision_catalog'; "
+        f"got:\n{sql}"
+    )

@@ -1061,8 +1061,8 @@ async def sweep_wedged_provisioning_catalogs(
     mark time) the catalog is left ``provisioning`` indefinitely.
 
     This sweep detects that condition — ``provisioning_status = 'provisioning'``
-    AND no ``PENDING``/``ACTIVE`` ``gcp_provision_catalog`` task pointing at the
-    same ``catalog_id`` in its ``inputs`` — and calls
+    AND no ``PENDING``/``ACTIVE`` ``gcp_provision_catalog`` or ``catalog_provision``
+    task pointing at the same ``catalog_id`` in its ``inputs`` — and calls
     ``drain_pending_checklist_steps`` on each such catalog.  The drain marks
     still-``pending`` steps ``"failed"``: a provisioning task that died without
     completing and is no longer being retried is a failure, so the catalog
@@ -1088,7 +1088,7 @@ async def sweep_wedged_provisioning_catalogs(
               SELECT 1
               FROM "{task_schema}".tasks t
               WHERE t.status IN ('PENDING', 'ACTIVE')
-                AND t.task_type = 'gcp_provision_catalog'
+                AND t.task_type IN ('gcp_provision_catalog', 'catalog_provision')
                 AND t.inputs->>'catalog_id' = c.id
           )
         LIMIT :sample_limit;

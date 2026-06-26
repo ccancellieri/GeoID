@@ -108,11 +108,11 @@ class GcpStorageOpsMixin:
         return await self.get_bucket_service().download_bytes_range(path, offset, length)
 
     async def ensure_storage_for_catalog(
-        self, catalog_id: str, conn: Optional[Any] = None
+        self, catalog_id: str, conn: Optional[Any] = None, raise_on_failure: bool = False
     ) -> Optional[str]:
         """StorageProtocol: Ensures that storage exists for a catalog, creating it if it doesn't."""
         return await self.get_bucket_service().ensure_storage_for_catalog(
-            catalog_id, conn=conn
+            catalog_id, conn=conn, raise_on_failure=raise_on_failure
         )
 
     async def drop_storage(

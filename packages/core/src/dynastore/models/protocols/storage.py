@@ -33,7 +33,7 @@ class StorageProtocol(Protocol):
         """Returns the storage identifier (e.g., bucket name) associated with a catalog."""
         ...
 
-    async def ensure_storage_for_catalog(self, catalog_id: str, conn: Optional[Any] = None) -> Optional[str]:
+    async def ensure_storage_for_catalog(self, catalog_id: str, conn: Optional[Any] = None, raise_on_failure: bool = False) -> Optional[str]:
         """Ensures that storage (e.g., a bucket) exists for a catalog, creating it if it doesn't."""
         ...
 
