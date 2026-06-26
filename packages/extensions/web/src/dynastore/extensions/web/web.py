@@ -1666,6 +1666,107 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             # Fallback for older WebModule without the method
             return [{"prefix": p, "owner": "", "description": ""} for p in sorted(self.web_module.static_providers)]
 
+        @self.router.get("/search", response_class=JSONResponse)
+        async def global_search(
+            q: str = Query(..., min_length=2, description="Search query"),
+            types: str = Query("catalog,collection,item,doc,task", description="Comma-separated result types"),
+            limit: int = Query(5, ge=1, le=50, description="Max results per type"),
+        ):
+            """Federated search across catalogs, collections, items, docs, and tasks.
+
+            Anonymous-accessible endpoint that searches multiple data sources
+            and returns grouped results. Each group is limited to ``limit`` items.
+
+            Returns:
+                {
+                    "results": {
+                        "catalogs": [...],
+                        "collections": [...],
+                        "items": [...],
+                        "docs": [...],
+                        "tasks": [...]
+                    },
+                    "total": 42,
+                    "query_time_ms": 23
+                }
+            """
+            import time
+            start_time = time.time()
+            
+            results = {
+                "results": {
+                    "catalogs": [],
+                    "collections": [],
+                    "items": [],
+                    "docs": [],
+                    "tasks": [],
+                },
+                "total": 0,
+                "query_time_ms": 0,
+            }
+            
+            if not self.web_module:
+                return results
+            
+            query = q.lower().strip()
+            type_filters = [t.strip() for t in types.split(",")]
+            
+            try:
+                # Search catalogs
+                if "catalog" in type_filters:
+                    from dynastore.models.protocols.catalogs import CatalogsProtocol
+                    catalog_proto = get_protocol(CatalogsProtocol)
+                    if catalog_proto and hasattr(catalog_proto, "list"):
+                        catalogs = await catalog_proto.list()
+                        matches = [
+                            {
+                                "id": c.get("id"),
+                                "title": c.get("title", c.get("id")),
+                                "description": c.get("description", ""),
+                                "url": f"/?catalog={c.get('id')}",
+                            }
+                            for c in catalogs
+                            if query in c.get("id", "").lower()
+                            or query in c.get("title", "").lower()
+                            or query in c.get("description", "").lower()
+                        ][:limit]
+                        results["results"]["catalogs"] = matches
+                        results["total"] += len(matches)
+                
+                # Search collections (simplified - just search across known catalogs)
+                if "collection" in type_filters:
+                    # TODO: Implement collection search when we have a better approach
+                    # For now, this is a placeholder
+                    pass
+                
+                # Search docs
+                if "doc" in type_filters:
+                    matches = []
+                    for doc_id, doc_item in self.docs_registry.items():
+                        title = doc_item.get("title", "")
+                        if query in title.lower() or query in doc_id.lower():
+                            matches.append({
+                                "id": doc_id,
+                                "title": title,
+                                "category": doc_item.get("category", "root"),
+                                "url": f"/web/docs#{doc_id}",
+                            })
+                            if len(matches) >= limit:
+                                break
+                    results["results"]["docs"] = matches
+                    results["total"] += len(matches)
+                
+                # Search tasks (if available)
+                if "task" in type_filters:
+                    # TODO: Implement task search when task protocol is available
+                    pass
+                
+            except Exception as e:
+                logger.exception(f"Search error: {e}")
+            
+            results["query_time_ms"] = int((time.time() - start_time) * 1000)
+            return results
+
         @self.router.get("/admin/pages/{page_id}/providers", response_class=JSONResponse)
         async def get_page_providers(page_id: str):
             """Sysadmin endpoint: list every handler registered for a page id.

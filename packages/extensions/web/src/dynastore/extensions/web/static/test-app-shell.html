@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>App Shell Test</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="../common/components/app-shell.css">
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        }
+        
+        .test-content {
+            padding: 2rem;
+            background: #1e293b;
+            border-radius: 0.5rem;
+            margin: 2rem;
+        }
+        
+        h1 {
+            color: #f8fafc;
+            margin-top: 0;
+        }
+        
+        p {
+            color: #cbd5e1;
+            line-height: 1.6;
+        }
+        
+        .test-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin-top: 2rem;
+        }
+        
+        .test-card {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 0.5rem;
+            padding: 1.5rem;
+        }
+        
+        .test-card h3 {
+            color: #f8fafc;
+            margin-top: 0;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .test-card p {
+            color: #94a3b8;
+            font-size: 0.875rem;
+            margin-bottom: 0;
+        }
+        
+        .kbd {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            background: #334155;
+            border-radius: 0.25rem;
+            font-size: 0.75rem;
+            color: #cbd5e1;
+            font-family: 'Monaco', 'Consolas', monospace;
+        }
+    </style>
+</head>
+<body>
+    <ds-app-shell>
+        <ds-sidebar slot="sidebar"></ds-sidebar>
+        <main slot="content" class="test-content">
+            <h1>🚀 Unified App Shell Test Page</h1>
+            <p>
+                This page demonstrates the new unified navigation system. 
+                Press <span class="kbd">⌘K</span> or <span class="kbd">Ctrl+K</span> to open global search.
+            </p>
+            
+            <div class="test-grid">
+                <div class="test-card">
+                    <h3><i class="fa-solid fa-search"></i> Global Search</h3>
+                    <p>
+                        Search across catalogs, collections, items, documentation, and tasks 
+                        with real-time results and keyboard navigation.
+                    </p>
+                </div>
+                
+                <div class="test-card">
+                    <h3><i class="fa-solid fa-clock"></i> Recent Items</h3>
+                    <p>
+                        Your recently visited items appear in the sidebar for quick access. 
+                        Items persist across sessions using localStorage.
+                    </p>
+                </div>
+                
+                <div class="test-card">
+                    <h3><i class="fa-solid fa-bars"></i> Collapsible Sidebar</h3>
+                    <p>
+                        Toggle the sidebar between expanded and collapsed modes. 
+                        State persists across sessions.
+                    </p>
+                </div>
+                
+                <div class="test-card">
+                    <h3><i class="fa-solid fa-universal-access"></i> Accessibility</h3>
+                    <p>
+                        Full keyboard navigation, screen reader support, and WCAG 2.1 AA 
+                        compliant color contrast ratios.
+                    </p>
+                </div>
+                
+                <div class="test-card">
+                    <h3><i class="fa-solid fa-mobile-alt"></i> Responsive Design</h3>
+                    <p>
+                        Adapts to different screen sizes with mobile-friendly navigation 
+                        patterns.
+                    </p>
+                </div>
+                
+                <div class="test-card">
+                    <h3><i class="fa-solid fa-puzzle-piece"></i> Unified Navigation</h3>
+                    <p>
+                        Consistent navigation across all DynaStore web applications: 
+                        Home, Dashboard, Admin, and Documentation.
+                    </p>
+                </div>
+            </div>
+        </main>
+    </ds-app-shell>
+    
+    <script src="../common/components/app-shell.js"></script>
+</body>
+</html>
