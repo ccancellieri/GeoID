@@ -11,7 +11,7 @@ license-files = ["../../../LICENSE"]
 dependencies = [
     "fastapi>=0.100",
     "sqlalchemy[asyncio]>=2.0.0",
-    "DynaStore",
+    "dynastore-core",
 ]
 
 [project.entry-points."dynastore.extensions"]

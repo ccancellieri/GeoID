@@ -61,6 +61,32 @@ class TemporalGeometryCreate(BaseModel):
     )
 
 
+class TemporalGeometryUpdate(BaseModel):
+    """Client-supplied payload to patch a temporal geometry sequence."""
+    datetimes: Optional[List[datetime]] = Field(
+        default=None, min_length=1, description="Ordered list of instants (ISO 8601)."
+    )
+    coordinates: Optional[List[List[float]]] = Field(
+        default=None, min_length=1,
+        description="Coordinate array matching datetimes length. Each entry is [lon, lat] or [lon, lat, elev].",
+    )
+    crs: Optional[str] = Field(
+        default=None,
+        description="Coordinate reference system URI.",
+    )
+    trs: Optional[str] = Field(
+        default=None,
+        description="Temporal reference system URI.",
+    )
+    interpolation: Optional[InterpolationEnum] = Field(
+        default=None,
+        description="Interpolation method between positions.",
+    )
+    properties: Optional[Dict[str, Any]] = Field(
+        default=None, description="Temporal scalar properties (e.g., speed, heading)."
+    )
+
+
 class TemporalGeometry(TemporalGeometryCreate):
     """Full temporal geometry sequence record from the database."""
     id: uuid.UUID
@@ -84,6 +110,14 @@ class MovingFeatureCreate(BaseModel):
     properties: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Static (non-temporal) properties of the moving feature.",
+    )
+
+
+class MovingFeatureUpdate(BaseModel):
+    """Client-supplied payload to update a moving feature's properties."""
+    properties: Dict[str, Any] = Field(
+        ...,
+        description="Updated static (non-temporal) properties of the moving feature.",
     )
 
 

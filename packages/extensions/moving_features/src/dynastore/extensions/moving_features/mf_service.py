@@ -50,8 +50,10 @@ from dynastore.modules.moving_features.db import delete_temporal_geometries_by_m
 from dynastore.modules.moving_features.models import (
     MovingFeature,
     MovingFeatureCreate,
+    MovingFeatureUpdate,
     TemporalGeometry,
     TemporalGeometryCreate,
+    TemporalGeometryUpdate,
 )
 from dynastore.tools.db import validate_sql_identifier
 
@@ -155,6 +157,13 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             summary="Delete a moving feature and its temporal data",
         )
         self.router.add_api_route(
+            col + "/items/{mf_id}",
+            self.update_moving_feature,
+            methods=["PUT"],
+            response_model=MovingFeature,
+            summary="Update a moving feature's properties",
+        )
+        self.router.add_api_route(
             col + "/items/{mf_id}/tgsequence",
             self.list_tg_sequence,
             methods=["GET"],
@@ -168,6 +177,13 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             response_model=TemporalGeometry,
             status_code=status.HTTP_201_CREATED,
             summary="Add a temporal geometry sequence to a moving feature",
+        )
+        self.router.add_api_route(
+            col + "/items/{mf_id}/tgsequence/{tg_id}",
+            self.update_tg_sequence,
+            methods=["PATCH"],
+            response_model=TemporalGeometry,
+            summary="Update a temporal geometry sequence",
         )
 
     # ------------------------------------------------------------------
@@ -395,6 +411,26 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         await delete_temporal_geometries_by_mf(conn, catalog_id, mf_id)
         await mf_db.delete_moving_feature(conn, catalog_id, mf_id)
 
+    async def update_moving_feature(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        mf_id: uuid.UUID,
+        mf_update: MovingFeatureUpdate = Body(...),
+        conn: AsyncConnection = Depends(get_async_connection),
+    ) -> MovingFeature:
+        validate_sql_identifier(catalog_id)
+        validate_sql_identifier(collection_id)
+        await self._require_catalog_ready(catalog_id)
+        feature = await mf_db.get_moving_feature(conn, catalog_id, mf_id)
+        if not feature or feature.collection_id != collection_id:
+            raise HTTPException(status_code=404, detail="Moving feature not found.")
+        
+        updated = await mf_db.update_moving_feature(conn, catalog_id, mf_id, mf_update)
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to update moving feature.")
+        return updated
+
     # ------------------------------------------------------------------
     # Temporal geometry sequence
     # ------------------------------------------------------------------
@@ -461,6 +497,42 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         if not created:
             raise HTTPException(status_code=500, detail="Failed to create temporal geometry sequence.")
         return created
+
+    async def update_tg_sequence(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        mf_id: uuid.UUID,
+        tg_id: uuid.UUID,
+        tg_update: TemporalGeometryUpdate = Body(...),
+        conn: AsyncConnection = Depends(get_async_connection),
+    ) -> TemporalGeometry:
+        validate_sql_identifier(catalog_id)
+        validate_sql_identifier(collection_id)
+        await self._require_catalog_ready(catalog_id)
+        
+        # Verify the moving feature exists and belongs to the collection
+        feature = await mf_db.get_moving_feature(conn, catalog_id, mf_id)
+        if not feature or feature.collection_id != collection_id:
+            raise HTTPException(status_code=404, detail="Moving feature not found.")
+        
+        # Verify the temporal geometry exists and belongs to the moving feature
+        tg = await mf_db.get_temporal_geometry(conn, catalog_id, tg_id)
+        if not tg or tg.mf_id != mf_id:
+            raise HTTPException(status_code=404, detail="Temporal geometry sequence not found.")
+        
+        # Validate datetimes and coordinates length match if both provided
+        if tg_update.datetimes is not None and tg_update.coordinates is not None:
+            if len(tg_update.datetimes) != len(tg_update.coordinates):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"datetimes length ({len(tg_update.datetimes)}) must match coordinates length ({len(tg_update.coordinates)}).",
+                )
+        
+        updated = await mf_db.update_temporal_geometry(conn, catalog_id, tg_id, tg_update)
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to update temporal geometry sequence.")
+        return updated
 
     # ------------------------------------------------------------------
     # Web page contribution (WebPageContributor / StaticAssetProvider)

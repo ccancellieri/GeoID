@@ -94,6 +94,24 @@ def test_routes_registered():
     assert col + "/items" in paths
     assert col + "/items/{mf_id}" in paths
     assert col + "/items/{mf_id}/tgsequence" in paths
+    assert col + "/items/{mf_id}/tgsequence/{tg_id}" in paths
+
+
+def test_update_routes_methods():
+    """Verify PUT and PATCH methods are registered for update operations."""
+    svc = _build_service()
+    route_methods = {}
+    for route in svc.router.routes:
+        if hasattr(route, 'methods'):
+            route_methods[route.path] = route.methods
+    
+    col = "/movingfeatures/catalogs/{catalog_id}/collections/{collection_id}"
+    
+    # PUT on items/{mf_id}
+    assert "PUT" in route_methods.get(col + "/items/{mf_id}", set())
+    
+    # PATCH on items/{mf_id}/tgsequence/{tg_id}
+    assert "PATCH" in route_methods.get(col + "/items/{mf_id}/tgsequence/{tg_id}", set())
 
 
 # ---------------------------------------------------------------------------

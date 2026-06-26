@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
-from .models import MovingFeature, MovingFeatureCreate, TemporalGeometry, TemporalGeometryCreate
+from .models import MovingFeature, MovingFeatureCreate, MovingFeatureUpdate, TemporalGeometry, TemporalGeometryCreate, TemporalGeometryUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,16 @@ _delete_mf_query = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
+_update_mf_query = DQLQuery(
+    """
+    UPDATE moving_features.moving_features
+    SET properties = :properties, updated_at = NOW()
+    WHERE catalog_id = :catalog_id AND id = :mf_id
+    RETURNING *;
+    """,
+    result_handler=ResultHandler.ONE_DICT,
+)
+
 # ---------------------------------------------------------------------------
 # Temporal geometry queries
 # ---------------------------------------------------------------------------
@@ -117,6 +127,34 @@ _list_tg_query = DQLQuery(
 _delete_tg_by_mf_query = DQLQuery(
     "DELETE FROM moving_features.temporal_geometries WHERE catalog_id = :catalog_id AND mf_id = :mf_id;",
     result_handler=ResultHandler.ROWCOUNT,
+)
+
+_get_tg_query = DQLQuery(
+    """
+    SELECT * FROM moving_features.temporal_geometries
+    WHERE catalog_id = :catalog_id AND id = :tg_id;
+    """,
+    result_handler=ResultHandler.ONE_DICT,
+)
+
+_update_tg_query = DQLQuery(
+    """
+    UPDATE moving_features.temporal_geometries
+    SET 
+        datetimes = COALESCE(:datetimes, datetimes),
+        coordinates = COALESCE(:coordinates, coordinates),
+        bbox_geom = CASE 
+            WHEN :coordinates IS NOT NULL THEN ST_GeomFromText(:bbox_wkt, 4326)
+            ELSE bbox_geom
+        END,
+        crs = COALESCE(:crs, crs),
+        trs = COALESCE(:trs, trs),
+        interpolation = COALESCE(:interpolation, interpolation),
+        properties = COALESCE(:properties, properties)
+    WHERE catalog_id = :catalog_id AND id = :tg_id
+    RETURNING *;
+    """,
+    result_handler=ResultHandler.ONE_DICT,
 )
 
 _list_tg_from_query = DQLQuery(
@@ -307,6 +345,21 @@ async def delete_moving_feature(
     return count > 0
 
 
+async def update_moving_feature(
+    conn: DbResource,
+    catalog_id: str,
+    mf_id: uuid.UUID,
+    mf_update: MovingFeatureUpdate,
+) -> Optional[MovingFeature]:
+    row = await _update_mf_query.execute(
+        conn,
+        catalog_id=catalog_id,
+        mf_id=str(mf_id),
+        properties=json.dumps(mf_update.properties),
+    )
+    return _mf_from_row(row) if row else None
+
+
 # ---------------------------------------------------------------------------
 # Temporal geometry CRUD
 # ---------------------------------------------------------------------------
@@ -363,3 +416,36 @@ async def delete_temporal_geometries_by_mf(
     mf_id: uuid.UUID,
 ) -> None:
     await _delete_tg_by_mf_query.execute(conn, catalog_id=catalog_id, mf_id=str(mf_id))
+
+
+async def get_temporal_geometry(
+    conn: DbResource,
+    catalog_id: str,
+    tg_id: uuid.UUID,
+) -> Optional[TemporalGeometry]:
+    row = await _get_tg_query.execute(conn, catalog_id=catalog_id, tg_id=str(tg_id))
+    return _tg_from_row(row) if row else None
+
+
+async def update_temporal_geometry(
+    conn: DbResource,
+    catalog_id: str,
+    tg_id: uuid.UUID,
+    tg_update: TemporalGeometryUpdate,
+) -> Optional[TemporalGeometry]:
+    coordinates_json = json.dumps(tg_update.coordinates) if tg_update.coordinates else None
+    bbox_wkt = _compute_bbox_wkt(tg_update.coordinates) if tg_update.coordinates else None
+    
+    row = await _update_tg_query.execute(
+        conn,
+        catalog_id=catalog_id,
+        tg_id=str(tg_id),
+        datetimes=tg_update.datetimes,
+        coordinates=coordinates_json,
+        bbox_wkt=bbox_wkt,
+        crs=tg_update.crs,
+        trs=tg_update.trs,
+        interpolation=tg_update.interpolation.value if tg_update.interpolation else None,
+        properties=json.dumps(tg_update.properties) if tg_update.properties else None,
+    )
+    return _tg_from_row(row) if row else None
