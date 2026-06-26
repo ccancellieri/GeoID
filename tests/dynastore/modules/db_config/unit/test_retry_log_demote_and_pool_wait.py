@@ -36,12 +36,18 @@ from unittest.mock import patch
 import pytest
 
 from dynastore.modules.db_config import query_executor
+from dynastore.modules.db_config.connection_health_config import (
+    resolve_slow_pool_acquire_threshold,
+)
 from dynastore.modules.db_config.query_executor import (
-    _SLOW_POOL_ACQUIRE_THRESHOLD_S,
     _acquire_async_engine_connection,
     pool_acquire_scope,
     retry_on_transient_connect,
 )
+
+# The slow-pool-acquire threshold is now read live (configs API) rather than
+# frozen at import. Resolve it here for the engine-delay baselines below.
+_SLOW_POOL_ACQUIRE_THRESHOLD_S = resolve_slow_pool_acquire_threshold()
 
 
 class _TransientOnce(Exception):

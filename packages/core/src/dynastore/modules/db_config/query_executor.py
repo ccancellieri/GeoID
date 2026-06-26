@@ -33,7 +33,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
     resolve_provisioning_retry_config,
-    resolve_connection_health_config,
+    resolve_slow_pool_acquire_threshold,
 )
 from sqlalchemy import text, DDL
 from sqlalchemy.engine import Engine
@@ -1326,16 +1326,16 @@ def retry_on_transient_connect(
     Only retries the exception types in :data:`_TRANSIENT_CONNECT_EXCEPTIONS`.
     Anything else propagates immediately so genuine bugs are not masked.
 
-    Configuration: Values are resolved from (1) function parameters,
-    (2) environment variables, (3) ConnectionRetryConfig defaults.
-    Values are resolved at CALL TIME, so env var changes take effect immediately.
+    Configuration: Values are resolved from (1) explicit function parameters,
+    else (2) the live ``ConnectionRetryConfig`` (configs API, hot-reloadable).
+    Resolved at CALL TIME, so a ``PUT /configs`` takes effect on the next call.
     See :mod:`connection_health_config` for details.
     """
 
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            # Resolve config at call time for dynamic behavior
+            # Resolve config at call time so live config edits are picked up.
             cfg_max_retries, cfg_base_delay, cfg_max_delay, cfg_jitter = resolve_connection_retry_config()
             _max_retries = max_retries if max_retries is not None else cfg_max_retries
             _base_delay = base_delay if base_delay is not None else cfg_base_delay
@@ -1383,8 +1383,8 @@ def retry_on_transient_connect(
 # M3 (issue #486): emit a structured log line on every async pool acquire so a
 # GCP log-based metric can compute db_pool_wait_seconds histograms per service
 # without needing a prometheus_client dep + scrape endpoint. INFO when slow,
-# DEBUG otherwise.
-_SLOW_POOL_ACQUIRE_THRESHOLD_S = resolve_connection_health_config()[0]
+# DEBUG otherwise. The threshold is read live (not frozen at import) so a
+# ``PUT /configs`` for ConnectionHealthConfig takes effect without a restart.
 
 
 def _resolve_service_name() -> str:
@@ -1486,10 +1486,11 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
         )
         raise
     wait_s = time.monotonic() - t0
-    if wait_s >= _SLOW_POOL_ACQUIRE_THRESHOLD_S:
+    slow_threshold_s = resolve_slow_pool_acquire_threshold()
+    if wait_s >= slow_threshold_s:
         logger.info(
             "db_pool_acquire slow service=%s wait_seconds=%.4f threshold=%.2f%s",
-            _SERVICE_NAME_FOR_METRICS, wait_s, _SLOW_POOL_ACQUIRE_THRESHOLD_S,
+            _SERVICE_NAME_FOR_METRICS, wait_s, slow_threshold_s,
             _acquire_scope_suffix(),
         )
     else:
@@ -1914,12 +1915,12 @@ async def provisioning_write_with_retry(
     Must NOT be used for non-idempotent writes.  The caller is responsible for
     ON CONFLICT / upsert semantics.
 
-    Configuration: Values are resolved from (1) function parameters,
-    (2) environment variables, (3) ProvisioningRetryConfig defaults.
-    Values are resolved at CALL TIME, so env var changes take effect immediately.
+    Configuration: Values are resolved from (1) explicit function parameters,
+    else (2) the live ``ProvisioningRetryConfig`` (configs API, hot-reloadable).
+    Resolved at CALL TIME, so a ``PUT /configs`` takes effect on the next call.
     See :mod:`connection_health_config` for details.
     """
-    # Resolve config at call time for dynamic behavior
+    # Resolve config at call time so live config edits are picked up.
     cfg_attempts, cfg_lock_backoff = resolve_provisioning_retry_config()
     _attempts = attempts if attempts is not None else cfg_attempts
     _lock_backoff = lock_backoff if lock_backoff is not None else cfg_lock_backoff

@@ -19,8 +19,26 @@
 """Connection retry and health management configuration (PluginConfig).
 
 Runtime-configurable settings for PostgreSQL connection retry behavior,
-provisioning retries, and advisory lock management. These values can be
-tuned per-deployment via the configs API without code changes.
+provisioning retries, and advisory lock management. Values are tuned at
+runtime via the configs API — a ``PUT /configs`` takes effect without a
+restart — exactly like every other ``PluginConfig`` in the platform.
+
+Why a module-global snapshot instead of reading the config on every call
+--------------------------------------------------------------------------
+The configs store is **async-only** (``await mgr.get_config(...)``), but the
+consumers here are a mix of sync and async call sites — ``retry_on_lock_conflict``
+and ``provisioning_write_with_retry`` are async, while ``sync_acquire_startup_lock``
+and the ``GcpLivenessReconciler.__init__`` constructor are synchronous and
+cannot ``await``. Awaiting in the retry hot-path would also add a checkout per
+attempt.
+
+So we hold the current config instances in module globals, populated once at
+startup by :func:`load_connection_health_configs` (async, called from
+``DBConfigModule.lifespan``) and refreshed on every change by the apply
+handlers registered via :func:`register_connection_health_apply_handlers`.
+The ``resolve_*`` helpers then read those globals synchronously. This is the
+same live-apply pattern ``cache_module`` and ``gcp_module`` already use for
+their configs.
 
 Related issues:
 - #2438 — Connection health management architecture
@@ -31,8 +49,7 @@ Related issues:
 from __future__ import annotations
 
 import logging
-import os
-from typing import ClassVar, Tuple
+from typing import Any, ClassVar, Optional, Tuple
 
 from pydantic import Field
 
@@ -209,10 +226,7 @@ class LeadershipConfig(PluginConfig):
 
 
 class ConnectionHealthConfig(PluginConfig):
-    """Runtime-configurable connection health check settings.
-
-    These settings control proactive connection health validation,
-    pool hygiene, and monitoring thresholds.
+    """Runtime-configurable connection health observability settings.
 
     Scope: Platform-only (sysadmin).
 
@@ -232,201 +246,177 @@ class ConnectionHealthConfig(PluginConfig):
         ),
     )
 
-    advisory_lock_validation_enabled: Mutable[bool] = Field(
-        default=False,
-        description=(
-            "Enable proactive validation of advisory locks on AUTOCOMMIT connections. "
-            "When True, checks ``pg_locks`` before using advisory lock connection. "
-            "Adds overhead but catches silently-dropped locks. "
-            "Default: False (rely on pool_pre_ping)."
-        ),
-    )
 
-    connection_health_check_interval_seconds: Mutable[int] = Field(
-        default=30,
-        ge=10,
-        le=300,
-        description=(
-            "Interval between proactive connection health checks. "
-            "Checks run in background to detect stale connections early. "
-            "Default: 30 seconds."
-        ),
-    )
-
-    circuit_breaker_threshold: Mutable[int] = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description=(
-            "Consecutive connection failures before circuit breaker trips. "
-            "When tripped, operations fail fast without retrying. "
-            "Default: 5 failures."
-        ),
-    )
-
-    circuit_breaker_recovery_seconds: Mutable[int] = Field(
-        default=60,
-        ge=10,
-        le=300,
-        description=(
-            "Time to wait before attempting recovery after circuit breaker trips. "
-            "Default: 60 seconds."
-        ),
-    )
-
-
-def _env_int(name: str, default: int) -> int:
-    """Read integer from env, falling back to default."""
-    val = os.getenv(name)
-    if val is not None:
-        try:
-            return int(val)
-        except ValueError:
-            logger.warning(
-                "Invalid int value for %s: %s, using default %s", name, val, default
-            )
-    return default
-
-
-def _env_float(name: str, default: float) -> float:
-    """Read float from env, falling back to default."""
-    val = os.getenv(name)
-    if val is not None:
-        try:
-            return float(val)
-        except ValueError:
-            logger.warning(
-                "Invalid float value for %s: %s, using default %s", name, val, default
-            )
-    return default
+# ---------------------------------------------------------------------------
+# Live snapshot of the current config instances.
+#
+# Initialised to the validated class defaults so ``resolve_*`` is correct even
+# before the configs store is reachable (early boot, tests). Replaced wholesale
+# by :func:`load_connection_health_configs` at startup and by the apply handlers
+# on every ``PUT /configs``.
+# ---------------------------------------------------------------------------
+_retry_config: ConnectionRetryConfig = ConnectionRetryConfig()
+_provisioning_config: ProvisioningRetryConfig = ProvisioningRetryConfig()
+_leadership_config: LeadershipConfig = LeadershipConfig()
+_health_config: ConnectionHealthConfig = ConnectionHealthConfig()
 
 
 def resolve_connection_retry_config() -> Tuple[int, float, float, float]:
-    """Resolve connection retry settings with env var override support.
+    """Return the live ``(max_retries, base_delay, max_delay, jitter)``.
 
-    Priority:
-    1. Environment variables (highest - for backwards compat and emergencies)
-    2. Defaults from ConnectionRetryConfig
-
-    Returns (max_retries, base_delay_seconds, max_delay_seconds, jitter)
+    Reads the module snapshot kept current by the configs apply handlers, so
+    a ``PUT /configs`` for ``ConnectionRetryConfig`` is reflected on the next
+    call without a restart.
     """
-    return (
-        _env_int(
-            "DB_RETRY_MAX_RETRIES",
-            ConnectionRetryConfig.model_fields["max_retries"].default,
-        ),
-        _env_float(
-            "DB_RETRY_BASE_DELAY_SECONDS",
-            ConnectionRetryConfig.model_fields["base_delay_seconds"].default,
-        ),
-        _env_float(
-            "DB_RETRY_MAX_DELAY_SECONDS",
-            ConnectionRetryConfig.model_fields["max_delay_seconds"].default,
-        ),
-        _env_float(
-            "DB_RETRY_JITTER", ConnectionRetryConfig.model_fields["jitter"].default
-        ),
-    )
+    c = _retry_config
+    return (c.max_retries, c.base_delay_seconds, c.max_delay_seconds, c.jitter)
 
 
 def resolve_provisioning_retry_config() -> Tuple[int, float]:
-    """Resolve provisioning retry settings with env var override support.
-
-    Priority:
-    1. Environment variables (highest - for backwards compat and emergencies)
-    2. Defaults from ProvisioningRetryConfig
-
-    Returns (max_attempts, lock_backoff_seconds)
-    """
-    return (
-        _env_int(
-            "DB_PROVISIONING_RETRY_ATTEMPTS",
-            ProvisioningRetryConfig.model_fields["max_attempts"].default,
-        ),
-        _env_float(
-            "DB_PROVISIONING_LOCK_BACKOFF_SECONDS",
-            ProvisioningRetryConfig.model_fields["lock_backoff_seconds"].default,
-        ),
-    )
+    """Return the live ``(max_attempts, lock_backoff_seconds)``."""
+    c = _provisioning_config
+    return (c.max_attempts, c.lock_backoff_seconds)
 
 
 def resolve_leadership_config() -> Tuple[int, int, float, int, int]:
-    """Resolve leadership settings with env var override support.
+    """Return the live leadership settings.
 
-    Priority:
-    1. Environment variables (highest - for backwards compat and emergencies)
-    2. Defaults from LeadershipConfig
-
-    Returns (lock_acquire_timeout_seconds, dismiss_force_delete_after_seconds,
-             leadership_interval_seconds, visibility_extend_seconds,
-             unknown_grace_seconds)
+    ``(lock_acquire_timeout_seconds, dismiss_force_delete_after_seconds,
+    leadership_interval_seconds, visibility_extend_seconds,
+    unknown_grace_seconds)``.
     """
+    c = _leadership_config
     return (
-        _env_int(
-            "DB_LEADERSHIP_LOCK_TIMEOUT_SECONDS",
-            LeadershipConfig.model_fields["lock_acquire_timeout_seconds"].default,
-        ),
-        _env_int(
-            "DB_LEADERSHIP_DISMISS_FORCE_DELETE_SECONDS",
-            LeadershipConfig.model_fields["dismiss_force_delete_after_seconds"].default,
-        ),
-        _env_float(
-            "DB_LEADERSHIP_INTERVAL_SECONDS",
-            LeadershipConfig.model_fields["leadership_interval_seconds"].default,
-        ),
-        _env_int(
-            "DB_LEADERSHIP_VISIBILITY_EXTEND_SECONDS",
-            LeadershipConfig.model_fields["visibility_extend_seconds"].default,
-        ),
-        _env_int(
-            "DB_LEADERSHIP_UNKNOWN_GRACE_SECONDS",
-            LeadershipConfig.model_fields["unknown_grace_seconds"].default,
-        ),
+        c.lock_acquire_timeout_seconds,
+        c.dismiss_force_delete_after_seconds,
+        c.leadership_interval_seconds,
+        c.visibility_extend_seconds,
+        c.unknown_grace_seconds,
     )
 
 
-def resolve_connection_health_config() -> Tuple[float, bool, int, int, int]:
-    """Resolve connection health settings with env var override support.
+def resolve_slow_pool_acquire_threshold() -> float:
+    """Return the live slow-pool-acquire logging threshold in seconds."""
+    return _health_config.slow_pool_acquire_threshold_seconds
 
-    Priority:
-    1. Environment variables (highest - for backwards compat and emergencies)
-    2. Defaults from ConnectionHealthConfig
 
-    Returns (slow_pool_acquire_threshold_seconds, advisory_lock_validation_enabled,
-             connection_health_check_interval_seconds, circuit_breaker_threshold,
-             circuit_breaker_recovery_seconds)
+# ---------------------------------------------------------------------------
+# Apply handlers — fire post-persist on every ``PUT /configs`` for these
+# classes (see ``platform_config_service.run_apply_handlers``). Signature is
+# the house ``(config, catalog_id, collection_id, conn)``.
+# ---------------------------------------------------------------------------
+async def _apply_retry_config(config: Any, *_: Any) -> None:
+    global _retry_config
+    if isinstance(config, ConnectionRetryConfig):
+        _retry_config = config
+        logger.info(
+            "ConnectionRetryConfig live-applied: max_retries=%d", config.max_retries
+        )
+
+
+async def _apply_provisioning_config(config: Any, *_: Any) -> None:
+    global _provisioning_config
+    if isinstance(config, ProvisioningRetryConfig):
+        _provisioning_config = config
+        logger.info(
+            "ProvisioningRetryConfig live-applied: max_attempts=%d", config.max_attempts
+        )
+
+
+async def _apply_leadership_config(config: Any, *_: Any) -> None:
+    global _leadership_config
+    if isinstance(config, LeadershipConfig):
+        _leadership_config = config
+        logger.info(
+            "LeadershipConfig live-applied: interval_seconds=%.1f",
+            config.leadership_interval_seconds,
+        )
+
+
+async def _apply_health_config(config: Any, *_: Any) -> None:
+    global _health_config
+    if isinstance(config, ConnectionHealthConfig):
+        _health_config = config
+        logger.info(
+            "ConnectionHealthConfig live-applied: "
+            "slow_pool_acquire_threshold_seconds=%.2f",
+            config.slow_pool_acquire_threshold_seconds,
+        )
+
+
+_APPLY_HANDLERS = (
+    (ConnectionRetryConfig, _apply_retry_config),
+    (ProvisioningRetryConfig, _apply_provisioning_config),
+    (LeadershipConfig, _apply_leadership_config),
+    (ConnectionHealthConfig, _apply_health_config),
+)
+
+
+def register_connection_health_apply_handlers() -> None:
+    """Register apply handlers so live config edits update the snapshot.
+
+    Call once from ``DBConfigModule.lifespan``; pair with
+    :func:`unregister_connection_health_apply_handlers` on teardown.
     """
-    val = os.getenv("DB_HEALTH_ADVISORY_LOCK_VALIDATION_ENABLED")
-    advisory_validation = (
-        val.lower() in ("true", "1", "yes")
-        if val is not None
-        else ConnectionHealthConfig.model_fields[
-            "advisory_lock_validation_enabled"
-        ].default
-    )
+    for cls, handler in _APPLY_HANDLERS:
+        cls.register_apply_handler(handler)
 
-    return (
-        _env_float(
-            "DB_HEALTH_SLOW_POOL_ACQUIRE_SECONDS",
-            ConnectionHealthConfig.model_fields[
-                "slow_pool_acquire_threshold_seconds"
-            ].default,
-        ),
-        advisory_validation,
-        _env_int(
-            "DB_HEALTH_CHECK_INTERVAL_SECONDS",
-            ConnectionHealthConfig.model_fields[
-                "connection_health_check_interval_seconds"
-            ].default,
-        ),
-        _env_int(
-            "DB_HEALTH_CIRCUIT_BREAKER_THRESHOLD",
-            ConnectionHealthConfig.model_fields["circuit_breaker_threshold"].default,
-        ),
-        _env_int(
-            "DB_HEALTH_CIRCUIT_BREAKER_RECOVERY_SECONDS",
-            ConnectionHealthConfig.model_fields[
-                "circuit_breaker_recovery_seconds"
-            ].default,
-        ),
-    )
+
+def unregister_connection_health_apply_handlers() -> None:
+    """Detach the apply handlers registered by
+    :func:`register_connection_health_apply_handlers`."""
+    for cls, handler in _APPLY_HANDLERS:
+        cls.unregister_apply_handler(handler)
+
+
+async def load_connection_health_configs(engine: Optional[Any] = None) -> None:
+    """Populate the module snapshot from the configs store at startup.
+
+    Best-effort: any failure (store not yet reachable, storage table absent)
+    leaves the validated class defaults in place — the apply handlers will
+    catch the values on the next seed/``PUT``. Call from
+    ``DBConfigModule.lifespan`` once ``PlatformConfigsProtocol`` is registered.
+    """
+    global _retry_config, _provisioning_config, _leadership_config, _health_config
+
+    try:
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+    except Exception:  # pragma: no cover - import wiring only
+        return
+
+    mgr = get_protocol(PlatformConfigsProtocol)
+    if mgr is None:
+        return
+
+    ctx = None
+    if engine is not None:
+        try:
+            from dynastore.models.driver_context import DriverContext
+
+            ctx = DriverContext(db_resource=engine)
+        except Exception:
+            ctx = None
+
+    async def _read(cls):
+        try:
+            cfg = await mgr.get_config(cls, ctx=ctx)
+            return cfg if isinstance(cfg, cls) else None
+        except Exception as e:
+            logger.debug(
+                "connection_health_config: could not load %s: %s", cls.__name__, e
+            )
+            return None
+
+    retry = await _read(ConnectionRetryConfig)
+    if retry is not None:
+        _retry_config = retry
+    provisioning = await _read(ProvisioningRetryConfig)
+    if provisioning is not None:
+        _provisioning_config = provisioning
+    leadership = await _read(LeadershipConfig)
+    if leadership is not None:
+        _leadership_config = leadership
+    health = await _read(ConnectionHealthConfig)
+    if health is not None:
+        _health_config = health

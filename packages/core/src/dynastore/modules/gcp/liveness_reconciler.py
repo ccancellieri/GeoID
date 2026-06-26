@@ -101,8 +101,9 @@ class ReconcileOutcome(NamedTuple):
 def _get_dismiss_force_delete_after() -> timedelta:
     """Get the grace period before force-deleting dismissed liveness records.
 
-    Configuration: Resolved from DB_LEADERSHIP_DISMISS_FORCE_DELETE_SECONDS
-    env var or LeadershipConfig default (600s).
+    Configuration: Resolved from the live
+    ``LeadershipConfig.dismiss_force_delete_after_seconds`` (configs API,
+    hot-reloadable; default 600s).
     """
     _, dismiss_seconds, _, _, _ = resolve_leadership_config()
     return timedelta(seconds=dismiss_seconds)
@@ -272,8 +273,8 @@ class GcpLivenessReconciler(PeriodicService):
         b) Execution still ALIVE within the force-delete deadline:
            call ``runner.signal_stop(task)`` (cancel / graceful SIGTERM) and
            return ``False`` — the next reconciler cycle re-probes.
-        c) Execution still ALIVE past the deadline (configurable via
-           DB_LEADERSHIP_DISMISS_FORCE_DELETE_SECONDS, default 600s):
+        c) Execution still ALIVE past the deadline (configurable via the live
+           ``LeadershipConfig.dismiss_force_delete_after_seconds``, default 600s):
            call ``runner.force_stop(task)`` (hard delete), stamp
            ``dismiss_confirmed_at``, emit ``dismiss_unconfirmed_total``,
            return ``True``.

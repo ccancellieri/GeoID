@@ -77,9 +77,9 @@ def retry_on_lock_conflict(max_retries: int | None = None, base_delay: float | N
     """Decorator to retry database operations when encountering lock contention
     or asyncpg protocol 'operation in progress' errors.
 
-    Configuration: Values are resolved from (1) function parameters,
-    (2) environment variables, (3) ConnectionRetryConfig defaults.
-    Values are resolved at CALL TIME, so env var changes take effect immediately.
+    Configuration: Values are resolved from (1) explicit function parameters,
+    else (2) the live ``ConnectionRetryConfig`` (configs API, hot-reloadable).
+    Resolved at CALL TIME, so a ``PUT /configs`` takes effect on the next call.
     See :mod:`connection_health_config` for details.
     """
 
@@ -314,9 +314,9 @@ def sync_acquire_startup_lock(
 ) -> "Iterator[Optional[DbResource]]":
     """Synchronous version of acquire_startup_lock for DDL coordination.
 
-    Configuration: Timeout is resolved from (1) function parameter,
-    (2) environment variable DB_LEADERSHIP_LOCK_TIMEOUT_SECONDS,
-    (3) LeadershipConfig default (30s).
+    Configuration: Timeout is resolved from (1) the function parameter, else
+    (2) the live ``LeadershipConfig.lock_acquire_timeout_seconds`` (configs
+    API, hot-reloadable; default 30s).
     """
     if timeout is None:
         timeout_secs, _, _, _, _ = resolve_leadership_config()
@@ -383,9 +383,9 @@ async def acquire_startup_lock(
     Serialization is handled internally by Query Executor.
     Ensures all operations happen on the same connection if an engine is provided.
 
-    Configuration: Timeout is resolved from (1) function parameter,
-    (2) environment variable DB_LEADERSHIP_LOCK_TIMEOUT_SECONDS,
-    (3) LeadershipConfig default (30s).
+    Configuration: Timeout is resolved from (1) the function parameter, else
+    (2) the live ``LeadershipConfig.lock_acquire_timeout_seconds`` (configs
+    API, hot-reloadable; default 30s).
     """
     if timeout is None:
         timeout_secs, _, _, _, _ = resolve_leadership_config()

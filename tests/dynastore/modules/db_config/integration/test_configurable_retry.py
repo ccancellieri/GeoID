@@ -16,26 +16,68 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Integration tests for configurable retry behavior."""
+"""Integration tests for configurable retry behavior.
+
+The retry/leadership knobs are driven by the live configs snapshot (set here
+via the apply handlers, exactly as a ``PUT /configs`` would), not by
+environment variables. Explicit call-time parameters still win over config.
+"""
 
 from __future__ import annotations
 
-import asyncio
-import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from dynastore.modules.db_config.query_executor import retry_on_transient_connect, provisioning_write_with_retry
+import dynastore.modules.db_config.connection_health_config as chc
+from dynastore.modules.db_config.connection_health_config import (
+    ConnectionRetryConfig,
+    ProvisioningRetryConfig,
+    LeadershipConfig,
+)
+from dynastore.modules.db_config.query_executor import (
+    retry_on_transient_connect,
+    provisioning_write_with_retry,
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_snapshot():
+    """Restore the live config snapshot after each test."""
+    saved = (
+        chc._retry_config,
+        chc._provisioning_config,
+        chc._leadership_config,
+        chc._health_config,
+    )
+    yield
+    (
+        chc._retry_config,
+        chc._provisioning_config,
+        chc._leadership_config,
+        chc._health_config,
+    ) = saved
+
+
+def _mock_context():
+    """A mock async context manager for managed_transaction."""
+    class MockContext:
+        async def __aenter__(self):
+            return "mock_connection"
+
+        async def __aexit__(self, *args):
+            return False
+
+    return MockContext()
 
 
 class TestRetryOnTransientConnectConfigurable:
-    """Tests that retry_on_transient_connect uses configurable values."""
+    """retry_on_transient_connect honours the live ConnectionRetryConfig."""
 
     @pytest.mark.asyncio
-    async def test_uses_env_var_max_retries(self):
-        """Test that retry_on_transient_connect respects DB_RETRY_MAX_RETRIES env var."""
+    async def test_uses_configured_max_retries(self):
+        chc._retry_config = ConnectionRetryConfig(max_retries=3, base_delay_seconds=0.1)
         call_count = 0
 
         @retry_on_transient_connect()
@@ -44,18 +86,16 @@ class TestRetryOnTransientConnectConfigurable:
             call_count += 1
             raise OperationalError("connection failed", {}, None)
 
-        env = {"DB_RETRY_MAX_RETRIES": "3"}
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(OperationalError):
-                await failing_func()
+        with pytest.raises(OperationalError):
+            await failing_func()
 
         assert call_count == 3, f"Expected 3 attempts, got {call_count}"
 
     @pytest.mark.asyncio
-    async def test_uses_env_var_base_delay(self):
-        """Test that retry_on_transient_connect respects DB_RETRY_BASE_DELAY_SECONDS env var."""
+    async def test_uses_configured_base_delay(self):
         import time
 
+        chc._retry_config = ConnectionRetryConfig(base_delay_seconds=0.1)
         call_count = 0
 
         @retry_on_transient_connect(max_retries=2)
@@ -64,21 +104,19 @@ class TestRetryOnTransientConnectConfigurable:
             call_count += 1
             raise OperationalError("connection failed", {}, None)
 
-        env = {"DB_RETRY_BASE_DELAY_SECONDS": "0.1"}
-        with patch.dict(os.environ, env, clear=True):
-            start = time.monotonic()
-            with pytest.raises(OperationalError):
-                await failing_func()
-            elapsed = time.monotonic() - start
+        start = time.monotonic()
+        with pytest.raises(OperationalError):
+            await failing_func()
+        elapsed = time.monotonic() - start
 
-        # With base_delay=0.1 and 2 retries: first attempt, 0.1s delay, second attempt
-        # Total delay should be ~0.1s (not 0.5s default)
+        # base_delay=0.1, 2 attempts → ~0.1s of total sleep (well under the 0.5s default).
         assert elapsed < 0.3, f"Expected fast retries (<0.3s), got {elapsed:.2f}s"
         assert call_count == 2
 
     @pytest.mark.asyncio
-    async def test_parameter_overrides_env_var(self):
-        """Test that explicit parameters override env vars."""
+    async def test_parameter_overrides_config(self):
+        # Config says 10, the explicit decorator parameter says 2 — parameter wins.
+        chc._retry_config = ConnectionRetryConfig(max_retries=10, base_delay_seconds=0.1)
         call_count = 0
 
         @retry_on_transient_connect(max_retries=2)
@@ -87,17 +125,13 @@ class TestRetryOnTransientConnectConfigurable:
             call_count += 1
             raise OperationalError("connection failed", {}, None)
 
-        env = {"DB_RETRY_MAX_RETRIES": "10"}
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(OperationalError):
-                await failing_func()
+        with pytest.raises(OperationalError):
+            await failing_func()
 
-        # Parameter (2) should override env var (10)
         assert call_count == 2, f"Expected 2 attempts (param override), got {call_count}"
 
     @pytest.mark.asyncio
     async def test_succeeds_before_max_retries(self):
-        """Test that function succeeds if retry succeeds before max attempts."""
         call_count = 0
 
         @retry_on_transient_connect(max_retries=5)
@@ -114,138 +148,103 @@ class TestRetryOnTransientConnectConfigurable:
 
 
 class TestProvisioningWriteWithRetryConfigurable:
-    """Tests that provisioning_write_with_retry uses configurable values."""
+    """provisioning_write_with_retry honours the live ProvisioningRetryConfig."""
 
     @pytest.mark.asyncio
-    async def test_uses_env_var_attempts(self):
-        """Test that provisioning_write_with_retry respects DB_PROVISIONING_RETRY_ATTEMPTS env var."""
-        from unittest.mock import MagicMock, patch
-
+    async def test_uses_configured_attempts(self):
+        chc._provisioning_config = ProvisioningRetryConfig(max_attempts=4)
         call_count = 0
 
         async def failing_fn(conn):
             nonlocal call_count
             call_count += 1
-            from sqlalchemy.exc import OperationalError
             exc = OperationalError("connection lost", {}, None)
             exc.connection_invalidated = True  # Mark as transient
             raise exc
 
         mock_engine = MagicMock()
-
-        env = {"DB_PROVISIONING_RETRY_ATTEMPTS": "4"}
-        with patch.dict(os.environ, env, clear=True):
-            with patch("dynastore.modules.db_config.query_executor.managed_transaction") as mock_txn:
-                mock_txn.side_effect = lambda engine: self._mock_context(failing_fn)
-                with pytest.raises(OperationalError):
-                    await provisioning_write_with_retry(mock_engine, failing_fn)
+        with patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction"
+        ) as mock_txn:
+            mock_txn.side_effect = lambda engine: _mock_context()
+            with pytest.raises(OperationalError):
+                await provisioning_write_with_retry(mock_engine, failing_fn)
 
         assert call_count == 4, f"Expected 4 attempts, got {call_count}"
 
-    def _mock_context(self, fn):
-        """Helper to create a mock async context manager."""
-        class MockContext:
-            async def __aenter__(self):
-                return "mock_connection"
-
-            async def __aexit__(self, *args):
-                pass
-
-        return MockContext()
-
     @pytest.mark.asyncio
-    async def test_parameter_overrides_env_var(self):
-        """Test that explicit parameters override env vars."""
-        from unittest.mock import MagicMock, patch
-
+    async def test_parameter_overrides_config(self):
+        chc._provisioning_config = ProvisioningRetryConfig(max_attempts=10)
         call_count = 0
 
         async def failing_fn(conn):
             nonlocal call_count
             call_count += 1
-            from sqlalchemy.exc import OperationalError
             exc = OperationalError("connection lost", {}, None)
             exc.connection_invalidated = True  # Mark as transient
             raise exc
 
         mock_engine = MagicMock()
+        with patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction"
+        ) as mock_txn:
+            mock_txn.side_effect = lambda engine: _mock_context()
+            with pytest.raises(OperationalError):
+                await provisioning_write_with_retry(mock_engine, failing_fn, attempts=2)
 
-        env = {"DB_PROVISIONING_RETRY_ATTEMPTS": "10"}
-        with patch.dict(os.environ, env, clear=True):
-            with patch("dynastore.modules.db_config.query_executor.managed_transaction") as mock_txn:
-                mock_txn.side_effect = lambda engine: self._mock_context(failing_fn)
-                with pytest.raises(OperationalError):
-                    await provisioning_write_with_retry(mock_engine, failing_fn, attempts=2)
-
-        # Parameter (2) should override env var (10)
         assert call_count == 2, f"Expected 2 attempts (param override), got {call_count}"
 
 
 class TestLeadershipConfigIntegration:
-    """Tests that leadership settings are used in actual code."""
+    """Leadership timeout resolves from config when no parameter is given."""
 
     def test_acquire_startup_lock_uses_configurable_timeout(self):
-        """Test that acquire_startup_lock uses configurable timeout."""
         from dynastore.modules.db_config.locking_tools import acquire_startup_lock
 
-        # This is more of a smoke test - we verify the function accepts None timeout
-        # and uses the resolved config internally
         import inspect
         sig = inspect.signature(acquire_startup_lock)
         timeout_param = sig.parameters.get("timeout")
         assert timeout_param is not None
-        assert timeout_param.default is None  # Should default to None (resolves from config)
+        assert timeout_param.default is None  # Defaults to None → resolves from config
 
     def test_sync_acquire_startup_lock_uses_configurable_timeout(self):
-        """Test that sync_acquire_startup_lock uses configurable timeout."""
         from dynastore.modules.db_config.locking_tools import sync_acquire_startup_lock
 
         import inspect
         sig = inspect.signature(sync_acquire_startup_lock)
         timeout_param = sig.parameters.get("timeout")
         assert timeout_param is not None
-        assert timeout_param.default is None  # Should default to None (resolves from config)
+        assert timeout_param.default is None  # Defaults to None → resolves from config
 
 
 class TestGcpLivenessReconcilerConfigurable:
-    """Tests that GcpLivenessReconciler uses configurable values."""
+    """GcpLivenessReconciler reads the live LeadershipConfig at construction."""
 
-    def test_uses_configurable_defaults(self):
-        """Test that GcpLivenessReconciler uses configurable defaults when no params provided."""
+    def test_uses_configured_defaults(self):
         from dynastore.modules.gcp.liveness_reconciler import GcpLivenessReconciler
-        from unittest.mock import MagicMock
 
-        mock_engine = MagicMock()
-
-        env = {
-            "DB_LEADERSHIP_INTERVAL_SECONDS": "15.0",
-            "DB_LEADERSHIP_VISIBILITY_EXTEND_SECONDS": "250",
-            "DB_LEADERSHIP_UNKNOWN_GRACE_SECONDS": "150",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            reconciler = GcpLivenessReconciler(mock_engine)
+        chc._leadership_config = LeadershipConfig(
+            leadership_interval_seconds=15.0,
+            visibility_extend_seconds=250,
+            unknown_grace_seconds=150,
+        )
+        reconciler = GcpLivenessReconciler(MagicMock())
 
         assert reconciler.cadence_seconds == 15.0
         assert reconciler._extend_visibility_seconds == 250
         assert reconciler._unknown_grace_seconds == 150
 
     def test_parameter_overrides_config(self):
-        """Test that explicit parameters override configurable defaults."""
         from dynastore.modules.gcp.liveness_reconciler import GcpLivenessReconciler
-        from unittest.mock import MagicMock
 
-        mock_engine = MagicMock()
+        chc._leadership_config = LeadershipConfig(leadership_interval_seconds=15.0)
+        reconciler = GcpLivenessReconciler(
+            MagicMock(),
+            interval_seconds=25.0,
+            extend_visibility_seconds=400,
+            unknown_grace_seconds=200,
+        )
 
-        env = {"DB_LEADERSHIP_INTERVAL_SECONDS": "15.0"}
-        with patch.dict(os.environ, env, clear=True):
-            reconciler = GcpLivenessReconciler(
-                mock_engine,
-                interval_seconds=25.0,
-                extend_visibility_seconds=400,
-                unknown_grace_seconds=200,
-            )
-
-        # Parameters should override env vars
         assert reconciler.cadence_seconds == 25.0
         assert reconciler._extend_visibility_seconds == 400
         assert reconciler._unknown_grace_seconds == 200

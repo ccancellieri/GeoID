@@ -16,15 +16,18 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for connection health configuration."""
+"""Unit tests for connection health configuration.
+
+These exercise the *live snapshot* contract: ``resolve_*`` reads the module
+snapshot, and the apply handlers (fired by the configs store on a ``PUT``)
+replace that snapshot in place — no environment variables, no restart.
+"""
 
 from __future__ import annotations
 
-import os
-from unittest.mock import patch
-
 import pytest
 
+import dynastore.modules.db_config.connection_health_config as chc
 from dynastore.modules.db_config.connection_health_config import (
     ConnectionRetryConfig,
     ProvisioningRetryConfig,
@@ -33,207 +36,147 @@ from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
     resolve_provisioning_retry_config,
     resolve_leadership_config,
-    resolve_connection_health_config,
+    resolve_slow_pool_acquire_threshold,
+    _apply_retry_config,
+    _apply_provisioning_config,
+    _apply_leadership_config,
+    _apply_health_config,
 )
 
 
-class TestConnectionRetryConfig:
-    """Tests for ConnectionRetryConfig."""
+@pytest.fixture(autouse=True)
+def _restore_snapshot():
+    """Each test mutates module-global snapshots; restore them afterwards so
+    tests cannot leak config state into one another."""
+    saved = (
+        chc._retry_config,
+        chc._provisioning_config,
+        chc._leadership_config,
+        chc._health_config,
+    )
+    yield
+    (
+        chc._retry_config,
+        chc._provisioning_config,
+        chc._leadership_config,
+        chc._health_config,
+    ) = saved
 
-    def test_default_values(self):
-        """Test that default values are correctly set."""
+
+class TestConfigClasses:
+    """Defaults, addresses, and validation bounds on the PluginConfig classes."""
+
+    def test_retry_defaults_and_address(self):
         config = ConnectionRetryConfig()
         assert config.max_retries == 5
         assert config.base_delay_seconds == 0.5
         assert config.max_delay_seconds == 8.0
         assert config.jitter == 0.25
-
-    def test_address(self):
-        """Test that address is correctly set."""
         assert ConnectionRetryConfig._address == ("platform", "db", "retry")
 
-    def test_validation_ge(self):
-        """Test that validation rejects values below minimum."""
-        with pytest.raises(ValueError):
-            ConnectionRetryConfig(max_retries=0)
-        with pytest.raises(ValueError):
-            ConnectionRetryConfig(base_delay_seconds=0.05)
-
-    def test_validation_le(self):
-        """Test that validation rejects values above maximum."""
-        with pytest.raises(ValueError):
-            ConnectionRetryConfig(max_retries=25)
-        with pytest.raises(ValueError):
-            ConnectionRetryConfig(max_delay_seconds=65.0)
-
-
-class TestProvisioningRetryConfig:
-    """Tests for ProvisioningRetryConfig."""
-
-    def test_default_values(self):
-        """Test that default values are correctly set."""
+    def test_provisioning_defaults_and_address(self):
         config = ProvisioningRetryConfig()
         assert config.max_attempts == 3
         assert config.lock_backoff_seconds == 1.0
-
-    def test_address(self):
-        """Test that address is correctly set."""
         assert ProvisioningRetryConfig._address == ("platform", "db", "provisioning_retry")
 
-
-class TestLeadershipConfig:
-    """Tests for LeadershipConfig."""
-
-    def test_default_values(self):
-        """Test that default values are correctly set."""
+    def test_leadership_defaults_and_address(self):
         config = LeadershipConfig()
         assert config.lock_acquire_timeout_seconds == 30
         assert config.dismiss_force_delete_after_seconds == 600
         assert config.leadership_interval_seconds == 20.0
         assert config.visibility_extend_seconds == 300
         assert config.unknown_grace_seconds == 180
-
-    def test_address(self):
-        """Test that address is correctly set."""
         assert LeadershipConfig._address == ("platform", "db", "leadership")
 
-
-class TestConnectionHealthConfig:
-    """Tests for ConnectionHealthConfig."""
-
-    def test_default_values(self):
-        """Test that default values are correctly set."""
+    def test_health_defaults_and_address(self):
         config = ConnectionHealthConfig()
         assert config.slow_pool_acquire_threshold_seconds == 0.5
-        assert config.advisory_lock_validation_enabled is False
-        assert config.connection_health_check_interval_seconds == 30
-        assert config.circuit_breaker_threshold == 5
-        assert config.circuit_breaker_recovery_seconds == 60
-
-    def test_address(self):
-        """Test that address is correctly set."""
         assert ConnectionHealthConfig._address == ("platform", "db", "health")
 
+    def test_validation_bounds_enforced(self):
+        # Bounds are enforced because the configs store always instantiates the
+        # class — there is no env bypass that could skip Pydantic validation.
+        with pytest.raises(ValueError):
+            ConnectionRetryConfig(max_retries=0)
+        with pytest.raises(ValueError):
+            ConnectionRetryConfig(max_retries=25)
+        with pytest.raises(ValueError):
+            ConnectionRetryConfig(base_delay_seconds=0.05)
+        with pytest.raises(ValueError):
+            ConnectionRetryConfig(max_delay_seconds=65.0)
 
-class TestResolveFunctions:
-    """Tests for config resolution functions."""
 
-    def test_resolve_connection_retry_config_defaults(self):
-        """Test that resolve_connection_retry_config returns defaults when no env vars set."""
-        with patch.dict(os.environ, {}, clear=True):
-            max_retries, base_delay, max_delay, jitter = resolve_connection_retry_config()
-            assert max_retries == 5
-            assert base_delay == 0.5
-            assert max_delay == 8.0
-            assert jitter == 0.25
+class TestResolveReadsSnapshot:
+    """``resolve_*`` returns the validated class defaults out of the box."""
 
-    def test_resolve_connection_retry_config_env_override(self):
-        """Test that env vars override defaults."""
-        env = {
-            "DB_RETRY_MAX_RETRIES": "10",
-            "DB_RETRY_BASE_DELAY_SECONDS": "1.0",
-            "DB_RETRY_MAX_DELAY_SECONDS": "15.0",
-            "DB_RETRY_JITTER": "0.5",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            max_retries, base_delay, max_delay, jitter = resolve_connection_retry_config()
-            assert max_retries == 10
-            assert base_delay == 1.0
-            assert max_delay == 15.0
-            assert jitter == 0.5
+    def test_retry_defaults(self):
+        assert resolve_connection_retry_config() == (5, 0.5, 8.0, 0.25)
 
-    def test_resolve_provisioning_retry_config_defaults(self):
-        """Test that resolve_provisioning_retry_config returns defaults when no env vars set."""
-        with patch.dict(os.environ, {}, clear=True):
-            attempts, lock_backoff = resolve_provisioning_retry_config()
-            assert attempts == 3
-            assert lock_backoff == 1.0
+    def test_provisioning_defaults(self):
+        assert resolve_provisioning_retry_config() == (3, 1.0)
 
-    def test_resolve_provisioning_retry_config_env_override(self):
-        """Test that env vars override defaults."""
-        env = {
-            "DB_PROVISIONING_RETRY_ATTEMPTS": "5",
-            "DB_PROVISIONING_LOCK_BACKOFF_SECONDS": "2.0",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            attempts, lock_backoff = resolve_provisioning_retry_config()
-            assert attempts == 5
-            assert lock_backoff == 2.0
+    def test_leadership_defaults(self):
+        assert resolve_leadership_config() == (30, 600, 20.0, 300, 180)
 
-    def test_resolve_leadership_config_defaults(self):
-        """Test that resolve_leadership_config returns defaults when no env vars set."""
-        with patch.dict(os.environ, {}, clear=True):
-            lock_timeout, dismiss_force_delete, interval, visibility, unknown_grace = resolve_leadership_config()
-            assert lock_timeout == 30
-            assert dismiss_force_delete == 600
-            assert interval == 20.0
-            assert visibility == 300
-            assert unknown_grace == 180
+    def test_health_default(self):
+        assert resolve_slow_pool_acquire_threshold() == 0.5
 
-    def test_resolve_leadership_config_env_override(self):
-        """Test that env vars override defaults."""
-        env = {
-            "DB_LEADERSHIP_LOCK_TIMEOUT_SECONDS": "60",
-            "DB_LEADERSHIP_DISMISS_FORCE_DELETE_SECONDS": "1200",
-            "DB_LEADERSHIP_INTERVAL_SECONDS": "30.0",
-            "DB_LEADERSHIP_VISIBILITY_EXTEND_SECONDS": "600",
-            "DB_LEADERSHIP_UNKNOWN_GRACE_SECONDS": "300",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            lock_timeout, dismiss_force_delete, interval, visibility, unknown_grace = resolve_leadership_config()
-            assert lock_timeout == 60
-            assert dismiss_force_delete == 1200
-            assert interval == 30.0
-            assert visibility == 600
-            assert unknown_grace == 300
 
-    def test_resolve_connection_health_config_defaults(self):
-        """Test that resolve_connection_health_config returns defaults when no env vars set."""
-        with patch.dict(os.environ, {}, clear=True):
-            slow_threshold, advisory_validation, check_interval, cb_threshold, cb_recovery = resolve_connection_health_config()
-            assert slow_threshold == 0.5
-            assert advisory_validation is False
-            assert check_interval == 30
-            assert cb_threshold == 5
-            assert cb_recovery == 60
+class TestApplyHandlersHotReload:
+    """The apply handlers swap the live snapshot; ``resolve_*`` reflects it
+    immediately — this is the configs-API hot-reload path."""
 
-    def test_resolve_connection_health_config_env_override(self):
-        """Test that env vars override defaults."""
-        env = {
-            "DB_HEALTH_SLOW_POOL_ACQUIRE_SECONDS": "1.0",
-            "DB_HEALTH_ADVISORY_LOCK_VALIDATION_ENABLED": "true",
-            "DB_HEALTH_CHECK_INTERVAL_SECONDS": "60",
-            "DB_HEALTH_CIRCUIT_BREAKER_THRESHOLD": "10",
-            "DB_HEALTH_CIRCUIT_BREAKER_RECOVERY_SECONDS": "120",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            slow_threshold, advisory_validation, check_interval, cb_threshold, cb_recovery = resolve_connection_health_config()
-            assert slow_threshold == 1.0
-            assert advisory_validation is True
-            assert check_interval == 60
-            assert cb_threshold == 10
-            assert cb_recovery == 120
+    @pytest.mark.asyncio
+    async def test_apply_retry_updates_resolve(self):
+        await _apply_retry_config(
+            ConnectionRetryConfig(max_retries=10, base_delay_seconds=1.0), None, None, None
+        )
+        max_retries, base_delay, _, _ = resolve_connection_retry_config()
+        assert max_retries == 10
+        assert base_delay == 1.0
 
-    def test_resolve_connection_health_config_bool_parsing(self):
-        """Test that boolean env var parsing handles various true values."""
-        for true_val in ("true", "TRUE", "True", "1", "yes", "YES"):
-            with patch.dict(os.environ, {"DB_HEALTH_ADVISORY_LOCK_VALIDATION_ENABLED": true_val}, clear=True):
-                _, advisory_validation, _, _, _ = resolve_connection_health_config()
-                assert advisory_validation is True, f"Failed for value: {true_val}"
+    @pytest.mark.asyncio
+    async def test_apply_provisioning_updates_resolve(self):
+        await _apply_provisioning_config(
+            ProvisioningRetryConfig(max_attempts=7, lock_backoff_seconds=2.0), None, None, None
+        )
+        assert resolve_provisioning_retry_config() == (7, 2.0)
 
-        for false_val in ("false", "FALSE", "False", "0", "no", "NO"):
-            with patch.dict(os.environ, {"DB_HEALTH_ADVISORY_LOCK_VALIDATION_ENABLED": false_val}, clear=True):
-                _, advisory_validation, _, _, _ = resolve_connection_health_config()
-                assert advisory_validation is False, f"Failed for value: {false_val}"
+    @pytest.mark.asyncio
+    async def test_apply_leadership_updates_resolve(self):
+        await _apply_leadership_config(
+            LeadershipConfig(lock_acquire_timeout_seconds=60, leadership_interval_seconds=30.0),
+            None, None, None,
+        )
+        lock_timeout, _, interval, _, _ = resolve_leadership_config()
+        assert lock_timeout == 60
+        assert interval == 30.0
 
-    def test_resolve_invalid_int_env_uses_default(self):
-        """Test that invalid int env values fall back to defaults."""
-        with patch.dict(os.environ, {"DB_RETRY_MAX_RETRIES": "invalid"}, clear=True):
-            max_retries, _, _, _ = resolve_connection_retry_config()
-            assert max_retries == 5  # Default value
+    @pytest.mark.asyncio
+    async def test_apply_health_updates_resolve(self):
+        await _apply_health_config(
+            ConnectionHealthConfig(slow_pool_acquire_threshold_seconds=1.5), None, None, None
+        )
+        assert resolve_slow_pool_acquire_threshold() == 1.5
 
-    def test_resolve_invalid_float_env_uses_default(self):
-        """Test that invalid float env values fall back to defaults."""
-        with patch.dict(os.environ, {"DB_RETRY_BASE_DELAY_SECONDS": "invalid"}, clear=True):
-            _, base_delay, _, _ = resolve_connection_retry_config()
-            assert base_delay == 0.5  # Default value
+    @pytest.mark.asyncio
+    async def test_apply_ignores_wrong_type(self):
+        # A handler must no-op on a foreign config instance (defensive: the
+        # registry keys by class, but isinstance guards belt-and-suspenders).
+        await _apply_retry_config(LeadershipConfig(), None, None, None)
+        assert resolve_connection_retry_config() == (5, 0.5, 8.0, 0.25)
+
+
+class TestApplyHandlerRegistration:
+    """register/unregister round-trips through the PluginConfig registry."""
+
+    def test_register_then_unregister(self):
+        chc.register_connection_health_apply_handlers()
+        try:
+            assert _apply_retry_config in ConnectionRetryConfig.get_apply_handlers()
+            assert _apply_health_config in ConnectionHealthConfig.get_apply_handlers()
+        finally:
+            chc.unregister_connection_health_apply_handlers()
+        assert _apply_retry_config not in ConnectionRetryConfig.get_apply_handlers()
+        assert _apply_health_config not in ConnectionHealthConfig.get_apply_handlers()
