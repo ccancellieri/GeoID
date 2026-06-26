@@ -86,6 +86,7 @@ class MovingFeaturesModule(ModuleProtocol):
 
             logger.info("MovingFeaturesModule: Initialization complete.")
         except Exception as e:
-            logger.error("CRITICAL: MovingFeaturesModule initialization failed: %s", e, exc_info=True)
+            logger.critical("MovingFeaturesModule initialization failed: %s", e, exc_info=True)
+            raise
 
         yield
