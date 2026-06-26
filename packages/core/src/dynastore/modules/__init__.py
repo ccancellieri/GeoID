@@ -212,7 +212,7 @@ def instantiate_modules(app_state: object, include_only: Optional[List[str]] = N
         # clients on the wrong event loop, and leave the registered-plugin
         # registry containing a stale reference.
         if config.instance is not None:
-            logger.info(
+            logger.debug(
                 f"Module '{module_name}' already instantiated ({type(config.instance).__name__}) — reusing."
             )
             continue
@@ -303,13 +303,13 @@ async def lifespan(app_state: object):
                 logger.warning(f"Skipping lifespan for module '{config.cls.__name__}' as it was not instantiated correctly.")
                 continue
 
-            logger.warning(f"DEBUG: Entering lifespan for module: {config.cls.__name__}")
+            logger.debug(f"Entering lifespan for module: {config.cls.__name__}")
             if isinstance(config.instance, ModuleProtocol):
                 # The lifespan context manager will handle async initializations.
                 try:
                     lifespan_manager = config.instance.lifespan(app_state)
                     await stack.enter_async_context(lifespan_manager)
-                    logger.warning(f"DEBUG: Lifespan for module '{config.cls.__name__}' entered successfully.")
+                    logger.debug(f"Lifespan for module '{config.cls.__name__}' entered successfully.")
                 except Exception as e:
                     # Wrong-SCOPE soft-skip: ModuleNotFoundError at lifespan
                     # entry means the deployment didn't pip-install the
