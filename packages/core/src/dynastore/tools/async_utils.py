@@ -552,6 +552,16 @@ async def run_leader_loop(
     inside ``on_leader`` keeps the lock held and is the anti-pattern this
     helper exists to prevent.
 
+    INVARIANT — no inner per-tick retry loop. ``on_leader`` must fail fast on a
+    transient error and let it propagate so this loop resigns (exits the
+    leadership context, releasing the advisory lock) and the lock hands off to
+    another pod. Do NOT wrap the tick body in a retry/backoff loop: the lock is
+    held on a dedicated AUTOCOMMIT connection for the whole leadership tenure,
+    so an inner retry pins that connection — and the leader's pool slot —
+    through the entire backoff, worsening pool pressure exactly when the DB is
+    already struggling. Self-healing belongs to the OUTER loop here (resign →
+    sleep one cadence → re-elect), never the inner tick.
+
     ``acquire_leadership`` MUST yield exactly once on every code path. Do not
     hand-roll it for Postgres advisory locks — use
     ``dynastore.modules.db_config.locking_tools.pg_advisory_leadership``,

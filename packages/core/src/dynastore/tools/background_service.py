@@ -214,6 +214,13 @@ class PeriodicService(ABC):
         services do NOT use this path: the supervisor drives their tick through
         ``run_leader_loop``, which intentionally resigns leadership and retries
         on error so a poisoned leader hands the lock to another pod.
+
+        The asymmetry is deliberate. RUN_EVERYWHERE self-heals in place because
+        no shared resource is held across ticks. LEADER_ONLY MUST NOT retry in
+        place: its tick holds the advisory-lock AUTOCOMMIT connection, so an
+        in-place retry pins that connection and a pool slot through the backoff.
+        A failing leader tick must raise so ``run_leader_loop`` resigns and the
+        lock is freed for another pod — never add an inner retry loop there.
         """
         try:
             await self.tick(ctx)
