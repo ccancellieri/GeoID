@@ -422,13 +422,28 @@ worker_task_stac_harvest = ["dynastore[task_base,catalog_grp,drivers_grp,index_g
 # Catalog provisioning executor (#2329): runs the registered provisioners for a
 # catalog or collection in priority order.  Needs:
 #   - task_base          — dispatcher + capability publisher (sync psycopg2 engine)
+#   - module_db          — async asyncpg engine. The provisioners and their
+#                          deprovision hooks (catalog-core schema create/drop,
+#                          CascadeOrchestrator.snapshot_and_enqueue,
+#                          safe_drop_relation) are async and write through
+#                          `managed_transaction(get_engine())` + `await
+#                          conn.execute(...)`; the storage drivers in drivers_grp
+#                          do the same via their async `_get_engine()`. Without
+#                          an async engine `get_engine()` falls back to the sync
+#                          psycopg2 engine and every `await conn.execute(...)`
+#                          fails with "'CursorResult' object can't be awaited"
+#                          (seen on catalog DELETE / deprovision_hard). task_base
+#                          is kept so the boot-time db_config engine_resolver
+#                          still has the sync engine it snapshots for per-driver
+#                          refs — the same dual-engine topology the catalog API
+#                          service already runs.
 #   - catalog_grp        — CatalogsProtocol + provisioning-registry callers
 #   - module_gcp         — GCP provisioner hooks (bucket, pubsub)
 #   - drivers_grp        — storage drivers for any provisioner that writes items
 #   - index_grp          — Elasticsearch client (provisioners may set up ES index)
 #   - configs            — ConfigsProtocol for hot-reloadable threshold/concurrency
 #   - module_storage_postgresql — explicit per SCOPE × routing invariant
-worker_task_catalog_provision = ["dynastore[task_base,catalog_grp,module_gcp,drivers_grp,index_grp,configs,module_storage_postgresql]"]
+worker_task_catalog_provision = ["dynastore[task_base,module_db,catalog_grp,module_gcp,drivers_grp,index_grp,configs,module_storage_postgresql]"]
 # Write-reactive tile-cache invalidation (#1292) needs no dedicated SCOPE / Job
 # (#1298): it reuses the existing tiles_preseed task (operation=invalidate),
 # which already deploys as the geospatial-tiles-preseed-job
