@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from dynastore.models.otf import SchemaEvolution, SchemaVersion, SnapshotInfo
     from dynastore.models.driver_context import DriverContext  # noqa: F401
     from dynastore.modules.storage.hints import Hint
+    from dynastore.models.resolved_ids import ResolvedCollectionIds
 
 
 @runtime_checkable
@@ -79,6 +80,36 @@ class CollectionsProtocol(Protocol):
 
         Returns ``None`` (default) or raises ``ValueError`` when the collection
         is not found, depending on ``allow_missing``.
+        """
+        ...
+
+    async def resolve_collection_ids(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        allow_missing: bool = False,
+    ) -> "ResolvedCollectionIds":
+        """
+        Resolve a collection's IDs (internal + external) from either form.
+
+        Accepts either an external_id or an internal_id and returns both,
+        ensuring callers always have the immutable internal ID for persistence
+        operations.
+
+        Args:
+            catalog_id: The catalog ID (can be external or internal).
+            collection_id: The collection ID (can be external or internal).
+            allow_missing: If False (default), raises ValueError when not found.
+
+        Returns:
+            ResolvedCollectionIds with both id (internal) and external_id.
+
+        Raises:
+            ValueError: When the collection is not found and allow_missing=False.
+
+        This method is the canonical resolution point for config persistence
+        (Issue #2430) to ensure configs are keyed on immutable internal IDs.
         """
         ...
 

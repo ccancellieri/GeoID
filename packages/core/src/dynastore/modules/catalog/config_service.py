@@ -384,8 +384,16 @@ class ConfigService(ConfigsProtocol):
                     if phys_schema and await check_table_exists(
                         conn, COLLECTION_CONFIGS_TABLE, phys_schema
                     ):
+                        # Issue #2430: Resolve to internal ID for lookup
+                        try:
+                            resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                                catalog_id, collection_id, allow_missing=True
+                            )
+                            internal_collection_id = resolved.id
+                        except Exception:
+                            internal_collection_id = collection_id
                         collection_delta = await _cq.select_collection_config(phys_schema).execute(
-                            conn, collection_id=collection_id, ref_key=class_key
+                            conn, collection_id=internal_collection_id, ref_key=class_key
                         )
                     else:
                         collection_delta = None
@@ -439,8 +447,23 @@ class ConfigService(ConfigsProtocol):
         self, catalog_id: str, collection_id: str, class_key: str
     ) -> Optional[dict]:
         assert self.engine is not None, "ConfigService.engine not initialised"
+
+        # Issue #2430: Resolve to internal ID for consistent cache lookup.
+        # After migration, all configs are keyed on internal ID. During migration
+        # window, this may return None for old external-ID-keyed rows; the caller
+        # should handle that gracefully.
+        catalogs = self._get_catalog_manager()
+        try:
+            resolved = await catalogs.collections.resolve_collection_ids(
+                catalog_id, collection_id, allow_missing=True
+            )
+            internal_collection_id = resolved.id
+        except Exception:
+            # Fall back to original ID if resolution fails
+            internal_collection_id = collection_id
+
         return await _collection_config_cache(
-            self.engine, self._get_catalog_manager(), catalog_id, collection_id, class_key
+            self.engine, catalogs, catalog_id, internal_collection_id, class_key
         )
 
     async def set_config(
@@ -704,6 +727,19 @@ class ConfigService(ConfigsProtocol):
         validate_sql_identifier(collection_id)
         class_key = cls.class_key()
 
+        # Issue #2430: Resolve collection_id to immutable internal ID for persistence.
+        # This ensures configs are keyed on the stable internal ID, not the mutable
+        # external_id. Both forms (external or internal) are accepted at the API
+        # boundary, but persistence always uses internal ID.
+        catalogs = self._get_catalog_manager()
+        resolved = await catalogs.collections.resolve_collection_ids(
+            catalog_id, collection_id, allow_missing=True
+        )
+        # Use internal ID for all persistence operations
+        internal_collection_id = resolved.id
+        # Keep original for cache invalidation (handles both forms)
+        original_collection_id = collection_id
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_or_create_phys_schema(
                 catalog_id, conn, reensure_on_missing=True
@@ -714,26 +750,26 @@ class ConfigService(ConfigsProtocol):
             # always succeeds — every sub-config resolves from the waterfall,
             # so a minimal Collection can be materialised without the caller
             # first hitting `POST /collections`.
-            await self._get_catalog_manager().ensure_collection_exists(
-                catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
+            await catalogs.ensure_collection_exists(
+                catalog_id, internal_collection_id, ctx=DriverContext(db_resource=conn)
             )
 
             if check_immutability:
                 current_data = await _cq.select_collection_config_for_update(phys_schema).execute(
                     conn,
-                    collection_id=collection_id,
+                    collection_id=internal_collection_id,
                     ref_key=class_key,
                 )
                 await self._enforce_write_immutability(
-                    cls, config, current_data, catalog_id, collection_id, conn
+                    cls, config, current_data, catalog_id, internal_collection_id, conn
                 )
 
             # Phase 2 — validate (pre-persist).
-            await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
+            await run_validate_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
-                collection_id=collection_id,
+                collection_id=internal_collection_id,
                 ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
@@ -741,12 +777,12 @@ class ConfigService(ConfigsProtocol):
             )
 
             # Phase 3 — apply (post-persist, best-effort).
-            await run_apply_handlers(cls, config, catalog_id, collection_id, conn)
+            await run_apply_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
         _collection_config_cache.cache_invalidate(
-            self.engine, self._get_catalog_manager(), catalog_id, collection_id, class_key
+            self.engine, catalogs, catalog_id, original_collection_id, class_key
         )
-        _maybe_bust_router(cls, catalog_id, collection_id)
+        _maybe_bust_router(cls, catalog_id, original_collection_id)
 
     async def list_configs(
         self,
@@ -763,6 +799,16 @@ class ConfigService(ConfigsProtocol):
 
             validate_sql_identifier(catalog_id)
             validate_sql_identifier(collection_id)
+
+            # Issue #2430: Resolve to internal ID for lookup
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                internal_collection_id = collection_id
+
             async with managed_transaction(db_resource or self.engine) as conn:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                     catalog_id, ctx=DriverContext(db_resource=conn)
@@ -775,7 +821,7 @@ class ConfigService(ConfigsProtocol):
 
                 rows = await _cq.list_collection_configs_paginated(phys_schema).execute(
                     conn,
-                    collection_id=collection_id,
+                    collection_id=internal_collection_id,
                     limit=limit,
                     offset=offset,
                 )
@@ -882,6 +928,16 @@ class ConfigService(ConfigsProtocol):
                 raise ValueError("catalog_id is required when collection_id is provided")
             validate_sql_identifier(catalog_id)
             validate_sql_identifier(collection_id)
+
+            # Issue #2430: Resolve to internal ID for lookup
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                internal_collection_id = collection_id
+
             async with managed_transaction(db_resource or self.engine) as conn:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                     catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
@@ -891,7 +947,7 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return {}
                 rows = await _cq.list_collection_refs(phys_schema).execute(
-                    conn, collection_id=collection_id
+                    conn, collection_id=internal_collection_id
                 )
             return {r["ref_key"]: r["class_key"] for r in rows}
 
@@ -936,6 +992,16 @@ class ConfigService(ConfigsProtocol):
                 raise ValueError("catalog_id is required when collection_id is provided")
             validate_sql_identifier(catalog_id)
             validate_sql_identifier(collection_id)
+
+            # Issue #2430: Resolve to internal ID for lookup
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                internal_collection_id = collection_id
+
             async with managed_transaction(db_resource or self.engine) as conn:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                     catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
@@ -945,7 +1011,7 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return None
                 row = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                    conn, collection_id=collection_id, ref_key=ref_key
+                    conn, collection_id=internal_collection_id, ref_key=ref_key
                 )
             return _materialise_ref_row(row, ref_key)
 
@@ -1100,38 +1166,46 @@ class ConfigService(ConfigsProtocol):
         validate_sql_identifier(collection_id)
         class_key = cls.class_key()
 
+        # Issue #2430: Resolve collection_id to immutable internal ID for persistence.
+        catalogs = self._get_catalog_manager()
+        resolved = await catalogs.collections.resolve_collection_ids(
+            catalog_id, collection_id, allow_missing=True
+        )
+        internal_collection_id = resolved.id
+        original_collection_id = collection_id
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_or_create_phys_schema(
                 catalog_id, conn, reensure_on_missing=False
             )
-            await self._get_catalog_manager().ensure_collection_exists(
-                catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
+            await catalogs.ensure_collection_exists(
+                catalog_id, internal_collection_id, ctx=DriverContext(db_resource=conn)
             )
 
             existing = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                conn, collection_id=collection_id, ref_key=ref_key
+                conn, collection_id=internal_collection_id, ref_key=ref_key
             )
             if existing:
                 stored_class_key = existing["class_key"]
                 if stored_class_key != class_key:
                     raise ValueError(
                         f"set_config_by_ref({ref_key!r}) at "
-                        f"{catalog_id}/{collection_id}: row stored as "
+                        f"{catalog_id}/{internal_collection_id}: row stored as "
                         f"class_key={stored_class_key!r}, refusing to "
                         f"overwrite with class_key={class_key!r}."
                     )
                 if check_immutability:
                     await enforce_config_immutability(
                         cls.model_validate(existing["config_data"]), config,
-                        catalog_id=catalog_id, collection_id=collection_id, conn=conn,
+                        catalog_id=catalog_id, collection_id=internal_collection_id, conn=conn,
                     )
 
             # Phase 2 — validate (pre-persist).
-            await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
+            await run_validate_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
-                collection_id=collection_id,
+                collection_id=internal_collection_id,
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
@@ -1139,16 +1213,16 @@ class ConfigService(ConfigsProtocol):
             )
 
             # Phase 3 — apply (post-persist, best-effort).
-            await run_apply_handlers(cls, config, catalog_id, collection_id, conn)
+            await run_apply_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
         _collection_config_cache.cache_invalidate(
             self.engine,
-            self._get_catalog_manager(),
+            catalogs,
             catalog_id,
-            collection_id,
+            original_collection_id,
             class_key,
         )
-        _maybe_bust_router(cls, catalog_id, collection_id)
+        _maybe_bust_router(cls, catalog_id, original_collection_id)
 
     async def delete_config_by_ref(
         self,
@@ -1165,6 +1239,16 @@ class ConfigService(ConfigsProtocol):
                 raise ValueError("catalog_id is required when collection_id is provided")
             validate_sql_identifier(catalog_id)
             validate_sql_identifier(collection_id)
+
+            # Issue #2430: Resolve to internal ID for lookup
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                internal_collection_id = collection_id
+
             async with managed_transaction(db_resource or self.engine) as conn:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                     catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
@@ -1174,13 +1258,13 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return False
                 existing = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                    conn, collection_id=collection_id, ref_key=ref_key
+                    conn, collection_id=internal_collection_id, ref_key=ref_key
                 )
                 if not existing:
                     return False
                 stored_class_key = existing["class_key"]
                 await _cq.delete_collection_config(phys_schema).execute(
-                    conn, collection_id=collection_id, ref_key=ref_key,
+                    conn, collection_id=internal_collection_id, ref_key=ref_key,
                 )
             _collection_config_cache.cache_invalidate(
                 self.engine, self._get_catalog_manager(),
@@ -1242,6 +1326,17 @@ class ConfigService(ConfigsProtocol):
         if collection_id:
             validate_sql_identifier(collection_id)
 
+        # Issue #2430: Resolve collection_id to internal ID
+        internal_collection_id = collection_id
+        if collection_id and catalog_id:
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                pass
+
         async with managed_transaction(db_resource or self.engine) as conn:
             if catalog_id:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
@@ -1288,7 +1383,7 @@ class ConfigService(ConfigsProtocol):
                     sql, result_handler=ResultHandler.ALL_DICTS
                 ).execute(
                     conn,
-                    collection_id=collection_id,
+                    collection_id=internal_collection_id,
                     query=f"%{query}%" if query else None,
                     limit=limit,
                     offset=offset,
@@ -1388,6 +1483,16 @@ class ConfigService(ConfigsProtocol):
         class_key = cls.class_key()
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+
+        # Issue #2430: Resolve to internal ID for lookup
+        try:
+            resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                catalog_id, collection_id, allow_missing=True
+            )
+            internal_collection_id = resolved.id
+        except Exception:
+            internal_collection_id = collection_id
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                 catalog_id, ctx=DriverContext(db_resource=conn)
@@ -1400,7 +1505,7 @@ class ConfigService(ConfigsProtocol):
 
             rows_affected = await _cq.delete_collection_config(phys_schema).execute(
                 conn,
-                collection_id=collection_id,
+                collection_id=internal_collection_id,
                 ref_key=class_key,
             )
 

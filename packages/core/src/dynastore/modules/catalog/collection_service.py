@@ -18,9 +18,12 @@
 
 import logging
 import json
-from typing import FrozenSet, List, Optional, Any, Dict, Union, Set
+from typing import FrozenSet, List, Optional, Any, Dict, Union, Set, TYPE_CHECKING
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
+
+if TYPE_CHECKING:
+    from dynastore.models.resolved_ids import ResolvedCollectionIds
 
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
@@ -434,6 +437,78 @@ class CollectionService:
                 f"Collection with internal id '{internal_id}' not found in catalog '{catalog_id}'."
             )
         return external_id
+
+    async def resolve_collection_ids(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        allow_missing: bool = False,
+    ) -> "ResolvedCollectionIds":
+        """Resolve a collection's IDs (internal + external) from either form.
+
+        This is the canonical resolution point for config persistence (Issue #2430).
+        Accepts either an external_id or an internal_id and returns both,
+        ensuring callers always have the immutable internal ID for persistence.
+
+        Args:
+            catalog_id: The catalog ID (can be external or internal).
+            collection_id: The collection ID (can be external or internal).
+            allow_missing: If False (default), raises ValueError when not found.
+
+        Returns:
+            ResolvedCollectionIds with both id (internal) and external_id.
+
+        Raises:
+            ValueError: When the collection is not found and allow_missing=False.
+        """
+        from dynastore.models.resolved_ids import ResolvedCollectionIds
+        from dynastore.modules.catalog.catalog_service import (
+            is_internal_physical_name as _is_internal_name,
+        )
+
+        # Resolve catalog_id to internal form first
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols import CatalogsProtocol
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+
+        # Determine if collection_id is already internal
+        if _is_internal_name(collection_id, "col"):
+            # Already internal - look up external_id
+            internal_id = collection_id
+            external_id = await self.resolve_collection_external_id(
+                catalog_id, internal_id, allow_missing=allow_missing
+            )
+            if external_id is None:
+                if not allow_missing:
+                    raise ValueError(
+                        f"Collection with internal id '{internal_id}' not found in catalog '{catalog_id}'."
+                    )
+                # Not found but allow_missing=True - return what we have
+                external_id = internal_id
+        else:
+            # External ID - resolve to internal
+            external_id = collection_id
+            internal_id = await self.resolve_collection_id(
+                catalog_id, external_id, allow_missing=allow_missing
+            )
+            if internal_id is None:
+                if not allow_missing:
+                    raise ValueError(
+                        f"Collection '{external_id}' not found in catalog '{catalog_id}'."
+                    )
+                # Not found but allow_missing=True - return what we have
+                internal_id = external_id
+
+        return ResolvedCollectionIds(
+            id=internal_id,
+            external_id=external_id,
+            catalog_id=catalog_id,
+        )
 
     async def resolve_collection_id(
         self,

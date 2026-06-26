@@ -135,6 +135,10 @@ from dynastore.models.protocols.asset_upload import (
     UploadStatus,
     UploadStatusResponse,
 )
+from dynastore.models.resolved_ids import (
+    ResolvedCatalogIds,
+    ResolvedCollectionIds,
+)
 # Export auth_models for convenience
 from dynastore.models.auth_models import (
     SYSTEM_USER_ID,
@@ -228,6 +232,9 @@ __all__ = [
     "UploadTicket",
     "UploadStatus",
     "UploadStatusResponse",
+    # Resolved IDs
+    "ResolvedCatalogIds",
+    "ResolvedCollectionIds",
     # Auth models
     "SYSTEM_USER_ID",
     "PolicyBundle",
