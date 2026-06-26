@@ -2113,10 +2113,16 @@ class CatalogService(CatalogsProtocol):
         """
         Delete a catalog.
 
-        If force=True, triggers a hard deletion (removal of schema and data).
+        If force=True, triggers a hard deletion (removal of schema and data)
+        via the catalog_provision task (operation='deprovision_hard').
         Otherwise, performs a soft delete (marks as deleted without touching
         the physical schema, metadata sidecars, or catalog_configs so the id
         can later be hard-deleted or reclaimed by create_catalog).
+
+        Hard delete uses the same checklist mechanism as provision:
+        tombstones the row, builds a deprovision checklist, sets
+        provisioning_status='deleting', and enqueues the catalog_provision task.
+        Task routing config controls where the deprovision runs.
         """
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
@@ -2128,87 +2134,9 @@ class CatalogService(CatalogsProtocol):
             return False
         catalog_id = internal_id
 
-        config_snapshot: Dict[str, Any] = {}
-        physical_schema: Optional[str] = None
-        async with managed_transaction(get_catalog_engine(db_resource)) as conn:
-            if db_resource is None:
-                # Relax idle_in_transaction_session_timeout for THIS delete
-                # transaction only (SET LOCAL auto-reverts on commit/rollback).
-                #
-                # _purge_catalog_storage calls snapshot_and_enqueue inside this
-                # transaction; its RoutingDrivenCascadeOwner.describe_scope reads
-                # routing config via ConfigsProtocol on a *second* pooled
-                # connection (by design — it must observe live, pre-drop config),
-                # leaving this transaction's connection idle. Under a cold config
-                # cache or pool contention that idle gap exceeds the 30s default,
-                # PostgreSQL terminates the backend, and the next statement fails
-                # with "the underlying connection is closed", leaving the catalog
-                # stuck mid-delete. Same mechanism and fix as the collection
-                # hard-delete path in CollectionService.delete_collection.
-                #
-                # Direct conn.execute (NOT DDLQuery): DDLQuery wraps the statement
-                # in a SAVEPOINT when the connection is already in a transaction,
-                # and a SET LOCAL scoped to that savepoint would not survive its
-                # release. The transaction stays bounded by lock_timeout and
-                # per-statement command_timeout and is driven by the background
-                # task runner, so disabling the idle reaper here is safe.
-                from typing import cast
-
-                from sqlalchemy import text
-                from sqlalchemy.ext.asyncio import AsyncConnection
-
-                await cast(AsyncConnection, conn).execute(
-                    text("SET LOCAL idle_in_transaction_session_timeout = '0'")
-                )
-            if force:
-                # Resolve the physical schema before purge (purge will delete
-                # the row so we capture it here for the post-txn async hook).
-                physical_schema = await DQLQuery(
-                    "SELECT id FROM catalog.catalogs WHERE id = :catalog_id;",
-                    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
-                ).execute(conn, catalog_id=catalog_id)
-                if not physical_schema:
-                    # Catalog not found at all — nothing to delete.
-                    return False
-
-                # Snapshot the config BEFORE the purge removes it — the async
-                # external-resource destroy scheduled after the txn needs it.
-                from dynastore.models.protocols import ConfigsProtocol
-                config_manager = get_protocol(ConfigsProtocol)
-                if config_manager:
-                    try:
-                        config_snapshot = await config_manager.list_catalog_configs(
-                            catalog_id, ctx=DriverContext(db_resource=conn)
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            "Could not list catalog configs before deletion: %s", e
-                        )
-
-                # 2. Hard Delete (Force)
-                # Lifecycle: BEFORE -> HARD_DELETE internal -> AFTER
-                await emit_event(
-                    CatalogEventType.BEFORE_CATALOG_HARD_DELETION,
-                    catalog_id=catalog_id,
-                    db_resource=conn,
-                )
-
-                logger.info(
-                    "[LIFECYCLE] Hard deleting catalog '%s'", catalog_id
-                )
-                await self._purge_catalog_storage(conn, catalog_id)
-                logger.info(
-                    "[LIFECYCLE] Hard deleted catalog '%s' successfully", catalog_id
-                )
-
-            else:
-                # Soft delete: tombstone the registry row only. The physical
-                # schema, metadata sidecars and catalog_configs are intentionally
-                # retained so the id can later be either hard-deleted or
-                # reclaimed by create_catalog — both of which purge the residue
-                # via _purge_catalog_storage for a clean reset. Retained
-                # configs are inert while the row is tombstoned (every read
-                # filters deleted_at IS NULL).
+        # Soft delete path (force=False)
+        if not force:
+            async with managed_transaction(get_catalog_engine(db_resource)) as conn:
                 rows = await _soft_delete_catalog_query.execute(conn, id=catalog_id)
                 if rows == 0:
                     return False
@@ -2230,17 +2158,95 @@ class CatalogService(CatalogsProtocol):
                 _invalidate_catalog_model_cache(catalog_id)
                 return True
 
-            # Reached only on the force=True path.
+        # Hard delete path (force=True) - uses same checklist mechanism as provision.
+        config_snapshot: Dict[str, Any] = {}
 
-            # Emit main HARD_DELETION event (triggers async destroyers)
+        async with managed_transaction(get_catalog_engine(db_resource)) as conn:
+            if db_resource is None:
+                # Relax idle_in_transaction_session_timeout for THIS delete
+                # transaction only (SET LOCAL auto-reverts on commit/rollback).
+                from typing import cast
+
+                from sqlalchemy import text
+                from sqlalchemy.ext.asyncio import AsyncConnection
+
+                await cast(AsyncConnection, conn).execute(
+                    text("SET LOCAL idle_in_transaction_session_timeout = '0'")
+                )
+
+            # Snapshot the config BEFORE any purge — the deprovision task needs it.
+            from dynastore.models.protocols import ConfigsProtocol
+
+            config_manager = get_protocol(ConfigsProtocol)
+            if config_manager:
+                try:
+                    config_snapshot = await config_manager.list_catalog_configs(
+                        catalog_id, ctx=DriverContext(db_resource=conn)
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Could not list catalog configs before deletion: %s", e
+                    )
+
             await emit_event(
-                CatalogEventType.CATALOG_HARD_DELETION,
+                CatalogEventType.BEFORE_CATALOG_HARD_DELETION,
                 catalog_id=catalog_id,
                 db_resource=conn,
-                physical_schema=physical_schema,
             )
 
-            # Fire the canonical secondary-index cleanup signal.
+            # Tombstone the row (makes it invisible in listings)
+            rows = await _soft_delete_catalog_query.execute(conn, id=catalog_id)
+            if rows == 0:
+                return False
+
+            # Build the deprovision checklist from active provisioners
+            from dynastore.modules.catalog.provisioning_registry import (
+                provisioning_registry,
+            )
+            checklist: Dict[str, str] = await provisioning_registry.build_checklist(
+                catalog_id, conn
+            )
+
+            if checklist:
+                # Set status to 'deleting' and store the checklist
+                await _set_provisioning_checklist_query.execute(
+                    conn,
+                    id=catalog_id,
+                    status="deleting",
+                    checklist=json.dumps(checklist),
+                )
+
+                # Enqueue catalog_provision task with operation='deprovision_hard'
+                from dynastore.modules.tasks.models import TaskCreate
+                from dynastore.modules.tasks.tasks_module import create_task
+
+                task_request = TaskCreate(
+                    task_type="catalog_provision",
+                    inputs={
+                        "catalog_id": catalog_id,
+                        "scope": "catalog",
+                        "operation": "deprovision_hard",
+                        "config_snapshot": config_snapshot,
+                    },
+                    caller_id="system",
+                    type="task",
+                )
+                await create_task(conn, task_request, catalog_id)
+
+                logger.info(
+                    "[LIFECYCLE] Hard delete: tombstoned catalog '%s', "
+                    "enqueued deprovision task with %d checklist steps",
+                    catalog_id, len(checklist),
+                )
+            else:
+                # No active provisioners: nothing to deprovision, hard-delete immediately.
+                await self._purge_catalog_storage(conn, catalog_id)
+                logger.info(
+                    "[LIFECYCLE] Hard deleted catalog '%s' (no active provisioners)",
+                    catalog_id,
+                )
+
+            # Emit CATALOG_METADATA_CHANGED for secondary-index cleanup
             await emit_event(
                 CatalogEventType.CATALOG_METADATA_CHANGED,
                 catalog_id=catalog_id,
@@ -2251,18 +2257,139 @@ class CatalogService(CatalogsProtocol):
                 },
             )
 
-            # Emit AFTER event
+        # Post-transaction cleanup
+        _invalidate_catalog_model_cache(catalog_id)
+        return True
+
+        # Hard delete path (force=True)
+        config_snapshot: Dict[str, Any] = {}
+        physical_schema: Optional[str] = None
+
+        async with managed_transaction(get_catalog_engine(db_resource)) as conn:
+            if db_resource is None:
+                # Relax idle_in_transaction_session_timeout for THIS delete
+                # transaction only (SET LOCAL auto-reverts on commit/rollback).
+                from typing import cast
+
+                from sqlalchemy import text
+                from sqlalchemy.ext.asyncio import AsyncConnection
+
+                await cast(AsyncConnection, conn).execute(
+                    text("SET LOCAL idle_in_transaction_session_timeout = '0'")
+                )
+
+            # Resolve the physical schema before any purge
+            physical_schema = await DQLQuery(
+                "SELECT id FROM catalog.catalogs WHERE id = :catalog_id;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, catalog_id=catalog_id)
+            if not physical_schema:
+                # Catalog not found at all — nothing to delete.
+                return False
+
+            # Snapshot the config BEFORE any purge — the async deprovision task needs it.
+            from dynastore.models.protocols import ConfigsProtocol
+
+            config_manager = get_protocol(ConfigsProtocol)
+            if config_manager:
+                try:
+                    config_snapshot = await config_manager.list_catalog_configs(
+                        catalog_id, ctx=DriverContext(db_resource=conn)
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Could not list catalog configs before deletion: %s", e
+                    )
+
             await emit_event(
-                CatalogEventType.AFTER_CATALOG_HARD_DELETION,
+                CatalogEventType.BEFORE_CATALOG_HARD_DELETION,
                 catalog_id=catalog_id,
                 db_resource=conn,
-                physical_schema=physical_schema,
             )
+
+            if async_delete_enabled:
+                # Async hard delete (#2340): tombstone the row, enqueue deprovision task.
+                # The row is soft-deleted so it disappears from listings immediately.
+                # The worker will run DROP SCHEMA CASCADE and external cleanup.
+                rows = await _soft_delete_catalog_query.execute(conn, id=catalog_id)
+                if rows == 0:
+                    return False
+
+                logger.info(
+                    "[LIFECYCLE] Async hard delete: tombstoned catalog '%s', enqueuing deprovision task",
+                    catalog_id,
+                )
+
+                # Enqueue catalog_provision task with operation='deprovision_hard'
+                from dynastore.modules.tasks.models import TaskCreate
+                from dynastore.modules.tasks.tasks_module import create_task
+
+                task_request = TaskCreate(
+                    task_type="catalog_provision",
+                    inputs={
+                        "catalog_id": catalog_id,
+                        "scope": "catalog",
+                        "operation": "deprovision_hard",
+                        "config_snapshot": config_snapshot,
+                    },
+                    caller_id="system",
+                    type="task",
+                )
+                await create_task(conn, task_request, catalog_id)
+
+                # Emit CATALOG_METADATA_CHANGED for secondary-index cleanup
+                await emit_event(
+                    CatalogEventType.CATALOG_METADATA_CHANGED,
+                    catalog_id=catalog_id,
+                    db_resource=conn,
+                    payload={
+                        "catalog_id": catalog_id,
+                        "operation": "delete",
+                    },
+                )
+            else:
+                # Sync hard delete (legacy path): run DROP SCHEMA CASCADE in-request.
+                logger.info(
+                    "[LIFECYCLE] Sync hard deleting catalog '%s'", catalog_id
+                )
+                await self._purge_catalog_storage(conn, catalog_id)
+                logger.info(
+                    "[LIFECYCLE] Hard deleted catalog '%s' successfully", catalog_id
+                )
+
+                # Emit main HARD_DELETION event (triggers async destroyers)
+                await emit_event(
+                    CatalogEventType.CATALOG_HARD_DELETION,
+                    catalog_id=catalog_id,
+                    db_resource=conn,
+                    physical_schema=physical_schema,
+                )
+
+                # Fire the canonical secondary-index cleanup signal.
+                await emit_event(
+                    CatalogEventType.CATALOG_METADATA_CHANGED,
+                    catalog_id=catalog_id,
+                    db_resource=conn,
+                    payload={
+                        "catalog_id": catalog_id,
+                        "operation": "delete",
+                    },
+                )
+
+                # Emit AFTER event
+                await emit_event(
+                    CatalogEventType.AFTER_CATALOG_HARD_DELETION,
+                    catalog_id=catalog_id,
+                    db_resource=conn,
+                    physical_schema=physical_schema,
+                )
 
         # Post-transaction cleanup
         _invalidate_catalog_model_cache(catalog_id)
 
-        if physical_schema:
+        # For sync delete, trigger legacy async destroyers (GCP bucket, eventing)
+        # For async delete, the deprovision task handles cleanup
+        if not async_delete_enabled and physical_schema:
             try:
                 from dynastore.modules.catalog.lifecycle_manager import LifecycleContext
 

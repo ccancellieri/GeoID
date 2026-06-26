@@ -73,6 +73,7 @@ __all__ = [
     "STEP_SKIPPED",
     "STEP_DEGRADED",
     "STATUS_PROVISIONING",
+    "STATUS_DELETING",
     "STATUS_READY",
     "STATUS_FAILED",
     "SCOPE_CATALOG",
@@ -97,6 +98,7 @@ STEP_DEGRADED = "degraded"
 
 # Catalog-level ``provisioning_status`` values this module drives.
 STATUS_PROVISIONING = "provisioning"
+STATUS_DELETING = "deleting"
 STATUS_READY = "ready"
 STATUS_FAILED = "failed"
 

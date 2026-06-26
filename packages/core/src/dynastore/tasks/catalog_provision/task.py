@@ -83,6 +83,11 @@ class CatalogProvisionInputs(BaseModel):
     # current step (full replay). Ignored for deprovision operations, which
     # always run every teardown hook.
     force: bool = False
+    # Deprovision context (#2340): config snapshot captured before any
+    # deprovision hook runs. Required for deprovision operations so
+    # external-resource cleanup (GCP bucket, eventing) can act on the
+    # pre-deletion state even though the catalog_core hook drops the schema.
+    config_snapshot: Optional[Dict[str, Any]] = None
 
 
 class CatalogProvisionTask(TaskProtocol):
@@ -112,6 +117,7 @@ class CatalogProvisionTask(TaskProtocol):
         operation = inputs.operation
         collection_id = inputs.collection_id
         force = inputs.force
+        config_snapshot = inputs.config_snapshot
 
         if not catalog_id:
             raise PermanentTaskFailure("Missing 'catalog_id' in task inputs")
@@ -141,6 +147,18 @@ class CatalogProvisionTask(TaskProtocol):
         async with managed_transaction(get_catalog_engine()) as conn:
             groups: List[List[Any]] = await provisioning_registry.active_provisioners(
                 catalog_id, conn, scope=scope
+            )
+
+        # For deprovision operations, reverse the group order so higher-priority
+        # provisioners (GCP at priority 1) run BEFORE lower-priority ones
+        # (catalog_core at priority 0). This ensures external resources (bucket,
+        # eventing) are cleaned up before the schema is dropped.
+        if operation in ("deprovision_soft", "deprovision_hard"):
+            groups = list(reversed(groups))
+            logger.info(
+                "CatalogProvisionTask: deprovision for catalog '%s' — "
+                "running %d groups in reverse priority order",
+                catalog_id, len(groups),
             )
 
         # Reprovision only what failed (#2395). For a ``provision`` run that is
@@ -188,6 +206,7 @@ class CatalogProvisionTask(TaskProtocol):
             "scope": scope,
             "operation": operation,
             "collection_id": collection_id,
+            "config_snapshot": config_snapshot,
         }
 
         for group in groups:

@@ -497,15 +497,132 @@ class GCPModule(
                 await _provision_eventing(storage, catalog_id)
                 # executor marks gcp_eventing 'complete' after this returns
 
+            async def _gcp_bucket_deprovision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "deprovision_hard",
+                collection_id=None,
+                config_snapshot=None,
+                **_kw,
+            ) -> None:
+                """Deprovision the GCS bucket for a catalog (#2340).
+
+                Called by CatalogProvisionTask with operation='deprovision_hard'.
+                Deletes the bucket using the pre-captured config snapshot
+                (passed via task inputs) so cleanup works even though
+                catalog_core already dropped the schema.
+
+                For the PostgreSQL driver, catalog_id IS the physical schema name.
+
+                Idempotent: drop_storage is NotFound-safe.
+                """
+                from dynastore.modules.gcp.gcp_config import GcpCatalogBucketConfig
+
+                bucket_manager = self.get_bucket_service()
+                old_bucket_name: Optional[str] = None
+
+                if isinstance(config_snapshot, dict):
+                    bucket_snapshot = config_snapshot.get(GcpCatalogBucketConfig.class_key())
+                    if isinstance(bucket_snapshot, dict):
+                        old_bucket_name = bucket_snapshot.get("bucket_name")
+
+                if not old_bucket_name:
+                    try:
+                        # For PG driver, catalog_id IS the physical schema
+                        old_bucket_name = bucket_manager.generate_bucket_name(
+                            catalog_id, physical_schema=catalog_id
+                        )
+                    except Exception:
+                        old_bucket_name = None
+
+                logger.info(
+                    "gcp_bucket deprovision: deleting bucket '%s' for catalog '%s'",
+                    old_bucket_name, catalog_id,
+                )
+                await bucket_manager.drop_storage(
+                    catalog_id,
+                    physical_schema=catalog_id,
+                    bucket_name=old_bucket_name,
+                )
+
+            async def _gcp_eventing_deprovision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "deprovision_hard",
+                collection_id=None,
+                config_snapshot=None,
+                **_kw,
+            ) -> None:
+                """Deprovision managed eventing for a catalog (#2340).
+
+                Called by CatalogProvisionTask with operation='deprovision_hard'.
+                Tears down Pub/Sub topic and subscription using the pre-captured
+                config snapshot.
+
+                Idempotent: teardown methods are NotFound-safe.
+                """
+                from dynastore.modules.gcp.gcp_config import GcpEventingConfig
+
+                if not isinstance(config_snapshot, dict):
+                    logger.debug(
+                        "gcp_eventing deprovision: no config snapshot for catalog '%s'; skipping",
+                        catalog_id,
+                    )
+                    return
+
+                eventing_data = config_snapshot.get(GcpEventingConfig.class_key())
+                if not eventing_data:
+                    logger.debug(
+                        "gcp_eventing deprovision: no eventing config for catalog '%s'; skipping",
+                        catalog_id,
+                    )
+                    return
+
+                try:
+                    eventing_config = GcpEventingConfig.model_validate(eventing_data)
+
+                    if (
+                        isinstance(eventing_config, GcpEventingConfig)
+                        and eventing_config.managed_eventing
+                    ):
+                        logger.info(
+                            "gcp_eventing deprovision: tearing down managed eventing for catalog '%s'",
+                            catalog_id,
+                        )
+                        await self.teardown_managed_eventing_channel(
+                            catalog_id, eventing_config.managed_eventing
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        "gcp_eventing deprovision: failed for catalog '%s': %s",
+                        catalog_id, e, exc_info=True,
+                    )
+                    raise
+
+                # Belt-and-braces: force-clean the deterministic default topic/subscription.
+                # This is NotFound-safe and guarantees no Pub/Sub resource survives.
+                try:
+                    await self.teardown_catalog_eventing(catalog_id, config=None)
+                except Exception as e:
+                    logger.warning(
+                        "gcp_eventing deprovision: best-effort default cleanup failed for '%s' (non-fatal): %s",
+                        catalog_id, e,
+                    )
+
             provisioning_registry.register(
                 "gcp_bucket",
                 self.provisioner_is_active,
                 provision=_gcp_bucket_provision,
+                deprovision=_gcp_bucket_deprovision,
             )
             provisioning_registry.register(
                 "gcp_eventing",
                 self.provisioner_is_active,
                 provision=_gcp_eventing_provision,
+                deprovision=_gcp_eventing_deprovision,
             )
             from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
 

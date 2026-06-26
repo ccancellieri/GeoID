@@ -445,6 +445,82 @@ class CatalogModule(ModuleProtocol):
                 _invalidate_catalog_model_cache(catalog_id)
                 _invalidate_catalog_external_id_cache(_ext_id)
 
+            async def _catalog_core_deprovision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "deprovision_hard",
+                collection_id=None,
+                config_snapshot=None,
+                **_kw,
+            ) -> None:
+                """Deprovision the core tenant schema for a catalog (#2340).
+
+                Called by CatalogProvisionTask with operation='deprovision_hard'.
+                Mirrors _purge_catalog_storage: snapshots cascade refs, drops
+                the schema CASCADE, and hard-deletes the registry row.
+
+                For the PostgreSQL driver, catalog_id IS the physical schema name.
+                Runs in its own managed transaction because the task is outside
+                any caller transaction. Lifecycle events (CATALOG_HARD_DELETION,
+                AFTER_CATALOG_HARD_DELETION) are emitted by CatalogProvisionTask
+                after all deprovision steps complete.
+                """
+                from dynastore.modules.catalog.catalog_service import (
+                    get_catalog_engine,
+                    _hard_delete_catalog_query,
+                    _invalidate_catalog_model_cache,
+                    _invalidate_catalog_external_id_cache,
+                )
+                from dynastore.modules.db_config.query_executor import (
+                    managed_transaction,
+                    DQLQuery,
+                    ResultHandler,
+                )
+                from dynastore.modules.db_config.locking_tools import safe_drop_relation
+                from dynastore.modules.catalog.cascade_runtime import CascadeOrchestrator
+                from dynastore.modules.catalog.resource_owner import CleanupMode, ResourceScope, ScopeRef
+
+                orchestrator = CascadeOrchestrator()
+                scope_ref = ScopeRef(scope=ResourceScope.CATALOG, catalog_id=catalog_id)
+
+                async with managed_transaction(get_catalog_engine()) as conn:
+                    # Snapshot cascade refs BEFORE schema drop while DB rows are readable.
+                    cascade_task_id = await orchestrator.snapshot_and_enqueue(
+                        conn, scope_ref, CleanupMode.HARD
+                    )
+
+                    # For the PostgreSQL driver, catalog_id IS the physical schema.
+                    # Resolve it (works on tombstoned rows too).
+                    physical_schema = await DQLQuery(
+                        "SELECT id FROM catalog.catalogs WHERE id = :catalog_id;",
+                        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+                    ).execute(conn, catalog_id=catalog_id)
+
+                    if physical_schema:
+                        # DROP SCHEMA CASCADE with retry on lock contention.
+                        await safe_drop_relation(
+                            conn,
+                            schema=physical_schema,
+                            relation=physical_schema,
+                            kind="schema",
+                            cascade=True,
+                            max_retries=5,
+                        )
+
+                    # Hard-delete the registry row (cascades to catalog_core/stac).
+                    await _hard_delete_catalog_query.execute(conn, id=catalog_id)
+
+                    if cascade_task_id is not None:
+                        logger.info(
+                            "catalog_core deprovision: enqueued cascade cleanup task %s for catalog %r.",
+                            cascade_task_id, catalog_id,
+                        )
+
+                _invalidate_catalog_model_cache(catalog_id)
+                if external_id:
+                    _invalidate_catalog_external_id_cache(external_id)
+
             _prov_registry.register(
                 "catalog_core",
                 _catalog_core_is_active,
@@ -453,6 +529,7 @@ class CatalogModule(ModuleProtocol):
                 name="Core tenant schema",
                 description="Creates tenant schema, core tables, and lifecycle hooks.",
                 provision=_catalog_core_provision,
+                deprovision=_catalog_core_deprovision,
             )
 
             # Wire render preseed subscriber — enqueues durable render_preseed
