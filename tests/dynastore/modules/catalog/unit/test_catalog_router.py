@@ -264,9 +264,11 @@ async def test_upsert_degrades_when_secondary_index_driver_fails(caplog):
 
     core.upsert_catalog_metadata.assert_awaited_once()
     es.upsert_catalog_metadata.assert_awaited_once()
-    assert any(
-        "secondary-index driver" in r.message for r in caplog.records
-    )
+    degrade = [r for r in caplog.records if "secondary-index driver" in r.message]
+    assert degrade
+    # The handled degradation must not log a traceback — exc_info would render
+    # as a false ERROR in aggregated logs on ES-less envs.
+    assert all(r.exc_info is None for r in degrade)
 
 
 @pytest.mark.asyncio
@@ -319,9 +321,9 @@ async def test_delete_degrades_when_secondary_index_driver_fails(caplog):
 
     core.delete_catalog_metadata.assert_awaited_once()
     es.delete_catalog_metadata.assert_awaited_once()
-    assert any(
-        "secondary-index driver" in r.message for r in caplog.records
-    )
+    degrade = [r for r in caplog.records if "secondary-index driver" in r.message]
+    assert degrade
+    assert all(r.exc_info is None for r in degrade)
 
 
 @pytest.mark.asyncio

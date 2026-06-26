@@ -429,14 +429,18 @@ async def upsert_catalog_metadata(
             await driver.upsert_catalog_metadata(
                 catalog_id, metadata, db_resource=db_resource,
             )
-        except Exception:
+        except Exception as exc:
             if not _is_secondary_index(driver):
                 raise
+            # Expected when the secondary index is unavailable (e.g. ES down or
+            # absent on PG-only envs). The async reindex off the
+            # catalog_metadata_changed event reconciles it, so log the reason on
+            # one line — no traceback, which would surface as a false ERROR.
             logger.warning(
-                "catalog %s: secondary-index driver %s failed during "
-                "synchronous upsert_catalog_metadata; degrading to async "
+                "catalog %s: secondary-index driver %s unavailable during "
+                "synchronous upsert_catalog_metadata (%s); degrading to async "
                 "reindex via the catalog_metadata_changed event",
-                catalog_id, type(driver).__name__, exc_info=True,
+                catalog_id, type(driver).__name__, exc,
             )
     await _emit_catalog_metadata_changed(
         catalog_id=catalog_id,
@@ -492,14 +496,16 @@ async def delete_catalog_metadata(
             await driver.delete_catalog_metadata(
                 catalog_id, soft=soft, db_resource=db_resource,
             )
-        except Exception:
+        except Exception as exc:
             if not _is_secondary_index(driver):
                 raise
+            # See upsert path: expected when the secondary index is unavailable;
+            # log the reason on one line without a traceback.
             logger.warning(
-                "catalog %s: secondary-index driver %s failed during "
-                "synchronous delete_catalog_metadata; degrading to async "
+                "catalog %s: secondary-index driver %s unavailable during "
+                "synchronous delete_catalog_metadata (%s); degrading to async "
                 "reindex via the catalog_metadata_changed event",
-                catalog_id, type(driver).__name__, exc_info=True,
+                catalog_id, type(driver).__name__, exc,
             )
     await _emit_catalog_metadata_changed(
         catalog_id=catalog_id,
