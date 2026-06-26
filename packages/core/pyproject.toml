@@ -47,21 +47,30 @@ dependencies = [
 # deps aren't installed (because the SCOPE didn't pull them in) raise
 # ImportError and are skipped — same behavior as before the wheel split.
 #
-# NOTE: the `datastore` entry-point (DatastoreModule / sync psycopg2 engine) is
-# intentionally absent here.  It ships in the separate `dynastore-module-datastore`
-# wheel so it is only registered in environments whose SCOPE selects
-# `module_datastore` (i.e. sync-worker tasks).  API/catalog SCOPEs
-# (`scope_catalog`, `scope_geoid`) do not include `module_datastore`, so the
-# entry-point is absent from importlib.metadata on those services regardless of
-# whether pyiceberg transitively installs psycopg2-binary.  See #1748.
+# NOTE: several entry-points are intentionally absent here.  They ship in
+# separate stub wheels under packages/modules/<name>/ so they are only
+# registered in environments whose SCOPE installs the corresponding extra:
+#
+#   dynastore-module-datastore    — `datastore` (sync psycopg2 engine).
+#                                   Absent from API/catalog SCOPEs so pyiceberg's
+#                                   transitive psycopg2-binary never triggers
+#                                   unexpected DatastoreModule discovery.  See #1748.
+#   dynastore-module-elasticsearch — `elasticsearch`, `storage_elasticsearch`,
+#                                   `storage_elasticsearch_private`,
+#                                   `storage_elasticsearch_envelope`,
+#                                   `storage_elasticsearch_assets`,
+#                                   `collection_elasticsearch`,
+#                                   `catalog_elasticsearch`.  See #2465.
+#   dynastore-module-gcp          — `gcp`, `storage_bigquery`.  See #2465.
+#   dynastore-module-cache        — `cache`.  See #2465.
+#   dynastore-module-storage-iceberg — `storage_iceberg`.  See #2465.
+#   dynastore-module-storage-duckdb  — `storage_duckdb`.  See #2465.
 # ============================================================================
 [project.entry-points."dynastore.modules"]
-cache = "dynastore.modules.cache.cache_module:CacheModule"
 tasks = "dynastore.modules.tasks.tasks_module:TasksModule"
 proxy = "dynastore.modules.proxy.proxy_module:ProxyModule"
 gdal = "dynastore.modules.gdal.gdal_module:GdalModule"
 catalog = "dynastore.modules.catalog.catalog_module:CatalogModule"
-gcp = "dynastore.modules.gcp.gcp_module:GCPModule"
 tiles = "dynastore.modules.tiles.tiles_module:TilesModule"
 styles = "dynastore.modules.styles.styles_module:StylesModule"
 moving_features = "dynastore.modules.moving_features.mf_module:MovingFeaturesModule"
@@ -74,19 +83,9 @@ crs = "dynastore.modules.crs.crs_module:CRSModule"
 task_event_driver = "dynastore.modules.tasks.event_driver:TaskEventDriver"
 notebooks = "dynastore.modules.notebooks.notebooks_module:NotebooksModule"
 stac = "dynastore.modules.stac.module:StacModule"
-elasticsearch = "dynastore.modules.elasticsearch.module:ElasticsearchModule"
 stats = "dynastore.modules.stats.stats_module:STATS"
 web = "dynastore.modules.web.web_module:WebModule"
 storage_postgresql = "dynastore.modules.storage.drivers.postgresql:ItemsPostgresqlDriver"
-storage_elasticsearch = "dynastore.modules.storage.drivers.elasticsearch:ItemsElasticsearchDriver"
-storage_elasticsearch_private = "dynastore.modules.storage.drivers.elasticsearch_private:ItemsElasticsearchPrivateDriver"
-storage_elasticsearch_envelope = "dynastore.modules.storage.drivers.elasticsearch_envelope:ItemsElasticsearchEnvelopeDriver"
-storage_elasticsearch_assets = "dynastore.modules.storage.drivers.elasticsearch:AssetElasticsearchDriver"
-storage_duckdb = "dynastore.modules.storage.drivers.duckdb:ItemsDuckdbDriver"
-storage_iceberg = "dynastore.modules.storage.drivers.iceberg:ItemsIcebergDriver"
-storage_bigquery = "dynastore.modules.storage.drivers.bigquery:ItemsBigQueryDriver"
-collection_elasticsearch = "dynastore.modules.elasticsearch.collection_es_driver:CollectionElasticsearchDriver"
-catalog_elasticsearch = "dynastore.modules.elasticsearch.catalog_es_driver:CatalogElasticsearchDriver"
 collection_postgresql = "dynastore.modules.storage.drivers.collection_postgresql:CollectionPostgresqlDriver"
 catalog_postgresql = "dynastore.modules.storage.drivers.catalog_postgresql:CatalogPostgresqlDriver"
 metadata_catalog_log_indexer = "dynastore.modules.storage.drivers.catalog_log_indexer:LogCatalogIndexer"

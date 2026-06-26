@@ -1,0 +1,62 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../../LICENSE.
+#
+# dynastore-module-elasticsearch — thin packaging wheel for Elasticsearch modules.
+#
+# This wheel carries no source of its own: the ElasticsearchModule and related
+# driver implementations live in dynastore-core
+# (packages/core/src/dynastore/modules/elasticsearch/ and
+#  packages/core/src/dynastore/modules/storage/drivers/elasticsearch*).
+# Its sole purpose is to register the `elasticsearch`, `storage_elasticsearch`,
+# `storage_elasticsearch_private`, `storage_elasticsearch_envelope`,
+# `storage_elasticsearch_assets`, `collection_elasticsearch`, and
+# `catalog_elasticsearch` entry-points under the `dynastore.modules` group so
+# that the discovery loop in `dynastore.tools.discovery` loads these modules
+# ONLY on services whose SCOPE explicitly pulls in `module_elasticsearch`.
+#
+# Why a separate wheel?  `dynastore-core` is always installed (every service
+# depends on it), so any entry-point declared there is always present in
+# importlib.metadata.  Moving the entry-points here ensures they are absent
+# from importlib.metadata on services that do not install this stub wheel
+# — which never instantiate these modules — regardless of transitive deps.
+# See refs #2465.
+
+[project]
+name = "dynastore-module-elasticsearch"
+dynamic = ["version"]
+description = "DynaStore ElasticsearchModule entry-points — full-text search and storage drivers."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+# The heavy runtime deps (opensearch-py[async]) are pulled in by the
+# `module_elasticsearch` extra in the root meta-package; they are NOT listed
+# here to avoid duplicating version constraints in two places.
+dependencies = [
+    "dynastore-core",
+]
+
+# Entry-point declarations — the only reason this wheel exists.
+# Source lives in packages/core/src/dynastore/modules/elasticsearch/ and
+# packages/core/src/dynastore/modules/storage/drivers/ (always importable
+# because dynastore-core is a dependency of every service).
+[project.entry-points."dynastore.modules"]
+elasticsearch = "dynastore.modules.elasticsearch.module:ElasticsearchModule"
+storage_elasticsearch = "dynastore.modules.storage.drivers.elasticsearch:ItemsElasticsearchDriver"
+storage_elasticsearch_private = "dynastore.modules.storage.drivers.elasticsearch_private:ItemsElasticsearchPrivateDriver"
+storage_elasticsearch_envelope = "dynastore.modules.storage.drivers.elasticsearch_envelope:ItemsElasticsearchEnvelopeDriver"
+storage_elasticsearch_assets = "dynastore.modules.storage.drivers.elasticsearch:AssetElasticsearchDriver"
+collection_elasticsearch = "dynastore.modules.elasticsearch.collection_es_driver:CollectionElasticsearchDriver"
+catalog_elasticsearch = "dynastore.modules.elasticsearch.catalog_es_driver:CatalogElasticsearchDriver"
+
+[build-system]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+# No source in this wheel — the implementation ships in dynastore-core.
+[tool.setuptools]
+packages = []
+
+[tool.uv.sources]
+dynastore-core = { workspace = true }
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"
