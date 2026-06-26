@@ -861,7 +861,14 @@ class CollectionService:
                 collection_id=collection_id,
                 ctx=DriverContext(db_resource=conn),
             )
-            if resolved_routing:
+            if resolved_routing and resolved_routing.model_fields_set:
+                # Guard: only persist when at least one field was explicitly set
+                # (i.e. get_config returned a delta from the waterfall, not a
+                # bare code-default). A code-default ItemsRoutingConfig() has
+                # empty model_fields_set, so model_dump(exclude_unset=True)
+                # produces {}. {} is falsy at read time — the waterfall skips
+                # it — making the write a no-op that wastes a transaction and
+                # triggers spurious cache invalidation (#2435).
                 await configs.set_config(
                     ItemsRoutingConfig,
                     resolved_routing,

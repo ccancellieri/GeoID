@@ -341,6 +341,42 @@ class TestCollectionMetadataRouting:
         from dynastore.modules.storage.hints import Hint
         assert read[1].hints == {Hint.GEOMETRY_EXACT, Hint.TILES}
 
+    def test_code_default_instance_has_empty_fields_set(self):
+        """ItemsRoutingConfig() built from default_factory has no
+        explicitly-set fields: model_fields_set is empty and
+        model_dump(exclude_unset=True) returns {}.
+
+        This is the root cause of #2435: _activate_collection called
+        get_config → received a bare cls() instance → called set_config →
+        _serialize_config_for_db persisted {} → the waterfall skips {} at
+        read time (falsy) → the collection-scope pin was a silent no-op.
+        """
+        cfg = ItemsRoutingConfig()
+        assert not cfg.model_fields_set, (
+            "code-default ItemsRoutingConfig must have empty model_fields_set; "
+            f"got {cfg.model_fields_set!r}"
+        )
+        assert cfg.model_dump(exclude_unset=True) == {}, (
+            "model_dump(exclude_unset=True) on a default-constructed instance "
+            "must return {} (the empty delta that is skipped by the waterfall)"
+        )
+
+    def test_explicitly_set_instance_has_nonempty_fields_set(self):
+        """When 'operations' is supplied at construction, it appears in
+        model_fields_set and model_dump(exclude_unset=True) is non-empty.
+        This is the signal _activate_collection now requires before writing
+        the collection-scope pin (#2435).
+        """
+        cfg = ItemsRoutingConfig(operations={
+            Operation.WRITE: [OperationDriverEntry(driver_ref="items_postgresql_driver")],
+        })
+        assert "operations" in cfg.model_fields_set, (
+            f"explicitly-set 'operations' missing from model_fields_set: {cfg.model_fields_set!r}"
+        )
+        assert cfg.model_dump(exclude_unset=True), (
+            "model_dump(exclude_unset=True) must be non-empty when 'operations' was supplied"
+        )
+
 
 class TestOperationEnum:
     def test_transform_not_an_operation(self):
