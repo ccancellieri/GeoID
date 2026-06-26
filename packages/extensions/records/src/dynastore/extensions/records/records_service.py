@@ -429,6 +429,10 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             ),
         ),
         sortby: Optional[str] = Query(None, description="Sort order (e.g., '-title,+created')."),
+        bbox: Optional[str] = Query(
+            None,
+            description="Spatial filter as comma-separated bbox (minx,miny,maxx,maxy). Records are geometry-less by default; use only on collections with spatial extent.",
+        ),
         q: Optional[str] = Query(None, description="Free-text search query."),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> Response:
@@ -534,7 +538,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         skip_geom_bool = resolve_geometry_flag_from_query(skip_geometry, return_geometry)
 
         request_obj = parse_ogc_query_request(
-            bbox=None,
+            bbox=bbox,
             datetime_param=None,
             sortby=sortby,
             filter=filter,

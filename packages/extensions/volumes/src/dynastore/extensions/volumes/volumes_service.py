@@ -84,6 +84,7 @@ from dynastore.modules.volumes.writers.b3dm import pack_b3dm
 from dynastore.modules.volumes.writers.glb import pack_glb
 from dynastore.modules.volumes.writers.tileset_json import write_tileset_json
 from dynastore.tools.discovery import get_protocol
+from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.extensions.tools.url import get_url
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.response_i18n import resolve_localized
@@ -454,7 +455,10 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     async def _get_volumes_config(
         self, catalog_id: str, collection_id: Optional[str] = None,
     ) -> VolumesConfig:
-        return VolumesConfig()
+        configs = get_protocol(ConfigsProtocol)
+        if configs is None:
+            return VolumesConfig()
+        return await configs.get_config(VolumesConfig, catalog_id, collection_id)
 
     async def _get_or_build_tileset(
         self,
