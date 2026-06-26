@@ -77,29 +77,35 @@ def _fake_dashboards_module() -> types.ModuleType:
 
 
 @pytest.mark.asyncio
-async def test_client_closed_when_post_init_import_raises():
-    """close() is called when an import between init() and yield raises.
+async def test_lifespan_succeeds_without_logs_extension():
+    """ES client stays alive when the logs extension is absent.
 
-    This mirrors the real production failure mode: a job SCOPE that excludes
-    the ``logs`` extension causes ``from dynastore.modules.elasticsearch.log_backend
-    import ElasticsearchLogBackend`` to raise ModuleNotFoundError.  Before
-    the fix the ``try/finally`` that called ``close()`` was only around the
-    ``yield``, so the session was leaked.
+    When the logs extension is not installed in the running SCOPE (e.g. the
+    offloaded catalog-provision job), the lifespan must skip the log-backend
+    registration block and continue through to ``yield`` so the ES client
+    remains available.  Before the fix the missing extension caused a
+    ``ModuleNotFoundError`` that tore down the ES client before any consumer
+    could use it.
     """
-    # In this test environment dynastore.extensions.logs is absent, so
-    # log_backend genuinely cannot be imported.  We stub only the client so we
-    # can track close().
     from dynastore.modules.elasticsearch.module import ElasticsearchModule
     close_mock = AsyncMock()
 
-    with (
-        patch("dynastore.modules.elasticsearch.client.init", AsyncMock()),
-        patch("dynastore.modules.elasticsearch.client.close", close_mock),
+    # Simulate the absence of the logs extension as it is in the offloaded
+    # catalog-provision job SCOPE.
+    with _inject_sys_modules(
+        **{
+            "dynastore.extensions.logs": None,  # type: ignore[dict-item]
+            "dynastore.modules.elasticsearch.dashboards_provisioner": _fake_dashboards_module(),
+        }
     ):
-        module = ElasticsearchModule()
-        with pytest.raises(ModuleNotFoundError):
+        with (
+            patch("dynastore.modules.elasticsearch.client.init", AsyncMock()),
+            patch("dynastore.modules.elasticsearch.client.close", close_mock),
+            patch("dynastore.modules.elasticsearch.client.get_client", MagicMock(return_value=None)),
+        ):
+            module = ElasticsearchModule()
             async with module.lifespan(object()):
-                pass  # pragma: no cover — startup fails before the yield
+                pass  # Lifespan must reach the yield without raising.
 
     close_mock.assert_awaited_once()
 

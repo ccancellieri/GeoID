@@ -23,9 +23,11 @@ Elasticsearch/OpenSearch log backend for batch log persistence.
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from dynastore.extensions.logs.models import LogEntryCreate
+if TYPE_CHECKING:
+    from dynastore.extensions.logs.models import LogEntryCreate
+
 from dynastore.models.protocols.logs import LogBackendProtocol
 from .client import get_client, get_index_prefix
 from .mappings import LOG_MAPPING, get_log_index_name
@@ -52,7 +54,7 @@ class ElasticsearchLogBackend(LogBackendProtocol):
     def name(self) -> str:
         return "elasticsearch"
 
-    async def write_batch(self, entries: List[LogEntryCreate]) -> Dict[str, Any]:
+    async def write_batch(self, entries: "List[LogEntryCreate]") -> Dict[str, Any]:
         """Write a batch of log entries to ES via bulk API."""
         es = get_client()
         if es is None:

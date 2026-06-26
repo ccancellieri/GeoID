@@ -17,6 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import fnmatch
+import importlib.util
 import logging
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from contextlib import asynccontextmanager
@@ -221,34 +222,41 @@ class ElasticsearchModule(ModuleProtocol):
         from dynastore.modules.elasticsearch import client as es_client
         await es_client.init()
         try:
-            # Register log backend for batch log persistence
-            from dynastore.modules.elasticsearch.log_backend import ElasticsearchLogBackend
-            from dynastore.modules.elasticsearch.mappings import LOG_MAPPING, get_log_index_name
+            # Register log backend for batch log persistence — optional; only
+            # available when the logs extension is installed in this SCOPE.
+            if importlib.util.find_spec("dynastore.extensions.logs") is not None:
+                from dynastore.modules.elasticsearch.log_backend import ElasticsearchLogBackend
+                from dynastore.modules.elasticsearch.mappings import LOG_MAPPING, get_log_index_name
 
-            log_backend = ElasticsearchLogBackend()
-            from dynastore.tools.discovery import register_plugin
-            register_plugin(log_backend)
+                log_backend = ElasticsearchLogBackend()
+                from dynastore.tools.discovery import register_plugin
+                register_plugin(log_backend)
 
-            # Ensure log index exists
-            es = es_client.get_client()
-            if es is not None:
-                index_name = get_log_index_name(es_client.get_index_prefix())
-                try:
-                    if not await es.indices.exists(index=index_name):
-                        await es.indices.create(index=index_name, body={"mappings": LOG_MAPPING})
-                        logger.info("ElasticsearchModule: Created log index '%s'.", index_name)
-                except Exception as exc:
-                    logger.warning(
-                        "ElasticsearchModule: Could not ensure log index '%s': %s",
-                        index_name,
-                        exc,
-                    )
+                # Ensure log index exists
+                es_for_log = es_client.get_client()
+                if es_for_log is not None:
+                    index_name = get_log_index_name(es_client.get_index_prefix())
+                    try:
+                        if not await es_for_log.indices.exists(index=index_name):
+                            await es_for_log.indices.create(index=index_name, body={"mappings": LOG_MAPPING})
+                            logger.info("ElasticsearchModule: Created log index '%s'.", index_name)
+                    except Exception as exc:
+                        logger.warning(
+                            "ElasticsearchModule: Could not ensure log index '%s': %s",
+                            index_name,
+                            exc,
+                        )
+            else:
+                logger.debug(
+                    "ElasticsearchModule: logs extension not installed — skipping ES log backend."
+                )
 
             # Ensure platform-wide shared indexes + the regular-items alias exist.
             # Per-tenant indexes (dynastore-items-{cat}) are created on demand by
             # the regular items driver's ensure_storage; the platform creates only
             # the shared collection/catalog indexes here so reads against them
             # never hit "index_not_found_exception" before the first write.
+            es = es_client.get_client()
             if es is not None:
                 from dynastore.modules.elasticsearch.aliases import (
                     ensure_public_alias_exists,
