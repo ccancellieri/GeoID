@@ -47,7 +47,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -85,6 +84,7 @@ from dynastore.modules.volumes.writers.glb import pack_glb
 from dynastore.modules.volumes.writers.tileset_json import write_tileset_json
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols.configs import ConfigsProtocol
+from dynastore.tools.cache import cached
 from dynastore.extensions.tools.url import get_url
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.response_i18n import resolve_localized
@@ -98,37 +98,6 @@ OGC_API_VOLUMES_URIS = [
     "http://www.opengis.net/spec/ogcapi-3d-geovolumes-1/0.0/conf/tileset",
     "http://www.opengis.net/spec/ogcapi-3d-geovolumes-1/0.0/conf/spatialquery",
 ]
-
-# Module-level BSP-tree cache: (catalog_id, collection_id) → (expires_at, tileset_dict)
-_TILESET_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
-_TILESET_CACHE_MAX = 256  # entries; evicts soonest-expiring when full
-
-
-def _cache_get(catalog_id: str, collection_id: str) -> Optional[Dict[str, Any]]:
-    key = (catalog_id, collection_id)
-    entry = _TILESET_CACHE.get(key)
-    if entry is None:
-        return None
-    if time.monotonic() >= entry[0]:
-        _TILESET_CACHE.pop(key, None)  # evict expired entry
-        return None
-    return entry[1]
-
-
-def _cache_set(
-    catalog_id: str,
-    collection_id: str,
-    tileset: Dict[str, Any],
-    ttl_s: int,
-) -> None:
-    if len(_TILESET_CACHE) >= _TILESET_CACHE_MAX:
-        # Evict the entry with the soonest expiry to bound memory usage.
-        oldest_key = min(_TILESET_CACHE, key=lambda k: _TILESET_CACHE[k][0])
-        _TILESET_CACHE.pop(oldest_key, None)
-    _TILESET_CACHE[(catalog_id, collection_id)] = (
-        time.monotonic() + ttl_s,
-        tileset,
-    )
 
 
 class VolumesService(ExtensionProtocol, OGCServiceMixin):
@@ -467,35 +436,37 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         cfg: VolumesConfig,
         request: Request,
     ) -> Dict[str, Any]:
-        cached = _cache_get(catalog_id, collection_id)
-        if cached is not None:
-            return cached
+        base = get_url(request).rsplit("/", 1)[0]
+        primary_fmt = cfg.supported_formats[0] if cfg.supported_formats else "b3dm"
+        template = f"{base}/tiles/{{tile_id}}.{primary_fmt}"
+        return await self._build_tileset_cached(catalog_id, collection_id, template, cfg)
 
+    @staticmethod
+    @cached(
+        maxsize=256,
+        ttl=3600,
+        namespace="volumes_tileset",
+        distributed=True,
+    )
+    async def _build_tileset_cached(
+        catalog_id: str,
+        collection_id: str,
+        template: str,
+        cfg: VolumesConfig,
+    ) -> Dict[str, Any]:
         bounds_source: BoundsSourceProtocol = (
             get_protocol(BoundsSourceProtocol) or EmptyBoundsSource()
         )
         try:
             bounds = list(await bounds_source.get_bounds(catalog_id, collection_id))
         except Exception as exc:
-            # A collection without a geometries sidecar (e.g. an external 3D
-            # Tiles reference or a non-CityJSON collection) makes the bounds
-            # query fail; serve an empty tileset rather than a 500.
             logger.warning(
                 "volumes: bounds lookup failed for %s/%s (%s); serving empty tileset",
                 catalog_id, collection_id, exc,
             )
             bounds = []
 
-        # get_url honors FORCE_HTTPS so the b3dm content.uri matches the page
-        # scheme (https) behind the inner load balancer; otherwise the browser
-        # blocks the tile as mixed content and only the bounding box renders.
-        base = get_url(request).rsplit("/", 1)[0]
-        primary_fmt = cfg.supported_formats[0] if cfg.supported_formats else "b3dm"
-        template = f"{base}/tiles/{{tile_id}}.{primary_fmt}"
-
-        tileset = build_tileset(bounds, cfg, content_uri_template=template)
-        _cache_set(catalog_id, collection_id, tileset, cfg.on_demand_cache_ttl_s)
-        return tileset
+        return build_tileset(bounds, cfg, content_uri_template=template)
 
     async def _resolve_tile(
         self,

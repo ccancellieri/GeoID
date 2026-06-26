@@ -83,13 +83,25 @@ async def test_tileset_json_uses_registered_bounds_source(monkeypatch):
     from dynastore.modules.volumes.bounds import FeatureBounds
     import dynastore.extensions.volumes.volumes_service as mod
 
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
     class _Source:
         async def get_bounds(self, catalog_id, collection_id, *, limit=None):
             return [FeatureBounds("the-only-feature", 0, 0, 0, 1, 1, 1)]
 
-    monkeypatch.setattr(mod, "get_protocol", lambda proto: _Source())
+    class _ConfigsSource:
+        async def get_config(self, config_cls, catalog_id=None, collection_id=None):
+            return config_cls()
+
+    def _fake_get_protocol(proto):
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        if proto is ConfigsProtocol:
+            return _ConfigsSource()
+        if hasattr(proto, '__name__') and 'Bounds' in proto.__name__:
+            return _Source()
+        return _Source()
+
+    monkeypatch.setattr(mod, "get_protocol", _fake_get_protocol)
 
     svc = VolumesService()
     request = MagicMock(spec=Request)
@@ -114,7 +126,7 @@ async def test_tileset_json_falls_back_to_empty_source(monkeypatch):
     from dynastore.extensions.volumes.volumes_service import VolumesService
     import dynastore.extensions.volumes.volumes_service as mod
 
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
     monkeypatch.setattr(mod, "get_protocol", lambda proto: None)
 
     svc = VolumesService()
@@ -142,13 +154,23 @@ async def test_tileset_json_degrades_when_bounds_source_raises(monkeypatch):
     from dynastore.extensions.volumes.volumes_service import VolumesService
     import dynastore.extensions.volumes.volumes_service as mod
 
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
     class _RaisingSource:
         async def get_bounds(self, catalog_id, collection_id, *, limit=None):
             raise RuntimeError("relation \"x_geometries\" does not exist")
 
-    monkeypatch.setattr(mod, "get_protocol", lambda proto: _RaisingSource())
+    class _ConfigsSource:
+        async def get_config(self, config_cls, catalog_id=None, collection_id=None):
+            return config_cls()
+
+    def _fake_get_protocol(proto):
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        if proto is ConfigsProtocol:
+            return _ConfigsSource()
+        return _RaisingSource()
+
+    monkeypatch.setattr(mod, "get_protocol", _fake_get_protocol)
 
     svc = VolumesService()
     request = MagicMock(spec=Request)
@@ -163,7 +185,7 @@ async def test_tileset_json_degrades_when_bounds_source_raises(monkeypatch):
     assert doc["root"]["boundingVolume"]["box"] == [0.0] * 12
     assert "content" not in doc["root"]
 
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +250,18 @@ async def test_tileset_cached_after_first_build(monkeypatch):
             call_count += 1
             return []
 
-    monkeypatch.setattr(mod, "get_protocol", lambda proto: _CountingSource())
-    # Clear any pre-existing cache entry.
-    mod._TILESET_CACHE.clear()
+    class _ConfigsSource:
+        async def get_config(self, config_cls, catalog_id=None, collection_id=None):
+            return config_cls()
+
+    def _fake_get_protocol(proto):
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        if proto is ConfigsProtocol:
+            return _ConfigsSource()
+        return _CountingSource()
+
+    monkeypatch.setattr(mod, "get_protocol", _fake_get_protocol)
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
     from unittest.mock import MagicMock
     from fastapi import Request
@@ -245,7 +276,7 @@ async def test_tileset_cached_after_first_build(monkeypatch):
 
     assert call_count == 1, "bounds source should only be called once (cache hit on second)"
 
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -288,17 +319,19 @@ async def test_get_tile_b3dm_returns_bytes_response(monkeypatch):
         return None
 
     monkeypatch.setattr(mod, "get_protocol", _fake_get_protocol)
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
     svc = mod.VolumesService()
     req = MagicMock(spec=Request)
     req.url = URL("http://ex/volumes/catalogs/c/collections/col/3dtiles/tileset.json")
 
-    # Build tileset so the cache is populated with correct tile_ids.
-    await svc.get_tileset_json("c", "col", req)
+    resp = await svc.get_tileset_json("c", "col", req)
+    body = b""
+    async for chunk in resp.body_iterator:
+        body += chunk if isinstance(chunk, bytes) else chunk.encode()
+    doc = json.loads(body.decode())
 
-    # Retrieve the root tile_id from the cached tileset.
-    root = mod._TILESET_CACHE[("c", "col")][1]["root"]
+    root = doc["root"]
     content_uri = root.get("content", {}).get("uri", "")
     tile_id = content_uri.rsplit("/", 1)[-1].split(".")[0]
 
@@ -310,7 +343,7 @@ async def test_get_tile_b3dm_returns_bytes_response(monkeypatch):
     assert len(response.body) > 28  # header alone is 28 bytes
     assert response.body[:4] == b"b3dm"
 
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -353,14 +386,18 @@ async def test_get_tile_glb_returns_gltf_binary(monkeypatch):
         return None
 
     monkeypatch.setattr(mod, "get_protocol", _fake_get_protocol)
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
     svc = mod.VolumesService()
     req = MagicMock(spec=Request)
     req.url = URL("http://ex/volumes/catalogs/c/collections/col2/3dtiles/tileset.json")
-    await svc.get_tileset_json("c", "col2", req)
+    resp = await svc.get_tileset_json("c", "col2", req)
+    body = b""
+    async for chunk in resp.body_iterator:
+        body += chunk if isinstance(chunk, bytes) else chunk.encode()
+    doc = json.loads(body.decode())
 
-    root = mod._TILESET_CACHE[("c", "col2")][1]["root"]
+    root = doc["root"]
     content_uri = root.get("content", {}).get("uri", "")
     tile_id = content_uri.rsplit("/", 1)[-1].split(".")[0]
 
@@ -371,7 +408,7 @@ async def test_get_tile_glb_returns_gltf_binary(monkeypatch):
     assert response.media_type == "model/gltf-binary"
     assert response.body[:4] == b"glTF"
 
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +424,7 @@ async def test_b3dm_returns_404_for_unknown_tile(monkeypatch):
     import dynastore.extensions.volumes.volumes_service as mod
 
     monkeypatch.setattr(mod, "get_protocol", lambda proto: None)
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
     svc = mod.VolumesService()
     req = MagicMock(spec=Request)
@@ -401,7 +438,7 @@ async def test_b3dm_returns_404_for_unknown_tile(monkeypatch):
         await svc.get_tile_b3dm("c", "empty", "999", req2)
     assert exc.value.status_code == 404
 
-    mod._TILESET_CACHE.clear()
+    mod.VolumesService._build_tileset_cached.cache_clear()
 
 
 # ---------------------------------------------------------------------------
