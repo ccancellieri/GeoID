@@ -45,6 +45,28 @@ _VISIBILITY_TIMEOUT = timedelta(
     seconds=int(os.getenv("TASK_VISIBILITY_TIMEOUT_SECONDS", "300"))
 )
 
+# Task statuses that indicate the task itself failed.  When a Cloud Run Job
+# retry arrives and cannot claim such a task it must exit non-zero so the
+# execution is recorded as FAILED — not as a false SUCCEEDED — in the GCP
+# console.
+_FAIL_EXIT_STATUSES: frozenset[str] = frozenset({"FAILED", "DEAD_LETTER"})
+
+
+def _exit_code_for_unclaimed_status(status: str | None) -> int:
+    """Return the process exit code for a Cloud Run execution that could not
+    claim its task row because the row is already terminal or held by a live
+    peer.
+
+    FAILED / DEAD_LETTER → 1: the task failed; the retry must not be recorded
+    as SUCCEEDED in the Cloud Run console (false green).
+
+    All other statuses (COMPLETED, DISMISSED, ACTIVE with a live foreign lease,
+    PENDING, or unknown / lookup failure) → 0: the work is done, was cancelled,
+    or a peer execution is still running.  This duplicate execution should step
+    aside quietly.
+    """
+    return 1 if status in _FAIL_EXIT_STATUSES else 0
+
 
 async def _heartbeat_loop(engine, task_id: uuid.UUID, interval_seconds: float) -> None:
     """Extend locked_until every interval_seconds while the task runs.
@@ -238,17 +260,37 @@ async def main(task_name: str, payload: dict, schema: str):
                         _VISIBILITY_TIMEOUT,
                     )
                     if claimed_row is None:
-                        # Lost claim: the row is already terminal, or ACTIVE
-                        # with a live lease held by another execution. This is
-                        # the #726 guard — a Cloud Run Job spawned by a reaper
-                        # re-enqueue (lease lapsed mid-cold-start) must NOT
-                        # re-run a task another execution already finished or
-                        # is finishing. Exit cleanly; the lifespans unwind.
+                        # The row is already terminal or ACTIVE with a live
+                        # foreign lease (#726 guard — no double-run).  Look up
+                        # the current status so we exit with the right code:
+                        # a Cloud Run retry finding FAILED / DEAD_LETTER must
+                        # exit 1 so the execution is not recorded as SUCCEEDED.
+                        _unclaimed_status: str | None = None
+                        try:
+                            _current_task = await tasks_mgr.get_task(
+                                engine, task_id_uuid, schema
+                            )
+                            _unclaimed_status = (
+                                _current_task.status.value
+                                if _current_task
+                                else None
+                            )
+                        except Exception as _lookup_err:
+                            logger.warning(
+                                "--- [main_task.py] Task %s not claimable and "
+                                "status lookup failed (%s); treating as "
+                                "non-failure (exit 0). ---",
+                                task_id_uuid, _lookup_err,
+                            )
+                        _exit_code = _exit_code_for_unclaimed_status(_unclaimed_status)
                         logger.warning(
-                            f"--- [main_task.py] Task {task_id_uuid} not claimable "
-                            f"(already terminal or owned by a live execution) — "
-                            f"skipping execution, no double-run. ---"
+                            "--- [main_task.py] Task %s not claimable "
+                            "(status=%s, exit_code=%d) — skipping execution, "
+                            "no double-run. ---",
+                            task_id_uuid, _unclaimed_status, _exit_code,
                         )
+                        if _exit_code != 0:
+                            sys.exit(_exit_code)
                         return
                     interval = _VISIBILITY_TIMEOUT.total_seconds() / 3
                     hb_task = asyncio.create_task(
@@ -379,6 +421,13 @@ async def main(task_name: str, payload: dict, schema: str):
                             retry=True,
                         )
                         logger.info("Successfully reported failure to DB via fail_task.")
+                        # Signal to the outer __main__ handler that this failure
+                        # was already recorded.  The outer handler checks this
+                        # attribute before calling report_failure(), which would
+                        # otherwise open a second full modules.lifespan() in the
+                        # same process — paying the ~40s bootstrap cost again and
+                        # triggering "already instantiated … reusing" warnings.
+                        e._failure_already_reported = True  # type: ignore[attr-defined]
                 except Exception as report_error:
                     logger.error(f"Failed to report failure within lifecycle: {report_error}. Falling back to external reporter.")
             raise
@@ -444,6 +493,10 @@ if __name__ == "__main__":
     except Exception as e:
         full_error = f"{e}\n{traceback.format_exc()}"
         logger.critical(f"An unexpected fatal error occurred: {full_error}")
-        if task_id:
+        if task_id and not getattr(e, '_failure_already_reported', False):
+            # The in-lifecycle handler (inside main()) reports via fail_task()
+            # when it can reach the DB through the active module stack.  When
+            # it succeeds it stamps _failure_already_reported on the exception
+            # to avoid a second full modules.lifespan() bootstrap here.
             asyncio.run(report_failure(task_id, args.schema, str(e)))
         sys.exit(1)
