@@ -18,9 +18,11 @@
 
 """Integration tests for configurable retry behavior.
 
-The retry/leadership knobs are driven by the live configs snapshot (set here
-via the apply handlers, exactly as a ``PUT /configs`` would), not by
-environment variables. Explicit call-time parameters still win over config.
+The retry/leadership knobs are backed by module-global dataclass instances.
+Tests override those globals directly to drive retry counts, delays, and
+leadership intervals without restarting; the ``_restore_snapshot`` fixture
+undoes the mutations after each test. Explicit call-time parameters still
+win over the module globals.
 """
 
 from __future__ import annotations

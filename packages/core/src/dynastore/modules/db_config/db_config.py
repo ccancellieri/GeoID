@@ -281,9 +281,8 @@ class DBConfig:
     #     statement_timeout, which overrides this session default within their
     #     transaction, so a session-wide value is safe to enable.
     #
-    # These defaults are also available as DbTimeoutConfig (PluginConfig) for
-    # runtime configuration via the configs API. The env var takes precedence
-    # for backwards compatibility, then the PluginConfig, then the code default.
+    # These are genuine infra dimensioning values. Configure them via env var
+    # (or db_config.json) before startup; they are resolved once at import time.
     lock_timeout: str = _cfg_str("DB_LOCK_TIMEOUT", "5s")
     statement_timeout: str = _cfg_str("DB_STATEMENT_TIMEOUT", "0")
     idle_in_transaction_session_timeout: str = _cfg_str(

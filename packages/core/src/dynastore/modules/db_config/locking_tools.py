@@ -78,9 +78,8 @@ def retry_on_lock_conflict(max_retries: int | None = None, base_delay: float | N
     or asyncpg protocol 'operation in progress' errors.
 
     Configuration: Values are resolved from (1) explicit function parameters,
-    else (2) the live ``ConnectionRetryConfig`` (configs API, hot-reloadable).
-    Resolved at CALL TIME, so a ``PUT /configs`` takes effect on the next call.
-    See :mod:`connection_health_config` for details.
+    else (2) the module-global ``ConnectionRetryConfig`` defaults.
+    Resolved at CALL TIME. See :mod:`connection_health_config` for details.
     """
 
     def decorator(func):
@@ -315,8 +314,7 @@ def sync_acquire_startup_lock(
     """Synchronous version of acquire_startup_lock for DDL coordination.
 
     Configuration: Timeout is resolved from (1) the function parameter, else
-    (2) the live ``LeadershipConfig.lock_acquire_timeout_seconds`` (configs
-    API, hot-reloadable; default 30s).
+    (2) ``LeadershipConfig.lock_acquire_timeout_seconds`` (default 30s).
     """
     if timeout is None:
         timeout_secs, _, _, _, _ = resolve_leadership_config()
@@ -384,8 +382,7 @@ async def acquire_startup_lock(
     Ensures all operations happen on the same connection if an engine is provided.
 
     Configuration: Timeout is resolved from (1) the function parameter, else
-    (2) the live ``LeadershipConfig.lock_acquire_timeout_seconds`` (configs
-    API, hot-reloadable; default 30s).
+    (2) ``LeadershipConfig.lock_acquire_timeout_seconds`` (default 30s).
     """
     if timeout is None:
         timeout_secs, _, _, _, _ = resolve_leadership_config()

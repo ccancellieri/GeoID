@@ -33,7 +33,6 @@ from dynastore.tools.discovery import register_plugin, unregister_plugin
 # them under platform.protocols.storage.*.  DBConfigModule loads at priority=0,
 # so this is the earliest reliable trigger.
 from . import engine_config as _engine_config  # noqa: F401
-from . import db_timeout_config as _db_timeout_config  # noqa: F401
 from .db_config import DBConfig
 from .engine_instance_cache import EngineInstanceCache, EngineInstanceCacheSweepService
 from .engine_resolver import (
@@ -197,18 +196,6 @@ class DBConfigModule(ModuleProtocol):
             register_plugin(pcfg)
             stack.callback(unregister_plugin, pcfg)
 
-            # Wire the connection-health configs (retry/leadership/health) to the
-            # live configs store: register apply handlers BEFORE any seed/PUT so
-            # changes refresh the in-process snapshot that the sync ``resolve_*``
-            # helpers read. The initial snapshot is loaded just before ``yield``,
-            # once the engine cache has proven platform-config storage is queryable.
-            from dynastore.modules.db_config.connection_health_config import (
-                register_connection_health_apply_handlers,
-                unregister_connection_health_apply_handlers,
-            )
-            register_connection_health_apply_handlers()
-            stack.callback(unregister_connection_health_apply_handlers)
-
             # 3. Engine instance cache (Cycle F.6) — snapshots platform-tier
             # engine configs at boot, exposes lazy-instantiating cache.
             # Until F.4c lands, no driver consumes this in production paths,
@@ -232,14 +219,6 @@ class DBConfigModule(ModuleProtocol):
                 self._teardown_sweep_supervisor, sweep_supervisor, sweep_shutdown
             )
             stack.push_async_callback(self._teardown_engine_cache, app_state)
-
-            # Load the initial connection-health config snapshot from the store.
-            # Best-effort: on failure the validated class defaults stay in place
-            # and apply handlers (registered above) pick up later seeds/PUTs.
-            from dynastore.modules.db_config.connection_health_config import (
-                load_connection_health_configs,
-            )
-            await load_connection_health_configs(engine)
 
             yield
 

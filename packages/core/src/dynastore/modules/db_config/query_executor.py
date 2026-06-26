@@ -1327,9 +1327,8 @@ def retry_on_transient_connect(
     Anything else propagates immediately so genuine bugs are not masked.
 
     Configuration: Values are resolved from (1) explicit function parameters,
-    else (2) the live ``ConnectionRetryConfig`` (configs API, hot-reloadable).
-    Resolved at CALL TIME, so a ``PUT /configs`` takes effect on the next call.
-    See :mod:`connection_health_config` for details.
+    else (2) the module-global ``ConnectionRetryConfig`` defaults.
+    Resolved at CALL TIME. See :mod:`connection_health_config` for details.
     """
 
     def decorator(func):
@@ -1383,8 +1382,9 @@ def retry_on_transient_connect(
 # M3 (issue #486): emit a structured log line on every async pool acquire so a
 # GCP log-based metric can compute db_pool_wait_seconds histograms per service
 # without needing a prometheus_client dep + scrape endpoint. INFO when slow,
-# DEBUG otherwise. The threshold is read live (not frozen at import) so a
-# ``PUT /configs`` for ConnectionHealthConfig takes effect without a restart.
+# DEBUG otherwise. The threshold is read at call time via
+# ``resolve_slow_pool_acquire_threshold()`` so tests that override the module
+# global see the updated value immediately.
 
 
 def _resolve_service_name() -> str:
@@ -1916,9 +1916,8 @@ async def provisioning_write_with_retry(
     ON CONFLICT / upsert semantics.
 
     Configuration: Values are resolved from (1) explicit function parameters,
-    else (2) the live ``ProvisioningRetryConfig`` (configs API, hot-reloadable).
-    Resolved at CALL TIME, so a ``PUT /configs`` takes effect on the next call.
-    See :mod:`connection_health_config` for details.
+    else (2) the module-global ``ProvisioningRetryConfig`` defaults.
+    Resolved at CALL TIME. See :mod:`connection_health_config` for details.
     """
     # Resolve config at call time so live config edits are picked up.
     cfg_attempts, cfg_lock_backoff = resolve_provisioning_retry_config()
