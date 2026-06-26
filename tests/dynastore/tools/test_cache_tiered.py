@@ -20,13 +20,15 @@
 
 Covers:
 - TieredAsyncBackend: multi-tier read/write/clear/exists
-- Read path: L1 hit, L2 hit (populate L1), L3 (populate L1+L2)
+- Read path: L2-authoritative with version envelopes
 - Write path: all tiers written with tier-specific TTLs
+- Version semantics: L2 wins on higher ver; L1 wins on own fresh write
+- Tombstone invalidation: keyed clear is synchronous on all tiers
+- Legacy raw entries: treated as ver=0, out-versioned by any new write
 - Circuit breaker: consecutive failures, threshold breach, unregister
-- Backend re-resolution: after circuit breaker trip
 """
 import asyncio
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -34,8 +36,16 @@ import pytest
 from dynastore.tools.cache import (
     LocalAsyncCacheBackend,
     TieredAsyncBackend,
+    _ev_parse,
     _notify_backend_change,
 )
+
+
+def _unpack(data: Any) -> Any:
+    """Test helper: extract the payload from a version envelope, or return raw for legacy."""
+    if isinstance(data, dict) and "__v" in data:
+        return data.get("__d")
+    return data
 
 
 class FakeCacheBackend:
@@ -129,39 +139,45 @@ class TestTieredAsyncBackend:
 
     @pytest.mark.asyncio
     async def test_get_l1_hit_returns_l1_value(self):
-        """L1 hit returns value immediately (L2 not queried first)."""
+        """L1-only hit (legacy raw) returns value; L2 also checked (L2-authoritative path)."""
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
-        # Pre-populate L1 only
+        # Pre-populate L1 only with a legacy (non-envelope) value.
+        # L2 is empty, so L1 wins by default.
         await l1.set("key1", b"value1")
 
         result = await tiered.get("key1")
         assert result == b"value1"
+        # Both tiers are read (L2-authoritative path always checks L2).
+        assert ("get", "key1") in l1._ops
+        assert ("get", "key1") in l2._ops
 
     @pytest.mark.asyncio
     async def test_get_l2_hit_returns_l2_and_populates_l1(self):
-        """L2 hit returns value and populates L1 for fallback."""
+        """L2-only hit returns value and populates L1 for future reads."""
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
-        # Pre-populate L2 only
+        # Pre-populate L2 only with a legacy raw value (ver=0).
         await l2.set("key2", b"value2")
 
         result = await tiered.get("key2")
         assert result == b"value2"
-        assert ("get", "key2") in l2._ops  # L2 queried first
+        # Both tiers are read.
+        assert ("get", "key2") in l1._ops
+        assert ("get", "key2") in l2._ops
 
-        # L1 populated for fallback
+        # L1 populated for future reads (envelope written with TTL cap).
         l1_set = [op for op in l1._ops if op[0] == "set"]
         assert len(l1_set) == 1
         assert l1_set[0][2] == TieredAsyncBackend.DEFAULT_L1_TTL_CAP
 
     @pytest.mark.asyncio
     async def test_get_l2_error_falls_back_to_l1(self):
-        """L2 error falls back to L1 (degraded mode)."""
+        """L2 error falls back to L1 best-effort (degraded mode)."""
         class FailingBackend(FakeCacheBackend):
             async def get(self, key: str):
                 raise RuntimeError("L2 down")
@@ -170,8 +186,8 @@ class TestTieredAsyncBackend:
         l2 = FailingBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
-        # Pre-populate L1 only
-        await l1.set("key1", b"value1")
+        # Pre-populate L1 with an envelope (via tiered.set, so version is stamped).
+        await tiered.set("key1", b"value1")
 
         result = await tiered.get("key1")
         assert result == b"value1"  # L1 fallback worked
@@ -190,7 +206,7 @@ class TestTieredAsyncBackend:
 
     @pytest.mark.asyncio
     async def test_set_writes_all_tiers(self):
-        """set() writes to both L1 (short TTL) and L2 (full TTL).
+        """set() writes version envelopes to both L1 (short TTL) and L2 (full TTL).
 
         L2 write is async background, so we must wait for the task.
         """
@@ -201,12 +217,12 @@ class TestTieredAsyncBackend:
         result = await tiered.set("key3", b"value3", ttl=300)
         assert result is True
 
-        # L1 has the value immediately
-        assert await l1.get("key3") == b"value3"
+        # L1 has the envelope immediately; unwrap to check payload.
+        assert _unpack(await l1.get("key3")) == b"value3"
 
-        # L2 write is background — wait for pending tasks
+        # L2 write is background — wait for pending tasks.
         await tiered.close()
-        assert await l2.get("key3") == b"value3"
+        assert _unpack(await l2.get("key3")) == b"value3"
 
         # Verify TTLs: L1 capped at DEFAULT_L1_TTL_CAP, L2 gets full ttl.
         l1_set = [op for op in l1._ops if op[0] == "set"]
@@ -216,46 +232,48 @@ class TestTieredAsyncBackend:
 
     @pytest.mark.asyncio
     async def test_clear_key_clears_all_tiers(self):
-        """clear(key=...) deletes from L1 sync, L2 background."""
+        """clear(key=...) writes a tombstone to L1 and L2 synchronously.
+
+        The tombstone makes tiered.get() return None from both tiers
+        immediately after clear() returns — no drain step needed for L2.
+        """
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
         await tiered.set("key4", b"value4")
-        await tiered.close()  # wait for background L2 set
-        assert await l1.get("key4") == b"value4"
-        assert await l2.get("key4") == b"value4"
+        await tiered.close()  # drain background L2 set
+        assert _unpack(await l1.get("key4")) == b"value4"
+        assert _unpack(await l2.get("key4")) == b"value4"
 
         result = await tiered.clear(key="key4")
         assert result is True
 
-        # L1 cleared immediately
-        assert await l1.get("key4") is None
-
-        # L2 cleared in background
-        await tiered.close()
-        assert await l2.get("key4") is None
+        # Both tiers hold tombstones; tiered.get() resolves to None immediately.
+        assert await tiered.get("key4") is None
+        # Direct tier reads show tombstone envelopes (not None, not the old value).
+        l1_raw = await l1.get("key4")
+        l2_raw = await l2.get("key4")
+        assert isinstance(l1_raw, dict) and "__t" in l1_raw, "L1 must hold a tombstone"
+        assert isinstance(l2_raw, dict) and "__t" in l2_raw, "L2 must hold a tombstone (sync write)"
 
     @pytest.mark.asyncio
     async def test_clear_namespace_clears_all_tiers(self):
-        """clear(namespace=...) deletes from L1 sync, L2 background."""
+        """clear(namespace=...) deletes from L1 and L2 synchronously."""
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
         await tiered.set("app:key1", b"v1")
         await tiered.set("app:key2", b"v2")
-        await tiered.close()  # wait for background L2 sets
+        await tiered.close()  # drain background L2 sets
 
         result = await tiered.clear(namespace="app")
         assert result is True
 
-        # L1 cleared immediately
+        # Both tiers cleared synchronously (no drain step needed for L2).
         assert await l1.get("app:key1") is None
         assert await l1.get("app:key2") is None
-
-        # L2 cleared in background
-        await tiered.close()
         assert await l2.get("app:key1") is None
         assert await l2.get("app:key2") is None
 
@@ -329,10 +347,11 @@ class TestTieredAsyncBackendL1TtlCap:
 
         await tiered.set("k", b"v", ttl=300)
         await tiered.close()  # wait for background L2 write
+        # set() calls l1.set once (the envelope write) and l2.set once (background).
         l1_set = [op for op in l1._ops if op[0] == "set"]
         l2_set = [op for op in l2._ops if op[0] == "set"]
-        assert l1_set[0][2] == 2.0
-        assert l2_set[0][2] == 300
+        assert l1_set[0][2] == 2.0   # L1 capped
+        assert l2_set[0][2] == 300   # L2 full TTL
 
     @pytest.mark.asyncio
     async def test_custom_l1_cap_used_on_l2_populate_back(self):
@@ -372,14 +391,15 @@ class TestTieredAsyncBackendL2Retry:
 
     @pytest.mark.asyncio
     async def test_set_returns_immediately_after_l1(self):
-        """set() returns True immediately after L1 write."""
+        """set() returns True immediately after L1 write (envelope stored)."""
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
         result = await tiered.set("k", b"v")
         assert result is True
-        assert await l1.get("k") == b"v"  # L1 written synchronously
+        # L1 written synchronously; stored as envelope.
+        assert _unpack(await l1.get("k")) == b"v"
 
     @pytest.mark.asyncio
     async def test_l2_write_is_background(self):
@@ -390,12 +410,12 @@ class TestTieredAsyncBackendL2Retry:
 
         await tiered.set("k", b"v")
 
-        # Background task pending
-        assert len(tiered._pending_bg_tasks) > 0 or await l2.get("k") == b"v"
+        # Background task pending (or already completed — accept either).
+        assert len(tiered._pending_bg_tasks) > 0 or _unpack(await l2.get("k")) == b"v"
 
-        # Wait for background task
+        # Wait for background task; envelope written to L2.
         await tiered.close()
-        assert await l2.get("k") == b"v"
+        assert _unpack(await l2.get("k")) == b"v"
 
     @pytest.mark.asyncio
     async def test_l2_retry_on_failure(self, caplog):
@@ -422,8 +442,8 @@ class TestTieredAsyncBackendL2Retry:
             await tiered.set("k", b"v")
             await tiered.close()
 
-        # L2 eventually succeeded after 2 failures
-        assert await l2.get("k") == b"v"
+        # L2 eventually succeeded after 2 failures; envelope written.
+        assert _unpack(await l2.get("k")) == b"v"
         assert l2._attempts == 3
 
     @pytest.mark.asyncio
@@ -447,77 +467,54 @@ class TestTieredAsyncBackendL2Retry:
         assert any("TTL cap will self-heal" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_clear_is_l1_sync_l2_background(self):
-        """clear() clears L1 sync, L2 in background."""
+    async def test_clear_key_is_synchronous_on_all_tiers(self):
+        """Keyed clear writes a tombstone synchronously to L1 and L2.
+
+        Unlike a value set (where L2 is background), the tombstone must be
+        visible cluster-wide immediately so that L2-authoritative reads in
+        other processes return None right away.
+        """
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
-        await l1.set("k", b"v")
-        await l2.set("k", b"v")
+        await tiered.set("k", b"v")
+        await tiered.close()  # drain background L2 write
 
         result = await tiered.clear(key="k")
         assert result is True
 
-        # L1 cleared immediately
-        assert await l1.get("k") is None
-        # L2 still has value
-        assert await l2.get("k") == b"v"
+        # Both tiers have tombstones immediately — no drain needed.
+        l1_raw = await l1.get("k")
+        l2_raw = await l2.get("k")
+        assert isinstance(l1_raw, dict) and "__t" in l1_raw, "L1 must hold tombstone"
+        assert isinstance(l2_raw, dict) and "__t" in l2_raw, "L2 must hold tombstone synchronously"
 
-        # Wait for background clear
-        await tiered.close()
-        assert await l2.get("k") is None
-
-    @pytest.mark.asyncio
-    async def test_clear_retry_on_failure(self, caplog):
-        """L2 clear retries with exponential backoff on failure."""
-        import logging
-
-        class FailingBackend(FakeCacheBackend):
-            def __init__(self, name, priority, fail_times):
-                super().__init__(name, priority)
-                self._fail_times = fail_times
-                self._attempts = 0
-
-            async def clear(self, *, key=None, namespace=None, tags=None):
-                self._attempts += 1
-                if self._attempts <= self._fail_times:
-                    raise RuntimeError(f"fail attempt {self._attempts}")
-                return await super().clear(key=key, namespace=namespace, tags=tags)
-
-        l1 = FakeCacheBackend("l1", 1000)
-        l2 = FailingBackend("l2", 100, fail_times=2)
-        tiered = TieredAsyncBackend([l1, l2], l2_retry_attempts=3, l2_retry_backoff=0.01)
-
-        await l1.set("k", b"v")
-        await l2.set("k", b"v")
-
-        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
-            await tiered.clear(key="k")
-            await tiered.close()
-
-        # L2 eventually succeeded after 2 failures
-        assert await l2.get("k") is None
-        assert l2._attempts == 3
+        # tiered.get() resolves the tombstone to a miss.
+        assert await tiered.get("k") is None
 
     @pytest.mark.asyncio
-    async def test_clear_retry_exhausted_logs_warning(self, caplog):
-        """When L2 clear retry exhausted, warning logged."""
+    async def test_clear_l2_failure_logs_warning_l1_tombstone_guards(self, caplog):
+        """If L2 tombstone write fails, a warning is logged; L1 tombstone still guards."""
         import logging
 
-        class AlwaysFailingBackend(FakeCacheBackend):
-            async def clear(self, *, key=None, namespace=None, tags=None):
-                raise RuntimeError("always fails")
+        class FailingSetBackend(FakeCacheBackend):
+            async def set(self, key, value, *, ttl=None, exist=None):
+                raise RuntimeError("L2 down")
 
         l1 = FakeCacheBackend("l1", 1000)
-        l2 = AlwaysFailingBackend("l2", 100)
-        tiered = TieredAsyncBackend([l1, l2], l2_retry_attempts=2, l2_retry_backoff=0.01)
+        l2 = FailingSetBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
 
         with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
-            await tiered.clear(key="k")
-            await tiered.close()
+            result = await tiered.clear(key="k")
 
-        assert any("L2 cache clear failed after 2 attempts" in r.getMessage() for r in caplog.records)
+        assert result is True
+        # Warning emitted for L2 failure.
+        assert any("tombstone write failed" in r.getMessage() for r in caplog.records)
+        # L1 tombstone written successfully; local reads return None.
+        l1_raw = await l1.get("k")
+        assert isinstance(l1_raw, dict) and "__t" in l1_raw
 
     @pytest.mark.asyncio
     async def test_close_waits_for_pending_tasks(self):
@@ -536,10 +533,159 @@ class TestTieredAsyncBackendL2Retry:
 
         await tiered.close()
 
-        # All tasks completed
+        # All tasks completed; envelopes written to L2.
         assert len(tiered._pending_bg_tasks) == 0
-        assert await l2.get("k1") == b"v1"
-        assert await l2.get("k2") == b"v2"
+        assert _unpack(await l2.get("k1")) == b"v1"
+        assert _unpack(await l2.get("k2")) == b"v2"
+
+
+class TestVersionedL2AuthoritativeRead:
+    """Version-stamped L2-authoritative read semantics.
+
+    Every stored value is an envelope ``{"__v": ver, "__d": payload}`` where
+    ``ver = time.time_ns()`` at write time.  ``get()`` reads both L1 and L2
+    and returns the value from the tier with the **higher version**.
+
+    This gives two guarantees simultaneously:
+    - Cross-instance accuracy: a newer write from another instance propagates
+      to local L1 on the next read (L2 wins with higher ver).
+    - Read-your-write: an immediate local read after ``set()`` returns the
+      fresh L1 value because L1.ver > stale L2.ver (L1 wins).
+    """
+
+    @pytest.mark.asyncio
+    async def test_set_then_immediate_get_returns_new_value(self):
+        """Immediate get() after set() returns the freshly-written value.
+
+        L2 still holds a legacy (unversioned, ver=0) value when L2's background
+        write has not yet run.  L1 holds the fresh envelope (ver=T >> 0), so L1
+        wins the version comparison and the new value is returned.
+        """
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        # Seed L2 with a legacy (unversioned, ver=0) value.
+        await l2.set("key", b"old")
+
+        # Write new value — L1 gets envelope(ver=T); L2 background write NOT yet run.
+        await tiered.set("key", b"new")
+
+        # get() reads L1 (ver=T) and L2 (ver=0, legacy); L1 wins.
+        result = await tiered.get("key")
+        assert result == b"new", (
+            "L1 envelope (fresh ver) must beat the stale legacy L2 value"
+        )
+        # L1 still holds the fresh envelope (not downgraded by the stale L2 read).
+        assert _unpack(await l1.get("key")) == b"new"
+
+    @pytest.mark.asyncio
+    async def test_clear_then_get_does_not_re_serve_cleared_value(self):
+        """After clear(), get() returns None immediately (tombstone in both tiers).
+
+        The tombstone is written synchronously to L1 and L2, so no drain step
+        is needed to make the invalidation visible.
+        """
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        await tiered.set("key", b"value")
+        await tiered.close()  # drain background L2 set
+        assert _unpack(await l1.get("key")) == b"value"
+        assert _unpack(await l2.get("key")) == b"value"
+
+        result = await tiered.clear(key="key")
+        assert result is True
+
+        # Tombstone is in both tiers immediately — no drain needed.
+        assert await tiered.get("key") is None
+
+    @pytest.mark.asyncio
+    async def test_stale_l2_lower_ver_does_not_overwrite_fresher_l1(self):
+        """A stale L2 entry (lower ver) must not clobber a fresher L1 entry.
+
+        Simulates another instance writing an older value to L2 while the local
+        instance has a newer write in L1.
+        """
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        import time
+
+        # Write "old" to L2 with a low version (simulating an older write).
+        old_ver = 1
+        await l2.set("key", {"__v": old_ver, "__d": b"old"})
+
+        # Write "new" to L1 with a higher version (our recent local write).
+        new_ver = time.time_ns()
+        await l1.set("key", {"__v": new_ver, "__d": b"new"})
+
+        # get() must pick L1 (new_ver > old_ver).
+        result = await tiered.get("key")
+        assert result == b"new", "L1 higher version must win over stale L2 lower version"
+
+        # L1 must retain the fresh value — not downgraded by L2 read-back.
+        assert _unpack(await l1.get("key")) == b"new"
+
+    @pytest.mark.asyncio
+    async def test_newer_l2_higher_ver_wins_and_refreshes_l1(self):
+        """A newer L2 entry (higher ver, from another instance) wins and updates L1.
+
+        Simulates a write from another Cloud Run instance propagating via L2.
+        Local L1 still holds the old value.  After get(), L1 is refreshed with
+        the newer L2 value so subsequent reads hit L1 with the up-to-date data.
+        """
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        import time
+
+        # L1 has an older value.
+        old_ver = 1
+        await l1.set("key", {"__v": old_ver, "__d": b"old"})
+
+        # L2 has a newer value (simulating another instance's write).
+        new_ver = time.time_ns()
+        await l2.set("key", {"__v": new_ver, "__d": b"new"})
+
+        # get() reads both; L2 (new_ver) wins.
+        result = await tiered.get("key")
+        assert result == b"new", "L2 higher version must win and be returned"
+
+        # L1 must now hold the refreshed value from L2.
+        assert _unpack(await l1.get("key")) == b"new"
+
+    @pytest.mark.asyncio
+    async def test_legacy_raw_l2_entry_is_tolerated_and_out_versioned(self):
+        """A legacy (non-envelope) L2 entry is treated as ver=0.
+
+        During rolling deployment, older instances may have stored raw values
+        without envelopes.  A new write via set() stamps ver=T >> 0, so L1
+        always beats the legacy L2 value.  The test also verifies that parsing
+        a legacy raw entry does not raise.
+        """
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+
+        # Legacy raw value in L2 (no envelope, no version).
+        await l2.set("key", b"legacy")
+
+        # _ev_parse must tolerate it: ver=0, value=raw, not a tombstone.
+        ver, val, tomb = _ev_parse(b"legacy")
+        assert ver == 0
+        assert val == b"legacy"
+        assert tomb is False
+
+        # Write a new value — L1 gets ver=T >> 0.
+        await tiered.set("key", b"new")
+
+        # get() picks L1 (T > 0) over the legacy L2.
+        result = await tiered.get("key")
+        assert result == b"new", "New envelope write must out-version legacy L2 entry"
 
 
 class TestConfigCachesUseTightL1Cap:

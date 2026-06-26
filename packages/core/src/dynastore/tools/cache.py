@@ -408,6 +408,47 @@ class LocalAsyncCacheBackend:
 
 
 # ---------------------------------------------------------------------------
+#  Cache version envelope
+# ---------------------------------------------------------------------------
+
+# Field names chosen to be short and collision-resistant.  Real cached
+# values are Python dicts/models from config services; having both "__v"
+# AND "__d" at the top level of a user value is astronomically unlikely.
+_EV_VER = "__v"   # monotonic version key  (int, time.time_ns())
+_EV_DATA = "__d"  # payload key            (any serialisable value)
+_EV_TOMB = "__t"  # tombstone flag key     (bool True; no __d present)
+
+
+def _ev_wrap(value: Any, ver: int) -> Dict[str, Any]:
+    """Wrap ``value`` in a version envelope for tiered storage."""
+    return {_EV_VER: ver, _EV_DATA: value}
+
+
+def _ev_tombstone(ver: int) -> Dict[str, Any]:
+    """Create a tombstone envelope (marks a deleted key)."""
+    return {_EV_VER: ver, _EV_TOMB: True}
+
+
+def _ev_parse(data: Any) -> "tuple[int, Any, bool]":
+    """Parse a stored value.
+
+    Returns ``(ver, value, is_tombstone)``:
+
+    - Normal envelope  → ``(ver, value, False)``
+    - Tombstone        → ``(ver, None, True)``
+    - Legacy raw value → ``(0, data, False)`` — treated as ver 0 so any
+      new envelope write out-versions it during rolling deployment.
+    """
+    if isinstance(data, dict) and _EV_VER in data:
+        ver = int(data[_EV_VER])
+        if _EV_TOMB in data:
+            return ver, None, True
+        return ver, data.get(_EV_DATA), False
+    # Legacy (pre-envelope) entry — ver=0 is out-versioned by any new write.
+    return 0, data, False
+
+
+# ---------------------------------------------------------------------------
 #  TieredAsyncBackend
 # ---------------------------------------------------------------------------
 
@@ -415,19 +456,44 @@ class LocalAsyncCacheBackend:
 class TieredAsyncBackend:
     """Chain multiple cache backends in priority order (L1, L2, L3...).
 
-    Read path: tries each tier in order, populating upstream tiers on miss.
-    Write path: L1 synchronous (fast, always succeeds), L2+ background with retry.
-    Delete/clear: L1 synchronous, L2+ background with retry.
+    Read path: L2-authoritative with version stamping — every value is
+    stored as a ``{"__v": ver, "__d": payload}`` envelope where ``ver`` is
+    ``time.time_ns()`` captured at write time.  On ``get()``, both L1
+    (in-process) and L2 (distributed) are read; the envelope with the
+    **higher version wins**.
 
-    Implements get_lock by delegating to the first tier that supports it.
+    This gives two guarantees at once:
+    - Cross-instance accuracy: L2 (Valkey) acts as the distributed source
+      of truth; a newer write from another Cloud Run instance propagates to
+      L1 automatically on the next local read.
+    - Read-your-write: ``set()`` stamps L1 with a fresh ver before the
+      asynchronous L2 write completes, so an immediate local read always
+      returns the new value (L1 ver > stale L2 ver).
+
+    Clock-skew caveat: ``time.time_ns()`` is wall-clock, so two instances
+    with clock skew may produce non-monotonic versions across processes.
+    This is acceptable because these caches hold infrequently-written
+    configuration data and the version is only compared within a TTL window
+    bounded by ``l1_ttl_cap``.  NTP keeps skew well under the write interval
+    for these workloads.
+
+    Write path: stamp envelope → L1 synchronous, L2+ background with retry.
+    If a conditional write (``exist=``) is rejected by L1, L2 writes are
+    skipped and ``False`` is returned.
+
+    Clear/invalidation: keyed clear writes a **tombstone** envelope to L1
+    **and** L2 **synchronously** (not background) so any L2-authoritative
+    read in another process sees the tombstone immediately.  Tombstones
+    carry a fresh ver so they out-version any concurrent stale async set.
+    Namespace/tags clears delete from all backends synchronously.
 
     Background L2 writes (#2328):
-        L1 (in-process memory) never times out, so we write synchronously and
-        return immediately. L2+ writes are scheduled in the background with
-        retry logic. Combined with TTL caps, this ensures:
-        - Zero latency impact on the hot path
-        - Eventual consistency even if L2 is unreliable
-        - Self-healing via TTL expiry if L2 never succeeds
+        L2+ set operations are scheduled as background tasks with exponential
+        backoff retry.  If L2 is unreliable the TTL cap self-heals staleness.
+        Set ``l2_retry_attempts=0`` to skip background writes entirely (no
+        task scheduled, no warning emitted).
+
+    Implements ``get_lock`` by delegating to the first tier that supports it.
     """
 
     DEFAULT_L1_TTL_CAP: float = 60.0
@@ -447,7 +513,8 @@ class TieredAsyncBackend:
             backends: Ordered list of backends (L1, L2, ...).
             l1_ttl_cap: Bounds TTL for L1 tier. Defaults to 60s.
             l2_retry_attempts: Max attempts for L2+ background writes.
-                Defaults to 3. Set to 0 to disable retry (fire-and-forget).
+                Defaults to 3. Set to 0 to skip background writes entirely
+                (no task is scheduled, no warning is emitted).
             l2_retry_backoff: Initial backoff in seconds for L2+ retry.
                 Defaults to 0.1s (100ms). Exponential backoff applied.
         """
@@ -480,89 +547,103 @@ class TieredAsyncBackend:
     def priority(self) -> int:
         return self._priority
 
-    async def get(self, key: str) -> Optional[bytes]:
-        """Try L2+ first for consistency, L1 as fallback, populate on miss.
+    async def get(self, key: str) -> Optional[Any]:
+        """L2-authoritative versioned read.
 
-        Read path prioritizes L2+ (distributed) for consistency across instances.
-        L1 is only checked if L2 is unavailable (degraded mode).
-        On L2 hit, L1 is populated for future fallback reads.
+        Reads both L1 (in-process) and L2 (distributed) and returns the
+        value carried by the **higher-versioned** envelope.
+
+        - L2 unavailable: falls back to L1 best-effort (degraded mode).
+        - L2 wins (ver >= L1 ver): refreshes L1 from L2 and returns L2 value.
+        - L1 wins (own fresh write not yet propagated): returns L1, leaves L2.
+        - Tombstone in winning tier: returns ``None`` (caller treats as miss).
+        - Legacy unversioned entry in either tier: treated as ver=0, so any
+          envelope write out-versions it automatically during rolling deploys.
         """
-        # 1. Try L2+ first (source of truth for cross-instance consistency)
-        for i, backend in enumerate(self._backends[1:], start=1):
+        l1_raw = await self._backends[0].get(key)
+        l1_ver, l1_val, l1_tomb = _ev_parse(l1_raw) if l1_raw is not None else (-1, None, False)
+        l1_present = l1_raw is not None
+
+        # Read L2 (distributed source of truth).
+        l2_present = False
+        l2_ver = -1
+        l2_val: Any = None
+        l2_tomb = False
+        if len(self._backends) > 1:
             try:
-                value = await backend.get(key)
-                if value is not None:
-                    # Populate L1 for fallback
-                    await self._backends[0].set(key, value, ttl=self._l1_ttl_cap)
-                    return value
+                l2_raw = await self._backends[1].get(key)
+                if l2_raw is not None:
+                    l2_present = True
+                    l2_ver, l2_val, l2_tomb = _ev_parse(l2_raw)
             except Exception as e:
-                logger.debug("L%d cache get failed (key=%s): %s", i + 1, key, e)
+                logger.debug("L2 cache get failed (key=%s): %s", key, e)
+                # L2 unavailable — fall back to L1 best-effort.
+                if l1_present and not l1_tomb:
+                    return l1_val
+                return None
 
-        # 2. L2 miss/unavailable → check L1 (degraded fallback)
-        value = await self._backends[0].get(key)
-        if value is not None:
-            return value
+        if not l1_present and not l2_present:
+            return None
 
-        return None
+        # L2 wins when it is present and its version is >= L1's version.
+        if l2_present and (not l1_present or l2_ver >= l1_ver):
+            if l2_tomb:
+                # Propagate tombstone to L1 so subsequent reads don't serve stale data.
+                if l1_present and not l1_tomb:
+                    await self._backends[0].set(
+                        key, _ev_tombstone(l2_ver), ttl=self._l1_ttl_cap
+                    )
+                return None
+            # Refresh L1 from L2 (version-guarded write).
+            await self._backends[0].set(
+                key, _ev_wrap(l2_val, l2_ver), ttl=self._l1_ttl_cap
+            )
+            return l2_val
+
+        # L1 wins — our own fresher write not yet propagated to L2.
+        if l1_tomb:
+            return None
+        return l1_val
 
     async def set(
         self,
         key: str,
-        value: bytes,
+        value: Any,
         *,
         ttl: Optional[float] = None,
         exist: Optional[bool] = None,
     ) -> bool:
-        """Write to L1 synchronously, L2+ in background with retry.
+        """Stamp a version envelope and write to L1 synchronously, L2+ in background.
 
-        L1 (in-process) always succeeds and returns immediately.
-        L2+ writes are scheduled as background tasks with retry logic.
-        Combined with TTL caps, this ensures eventual consistency even
-        when L2 is unreliable (#2328).
+        The version (``time.time_ns()``) is captured once and embedded in the
+        envelope stored in every tier.  Because ``get()`` picks the higher
+        version, the synchronous L1 write wins over any stale L2 value still
+        present during the background-write window (read-your-write guarantee).
+
+        If a conditional write (``exist=True/False``) is rejected by L1, L2
+        writes are skipped and ``False`` is returned.
         """
+        ver = time.time_ns()
+        envelope = _ev_wrap(value, ver)
+
         l1_ttl: Optional[float] = (
             min(ttl, self._l1_ttl_cap) if ttl is not None else self._l1_ttl_cap
         )
-        await self._backends[0].set(key, value, ttl=l1_ttl, exist=exist)
+        l1_ok = await self._backends[0].set(key, envelope, ttl=l1_ttl, exist=exist)
+        if not l1_ok:
+            # Conditional write precondition rejected by L1; skip L2.
+            return False
 
         for i, backend in enumerate(self._backends[1:], start=2):
+            async def _set_op(b: CacheBackend = backend, e: Any = envelope) -> bool:
+                return await b.set(key, e, ttl=ttl, exist=exist)
             task = asyncio.create_task(
-                self._bg_set_with_retry(backend, key, value, ttl, exist, i)
+                self._bg_op_with_retry(_set_op, i, "set", f"key={key}")
             )
             self._pending_bg_tasks.add(task)
             task.add_done_callback(self._pending_bg_tasks.discard)
 
         return True
-
-    async def _bg_set_with_retry(
-        self,
-        backend: CacheBackend,
-        key: str,
-        value: bytes,
-        ttl: Optional[float],
-        exist: Optional[bool],
-        tier: int,
-    ) -> None:
-        """Background L2+ write with exponential backoff retry."""
-        for attempt in range(self._l2_retry_attempts):
-            try:
-                result = await backend.set(key, value, ttl=ttl, exist=exist)
-                if result:
-                    return
-            except Exception as e:
-                logger.debug(
-                    "L%d cache set exception (attempt %d/%d): %s",
-                    tier, attempt + 1, self._l2_retry_attempts, e,
-                )
-
-            if attempt < self._l2_retry_attempts - 1:
-                backoff = self._l2_retry_backoff * (2**attempt)
-                await asyncio.sleep(backoff)
-
-        logger.warning(
-            "L%d cache set failed after %d attempts (key=%s) — TTL cap will self-heal",
-            tier, self._l2_retry_attempts, key,
-        )
 
     async def clear(
         self,
@@ -571,45 +652,80 @@ class TieredAsyncBackend:
         namespace: Optional[str] = None,
         tags: Optional[List[str]] = None,
     ) -> bool:
-        """Clear L1 synchronously, L2+ in background with retry."""
-        l1_result = await self._backends[0].clear(key=key, namespace=namespace, tags=tags)
+        """Invalidate cache entries with immediate cluster-wide visibility.
 
+        Keyed clear (``key=``):
+            Writes a versioned tombstone to L1 **and** all L2+ backends
+            **synchronously** (not in background).  A tombstone carries a
+            fresh ``time.time_ns()`` version so it out-versions any
+            concurrent stale async set still in flight.  Callers that read
+            via ``get()`` see the tombstone immediately regardless of which
+            instance they are on.  On L2 write failure a warning is logged
+            but the L1 tombstone still guards local reads for ``l1_ttl_cap``.
+
+        Namespace / tags clear:
+            Deletes matching keys from all backends synchronously.  Namespace
+            clears cannot use per-key tombstones without a full key scan, so
+            they rely on the same synchronous-delete approach as before.
+        """
+        if key is not None:
+            ver = time.time_ns()
+            tombstone = _ev_tombstone(ver)
+            # L1 tombstone — synchronous, always fast.
+            await self._backends[0].set(key, tombstone, ttl=self._l1_ttl_cap)
+            # L2+ tombstone — synchronous so other instances see it immediately.
+            for i, backend in enumerate(self._backends[1:], start=2):
+                try:
+                    await backend.set(key, tombstone, ttl=self._l1_ttl_cap)
+                except Exception as e:
+                    logger.warning(
+                        "L%d cache clear tombstone write failed (key=%s): %s — "
+                        "L1 tombstone guards local reads for %.0fs",
+                        i, key, e, self._l1_ttl_cap,
+                    )
+            return True
+
+        # Namespace / tags clear: synchronous delete on all backends.
+        l1_result = await self._backends[0].clear(namespace=namespace, tags=tags)
         for i, backend in enumerate(self._backends[1:], start=2):
-            task = asyncio.create_task(
-                self._bg_clear_with_retry(backend, key, namespace, tags, i)
-            )
-            self._pending_bg_tasks.add(task)
-            task.add_done_callback(self._pending_bg_tasks.discard)
-
+            try:
+                await backend.clear(namespace=namespace, tags=tags)
+            except Exception as e:
+                logger.warning(
+                    "L%d cache clear failed (ns=%s): %s", i, namespace, e
+                )
         return l1_result
 
-    async def _bg_clear_with_retry(
+    async def _bg_op_with_retry(
         self,
-        backend: CacheBackend,
-        key: Optional[str],
-        namespace: Optional[str],
-        tags: Optional[List[str]],
+        op_factory: Callable[[], Awaitable[bool]],
         tier: int,
+        op_name: str,
+        log_ctx: str,
     ) -> None:
-        """Background L2+ clear with exponential backoff retry."""
+        """Shared background retry loop for L2+ set operations.
+
+        Skipped entirely (no attempt, no warning) when ``l2_retry_attempts`` is 0.
+        ``op_factory`` is called once per attempt so each retry creates a fresh
+        coroutine — never re-awaits a spent one.
+        """
+        if self._l2_retry_attempts <= 0:
+            return
         for attempt in range(self._l2_retry_attempts):
             try:
-                result = await backend.clear(key=key, namespace=namespace, tags=tags)
-                if result:
+                if await op_factory():
                     return
             except Exception as e:
                 logger.debug(
-                    "L%d cache clear exception (attempt %d/%d): %s",
-                    tier, attempt + 1, self._l2_retry_attempts, e,
+                    "L%d cache %s exception (attempt %d/%d): %s",
+                    tier, op_name, attempt + 1, self._l2_retry_attempts, e,
                 )
-
             if attempt < self._l2_retry_attempts - 1:
                 backoff = self._l2_retry_backoff * (2**attempt)
                 await asyncio.sleep(backoff)
-
         logger.warning(
-            "L%d cache clear failed after %d attempts (key=%s ns=%s) — TTL cap will self-heal",
-            tier, self._l2_retry_attempts, key, namespace,
+            "L%d cache %s failed after %d attempts (%s) — TTL cap will self-heal",
+            tier, op_name, self._l2_retry_attempts, log_ctx,
         )
 
     async def exists(self, key: str) -> bool:
