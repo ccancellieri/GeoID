@@ -16,10 +16,11 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Utilities for loading component-local .env files."""
+"""Utilities for loading component-local .env files and probing the runtime context."""
 
 import inspect
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -51,3 +52,16 @@ def load_component_dotenv(cls: "type[Any]") -> None:
             logger.info(f"Loaded component .env from {env_path}")
     except (TypeError, OSError, ImportError):
         pass
+
+
+def is_running_as_job() -> bool:
+    """Return True when the process is an ephemeral worker (Cloud Run Job or
+    local dev / CI), False when it is a long-running Cloud Run Service.
+
+    Cloud Run Services always set the ``K_SERVICE`` environment variable.
+    Cloud Run Jobs do not; neither does local dev or a CI runner.
+    In all non-service contexts there is no prior in-memory state to recover —
+    startup scans that exist solely to reconstruct that state (e.g. the DENY
+    policy restore in the private ES driver) are pure waste and must be skipped.
+    """
+    return not bool(os.getenv("K_SERVICE"))

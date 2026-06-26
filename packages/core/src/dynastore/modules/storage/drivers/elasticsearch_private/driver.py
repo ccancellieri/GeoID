@@ -175,8 +175,21 @@ class ItemsElasticsearchPrivateDriver(
         IndexDispatcher now (Phase 2d).  No event listeners registered
         on this driver — the dispatcher resolves it via the slim
         :class:`Indexer` Protocol and routing config.
+
+        The restore scan is skipped in ephemeral job contexts (Cloud Run Jobs,
+        local dev, CI) because there is no prior in-memory DENY state to
+        recover — the scan only makes sense after a long-running service
+        restart.  Detection uses ``K_SERVICE``, which Cloud Run Services
+        always set and Cloud Run Jobs never do.
         """
-        await self._restore_deny_policies()
+        from dynastore.tools.env import is_running_as_job
+        if is_running_as_job():
+            logger.debug(
+                "PrivateDriver: skipping _restore_deny_policies() — "
+                "ephemeral job context has no prior in-memory DENY state to recover."
+            )
+        else:
+            await self._restore_deny_policies()
         yield
 
     # ------------------------------------------------------------------

@@ -29,6 +29,11 @@ with at least one private-items collection.
 These tests exercise the static helper
 ``_catalog_has_private_collection`` directly (pure logic, fully
 mockable) and the lifespan loop's integration with that helper.
+
+#2464 — the lifespan also skips the scan entirely in ephemeral job
+contexts (Cloud Run Jobs, local dev) where there is no prior in-memory
+DENY state to recover.  Detection is via ``K_SERVICE``, which Cloud Run
+Services always set and Jobs never do.
 """
 from __future__ import annotations
 
@@ -442,3 +447,77 @@ def test_get_ogc_service_prefixes_filters_to_path_prefixes():
         result = get_ogc_service_prefixes()
 
     assert result == ["maps", "records"]
+
+
+# ---------------------------------------------------------------------------
+# lifespan — job-context skip (#2464)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lifespan_skips_restore_deny_in_job_context():
+    """In a Cloud Run Job (K_SERVICE absent), lifespan must skip
+    ``_restore_deny_policies()`` entirely.
+
+    The O(N_catalogs × M_collections) startup scan is pure waste in an
+    ephemeral job that runs one task and exits — it has no prior in-memory
+    DENY state to recover.
+    """
+    driver = ItemsElasticsearchPrivateDriver()
+    restore_called = False
+
+    async def _should_not_be_called() -> None:
+        nonlocal restore_called
+        restore_called = True
+
+    # Patch at the source; the driver imports it lazily so the source location
+    # (dynastore.tools.env) is the right target.
+    with patch.object(driver, "_restore_deny_policies", side_effect=_should_not_be_called), \
+         patch("dynastore.tools.env.is_running_as_job", return_value=True):
+        async with driver.lifespan(object()):
+            pass
+
+    assert not restore_called, "_restore_deny_policies must not run in job context"
+
+
+@pytest.mark.asyncio
+async def test_lifespan_calls_restore_deny_in_service_context():
+    """In a Cloud Run Service (K_SERVICE present), lifespan must call
+    ``_restore_deny_policies()`` as usual — service behavior is unchanged.
+    """
+    driver = ItemsElasticsearchPrivateDriver()
+    restore_called = False
+
+    async def _record_call() -> None:
+        nonlocal restore_called
+        restore_called = True
+
+    with patch.object(driver, "_restore_deny_policies", side_effect=_record_call), \
+         patch("dynastore.tools.env.is_running_as_job", return_value=False):
+        async with driver.lifespan(object()):
+            pass
+
+    assert restore_called, "_restore_deny_policies must run in service context"
+
+
+@pytest.mark.asyncio
+async def test_lifespan_job_skip_emits_debug_log(caplog):
+    """The job-context skip path must emit exactly one DEBUG message so
+    operators have a trace without WARNING noise on every job cold-boot.
+    """
+    import logging
+    driver = ItemsElasticsearchPrivateDriver()
+    driver_logger = "dynastore.modules.storage.drivers.elasticsearch_private.driver"
+
+    with patch.object(driver, "_restore_deny_policies", new=AsyncMock()), \
+         patch("dynastore.tools.env.is_running_as_job", return_value=True), \
+         caplog.at_level(logging.DEBUG, logger=driver_logger):
+        async with driver.lifespan(object()):
+            pass
+
+    skip_records = [
+        r for r in caplog.records
+        if "skipping _restore_deny_policies" in r.message
+    ]
+    assert len(skip_records) == 1
+    assert skip_records[0].levelname == "DEBUG"

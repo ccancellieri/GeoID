@@ -197,3 +197,110 @@ async def test_fallback_warn_gate_is_module_level_not_per_call(monkeypatch):
         "resolve_routed must declare `global _FALLBACK_WARNED` so the first-"
         "occurrence promotion to WARNING persists across calls"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_routed_non_fatal_missing_driver_logs_debug_not_warning(
+    monkeypatch, caplog,
+):
+    """A missing driver whose ``on_failure`` is non-FATAL (e.g. WARN for an
+    optional ES secondary index) must log at DEBUG, not WARNING.
+
+    This silences the structural noise from stacks that legitimately omit
+    optional drivers (e.g. ``collection_elasticsearch_driver`` in a PG-only
+    deployment) without hiding truly unexpected absences (FATAL entries still
+    emit WARNING).
+    """
+    from dynastore.modules.storage import routed_resolver
+    from dynastore.modules.storage.routing_config import (
+        CollectionRoutingConfig, FailurePolicy, Operation, OperationDriverEntry,
+    )
+
+    # Simulate the collection_elasticsearch_driver absence in a PG-only stack:
+    # the default CollectionRoutingConfig READ list includes it with on_failure=WARN.
+    cfg = CollectionRoutingConfig(
+        operations={
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="collection_elasticsearch_driver",
+                    on_failure=FailurePolicy.WARN,
+                ),
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+        }
+    )
+
+    async def _fake_load(rpc, catalog_id, collection_id, db_resource):
+        return cfg
+
+    monkeypatch.setattr(routed_resolver, "_load_routing_config", _fake_load)
+    # Only PG is registered; ES is absent (PG-only deployment)
+    monkeypatch.setattr(
+        routed_resolver, "_index_for",
+        lambda rpc: {"collection_postgresql_driver": _FakePgDriver()},
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=routed_resolver.__name__):
+        resolved = await routed_resolver.resolve_routed(
+            CollectionRoutingConfig, Operation.READ, "cat", "coll",
+        )
+
+    # Only PG is returned
+    assert [e.driver_ref for e, _ in resolved] == ["collection_postgresql_driver"]
+
+    # The missing ES driver must appear in a DEBUG record, not WARNING
+    es_records = [
+        r for r in caplog.records if "collection_elasticsearch_driver" in r.message
+    ]
+    assert es_records, "missing optional driver must be logged"
+    assert all(r.levelname == "DEBUG" for r in es_records), (
+        f"non-FATAL missing driver must log at DEBUG, got: "
+        f"{[r.levelname for r in es_records]}"
+    )
+    # No WARNING for the non-FATAL absence
+    assert not any(
+        r.levelname == "WARNING" and "collection_elasticsearch_driver" in r.message
+        for r in caplog.records
+    ), "non-FATAL missing driver must NOT emit WARNING"
+
+
+@pytest.mark.asyncio
+async def test_resolve_routed_fatal_missing_driver_still_warns(monkeypatch, caplog):
+    """A missing driver with ``on_failure=FATAL`` must still log WARNING so
+    operators notice a genuinely misconfigured deployment.
+    """
+    from dynastore.modules.storage import routed_resolver
+    from dynastore.modules.storage.routing_config import (
+        CollectionRoutingConfig, FailurePolicy, Operation, OperationDriverEntry,
+    )
+
+    cfg = CollectionRoutingConfig(
+        operations={
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="missing_fatal_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+        }
+    )
+
+    async def _fake_load(rpc, catalog_id, collection_id, db_resource):
+        return cfg
+
+    monkeypatch.setattr(routed_resolver, "_load_routing_config", _fake_load)
+    monkeypatch.setattr(routed_resolver, "_index_for", lambda rpc: {})
+
+    with caplog.at_level(logging.WARNING, logger=routed_resolver.__name__):
+        await routed_resolver.resolve_routed(
+            CollectionRoutingConfig, Operation.READ, "cat", "coll",
+        )
+
+    warn_records = [
+        r for r in caplog.records
+        if "missing_fatal_driver" in r.message and r.levelname == "WARNING"
+    ]
+    assert warn_records, "FATAL missing driver must still emit WARNING"

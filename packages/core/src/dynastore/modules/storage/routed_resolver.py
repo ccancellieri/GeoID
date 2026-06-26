@@ -44,7 +44,7 @@ import logging
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Type
 
 from dynastore.modules.storage.hints import Hint
-from dynastore.modules.storage.routing_config import OperationDriverEntry
+from dynastore.modules.storage.routing_config import FailurePolicy, OperationDriverEntry
 
 logger = logging.getLogger(__name__)
 
@@ -230,12 +230,27 @@ async def resolve_routed(
     for entry in entries:
         driver = index.get(entry.driver_ref)
         if driver is None:
-            logger.warning(
-                "routed-resolve: driver_ref '%s' for %s op=%s on %s/%s is not "
-                "registered — skipping",
-                entry.driver_ref, routing_plugin_cls.__name__, operation,
-                catalog_id, collection_id,
-            )
+            # FATAL entries are unexpected absences (the driver must be
+            # registered for the operation to succeed); warn so operators
+            # notice a misconfigured or missing driver.  Non-FATAL entries
+            # (WARN / IGNORE / OUTBOX) are legitimately absent in stacks
+            # that omit the optional driver (e.g. collection_elasticsearch_driver
+            # in a PG-only deployment) — demote to DEBUG to silence that
+            # structural noise.
+            if entry.on_failure is FailurePolicy.FATAL:
+                logger.warning(
+                    "routed-resolve: driver_ref '%s' for %s op=%s on %s/%s is not "
+                    "registered — skipping",
+                    entry.driver_ref, routing_plugin_cls.__name__, operation,
+                    catalog_id, collection_id,
+                )
+            else:
+                logger.debug(
+                    "routed-resolve: driver_ref '%s' for %s op=%s on %s/%s is not "
+                    "registered — skipping (on_failure=%s, structurally optional)",
+                    entry.driver_ref, routing_plugin_cls.__name__, operation,
+                    catalog_id, collection_id, entry.on_failure,
+                )
             continue
         resolved.append((entry, driver))
 
