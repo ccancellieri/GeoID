@@ -208,31 +208,13 @@ async def _is_es_active(catalog_id: str, collection_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 class ElasticsearchModule(ModuleProtocol):
-    """
-    Ensures the platform-wide ES indices/aliases exist and exposes
-    bulk-reindex orchestration entry points.
-
-    Catalog, collection, and item secondary-index propagation are all driven by
-    the routing-config rails today — items via ``IndexDispatcher.fan_out_bulk``
-    reading ``ItemsRoutingConfig``/``CollectionRoutingConfig`` (#820), catalogs
-    via ``ReindexWorker`` consuming ``CATALOG_METADATA_CHANGED`` events and
-    fanning out to the secondary-index ``WRITE`` entries (``secondary_index=True``)
-    in ``CatalogRoutingConfig.operations[WRITE]``. The legacy
-    listener path that dispatched ``elasticsearch_index``/``elasticsearch_delete``
-    tasks on catalog/collection lifecycle events was retired in #825 — it ran
-    in parallel to the canonical rails and was the source of the misleading
-    "Indexing collection …" log line that surfaced #810.
-
-    Privacy is per-collection (#733, #1047) — expressed via the presence of
-    ``items_elasticsearch_private_driver`` in the per-collection
-    ``ItemsRoutingConfig``. The items-private driver owns its per-tenant
-    index plus DENY policy management. Collection and catalog envelopes for
-    private catalogs are PG-only — no ES private index at those tiers (#1047).
-    Per-catalog privacy presets write catalog-scope routing configs that
-    cascade to newly-created collections.
+    """Platform-level Elasticsearch singleton: shared client, index templates.
+    
+    Must start before CatalogModule (priority=20) so ES drivers are available
+    in DriverRegistry when routing_driven_cascade_owner registers (see #2377).
     """
 
-    priority: int = 50
+    priority: int = 18
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
