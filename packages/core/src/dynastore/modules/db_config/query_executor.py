@@ -110,18 +110,76 @@ _TRANSIENT_ASYNCPG_MESSAGE_FRAGMENTS = (
 
 
 def _is_transient_asyncpg_error(exc: Optional[BaseException]) -> bool:
-    """Return True if ``exc`` is an asyncpg transient client-state error.
+    """Return True if ``exc`` is an asyncpg transient error safe to retry.
 
-    Detected by class name (avoids hard import dependency on asyncpg) plus
-    message-fragment fallback for nested wraps.  See exception taxonomy in
-    issues #235 / #239.
+    Covers:
+    - ``InterfaceError`` (connection factory not ready during DB warm-up)
+    - ``ConnectionDoesNotExistError`` (server terminated the connection)
+    - ``InternalClientError`` (internal asyncpg state machine error)
+    - Any exception with message containing known transient fragments.
+
+    Used by :func:`retry_on_transient_connect` to decide whether to retry
+    a failed connection acquisition, and by the cancel-drain path in
+    :func:`managed_transaction` to decide whether to invalidate a dead wire.
     """
     if exc is None:
         return False
-    if type(exc).__name__ in _TRANSIENT_ASYNCPG_ERROR_CLASS_NAMES:
+    # asyncpg raises its own exception hierarchy for transient failures.
+    # SQLAlchemy wraps these inside DBAPIError with .orig set to the asyncpg exc.
+    if isinstance(
+        exc,
+        (
+            AsyncpgInterfaceError,
+            AsyncpgConnectionDoesNotExistError,
+            AsyncpgInternalClientError,
+        ),
+    ):
         return True
+    # Check wrapped exceptions (SQLAlchemy DBAPIError.orig)
+    if isinstance(
+        getattr(exc, "orig", None),
+        (
+            AsyncpgInterfaceError,
+            AsyncpgConnectionDoesNotExistError,
+            AsyncpgInternalClientError,
+        ),
+    ):
+        return True
+    # Fallback: message matching for cases where the exception class is not
+    # directly importable or is wrapped in an unexpected way.
     msg = str(exc)
     return any(fragment in msg for fragment in _TRANSIENT_ASYNCPG_MESSAGE_FRAGMENTS)
+
+
+def _is_autocommit_connection(conn: Any) -> bool:
+    """Detect if connection has AUTOCOMMIT isolation level.
+
+    AUTOCOMMIT connections (used by pg_advisory_leadership for advisory locks)
+    have no active PostgreSQL transaction, so attempting begin_nested()
+    (SAVEPOINT) raises NoActiveSQLTransactionError.
+
+    This function checks SQLAlchemy's execution_options for isolation_level.
+    Works for both async (AsyncConnection) and sync (Connection) paths.
+
+    Args:
+        conn: SQLAlchemy connection (async or sync)
+
+    Returns:
+        True if connection is in AUTOCOMMIT mode, False otherwise.
+    """
+    # Check async connection's execution_options
+    exec_opts = getattr(conn, "_execution_options", None)
+    if exec_opts and exec_opts.get("isolation_level") == "AUTOCOMMIT":
+        return True
+
+    # For sync connections, check the underlying connection
+    sync_conn = getattr(conn, "sync_connection", None) or getattr(conn, "connection", None)
+    if sync_conn:
+        exec_opts = getattr(sync_conn, "_execution_options", None)
+        if exec_opts and exec_opts.get("isolation_level") == "AUTOCOMMIT":
+            return True
+
+    return False
 
 
 # --- Lock-not-available detection (pgcode 55P03) ----------------------------
@@ -1497,7 +1555,41 @@ def sync_managed_transaction(db_resource: DbSyncResource) -> Iterator[Any]:
 
 @asynccontextmanager
 async def managed_transaction(db_resource: Optional[DbResource]):
-    """Async-native re-entrant transaction manager."""
+    """Async-native re-entrant transaction manager.
+
+    Handles three connection scenarios:
+
+    1. **Engine input**: Acquires a connection from the pool and starts a
+       transaction with ``conn.begin()``.
+
+    2. **Regular connection input**: If the connection is already in a
+       transaction, starts a nested SAVEPOINT. Otherwise starts a new
+       transaction with ``conn.begin()``.
+
+    3. **AUTOCOMMIT connection input**: Connections with isolation_level
+       AUTOCOMMIT (e.g., from :func:`pg_advisory_leadership`) have no active
+       PostgreSQL transaction. Attempting ``begin_nested()`` (SAVEPOINT) on
+       such connections raises ``NoActiveSQLTransactionError``. This function
+       detects AUTOCOMMIT mode and uses ``begin()`` instead, starting a real
+       transaction.
+
+    The AUTOCOMMIT handling is critical for LEADER_ONLY background services
+    that reuse the advisory-lock connection for database work during their
+    tick cycle. See :class:`~dynastore.tools.background_service.ServiceContext`
+    for details on ``lock_connection`` usage.
+
+    Args:
+        db_resource: AsyncEngine, Engine, AsyncConnection, Connection,
+            AsyncSession, or Session.
+
+    Yields:
+        The connection/session ready for transactional work.
+
+    Raises:
+        ValueError: If ``db_resource`` is ``None``.
+        DatabaseConnectionError: If the connection is closed or in a poisoned
+            transaction state.
+    """
     if db_resource is None:
         raise ValueError("Cannot start managed_transaction: db_resource is None.")
     if isinstance(db_resource, (AsyncEngine, Engine)):
@@ -1635,6 +1727,21 @@ async def managed_transaction(db_resource: Optional[DbResource]):
         # leave its context manager open, causing subsequent InvalidRequestErrors.
         if isinstance(conn, (AsyncConnection, AsyncSession)):
             if conn.in_transaction():
+                # SPECIAL CASE: AUTOCOMMIT connections
+                # AUTOCOMMIT connections (used by pg_advisory_leadership) have no
+                # active PostgreSQL transaction. SQLAlchemy's in_transaction() may
+                # return True due to autobegin, but begin_nested() (SAVEPOINT) fails
+                # with NoActiveSQLTransactionError. Use begin() instead.
+                if _is_autocommit_connection(conn):
+                    logger.debug(
+                        "managed_transaction_autocommit_detected wire_id=%s",
+                        wire_id,
+                    )
+                    # AUTOCOMMIT mode: start a real transaction with begin()
+                    async with conn.begin():
+                        yield conn
+                    return
+
                 # Check for poisoned state (SQLAlchemy 2.0)
                 if not getattr(conn, "is_active", True):
                     raise DatabaseConnectionError(
@@ -1708,6 +1815,16 @@ async def managed_transaction(db_resource: Optional[DbResource]):
         else:
             assert isinstance(conn, (SAConnection, SASession))
             if conn.in_transaction():
+                # SPECIAL CASE: AUTOCOMMIT connections (sync path)
+                if _is_autocommit_connection(conn):
+                    logger.debug(
+                        "managed_transaction_autocommit_detected wire_id=%s (sync)",
+                        wire_id,
+                    )
+                    with conn.begin():
+                        yield conn
+                    return
+
                 # Check for poisoned state
                 if not getattr(conn, "is_active", True):
                     raise DatabaseConnectionError(

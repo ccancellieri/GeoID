@@ -29,6 +29,13 @@ else:
     except ImportError:
         storage = None
 
+try:
+    from google.api_core import retry
+    from google.cloud.exceptions import GoogleCloudError
+except ImportError:
+    retry = None  # type: ignore
+    GoogleCloudError = Exception  # type: ignore
+
 from dynastore.modules.db_config.query_executor import (
     managed_transaction,
     DbResource,
@@ -812,11 +819,82 @@ class BucketService:
         """
         Maps the declarative Pydantic configuration to the GCS bucket properties.
         This handles partial updates for mutable fields.
+
+        Uses exponential backoff retry for transient GCS errors (network issues,
+        temporary unavailability). The bucket settings operation is idempotent,
+        making it safe to retry on transient failures.
         """
         if not self.storage_client:
             logger.warning(
                 f"Storage client not available. Skipping update for bucket '{bucket_name}'."
             )
+            return
+
+        def _sync_update():
+            bucket = self.storage_client.bucket(bucket_name)
+            needs_patch = False
+
+            # 1. CORS Configuration
+            if config.cors_rules:
+                cors_list = []
+                for rule in config.cors_rules:
+                    rule_dict: Dict[str, Any] = {
+                        "origin": rule.origin,
+                        "method": rule.method,
+                    }
+                    if rule.response_header:
+                        rule_dict["responseHeader"] = rule.response_header
+                    if rule.max_age_seconds:
+                        rule_dict["maxAgeSeconds"] = rule.max_age_seconds
+                    cors_list.append(rule_dict)
+
+                logger.info(
+                    f"Applying CORS rules to bucket '{bucket_name}': {cors_list}"
+                )
+                bucket.cors = cors_list
+                needs_patch = True
+
+            # 2. Lifecycle Rules (Placeholder)
+            # if config.lifecycle_rules:
+            #     pass
+
+            if needs_patch:
+                bucket.patch()
+                logger.info(
+                    f"Successfully applied settings to GCS bucket '{bucket_name}'."
+                )
+
+        # Wrap with retry logic for transient GCS errors
+        def _sync_update_with_retry():
+            if retry is None:
+                # Fallback if google.api_core is not available
+                return _sync_update()
+
+            @retry.Retry(
+                predicate=retry.if_exception_type(
+                    GoogleCloudError,
+                    ConnectionError,
+                    TimeoutError,
+                ),
+                initial=1.0,
+                maximum=10.0,
+                multiplier=2.0,
+                deadline=60.0,
+            )
+            def _retry_wrapper():
+                return _sync_update()
+
+            return _retry_wrapper()
+
+        try:
+            await run_in_thread(_sync_update_with_retry)
+        except Exception as e:
+            logger.error(
+                f"Failed to patch GCS bucket '{bucket_name}': {e}", exc_info=True
+            )
+            # Re-raise to fail the provisioning - bucket exists but settings
+            # may need manual intervention
+            raise
             return
 
         def _sync_update():

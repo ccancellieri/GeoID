@@ -112,6 +112,12 @@ class ServiceContext:
         the advisory lock. Services should use this connection for DB work
         during the tick to avoid acquiring a second connection from the pool.
         None for RUN_EVERYWHERE services or when not the leader.
+
+        IMPORTANT: This is an AUTOCOMMIT connection (isolation_level='AUTOCOMMIT').
+        When passing to :func:`~dynastore.modules.db_config.query_executor.managed_transaction`,
+        the function automatically detects AUTOCOMMIT mode and uses ``begin()``
+        instead of ``begin_nested()``. Do NOT attempt to create nested transactions
+        manually on this connection - it will raise ``NoActiveSQLTransactionError``.
     """
 
     engine: Any
