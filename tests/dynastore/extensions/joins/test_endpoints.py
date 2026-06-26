@@ -82,7 +82,7 @@ async def test_execute_join_bigquery_materializes_secondary(monkeypatch):
         ),
         join=JoinSpec(primary_column="uid", secondary_column="user_id"),
     )
-    resp = await svc.execute_join("c", "l", req, body=body)
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
     assert resp["type"] == "FeatureCollection"
     assert resp["_join_meta"]["secondary_rows_materialized"] == 1
 
@@ -131,7 +131,7 @@ async def test_execute_join_bigquery_end_to_end(monkeypatch):
         ),
         join=JoinSpec(primary_column="uid", secondary_column="user_id"),
     )
-    resp = await svc.execute_join("c", "l", req, body=body)
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
     assert resp["type"] == "FeatureCollection"
     assert len(resp["features"]) == 1  # only Alice matches
     assert resp["features"][0]["properties"]["score"] == 42
@@ -166,7 +166,7 @@ async def test_execute_join_bigquery_returns_404_when_no_primary_driver(monkeypa
         join=JoinSpec(primary_column="uid", secondary_column="user_id"),
     )
     with pytest.raises(HTTPException) as exc:
-        await svc.execute_join("c", "l", req, body=body)
+        await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
     assert exc.value.status_code == 404
 
 
@@ -213,7 +213,7 @@ async def test_execute_join_named_secondary_resolves_via_registry(monkeypatch):
         secondary=NamedSecondarySpec(ref="the-other-collection"),
         join=JoinSpec(primary_column="uid", secondary_column="user_id"),
     )
-    resp = await svc.execute_join("c", "l", req, body=body)
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
     assert resp["type"] == "FeatureCollection"
     assert len(resp["features"]) == 1
     assert resp["features"][0]["properties"]["score"] == 99
@@ -241,7 +241,7 @@ async def test_execute_join_named_404_when_secondary_missing(monkeypatch):
         join=JoinSpec(primary_column="uid", secondary_column="user_id"),
     )
     with pytest.raises(HTTPException) as exc:
-        await svc.execute_join("c", "l", req, body=body)
+        await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
     assert exc.value.status_code == 404
 
 
@@ -285,7 +285,7 @@ async def test_primary_filter_forwarded_as_cql_filter_on_query_request(monkeypat
         join=JoinSpec(primary_column="uid", secondary_column="user_id"),
         primary_filter=PrimaryFilterSpec(cql="status='active'"),
     )
-    await svc.execute_join("c", "l", req, body=body)
+    await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
     assert len(observed_requests) == 1
     qr = observed_requests[0]
     assert qr is not None
@@ -330,7 +330,7 @@ async def test_primary_filter_validation_error_maps_to_400(monkeypatch):
         primary_filter=PrimaryFilterSpec(cql="bogus_field='x'"),
     )
     with pytest.raises(HTTPException) as exc:
-        await svc.execute_join("c", "l", req, body=body)
+        await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
     assert exc.value.status_code == 400
     assert "Unknown CQL2 property" in str(exc.value.detail)
 
@@ -349,3 +349,169 @@ def test_joins_service_discovered_via_entry_point():
     ]
     assert len(eps) == 1
     assert "JoinsService" in eps[0].value
+
+
+@pytest.mark.asyncio
+async def test_execute_join_left_join_yields_all_primary_features(monkeypatch):
+    """LEFT JOIN yields all primary features, with null secondary props for non-matches."""
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import Request
+    from dynastore.extensions.joins.joins_service import JoinsService
+    from dynastore.modules.joins.models import (
+        BigQuerySecondarySpec, JoinRequest, JoinSpec,
+    )
+    from dynastore.modules.storage.drivers.bigquery_models import BigQueryTarget
+    from dynastore.models.ogc import Feature
+
+    # Fake BQ secondary stream - only has alice and bob
+    async def fake_bq_stream(spec, *, secondary_column, **kwargs):
+        yield Feature(type="Feature", id="bq1", geometry=None,
+                      properties={"user_id": "alice", "score": 42})
+        yield Feature(type="Feature", id="bq2", geometry=None,
+                      properties={"user_id": "bob", "score": 7})
+
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(svc_mod, "stream_bigquery_secondary", fake_bq_stream)
+
+    # Fake primary driver with three features: alice matches, carol doesn't
+    class _FakePrimaryDriver:
+        async def read_entities(self, *args, **kwargs):
+            yield Feature(type="Feature", id="p1", geometry=None,
+                          properties={"uid": "alice", "name": "Alice"})
+            yield Feature(type="Feature", id="p2", geometry=None,
+                          properties={"uid": "carol", "name": "Carol"})
+
+    fake_resolved = type("R", (), {"driver": _FakePrimaryDriver()})()
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(
+        svc_mod, "resolve_drivers", AsyncMock(return_value=[fake_resolved]),
+    )
+
+    svc = JoinsService()
+    req = MagicMock(spec=Request)
+    body = JoinRequest(
+        secondary=BigQuerySecondarySpec(
+            target=BigQueryTarget(project_id="p", dataset_id="d", table_name="t"),
+        ),
+        join=JoinSpec(
+            primary_column="uid",
+            secondary_column="user_id",
+            join_type="LEFT",
+        ),
+    )
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
+    assert resp["type"] == "FeatureCollection"
+    # LEFT JOIN should yield both features
+    assert len(resp["features"]) == 2
+    # Alice matches - has score
+    assert resp["features"][0]["properties"]["name"] == "Alice"
+    assert resp["features"][0]["properties"]["score"] == 42
+    # Carol doesn't match - no score field
+    assert resp["features"][1]["properties"]["name"] == "Carol"
+    assert "score" not in resp["features"][1]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_execute_join_inner_join_filters_non_matching(monkeypatch):
+    """INNER JOIN (default) filters out primary features without matching secondary."""
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import Request
+    from dynastore.extensions.joins.joins_service import JoinsService
+    from dynastore.modules.joins.models import (
+        BigQuerySecondarySpec, JoinRequest, JoinSpec,
+    )
+    from dynastore.modules.storage.drivers.bigquery_models import BigQueryTarget
+    from dynastore.models.ogc import Feature
+
+    # Fake BQ secondary stream - only has alice
+    async def fake_bq_stream(spec, *, secondary_column, **kwargs):
+        yield Feature(type="Feature", id="bq1", geometry=None,
+                      properties={"user_id": "alice", "score": 42})
+
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(svc_mod, "stream_bigquery_secondary", fake_bq_stream)
+
+    # Fake primary driver with two features: alice matches, carol doesn't
+    class _FakePrimaryDriver:
+        async def read_entities(self, *args, **kwargs):
+            yield Feature(type="Feature", id="p1", geometry=None,
+                          properties={"uid": "alice", "name": "Alice"})
+            yield Feature(type="Feature", id="p2", geometry=None,
+                          properties={"uid": "carol", "name": "Carol"})
+
+    fake_resolved = type("R", (), {"driver": _FakePrimaryDriver()})()
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(
+        svc_mod, "resolve_drivers", AsyncMock(return_value=[fake_resolved]),
+    )
+
+    svc = JoinsService()
+    req = MagicMock(spec=Request)
+    body = JoinRequest(
+        secondary=BigQuerySecondarySpec(
+            target=BigQueryTarget(project_id="p", dataset_id="d", table_name="t"),
+        ),
+        join=JoinSpec(
+            primary_column="uid",
+            secondary_column="user_id",
+            join_type="INNER",  # explicit INNER JOIN
+        ),
+    )
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
+    assert resp["type"] == "FeatureCollection"
+    # INNER JOIN should only yield matching feature
+    assert len(resp["features"]) == 1
+    assert resp["features"][0]["properties"]["name"] == "Alice"
+    assert resp["features"][0]["properties"]["score"] == 42
+
+
+@pytest.mark.asyncio
+async def test_execute_join_default_is_inner_join(monkeypatch):
+    """Default join_type (when not specified) is INNER JOIN."""
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import Request
+    from dynastore.extensions.joins.joins_service import JoinsService
+    from dynastore.modules.joins.models import (
+        BigQuerySecondarySpec, JoinRequest, JoinSpec,
+    )
+    from dynastore.modules.storage.drivers.bigquery_models import BigQueryTarget
+    from dynastore.models.ogc import Feature
+
+    async def fake_bq_stream(spec, *, secondary_column, **kwargs):
+        yield Feature(type="Feature", id="bq1", geometry=None,
+                      properties={"user_id": "alice", "score": 42})
+
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(svc_mod, "stream_bigquery_secondary", fake_bq_stream)
+
+    class _FakePrimaryDriver:
+        async def read_entities(self, *args, **kwargs):
+            yield Feature(type="Feature", id="p1", geometry=None,
+                          properties={"uid": "alice", "name": "Alice"})
+            yield Feature(type="Feature", id="p2", geometry=None,
+                          properties={"uid": "carol", "name": "Carol"})
+
+    fake_resolved = type("R", (), {"driver": _FakePrimaryDriver()})()
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(
+        svc_mod, "resolve_drivers", AsyncMock(return_value=[fake_resolved]),
+    )
+
+    svc = JoinsService()
+    req = MagicMock(spec=Request)
+    # Not specifying join_type - should default to INNER
+    body = JoinRequest(
+        secondary=BigQuerySecondarySpec(
+            target=BigQueryTarget(project_id="p", dataset_id="d", table_name="t"),
+        ),
+        join=JoinSpec(
+            primary_column="uid",
+            secondary_column="user_id",
+            # join_type not specified
+        ),
+    )
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
+    assert resp["type"] == "FeatureCollection"
+    # Default INNER JOIN should only yield matching feature
+    assert len(resp["features"]) == 1
+    assert resp["features"][0]["properties"]["name"] == "Alice"

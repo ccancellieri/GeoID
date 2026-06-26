@@ -179,6 +179,14 @@ class JoinSpec(BaseModel):
         ),
         examples=["geoid", "id"],
     )
+    join_type: Literal["INNER", "LEFT"] = Field(
+        default="INNER",
+        description=(
+            "INNER (default) yields only features with matching secondary rows. "
+            "LEFT yields all primary features; non-matching features have "
+            "secondary properties set to null."
+        ),
+    )
     enrichment: bool = Field(
         default=True,
         description=(

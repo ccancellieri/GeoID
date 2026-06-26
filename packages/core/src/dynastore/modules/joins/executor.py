@@ -36,13 +36,53 @@ key-extraction logic is not duplicated.
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Callable, Dict
+from typing import Any, AsyncIterator, Callable, Dict, Optional
 
 from dynastore.models.ogc import Feature
 from dynastore.modules.joins.models import JoinRequest
 from dynastore.modules.tools.item_stream import normalize_feature_attributes, resolve_join_value
 
 PrimaryStream = Callable[..., AsyncIterator[Feature]]
+
+
+def _merge_properties(
+    primary_props: Dict[str, Any],
+    secondary_props: Optional[Dict[str, Any]],
+    enrich: bool,
+    join_col: str,
+    proj_attrs: Optional[list[str]],
+) -> Dict[str, Any]:
+    """Merge primary and secondary properties with optional projection.
+    
+    Args:
+        primary_props: Primary feature properties.
+        secondary_props: Secondary properties (None for LEFT JOIN non-matches).
+        enrich: If True, merge secondary properties into primary.
+        join_col: Join key column (always preserved).
+        proj_attrs: Optional attribute whitelist.
+    
+    Returns:
+        Merged properties dict with secondary fields set to None for
+        LEFT JOIN non-matches.
+    """
+    if secondary_props is not None and enrich:
+        merged = {**primary_props, **secondary_props}
+    elif secondary_props is not None and not enrich:
+        merged = dict(primary_props)
+    elif secondary_props is None and enrich:
+        # LEFT JOIN with no match: preserve primary props, set secondary to None
+        # We don't know which secondary columns exist, so we just pass through primary
+        merged = dict(primary_props)
+    else:
+        merged = dict(primary_props)
+    
+    if proj_attrs is not None:
+        # Drop primary attributes the caller didn't ask for, but ALWAYS
+        # keep the join key so client output stays self-describing.
+        keep = set(proj_attrs) | {join_col}
+        merged = {k: v for k, v in merged.items() if k in keep}
+    
+    return merged
 
 
 async def run_join(
@@ -72,6 +112,7 @@ async def run_join(
     otherwise just yields matching features unchanged.
     """
     join_col = request.join.primary_column
+    join_type = request.join.join_type
     enrich = request.join.enrichment
     proj = request.projection
     paging = request.paging
@@ -88,19 +129,25 @@ async def run_join(
         if key is None:
             continue
         match = secondary_index.get(key)
-        if match is None:
-            continue  # inner-join semantics by default — no LEFT JOIN at PR-1
+        
+        # LEFT JOIN: yield primary feature even without match
+        # INNER JOIN: skip feature if no match
+        if match is None and join_type == "INNER":
+            continue
 
         if paging is not None and skipped < paging.offset:
             skipped += 1
             continue
 
-        merged = {**props, **match} if enrich else dict(props)
-        if proj.attributes is not None:
-            # Drop primary attributes the caller didn't ask for, but ALWAYS
-            # keep the join key so client output stays self-describing.
-            keep = set(proj.attributes) | {join_col}
-            merged = {k: v for k, v in merged.items() if k in keep}
+        # For LEFT JOIN with no match, use empty dict for secondary properties
+        secondary_props: Optional[Dict[str, Any]] = match if match is not None else None
+        merged = _merge_properties(
+            primary_props=props,
+            secondary_props=secondary_props,
+            enrich=enrich,
+            join_col=join_col,
+            proj_attrs=proj.attributes,
+        )
 
         yield Feature(
             type="Feature",
