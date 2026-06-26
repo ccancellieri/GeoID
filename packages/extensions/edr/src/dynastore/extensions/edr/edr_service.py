@@ -368,7 +368,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         collection_id: str,
         request: Request,
         coords: str = Query(..., description="WKT POINT geometry, e.g. POINT(lon lat)"),
-        z: Optional[str] = Query(None, description="Vertical level or range"),
+        z: Optional[str] = Query(None, description="Vertical level or range (e.g. '850' or '850/1000')"),
         datetime: Optional[str] = Query(None, description="ISO 8601 instant or interval"),
         parameter_name: Optional[str] = Query(None, alias="parameter-name"),
         crs: Optional[str] = Query(None, description="Output CRS (default CRS84)"),

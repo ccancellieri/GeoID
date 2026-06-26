@@ -115,18 +115,3 @@ def extract_area_values(
         return ref, box, band_arrays
     finally:
         ds.close()
-
-
-def get_raster_crs(href: str) -> Optional[str]:
-    """Get the CRS of a raster asset.
-
-    Returns the CRS as a string (typically EPSG:XXXX or WKT).
-    Returns None if CRS cannot be determined.
-    """
-    from dynastore.modules.gdal.service import open_raster_vsi
-
-    ds = open_raster_vsi(href)
-    try:
-        return str(ds.crs) if ds.crs else None
-    finally:
-        ds.close()

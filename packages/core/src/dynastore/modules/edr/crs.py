@@ -88,7 +88,12 @@ def validate_crs(crs_uri: str) -> bool:
         except Exception as exc:
             raise ValueError(f"Invalid EPSG code in CRS URI: {crs_uri}") from exc
 
-    return True
+    try:
+        from pyproj import CRS as PyprojCRS
+        PyprojCRS.from_user_input(crs_uri)
+        return True
+    except Exception as exc:
+        raise ValueError(f"Unrecognised CRS URI: {crs_uri!r}") from exc
 
 
 def transform_point(

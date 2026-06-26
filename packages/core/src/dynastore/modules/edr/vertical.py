@@ -18,9 +18,9 @@
 
 """EDR vertical level (z) parameter parsing.
 
-Handles OGC EDR z parameter formats:
+Handles OGC EDR z parameter formats per OGC API EDR 19-086r6 §8.2.7:
 - single level:     "100"
-- level range:      "100:200"
+- level range:      "100/200"  (slash interval notation)
 - named level:      "surface" (requires collection metadata)
 """
 
@@ -40,8 +40,8 @@ def parse_z_param(value: Optional[str]) -> Tuple[Optional[float], Optional[float
     """
     if not value:
         return None, None
-    if ":" in value:
-        parts = value.split(":", 1)
+    if "/" in value:
+        parts = value.split("/", 1)
         try:
             low = float(parts[0]) if parts[0] else None
             high = float(parts[1]) if parts[1] else None

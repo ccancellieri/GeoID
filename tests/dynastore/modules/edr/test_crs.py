@@ -73,6 +73,11 @@ def test_validate_crs_invalid_epsg():
         validate_crs("http://www.opengis.net/def/crs/EPSG/0/999999999")
 
 
+def test_validate_crs_bogus_uri():
+    with pytest.raises(ValueError, match="Unrecognised CRS URI"):
+        validate_crs("http://example.com/crs/totally-made-up")
+
+
 @pytest.mark.skipif(
     not pytest.importorskip("pyproj", reason="pyproj not installed"),
     reason="pyproj not installed"

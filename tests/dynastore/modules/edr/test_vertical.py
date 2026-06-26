@@ -37,17 +37,24 @@ def test_parse_z_param_single_level():
 
 
 def test_parse_z_param_range():
-    low, high = parse_z_param("100:200")
+    # OGC API EDR 19-086r6 §8.2.7 — slash interval notation
+    low, high = parse_z_param("100/200")
     assert low == pytest.approx(100.0)
     assert high == pytest.approx(200.0)
 
 
+def test_parse_z_param_range_pressure_levels():
+    low, high = parse_z_param("850/1000")
+    assert low == pytest.approx(850.0)
+    assert high == pytest.approx(1000.0)
+
+
 def test_parse_z_param_open_range():
-    low, high = parse_z_param("100:")
+    low, high = parse_z_param("100/")
     assert low == pytest.approx(100.0)
     assert high is None
 
-    low, high = parse_z_param(":200")
+    low, high = parse_z_param("/200")
     assert low is None
     assert high == pytest.approx(200.0)
 
