@@ -1,0 +1,51 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../../LICENSE.
+#
+# dynastore-module-local — thin packaging wheel for the local-upload module.
+#
+# This wheel carries no source of its own: the LocalUploadModule implementation
+# lives in dynastore-core (packages/core/src/dynastore/modules/local/).
+# Its sole purpose is to register the `local_upload` entry-point under the
+# `dynastore.modules` group so that the discovery loop in
+# `dynastore.tools.discovery` loads LocalUploadModule ONLY on services whose
+# SCOPE explicitly pulls in `module_local`.
+#
+# Why a separate wheel?  `dynastore-core` is always installed (every service
+# depends on it), so any entry-point declared there is always present in
+# importlib.metadata.  Moving the entry-point here ensures it is absent from
+# importlib.metadata on services that do not install this stub wheel.
+# See refs #2465.
+
+[project]
+name = "dynastore-module-local"
+dynamic = ["version"]
+description = "DynaStore LocalUploadModule entry-point — local-disk asset upload backend."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+# The heavy runtime dep (python-multipart) is pulled in by the `module_local`
+# extra in the root meta-package; it is NOT listed here to avoid duplicating
+# version constraints in two places.  python-multipart is consumed at request
+# time by the FastAPI assets extension, not at LocalUploadModule discovery.
+dependencies = [
+    "dynastore-core",
+]
+
+# Entry-point declaration — the only reason this wheel exists.
+# Source is in packages/core/src/dynastore/modules/local/local_upload.py
+# (always importable because dynastore-core is a dependency of every service).
+[project.entry-points."dynastore.modules"]
+local_upload = "dynastore.modules.local.local_upload:LocalUploadModule"
+
+[build-system]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+# No source in this wheel — the implementation ships in dynastore-core.
+[tool.setuptools]
+packages = []
+
+[tool.uv.sources]
+dynastore-core = { workspace = true }
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"

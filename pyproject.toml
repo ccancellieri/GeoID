@@ -44,6 +44,11 @@ dynastore-module-storage-duckdb = { workspace = true }
 dynastore-module-gdal = { workspace = true }
 dynastore-module-tiles = { workspace = true }
 dynastore-module-crs = { workspace = true }
+dynastore-module-web = { workspace = true }
+dynastore-module-iam = { workspace = true }
+dynastore-module-styles = { workspace = true }
+dynastore-module-local = { workspace = true }
+dynastore-module-notebooks = { workspace = true }
 dynastore-ext-tasks = { workspace = true }
 dynastore-ext-stats = { workspace = true }
 dynastore-ext-edr = { workspace = true }
@@ -102,8 +107,9 @@ module_catalog = ["dynastore[geospatial_core]", "sqlalchemy>=2.0.0"]
 module_gcp = ["gcloud-aio-storage==9.6.0", "google-cloud-bigquery==3.24.0", "google-cloud-run", "google-cloud-storage>=3.1.0", "google-cloud-pubsub", "gcsfs>=2024.5.0", "charset-normalizer>=3", "urllib3>=2.7.0,<3", "requests>=2.32", "httpx", "pmtiles>=3.2.0", "dynastore-module-gcp"]
 module_datastore = ["dynastore[db_sync]", "psycopg2-binary>=2.9.7", "dynastore-module-datastore"]
 module_db_config = ["sqlalchemy", "geoalchemy2", "h3>=4.4.2", "s2sphere>=0.2.5", "python-dateutil"]
-module_iam = ["pydantic[email]", "PyJWT>=2.0.0", "tenacity>=8.0"]
-module_local = ["python-multipart>=0.0.27"]
+module_web = ["dynastore-module-web"]
+module_iam = ["pydantic[email]", "PyJWT>=2.0.0", "tenacity>=8.0", "dynastore-module-iam"]
+module_local = ["python-multipart>=0.0.27", "dynastore-module-local"]
 module_db = ["dynastore[db_async]", "sqlalchemy[asyncio]", "asyncpg"]
 module_crs = ["dynastore[geospatial_core]", "pyproj>=3.0.0", "dynastore-module-crs"]
 module_events = ["psycopg[binary,pool]"]
@@ -113,11 +119,11 @@ module_tiles = ["dynastore[geospatial_core]", "pmtiles>=3.2.0", "morecantile>=7.
 module_cache = ["valkey>=6.0", "msgpack>=1.0", "dynastore-module-cache"]
 module_tasks = []
 module_proxy = []
-module_styles = ["lxml>=4.9"]
+module_styles = ["lxml>=4.9", "dynastore-module-styles"]
 module_moving_features = []
 module_connected_systems = []
 module_stats = []
-module_notebooks = ["httpx", "python-dotenv"]
+module_notebooks = ["httpx", "python-dotenv", "dynastore-module-notebooks"]
 
 # ==========================================================================
 # GRANULAR EXTENSIONS — FastAPI routers, one per domain
@@ -214,7 +220,7 @@ gdal = ["dynastore[module_gdal,extension_gdal,task_gdal_deps]"]
 maps = ["dynastore[extension_maps]"]
 stac = ["dynastore[module_stac, extension_stac]"]
 stats = ["dynastore[module_stats,extension_stats]"]
-web = ["dynastore[extension_web]"]
+web = ["dynastore[module_web, extension_web]"]
 geoid = ["dynastore[web_core,extension_geoid]"]
 processes = ["dynastore[extension_processes]"]
 features = ["dynastore[extension_features]"]
@@ -231,7 +237,7 @@ storage = ["dynastore[module_storage]"]
 auth = ["dynastore[extension_auth]"]
 template = ["dynastore[extension_template]"]
 dimensions = ["dynastore[extension_dimensions]"]
-notebooks = ["dynastore[extension_notebooks]"]
+notebooks = ["dynastore[module_notebooks, extension_notebooks]"]
 edr = ["dynastore[extension_edr]"]
 
 # ==========================================================================

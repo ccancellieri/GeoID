@@ -68,23 +68,23 @@ dependencies = [
 #   dynastore-module-gdal            — `gdal`.  See #2465.
 #   dynastore-module-tiles           — `tiles`.  See #2465.
 #   dynastore-module-crs             — `crs`.  See #2465.
+#   dynastore-module-web             — `web`.  See #2465.
+#   dynastore-module-iam             — `iam`.  See #2465.
+#   dynastore-module-styles          — `styles`.  See #2465.
+#   dynastore-module-local           — `local_upload`.  See #2465.
+#   dynastore-module-notebooks       — `notebooks`.  See #2465.
 # ============================================================================
 [project.entry-points."dynastore.modules"]
 tasks = "dynastore.modules.tasks.tasks_module:TasksModule"
 proxy = "dynastore.modules.proxy.proxy_module:ProxyModule"
 catalog = "dynastore.modules.catalog.catalog_module:CatalogModule"
-styles = "dynastore.modules.styles.styles_module:StylesModule"
 moving_features = "dynastore.modules.moving_features.mf_module:MovingFeaturesModule"
-local_upload = "dynastore.modules.local.local_upload:LocalUploadModule"
 connected_systems = "dynastore.modules.connected_systems.ddl:ConnectedSystemsModule"
 db_config = "dynastore.modules.db_config.db_config_service:DBConfigModule"
-iam = "dynastore.modules.iam.module:IamModule"
 db = "dynastore.modules.db.db_service:DBService"
 task_event_driver = "dynastore.modules.tasks.event_driver:TaskEventDriver"
-notebooks = "dynastore.modules.notebooks.notebooks_module:NotebooksModule"
 stac = "dynastore.modules.stac.module:StacModule"
 stats = "dynastore.modules.stats.stats_module:STATS"
-web = "dynastore.modules.web.web_module:WebModule"
 storage_postgresql = "dynastore.modules.storage.drivers.postgresql:ItemsPostgresqlDriver"
 collection_postgresql = "dynastore.modules.storage.drivers.collection_postgresql:CollectionPostgresqlDriver"
 catalog_postgresql = "dynastore.modules.storage.drivers.catalog_postgresql:CatalogPostgresqlDriver"

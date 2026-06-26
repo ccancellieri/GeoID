@@ -1,0 +1,58 @@
+#    Copyright 2025 FAO — Apache 2.0; see ../../../LICENSE.
+#
+# dynastore-module-iam — thin packaging wheel for the IAM module.
+#
+# This wheel carries no source of its own: the IamModule implementation
+# lives in dynastore-core (packages/core/src/dynastore/modules/iam/).
+# Its sole purpose is to register the `iam` entry-point under the
+# `dynastore.modules` group so that the discovery loop in
+# `dynastore.tools.discovery` loads IamModule ONLY on services whose
+# SCOPE explicitly pulls in `module_iam`.
+#
+# Why a separate wheel?  `dynastore-core` is always installed (every service
+# depends on it), so any entry-point declared there is always present in
+# importlib.metadata.  Moving the entry-point here ensures it is absent from
+# importlib.metadata on services that do not install this stub wheel.
+# See refs #2465.
+#
+# Note: IamModule also carries an internal distribution-presence gate
+# (`importlib.metadata.distribution("dynastore-ext-iam")`) that was
+# introduced before the stub-wheel pattern.  That gate remains as a safety
+# net: installing just this stub without `extension_iam` (which ships
+# `dynastore-ext-iam`) will still result in IamModule being skipped at
+# discovery.  The aggregate `iam` feature alias always pulls both
+# `module_iam` and `extension_iam` together.
+
+[project]
+name = "dynastore-module-iam"
+dynamic = ["version"]
+description = "DynaStore IamModule entry-point — identity and access management."
+requires-python = ">=3.12"
+license-files = ["../../../LICENSE"]
+# The heavy runtime deps (pydantic[email], PyJWT, tenacity) are pulled in by
+# the `module_iam` extra in the root meta-package; they are NOT listed here
+# to avoid duplicating version constraints in two places.
+dependencies = [
+    "dynastore-core",
+]
+
+# Entry-point declaration — the only reason this wheel exists.
+# Source is in packages/core/src/dynastore/modules/iam/module.py
+# (always importable because dynastore-core is a dependency of every service).
+[project.entry-points."dynastore.modules"]
+iam = "dynastore.modules.iam.module:IamModule"
+
+[build-system]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+# No source in this wheel — the implementation ships in dynastore-core.
+[tool.setuptools]
+packages = []
+
+[tool.uv.sources]
+dynastore-core = { workspace = true }
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
+fallback_version = "0.0.0+unknown"
