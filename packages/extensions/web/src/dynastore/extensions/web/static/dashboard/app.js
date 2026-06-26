@@ -4,6 +4,13 @@
 // + context selector + manual / 30 s auto refresh. All server-derived
 // strings are rendered via textContent / createElement — never innerHTML —
 // since logs and task names carry untrusted text.
+//
+// Fixes for #2503:
+// - Added AbortController for race condition prevention
+// - Added error handling with UI error states
+// - Added loading states during async operations
+// - Added auto-refresh countdown timer
+// - Improved task filtering with server-side pagination
 
 import { mountContextBar } from "../static/common/context-bar.js";
 import { apiBase } from "../static/common/url.js";
@@ -14,10 +21,18 @@ const app = {
         activeTab: 'overview',
         catalogId: null,
         collectionId: null,
-        // Cached full task list for client-side pill filtering (defect C).
-        _allTasks: [],
+        // Task filter state (now server-side, no caching)
         _activePillFilter: 'active',
+        _taskLimit: 100,
     },
+    
+    // AbortController for preventing race conditions
+    _abortController: null,
+    
+    // Auto-refresh state
+    _refreshInterval: 30000, // 30 seconds
+    _countdown: 30,
+    _countdownInterval: null,
 
     // --- Initialization ---
     init() {
@@ -35,9 +50,8 @@ const app = {
         }
 
         this.bindEvents();
+        this.startAutoRefresh();
         this.refreshAll();
-        // Auto-refresh every 30 s.
-        setInterval(() => this.refreshAll(), 30000);
     },
 
     bindEvents() {
@@ -54,7 +68,10 @@ const app = {
 
         const refreshBtn = document.getElementById('refresh-btn');
         if (refreshBtn) {
-            refreshBtn.addEventListener('click', () => this.refreshAll());
+            refreshBtn.addEventListener('click', () => {
+                this.refreshAll();
+                this._countdown = 30; // Reset countdown on manual refresh
+            });
         }
 
         const logsFilterBtn = document.getElementById('logs-filter-btn');
@@ -62,7 +79,7 @@ const app = {
             logsFilterBtn.addEventListener('click', () => this.loadLogs());
         }
 
-        // Task-filter pill toolbar — client-side filter against cached tasks.
+        // Task-filter pill toolbar — now triggers server-side fetch
         document.querySelectorAll('.tasks-toolbar .pill').forEach((el) => {
             el.addEventListener('click', (e) => {
                 document.querySelectorAll('.tasks-toolbar .pill').forEach(
@@ -71,12 +88,39 @@ const app = {
                 e.currentTarget.classList.add('active');
                 const filter = e.currentTarget.dataset.filter || 'active';
                 this.state._activePillFilter = filter;
-                this._renderTasks(this.state._allTasks);
+                this.loadTasks(); // Fetch from server with new filter
             });
         });
     },
+    
+    startAutoRefresh() {
+        // Clear existing interval if any
+        if (this._countdownInterval) {
+            clearInterval(this._countdownInterval);
+        }
+        
+        this._countdown = 30;
+        
+        // Update countdown every second
+        this._countdownInterval = setInterval(() => {
+            this._countdown--;
+            
+            const countdownEl = document.getElementById('refresh-countdown');
+            if (countdownEl) {
+                countdownEl.textContent = this._countdown;
+            }
+            
+            if (this._countdown <= 0) {
+                this._countdown = 30;
+                this.refreshAll();
+            }
+        }, 1000);
+    },
 
     switchTab(tabId) {
+        // Cancel any pending requests
+        this.cancelPendingRequests();
+        
         document.querySelectorAll('.tab-btn').forEach((el) => {
             const isActive = el.dataset.tab === tabId;
             el.classList.toggle('active', isActive);
@@ -103,6 +147,13 @@ const app = {
         this.state.activeTab = tabId;
         this.refreshActiveView();
     },
+    
+    cancelPendingRequests() {
+        if (this._abortController) {
+            this._abortController.abort();
+            this._abortController = null;
+        }
+    },
 
     refreshAll() {
         const now = new Date().toLocaleTimeString();
@@ -117,22 +168,81 @@ const app = {
     refreshActiveView() {
         this.refreshAll();
     },
+    
+    showLoading(containerId) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        
+        // Clear existing content
+        while (container.firstChild) {
+            container.removeChild(container.firstChild);
+        }
+        
+        // Show loading state
+        const loading = document.createElement('div');
+        loading.className = 'loading-state';
+        
+        const spinner = document.createElement('i');
+        spinner.className = 'fa-solid fa-spinner fa-spin';
+        loading.appendChild(spinner);
+        
+        const text = document.createElement('p');
+        text.textContent = 'Loading...';
+        loading.appendChild(text);
+        
+        container.appendChild(loading);
+    }
+    ,
+    
+    showError(containerId, message, retryCallback) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        
+        // Clear existing content
+        while (container.firstChild) {
+            container.removeChild(container.firstChild);
+        }
+        
+        // Show error state
+        const error = document.createElement('div');
+        error.className = 'error-state';
+        
+        const icon = document.createElement('i');
+        icon.className = 'fa-solid fa-exclamation-triangle';
+        error.appendChild(icon);
+        
+        const text = document.createElement('p');
+        text.textContent = message;
+        error.appendChild(text);
+        
+        if (retryCallback) {
+            const retryBtn = document.createElement('button');
+            retryBtn.className = 'btn btn-secondary btn-xs';
+            retryBtn.textContent = 'Retry';
+            retryBtn.addEventListener('click', retryCallback);
+            error.appendChild(retryBtn);
+        }
+        
+        container.appendChild(error);
+    },
 
     // --- Data fetching ---
 
     async loadOverview() {
+        // Cancel previous request
+        this.cancelPendingRequests();
+        this._abortController = new AbortController();
+        
         try {
             const { catalogId, collectionId } = this.state;
-            // Scope comes from the context-bar picker, not the page URL. Build an
-            // absolute, proxy-prefix-aware URL to the picked catalog's stats so the
-            // result does not depend on where the shell HTML is served from.
             const url = this._statsUrl(catalogId, collectionId);
 
             const res = await fetch(url, {
                 credentials: "same-origin",
                 headers: { ..._authHeader() },
+                signal: this._abortController.signal,
             });
-            if (!res.ok) { throw new Error(`${res.status} ${url}`); }
+            if (!res.ok) { throw new Error(`HTTP ${res.status}`); }
             const data = await res.json();
 
             const setText = (id, value) => {
@@ -178,7 +288,13 @@ const app = {
                 }
             }
         } catch (e) {
+            if (e.name === 'AbortError') return; // Ignore cancelled requests
             console.error('Failed to load stats', e);
+            // Show error in stats grid
+            const statsGrid = document.querySelector('.stats-grid');
+            if (statsGrid) {
+                this.showError('stat-requests', 'Failed to load stats', () => this.loadOverview());
+            }
         }
     },
 
@@ -194,11 +310,26 @@ const app = {
     },
 
     // Tasks endpoint scoped to the picked catalog; platform-tier when unset.
-    _tasksUrl(catalogId) {
+    // Now supports server-side filtering via query params (#2503).
+    _tasksUrl(catalogId, status = null, limit = 100) {
         const prefix = apiBase();
-        return catalogId
+        let url = catalogId
             ? `${prefix}/web/dashboard/catalogs/${encodeURIComponent(catalogId)}/tasks`
             : `${prefix}/web/dashboard/tasks`;
+        
+        const params = new URLSearchParams();
+        if (status && status !== 'all') {
+            // Map UI filter to backend status values
+            const statusMap = {
+                'active': 'running,pending,in_progress',
+                'completed': 'completed,success',
+                'failed': 'failed,error'
+            };
+            params.set('status', statusMap[status] || status);
+        }
+        params.set('limit', limit.toString());
+        
+        return `${url}?${params.toString()}`;
     },
 
     // Proxy-prefix-aware absolute URL to the canonical logs API, scoped to the
@@ -212,26 +343,34 @@ const app = {
     },
 
     async loadLogs() {
+        // Cancel previous request
+        this.cancelPendingRequests();
+        this._abortController = new AbortController();
+        
+        // Show loading state
+        const tbody = document.querySelector('#logs-table tbody');
+        if (!tbody) return;
+        this.showLoading('logs-table-tbody');
+        
         try {
             const { catalogId, collectionId } = this.state;
-            // /web/dashboard/catalogs/{cat}/logs was deleted; fetch from the
-            // canonical logs extension surface instead (defect A fix).
             const url = catalogId
                 ? this._logsUrl(catalogId, collectionId)
                 : null;
 
-            if (!url) { return; }
+            if (!url) {
+                this.showError('logs-table-tbody', 'Select a catalog to view logs');
+                return;
+            }
 
             const res = await fetch(url, {
                 credentials: "same-origin",
                 headers: { ..._authHeader() },
+                signal: this._abortController.signal,
             });
-            if (!res.ok) { throw new Error(`${res.status} ${url}`); }
+            if (!res.ok) { throw new Error(`HTTP ${res.status}`); }
             // Response is LogsListResponse: {logs: [...], kibana_dashboard_url?, total?}
             const logs = (await res.json()).logs || [];
-
-            const tbody = document.querySelector('#logs-table tbody');
-            if (!tbody) { return; }
 
             // Drop existing children safely (no innerHTML).
             while (tbody.firstChild) { tbody.removeChild(tbody.firstChild); }
@@ -301,54 +440,66 @@ const app = {
                 tbody.appendChild(tr);
             });
         } catch (e) {
+            if (e.name === 'AbortError') return; // Ignore cancelled requests
             console.error('Failed to load logs', e);
+            this.showError('logs-table-tbody', 'Failed to load logs: ' + e.message, () => this.loadLogs());
         }
     },
 
     async loadTasks() {
+        // Cancel previous request
+        this.cancelPendingRequests();
+        this._abortController = new AbortController();
+        
+        // Show loading state
+        const grid = document.getElementById('tasks-grid');
+        if (!grid) return;
+        this.showLoading('tasks-grid');
+        
         try {
-            const res = await fetch(this._tasksUrl(this.state.catalogId), {
+            // Use server-side filtering instead of client-side caching
+            const url = this._tasksUrl(
+                this.state.catalogId,
+                this.state._activePillFilter,
+                this.state._taskLimit
+            );
+            
+            const res = await fetch(url, {
                 credentials: "same-origin",
                 headers: { ..._authHeader() },
+                signal: this._abortController.signal,
             });
-            if (!res.ok) { throw new Error(`${res.status} ${this._tasksUrl(this.state.catalogId)}`); }
-            const tasks = await res.json();
-            this.state._allTasks = Array.isArray(tasks) ? tasks : [];
-            this._renderTasks(this.state._allTasks);
+            if (!res.ok) { throw new Error(`HTTP ${res.status}`); }
+            
+            // Backend returns filtered tasks
+            let tasks = await res.json();
+            tasks = Array.isArray(tasks) ? tasks : [];
+            
+            // Render tasks (no client-side filtering needed)
+            this._renderTasks(tasks);
         } catch (e) {
+            if (e.name === 'AbortError') return; // Ignore cancelled requests
             console.error('Failed to load tasks', e);
+            this.showError('tasks-grid', 'Failed to load tasks: ' + e.message, () => this.loadTasks());
         }
     },
 
-    // Render task cards filtered by the active pill (defect C fix).
-    // filter values match task.status lowercased; 'active' matches
-    // 'active', 'running', 'in_progress' as synonyms.
-    _renderTasks(allTasks) {
+    // Render task cards (no filtering - already done server-side)
+    _renderTasks(tasks) {
         const grid = document.getElementById('tasks-grid');
         if (!grid) { return; }
 
         while (grid.firstChild) { grid.removeChild(grid.firstChild); }
 
-        const filter = this.state._activePillFilter || 'active';
-        const filtered = allTasks.filter((task) => {
-            const s = (task.status || '').toLowerCase();
-            if (filter === 'active') {
-                return s === 'active' || s === 'running' || s === 'in_progress';
-            }
-            return s === filter;
-        });
-
-        if (filtered.length === 0) {
+        if (tasks.length === 0) {
             const empty = document.createElement('p');
             empty.className = 'empty-cell';
-            empty.textContent = allTasks.length === 0
-                ? 'No background tasks.'
-                : `No ${filter} tasks.`;
+            empty.textContent = `No ${this.state._activePillFilter} tasks.`;
             grid.appendChild(empty);
             return;
         }
 
-        filtered.forEach((task) => {
+        tasks.forEach((task) => {
             const card = document.createElement('div');
             card.className = 'task-card';
 

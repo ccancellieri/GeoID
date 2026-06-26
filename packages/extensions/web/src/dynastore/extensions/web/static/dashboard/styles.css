@@ -459,3 +459,77 @@
   font-size: 1.05rem;
   border: 1px dashed var(--rule);
 }
+
+/* --- Loading and Error States (#2503) --------------------------------- */
+
+.loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  color: var(--ink-dim);
+  font-family: var(--font-ui);
+  font-size: 0.88rem;
+  gap: 12px;
+}
+
+.loading-state i {
+  font-size: 1.5rem;
+  color: var(--ink-soft);
+}
+
+.error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  color: var(--terracotta-deep);
+  font-family: var(--font-ui);
+  font-size: 0.88rem;
+  gap: 12px;
+  text-align: center;
+}
+
+.error-state i {
+  font-size: 2rem;
+  color: var(--terracotta-deep);
+  opacity: 0.7;
+}
+
+.error-state p {
+  margin: 0;
+  max-width: 300px;
+}
+
+.error-state .btn {
+  margin-top: 8px;
+}
+
+/* Refresh indicator for auto-refresh countdown */
+.refresh-indicator {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--ink-dim);
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  background: var(--paper-shadow);
+  border: 1px solid var(--rule-hair);
+  border-radius: 3px;
+}
+
+.refresh-indicator #refresh-countdown {
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+/* Loading state for table rows */
+.loading-row td {
+  text-align: center;
+  color: var(--ink-dim);
+  font-family: var(--font-ui);
+  font-style: italic;
+  padding: 24px 10px;
+  font-size: 0.88rem;
+}

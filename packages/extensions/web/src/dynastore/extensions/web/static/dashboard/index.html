@@ -34,6 +34,9 @@
 
     <div class="dashboard-actions">
       <span class="last-updated" id="last-updated">Updated: just now</span>
+      <span class="refresh-indicator">
+        <span id="refresh-countdown">30</span>s
+      </span>
       <span class="spacer"></span>
       <button class="btn btn-secondary btn-xs" id="refresh-btn" type="button"
               aria-label="Refresh dashboard data">Refresh</button>
@@ -115,7 +118,7 @@
               <th>Message</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody id="logs-table-tbody">
             <tr class="empty-row"><td colspan="4">Loading logs…</td></tr>
           </tbody>
         </table>
