@@ -538,6 +538,131 @@ class TestOperationSelection:
 
 
 # ---------------------------------------------------------------------------
+# Missing-catalog guard (deprovision idempotency)
+# ---------------------------------------------------------------------------
+
+
+class TestMissingCatalogGuard:
+    """The hard-delete dispatch tombstones the catalog row before enqueuing the
+    deprovision task, and get_catalog_model filters tombstoned rows — so a
+    deprovision always sees get_catalog_model() == None on its first run. The
+    task must look the row up tombstone-inclusive: run teardown when it still
+    exists, return idempotent success only when it is fully gone, and keep
+    failing fast for a provision against a genuinely missing catalog.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["deprovision_soft", "deprovision_hard"])
+    async def test_deprovision_tombstoned_catalog_runs_teardown(self, operation: str):
+        from dynastore.tasks.catalog_provision.task import CatalogProvisionTask
+
+        deprovision_called = []
+
+        async def deprov(**ctx):
+            deprovision_called.append(ctx.get("external_id"))
+
+        p = _make_provisioner("op_test", deprovision_fn=deprov)
+        groups = [[p]]
+
+        task = _make_task()
+        payload = _make_payload(operation=operation)
+        mock_catalogs = _mock_catalogs()
+        # get_catalog_model filters tombstoned rows → None on a deprovision.
+        mock_catalogs.get_catalog_model = AsyncMock(return_value=None)
+
+        with patch(
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
+            return_value=mock_catalogs,
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.managed_transaction",
+            return_value=_txn_ctx(),
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.get_catalog_engine",
+            return_value=MagicMock(),
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.provisioning_registry",
+        ) as mock_reg, patch(
+            "dynastore.tasks.catalog_provision.task._get_group_concurrency",
+            new=AsyncMock(return_value=4),
+        ), patch.object(
+            CatalogProvisionTask,
+            "_lookup_tombstoned_catalog",
+            new=AsyncMock(return_value={"id": "c_test", "external_id": "ext-id"}),
+        ):
+            mock_reg.active_provisioners = AsyncMock(return_value=groups)
+            result = await task.run(payload)
+
+        # Teardown ran with the tombstoned row's external_id; not a no-op.
+        assert deprovision_called == ["ext-id"]
+        assert result["groups_run"] == 1
+        assert result.get("already_absent") is not True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["deprovision_soft", "deprovision_hard"])
+    async def test_deprovision_fully_absent_is_idempotent_success(self, operation: str):
+        from dynastore.tasks.catalog_provision.task import CatalogProvisionTask
+
+        deprovision_called = []
+
+        async def deprov(**ctx):
+            deprovision_called.append(True)
+
+        p = _make_provisioner("op_test", deprovision_fn=deprov)
+        groups = [[p]]
+
+        task = _make_task()
+        payload = _make_payload(operation=operation)
+        mock_catalogs = _mock_catalogs()
+        mock_catalogs.get_catalog_model = AsyncMock(return_value=None)
+
+        with patch(
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
+            return_value=mock_catalogs,
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.managed_transaction",
+            return_value=_txn_ctx(),
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.get_catalog_engine",
+            return_value=MagicMock(),
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.provisioning_registry",
+        ) as mock_reg, patch(
+            "dynastore.tasks.catalog_provision.task._get_group_concurrency",
+            new=AsyncMock(return_value=4),
+        ), patch.object(
+            CatalogProvisionTask,
+            "_lookup_tombstoned_catalog",
+            new=AsyncMock(return_value=None),
+        ):
+            mock_reg.active_provisioners = AsyncMock(return_value=groups)
+            result = await task.run(payload)
+
+        # Fully gone → no teardown, no error, idempotent success.
+        assert deprovision_called == []
+        assert result["groups_run"] == 0
+        assert result["already_absent"] is True
+
+    @pytest.mark.asyncio
+    async def test_provision_missing_catalog_still_raises(self):
+        from dynastore.modules.tasks.models import PermanentTaskFailure
+
+        task = _make_task()
+        payload = _make_payload(operation="provision")
+        mock_catalogs = _mock_catalogs()
+        mock_catalogs.get_catalog_model = AsyncMock(return_value=None)
+
+        with patch(
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
+            return_value=mock_catalogs,
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.get_catalog_engine",
+            return_value=MagicMock(),
+        ):
+            with pytest.raises(PermanentTaskFailure, match="not found"):
+                await task.run(payload)
+
+
+# ---------------------------------------------------------------------------
 # Failure handling
 # ---------------------------------------------------------------------------
 

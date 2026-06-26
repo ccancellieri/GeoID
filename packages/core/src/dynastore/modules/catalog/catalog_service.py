@@ -541,6 +541,16 @@ _hard_delete_catalog_query = DQLQuery(
     result_handler=ResultHandler.ROWCOUNT,
 )
 
+# Tombstone-inclusive existence probe. The hard-delete path re-tombstones the
+# row, which updates 0 rows when the catalog was ALREADY soft-deleted (reaper
+# promotion or a force=True after a soft delete). That 0-row result must not be
+# read as "catalog gone" — only a row that does not exist at all should abort
+# the hard delete.
+_catalog_exists_query = DQLQuery(
+    "SELECT 1 FROM catalog.catalogs WHERE id = :id;",
+    result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+)
+
 
 def _catalog_model_is_ready(c: Any) -> bool:
     """Only cache 'ready' catalogs: transient states ('provisioning',
@@ -2194,10 +2204,17 @@ class CatalogService(CatalogsProtocol):
                 db_resource=conn,
             )
 
-            # Tombstone the row (makes it invisible in listings)
+            # Tombstone the row (makes it invisible in listings). An
+            # already-tombstoned catalog — soft-deleted earlier and now being
+            # promoted to a hard delete by the reaper or a force=True call —
+            # updates 0 rows here, but its physical schema/storage still needs
+            # teardown. Only abort when the row genuinely does not exist;
+            # otherwise fall through and enqueue the deprovision checklist.
             rows = await _soft_delete_catalog_query.execute(conn, id=catalog_id)
             if rows == 0:
-                return False
+                still_exists = await _catalog_exists_query.execute(conn, id=catalog_id)
+                if not still_exists:
+                    return False
 
             # Build the deprovision checklist from active provisioners
             from dynastore.modules.catalog.provisioning_registry import (

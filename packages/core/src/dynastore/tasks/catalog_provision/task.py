@@ -136,12 +136,50 @@ class CatalogProvisionTask(TaskProtocol):
         catalogs = _get_catalog_protocol()
 
         catalog_model = await catalogs.get_catalog_model(catalog_id)
-        if catalog_model is None:
-            raise PermanentTaskFailure(
-                f"Catalog '{catalog_id}' not found — cannot run provisioning"
-            )
 
         external_id: Optional[str] = getattr(catalog_model, "external_id", None)
+
+        if catalog_model is None:
+            if operation in ("deprovision_soft", "deprovision_hard"):
+                # The hard-delete dispatch tombstones the catalog row (sets
+                # ``deleted_at``) BEFORE enqueuing this task, and
+                # ``get_catalog_model`` filters out tombstoned rows — so a
+                # deprovision ALWAYS sees None here on its first run. The
+                # teardown provisioners (catalog_core et al.) are written to
+                # operate on tombstoned rows by id, so we must not bail out:
+                # look the row up tombstone-inclusive and, if it still exists,
+                # fall through and run the teardown. Only a row that is fully
+                # gone (a retry after catalog_core already hard-deleted it)
+                # means the teardown end-state is already satisfied — treat
+                # that as an idempotent success instead of wedging the delete
+                # in a permanent-failed loop that retries can never clear.
+                row = await self._lookup_tombstoned_catalog(catalog_id)
+                if row is None:
+                    logger.warning(
+                        "CatalogProvisionTask: catalog '%s' already absent for "
+                        "operation='%s' — nothing to deprovision; treating as "
+                        "idempotent success",
+                        catalog_id, operation,
+                    )
+                    return {
+                        "catalog_id": catalog_id,
+                        "scope": scope,
+                        "operation": operation,
+                        "groups_run": 0,
+                        "steps_completed": 0,
+                        "steps_failed": 0,
+                        "already_absent": True,
+                    }
+                external_id = row.get("external_id")
+                logger.info(
+                    "CatalogProvisionTask: catalog '%s' is tombstoned "
+                    "(deleted_at set) — running deprovision teardown",
+                    catalog_id,
+                )
+            else:
+                raise PermanentTaskFailure(
+                    f"Catalog '{catalog_id}' not found — cannot run provisioning"
+                )
 
         # Fetch the active provisioners grouped by ascending priority.
         async with managed_transaction(get_catalog_engine()) as conn:
@@ -269,6 +307,30 @@ class CatalogProvisionTask(TaskProtocol):
             "steps_completed": steps_completed,
             "steps_failed": steps_failed,
         }
+
+    async def _lookup_tombstoned_catalog(
+        self, catalog_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read a catalog row by internal id, INCLUDING tombstoned rows.
+
+        ``get_catalog_model`` filters ``deleted_at IS NULL``, but a deprovision
+        runs against a row the dispatch already tombstoned. Mirror the
+        tombstone-inclusive lookup used by the catalog_core deprovision hook so
+        the task can tell "tombstoned, still needs teardown" (row present) from
+        "fully gone, idempotent success" (row absent). Returns the row dict or
+        None when no row exists for the id.
+        """
+        from dynastore.modules.db_config.query_executor import (
+            DQLQuery,
+            ResultHandler,
+        )
+
+        query = DQLQuery(
+            "SELECT id, external_id FROM catalog.catalogs WHERE id = :id;",
+            result_handler=ResultHandler.ONE_DICT,
+        )
+        async with managed_transaction(get_catalog_engine()) as conn:
+            return await query.execute(conn, id=catalog_id)
 
     async def _emit_catalog_created_events(self, catalog_id: str) -> None:
         """Emit CATALOG_CREATION and AFTER_CATALOG_CREATION lifecycle events.
