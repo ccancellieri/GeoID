@@ -190,6 +190,52 @@ class DatabaseInputExceptionHandler(ExceptionHandler):
         )
 
 
+class DatabaseErrorHandler(ExceptionHandler):
+    """Handles database errors and surfaces original exception details to aid debugging.
+    
+    This ensures that errors like serialization failures, lock contention, and other DB-level
+    exceptions are visible to API consumers instead of being masked behind generic "Database query failed" messages.
+    """
+    
+    def can_handle(self, exception: Exception) -> bool:
+        # Import locally to avoid circular dependencies
+        from dynastore.modules.db_config.exceptions import DatabaseError
+        return isinstance(exception, DatabaseError)
+    
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.tools.correlation import get_correlation_id
+
+        
+        # Reuse the existing __str__() logic that includes original_exception details
+        detail = str(exception)
+        
+        # Extract context for more informative logging
+        context = context or {}
+        resource_name = context.get("resource_name", "Resource")
+        operation = context.get("operation", "operation")
+        resource_id = context.get("resource_id")
+        
+        # Log the full error with correlation ID for operators
+        cid = get_correlation_id() or "(no correlation id)"
+        logger.error(
+            f"Database error during {operation} on {resource_name}: {detail} "
+            f"(correlation_id={cid}, resource_id={resource_id})",
+            exc_info=True,
+        )
+        
+        # Return 500 with detailed error message that includes original exception details
+        # This replaces the generic "Database query failed. (Details: No additional details.)"
+        # with something like:
+        # "Database query failed. (Details: serialization_failure)"
+        # "Database query failed. (Details: deadlock detected)"
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=detail,
+        )
+
+
 class ValidationExceptionHandler(ExceptionHandler):
     """Handles validation errors (ValueError, Pydantic ValidationError)."""
 
@@ -801,6 +847,7 @@ class ExceptionHandlerRegistry:
         )  # Catch programming errors before generic validation
         self.register(GcpInternalErrorHandler())  # GcpInternalError → 500 with message preserved
         self.register(DatabaseInputExceptionHandler())  # Catch DB input errors (400)
+        self.register(DatabaseErrorHandler())  # Surface original DB exception details for better debugging
         self.register(ValidationExceptionHandler())  # Generic - must be last
 
     def register(self, handler: ExceptionHandler, prepend: bool = False) -> None:
