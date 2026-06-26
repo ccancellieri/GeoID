@@ -780,7 +780,7 @@ class ConfigService(ConfigsProtocol):
             await run_apply_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
         _collection_config_cache.cache_invalidate(
-            self.engine, catalogs, catalog_id, original_collection_id, class_key
+            self.engine, catalogs, catalog_id, internal_collection_id, class_key
         )
         _maybe_bust_router(cls, catalog_id, original_collection_id)
 
@@ -1219,7 +1219,7 @@ class ConfigService(ConfigsProtocol):
             self.engine,
             catalogs,
             catalog_id,
-            original_collection_id,
+            internal_collection_id,
             class_key,
         )
         _maybe_bust_router(cls, catalog_id, original_collection_id)
@@ -1268,7 +1268,7 @@ class ConfigService(ConfigsProtocol):
                 )
             _collection_config_cache.cache_invalidate(
                 self.engine, self._get_catalog_manager(),
-                catalog_id, collection_id, stored_class_key,
+                catalog_id, internal_collection_id, stored_class_key,
             )
             cls = resolve_config_class(stored_class_key)
             if cls is not None:
@@ -1514,7 +1514,7 @@ class ConfigService(ConfigsProtocol):
                     self.engine,
                     self.catalog_manager,
                     catalog_id,
-                    collection_id,
+                    internal_collection_id,
                     class_key,
                 )
                 _maybe_bust_router(cls, catalog_id, collection_id)
