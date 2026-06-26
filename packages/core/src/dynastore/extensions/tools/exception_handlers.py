@@ -190,49 +190,82 @@ class DatabaseInputExceptionHandler(ExceptionHandler):
         )
 
 
-class DatabaseErrorHandler(ExceptionHandler):
-    """Handles database errors and surfaces original exception details to aid debugging.
-    
-    This ensures that errors like serialization failures, lock contention, and other DB-level
-    exceptions are visible to API consumers instead of being masked behind generic "Database query failed" messages.
+def _extract_pgcode(exception: Exception) -> Optional[str]:
+    """Extract the raw PostgreSQL error code from a DatabaseError without leaking str(exception).
+
+    Walks the ``original_exception`` chain the same way ``get_conflict_context``
+    does, but avoids calling ``str()`` on any exception along the path so no
+    physical schema/table names are touched.
     """
-    
+    original = getattr(exception, "original_exception", None)
+    if original is None:
+        return None
+    # asyncpg: ``pgcode`` / ``sqlstate`` on the raw error object
+    pgcode = getattr(original, "pgcode", None) or getattr(original, "sqlstate", None)
+    if pgcode:
+        return str(pgcode)
+    # SQLAlchemy wraps asyncpg/psycopg2 as ``.orig``
+    orig_inner = getattr(original, "orig", None)
+    if orig_inner is not None:
+        pgcode = getattr(orig_inner, "pgcode", None) or getattr(orig_inner, "sqlstate", None)
+        if pgcode:
+            return str(pgcode)
+    return None
+
+
+class DatabaseErrorHandler(ExceptionHandler):
+    """Handles database errors with a sanitized HTTP response.
+
+    Logs the full ``str(exception)`` (which may embed raw asyncpg/psycopg2
+    messages containing internal physical schema/table names such as
+    ``c_<hash>`` and ``items_<hash>``) server-side only.  The HTTP 500 detail
+    is limited to: the exception type name (a safe error category), the bare
+    PostgreSQL error code when available (a standard identifier with no physical
+    names), and the correlation-id so operators can cross-reference the server
+    log for the full message.
+    """
+
     def can_handle(self, exception: Exception) -> bool:
         # Import locally to avoid circular dependencies
         from dynastore.modules.db_config.exceptions import DatabaseError
         return isinstance(exception, DatabaseError)
-    
+
     def handle(
         self, exception: Exception, context: Optional[Dict[str, Any]] = None
     ) -> Optional[HTTPException]:
         from dynastore.tools.correlation import get_correlation_id
 
-        
-        # Reuse the existing __str__() logic that includes original_exception details
-        detail = str(exception)
-        
-        # Extract context for more informative logging
         context = context or {}
         resource_name = context.get("resource_name", "Resource")
         operation = context.get("operation", "operation")
         resource_id = context.get("resource_id")
-        
-        # Log the full error with correlation ID for operators
+
         cid = get_correlation_id() or "(no correlation id)"
+
+        # Log the FULL exception string server-side (may contain physical names).
         logger.error(
-            f"Database error during {operation} on {resource_name}: {detail} "
-            f"(correlation_id={cid}, resource_id={resource_id})",
+            "Database error during %s on %s: %s (correlation_id=%s, resource_id=%s)",
+            operation,
+            resource_name,
+            str(exception),
+            cid,
+            resource_id,
             exc_info=True,
         )
-        
-        # Return 500 with detailed error message that includes original exception details
-        # This replaces the generic "Database query failed. (Details: No additional details.)"
-        # with something like:
-        # "Database query failed. (Details: serialization_failure)"
-        # "Database query failed. (Details: deadlock detected)"
+
+        # Build a sanitized HTTP detail: safe category + pgcode + correlation-id.
+        # Physical schema/table names from the raw PG message are deliberately omitted.
+        err_type = exception.__class__.__name__
+        pgcode = _extract_pgcode(exception)
+        pgcode_hint = f", pgcode={pgcode}" if pgcode else ""
+        sanitized_detail = (
+            f"Database error during {operation}"
+            f" ({err_type}{pgcode_hint}; correlation_id={cid})"
+        )
+
         return HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=detail,
+            detail=sanitized_detail,
         )
 
 
@@ -1211,8 +1244,13 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
         if isinstance(result, Response):
             return result
 
+        # Use only the handler-produced detail (already sanitized).
+        # str(exc) is intentionally omitted here: it may contain internal
+        # physical schema/table names that must not appear in HTTP responses.
+        # The full exception string is already captured by the logger.warning
+        # call above and (when available) in the database log entry.
         response_content = {
-            "detail": f"{getattr(result, 'detail', 'An unexpected error occurred.')} | Error: {str(exc)}"
+            "detail": getattr(result, "detail", "An unexpected error occurred.")
         }
         status_code = getattr(result, "status_code", 500)
 
