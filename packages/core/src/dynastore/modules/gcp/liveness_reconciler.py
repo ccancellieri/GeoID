@@ -22,8 +22,7 @@
 cold-start duration, fragile the moment the image grows or a region throttles.
 This reconciler replaces the guess with a real signal.
 
-Every ``interval_seconds`` (default 20s — faster than the MaintenanceSupervisor
-``task_reaper`` cadence, so it gets first look) it scans lapsed-lease
+Every ``interval_seconds`` (default from LeadershipConfig) it scans lapsed-lease
 ``gcp_cloud_run_*`` task rows and, for each, asks the owning runner — via
 :class:`LivenessProbeProtocol` — whether the Cloud Run execution backing the row
 is actually alive. It then acts on the verdict:
@@ -52,6 +51,7 @@ from typing import Any, Dict, NamedTuple, Optional, Union
 
 from dynastore.modules.tasks import tasks_module
 from dynastore.modules.tasks.liveness import LivenessVerdict, resolve_probe, resolve_stop_signal
+from dynastore.modules.db_config.connection_health_config import resolve_leadership_config
 from dynastore.tools.background_service import (
     Leadership,
     PeriodicService,
@@ -98,14 +98,14 @@ class ReconcileOutcome(NamedTuple):
     race_lost: bool = False
 
 
-# How long (in seconds) to keep trying graceful cancel before escalating
-# to force_stop on a DISMISSED-but-still-alive execution.  The reference
-# point is ``last_heartbeat_at`` (most recent alive signal from the job
-# container) falling back to ``timestamp`` (row creation time).  A value
-# of 600s (10 minutes) covers the worst-case Cloud Run cold-start window
-# plus a generous SIGTERM drain period, without letting a dismissed
-# execution run indefinitely.
-_DISMISS_FORCE_DELETE_AFTER: timedelta = timedelta(seconds=600)
+def _get_dismiss_force_delete_after() -> timedelta:
+    """Get the grace period before force-deleting dismissed liveness records.
+
+    Configuration: Resolved from DB_LEADERSHIP_DISMISS_FORCE_DELETE_SECONDS
+    env var or LeadershipConfig default (600s).
+    """
+    _, dismiss_seconds, _, _, _ = resolve_leadership_config()
+    return timedelta(seconds=dismiss_seconds)
 
 
 class GcpLivenessReconciler(PeriodicService):
@@ -132,17 +132,21 @@ class GcpLivenessReconciler(PeriodicService):
         self,
         engine: Any = None,
         *,
-        interval_seconds: float = 20.0,
-        extend_visibility_seconds: int = 300,
-        unknown_grace_seconds: int = 180,
+        interval_seconds: float | None = None,
+        extend_visibility_seconds: int | None = None,
+        unknown_grace_seconds: int | None = None,
     ) -> None:
         from dynastore.modules.db_config.instance import get_service_name as _get_service_name
         service = _get_service_name() or "unknown"
-        self.cadence_seconds: float = float(interval_seconds)
+
+        # Resolve configurable leadership settings
+        _, _, cfg_interval, cfg_visibility, cfg_unknown_grace = resolve_leadership_config()
+
+        self.cadence_seconds: float = float(interval_seconds if interval_seconds is not None else cfg_interval)
         self.lock_key: Optional[Union[int, str]] = f"gcp-liveness-reconciler:{service}"
         self._engine: Any = engine
-        self._extend_visibility_seconds: int = int(extend_visibility_seconds)
-        self._unknown_grace_seconds: int = int(unknown_grace_seconds)
+        self._extend_visibility_seconds: int = int(extend_visibility_seconds if extend_visibility_seconds is not None else cfg_visibility)
+        self._unknown_grace_seconds: int = int(unknown_grace_seconds if unknown_grace_seconds is not None else cfg_unknown_grace)
 
     # --- PeriodicService tick ----------------------------------------------
 
@@ -268,8 +272,8 @@ class GcpLivenessReconciler(PeriodicService):
         b) Execution still ALIVE within the force-delete deadline:
            call ``runner.signal_stop(task)`` (cancel / graceful SIGTERM) and
            return ``False`` — the next reconciler cycle re-probes.
-        c) Execution still ALIVE past the deadline (``_DISMISS_FORCE_DELETE_AFTER``
-           elapsed since ``last_heartbeat_at`` or ``timestamp``):
+        c) Execution still ALIVE past the deadline (configurable via
+           DB_LEADERSHIP_DISMISS_FORCE_DELETE_SECONDS, default 600s):
            call ``runner.force_stop(task)`` (hard delete), stamp
            ``dismiss_confirmed_at``, emit ``dismiss_unconfirmed_total``,
            return ``True``.
@@ -334,7 +338,7 @@ class GcpLivenessReconciler(PeriodicService):
         ref_ts: Optional[datetime] = row.get("last_heartbeat_at") or row.get("timestamp")
         elapsed = (now - ref_ts) if ref_ts is not None else None
         past_deadline = (
-            elapsed is not None and elapsed >= _DISMISS_FORCE_DELETE_AFTER
+            elapsed is not None and elapsed >= _get_dismiss_force_delete_after()
         )
 
         if past_deadline:

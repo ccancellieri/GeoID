@@ -23,6 +23,11 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import Optional, Callable, Awaitable, ClassVar, TypeVar, Dict, AsyncGenerator, Iterator, Set, Tuple, Union, cast
+
+from dynastore.modules.db_config.connection_health_config import (
+    resolve_connection_retry_config,
+    resolve_leadership_config,
+)
 from sqlalchemy import text, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from dynastore.modules.tasks.durable.locks import stable_lock_id_sha256 as _stable_lock_id_sha256
@@ -68,25 +73,31 @@ def held_advisory_locks() -> Dict[int, Tuple[str, float]]:
     return dict(_held_advisory_locks)
 
 
-def retry_on_lock_conflict(max_retries: int = 5, base_delay: float = 0.5):
-    """
-    Decorator to retry database operations when encountering lock contention
+def retry_on_lock_conflict(max_retries: int | None = None, base_delay: float | None = None):
+    """Decorator to retry database operations when encountering lock contention
     or asyncpg protocol 'operation in progress' errors.
+
+    Configuration: Values are resolved from (1) function parameters,
+    (2) environment variables, (3) ConnectionRetryConfig defaults.
+    Values are resolved at CALL TIME, so env var changes take effect immediately.
+    See :mod:`connection_health_config` for details.
     """
 
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
+            # Resolve config at call time for dynamic behavior
+            cfg_max_retries, cfg_base_delay, _, _ = resolve_connection_retry_config()
+            _max_retries = max_retries if max_retries is not None else cfg_max_retries
+            _base_delay = base_delay if base_delay is not None else cfg_base_delay
+
             last_err = None
-            for attempt in range(max_retries):
+            for attempt in range(_max_retries):
                 try:
                     return await func(*args, **kwargs)
                 except Exception as e:
                     last_err = e
                     err_str = str(e).lower()
-                    # Catch lock timeouts (55P03), deadlocks (40P01),
-                    # asyncpg InterfaceErrors (protocol busy),
-                    # and DatabaseConnectionError/closed connection errors
                     retryable = any(
                         x in err_str
                         for x in [
@@ -105,12 +116,12 @@ def retry_on_lock_conflict(max_retries: int = 5, base_delay: float = 0.5):
                         ]
                     )
 
-                    if not retryable or attempt == max_retries - 1:
+                    if not retryable or attempt == _max_retries - 1:
                         raise
 
-                    delay = base_delay * (2**attempt)
+                    delay = _base_delay * (2**attempt)
                     logger.warning(
-                        f"Conflict on wire/DB (attempt {attempt + 1}/{max_retries}): {e}\nRetrying in {delay:.2f}s..."
+                        f"Conflict on wire/DB (attempt {attempt + 1}/{_max_retries}): {e}\nRetrying in {delay:.2f}s..."
                     )
                     await asyncio.sleep(delay)
             if last_err:
@@ -299,23 +310,25 @@ async def pg_advisory_leadership(
 
 @contextmanager
 def sync_acquire_startup_lock(
-    conn: DbResource, lock_key: str, timeout: str = "30s"
+    conn: DbResource, lock_key: str, timeout: str | None = None
 ) -> "Iterator[Optional[DbResource]]":
+    """Synchronous version of acquire_startup_lock for DDL coordination.
+
+    Configuration: Timeout is resolved from (1) function parameter,
+    (2) environment variable DB_LEADERSHIP_LOCK_TIMEOUT_SECONDS,
+    (3) LeadershipConfig default (30s).
     """
-    Synchronous version of acquire_startup_lock for DDL coordination.
-    """
+    if timeout is None:
+        timeout_secs, _, _, _, _ = resolve_leadership_config()
+        timeout = f"{timeout_secs}s"
+
     if isinstance(conn, Engine):
         with sync_managed_transaction(conn) as tx_conn:
             with sync_acquire_startup_lock(tx_conn, lock_key, timeout) as active:
                 yield active
         return
 
-    # Below here conn is guaranteed to be a Connection resource
     lock_id = _get_stable_lock_id(lock_key)
-
-    # First try non-blocking
-    # We use execute directly as DQLQuery is async-oriented or we need to check if it supports sync
-    # DQLQuery executor is BaseExecutor which supports sync.
 
     q_try = DQLQuery(
         "SELECT pg_try_advisory_xact_lock(:lock_id)",
@@ -363,23 +376,29 @@ def sync_acquire_startup_lock(
 
 @asynccontextmanager
 async def acquire_startup_lock(
-    conn: DbResource, lock_key: str, timeout: str = "30s"
+    conn: DbResource, lock_key: str, timeout: str | None = None
 ) -> AsyncGenerator[Optional[DbResource], None]:
-    """
-    Acquires an advisory lock for coordination.
+    """Acquires an advisory lock for coordination.
+
     Serialization is handled internally by Query Executor.
     Ensures all operations happen on the same connection if an engine is provided.
+
+    Configuration: Timeout is resolved from (1) function parameter,
+    (2) environment variable DB_LEADERSHIP_LOCK_TIMEOUT_SECONDS,
+    (3) LeadershipConfig default (30s).
     """
+    if timeout is None:
+        timeout_secs, _, _, _, _ = resolve_leadership_config()
+        timeout = f"{timeout_secs}s"
+
     if isinstance(conn, (AsyncEngine, Engine)):
         async with managed_transaction(conn) as tx_conn:
             async with acquire_startup_lock(tx_conn, lock_key, timeout) as active:
                 yield active
         return
 
-    # Below here conn is guaranteed to be a Connection resource
     lock_id = _get_stable_lock_id(lock_key)
 
-    # First try non-blocking to be fast
     q_try = DQLQuery(
         "SELECT pg_try_advisory_xact_lock(:lock_id)",
         result_handler=ResultHandler.SCALAR,
@@ -387,9 +406,7 @@ async def acquire_startup_lock(
     acquired = await q_try.execute(conn, lock_id=lock_id)
 
     if not acquired:
-        # If busy, wait with a timeout to prevent deadlocks
         logger.debug(f"Lock {lock_key} busy, waiting up to {timeout}...")
-        # We use a local session timeout for safety during the lock wait.
         await DDLQuery(f"SET LOCAL lock_timeout = '{timeout}'").execute(conn)
 
         q_wait = DQLQuery(
@@ -402,7 +419,7 @@ async def acquire_startup_lock(
             logger.warning(
                 f"Failed to acquire advisory lock {lock_key} within {timeout}: {e}"
             )
-            raise  # Re-raise to ensure transaction rollback
+            raise
 
     if acquired:
         logger.debug(f"Acquired advisory lock: {lock_key}")

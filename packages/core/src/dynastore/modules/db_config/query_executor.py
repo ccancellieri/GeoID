@@ -29,6 +29,12 @@ import os
 import time
 from abc import abstractmethod, ABC
 from contextlib import asynccontextmanager, contextmanager
+
+from dynastore.modules.db_config.connection_health_config import (
+    resolve_connection_retry_config,
+    resolve_provisioning_retry_config,
+    resolve_connection_health_config,
+)
 from sqlalchemy import text, DDL
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.base import Connection as SAConnection
@@ -84,10 +90,12 @@ try:
     from asyncpg.exceptions import (
         ConnectionDoesNotExistError as AsyncpgConnectionDoesNotExistError,
         InternalClientError as AsyncpgInternalClientError,
+        InterfaceError as AsyncpgInterfaceError,
     )
 except ImportError:
     AsyncpgConnectionDoesNotExistError = type("AsyncpgConnectionDoesNotExistError", (Exception,), {})
     AsyncpgInternalClientError = type("AsyncpgInternalClientError", (Exception,), {})
+    AsyncpgInterfaceError = type("AsyncpgInterfaceError", (Exception,), {})
 
 
 # Class names of asyncpg client-side errors that indicate transient connection
@@ -1297,10 +1305,10 @@ _TRANSIENT_CONNECT_EXCEPTIONS: tuple = (
 
 
 def retry_on_transient_connect(
-    max_retries: int = 5,
-    base_delay: float = 0.5,
-    max_delay: float = 8.0,
-    jitter: float = 0.25,
+    max_retries: int | None = None,
+    base_delay: float | None = None,
+    max_delay: float | None = None,
+    jitter: float | None = None,
 ):
     """Retry a coroutine on transient connection-acquisition / DDL infra errors.
 
@@ -1317,42 +1325,48 @@ def retry_on_transient_connect(
 
     Only retries the exception types in :data:`_TRANSIENT_CONNECT_EXCEPTIONS`.
     Anything else propagates immediately so genuine bugs are not masked.
+
+    Configuration: Values are resolved from (1) function parameters,
+    (2) environment variables, (3) ConnectionRetryConfig defaults.
+    Values are resolved at CALL TIME, so env var changes take effect immediately.
+    See :mod:`connection_health_config` for details.
     """
 
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
+            # Resolve config at call time for dynamic behavior
+            cfg_max_retries, cfg_base_delay, cfg_max_delay, cfg_jitter = resolve_connection_retry_config()
+            _max_retries = max_retries if max_retries is not None else cfg_max_retries
+            _base_delay = base_delay if base_delay is not None else cfg_base_delay
+            _max_delay = max_delay if max_delay is not None else cfg_max_delay
+            _jitter = jitter if jitter is not None else cfg_jitter
+
             last_err: Optional[BaseException] = None
-            for attempt in range(max_retries):
+            for attempt in range(_max_retries):
                 try:
                     return await func(*args, **kwargs)
                 except _TRANSIENT_CONNECT_EXCEPTIONS as exc:
                     last_err = exc
                     fn_mod = getattr(func, "__module__", "<unknown>")
                     fn_name = getattr(func, "__qualname__", getattr(func, "__name__", "<fn>"))
-                    if attempt == max_retries - 1:
-                        # Terminal failure after exhausting retries — keep as WARNING
-                        # so real exhaustion remains visible in Cloud Logging.
+                    if attempt == _max_retries - 1:
                         logger.warning(
                             "retry_on_transient_connect: %s.%s exhausted %d attempts "
                             "(%s: %s)",
-                            fn_mod, fn_name, max_retries,
+                            fn_mod, fn_name, _max_retries,
                             type(exc).__name__, exc,
                         )
                         raise
-                    delay = min(base_delay * (2 ** attempt), max_delay)
-                    if jitter:
-                        delay *= random.uniform(1.0 - jitter, 1.0 + jitter)
-                    # Demoted from WARNING → DEBUG (issue #486): per-attempt retries
-                    # under transient pool pressure flood Cloud Logging and mask the
-                    # actual root-cause signal. Terminal exhaustion above is the
-                    # WARNING that operators need to see.
+                    delay = min(_base_delay * (2 ** attempt), _max_delay)
+                    if _jitter:
+                        delay *= random.uniform(1.0 - _jitter, 1.0 + _jitter)
                     logger.debug(
                         "retry_on_transient_connect: %s.%s attempt %d/%d failed "
                         "(%s: %s); retrying in %.2fs",
                         fn_mod, fn_name,
                         attempt + 1,
-                        max_retries,
+                        _max_retries,
                         type(exc).__name__,
                         exc,
                         delay,
@@ -1370,7 +1384,7 @@ def retry_on_transient_connect(
 # GCP log-based metric can compute db_pool_wait_seconds histograms per service
 # without needing a prometheus_client dep + scrape endpoint. INFO when slow,
 # DEBUG otherwise.
-_SLOW_POOL_ACQUIRE_THRESHOLD_S = 0.5
+_SLOW_POOL_ACQUIRE_THRESHOLD_S = resolve_connection_health_config()[0]
 
 
 def _resolve_service_name() -> str:
@@ -1877,8 +1891,8 @@ async def provisioning_write_with_retry(
     engine: DbResource,
     fn: Callable[[Any], Awaitable["_T"]],
     *,
-    attempts: int = 3,
-    lock_backoff: float = 1.0,
+    attempts: int | None = None,
+    lock_backoff: float | None = None,
 ) -> "_T":
     """Run ``fn(conn)`` in a short committed transaction, retrying on transient errors.
 
@@ -1893,30 +1907,40 @@ async def provisioning_write_with_retry(
 
     ``lock_backoff`` controls the sleep before retrying a
     ``LockNotAvailableError``: ``lock_backoff * attempt`` seconds, giving PG
-    time to release the conflicting lock.  Transient connection-closed errors
+    time to release the conflicting locks.  Transient connection-closed errors
     use a zero-length yield (``asyncio.sleep(0)``) — the connection is simply
     dead and a fresh one is available immediately from the pool.
 
     Must NOT be used for non-idempotent writes.  The caller is responsible for
     ON CONFLICT / upsert semantics.
+
+    Configuration: Values are resolved from (1) function parameters,
+    (2) environment variables, (3) ProvisioningRetryConfig defaults.
+    Values are resolved at CALL TIME, so env var changes take effect immediately.
+    See :mod:`connection_health_config` for details.
     """
-    for attempt in range(attempts):
+    # Resolve config at call time for dynamic behavior
+    cfg_attempts, cfg_lock_backoff = resolve_provisioning_retry_config()
+    _attempts = attempts if attempts is not None else cfg_attempts
+    _lock_backoff = lock_backoff if lock_backoff is not None else cfg_lock_backoff
+
+    for attempt in range(_attempts):
         try:
             async with managed_transaction(engine) as conn:
                 return await fn(conn)
         except Exception as exc:
             orig = getattr(exc, "orig", None)
             if is_transient_db_error(exc):
-                if attempt < attempts - 1:
+                if attempt < _attempts - 1:
                     is_lock = _is_lock_not_available_error(exc) or (
                         orig is not None and _is_lock_not_available_error(orig)
                     )
-                    delay = lock_backoff * (attempt + 1) if is_lock else 0.0
+                    delay = _lock_backoff * (attempt + 1) if is_lock else 0.0
                     logger.warning(
                         "provisioning_write_retry "
                         "attempt=%d/%d exc=%s cause=%s delay=%.1fs; retrying on fresh connection",
                         attempt + 1,
-                        attempts,
+                        _attempts,
                         exc.__class__.__name__,
                         orig.__class__.__name__ if orig is not None else "none",
                         delay,
