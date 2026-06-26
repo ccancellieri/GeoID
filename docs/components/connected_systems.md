@@ -23,17 +23,24 @@ The service mounts under `/consys` (priority 100).
 
 ## Conformance
 
-The extension declares the following OGC conformance URIs:
+The extension declares the following OGC conformance URIs, aggregated into the
+platform conformance matrix by `extensions/tools/conformance.py` (family
+`OGC API Connected Systems`).
 
-```
-http://www.opengis.net/spec/ogcapi-connectedsystems-1/1.0/conf/core
-http://www.opengis.net/spec/ogcapi-connectedsystems-1/1.0/conf/system-features
-http://www.opengis.net/spec/ogcapi-connectedsystems-1/1.0/conf/datastreams
-http://www.opengis.net/spec/ogcapi-connectedsystems-1/1.0/conf/observations
-```
+| Conformance class | URI | Status |
+|---|---|---|
+| Core | `http://www.opengis.net/spec/ogcapi-connectedsystems-1/1.0/conf/core` | Implemented — landing page, conformance, catalog-readiness guard, pagination |
+| System Features | `http://www.opengis.net/spec/ogcapi-connectedsystems-1/1.0/conf/system-features` | Implemented — list/get/create/update/delete systems; optional bbox spatial filter; linked deployments and datastreams |
+| DataStreams | `http://www.opengis.net/spec/ogcapi-connectedsystems-1/1.0/conf/datastreams` | Implemented — list/get/create datastreams; parent-system validation; 409 on duplicate |
+| Observations | `http://www.opengis.net/spec/ogcapi-connectedsystems-1/1.0/conf/observations` | Implemented — list/create observations; ISO 8601 datetime filter (instant / interval / open interval); bbox filter via parent system geometry |
 
-These are aggregated into the platform conformance matrix by
-`extensions/tools/conformance.py` (family `OGC API Connected Systems`).
+**Not yet implemented** (known gaps):
+
+| Conformance class | Notes |
+|---|---|
+| SamplingFeatures | Spatial footprints for observations — not modelled; `GET /consys/samplingfeatures` returns 404 |
+| Deployment create/update | Deployments are created implicitly with their parent system; no standalone POST/PUT endpoint |
+| Collection-scope config | `ConnectedSystemsPluginConfig._tiers = ("platform", "catalog")` — no per-collection override surface |
 
 ## Resources
 

@@ -26,7 +26,7 @@ from modules/styles/db.py.
 import json
 import logging
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from dateutil.parser import isoparse
 from sqlalchemy import text
@@ -202,58 +202,65 @@ _create_observation_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
-def _build_list_observations_query(
-    db_resource: DbResource, raw_params: dict
-):
-    conditions = ["ds.catalog_id = :catalog_id", "ds.datastream_id = :datastream_id"]
-    bind_params = {
-        "catalog_id": raw_params["catalog_id"],
-        "datastream_id": raw_params["datastream_id"],
-        "limit": raw_params["limit"],
-        "offset": raw_params["offset"],
-    }
-    
+def _build_observations_sql(
+    datetime_str: Optional[str],
+    bbox: Optional[Tuple[float, float, float, float]],
+) -> Tuple[str, dict]:
+    """Build the WHERE clause and extra bind params for an observations list query.
+
+    Returns ``(sql_string, extra_params)`` where the SQL string embeds all
+    optional filter clauses so it can be passed directly to ``DQLQuery``.
+    The base params (catalog_id, datastream_id, limit, offset) are NOT included
+    in ``extra_params`` — the caller merges them before calling ``execute``.
+    """
+    conditions: List[str] = [
+        "ds.catalog_id = :catalog_id",
+        "ds.datastream_id = :datastream_id",
+    ]
+    extra: dict = {}
     needs_systems_join = False
-    
-    datetime_str = raw_params.get("datetime")
+
     if datetime_str:
         if "/" in datetime_str:
-            start_str, end_str = datetime_str.split("/")
+            start_str, end_str = datetime_str.split("/", 1)
             start_dt = isoparse(start_str) if start_str != ".." else None
             end_dt = isoparse(end_str) if end_str != ".." else None
-            
             if start_dt and end_dt:
                 conditions.append("o.phenomenon_time >= :start_dt")
                 conditions.append("o.phenomenon_time <= :end_dt")
-                bind_params["start_dt"] = start_dt
-                bind_params["end_dt"] = end_dt
+                extra["start_dt"] = start_dt
+                extra["end_dt"] = end_dt
             elif start_dt:
                 conditions.append("o.phenomenon_time >= :start_dt")
-                bind_params["start_dt"] = start_dt
+                extra["start_dt"] = start_dt
             elif end_dt:
                 conditions.append("o.phenomenon_time <= :end_dt")
-                bind_params["end_dt"] = end_dt
+                extra["end_dt"] = end_dt
         else:
             dt = isoparse(datetime_str)
             conditions.append("o.phenomenon_time = :dt")
-            bind_params["dt"] = dt
-    
-    bbox = raw_params.get("bbox")
-    if bbox:
+            extra["dt"] = dt
+
+    if bbox is not None:
         xmin, ymin, xmax, ymax = bbox
         conditions.append("s.geometry IS NOT NULL")
-        conditions.append("ST_Intersects(s.geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))")
-        bind_params["xmin"] = xmin
-        bind_params["ymin"] = ymin
-        bind_params["xmax"] = xmax
-        bind_params["ymax"] = ymax
+        conditions.append(
+            "ST_Intersects(s.geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))"
+        )
+        extra["xmin"] = xmin
+        extra["ymin"] = ymin
+        extra["xmax"] = xmax
+        extra["ymax"] = ymax
         needs_systems_join = True
-    
+
     where_clause = " AND ".join(conditions)
-    
-    systems_join = "JOIN consys.systems s ON s.id = ds.system_id AND s.catalog_id = ds.catalog_id" if needs_systems_join else ""
-    
-    sql = text(
+    systems_join = (
+        "JOIN consys.systems s ON s.id = ds.system_id AND s.catalog_id = ds.catalog_id"
+        if needs_systems_join
+        else ""
+    )
+
+    sql = (
         f"""
         SELECT o.id, o.catalog_id, o.datastream_id, o.phenomenon_time, o.result_time,
                o.result_value, o.result_quality, o.parameters
@@ -265,7 +272,7 @@ def _build_list_observations_query(
         LIMIT :limit OFFSET :offset;
         """
     )
-    return sql, bind_params
+    return sql, extra
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +358,38 @@ async def list_systems(
     catalog_id: str,
     limit: int = 100,
     offset: int = 0,
+    bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> List[System]:
-    rows = await _list_systems_query.execute(
-        conn, catalog_id=catalog_id, limit=limit, offset=offset
-    )
+    if bbox is not None:
+        xmin, ymin, xmax, ymax = bbox
+        bbox_query = DQLQuery(
+            """
+            SELECT id, catalog_id, system_id, name, description, type,
+                   ST_AsGeoJSON(geometry)::jsonb AS geometry,
+                   properties, stac_collection_id, created_at, updated_at
+            FROM consys.systems
+            WHERE catalog_id = :catalog_id
+              AND geometry IS NOT NULL
+              AND ST_Intersects(geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))
+            ORDER BY system_id
+            LIMIT :limit OFFSET :offset;
+            """,
+            result_handler=ResultHandler.ALL_DICTS,
+        )
+        rows = await bbox_query.execute(
+            conn,
+            catalog_id=catalog_id,
+            xmin=xmin,
+            ymin=ymin,
+            xmax=xmax,
+            ymax=ymax,
+            limit=limit,
+            offset=offset,
+        )
+    else:
+        rows = await _list_systems_query.execute(
+            conn, catalog_id=catalog_id, limit=limit, offset=offset
+        )
     return [s for r in rows if (s := _system_from_row(r)) is not None]
 
 
@@ -534,17 +569,14 @@ async def list_observations(
     datetime: Optional[str] = None,
     bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> List[Observation]:
-    params = {
-        "catalog_id": catalog_id,
-        "datastream_id": datastream_id,
-        "limit": limit,
-        "offset": offset,
-        "datetime": datetime,
-        "bbox": bbox,
-    }
-    
-    executor = DQLQuery.from_builder(
-        _build_list_observations_query, result_handler=ResultHandler.ALL_DICTS
+    sql, extra_params = _build_observations_sql(datetime, bbox)
+    query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
+    rows = await query.execute(
+        conn,
+        catalog_id=catalog_id,
+        datastream_id=datastream_id,
+        limit=limit,
+        offset=offset,
+        **extra_params,
     )
-    rows = await executor.execute(conn, **params)
     return [o for r in rows if (o := _observation_from_row(r)) is not None]

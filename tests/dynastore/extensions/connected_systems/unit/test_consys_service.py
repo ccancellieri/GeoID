@@ -35,6 +35,30 @@ import pytest
 # Service structure
 # ---------------------------------------------------------------------------
 
+def test_package_exports_service_class():
+    """The extension __init__ exports ConnectedSystemsService in __all__."""
+    import dynastore.extensions.connected_systems as pkg
+
+    assert hasattr(pkg, "ConnectedSystemsService")
+    assert "ConnectedSystemsService" in pkg.__all__
+
+
+def test_config_tiers_platform_and_catalog_only():
+    """ConnectedSystemsPluginConfig must not expose a collection-tier override surface."""
+    from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+
+    tiers = ConnectedSystemsPluginConfig.effective_tiers()
+    assert "platform" in tiers
+    assert "catalog" in tiers
+    assert "collection" not in tiers, "connected_systems must not be configurable at collection scope"
+
+
+def test_config_address():
+    from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+
+    assert ConnectedSystemsPluginConfig._address == ("platform", "extensions", "connected_systems")
+
+
 def test_service_inherits_ogc_mixin():
     from dynastore.extensions.connected_systems.consys_service import ConnectedSystemsService
     from dynastore.extensions.ogc_base import OGCServiceMixin
@@ -343,57 +367,55 @@ async def test_list_datastreams_calls_query():
 @pytest.mark.asyncio
 async def test_list_observations_calls_query():
     from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
 
     conn = AsyncMock()
-    with patch(
-        "dynastore.modules.connected_systems.db.DQLQuery.from_builder"
-    ) as mock_builder:
-        mock_executor = AsyncMock()
-        mock_executor.execute = AsyncMock(return_value=[])
-        mock_builder.return_value = mock_executor
-        
+    with patch.object(DQLQuery, "execute", new_callable=AsyncMock, return_value=[]):
         result = await consys_db.list_observations(conn, "cat1", "ds-001", limit=10, offset=0)
-        assert result == []
-        mock_builder.assert_called_once()
+    assert result == []
 
 
 @pytest.mark.asyncio
 async def test_list_observations_with_datetime_filter():
     from dynastore.modules.connected_systems import db as consys_db
-    from datetime import datetime
+    from dynastore.modules.db_config.query_executor import DQLQuery
 
     conn = AsyncMock()
-    with patch(
-        "dynastore.modules.connected_systems.db.DQLQuery.from_builder"
-    ) as mock_builder:
-        mock_executor = AsyncMock()
-        mock_executor.execute = AsyncMock(return_value=[])
-        mock_builder.return_value = mock_executor
-        
+    with patch.object(
+        DQLQuery, "__init__", return_value=None
+    ) as mock_init, patch.object(
+        DQLQuery, "execute", new_callable=AsyncMock, return_value=[]
+    ):
         result = await consys_db.list_observations(
             conn, "cat1", "ds-001", limit=10, offset=0, datetime="2025-06-01/2025-06-25"
         )
         assert result == []
-        mock_builder.assert_called_once()
+        mock_init.assert_called_once()
+        call_args = str(mock_init.call_args)
+        assert "phenomenon_time" in call_args
+        assert "start_dt" in call_args
+        assert "end_dt" in call_args
 
 
 @pytest.mark.asyncio
 async def test_list_observations_with_open_interval():
     from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
 
     conn = AsyncMock()
-    with patch(
-        "dynastore.modules.connected_systems.db.DQLQuery.from_builder"
-    ) as mock_builder:
-        mock_executor = AsyncMock()
-        mock_executor.execute = AsyncMock(return_value=[])
-        mock_builder.return_value = mock_executor
-        
+    with patch.object(
+        DQLQuery, "__init__", return_value=None
+    ) as mock_init, patch.object(
+        DQLQuery, "execute", new_callable=AsyncMock, return_value=[]
+    ):
         result = await consys_db.list_observations(
             conn, "cat1", "ds-001", limit=10, offset=0, datetime="../2025-06-25"
         )
         assert result == []
-        mock_builder.assert_called_once()
+        mock_init.assert_called_once()
+        call_args = str(mock_init.call_args)
+        assert "phenomenon_time" in call_args
+        assert "end_dt" in call_args
 
 
 @pytest.mark.asyncio

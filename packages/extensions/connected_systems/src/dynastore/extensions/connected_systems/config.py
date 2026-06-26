@@ -23,7 +23,14 @@ from dynastore.models.plugin_config import PluginConfig
 
 
 class ConnectedSystemsPluginConfig(ExposableConfigMixin, PluginConfig):
-    """Service-exposure config for the OGC API - Connected Systems extension."""
+    """Service-exposure config for the OGC API - Connected Systems extension.
+
+    Scoped to platform and catalog tiers only (not per-collection): all
+    Connected Systems resources are catalog-scoped (systems, datastreams,
+    observations are keyed on ``catalog_id``), so there is no meaningful
+    collection-level override surface.
+    """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "connected_systems")
+    _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog")
 
     # `enabled` inherited from ExposableConfigMixin — no further fields.

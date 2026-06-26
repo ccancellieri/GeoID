@@ -14,6 +14,12 @@ dependencies = [
     "DynaStore",
 ]
 
+[project.optional-dependencies]
+# Scope extras — signal that this extension is available on both the platform
+# and catalog deployment tiers (not collection-scoped). See _tiers in config.py.
+platform = []
+catalog = []
+
 [project.entry-points."dynastore.extensions"]
 connected_systems = "dynastore.extensions.connected_systems.consys_service:ConnectedSystemsService"
 
