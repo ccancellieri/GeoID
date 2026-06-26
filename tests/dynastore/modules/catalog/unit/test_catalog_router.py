@@ -567,6 +567,279 @@ class TestMetadataChangedEventEmission:
         )
 
 
+# ---------------------------------------------------------------------------
+# Routing-config write_mode / secondary_index filtering
+# ---------------------------------------------------------------------------
+
+
+class TestWriteModeRoutingHonored:
+    """The WRITE fan-out must honor ``write_mode`` and ``secondary_index`` from
+    the routing config entry, not just the driver ClassVar.
+
+    Secondary-index entries (``write_mode=ASYNC``, ``secondary_index=True``) are
+    excluded from the synchronous write set; they are fed by the reindex_listener
+    off the ``catalog_metadata_changed`` event.  These tests drive the behavior
+    through the routing path (patching ``_routed_catalog_drivers`` to return
+    ``(entry, driver)`` pairs) rather than injecting ``drivers=`` directly.
+    """
+
+    def _make_entry(
+        self,
+        *,
+        driver_ref: str,
+        write_mode,
+        secondary_index: bool,
+        on_failure=None,
+    ):
+        from dynastore.modules.storage.routing_config import (
+            FailurePolicy,
+            OperationDriverEntry,
+        )
+        return OperationDriverEntry(
+            driver_ref=driver_ref,
+            write_mode=write_mode,
+            secondary_index=secondary_index,
+            on_failure=on_failure or FailurePolicy.FATAL,
+        )
+
+    def _make_driver(self, method_name: str):
+        """Return a mock CatalogStore with the given WRITE method as an AsyncMock."""
+        from unittest.mock import AsyncMock, MagicMock
+        d = MagicMock()
+        # _filter_capable checks ``capabilities``; "write" = EntityStoreCapability.WRITE
+        d.capabilities = frozenset({"write"})
+        setattr(d, method_name, AsyncMock())
+        return d
+
+    @pytest.mark.asyncio
+    async def test_upsert_excludes_async_secondary_from_sync_fan_out(self, monkeypatch):
+        """Routing path: secondary-index driver (write_mode=ASYNC, secondary_index=True)
+        is NOT called in the synchronous fan-out — only SYNC primary drivers run.
+        """
+        from unittest.mock import AsyncMock, patch
+        from dynastore.modules.catalog.catalog_router import upsert_catalog_metadata
+        from dynastore.modules.storage.routing_config import WriteMode
+
+        primary = self._make_driver("upsert_catalog_metadata")
+        secondary = self._make_driver("upsert_catalog_metadata")
+
+        primary_entry = self._make_entry(
+            driver_ref="catalog_postgresql_driver",
+            write_mode=WriteMode.SYNC,
+            secondary_index=False,
+        )
+        secondary_entry = self._make_entry(
+            driver_ref="catalog_elasticsearch_driver",
+            write_mode=WriteMode.ASYNC,
+            secondary_index=True,
+        )
+        routed_pairs = [(primary_entry, primary), (secondary_entry, secondary)]
+
+        with patch(
+            "dynastore.modules.catalog.catalog_router._routed_catalog_drivers",
+            AsyncMock(return_value=routed_pairs),
+        ):
+            await upsert_catalog_metadata("cat-42", {"title": "T"})
+
+        # Primary (SYNC, not secondary_index) → called synchronously.
+        primary.upsert_catalog_metadata.assert_awaited_once()
+        # Secondary (ASYNC, secondary_index=True) → excluded; fed by event.
+        secondary.upsert_catalog_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upsert_routing_event_still_emitted_when_secondary_excluded(
+        self, monkeypatch,
+    ):
+        """catalog_metadata_changed event is emitted even when secondary-index
+        driver is excluded from the sync write set.
+
+        The event is the trigger for the async reindex path; omitting it when
+        secondary drivers are excluded would silently skip propagation.
+        """
+        from unittest.mock import AsyncMock, patch
+        from dynastore.modules.catalog.catalog_router import upsert_catalog_metadata
+        from dynastore.modules.storage.routing_config import WriteMode
+
+        primary = self._make_driver("upsert_catalog_metadata")
+
+        primary_entry = self._make_entry(
+            driver_ref="catalog_postgresql_driver",
+            write_mode=WriteMode.SYNC,
+            secondary_index=False,
+        )
+        secondary_entry = self._make_entry(
+            driver_ref="catalog_elasticsearch_driver",
+            write_mode=WriteMode.ASYNC,
+            secondary_index=True,
+        )
+        routed_pairs = [(primary_entry, primary), (secondary_entry, self._make_driver("upsert_catalog_metadata"))]
+
+        emit = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "dynastore.modules.catalog.event_service.emit_event", emit,
+        )
+
+        with patch(
+            "dynastore.modules.catalog.catalog_router._routed_catalog_drivers",
+            AsyncMock(return_value=routed_pairs),
+        ):
+            await upsert_catalog_metadata("cat-42", {"title": "T"})
+
+        # Event must still fire so the reindex_listener can propagate to ES.
+        assert emit.await_count >= 1
+        payload_ops = [c.kwargs["payload"]["operation"] for c in emit.call_args_list]
+        assert all(op == "upsert" for op in payload_ops)
+
+    @pytest.mark.asyncio
+    async def test_delete_excludes_async_secondary_from_sync_fan_out(self, monkeypatch):
+        """delete_catalog_metadata mirrors upsert: secondary-index driver excluded."""
+        from unittest.mock import AsyncMock, patch
+        from dynastore.modules.catalog.catalog_router import delete_catalog_metadata
+        from dynastore.modules.storage.routing_config import WriteMode
+
+        primary = self._make_driver("delete_catalog_metadata")
+        secondary = self._make_driver("delete_catalog_metadata")
+
+        primary_entry = self._make_entry(
+            driver_ref="catalog_postgresql_driver",
+            write_mode=WriteMode.SYNC,
+            secondary_index=False,
+        )
+        secondary_entry = self._make_entry(
+            driver_ref="catalog_elasticsearch_driver",
+            write_mode=WriteMode.ASYNC,
+            secondary_index=True,
+        )
+        routed_pairs = [(primary_entry, primary), (secondary_entry, secondary)]
+
+        with patch(
+            "dynastore.modules.catalog.catalog_router._routed_catalog_drivers",
+            AsyncMock(return_value=routed_pairs),
+        ):
+            await delete_catalog_metadata("cat-42")
+
+        primary.delete_catalog_metadata.assert_awaited_once()
+        secondary.delete_catalog_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sync_non_secondary_entry_is_included(self, monkeypatch):
+        """A SYNC entry with secondary_index=False IS included in the sync set."""
+        from unittest.mock import AsyncMock, patch
+        from dynastore.modules.catalog.catalog_router import upsert_catalog_metadata
+        from dynastore.modules.storage.routing_config import WriteMode
+
+        driver_a = self._make_driver("upsert_catalog_metadata")
+        driver_b = self._make_driver("upsert_catalog_metadata")
+
+        entry_a = self._make_entry(
+            driver_ref="catalog_postgresql_driver",
+            write_mode=WriteMode.SYNC,
+            secondary_index=False,
+        )
+        entry_b = self._make_entry(
+            driver_ref="catalog_stac_postgresql_driver",
+            write_mode=WriteMode.SYNC,
+            secondary_index=False,
+        )
+        routed_pairs = [(entry_a, driver_a), (entry_b, driver_b)]
+
+        with patch(
+            "dynastore.modules.catalog.catalog_router._routed_catalog_drivers",
+            AsyncMock(return_value=routed_pairs),
+        ):
+            await upsert_catalog_metadata("cat-x", {})
+
+        driver_a.upsert_catalog_metadata.assert_awaited_once()
+        driver_b.upsert_catalog_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_secondary_primary_included_regardless_of_write_mode(
+        self, monkeypatch,
+    ):
+        """A non-secondary primary entry must run synchronously even when its
+        write_mode is FIRST/FAN_OUT — not just SYNC.
+
+        Regression guard: filtering the sync set on ``write_mode == SYNC`` would
+        silently drop a non-secondary primary configured with FIRST/FAN_OUT,
+        and such an entry is NOT in the secondary_index set the reindex path
+        owns, so the write would be lost on both paths. The sync set is the
+        complement of the reindex-owned (secondary_index) set, so every
+        non-secondary entry runs here regardless of write_mode.
+        """
+        from unittest.mock import AsyncMock, patch
+        from dynastore.modules.catalog.catalog_router import upsert_catalog_metadata
+        from dynastore.modules.storage.routing_config import WriteMode
+
+        first_primary = self._make_driver("upsert_catalog_metadata")
+        fanout_primary = self._make_driver("upsert_catalog_metadata")
+        secondary = self._make_driver("upsert_catalog_metadata")
+
+        routed_pairs = [
+            (self._make_entry(
+                driver_ref="catalog_postgresql_driver",
+                write_mode=WriteMode.FIRST,
+                secondary_index=False,
+            ), first_primary),
+            (self._make_entry(
+                driver_ref="catalog_stac_postgresql_driver",
+                write_mode=WriteMode.FAN_OUT,
+                secondary_index=False,
+            ), fanout_primary),
+            (self._make_entry(
+                driver_ref="catalog_elasticsearch_driver",
+                write_mode=WriteMode.ASYNC,
+                secondary_index=True,
+            ), secondary),
+        ]
+
+        with patch(
+            "dynastore.modules.catalog.catalog_router._routed_catalog_drivers",
+            AsyncMock(return_value=routed_pairs),
+        ):
+            await upsert_catalog_metadata("cat-fm", {})
+
+        # Both non-secondary primaries run synchronously despite non-SYNC mode.
+        first_primary.upsert_catalog_metadata.assert_awaited_once()
+        fanout_primary.upsert_catalog_metadata.assert_awaited_once()
+        # The secondary index is still excluded from the sync fan-out.
+        secondary.upsert_catalog_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_discovery_fallback_excludes_is_catalog_indexer_driver(self, monkeypatch):
+        """When _routed_catalog_drivers returns None (ConfigsProtocol unavailable),
+        the discovery fallback uses the is_catalog_indexer ClassVar to exclude
+        secondary-index drivers from the sync write set.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from dynastore.modules.catalog.catalog_router import upsert_catalog_metadata
+
+        primary = MagicMock()
+        primary.capabilities = frozenset({"write"})
+        primary.is_catalog_indexer = False
+        primary.upsert_catalog_metadata = AsyncMock()
+
+        es_indexer = MagicMock()
+        es_indexer.capabilities = frozenset({"write"})
+        es_indexer.is_catalog_indexer = True
+        es_indexer.upsert_catalog_metadata = AsyncMock()
+
+        with (
+            patch(
+                "dynastore.modules.catalog.catalog_router._routed_catalog_drivers",
+                AsyncMock(return_value=None),  # simulate ConfigsProtocol unavailable
+            ),
+            patch(
+                "dynastore.modules.catalog.catalog_router._resolve_catalog_store_drivers",
+                return_value=[primary, es_indexer],
+            ),
+        ):
+            await upsert_catalog_metadata("cat-fallback", {})
+
+        # Primary written; ES indexer excluded via ClassVar fallback.
+        primary.upsert_catalog_metadata.assert_awaited_once()
+        es_indexer.upsert_catalog_metadata.assert_not_awaited()
+
+
 def test_catalog_routing_config_defaults_use_canonical_names():
     """The defaults must reference the canonical registered driver_ref.
 
