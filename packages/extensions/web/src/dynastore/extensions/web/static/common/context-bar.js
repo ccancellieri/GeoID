@@ -13,6 +13,7 @@
 // mountContextBar(container, options) — the single public export.
 
 import { fetchCatalogOptions, getJSON } from "./api.js";
+import { apiUrl } from "./url.js";
 
 const STORAGE_KEY = "dynastore.admin.scope";
 
@@ -69,11 +70,11 @@ function clearNode(node) {
 
 // Fetch and cache collections for a catalog.
 // Returns a normalized [{id, title}] list; returns [] on error.
-async function fetchCollectionsFor(catalogId, collectionsByCatalog, includeVirtual) {
+async function fetchCollectionsFor(catalogId, collectionsByCatalog, includeVirtual, basePath = "/stac") {
   if (!catalogId) return [];
   if (collectionsByCatalog[catalogId]) return collectionsByCatalog[catalogId];
   try {
-    let url = `/stac/catalogs/${encodeURIComponent(catalogId)}/collections`;
+    let url = apiUrl(`${basePath}/catalogs/${encodeURIComponent(catalogId)}/collections`);
     if (includeVirtual) url += "?include_virtual=true";
     const res = await getJSON(url);
     const items = Array.isArray(res) ? res : (res.collections || res.items || []);
@@ -90,7 +91,7 @@ async function fetchCollectionsFor(catalogId, collectionsByCatalog, includeVirtu
 // Catalog / Collection radio buttons, sessionStorage persistence, and scope
 // objects of the form {kind, catalogId?, collectionId?}.
 
-function mountBarMode(container, { onChange } = {}) {
+function mountBarMode(container, { onChange, basePath = "/stac" } = {}) {
   container.classList.add("context-bar");
   clearNode(container);
 
@@ -184,7 +185,7 @@ function mountBarMode(container, { onChange } = {}) {
     if (!rCollection.input.checked) return;
     const catId = scope.kind !== "platform" ? scope.catalogId : (catalogs[0]?.id || "");
     scope = { kind: "collection", catalogId: catId, collectionId: "" };
-    await fetchCollectionsFor(catId, collectionsByCatalog, false);
+    await fetchCollectionsFor(catId, collectionsByCatalog, false, basePath);
     syncUI();
   });
 
@@ -194,7 +195,7 @@ function mountBarMode(container, { onChange } = {}) {
       scope = { kind: "catalog", catalogId: v };
     } else if (scope.kind === "collection") {
       scope = { kind: "collection", catalogId: v, collectionId: "" };
-      await fetchCollectionsFor(v, collectionsByCatalog, false);
+      await fetchCollectionsFor(v, collectionsByCatalog, false, basePath);
     }
     syncUI();
     if (v) emit();
@@ -216,7 +217,7 @@ function mountBarMode(container, { onChange } = {}) {
     if (scope.kind !== "platform" && !scope.catalogId && catalogs.length) {
       scope.catalogId = catalogs[0].id;
     }
-    if (scope.kind === "collection") await fetchCollectionsFor(scope.catalogId, collectionsByCatalog, false);
+    if (scope.kind === "collection") await fetchCollectionsFor(scope.catalogId, collectionsByCatalog, false, basePath);
     syncUI();
     // Avoid emitting an incomplete restored scope on boot (e.g. a persisted
     // "collection" scope with no collection chosen yet), which makes
@@ -249,6 +250,7 @@ function mountSelectMode(container, {
   preferredCollection = null,
   enableVirtualCollections = false,
   enableSearch = false,
+  basePath = "/stac",
 } = {}) {
   clearNode(container);
 
@@ -360,7 +362,7 @@ function mountSelectMode(container, {
     emitChange();
 
     if (collectionSelect) {
-      const cols = await fetchCollectionsFor(catId, collectionsByCatalog, enableVirtualCollections);
+      const cols = await fetchCollectionsFor(catId, collectionsByCatalog, enableVirtualCollections, basePath);
       await populateCollectionSelect(cols);
 
       if (autoSelectFirst && cols.length) {
@@ -411,7 +413,7 @@ function mountSelectMode(container, {
     if (currentCatalog) {
       catalogSelect.value = currentCatalog;
       if (collectionSelect) {
-        const cols = await fetchCollectionsFor(currentCatalog, collectionsByCatalog, enableVirtualCollections);
+        const cols = await fetchCollectionsFor(currentCatalog, collectionsByCatalog, enableVirtualCollections, basePath);
         await populateCollectionSelect(cols);
 
         if (!currentCollection && autoSelectFirst && cols.length) {
@@ -457,7 +459,7 @@ function mountSelectMode(container, {
     refreshCollections: async (selectId) => {
       if (!collectionSelect || !currentCatalog) return [];
       delete collectionsByCatalog[currentCatalog];
-      const cols = await fetchCollectionsFor(currentCatalog, collectionsByCatalog, enableVirtualCollections);
+      const cols = await fetchCollectionsFor(currentCatalog, collectionsByCatalog, enableVirtualCollections, basePath);
       await populateCollectionSelect(cols);
       if (selectId) {
         currentCollection = selectId;
@@ -490,6 +492,8 @@ function mountSelectMode(container, {
  * @param {boolean}     [options.enableSearch=false]            - Select mode: show a text filter above the
  *   catalog select that narrows options by case-insensitive substring. Current selection is cleared when
  *   filtered out. Does not affect bar mode.
+ * @param {string}      [options.basePath="/stac"]     - API base path for fetching collections.
+ *   Use "/features" for Features browser, "/volumes" for Volumes, etc. Defaults to "/stac" for backward compatibility.
  *
  * @returns {Object} Control handle.
  *   Bar mode:    { getScope(), setScope(scope) }

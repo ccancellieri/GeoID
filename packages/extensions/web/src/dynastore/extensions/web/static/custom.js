@@ -191,9 +191,15 @@ async function switchTab(tabId) {
     contentArea.innerHTML = '<div class="flex items-center justify-center h-full py-40"><i class="fa-solid fa-circle-notch fa-spin text-4xl text-blue-500"></i></div>';
 
     let isFullPage = false;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
     try {
         // 3. Fetch Content Fragment
-        const res = await fetch(`pages/${tabId}?language=${currentLocale}`);
+        const res = await fetch(`pages/${tabId}?language=${currentLocale}`, {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
         if (!res.ok) throw new Error(`Failed to load ${tabId}`);
         const html = await res.text();
 
@@ -286,7 +292,29 @@ async function switchTab(tabId) {
 
     } catch (e) {
         console.error(`Error switching to tab ${tabId}:`, e);
-        contentArea.innerHTML = `<div class="p-20 text-center text-red-400"><i class="fa-solid fa-triangle-exclamation text-4xl mb-4"></i><p>Failed to load ${tabId}</p></div>`;
+        clearTimeout(timeoutId);
+        
+        if (e.name === 'AbortError') {
+            contentArea.innerHTML = `
+                <div class="p-20 text-center">
+                    <i class="fa-solid fa-clock text-4xl mb-4 text-yellow-500"></i>
+                    <p class="text-lg mb-2">Loading timed out</p>
+                    <p class="text-sm text-gray-500 mb-4">The page took too long to load.</p>
+                    <button onclick="window.switchTab('${tabId}')" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
+                        <i class="fa-solid fa-redo mr-2"></i>Retry
+                    </button>
+                </div>`;
+        } else {
+            contentArea.innerHTML = `
+                <div class="p-20 text-center text-red-400">
+                    <i class="fa-solid fa-triangle-exclamation text-4xl mb-4"></i>
+                    <p>Failed to load ${tabId}</p>
+                    <p class="text-sm mt-2">${e.message}</p>
+                    <button onclick="window.switchTab('${tabId}')" class="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
+                        <i class="fa-solid fa-redo mr-2"></i>Retry
+                    </button>
+                </div>`;
+        }
     }
 
     // 6. Update Hash and Scroll

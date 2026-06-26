@@ -2,6 +2,7 @@
 // Each source describes how to fetch pages of items; entity-selector.js drives
 // the pagination and search-debounce logic.
 import { getJSON, fetchCatalogOptions } from "./api.js";
+import { apiUrl } from "./url.js";
 
 // qs helper: builds ?k=v&… omitting null/undefined/empty values.
 function qs(params) {
@@ -65,7 +66,7 @@ export function collectionSource({ basePath, filter } = {}) {
         labelOf: (c) => c.title || c.id,
         idOf:    (c) => c.id,
         async fetch({ q, limit = 25, offset = 0, lang } = {}) {
-          const url = `${basePath}/catalogs/${encodeURIComponent(catalogId)}/collections`
+          const url = apiUrl(`${basePath}/catalogs/${encodeURIComponent(catalogId)}/collections`)
             + qs({ q, limit, offset, language: lang });
           const res  = await getJSON(url);
           // Compute hasMore BEFORE applying the optional client filter so the

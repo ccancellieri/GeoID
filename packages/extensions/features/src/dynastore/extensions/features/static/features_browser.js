@@ -253,6 +253,7 @@ function init() {
     mountContextBar(csContainer, {
       mode: "select",
       enableVirtualCollections: false,
+      basePath: "/features",
       onChange: ({ catalogId, collectionId }) => {
         _currentCat = catalogId || null;
         _currentColl = collectionId || null;
