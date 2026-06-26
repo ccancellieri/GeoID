@@ -409,6 +409,22 @@ class RelativeSlashRedirectMiddleware:
         if scope["type"] == "http":
             route_path = get_route_path(scope)
             if route_path != "/" and not route_path.endswith("/"):
+                # Skip redirect for static file paths (they use {prefix}/{filename:path} pattern)
+                # Static files are served at /web/{prefix}/{filename} and must not be redirected
+                path_parts = route_path.strip("/").split("/")
+                if len(path_parts) >= 2:
+                    # Check if this looks like a static file path (prefix/filename)
+                    # by checking if there's a registered static provider for the prefix
+                    from dynastore.modules import get_protocol
+                    from dynastore.models.protocols.web import WebModuleProtocol
+                    web_module = get_protocol(WebModuleProtocol)
+                    if web_module and hasattr(web_module, 'static_providers'):
+                        potential_prefix = path_parts[1] if path_parts[0] == "web" else path_parts[0]
+                        if potential_prefix in web_module.static_providers:
+                            # This is a static file path - skip redirect
+                            await self.app(scope, receive, send)
+                            return
+                
                 router = self._get_router()
                 if router is not None:
                     # Skip redirect if the original path already matches a route

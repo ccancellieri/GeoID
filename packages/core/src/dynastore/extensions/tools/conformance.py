@@ -63,6 +63,7 @@ class ConformanceSummary(BaseModel):
 # them as peer entries on the conformance matrix would overstate the
 # platform's standards posture.
 _STANDARD_PATTERNS: Dict[str, str] = {
+    "OGC API Common": r"ogcapi-common",
     "OGC API Features": r"ogcapi-features",
     "STAC API": r"stacspec\.org|stac-api",
     "OGC API Processes": r"ogcapi-processes",
@@ -71,10 +72,12 @@ _STANDARD_PATTERNS: Dict[str, str] = {
     "OGC API Maps": r"ogcapi-maps",
     "OGC API Coverages": r"ogcapi-coverages",
     "OGC API DGGS": r"ogcapi-dggs",
-    "OGC API Connected Systems": r"ogcapi-connectedsystems",
+    "OGC API ConnectedSystems": r"ogcapi-connectedsystems",
     "OGC API Moving Features": r"ogcapi-movingfeatures",
     "OGC API Styles": r"ogcapi-styles",
     "OGC API EDR": r"ogcapi-edr",
+    "OGC API Joins": r"ogcapi-joins",
+    "OGC API Routes": r"ogcapi-routes",
     "OGC API 3D GeoVolumes": r"ogcapi-3d-geovolumes",
 }
 
